@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LLMRelay</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #10141b; color: #eef3f9; }
+      main { width: min(42rem, calc(100% - 3rem)); padding: 2.5rem; border: 1px solid #34404f; border-radius: 1rem; background: #171d26; }
+      h1 { margin-top: 0; }
+      .state { color: #8bd3ff; font-weight: 650; }
+      code { color: #c7d7ea; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>LLMRelay foundation</h1>
+      <p class="state" id="state">Connecting to the local service…</p>
+      <p>The workflow dashboard is not included in this foundation build. The local host, durable state, scoped role channel, and PTY capability checks are available through the CLI.</p>
+      <p id="detail"></p>
+    </main>
+    <script>
+      const fragment = new URLSearchParams(location.hash.slice(1));
+      const bootstrap = fragment.get("bootstrap");
+      const detail = document.getElementById("detail");
+      const state = document.getElementById("state");
+      async function start() {
+        if (bootstrap) {
+          history.replaceState(null, "", location.pathname + location.search);
+          const response = await fetch("/api/bootstrap", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ token: bootstrap })
+          });
+          if (!response.ok) throw new Error(`bootstrap failed (${response.status})`);
+        }
+        const response = await fetch("/api/health", { credentials: "same-origin" });
+        if (!response.ok) throw new Error(`health check failed (${response.status})`);
+        const health = await response.json();
+        state.textContent = "Local service is running";
+        detail.textContent = `Instance ${health.instance_id}, boot ${health.boot_id}.`;
+      }
+      start().catch(error => {
+        state.textContent = "Local service connection failed";
+        detail.textContent = String(error);
+      });
+    </script>
+  </body>
+</html>

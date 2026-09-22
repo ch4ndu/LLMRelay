@@ -1,0 +1,28 @@
+{
+  "id": "trip-v1",
+  "schema": 1,
+  "phases": [
+    "planning",
+    "plan_review",
+    "awaiting_plan_approval",
+    "implementation",
+    "code_review",
+    "checks",
+    "final_review",
+    "manager_handoff",
+    "awaiting_human_review"
+  ],
+  "roles": [
+    "manager",
+    "plan_reviewer",
+    "implementer",
+    "code_reviewer",
+    "final_reviewer"
+  ],
+  "authority": {
+    "plan_approval": "human",
+    "acceptance": "human",
+    "review_results": "candidate-bound independent role results",
+    "transitions": "current manager proposal or authenticated human action"
+  }
+}

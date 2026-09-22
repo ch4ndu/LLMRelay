@@ -1,0 +1,10 @@
+{
+  "nodeModulesDir": "auto",
+  "lock": true,
+  "tasks": {
+    "dev": "deno run -A npm:vite@7.1.5 --host 127.0.0.1",
+    "typecheck": "deno check src/main.tsx vite.config.ts",
+    "build": "deno task typecheck && deno run -A npm:vite@7.1.5 build",
+    "test": "deno test --allow-env --allow-read src/flows.test.tsx"
+  }
+}

@@ -1,0 +1,2 @@
+ALTER TABLE check_runs ADD COLUMN suite_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE check_runs ADD COLUMN check_suite_version INTEGER NOT NULL DEFAULT 1;

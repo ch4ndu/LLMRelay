@@ -1,0 +1,83 @@
+{
+  "documentation": {
+    "no_change_text": "No durable documentation changed; existing usage, operations, building, workflow, security, and milestone guidance remains accurate."
+  },
+  "guidance": [
+    "AGENTS.md",
+    "README.md",
+    "RESEARCH_AND_PLAN.md",
+    "docs/BUILDING.md",
+    "docs/MILESTONES.md",
+    "docs/OPERATIONS.md",
+    "docs/SECURITY.md",
+    "docs/WORKFLOWS.md"
+  ],
+  "observability": {
+    "cmux": "on"
+  },
+  "profiles": {
+    "claude-fable-read-fresh": {
+      "adapter": "claude-cli",
+      "authority": "read-only",
+      "effort": "medium",
+      "model": "fable",
+      "provider": "anthropic",
+      "session": "fresh"
+    },
+    "claude-fable-read-retained": {
+      "adapter": "claude-cli",
+      "authority": "read-only",
+      "effort": "medium",
+      "model": "fable",
+      "provider": "anthropic",
+      "session": "retained"
+    },
+    "codex-sol-read-retained": {
+      "adapter": "codex-cli",
+      "authority": "read-only",
+      "effort": "high",
+      "model": "gpt-5.6-sol",
+      "provider": "openai",
+      "session": "retained"
+    },
+    "codex-terra-write-retained": {
+      "adapter": "codex-cli",
+      "authority": "workspace-write",
+      "effort": "max",
+      "model": "gpt-5.6-terra",
+      "provider": "openai",
+      "session": "retained"
+    }
+  },
+  "project_name": "LLMRelay",
+  "roles": {
+    "code_reviewer": {
+      "profile": "codex-sol-read-retained"
+    },
+    "explorer": {
+      "profile": "codex-sol-read-retained"
+    },
+    "final_verifier": {
+      "profile": "claude-fable-read-fresh"
+    },
+    "implementer": {
+      "profile": "codex-terra-write-retained"
+    },
+    "plan_reviewer": {
+      "profile": "claude-fable-read-retained"
+    }
+  },
+  "testing": {
+    "coverage": "moderate"
+  },
+  "verification": {
+    "broad": [
+      "./scripts/verify.sh"
+    ],
+    "cleanup": [],
+    "focused": [
+      "cargo test --locked",
+      "cd frontend && deno task test"
+    ]
+  }
+}
