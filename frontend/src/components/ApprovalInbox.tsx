@@ -334,7 +334,12 @@ export function ApprovalInbox(
         );
         const task = state.tasks.find((item) => item.id === request.task_id);
         return (
-          <article key={request.id} className="approval-request">
+          <article
+            key={request.id}
+            className="approval-request"
+            data-attention-target={`permission_request:${request.id}`}
+            tabIndex={-1}
+          >
             <button
               className="approval-target"
               onClick={() => task && onSelect(task, request.session_id)}

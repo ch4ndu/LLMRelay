@@ -91,6 +91,7 @@ export function TaskBoard(
         </span>
         <strong>{task.title}</strong>
         <small>{project(task.project_id)}</small>
+        {task.recipe_provenance && <small>{task.recipe_provenance.schedule_id ? "Scheduled draft" : "Recipe draft"} · {task.recipe_provenance.recipe_name} revision {task.recipe_provenance.recipe_revision}</small>}
         {task.attention !== "none" && (
           <span className="attention">
             {task.attention.replaceAll("_", " ")}
@@ -188,6 +189,7 @@ export function TaskBoard(
                     {labels[task.lifecycle] || task.lifecycle} · order{" "}
                     {task.manual_order}
                   </small>
+                  {task.recipe_provenance && <small> · {task.recipe_provenance.schedule_id ? "Scheduled draft" : "Recipe draft"} from {task.recipe_provenance.recipe_name}</small>}
                 </button>
                 {["backlog", "ready"].includes(task.lifecycle) && (
                   <div className="button-row">

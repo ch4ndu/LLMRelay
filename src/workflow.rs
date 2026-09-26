@@ -1,12 +1,583 @@
 use crate::domain::{
-    AppStateDto, ContinuationAction, ContinuationActionKind, HumanCommand, OperationResult,
-    ProjectDto, TaskDto,
+    AppStateDto, AttentionCategory, AttentionItem, AttentionTarget, ContinuationAction,
+    ContinuationActionKind, DecisionActionBinding, DecisionControlPolicy, DecisionDisposition,
+    DecisionEvidenceState, DecisionExplanation, DecisionNextAction, DecisionObservedRevision,
+    DecisionOwner, DecisionOwnership, DecisionPrerequisite, DecisionSubject, HumanCommand,
+    OperationResult, PermissionRequestDto, ProjectDto, RestartCandidateResult, TaskAttentionTarget,
+    TaskDto,
 };
 use crate::store::{json_hash, Store};
 use crate::supervisor::GRACEFUL_STOP_SECONDS;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use std::collections::HashSet;
+
+// A reserved route keeps its captured authority but has already moved reviewer and Explorer ownership.
+const FRESH_ROUTE_AUTHORITY: &str = "SELECT EXISTS(
+                            SELECT 1 FROM audit_events event
+                            JOIN sessions session ON session.id=event.entity_id
+                            JOIN role_generations generation ON generation.id=session.role_generation_id
+                            JOIN attempts current_attempt ON current_attempt.id=generation.attempt_id
+                            WHERE event.event_code='session.resume.rejected'
+                              AND event.id=?1 AND session.id=?2 AND generation.id=?3
+                              AND session.transcript_epoch=?4 AND session.resume_count=?5
+                              AND generation.attempt_id=?6 AND session.status='exited'
+                              AND json_extract(event.detail_json,'$.session_id')=session.id
+                              AND json_extract(event.detail_json,'$.transcript_epoch')=session.transcript_epoch
+                              AND CAST(json_extract(event.detail_json,'$.resume_count') AS INTEGER)=session.resume_count
+                              AND json_extract(event.detail_json,'$.role_generation_id')=generation.id
+                              AND json_extract(event.detail_json,'$.category') IN (
+                                'frozen_runtime_identity_changed',
+                                'provider_compatibility_unsupported',
+                                'provider_compatibility_contract_changed')
+                              AND json_extract(event.detail_json,'$.same_profile_authority')=1
+                              AND current_attempt.id=(SELECT latest.id FROM attempts latest
+                                WHERE latest.task_id=current_attempt.task_id
+                                ORDER BY latest.created_at DESC LIMIT 1)
+                              AND current_attempt.phase IS json_extract(event.detail_json,'$.attempt_phase')
+                              AND current_attempt.candidate_hash IS json_extract(event.detail_json,'$.candidate_hash')
+                              AND current_attempt.plan_hash IS json_extract(event.detail_json,'$.plan_hash')
+                              AND json_type(event.detail_json,'$.frozen_capability_key')='text'
+                              AND json_type(event.detail_json,'$.observed_capability_key')='text'
+                              AND json_extract(event.detail_json,'$.frozen_capability_key') IS NOT
+                                  json_extract(event.detail_json,'$.observed_capability_key')
+                              AND json_type(event.detail_json,'$.observed_identity')='object'
+                              AND json_extract(event.detail_json,'$.observed_identity.provider')=session.provider
+                              AND json_extract(event.detail_json,'$.observed_identity.role')=generation.role
+                              AND json_extract(event.detail_json,'$.observed_identity.mode')='interactive_pty'
+                              AND json_extract(event.detail_json,'$.observed_identity.executable_version')!=''
+                              AND json_extract(event.detail_json,'$.observed_identity.model')!=''
+                              AND json_extract(event.detail_json,'$.observed_identity.effort')!=''
+                              AND EXISTS(SELECT 1 FROM capabilities current_capability
+                                WHERE current_capability.rowid=(
+                                  SELECT latest_capability.rowid FROM capabilities latest_capability
+                                  WHERE latest_capability.provider=json_extract(event.detail_json,'$.observed_identity.provider')
+                                    AND latest_capability.executable_version=json_extract(event.detail_json,'$.observed_identity.executable_version')
+                                    AND latest_capability.role=json_extract(event.detail_json,'$.observed_identity.role')
+                                    AND latest_capability.mode=json_extract(event.detail_json,'$.observed_identity.mode')
+                                  ORDER BY latest_capability.checked_at DESC,latest_capability.rowid DESC LIMIT 1)
+                                  AND current_capability.status='supported'
+                                  AND current_capability.proof_json!='{}'
+                                  AND current_capability.config_hash=json_extract(event.detail_json,'$.observed_capability_key')
+                                  AND (json_extract(event.detail_json,'$.category')='frozen_runtime_identity_changed'
+                                    OR (json_type(current_capability.proof_json,'$.compatibility')='object'
+                                      AND json_extract(current_capability.proof_json,'$.compatibility.effective_hash')=
+                                        json_extract(event.detail_json,'$.observed_identity.compatibility_hash'))))
+                              AND EXISTS(SELECT 1 FROM role_settings profile
+                                   WHERE profile.task_id=?7 AND profile.role=generation.role
+                                     AND profile.revision=generation.config_revision
+                                     AND json_extract(profile.config_json,'$.provider')=
+                                         json_extract(event.detail_json,'$.observed_identity.provider')
+                                     AND json_extract(profile.config_json,'$.model')=
+                                         json_extract(event.detail_json,'$.observed_identity.model')
+                                     AND json_extract(profile.config_json,'$.effort')=
+                                         json_extract(event.detail_json,'$.observed_identity.effort'))
+                              AND (EXISTS(SELECT 1 FROM role_settings setting
+                                   WHERE setting.task_id=?7 AND setting.role=generation.role
+                                     AND setting.revision=generation.config_revision
+                                     AND setting.effective_generation_id=generation.id)
+                                   OR (generation.role='implementer' AND generation.lane_id!='default'
+                                     AND EXISTS(SELECT 1 FROM lane_generations lane
+                                       WHERE lane.lane_id=generation.lane_id
+                                         AND lane.effective_generation_id=generation.id)))
+                              AND generation.role!='final_verifier'
+                              AND (generation.role NOT IN ('plan_reviewer','code_reviewer')
+                                   OR EXISTS(SELECT 1 FROM review_requests review
+                                     JOIN review_budgets budget
+                                       ON budget.attempt_id=review.attempt_id
+                                      AND budget.review_kind=review.review_kind
+                                    WHERE review.id=json_extract(event.detail_json,'$.review_request_id')
+                                      AND review.attempt_id=current_attempt.id
+                                      AND review.role_generation_id=generation.id
+                                      AND review.session_id=session.id
+                                      AND review.delivery_state=CASE WHEN ?8 IS NULL THEN 'delivered' ELSE 'superseded_after_rejected_resume' END
+                                      AND review.review_kind=CASE generation.role
+                                        WHEN 'plan_reviewer' THEN 'plan' ELSE 'code' END
+                                      AND review.candidate_hash IS CASE review.review_kind
+                                        WHEN 'plan' THEN current_attempt.plan_hash
+                                        ELSE current_attempt.candidate_hash END
+                                      AND budget.spent < budget.initial_allowance+budget.extension_allowance))
+                              AND (generation.role!='explorer' OR EXISTS(
+                                    SELECT 1 FROM trip_explorer_decisions decision
+                                     WHERE decision.attempt_id=current_attempt.id
+                                       AND decision.activated=1
+                                       AND decision.outcome_json IS NULL
+                                       AND ((?8 IS NULL AND decision.role_generation_id=generation.id) OR (?8 IS NOT NULL AND decision.role_generation_id IS NULL))
+                                       AND (?8 IS NULL OR decision.id=(
+                                         SELECT json_extract(route.detail_json,'$.explorer_decision_id')
+                                         FROM audit_events route WHERE route.operation_id=?8
+                                           AND route.event_code='session.resume.fresh_route.reserved'))
+                                       AND decision.candidate_hash IS current_attempt.candidate_hash))
+                              AND NOT EXISTS(SELECT 1 FROM recovery_records recovery
+                                WHERE recovery.session_id=session.id
+                                  AND recovery.state='attention_required')
+                              AND NOT EXISTS(SELECT 1 FROM role_generations newer
+                                WHERE newer.attempt_id=generation.attempt_id
+                                  AND newer.role=generation.role
+                                  AND newer.lane_id=generation.lane_id
+                                  AND newer.generation>generation.generation)
+                              AND ((?8 IS NULL AND NOT EXISTS(SELECT 1 FROM audit_events consumed
+                                WHERE consumed.event_code='session.resume.fresh_route.reserved'
+                                  AND json_extract(consumed.detail_json,'$.rejection_event_id')=event.id))
+                                OR (?8 IS NOT NULL AND EXISTS(SELECT 1 FROM audit_events reserved
+                                  WHERE reserved.event_code='session.resume.fresh_route.reserved'
+                                    AND reserved.operation_id=?8 AND reserved.entity_id=session.id
+                                    AND json_extract(reserved.detail_json,'$.rejection_event_id')=event.id
+                                    AND json_extract(reserved.detail_json,'$.role_generation_id')=generation.id
+                                    AND json_extract(reserved.detail_json,'$.transcript_epoch')=session.transcript_epoch
+                                    AND CAST(json_extract(reserved.detail_json,'$.resume_count') AS INTEGER)=session.resume_count
+                                    AND json_extract(reserved.detail_json,'$.attempt_id')=current_attempt.id)))
+                        )";
+
+pub(crate) fn fresh_route_authorized(
+    connection: &Connection,
+    rejection_event_id: &str,
+    session_id: &str,
+    generation_id: &str,
+    transcript_epoch: &str,
+    resume_count: i64,
+    attempt_id: &str,
+    task_id: &str,
+    reserved_operation_id: Option<&str>,
+) -> Result<bool> {
+    let allowed = connection.query_row(
+        FRESH_ROUTE_AUTHORITY,
+        params![
+            rejection_event_id,
+            session_id,
+            generation_id,
+            transcript_epoch,
+            resume_count,
+            attempt_id,
+            task_id,
+            reserved_operation_id
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(allowed)
+}
+
+pub(crate) fn ordinary_control_allowed(
+    lifecycle: &str,
+    attention: &str,
+    attempt_status: Option<&str>,
+    attempt_phase: Option<&str>,
+    rework: Option<(&str, bool)>,
+    manager_control_active: bool,
+    action: &str,
+) -> bool {
+    if manager_control_active || matches!(lifecycle, "done" | "cancelled" | "backlog") {
+        return false;
+    }
+    if lifecycle == "ready" {
+        return action == "run_next";
+    }
+    let Some(status) = attempt_status else {
+        return false;
+    };
+    if !matches!(
+        attempt_phase,
+        Some(
+            "planning"
+                | "plan_review"
+                | "awaiting_plan_approval"
+                | "awaiting_implementation_authorization"
+                | "implementation"
+                | "code_review"
+                | "checks"
+                | "final_review"
+                | "manager_handoff"
+                | "awaiting_human_review"
+        )
+    ) {
+        return false;
+    }
+    if let Some((state, cancellation_pending)) = rework {
+        if cancellation_pending {
+            return false;
+        }
+        let permitted = match state {
+            "reserved" | "materializing" => {
+                matches!(action, "pause_now" | "pause_after_role" | "cancel")
+            }
+            "paused" | "recovery_required" => matches!(
+                action,
+                "continue" | "pause_now" | "pause_after_role" | "cancel"
+            ),
+            _ => false,
+        };
+        return permitted && !matches!(status, "done" | "cancelled" | "failed");
+    }
+    if matches!(status, "done" | "cancelled" | "failed") {
+        return action == "retry" && rework.is_none();
+    }
+    match action {
+        "pause_now" | "pause_after_role" | "cancel" => true,
+        "continue" => {
+            (attention == "paused"
+                || (attention == "none" && status == "running")
+                || (attention == "needs_input"
+                    && status == "running"
+                    && attempt_phase == Some("planning")))
+                && lifecycle != "awaiting_review"
+                && !matches!(
+                    attempt_phase,
+                    Some(
+                        "awaiting_plan_approval"
+                            | "awaiting_implementation_authorization"
+                            | "plan_review"
+                            | "code_review"
+                            | "final_review"
+                    )
+                )
+        }
+        "retry" => attention == "needs_input" && lifecycle != "awaiting_review",
+        "run_next" => attention == "paused" && lifecycle != "awaiting_review",
+        _ => false,
+    }
+}
+
+pub(crate) fn restart_hold_continue_allowed(
+    connection: &Connection,
+    task_id: &str,
+    attempt_id: &str,
+    lifecycle: &str,
+    attention: &str,
+    attempt_status: &str,
+    attempt_phase: &str,
+    rework: Option<(&str, bool)>,
+    manager_control_active: bool,
+) -> Result<bool> {
+    // A parked restart uses ordinary Continue's phase and human gates; its
+    // process and candidate safety checks remain at hold release.
+    if attention != "restart_parked"
+        || attempt_status != "restart_parked"
+        || rework.is_some()
+        || !ordinary_control_allowed(
+            lifecycle,
+            "paused",
+            Some("running"),
+            Some(attempt_phase),
+            None,
+            manager_control_active,
+            "continue",
+        )
+    {
+        return Ok(false);
+    }
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM restart_candidates
+             WHERE task_id=?1 AND attempt_id=?2
+               AND state NOT IN ('resumed','released_fresh_dispatch','cancelled'))",
+            params![task_id, attempt_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+pub(crate) fn pending_continue(
+    connection: &Connection,
+    attempt_id: &str,
+    except_control_id: Option<&str>,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1 AND kind='continue'
+             AND state NOT IN ('rejected','finished','cancelled','superseded')
+             AND (?2 IS NULL OR id!=?2))",
+            params![attempt_id, except_control_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+pub(crate) fn ordinary_control_policy(
+    connection: &Connection,
+    task_id: &str,
+    attempt_id: Option<&str>,
+) -> Result<Vec<String>> {
+    let task: Option<(String, String, bool)> = connection
+        .query_row(
+            "SELECT lifecycle,attention,archived_at IS NOT NULL FROM tasks WHERE id=?1",
+            params![task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((lifecycle, attention, archived)) = task else {
+        return Ok(Vec::new());
+    };
+    if archived {
+        return Ok(Vec::new());
+    }
+    let (status, phase, rework, manager_control_active) = if let Some(attempt_id) = attempt_id {
+        let current: Option<(String, String)> = connection
+            .query_row(
+                "SELECT status,phase FROM attempts WHERE id=?1 AND task_id=?2
+             AND id=(SELECT id FROM attempts WHERE task_id=?2 ORDER BY created_at DESC LIMIT 1)",
+                params![attempt_id, task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let rework = connection.query_row(
+            "SELECT state,COALESCE(json_extract(result_json,'$.cancellation_pending'),0)
+             FROM rework_intents WHERE new_attempt_id=?1 AND state NOT IN ('completed','cancelled')",
+            params![attempt_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+        ).optional()?;
+        let manager_control_active: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
+             AND kind IN ('manager_stop','manager_change')
+             AND state NOT IN ('finished','cancelled','superseded','rejected'))",
+            params![attempt_id],
+            |row| row.get(0),
+        )?;
+        (
+            current.as_ref().map(|(status, _)| status.clone()),
+            current.map(|(_, phase)| phase),
+            rework,
+            manager_control_active,
+        )
+    } else {
+        (None, None, None, false)
+    };
+    let mut controls: Vec<String> = [
+        "continue",
+        "run_next",
+        "pause_after_role",
+        "pause_now",
+        "retry",
+        "cancel",
+    ]
+    .into_iter()
+    .filter(|action| {
+        ordinary_control_allowed(
+            &lifecycle,
+            &attention,
+            status.as_deref(),
+            phase.as_deref(),
+            rework
+                .as_ref()
+                .map(|(state, pending)| (state.as_str(), *pending)),
+            manager_control_active,
+            action,
+        )
+    })
+    .map(str::to_owned)
+    .collect();
+    if attention == "restart_parked"
+        && status.as_deref() == Some("restart_parked")
+        && rework.is_none()
+    {
+        controls.retain(|control| control != "continue");
+    }
+    if let (Some(attempt_id), Some(status), Some(phase)) =
+        (attempt_id, status.as_deref(), phase.as_deref())
+    {
+        if restart_hold_continue_allowed(
+            connection,
+            task_id,
+            attempt_id,
+            &lifecycle,
+            &attention,
+            status,
+            phase,
+            rework
+                .as_ref()
+                .map(|(state, pending)| (state.as_str(), *pending)),
+            manager_control_active,
+        )? {
+            controls.push("continue".to_owned());
+        }
+    }
+    if let Some(attempt_id) = attempt_id {
+        if pending_continue(connection, attempt_id, None)? {
+            controls.retain(|control| control != "continue");
+        }
+    }
+    Ok(controls)
+}
+
+fn nondelivery_recovery_identity_current(
+    connection: &Connection,
+    session: &str,
+    identity: &str,
+) -> Result<bool> {
+    let recorded: serde_json::Value = match serde_json::from_str(identity) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    let invocation: Option<String> = connection
+        .query_row(
+            "SELECT ri.process_identity_json FROM resume_invocations ri
+         JOIN sessions s ON s.id=ri.session_id AND s.transcript_epoch=ri.transcript_epoch
+         WHERE ri.session_id=?1 AND ri.state='proven_nondelivery_cleanup_unknown'
+         ORDER BY ri.resume_ordinal DESC LIMIT 1",
+            params![session],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    if invocation
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .as_ref()
+        == Some(&recorded)
+    {
+        return Ok(true);
+    }
+    let (anchor, boot, root, group): (Option<String>, Option<String>, Option<i64>, Option<i32>) =
+        connection.query_row(
+            "SELECT recovery_anchor_json,launch_boot_identity,recovery_root_pid,recovery_process_group_id
+             FROM sessions WHERE id=?1",
+            params![session],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    let mut statement = connection.prepare(
+        "SELECT pid,parent_pid,process_group_id,native_start_marker FROM session_processes
+         WHERE session_id=?1 ORDER BY pid,native_start_marker",
+    )?;
+    let members = statement
+        .query_map(params![session], |row| {
+            Ok(serde_json::json!({
+                "pid":row.get::<_,i64>(0)?,
+                "parent_pid":row.get::<_,Option<i64>>(1)?,
+                "process_group_id":row.get::<_,i32>(2)?,
+                "native_start_marker":row.get::<_,String>(3)?
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // This is the exact fallback evidence written for uncertain wrapper cleanup.
+    Ok(recorded
+        == serde_json::json!({
+            "provider_spawned":false,
+            "wrapper_anchor":anchor.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok()),
+            "launch_boot_identity":boot,
+            "root_pid":root,
+            "process_group_id":group,
+            "observed_members":members
+        }))
+}
+
+pub(crate) fn validate_recovery_identity(
+    connection: &Connection,
+    recovery_id: &str,
+    task_id: &str,
+    attempt_id: &str,
+    session_id: Option<&str>,
+) -> Result<()> {
+    if recovery_id.is_empty() {
+        bail!("recovery_id is required")
+    }
+    let record = connection
+        .query_row(
+            "SELECT r.session_id, json_extract(r.detail_json,'$.kind'),
+                json_extract(r.detail_json,'$.check_id'),
+                json_extract(r.detail_json,'$.claim_id'),
+                json_extract(r.detail_json,'$.freeze_id'),
+                r.process_identity_json,
+                EXISTS(SELECT 1 FROM recovery_records newer
+                       WHERE newer.id!=r.id AND newer.state='attention_required'
+                         AND newer.attempt_id=r.attempt_id
+                         AND ((newer.session_id=r.session_id AND r.session_id IS NOT NULL
+                               AND COALESCE(json_extract(newer.detail_json,'$.kind'),'prior_boot_process')
+                                   =COALESCE(json_extract(r.detail_json,'$.kind'),'prior_boot_process')) OR
+                              (r.session_id IS NULL AND newer.session_id IS NULL AND
+                               COALESCE(json_extract(newer.detail_json,'$.check_id'),
+                                        json_extract(newer.detail_json,'$.claim_id'),
+                                        json_extract(newer.detail_json,'$.freeze_id')) =
+                               COALESCE(json_extract(r.detail_json,'$.check_id'),
+                                        json_extract(r.detail_json,'$.claim_id'),
+                                        json_extract(r.detail_json,'$.freeze_id'))))
+                         AND (newer.created_at>r.created_at OR
+                              (newer.created_at=r.created_at AND newer.rowid>r.rowid)))
+         FROM recovery_records r JOIN attempts a ON a.id=r.attempt_id
+         WHERE r.id=?1 AND r.attempt_id=?2 AND a.task_id=?3
+           AND a.status IN ('needs_recovery','running') AND r.state='attention_required'",
+            params![recovery_id, attempt_id, task_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, bool>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(record) = record else {
+        let rework: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rework_intents ri
+              JOIN attempts a ON a.id=ri.new_attempt_id
+              JOIN tasks t ON t.id=a.task_id
+              WHERE ri.id=?1 AND ri.new_attempt_id=?2 AND t.id=?3
+                AND ri.state='recovery_required' AND a.status='needs_recovery'
+                AND t.attention='needs_recovery' AND t.lifecycle='in_progress')",
+            params![recovery_id, attempt_id, task_id],
+            |row| row.get(0),
+        )?;
+        if session_id.is_none() && rework {
+            return Ok(());
+        }
+        bail!("recovery identity is stale or does not match this task and attempt")
+    };
+    if record.0.as_deref() != session_id || record.6 {
+        bail!("recovery record session is mismatched or superseded")
+    }
+    if let Some(session) = session_id {
+        if matches!(
+            record.1.as_deref(),
+            Some("workspace_reservation" | "graceful_stop_deadline")
+        ) {
+            bail!("this recovery kind requires its exact dedicated action")
+        }
+        let current: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
+                 WHERE s.id=?1 AND rg.attempt_id=?2 AND s.status IN ('recovery_required','exited')
+                   )",
+            params![session, attempt_id], |row| row.get(0),
+        )?;
+        let process_current: bool = connection.query_row(
+            "SELECT ?2 IS NULL OR COALESCE(process_identity_json=?2,0) FROM sessions WHERE id=?1",
+            params![session, record.5],
+            |row| row.get(0),
+        )?;
+        let nondelivery_current =
+            if record.1.as_deref() == Some("provider_nondelivery_cleanup_unknown") {
+                match record.5.as_deref() {
+                    Some(identity) if !identity.is_empty() => {
+                        nondelivery_recovery_identity_current(connection, session, identity)?
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+        if !current || !(process_current || nondelivery_current) {
+            bail!("recovery session no longer belongs to this attempt")
+        }
+    } else {
+        let current: bool = match (record.1.as_deref(), record.2.as_deref(), record.3.as_deref(), record.4.as_deref()) {
+            (Some("database_restore_claim"), _, Some(claim), _) => connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM claims WHERE id=?1 AND attempt_id=?2 AND state IN ('reserved','launching','running','unknown','stopping'))",
+                params![claim, attempt_id], |row| row.get(0))?,
+            (Some("database_restore_freeze"), _, _, Some(freeze)) => connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM freeze_intents WHERE id=?1 AND attempt_id=?2 AND state='recovery_required')",
+                params![freeze, attempt_id], |row| row.get(0))?,
+            (kind, Some(check), _, _) if !matches!(kind, Some("workspace_reservation" | "graceful_stop_deadline")) => connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM check_runs WHERE id=?1 AND attempt_id=?2 AND status='recovery_required')",
+                params![check, attempt_id], |row| row.get(0))?,
+            _ => false,
+        };
+        if !current {
+            bail!("recovery record kind or subject is stale or unsupported")
+        }
+    }
+    Ok(())
+}
 
 fn requested_manager_revision(payload: &serde_json::Value) -> Result<i64> {
     payload
@@ -115,7 +686,7 @@ fn require_manager_replacement_authority(
         bail!("manager change requires the latest requested manager revision")
     }
     let requested: crate::domain::RoleOverride = serde_json::from_str(&config_json)?;
-    let prepared = crate::providers::prepare_role_launch(
+    let prepared = crate::providers::prepare_role_launch_with_bundles(
         requested.provider,
         crate::domain::RoleKind::Manager,
         &requested.model,
@@ -129,13 +700,15 @@ fn require_manager_replacement_authority(
         None,
         &runtime.hooks,
         &runtime.executable,
+        &runtime.compatibility_bundles,
     )?;
-    crate::trip::current_task_profile_authority(
+    crate::trip::current_task_profile_authority_with_bundles(
         transaction,
         task_id,
         crate::domain::RoleKind::Manager,
         settings_revision,
         &prepared.config,
+        &runtime.compatibility_bundles,
     )
     .map_err(|error| anyhow!(
         "requested manager replacement is pending exact capability proof or activation: {error:#}; the current manager remains effective"
@@ -245,6 +818,78 @@ fn rework_recovery_ownership(
     ))
 }
 
+fn revalidate_admission_proofs(
+    connection: &Connection,
+    evidence: &serde_json::Value,
+) -> Result<()> {
+    if let Some(proof) = evidence
+        .get("admission_proof")
+        .filter(|value| !value.is_null())
+    {
+        let session = evidence["session_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("admission proof has no session"))?;
+        if crate::recovery::admission_proof_snapshot(connection, session)?.as_ref() != Some(proof) {
+            bail!("interrupted admission proof changed during recovery verification")
+        }
+    }
+    if let Some(items) = evidence.as_array() {
+        for item in items {
+            revalidate_admission_proofs(connection, item)?;
+        }
+    } else if let Some(object) = evidence.as_object() {
+        for item in object.values() {
+            revalidate_admission_proofs(connection, item)?;
+        }
+    }
+    Ok(())
+}
+
+fn park_resolved_admission(
+    transaction: &rusqlite::Transaction<'_>,
+    session: &str,
+    attempt: &str,
+    recovery_id: &str,
+    now: &str,
+) -> Result<()> {
+    let row: Option<(String, String, String)> = transaction
+        .query_row(
+            "SELECT rc.state,rc.result_json,s.role_generation_id FROM restart_candidates rc
+         JOIN sessions s ON s.id=rc.session_id WHERE rc.session_id=?1 AND rc.attempt_id=?2",
+            params![session, attempt],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((state, raw, generation)) = row else {
+        return Ok(());
+    };
+    if matches!(
+        state.as_str(),
+        "resumed" | "released_fresh_dispatch" | "cancelled"
+    ) {
+        return Ok(());
+    }
+    let mut result = RestartCandidateResult::parse(&raw)?;
+    result.validate_candidate_state(&state, session)?;
+    let incident = result.get("startup_admission_reconciliation");
+    if !incident.is_some_and(|value| {
+        value["recovery_id"] == recovery_id && value["role_generation_id"] == generation
+    }) {
+        return Ok(());
+    }
+    let stale = incident.is_some_and(|value| value["authority"] == "stale");
+    let capped = result.restart.replacement_failures >= 3;
+    result.set("native_resume_forbidden", serde_json::Value::Bool(true));
+    result.set(
+        "fresh_dispatch_requires_explicit_continue",
+        serde_json::Value::Bool(true),
+    );
+    let next_state = if stale || capped { "blocked" } else { "parked" };
+    transaction.execute("UPDATE restart_candidates SET state=?1,reason='verified interrupted admission is parked until explicit Continue',result_json=?2,updated_at=?3 WHERE session_id=?4 AND state=?5",
+        params![next_state,result.encode()?,now,session,state])?;
+    Ok(())
+}
+
 pub fn execute(store: &Store, command: &HumanCommand) -> Result<OperationResult> {
     execute_with_runtime(store, command, None)
 }
@@ -260,6 +905,31 @@ pub fn execute_with_runtime(
         bail!("operation_id is required")
     }
     if let HumanCommand::ResolveRecovery {
+        recovery_id,
+        task_id,
+        attempt_id,
+        session_id,
+        ..
+    } = command
+    {
+        let connection = store.lock()?;
+        if let Some((stored_hash, stored_result)) = connection.query_row(
+            "SELECT request_hash,result_json FROM operation_receipts WHERE operation_id=?1 AND actor_key='human_control' AND operation_kind='human_command'",
+            params![operation_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ).optional()? {
+            if stored_hash != request_hash { bail!("operation_id was already used for another request") }
+            return Ok(serde_json::from_str(&stored_result)?);
+        }
+        validate_recovery_identity(
+            &connection,
+            recovery_id,
+            task_id,
+            attempt_id,
+            session_id.as_deref(),
+        )?;
+    }
+    if let HumanCommand::ResolveRecovery {
+        recovery_id,
         attempt_id,
         decision,
         ..
@@ -268,10 +938,10 @@ pub fn execute_with_runtime(
         if decision == "cancel" {
             let connection = store.lock()?;
             let workspace_recovery: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=?1
+                "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE id=?1 AND attempt_id=?2
                    AND state='attention_required'
                    AND json_extract(detail_json,'$.kind')='workspace_reservation')",
-                params![attempt_id],
+                params![recovery_id, attempt_id],
                 |row| row.get(0),
             )?;
             if workspace_recovery {
@@ -280,6 +950,7 @@ pub fn execute_with_runtime(
         }
     }
     let recovery_evidence = if let HumanCommand::ResolveRecovery {
+        recovery_id,
         attempt_id,
         session_id,
         decision,
@@ -289,8 +960,8 @@ pub fn execute_with_runtime(
         let (process_recovery, rework) = {
             let connection = store.lock()?;
             let process_recovery = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=?1 AND state='attention_required' AND (session_id IS NOT NULL OR json_extract(detail_json,'$.check_id') IS NOT NULL))",
-                params![attempt_id], |row| row.get::<_,bool>(0),
+                "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE id=?1 AND attempt_id=?2 AND state='attention_required' AND (session_id IS NOT NULL OR json_extract(detail_json,'$.check_id') IS NOT NULL))",
+                params![recovery_id, attempt_id], |row| row.get::<_,bool>(0),
             )?;
             (process_recovery, rework_recovery(&connection, attempt_id)?)
         };
@@ -347,6 +1018,9 @@ pub fn execute_with_runtime(
     };
     let mut connection = store.lock()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(verified) = recovery_evidence.as_ref() {
+        revalidate_admission_proofs(&transaction, verified)?;
+    }
     if let Some((stored_hash, result)) = transaction
         .query_row(
             "SELECT request_hash, result_json FROM operation_receipts
@@ -363,6 +1037,17 @@ pub fn execute_with_runtime(
     }
     let now = Utc::now().to_rfc3339();
     let result = match command {
+        HumanCommand::UpsertProfileSet { .. }
+        | HumanCommand::ArchiveProfileSet { .. }
+        | HumanCommand::UpsertTaskRecipe { .. }
+        | HumanCommand::ArchiveTaskRecipe { .. }
+        | HumanCommand::CreateDraftFromRecipe { .. }
+        | HumanCommand::UpsertRecipeSchedule { .. }
+        | HumanCommand::PauseRecipeSchedule { .. }
+        | HumanCommand::ResumeRecipeSchedule { .. }
+        | HumanCommand::ArchiveRecipeSchedule { .. } => {
+            crate::recipes::apply_command(&transaction, command, &now)?
+        }
         HumanCommand::Trip { .. } => {
             bail!("TRIP commands require the application runtime paths")
         }
@@ -432,45 +1117,20 @@ pub fn execute_with_runtime(
             if *ready {
                 crate::trip::require_project_ready(&transaction, project_id)?;
             }
-            let id = format!(
-                "AJ-{}",
-                &uuid::Uuid::new_v4().simple().to_string()[..8].to_ascii_uppercase()
-            );
             let lifecycle = if *ready { "ready" } else { "backlog" };
-            transaction.execute(
-                "INSERT INTO tasks(id,project_id,title,description,acceptance_criteria_json,priority,manual_order,lifecycle,attention,version,created_at,updated_at,role_overrides_json,ready_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,0,?7,'none',1,?8,?8,?9,?10)",
-                params![id, project_id, title.trim(), description, serde_json::to_string(acceptance_criteria)?, priority, lifecycle, now,
-                    serde_json::to_string(role_overrides)?, ready.then_some(now.as_str())],
-            )?;
             let defaults: serde_json::Value = serde_json::from_str(&project_settings)?;
-            if !role_overrides.is_null() && !role_overrides.is_object() {
-                bail!("role_overrides must be a role-keyed JSON object")
-            }
-            for role in [
-                "manager",
-                "explorer",
-                "plan_reviewer",
-                "implementer",
-                "code_reviewer",
-                "final_verifier",
-            ] {
-                let selected = role_overrides
-                    .get(role)
-                    .or_else(|| defaults.get("roles").and_then(|value| value.get(role)));
-                let Some(selected) = selected else {
-                    if *ready {
-                        bail!("Ready tasks require provider, model, and effort settings for role {role}")
-                    }
-                    continue;
-                };
-                let config: crate::domain::RoleOverride = serde_json::from_value(selected.clone())?;
-                if config.model.trim().is_empty() || config.effort.trim().is_empty() {
-                    bail!("role {role} model and effort are required")
-                }
-                transaction.execute("INSERT INTO role_settings(id,task_id,role,revision,config_json,created_at) VALUES(?1,?2,?3,1,?4,?5)",
-                    params![uuid::Uuid::new_v4().to_string(),id,role,serde_json::to_string(&config)?,now])?;
-            }
+            let id = insert_task_rows(
+                &transaction,
+                project_id,
+                title,
+                description,
+                acceptance_criteria,
+                *priority,
+                role_overrides,
+                Some(&defaults),
+                *ready,
+                &now,
+            )?;
             let state = if *ready {
                 match runtime
                     .ok_or_else(|| {
@@ -583,12 +1243,21 @@ pub fn execute_with_runtime(
             ..
         } => {
             require_task_state(&transaction, task_id, *expected_version, &["backlog"])?;
+            let unarchived: bool = transaction.query_row(
+                "SELECT archived_at IS NULL FROM tasks WHERE id=?1",
+                params![task_id],
+                |row| row.get(0),
+            )?;
+            if !unarchived {
+                bail!("archived drafts must be restored before Make Ready")
+            }
             let project_id: String = transaction.query_row(
                 "SELECT project_id FROM tasks WHERE id=?1",
                 params![task_id],
                 |row| row.get(0),
             )?;
             crate::trip::require_project_ready(&transaction, &project_id)?;
+            crate::recipes::require_binding_current(&transaction, task_id)?;
             let (title, criteria, configured): (String, String, i64) = transaction.query_row(
                 "SELECT title,acceptance_criteria_json,
                    (SELECT COUNT(DISTINCT role) FROM role_settings WHERE task_id=tasks.id
@@ -611,7 +1280,7 @@ pub fn execute_with_runtime(
             )?;
             let changed = transaction.execute(
                 "UPDATE tasks SET lifecycle='ready',ready_at=?1,attention='none',version=version+1,updated_at=?1
-                 WHERE id=?2 AND version=?3 AND lifecycle='backlog'",
+                 WHERE id=?2 AND version=?3 AND lifecycle='backlog' AND archived_at IS NULL",
                 params![now, task_id, expected_version],
             )?;
             if changed != 1 {
@@ -919,7 +1588,9 @@ pub fn execute_with_runtime(
                 bail!("unsupported workflow control {action}")
             }
             if lifecycle == "ready" {
-                if action != "run_next" {
+                if !ordinary_control_allowed(
+                    &lifecycle, &attention, None, None, None, false, action,
+                ) {
                     bail!("a Ready task accepts only Run next before an attempt is claimed")
                 }
                 transaction.execute(
@@ -943,6 +1614,9 @@ pub fn execute_with_runtime(
                     .optional()?;
                 let attempt =
                     attempt.ok_or_else(|| anyhow!("task has no attempt for control {action}"))?;
+                if action == "continue" && pending_continue(&transaction, &attempt, None)? {
+                    bail!("a Continue control is already pending for this attempt")
+                }
                 if action == "continue" && attention == "resume_failed" {
                     if payload.get("resume_rejection").is_some() {
                         let (
@@ -952,117 +1626,39 @@ pub fn execute_with_runtime(
                             rejected_epoch,
                             rejected_resume_count,
                         ) = fresh_resume_rejection_binding(payload)?;
-                        let fresh_route_allowed: bool = transaction.query_row(
-                        "SELECT EXISTS(
-                            SELECT 1 FROM audit_events event
-                            JOIN sessions session ON session.id=event.entity_id
-                            JOIN role_generations generation ON generation.id=session.role_generation_id
-                            JOIN attempts current_attempt ON current_attempt.id=generation.attempt_id
-                            WHERE event.event_code='session.resume.rejected'
-                              AND event.id=?1 AND session.id=?2 AND generation.id=?3
-                              AND session.transcript_epoch=?4 AND session.resume_count=?5
-                              AND generation.attempt_id=?6 AND session.status='exited'
-                              AND json_extract(event.detail_json,'$.session_id')=session.id
-                              AND json_extract(event.detail_json,'$.transcript_epoch')=session.transcript_epoch
-                              AND CAST(json_extract(event.detail_json,'$.resume_count') AS INTEGER)=session.resume_count
-                              AND json_extract(event.detail_json,'$.role_generation_id')=generation.id
-                              AND json_extract(event.detail_json,'$.category')='frozen_runtime_identity_changed'
-                              AND json_extract(event.detail_json,'$.same_profile_authority')=1
-                              AND current_attempt.id=(SELECT latest.id FROM attempts latest
-                                WHERE latest.task_id=current_attempt.task_id
-                                ORDER BY latest.created_at DESC LIMIT 1)
-                              AND current_attempt.phase IS json_extract(event.detail_json,'$.attempt_phase')
-                              AND current_attempt.candidate_hash IS json_extract(event.detail_json,'$.candidate_hash')
-                              AND current_attempt.plan_hash IS json_extract(event.detail_json,'$.plan_hash')
-                              AND json_type(event.detail_json,'$.frozen_capability_key')='text'
-                              AND json_type(event.detail_json,'$.observed_capability_key')='text'
-                              AND json_extract(event.detail_json,'$.frozen_capability_key') IS NOT
-                                  json_extract(event.detail_json,'$.observed_capability_key')
-                              AND json_type(event.detail_json,'$.observed_identity')='object'
-                              AND json_extract(event.detail_json,'$.observed_identity.provider')=session.provider
-                              AND json_extract(event.detail_json,'$.observed_identity.role')=generation.role
-                              AND json_extract(event.detail_json,'$.observed_identity.mode')='interactive_pty'
-                              AND json_extract(event.detail_json,'$.observed_identity.executable_version')!=''
-                              AND json_extract(event.detail_json,'$.observed_identity.model')!=''
-                              AND json_extract(event.detail_json,'$.observed_identity.effort')!=''
-                              AND EXISTS(SELECT 1 FROM capabilities current_capability
-                                WHERE current_capability.rowid=(
-                                  SELECT latest_capability.rowid FROM capabilities latest_capability
-                                  WHERE latest_capability.provider=json_extract(event.detail_json,'$.observed_identity.provider')
-                                    AND latest_capability.executable_version=json_extract(event.detail_json,'$.observed_identity.executable_version')
-                                    AND latest_capability.role=json_extract(event.detail_json,'$.observed_identity.role')
-                                    AND latest_capability.mode=json_extract(event.detail_json,'$.observed_identity.mode')
-                                  ORDER BY latest_capability.checked_at DESC,latest_capability.rowid DESC LIMIT 1)
-                                  AND current_capability.status='supported'
-                                  AND current_capability.proof_json!='{}'
-                                  AND current_capability.config_hash=json_extract(event.detail_json,'$.observed_capability_key'))
-                              AND EXISTS(SELECT 1 FROM role_settings profile
-                                   WHERE profile.task_id=?7 AND profile.role=generation.role
-                                     AND profile.revision=generation.config_revision
-                                     AND json_extract(profile.config_json,'$.provider')=
-                                         json_extract(event.detail_json,'$.observed_identity.provider')
-                                     AND json_extract(profile.config_json,'$.model')=
-                                         json_extract(event.detail_json,'$.observed_identity.model')
-                                     AND json_extract(profile.config_json,'$.effort')=
-                                         json_extract(event.detail_json,'$.observed_identity.effort'))
-                              AND (EXISTS(SELECT 1 FROM role_settings setting
-                                   WHERE setting.task_id=?7 AND setting.role=generation.role
-                                     AND setting.revision=generation.config_revision
-                                     AND setting.effective_generation_id=generation.id)
-                                   OR (generation.role='implementer' AND generation.lane_id!='default'
-                                     AND EXISTS(SELECT 1 FROM lane_generations lane
-                                       WHERE lane.lane_id=generation.lane_id
-                                         AND lane.effective_generation_id=generation.id)))
-                              AND generation.role!='final_verifier'
-                              AND (generation.role NOT IN ('plan_reviewer','code_reviewer')
-                                   OR EXISTS(SELECT 1 FROM review_requests review
-                                     JOIN review_budgets budget
-                                       ON budget.attempt_id=review.attempt_id
-                                      AND budget.review_kind=review.review_kind
-                                    WHERE review.id=json_extract(event.detail_json,'$.review_request_id')
-                                      AND review.attempt_id=current_attempt.id
-                                      AND review.role_generation_id=generation.id
-                                      AND review.session_id=session.id
-                                      AND review.delivery_state='delivered'
-                                      AND review.review_kind=CASE generation.role
-                                        WHEN 'plan_reviewer' THEN 'plan' ELSE 'code' END
-                                      AND review.candidate_hash IS CASE review.review_kind
-                                        WHEN 'plan' THEN current_attempt.plan_hash
-                                        ELSE current_attempt.candidate_hash END
-                                      AND budget.spent < budget.initial_allowance+budget.extension_allowance))
-                              AND (generation.role!='explorer' OR EXISTS(
-                                    SELECT 1 FROM trip_explorer_decisions decision
-                                     WHERE decision.attempt_id=current_attempt.id
-                                       AND decision.activated=1
-                                       AND decision.outcome_json IS NULL
-                                       AND decision.role_generation_id=generation.id
-                                       AND decision.candidate_hash IS current_attempt.candidate_hash))
-                              AND NOT EXISTS(SELECT 1 FROM recovery_records recovery
-                                WHERE recovery.session_id=session.id
-                                  AND recovery.state='attention_required')
-                              AND NOT EXISTS(SELECT 1 FROM role_generations newer
-                                WHERE newer.attempt_id=generation.attempt_id
-                                  AND newer.role=generation.role
-                                  AND newer.lane_id=generation.lane_id
-                                  AND newer.generation>generation.generation)
-                              AND NOT EXISTS(SELECT 1 FROM audit_events consumed
-                                WHERE consumed.event_code='session.resume.fresh_route.reserved'
-                                  AND json_extract(consumed.detail_json,'$.rejection_event_id')=event.id)
-                        )",
-                        params![
-                            rejection_event_id,
-                            rejected_session_id,
-                            rejected_generation_id,
-                            rejected_epoch,
+                        let fresh_route_allowed = fresh_route_authorized(
+                            &transaction,
+                            &rejection_event_id,
+                            &rejected_session_id,
+                            &rejected_generation_id,
+                            &rejected_epoch,
                             rejected_resume_count,
-                            attempt,
+                            &attempt,
                             task_id,
-                        ],
-                        |row| row.get(0),
-                    )?;
+                            None,
+                        )?;
                         if !fresh_route_allowed {
                             bail!("continue cannot clear a resume failure without the current exact rejected-session fresh-route authority")
                         }
+                        let rejected_role: String = transaction.query_row(
+                        "SELECT generation.role FROM sessions session
+                         JOIN role_generations generation ON generation.id=session.role_generation_id
+                         WHERE session.id=?1 AND generation.id=?2",
+                        params![rejected_session_id, rejected_generation_id],
+                        |row| row.get(0),
+                    )?;
+                        let explorer_decision_id: Option<String> = if rejected_role == "explorer" {
+                            transaction.query_row(
+                                "SELECT id FROM trip_explorer_decisions
+                                 WHERE attempt_id=?1 AND role_generation_id=?2 AND activated=1
+                                   AND outcome_json IS NULL
+                                   AND candidate_hash IS (SELECT candidate_hash FROM attempts WHERE id=?1)",
+                                params![attempt, rejected_generation_id],
+                                |row| row.get(0),
+                            ).optional()?
+                        } else {
+                            None
+                        };
                         transaction.execute(
                         "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
                          VALUES(?1,?2,'human','session.resume.fresh_route.reserved','session',?3,?4,?5)",
@@ -1076,17 +1672,11 @@ pub fn execute_with_runtime(
                                 "transcript_epoch":rejected_epoch,
                                 "resume_count":rejected_resume_count,
                                 "attempt_id":attempt,
+                                "explorer_decision_id":explorer_decision_id,
                                 "fresh_dispatch":"coordinator",
                             }).to_string(),
                             now,
                         ],
-                    )?;
-                        let rejected_role: String = transaction.query_row(
-                        "SELECT generation.role FROM sessions session
-                         JOIN role_generations generation ON generation.id=session.role_generation_id
-                         WHERE session.id=?1 AND generation.id=?2",
-                        params![rejected_session_id, rejected_generation_id],
-                        |row| row.get(0),
                     )?;
                         if matches!(rejected_role.as_str(), "plan_reviewer" | "code_reviewer") {
                             let changed = transaction.execute(
@@ -1128,10 +1718,10 @@ pub fn execute_with_runtime(
                         bail!("continue cannot clear a resume failure without the current exact rejected-session fresh-route authority")
                     }
                 }
-                let attempt_status: String = transaction.query_row(
-                    "SELECT status FROM attempts WHERE id=?1",
+                let (attempt_status, attempt_phase): (String, String) = transaction.query_row(
+                    "SELECT status,phase FROM attempts WHERE id=?1",
                     params![attempt],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
                 let unfinished_rework: Option<(String, bool)> = transaction
                     .query_row(
@@ -1141,24 +1731,26 @@ pub fn execute_with_runtime(
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?;
-                if let Some((rework_state, cancellation_pending)) = unfinished_rework {
-                    if cancellation_pending {
+                let manager_control_active: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
+                     AND kind IN ('manager_stop','manager_change')
+                     AND state NOT IN ('finished','cancelled','superseded','rejected'))",
+                    params![attempt],
+                    |row| row.get(0),
+                )?;
+                if let Some((rework_state, cancellation_pending)) = &unfinished_rework {
+                    if *cancellation_pending {
                         bail!("pending rework cancellation accepts only the recovery cancellation decision")
                     }
-                    let allowed = match rework_state.as_str() {
-                        "reserved" | "materializing" => {
-                            matches!(action.as_str(), "pause_now" | "pause_after_role" | "cancel")
-                        }
-                        "paused" => matches!(
-                            action.as_str(),
-                            "continue" | "pause_now" | "pause_after_role" | "cancel"
-                        ),
-                        "recovery_required" => matches!(
-                            action.as_str(),
-                            "continue" | "pause_now" | "pause_after_role" | "cancel"
-                        ),
-                        _ => false,
-                    };
+                    let allowed = ordinary_control_allowed(
+                        &lifecycle,
+                        &attention,
+                        Some(&attempt_status),
+                        Some(&attempt_phase),
+                        Some((rework_state, *cancellation_pending)),
+                        manager_control_active,
+                        action,
+                    );
                     if !allowed {
                         if matches!(
                             action.as_str(),
@@ -1171,6 +1763,38 @@ pub fn execute_with_runtime(
                         }
                         bail!("unfinished rework accepts only pause, continue, or cancel controls appropriate to its materialization state")
                     }
+                }
+                if matches!(
+                    action.as_str(),
+                    "continue" | "run_next" | "pause_after_role" | "pause_now" | "retry" | "cancel"
+                ) && !(action == "continue" && attention == "resume_failed")
+                    && !ordinary_control_allowed(
+                        &lifecycle,
+                        &attention,
+                        Some(&attempt_status),
+                        Some(&attempt_phase),
+                        unfinished_rework
+                            .as_ref()
+                            .map(|(state, pending)| (state.as_str(), *pending)),
+                        manager_control_active,
+                        action,
+                    )
+                    && !(action == "continue"
+                        && restart_hold_continue_allowed(
+                            &transaction,
+                            task_id,
+                            &attempt,
+                            &lifecycle,
+                            &attention,
+                            &attempt_status,
+                            &attempt_phase,
+                            unfinished_rework
+                                .as_ref()
+                                .map(|(state, pending)| (state.as_str(), *pending)),
+                            manager_control_active,
+                        )?)
+                {
+                    bail!("workflow control is not available in the current task and attempt state")
                 }
                 if matches!(attempt_status.as_str(), "done" | "cancelled" | "failed")
                     && action != "retry"
@@ -1369,6 +1993,7 @@ pub fn execute_with_runtime(
                     let attention = match action.as_str() {
                         "pause_now" => "pause_requested",
                         "cancel" => "pause_requested",
+                        "continue" if attention == "restart_parked" => "restart_parked",
                         _ => "none",
                     };
                     transaction.execute("UPDATE tasks SET attention=?1,version=version+1,updated_at=?2 WHERE id=?3 AND version=?4", params![attention, now, task_id, expected_version])?;
@@ -1598,10 +2223,15 @@ pub fn execute_with_runtime(
             crate::trip::require_attempt_ready(&transaction, attempt_id, None)?;
             match decision.as_str() {
                 "accept" => {
-                    let (snapshot,candidate_hash): (Option<String>,Option<String>) = transaction.query_row(
-                        "SELECT accepted_snapshot_id,candidate_hash FROM attempts WHERE id=?1 AND task_id=?2",
-                        params![attempt_id, task_id], |row| Ok((row.get(0)?,row.get(1)?)),
+                    let (snapshot,candidate_hash,attempt_status): (Option<String>,Option<String>,String) = transaction.query_row(
+                        "SELECT accepted_snapshot_id,candidate_hash,status FROM attempts WHERE id=?1 AND task_id=?2",
+                        params![attempt_id, task_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
                     )?;
+                    if !matches!(attempt_status.as_str(), "running" | "held") {
+                        bail!(
+                            "accept requires a live running or held attempt without unresolved blockers"
+                        )
+                    }
                     let Some(snapshot_id) = snapshot else {
                         bail!("accept requires an immutable accepted snapshot")
                     };
@@ -1771,6 +2401,7 @@ pub fn execute_with_runtime(
                  JOIN role_generations rg ON rg.id=c.role_generation_id
                  JOIN role_settings rs ON rs.effective_generation_id=rg.id AND rs.role='manager'
                  WHERE c.id=?1 AND a.task_id=?2 AND c.kind='transition_proposal' AND c.state='proposed'
+                   AND a.status='running'
                    AND c.expected_version=t.version AND json_extract(c.payload_json,'$.expected_task_version')=t.version",
                 params![proposal_id,task_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
             ).optional()?.ok_or_else(||anyhow!("transition proposal is stale"))?;
@@ -1875,6 +2506,7 @@ pub fn execute_with_runtime(
         HumanCommand::ResolveRecovery {
             task_id,
             attempt_id,
+            recovery_id,
             session_id,
             expected_version,
             decision,
@@ -1882,10 +2514,17 @@ pub fn execute_with_runtime(
             ..
         } => {
             task_version(&transaction, task_id, *expected_version)?;
+            validate_recovery_identity(
+                &transaction,
+                recovery_id,
+                task_id,
+                attempt_id,
+                session_id.as_deref(),
+            )?;
             if evidence.trim().is_empty() || evidence.len() > 64 * 1024 {
                 bail!("bounded recovery evidence is required")
             }
-            let belongs:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1 AND task_id=?2 AND status='needs_recovery')",params![attempt_id,task_id],|row|row.get(0))?;
+            let belongs:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1 AND task_id=?2 AND status IN ('needs_recovery','running'))",params![attempt_id,task_id],|row|row.get(0))?;
             if !belongs {
                 bail!("attempt is not awaiting recovery")
             }
@@ -1919,11 +2558,11 @@ pub fn execute_with_runtime(
                              JOIN sessions s ON s.id=recovery.session_id
                              JOIN role_generations rg ON rg.id=s.role_generation_id
                              LEFT JOIN trip_setup_permits permit ON permit.id=s.setup_permit_id
-                             WHERE recovery.session_id=?1 AND recovery.attempt_id=?2
+                             WHERE recovery.id=?1 AND recovery.session_id=?2 AND recovery.attempt_id=?3
                                AND recovery.state='attention_required'
                                AND s.status IN ('recovery_required','exited')
-                             ORDER BY recovery.created_at DESC LIMIT 1",
-                            params![session,attempt_id],|row|Ok((row.get(0)?,row.get(1)?))
+                             ",
+                            params![recovery_id,session,attempt_id],|row|Ok((row.get(0)?,row.get(1)?))
                         ).optional()?.ok_or_else(||anyhow!("no unresolved recovery record matches the session"))?;
                         let recovery_patch = serde_json::json!({
                             "human_annotation":evidence,
@@ -1932,14 +2571,50 @@ pub fn execute_with_runtime(
                                 .and_then(|value|serde_json::from_str::<serde_json::Value>(&value).ok())
                         });
                         transaction.execute("UPDATE recovery_records SET state='resolved_quiescent',detail_json=json_patch(detail_json,?1),resolved_at=?2,updated_at=?2 WHERE id=?3",params![recovery_patch.to_string(),now,record])?;
-                        transaction.execute("UPDATE sessions SET status='exited',readiness_state='unknown',exit_json=?1,updated_at=?2 WHERE id=?3 AND status='recovery_required'",params![serde_json::json!({"process_group_quiescent":true,"source":"recorded_process_inventory_reconciled","verification":verified,"human_annotation":evidence}).to_string(),now,session])?;
+                        transaction.execute("UPDATE sessions SET status='exited',readiness_state='unknown',exit_json=?1,updated_at=?2 WHERE id=?3 AND status IN ('recovery_required','exited')",params![serde_json::json!({"process_group_quiescent":true,"source":"recorded_process_inventory_reconciled","verification":verified,"human_annotation":evidence}).to_string(),now,session])?;
+                        park_resolved_admission(
+                            &transaction,
+                            session,
+                            attempt_id,
+                            recovery_id,
+                            &now,
+                        )?;
                         transaction.execute("UPDATE role_generations SET status='exited',updated_at=?1 WHERE id=(SELECT role_generation_id FROM sessions WHERE id=?2)",params![now,session])?;
                         transaction.execute("UPDATE role_credentials SET revoked_at=?1 WHERE role_generation_id=(SELECT role_generation_id FROM sessions WHERE id=?2) AND revoked_at IS NULL",params![now,session])?;
                         transaction.execute("UPDATE review_requests SET delivery_state='abandoned',ambiguity_state='human_abandoned_after_verified_quiescence',updated_at=?1 WHERE session_id=?2 AND attempt_id=?3 AND delivery_state='ambiguous'",params![now,session,attempt_id])?;
                     } else {
-                        let (record,check):(String,String)=transaction.query_row("SELECT id,json_extract(detail_json,'$.check_id') FROM recovery_records WHERE session_id IS NULL AND attempt_id=?1 AND state='attention_required' ORDER BY created_at DESC LIMIT 1",params![attempt_id],|row|Ok((row.get(0)?,row.get(1)?))).optional()?.ok_or_else(||anyhow!("no unresolved check recovery record matches the attempt"))?;
-                        transaction.execute("UPDATE recovery_records SET state='resolved_quiescent',detail_json=json_patch(detail_json,?1),resolved_at=?2,updated_at=?2 WHERE id=?3",params![serde_json::json!({"human_annotation":evidence,"verification":verified,"check_id":check}).to_string(),now,record])?;
-                        transaction.execute("UPDATE check_runs SET status='reconciled_interrupted',finished_at=?1,evidence_json=?2 WHERE id=?3 AND status='recovery_required'",params![now,serde_json::json!({"verification":verified,"human_annotation":evidence}).to_string(),check])?;
+                        let (record,kind,subject):(String,String,String)=transaction.query_row(
+                            "SELECT id,COALESCE(json_extract(detail_json,'$.kind'),'check'),
+                                    COALESCE(json_extract(detail_json,'$.check_id'),
+                                             json_extract(detail_json,'$.claim_id'),
+                                             json_extract(detail_json,'$.freeze_id'))
+                             FROM recovery_records
+                             WHERE id=?1 AND session_id IS NULL AND attempt_id=?2 AND state='attention_required'
+                               AND (json_extract(detail_json,'$.check_id') IS NOT NULL
+                                 OR json_extract(detail_json,'$.kind') IN ('database_restore_claim','database_restore_freeze'))
+                             ",
+                            params![recovery_id,attempt_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))
+                        ).optional()?.ok_or_else(||anyhow!("no unresolved check, claim, or freeze recovery record matches the attempt"))?;
+                        transaction.execute("UPDATE recovery_records SET state='resolved_quiescent',detail_json=json_patch(detail_json,?1),resolved_at=?2,updated_at=?2 WHERE id=?3",params![serde_json::json!({"human_annotation":evidence,"verification":verified,"reconciled_id":&subject}).to_string(),now,record])?;
+                        match kind.as_str() {
+                            "database_restore_claim" => {
+                                transaction.execute("UPDATE claims SET state='cancelled',updated_at=?1 WHERE id=?2 AND state IN ('reserved','launching','running','unknown','stopping')",params![now,subject])?;
+                            }
+                            "database_restore_freeze" => {
+                                transaction.execute("UPDATE freeze_intents SET state='abandoned',error='database restore recovery verified quiescence',updated_at=?1 WHERE id=?2 AND state='recovery_required'",params![now,subject])?;
+                            }
+                            _ => {
+                                transaction.execute("UPDATE check_runs SET status='reconciled_interrupted',finished_at=?1,evidence_json=?2 WHERE id=?3 AND status='recovery_required'",params![now,serde_json::json!({"verification":verified,"human_annotation":evidence}).to_string(),subject])?;
+                            }
+                        }
+                    }
+                    let restore_hold_active: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE id='database-restore-hold' AND state='attention_required')",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if restore_hold_active {
+                        transaction.execute("UPDATE claims SET state='cancelled',updated_at=?1 WHERE attempt_id=?2 AND state IN ('reserved','launching','running','unknown','stopping')",params![now,attempt_id])?;
                     }
                     let remaining:i64=transaction.query_row("SELECT COUNT(*) FROM recovery_records WHERE attempt_id=?1 AND state='attention_required'",params![attempt_id],|row|row.get(0))?;
                     let return_to_validation_hold: bool = transaction.query_row(
@@ -1954,14 +2629,48 @@ pub fn execute_with_runtime(
                         params![attempt_id],
                         |row| row.get(0),
                     )?;
+                    let explicit_restart_hold: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM restart_candidates rc
+                           JOIN sessions s ON s.id=rc.session_id
+                           LEFT JOIN recovery_records r ON r.id=json_extract(rc.result_json,'$.startup_admission_reconciliation.recovery_id')
+                           WHERE rc.attempt_id=?1 AND rc.state NOT IN ('resumed','released_fresh_dispatch','cancelled')
+                             AND ((rc.state='parked' AND COALESCE(json_extract(rc.result_json,'$.native_resume_forbidden'),0)=1
+                                   AND json_extract(rc.result_json,'$.startup_admission_reconciliation.recovery_id') IS NULL)
+                               OR (r.session_id=rc.session_id AND r.attempt_id=rc.attempt_id
+                                   AND r.state='resolved_quiescent'
+                                   AND json_extract(rc.result_json,'$.startup_admission_reconciliation.role_generation_id')=s.role_generation_id
+                                   AND NOT EXISTS(SELECT 1 FROM recovery_records newer WHERE newer.session_id=r.session_id
+                                     AND newer.id!=r.id AND (newer.created_at>r.created_at OR
+                                       (newer.created_at=r.created_at AND newer.rowid>r.rowid))))))",
+                        params![attempt_id],|row|row.get(0)
+                    )?;
+                    let active_restored_lane: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM restart_candidates rc JOIN sessions s ON s.id=rc.session_id
+                         WHERE rc.attempt_id=?1 AND rc.state='resumed' AND s.status='running')",
+                        params![attempt_id],|row|row.get(0)
+                    )?;
+                    let park_restart = explicit_restart_hold
+                        && !active_restored_lane
+                        && !return_to_validation_hold
+                        && !restore_hold_active;
                     if remaining == 0 {
                         transaction.execute(
-                            "UPDATE attempts SET status=CASE WHEN ?1 THEN 'held' ELSE 'running' END,updated_at=?2 WHERE id=?3",
-                            params![return_to_validation_hold, now, attempt_id],
+                            "UPDATE attempts SET status=CASE WHEN ?1 OR ?2 THEN 'held' WHEN ?3 THEN 'restart_parked' ELSE 'running' END,updated_at=?4 WHERE id=?5",
+                            params![return_to_validation_hold, restore_hold_active, park_restart, now, attempt_id],
                         )?;
-                        transaction.execute("UPDATE claims SET state='running',updated_at=?1 WHERE attempt_id=?2 AND state='unknown'",params![now,attempt_id])?;
+                        if !restore_hold_active {
+                            transaction.execute("UPDATE claims SET state='running',updated_at=?1 WHERE attempt_id=?2 AND state='unknown'",params![now,attempt_id])?;
+                        }
                     }
-                    transaction.execute("UPDATE tasks SET attention=CASE WHEN ?1!=0 THEN 'needs_recovery' WHEN ?2 THEN 'paused' ELSE 'none' END,version=version+1,updated_at=?3 WHERE id=?4",params![remaining,return_to_validation_hold,now,task_id])?;
+                    transaction.execute("UPDATE tasks SET attention=CASE WHEN ?1!=0 THEN 'needs_recovery' WHEN ?2 OR ?3 THEN 'paused' WHEN ?4 THEN 'restart_parked' ELSE 'none' END,version=version+1,updated_at=?5 WHERE id=?6",params![remaining,return_to_validation_hold,restore_hold_active,park_restart,now,task_id])?;
+                    if remaining == 0 && !restore_hold_active && !explicit_restart_hold {
+                        Store::release_restart_hold_for_fresh_dispatch_in(
+                            &transaction,
+                            attempt_id,
+                            "human_recovery",
+                            &now,
+                        )?;
+                    }
                     result(
                         operation_id,
                         "attempt",
@@ -2150,11 +2859,16 @@ pub fn execute_with_runtime(
             expected_version,
             ..
         } => {
-            require_task_state(&transaction, task_id, *expected_version, &["done"])?;
-            transaction.execute(
-                "UPDATE tasks SET archived_at=?1,version=version+1,updated_at=?1 WHERE id=?2",
-                params![now, task_id],
+            let changed = transaction.execute(
+                "UPDATE tasks SET archived_at=?1,version=version+1,updated_at=?1
+                 WHERE id=?2 AND version=?3 AND archived_at IS NULL
+                   AND (lifecycle='done' OR (lifecycle='backlog' AND ready_at IS NULL
+                     AND NOT EXISTS(SELECT 1 FROM attempts WHERE task_id=?2)))",
+                params![now, task_id, expected_version],
             )?;
+            if changed != 1 {
+                bail!("only a completed task or a never attempted backlog draft can be archived at its current version")
+            }
             result(
                 operation_id,
                 "task",
@@ -2294,7 +3008,7 @@ pub fn role_preparations(
             .map_err(|error| anyhow!(error))?;
         let config: crate::domain::RoleOverride = serde_json::from_str(&config_json)?;
         let provider = config.provider;
-        let prepared = crate::providers::prepare_role_launch(
+        let prepared = crate::providers::prepare_role_launch_with_bundles(
             provider,
             role,
             &config.model,
@@ -2308,6 +3022,7 @@ pub fn role_preparations(
             None,
             hooks,
             executable,
+            &store.compatibility_bundles,
         );
         match prepared {
             Ok(prepared) => {
@@ -2352,12 +3067,13 @@ pub fn role_preparations(
                 };
                 let authority = {
                     let connection = store.lock()?;
-                    crate::trip::task_profile_preparation_authority(
+                    crate::trip::task_profile_preparation_authority_with_bundles(
                         &connection,
                         task_id,
                         role,
                         revision,
                         &prepared.config,
+                        &store.compatibility_bundles,
                     )
                 };
                 let runtime_admission = {
@@ -2406,6 +3122,8 @@ pub fn role_preparations(
                     "task_profile_source":authority.as_ref().ok().map(|value|value.descriptor.source.as_str()),
                     "adapter":authority.as_ref().ok().map(|value|value.descriptor.adapter_name.as_str()),
                     "runtime_admission":runtime_admission,
+                    "compatibility":prepared.config.compatibility.as_ref().map(|binding|
+                        crate::provider_compatibility::matched_explanation(binding, generic_supported)),
                     "status":if exact_runtime_authority { "supported" } else { "unverified" },
                     "reason":if exact_runtime_authority {
                         "Exact current runtime-scoped authority is supported"
@@ -2424,6 +3142,8 @@ pub fn role_preparations(
                 "requested_revision":revision,
                 "config":config,
                 "status":"unsupported",
+                "compatibility":error.chain().find_map(|cause| cause.downcast_ref::<crate::provider_compatibility::CompatibilityError>())
+                    .map(crate::provider_compatibility::CompatibilityError::explanation),
                 "reason":format!("Current preparation failed: {error:#}"),
             })),
         }
@@ -2431,8 +3151,215 @@ pub fn role_preparations(
     Ok(preparations)
 }
 
+fn selected_setup_capability<'a>(
+    selection: &serde_json::Value,
+    receipts: &[serde_json::Value],
+    capabilities: &'a [serde_json::Value],
+) -> Option<&'a serde_json::Value> {
+    let exact_receipt = receipts
+        .iter()
+        .filter(|receipt| {
+            receipt.get("role") == selection.get("role")
+                && receipt.get("provider") == selection.pointer("/profile/provider")
+                && receipt.get("profile_hash") == selection.get("profile_hash")
+        })
+        .max_by_key(|receipt| {
+            receipt
+                .get("created_at")
+                .and_then(serde_json::Value::as_str)
+        })?;
+    if exact_receipt
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        != Some("success")
+    {
+        return None;
+    }
+    let key = exact_receipt.get("capability_key")?;
+    capabilities.iter().find(|capability| {
+        capability.get("config_hash") == Some(key)
+            && capability.get("provider") == selection.pointer("/profile/provider")
+            && capability.get("role") == selection.get("role")
+            && capabilities
+                .iter()
+                .filter(|other| {
+                    other.get("provider") == capability.get("provider")
+                        && other.get("version") == capability.get("version")
+                        && other.get("role") == capability.get("role")
+                        && other.get("mode") == capability.get("mode")
+                })
+                .all(|other| {
+                    (
+                        other.get("checked_at").and_then(serde_json::Value::as_str),
+                        other.get("rowid").and_then(serde_json::Value::as_i64),
+                    ) <= (
+                        capability
+                            .get("checked_at")
+                            .and_then(serde_json::Value::as_str),
+                        capability.get("rowid").and_then(serde_json::Value::as_i64),
+                    )
+                })
+    })
+}
+
+#[cfg(test)]
+mod m7_setup_projection_tests {
+    use super::{
+        continuation_actions, permanent_resume_rejection_is_current, selected_setup_capability,
+    };
+    use crate::domain::TaskDto;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn exact_selected_profile_ignores_unrelated_and_newer_failed_evidence() {
+        let selected =
+            json!({"role":"explorer","profile":{"provider":"codex"},"profile_hash":"selected"});
+        let other =
+            json!({"role":"plan_reviewer","profile":{"provider":"codex"},"profile_hash":"other"});
+        let receipts = vec![
+            json!({"role":"explorer","provider":"codex","profile_hash":"selected","result":"success","capability_key":"selected-key","created_at":"2026-01-01"}),
+            json!({"role":"plan_reviewer","provider":"codex","profile_hash":"other","result":"success","capability_key":"other-key","created_at":"2026-01-02"}),
+        ];
+        let capabilities = vec![
+            json!({"rowid":1,"provider":"codex","version":"v1","role":"explorer","mode":"interactive_pty","config_hash":"selected-key","checked_at":"2026-01-01","compatibility":{"status":"matched"}}),
+            json!({"rowid":2,"provider":"codex","version":"v2","role":"explorer","mode":"interactive_pty","config_hash":"unrelated-key","checked_at":"2026-01-03","compatibility":{"status":"unknown_version"}}),
+            json!({"rowid":3,"provider":"codex","version":"v1","role":"plan_reviewer","mode":"interactive_pty","config_hash":"other-key","checked_at":"2026-01-02","compatibility":{"status":"matched"}}),
+        ];
+        assert_eq!(
+            selected_setup_capability(&selected, &receipts, &capabilities).unwrap()["config_hash"],
+            "selected-key"
+        );
+        assert_eq!(
+            selected_setup_capability(&other, &receipts, &capabilities).unwrap()["config_hash"],
+            "other-key"
+        );
+        let newer_same_scope = json!({"rowid":4,"provider":"codex","version":"v1","role":"explorer","mode":"interactive_pty","config_hash":"new-key","checked_at":"2026-01-04","compatibility":{"status":"evidence_stale"}});
+        let mut superseded = capabilities.clone();
+        superseded.push(newer_same_scope);
+        assert!(selected_setup_capability(&selected, &receipts, &superseded).is_none());
+        assert!(selected_setup_capability(&other, &receipts, &superseded).is_some());
+        let mut failed = receipts.clone();
+        failed.push(json!({"role":"explorer","provider":"codex","profile_hash":"selected","result":"failure","capability_key":"selected-key","created_at":"2026-01-05"}));
+        assert!(selected_setup_capability(&selected, &failed, &capabilities).is_none());
+        assert!(selected_setup_capability(&other, &failed, &capabilities).is_some());
+        let wrong_profile: Value =
+            json!({"role":"explorer","profile":{"provider":"codex"},"profile_hash":"new-profile"});
+        assert!(selected_setup_capability(&wrong_profile, &receipts, &capabilities).is_none());
+    }
+
+    #[test]
+    fn invalid_manifest_rejection_retires_only_for_newer_exact_proof() {
+        let task = TaskDto {
+            id: "task".into(),
+            project_id: "project".into(),
+            title: String::new(),
+            description: String::new(),
+            acceptance_criteria: vec![],
+            priority: 0,
+            manual_order: 0,
+            lifecycle: "active".into(),
+            attention: "active".into(),
+            version: 1,
+            archived: false,
+            can_archive: false,
+            recipe_provenance: None,
+            permission_waiting: false,
+            role_overrides: json!({}),
+            dependencies: vec![],
+            active_attempt: Some(json!({"id":"attempt"})),
+            role_settings: vec![
+                json!({"role":"manager","revision":1,"effective_generation_id":"generation","config":{"provider":"codex","model":"model","effort":"high"}}),
+            ],
+            reviews: vec![],
+            snapshots: vec![],
+            review_budgets: vec![],
+            legacy: json!({}),
+        };
+        let session = json!({"id":"session","task_id":"task","attempt_id":"attempt","role":"manager","role_generation_id":"generation","generation_status":"exited","config_revision":1,"provider":"codex","status":"exited","resume_count":0,"transcript_epoch":"epoch","capability_current":false});
+        let rejection = json!({"category":"provider_compatibility_invalid_manifest"});
+        let binding = crate::provider_compatibility::BundleSet::embedded()
+            .resolve(
+                crate::domain::Provider::Codex,
+                crate::provider_compatibility::CODEX_EXACT_VERSION,
+                crate::domain::RoleKind::Manager,
+            )
+            .unwrap();
+        let proof = json!({"compatibility":crate::provider_compatibility::AuthorityBinding::from(&binding),"model":"model","effort":"high"});
+        let exact = json!({"provider":"codex","version":crate::provider_compatibility::CODEX_EXACT_VERSION,"role":"manager","mode":"interactive_pty","config_hash":"new-key","status":"supported","checked_at":"2026-01-03","proof":proof});
+        let unrelated = json!({"provider":"codex","version":crate::provider_compatibility::CODEX_EXACT_VERSION,"role":"explorer","mode":"interactive_pty","config_hash":"other-key","status":"supported","checked_at":"2026-01-04","proof":proof});
+        assert!(permanent_resume_rejection_is_current(
+            &[task.clone()],
+            &[],
+            &[unrelated.clone()],
+            Some("2026-01-02"),
+            &rejection,
+            &session
+        ));
+        assert!(permanent_resume_rejection_is_current(
+            &[task.clone()],
+            &[],
+            &[exact.clone()],
+            Some("2026-01-04"),
+            &rejection,
+            &session
+        ));
+        assert!(!permanent_resume_rejection_is_current(
+            &[task.clone()],
+            &[],
+            &[unrelated.clone(), exact.clone()],
+            Some("2026-01-02"),
+            &rejection,
+            &session
+        ));
+        let newer_unverified = json!({"provider":"codex","version":crate::provider_compatibility::CODEX_EXACT_VERSION,"role":"manager","mode":"interactive_pty","config_hash":"newest-key","status":"unverified","checked_at":"2026-01-05","proof":{}});
+        assert!(permanent_resume_rejection_is_current(
+            &[task.clone()],
+            &[],
+            &[exact.clone(), newer_unverified],
+            Some("2026-01-02"),
+            &rejection,
+            &session
+        ));
+        let detail = json!({"category":"provider_compatibility_invalid_manifest","role_generation_id":"generation","transcript_epoch":"epoch","resume_count":0,"attempt_id":"attempt","role":"manager","config_revision":1});
+        let history = vec![
+            json!({"id":"rejection","event_code":"session.resume.rejected","entity_id":"session","created_at":"2026-01-02","detail":detail}),
+        ];
+        let decision_actions = |evidence: &[Value]| {
+            continuation_actions(
+                &[task.clone()],
+                evidence,
+                &[session.clone()],
+                &[],
+                &[],
+                &[],
+                &history,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+        };
+        let held = decision_actions(&[unrelated.clone()]);
+        assert!(held
+            .iter()
+            .any(|action| action.binding["session_id"] == "session"
+                && action.operation == "terminal_incomplete"
+                && !action.enabled));
+        let released = decision_actions(&[unrelated, exact]);
+        assert!(!released
+            .iter()
+            .any(|action| action.binding["session_id"] == "session"
+                && action.operation == "terminal_incomplete"));
+    }
+}
+
 pub fn state(store: &Store) -> Result<AppStateDto> {
     let connection = store.lock()?;
+    // Read before any projected row: without a read transaction, an external
+    // writer can only make the rows newer than this cursor, never older.
+    let revision = crate::store::read_state_revision(&connection)
+        .context("read state revision for the dashboard projection")?;
     let projects = {
         let mut statement = connection.prepare("SELECT p.id,p.display_name,p.repository_path,p.repository_identity,p.base_revision,p.queue_paused,p.version,p.settings_json,
             COALESCE((SELECT json_object('readiness',s.readiness,'reason',s.reason,'detected_installation',s.detected_installation,'detected',json(s.detected_json),'setup_operation_id',s.setup_operation_id,'active_config_revision_id',s.active_config_revision_id,'workflow_id',s.workflow_id,'package_version',s.package_version,'upstream_source_hash',s.upstream_source_hash,'overlay_hash',s.overlay_hash,'manifest_hash',s.manifest_hash,'activated_at',s.activated_at,'updated_at',s.updated_at,
@@ -2465,8 +3392,9 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
     };
     let mut tasks = Vec::new();
     for id in task_ids {
-        let mut task = connection.query_row("SELECT id,project_id,title,description,acceptance_criteria_json,priority,manual_order,lifecycle,attention,version,archived_at,role_overrides_json,legacy_json,EXISTS(SELECT 1 FROM permission_requests pr WHERE pr.task_id=tasks.id AND pr.state='pending') FROM tasks WHERE id=?1",
-            params![id], |row| Ok(TaskDto { id:row.get(0)?,project_id:row.get(1)?,title:row.get(2)?,description:row.get(3)?,acceptance_criteria:serde_json::from_str(&row.get::<_,String>(4)?).unwrap_or_default(),priority:row.get(5)?,manual_order:row.get(6)?,lifecycle:row.get(7)?,attention:row.get(8)?,version:row.get(9)?,archived:row.get::<_,Option<String>>(10)?.is_some(),role_overrides:parse(row.get(11)?),legacy:parse(row.get(12)?),permission_waiting:row.get(13)?,dependencies:vec![],active_attempt:None,role_settings:vec![],reviews:vec![],snapshots:vec![],review_budgets:vec![] }))?;
+        let mut task = connection.query_row("SELECT id,project_id,title,description,acceptance_criteria_json,priority,manual_order,lifecycle,attention,version,archived_at,role_overrides_json,legacy_json,EXISTS(SELECT 1 FROM permission_requests pr WHERE pr.task_id=tasks.id AND pr.state='pending'),(archived_at IS NULL AND (lifecycle='done' OR (lifecycle='backlog' AND ready_at IS NULL AND NOT EXISTS(SELECT 1 FROM attempts WHERE task_id=tasks.id)))) FROM tasks WHERE id=?1",
+            params![id], |row| Ok(TaskDto { id:row.get(0)?,project_id:row.get(1)?,title:row.get(2)?,description:row.get(3)?,acceptance_criteria:serde_json::from_str(&row.get::<_,String>(4)?).unwrap_or_default(),priority:row.get(5)?,manual_order:row.get(6)?,lifecycle:row.get(7)?,attention:row.get(8)?,version:row.get(9)?,archived:row.get::<_,Option<String>>(10)?.is_some(),can_archive:row.get(14)?,recipe_provenance:None,role_overrides:parse(row.get(11)?),legacy:parse(row.get(12)?),permission_waiting:row.get(13)?,dependencies:vec![],active_attempt:None,role_settings:vec![],reviews:vec![],snapshots:vec![],review_budgets:vec![] }))?;
+        task.recipe_provenance = crate::recipes::task_provenance(&connection, &id)?;
         task.dependencies = json_rows(&connection, "SELECT json_object('task_id',depends_on_task_id,'integration_ref',integration_ref,'verified_at',verified_at) FROM task_dependencies WHERE task_id=?1", &id)?;
         task.active_attempt = connection
             .query_row(
@@ -2527,7 +3455,73 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         "status": "unverified",
         "reason": crate::providers::codex::IMPLEMENTER_NATIVE_POLICY_REASON,
     })];
-    let capabilities = json_rows_no_param(&connection, "SELECT json_object('rowid',rowid,'provider',provider,'version',executable_version,'role',role,'mode',mode,'config_hash',config_hash,'hook_hash',hook_hash,'status',status,'proof',json(proof_json),'gaps',json(gaps_json),'checked_at',checked_at) FROM capabilities ORDER BY provider,role")?;
+    let mut capabilities = json_rows_no_param(&connection, "SELECT json_object('rowid',rowid,'provider',provider,'version',executable_version,'role',role,'mode',mode,'config_hash',config_hash,'hook_hash',hook_hash,'status',status,'proof',json(proof_json),'gaps',json(gaps_json),'checked_at',checked_at) FROM capabilities ORDER BY provider,role")?;
+    for capability in &mut capabilities {
+        let Some(provider) = capability
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<crate::domain::Provider>().ok())
+        else {
+            continue;
+        };
+        let Some(role) = capability
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<crate::domain::RoleKind>().ok())
+        else {
+            continue;
+        };
+        let version = capability
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let current = store.compatibility_bundles.resolve(provider, version, role);
+        let recorded = capability
+            .pointer("/proof/compatibility")
+            .and_then(|value| {
+                serde_json::from_value::<crate::provider_compatibility::AuthorityBinding>(
+                    value.clone(),
+                )
+                .ok()
+            });
+        let explanation = match current {
+            Ok(binding) if recorded.as_ref() == Some(&(&binding).into()) => {
+                crate::provider_compatibility::matched_explanation(
+                    &binding,
+                    capability.get("status").and_then(serde_json::Value::as_str)
+                        == Some("supported"),
+                )
+            }
+            Ok(binding) => crate::provider_compatibility::CompatibilityExplanation {
+                status: crate::provider_compatibility::CompatibilityStatus::EvidenceStale,
+                observed_version: None,
+                pack_id: Some(binding.pack_id),
+                pack_revision: Some(binding.pack_revision),
+                contract_id: Some(binding.contract_id),
+                contract_revision: Some(binding.contract_revision),
+                short_hash: Some(binding.effective_hash.chars().take(12).collect()),
+                predicate_id: Some(binding.predicate_id),
+                missing_evidence: vec!["current_contract_proof".into()],
+                action: crate::provider_compatibility::SafeAction::RequalifyExactProfile,
+                message:
+                    "Stored evidence predates or differs from this exact compatibility contract."
+                        .into(),
+            },
+            Err(error) => error.explanation().clone(),
+        };
+        if explanation.status != crate::provider_compatibility::CompatibilityStatus::Matched {
+            capability["status"] = serde_json::json!("unverified");
+            let gap = serde_json::json!("provider_compatibility_requalification_required");
+            if let Some(gaps) = capability["gaps"].as_array_mut() {
+                if !gaps.contains(&gap) {
+                    gaps.push(gap);
+                }
+            } else {
+                capability["gaps"] = serde_json::json!([gap]);
+            }
+        }
+        capability["compatibility"] = serde_json::to_value(explanation)?;
+    }
     let active_sessions = json_rows_no_param(
         &connection,
         r#"
@@ -2573,6 +3567,10 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             'launch',json(s.launch_config_json),
             'capability_key',s.capability_key,
             'current_capability_key',(SELECT c.config_hash FROM capabilities c
+              WHERE c.provider=s.provider AND c.executable_version=s.executable_version
+                AND c.role=rg.role AND c.mode='interactive_pty'
+              ORDER BY c.checked_at DESC,c.rowid DESC LIMIT 1),
+            'current_capability_rowid',(SELECT c.rowid FROM capabilities c
               WHERE c.provider=s.provider AND c.executable_version=s.executable_version
                 AND c.role=rg.role AND c.mode='interactive_pty'
               ORDER BY c.checked_at DESC,c.rowid DESC LIMIT 1),
@@ -2624,12 +3622,21 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         ORDER BY s.created_at DESC LIMIT 200
     "#,
     )?;
+    let mut active_sessions = active_sessions;
+    for session in &mut active_sessions {
+        let current = capabilities.iter().find(|capability| {
+            capability.get("rowid") == session.get("current_capability_rowid")
+                && capability.get("config_hash") == session.get("capability_key")
+                && capability.get("status").and_then(serde_json::Value::as_str) == Some("supported")
+        });
+        session["capability_current"] = serde_json::json!(current.is_some());
+    }
     let controls = json_rows_no_param(&connection, "SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,'kind',kind,'state',state,'payload',json(payload_json),'updated_at',updated_at) FROM controls WHERE state NOT IN ('finished','cancelled') ORDER BY created_at")?;
     let guidance=json_rows_no_param(&connection,"SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,'body',body,'state',state,'reason',reason,'created_at',created_at,'acknowledged_at',acknowledged_at) FROM guidance_messages ORDER BY created_at DESC LIMIT 200")?;
     let check_suites=json_rows_no_param(&connection,"SELECT json_object('id',id,'project_id',project_id,'name',name,'position',position,'executable',executable,'arguments',json(arguments_json),'timeout_seconds',timeout_seconds,'enabled',enabled,'version',version) FROM check_suites ORDER BY project_id,position,name")?;
     let checks=json_rows_no_param(&connection,"SELECT json_object('id',id,'attempt_id',attempt_id,'candidate_hash',candidate_hash,'check_id',check_id,'selected_check_revision',selected_check_revision,'suite_name',suite_name,'suite_version',check_suite_version,'executable',executable,'arguments',json(arguments_json),'status',status,'launch_state',launch_state,'launch_error',launch_error,'failure_category',json_extract(evidence_json,'$.failure_category'),'exit_code',exit_code,'inputs_hash',inputs_hash,'acceptance_coverage',json(acceptance_coverage_json),'elapsed_millis',elapsed_millis,'freshness_state',freshness_state,'evidence',json(evidence_json),'created_at',created_at,'finished_at',finished_at) FROM check_runs ORDER BY created_at DESC LIMIT 200")?;
     let switches=json_rows_no_param(&connection,"SELECT json_object('id',si.id,'attempt_id',si.attempt_id,'role',si.role,'lane_id',COALESCE((SELECT lane_id FROM role_generations WHERE id=si.old_generation_id),(SELECT lane_id FROM role_generations WHERE id=si.new_generation_id),'default'),'old_generation_id',si.old_generation_id,'new_generation_id',si.new_generation_id,'requested_settings_revision',si.requested_settings_revision,'checkpoint_snapshot_id',si.checkpoint_snapshot_id,'handoff',CASE WHEN json_valid(si.handoff_json) THEN json(si.handoff_json) ELSE json_object('malformed_handoff',1) END,'state',si.state,'updated_at',si.updated_at) FROM switch_intents si ORDER BY si.created_at DESC LIMIT 200")?;
-    let recovery = json_rows_no_param(
+    let mut recovery = json_rows_no_param(
         &connection,
         r#"
         SELECT json_object(
@@ -2670,6 +3677,17 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         ) FROM recovery_records r ORDER BY r.created_at DESC LIMIT 200
     "#,
     )?;
+    recovery.extend(json_rows_no_param(
+        &connection,
+        "SELECT json_object('id',ri.id,'session_id',NULL,'attempt_id',ri.new_attempt_id,
+          'state','attention_required','detail',json_object('kind','rework_materialization',
+          'rework_intent_id',ri.id,'parent_attempt_id',ri.parent_attempt_id),
+          'updated_at',ri.updated_at,'actionable',1)
+         FROM rework_intents ri JOIN attempts a ON a.id=ri.new_attempt_id
+         JOIN tasks t ON t.id=a.task_id WHERE ri.state='recovery_required'
+           AND a.status='needs_recovery' AND t.attention='needs_recovery'
+           AND t.lifecycle='in_progress' ORDER BY ri.updated_at DESC",
+    )?);
     let history=json_rows_no_param(&connection,"SELECT json_object('id',id,'operation_id',operation_id,'actor_kind',actor_kind,'actor_id',actor_id,'event_code',event_code,'entity_kind',entity_kind,'entity_id',entity_id,'old_version',old_version,'new_version',new_version,'detail',json(detail_json),'created_at',created_at) FROM audit_events WHERE event_code IN ('session.resume.rejected','session.resume.fresh_route.reserved') OR rowid IN (SELECT rowid FROM audit_events ORDER BY created_at DESC LIMIT 500) ORDER BY created_at DESC")?;
     let process_observations = resource_observations(&connection)?;
     let capacity = capacity_status(&connection)?;
@@ -2682,6 +3700,128 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
     let (permission_requests, permission_rules) = crate::permissions::state_rows(&connection)?;
     let (mut trip_setups, trip_explorer, trip_lanes, trip_checks, trip_task_verification) =
         crate::trip::state_rows(&connection)?;
+    let mut decisions = crate::coordinator::read_only_decisions(&connection)?;
+    decisions.extend(crate::scheduler::read_only_decisions(&connection)?);
+    for task in &tasks {
+        if decisions
+            .iter()
+            .any(|decision| decision.subject.task_id.as_deref() == Some(task.id.as_str()))
+        {
+            continue;
+        }
+        if task.lifecycle == "backlog" {
+            decisions.push(backlog_readiness_decision(&connection, task)?);
+            continue;
+        }
+        let terminal = matches!(task.lifecycle.as_str(), "done" | "cancelled");
+        let project_ready =
+            crate::trip::require_project_ready(&connection, &task.project_id).is_ok();
+        let prerequisite = DecisionPrerequisite {
+            code: if terminal {
+                "task.terminal"
+            } else {
+                "task.owner_evaluation"
+            }
+            .into(),
+            state: if terminal {
+                DecisionEvidenceState::Satisfied
+            } else if !project_ready {
+                DecisionEvidenceState::Missing
+            } else {
+                DecisionEvidenceState::Unknown
+            },
+            owner: DecisionOwner::Human,
+            evidence: serde_json::json!({"lifecycle":task.lifecycle,"project_id":task.project_id}),
+            message: Some(if terminal {
+                format!("Task is {}", task.lifecycle)
+            } else if !project_ready {
+                "Project readiness must be restored before task admission".into()
+            } else {
+                "Task admission needs current profile and owner verification".into()
+            }),
+        };
+        decisions.push(DecisionExplanation {
+            decision_schema: 1,
+            reason_code: if terminal {
+                "task.terminal"
+            } else {
+                "task.owner_evaluation_unknown"
+            }
+            .into(),
+            disposition: if terminal {
+                DecisionDisposition::Terminal
+            } else {
+                DecisionDisposition::Waiting
+            },
+            subject: DecisionSubject {
+                project_id: Some(task.project_id.clone()),
+                task_id: Some(task.id.clone()),
+                attempt_id: task
+                    .active_attempt
+                    .as_ref()
+                    .and_then(|attempt| attempt.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                ..DecisionSubject::default()
+            },
+            observed_revision: DecisionObservedRevision {
+                task_version: Some(task.version),
+                ..DecisionObservedRevision::default()
+            },
+            primary_blocker: (!terminal).then_some(prerequisite.clone()),
+            prerequisites: vec![prerequisite],
+            ownership: DecisionOwnership {
+                owner: DecisionOwner::Human,
+                state: "recorded_task_status".into(),
+                binding: DecisionActionBinding {
+                    task_id: Some(task.id.clone()),
+                    expected_task_version: Some(task.version),
+                    ..DecisionActionBinding::default()
+                },
+            },
+            next_action: None,
+            control_policy: DecisionControlPolicy {
+                allowed_controls: Vec::new(),
+                disabled_reason_code: (!terminal)
+                    .then_some("task.current_admission_unknown".into()),
+            },
+        });
+    }
+    let restore_hold_active: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE id='database-restore-hold' AND state='attention_required')",
+        [], |row| row.get(0),
+    )?;
+    if restore_hold_active {
+        let prerequisites = crate::database::restore_prerequisites(&connection, false)?;
+        decisions.push(DecisionExplanation {
+            decision_schema: 1,
+            reason_code: "restore.hold_active".into(),
+            disposition: DecisionDisposition::Held,
+            subject: DecisionSubject {
+                recovery_id: Some("database-restore-hold".into()),
+                ..DecisionSubject::default()
+            },
+            observed_revision: DecisionObservedRevision::default(),
+            primary_blocker: prerequisites
+                .iter()
+                .find(|item| item.state != crate::domain::DecisionEvidenceState::Satisfied)
+                .cloned(),
+            prerequisites,
+            ownership: DecisionOwnership {
+                owner: DecisionOwner::External,
+                state: "offline_restore_release".into(),
+                binding: DecisionActionBinding {
+                    recovery_id: Some("database-restore-hold".into()),
+                    ..DecisionActionBinding::default()
+                },
+            },
+            next_action: None,
+            control_policy: DecisionControlPolicy {
+                allowed_controls: Vec::new(),
+                disabled_reason_code: Some("restore.release_offline_only".into()),
+            },
+        });
+    }
     let continuation_actions = continuation_actions(
         &tasks,
         &capabilities,
@@ -2694,8 +3834,71 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         &trip_setups,
         &trip_explorer,
         &trip_lanes,
+        &decisions,
     );
     for setup in &mut trip_setups {
+        let setup_receipts = setup
+            .get("probe_receipts")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(selections) = setup
+            .get_mut("selected_profiles")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for selection in selections {
+                let Some(provider) = selection
+                    .pointer("/profile/provider")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| value.parse::<crate::domain::Provider>().ok())
+                else {
+                    continue;
+                };
+                let Some(role) = selection
+                    .get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| value.parse::<crate::domain::RoleKind>().ok())
+                else {
+                    continue;
+                };
+                let observed = selected_setup_capability(selection, &setup_receipts, &capabilities);
+                let explanation = if let Some(observed) = observed {
+                    observed.get("compatibility").cloned()
+                } else if provider == crate::domain::Provider::Claude {
+                    store
+                        .compatibility_bundles
+                        .resolve(provider, "", role)
+                        .err()
+                        .and_then(|error| serde_json::to_value(error.explanation()).ok())
+                } else {
+                    Some(serde_json::to_value(crate::provider_compatibility::CompatibilityExplanation {
+                        status: crate::provider_compatibility::CompatibilityStatus::EvidenceStale,
+                        observed_version: None,
+                        pack_id: None,
+                        pack_revision: None,
+                        contract_id: None,
+                        contract_revision: None,
+                        short_hash: None,
+                        predicate_id: None,
+                        missing_evidence: vec!["exact_selected_profile_observation".into()],
+                        action: crate::provider_compatibility::SafeAction::RequalifyExactProfile,
+                        message: "No exact compatibility observation is recorded for this selected profile.".into(),
+                    })?)
+                };
+                let explanation = explanation.map(|mut value| {
+                    if value["status"] == "matched" {
+                        value["message"] = serde_json::json!(
+                            "A reviewed contract candidate exists. Selected profile authority is checked separately."
+                        );
+                    }
+                    value
+                });
+                if let (Some(explanation), Some(object)) = (explanation, selection.as_object_mut())
+                {
+                    object.insert("compatibility".into(), explanation);
+                }
+            }
+        }
         let setup_id = setup.get("setup_operation_id");
         let project_id = setup.get("project_id");
         let discovery_attempt = setup.get("discovery_attempt_id");
@@ -2721,6 +3924,17 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             );
         }
     }
+    let attention = AttentionSources {
+        projects: &projects,
+        tasks: &tasks,
+        sessions: &active_sessions,
+        recovery: &recovery,
+        permission_requests: &permission_requests,
+        trip_setups: &trip_setups,
+        decisions: &decisions,
+        continuation_actions: &continuation_actions,
+    }
+    .items();
     let resources = serde_json::json!({
         "active_sessions":active_sessions.iter().filter(|value|!matches!(value.get("status").and_then(|state|state.as_str()),Some("exited"|"launch_failed"))).count(),
         "active_controls":controls.len(),
@@ -2730,11 +3944,16 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         "observed_at":Utc::now().to_rfc3339(),
         "processes":process_observations,
     });
+    let (profile_sets, task_recipes, recipe_schedules) = crate::recipes::projection(&connection)?;
     Ok(AppStateDto {
-        schema: 7,
+        schema: 8,
         generated_at: Utc::now().to_rfc3339(),
+        revision: revision.to_string(),
         projects,
         tasks,
+        profile_sets,
+        task_recipes,
+        recipe_schedules,
         production_role_restrictions,
         capabilities,
         active_sessions,
@@ -2755,7 +3974,67 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         trip_lanes,
         trip_checks,
         trip_task_verification,
+        decisions,
         continuation_actions,
+        attention,
+    })
+}
+
+fn backlog_readiness_decision(
+    connection: &Connection,
+    task: &TaskDto,
+) -> Result<DecisionExplanation> {
+    let project = crate::trip::require_project_ready(connection, &task.project_id);
+    let scope = validate_task(&task.title, &task.acceptance_criteria);
+    let configured: i64 = connection.query_row(
+        "SELECT COUNT(DISTINCT role)
+         FROM role_settings WHERE task_id=?1 AND role IN
+         ('manager','explorer','plan_reviewer','implementer','code_reviewer','final_verifier')
+         AND revision=(SELECT MAX(latest.revision) FROM role_settings latest
+                       WHERE latest.task_id=role_settings.task_id AND latest.role=role_settings.role)",
+        params![task.id], |row| row.get(0),
+    )?;
+    let prerequisite =
+        |code: &str, state: DecisionEvidenceState, message: Option<String>| DecisionPrerequisite {
+            code: code.into(),
+            state,
+            owner: DecisionOwner::Human,
+            evidence: serde_json::json!({"task_id":task.id,"project_id":task.project_id}),
+            message,
+        };
+    let prerequisites = vec![
+        prerequisite("task.project_ready", if project.is_ok() { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Missing }, project.as_ref().err().map(|error| format!("{error:#}"))),
+        prerequisite("task.valid_scope", if scope.is_ok() { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Missing }, scope.as_ref().err().map(|error| format!("{error:#}"))),
+        prerequisite("task.six_role_settings", if configured == 6 { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Missing }, (configured != 6).then(|| format!("{configured} of six app roles have current settings"))),
+        prerequisite("task.profile_activation_and_runtime", DecisionEvidenceState::Unknown, Some("Exact project-default or task-override activation and current runtime capability are checked by Make Ready".into())),
+    ];
+    let blocker = prerequisites
+        .iter()
+        .find(|item| item.state == DecisionEvidenceState::Missing)
+        .cloned();
+    let enabled = blocker.is_none();
+    let binding = DecisionActionBinding {
+        project_id: Some(task.project_id.clone()),
+        task_id: Some(task.id.clone()),
+        expected_task_version: Some(task.version),
+        ..DecisionActionBinding::default()
+    };
+    Ok(DecisionExplanation {
+        decision_schema: 1, reason_code: "task.backlog_readiness".into(),
+        disposition: DecisionDisposition::Waiting,
+        subject: DecisionSubject { project_id: Some(task.project_id.clone()), task_id: Some(task.id.clone()), ..DecisionSubject::default() },
+        observed_revision: DecisionObservedRevision { task_version: Some(task.version), ..DecisionObservedRevision::default() },
+        primary_blocker: blocker.clone(), prerequisites,
+        ownership: DecisionOwnership { owner: DecisionOwner::Human, state: "recorded_task_status".into(), binding: binding.clone() },
+        next_action: Some(DecisionNextAction {
+            operation: if project.is_ok() { "make_ready" } else { "inspect_project" }.into(),
+            enabled: enabled || project.is_err(), owner: DecisionOwner::Human, binding,
+            accounting_note: Some("Make Ready rechecks project, scope, six settings, activations, and current runtime authority".into()),
+        }),
+        control_policy: DecisionControlPolicy {
+            allowed_controls: if enabled { vec!["make_ready".into()] } else if project.is_err() { vec!["inspect_project".into()] } else { Vec::new() },
+            disabled_reason_code: blocker.map(|item| item.code),
+        },
     })
 }
 
@@ -3104,6 +4383,8 @@ fn observed_resume_profile_is_current(
 fn permanent_resume_rejection_is_current(
     tasks: &[TaskDto],
     trip_lanes: &[serde_json::Value],
+    capabilities: &[serde_json::Value],
+    rejection_created_at: Option<&str>,
     detail: &serde_json::Value,
     session: &serde_json::Value,
 ) -> bool {
@@ -3111,6 +4392,65 @@ fn permanent_resume_rejection_is_current(
         return false;
     }
     match detail.get("category").and_then(serde_json::Value::as_str) {
+        Some(
+            "provider_compatibility_unsupported"
+            | "provider_compatibility_contract_changed"
+            | "provider_compatibility_invalid_manifest",
+        ) => {
+            // A proved replacement does not make an unsupported or changed frozen session resumable.
+            if detail.get("category").and_then(serde_json::Value::as_str)
+                == Some("provider_compatibility_invalid_manifest")
+            {
+                let replacement_proved = capabilities.iter().any(|capability| {
+                    let (Some(rejected_at), Some(proof)) =
+                        (rejection_created_at, capability.get("proof"))
+                    else {
+                        return false;
+                    };
+                    if capability.get("status").and_then(serde_json::Value::as_str)
+                        != Some("supported")
+                        || capability.get("provider") != session.get("provider")
+                        || capability.get("role") != session.get("role")
+                        || capability
+                            .get("checked_at")
+                            .and_then(serde_json::Value::as_str)
+                            .is_none_or(|checked| checked <= rejected_at)
+                        || proof.get("compatibility").is_none()
+                    {
+                        return false;
+                    }
+                    let candidate = serde_json::json!({
+                        "observed_capability_key":capability.get("config_hash"),
+                        "observed_identity":{
+                            "provider":capability.get("provider"),
+                            "executable_version":capability.get("version"),
+                            "role":capability.get("role"),
+                            "model":proof.get("model"),
+                            "effort":proof.get("effort"),
+                            "mode":"interactive_pty"
+                        }
+                    });
+                    observed_resume_profile_is_current(tasks, session, &candidate)
+                        && observed_resume_capability_is_current_supported(capabilities, &candidate)
+                });
+                return !replacement_proved;
+            }
+            let Some(observed_key) = detail
+                .get("observed_capability_key")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return true;
+            };
+            let capability_current = session
+                .get("capability_current")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            !capability_current
+                || session
+                    .get("current_capability_key")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(observed_key)
+        }
         Some("frozen_runtime_identity_changed") => detail
             .get("frozen_capability_key")
             .and_then(serde_json::Value::as_str)
@@ -3130,6 +4470,16 @@ fn permanent_resume_rejection_route(
     Option<&'static str>,
 ) {
     match category {
+        "provider_compatibility_invalid_manifest" => (
+            ContinuationActionKind::TerminalIncomplete, false,
+            "The embedded provider compatibility contract is invalid; update LLMRelay.",
+            "external", "terminal_incomplete", Some("No retry is available from this release."),
+        ),
+        "provider_compatibility_unsupported" | "provider_compatibility_contract_changed" => (
+            ContinuationActionKind::ReplaceStaleAuthority, false,
+            "The provider compatibility contract needs a reviewed exact version and fresh proof.",
+            "human", "replace_stale_authority", Some("Fresh dispatch requires a current matching contract and proof."),
+        ),
         "resume_spent" | "authority_consumed" => (
             ContinuationActionKind::AuthorizationRequired,
             false,
@@ -3174,6 +4524,7 @@ fn continuation_actions(
     trip_setups: &[serde_json::Value],
     trip_explorer: &[serde_json::Value],
     trip_lanes: &[serde_json::Value],
+    decisions: &[DecisionExplanation],
 ) -> Vec<ContinuationAction> {
     let mut actions = Vec::new();
     for task in tasks {
@@ -3439,7 +4790,15 @@ fn continuation_actions(
                 || detail
                     .get("check_id")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|check_id| !check_id.is_empty());
+                    .is_some_and(|check_id| !check_id.is_empty())
+                || matches!(
+                    kind,
+                    Some(
+                        "database_restore_claim"
+                            | "database_restore_freeze"
+                            | "rework_materialization"
+                    )
+                );
             actions.push(continuation(
                 if exact_process_or_check {
                     ContinuationActionKind::RecoverOwnership
@@ -3558,6 +4917,8 @@ fn continuation_actions(
                 permanent_resume_rejection_is_current(
                     tasks,
                     trip_lanes,
+                    capabilities,
+                    event.get("created_at").and_then(serde_json::Value::as_str),
                     event.get("detail").unwrap_or(&serde_json::Value::Null),
                     session,
                 ) && !history.iter().any(|consumed| {
@@ -3600,9 +4961,19 @@ fn continuation_actions(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown");
                 let reviewer_route = reviewer_fresh_route(tasks, session, &detail);
-                let (kind, enabled, reason, owner, operation, accounting_note) = if category
-                    == "frozen_runtime_identity_changed"
-                {
+                let (kind, enabled, reason, owner, operation, accounting_note) = if matches!(
+                    category,
+                    "provider_compatibility_unsupported"
+                        | "provider_compatibility_contract_changed"
+                ) {
+                    (
+                        ContinuationActionKind::ReplaceStaleAuthority,
+                        same_profile_authority && current_capability_supported,
+                        "The provider compatibility contract needs a reviewed exact version and fresh proof.",
+                        "human", "replace_stale_authority",
+                        Some("Fresh dispatch requires a current matching contract and proof."),
+                    )
+                } else if category == "frozen_runtime_identity_changed" {
                     match reviewer_route {
                             ReviewerFreshRoute::FinalFreshOnly => (
                                 ContinuationActionKind::AuthorizationRequired,
@@ -3759,112 +5130,52 @@ fn continuation_actions(
             }
         }
     }
-    for candidate in restart_candidates {
-        let state = candidate.get("state").and_then(serde_json::Value::as_str);
-        let native_resume_forbidden = candidate
-            .get("result")
-            .and_then(|result| result.get("native_resume_forbidden"))
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-        let session = candidate
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|session_id| {
-                sessions.iter().find(|session| {
-                    session.get("id").and_then(serde_json::Value::as_str) == Some(session_id)
-                })
-            });
-        let exact_restart_ready = session.is_some_and(|session| {
-            session.get("status").and_then(serde_json::Value::as_str) == Some("exited")
-                && session
-                    .get("native_session_id")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|native_id| !native_id.is_empty())
-                && session
-                    .get("capability_current")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-                && (session
-                    .get("process_group_quiescent")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-                    || session
-                        .get("process_group_quiescent")
-                        .and_then(serde_json::Value::as_i64)
-                        == Some(1))
-                && session
-                    .get("validation_cell")
-                    .is_some_and(serde_json::Value::is_null)
-                && !matches!(
-                    session.get("role").and_then(serde_json::Value::as_str),
-                    Some("final_verifier" | "final_reviewer")
-                )
-                && session_generation_is_current(tasks, trip_lanes, session)
-                && !native_resume_is_fenced(controls, switches, session)
-        });
-        let binding = serde_json::json!({
-            "task_id":candidate.get("task_id"),
-            "attempt_id":candidate.get("attempt_id"),
-            "session_id":candidate.get("session_id"),
-            "role_generation_id":session.and_then(|value| value.get("role_generation_id")),
-            "transcript_epoch":session.and_then(|value| value.get("transcript_epoch")),
-        });
-        if matches!(state, Some("parked" | "failed")) && !native_resume_forbidden {
-            actions.push(continuation(
-                ContinuationActionKind::ExactResume,
-                exact_restart_ready,
-                if exact_restart_ready {
-                    "The restart candidate has a verified native identity and can request serialized exact-resume admission."
-                } else {
-                    "Restart admission remains unavailable until the recorded native identity, quiescence evidence, and current authority are valid."
-                },
-                if exact_restart_ready { "human" } else { "service" },
-                (!exact_restart_ready).then_some(
-                    "verified native identity, process-group quiescence, and current authority",
-                ),
-                candidate
-                    .get("updated_at")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-                None,
-                "restart_resume",
-                binding.clone(),
-                Some(
-                    "Serialized restart admission reuses only the retained native session and updates the exact attempt, task, and claim together.",
-                ),
-            ));
-        }
-        if state == Some("parked") {
-            actions.push(continuation(
-                ContinuationActionKind::ContinueFreshDispatch,
-                true,
-                "The restart candidate is parked after verified reconciliation and can release only its normal fresh-dispatch hold.",
-                "human",
-                None,
-                candidate.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
-                None,
-                "continue",
-                binding,
-                Some("Continue releases the existing hold; it does not create a duplicate restart operation."),
-            ));
-        } else if state == Some("queued_capacity") {
-            actions.push(continuation(
-                ContinuationActionKind::WaitForCapacity,
-                false,
-                candidate
-                    .get("reason")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("The retained work remains queued behind the current provider capacity limit.")
-                    .to_owned(),
-                "service",
-                Some("provider capacity"),
-                candidate.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
-                None,
-                "wait_for_capacity",
-                binding,
-                None,
-            ));
-        }
+    for decision in decisions.iter().filter(|decision| {
+        decision.reason_code.starts_with("restart.")
+            && decision.reason_code != "restart.hold_active"
+            && decision.subject.session_id.is_some()
+    }) {
+        let Some(next_action) = decision.next_action.as_ref() else {
+            continue;
+        };
+        let kind = match next_action.operation.as_str() {
+            "restart_resume" => ContinuationActionKind::ExactResume,
+            "continue" => ContinuationActionKind::ContinueFreshDispatch,
+            "wait_for_capacity" => ContinuationActionKind::WaitForCapacity,
+            "wait_for_service" => ContinuationActionKind::WaitForService,
+            "resolve_recovery" => ContinuationActionKind::RecoverOwnership,
+            "refresh_and_reconcile" => ContinuationActionKind::RefreshAndReconcile,
+            _ => ContinuationActionKind::TerminalIncomplete,
+        };
+        let reason = decision
+            .primary_blocker
+            .as_ref()
+            .and_then(|blocker| blocker.message.as_deref())
+            .or_else(|| {
+                decision
+                    .prerequisites
+                    .first()
+                    .and_then(|prerequisite| prerequisite.message.as_deref())
+            })
+            .unwrap_or("Recorded restart authority requires revalidation.");
+        let owner = match next_action.owner {
+            DecisionOwner::Service => "service",
+            DecisionOwner::Human => "human",
+            DecisionOwner::Provider => "provider",
+            DecisionOwner::External => "external",
+        };
+        actions.push(continuation(
+            kind,
+            next_action.enabled,
+            reason,
+            owner,
+            (!next_action.enabled).then_some(decision.reason_code.as_str()),
+            None,
+            None,
+            &next_action.operation,
+            serde_json::to_value(&next_action.binding).unwrap_or_default(),
+            next_action.accounting_note.as_deref(),
+        ));
     }
     for control in controls {
         if matches!(
@@ -3916,6 +5227,534 @@ fn continuation_actions(
         }
     }
     actions
+}
+
+/// Rows already read for one snapshot, so attention derives from exactly what
+/// the dashboard shows under the same cursor.
+struct AttentionSources<'a> {
+    projects: &'a [ProjectDto],
+    tasks: &'a [TaskDto],
+    sessions: &'a [serde_json::Value],
+    recovery: &'a [serde_json::Value],
+    permission_requests: &'a [PermissionRequestDto],
+    trip_setups: &'a [serde_json::Value],
+    decisions: &'a [DecisionExplanation],
+    continuation_actions: &'a [ContinuationAction],
+}
+
+impl AttentionSources<'_> {
+    /// Precedence: every pending permission request and open recovery record
+    /// is its own item, as is the restore hold. A continuation action bound to
+    /// an open recovery record or to an unready project's setup folds into
+    /// that item; implementation authorization folds into its attempt's
+    /// decision. A task item comes last and is omitted when listed permission
+    /// or recovery items already explain its attention.
+    fn items(&self) -> Vec<AttentionItem> {
+        let mut items: Vec<AttentionItem> = self.permission_items().collect();
+        items.extend(self.restore_hold_item());
+        items.extend(self.recovery_items());
+        items.extend(self.setup_items());
+        items.extend(self.continuation_items());
+        let task_items = self
+            .tasks
+            .iter()
+            .filter_map(|task| self.task_item(task, &items))
+            .collect::<Vec<_>>();
+        items.extend(task_items);
+        let mut seen = HashSet::new();
+        items.retain(|item| seen.insert(item.id.clone()));
+        items.sort_by_key(|item| item.category);
+        items
+    }
+
+    fn permission_items(&self) -> impl Iterator<Item = AttentionItem> + '_ {
+        self.permission_requests
+            .iter()
+            .filter(|request| request.state == "pending")
+            .map(|request| AttentionItem {
+                id: format!("permission_request:{}", request.id),
+                category: AttentionCategory::Permission,
+                title: format!("{} · {}", request.task_id, request.tool_name),
+                reason: format!(
+                    "The {} role ({}) is waiting for a permission decision.",
+                    request.role.to_string().replace('_', " "),
+                    request.provider
+                ),
+                target: Some(AttentionTarget::PermissionRequest {
+                    project_id: request.project_id.clone(),
+                    task_id: request.task_id.clone(),
+                    attempt_id: request.attempt_id.clone(),
+                    session_id: request.session_id.clone(),
+                    request_id: request.id.clone(),
+                    request_revision: request.revision,
+                }),
+                held_tasks: Vec::new(),
+            })
+    }
+
+    fn restore_hold_item(&self) -> Option<AttentionItem> {
+        let hold = self.decisions.iter().find(|decision| {
+            decision.subject.recovery_id.as_deref() == Some("database-restore-hold")
+        })?;
+        let held = |task: &&TaskDto| {
+            hold.prerequisites
+                .iter()
+                .any(|item| json_text(&item.evidence, "task_id") == Some(task.id.as_str()))
+        };
+        Some(AttentionItem {
+            id: "restore_hold".into(),
+            category: AttentionCategory::Recovery,
+            title: "Instance restore hold · offline release required".into(),
+            reason: hold
+                .prerequisites
+                .iter()
+                .filter(|item| item.state != DecisionEvidenceState::Satisfied)
+                .map(|item| item.message.as_deref().unwrap_or(&item.code))
+                .collect::<Vec<_>>()
+                .join("; "),
+            target: None,
+            held_tasks: self.tasks.iter().filter(held).map(task_target).collect(),
+        })
+    }
+
+    fn recovery_items(&self) -> impl Iterator<Item = AttentionItem> + '_ {
+        self.recovery
+            .iter()
+            .filter(|record| json_text(record, "state") == Some("attention_required"))
+            .filter_map(|record| {
+                let recovery_id =
+                    json_text(record, "id").filter(|id| *id != "database-restore-hold")?;
+                let attempt_id = json_text(record, "attempt_id");
+                let (subject, target) = match self.setup_owning_recovery(recovery_id) {
+                    Some(setup) => {
+                        let project_id = json_text(setup, "project_id").unwrap_or_default();
+                        let project = self.project(project_id);
+                        (
+                            format!(
+                                "{} setup",
+                                project.map_or(project_id, |item| item.display_name.as_str())
+                            ),
+                            json_text(setup, "setup_operation_id")
+                                .and_then(|id| self.setup_target(id)),
+                        )
+                    }
+                    None => match attempt_id
+                        .and_then(|id| Some((id, self.task_with_active_attempt(id)?)))
+                    {
+                        Some((attempt_id, task)) => (
+                            task.id.clone(),
+                            Some(AttentionTarget::RecoveryRecord {
+                                project_id: task.project_id.clone(),
+                                task_id: task.id.clone(),
+                                attempt_id: attempt_id.to_owned(),
+                                recovery_id: recovery_id.to_owned(),
+                            }),
+                        ),
+                        None => (
+                            attempt_id.map_or("Unbound".into(), |id| format!("Attempt {id}")),
+                            None,
+                        ),
+                    },
+                };
+                let kind = record
+                    .get("detail")
+                    .and_then(|detail| json_text(detail, "kind"))
+                    .unwrap_or("process_ownership");
+                let reason = self
+                    .continuation_actions
+                    .iter()
+                    .find(|action| json_text(&action.binding, "recovery_id") == Some(recovery_id))
+                    .map_or_else(
+                        || {
+                            "Durable recovery must be resolved before automatic work can continue."
+                                .to_owned()
+                        },
+                        |action| action.reason.clone(),
+                    );
+                Some(AttentionItem {
+                    id: format!("recovery_record:{recovery_id}"),
+                    category: AttentionCategory::Recovery,
+                    title: format!("{subject} · {} recovery", kind.replace('_', " ")),
+                    reason,
+                    target,
+                    held_tasks: Vec::new(),
+                })
+            })
+    }
+
+    fn setup_items(&self) -> impl Iterator<Item = AttentionItem> + '_ {
+        self.projects
+            .iter()
+            .filter(|project| json_text(&project.trip, "readiness") != Some("ready"))
+            .map(|project| AttentionItem {
+                id: format!("project_setup:{}", project.id),
+                category: if json_text(&project.trip, "readiness") == Some("recovery_required") {
+                    AttentionCategory::Recovery
+                } else {
+                    AttentionCategory::Compatibility
+                },
+                title: format!("{} · project setup", project.display_name),
+                reason: json_text(&project.trip, "reason")
+                    .unwrap_or("Project setup has not been inspected.")
+                    .to_owned(),
+                target: Some(AttentionTarget::ProjectSetup {
+                    project_id: project.id.clone(),
+                    setup_operation_id: json_text(&project.trip, "setup_operation_id")
+                        .map(str::to_owned),
+                }),
+                held_tasks: Vec::new(),
+            })
+    }
+
+    fn continuation_items(&self) -> Vec<AttentionItem> {
+        let open_recoveries = self
+            .recovery
+            .iter()
+            .filter(|record| json_text(record, "state") == Some("attention_required"))
+            .filter_map(|record| json_text(record, "id"))
+            .collect::<HashSet<_>>();
+        let unready_projects = self
+            .projects
+            .iter()
+            .filter(|project| json_text(&project.trip, "readiness") != Some("ready"))
+            .map(|project| project.id.as_str())
+            .collect::<HashSet<_>>();
+        self.continuation_actions
+            .iter()
+            .filter(|action| {
+                action.owner != "service" || action.waiting_for.is_some() || action.enabled
+            })
+            // Projected only for an attempt awaiting this authorization, which
+            // already has its own decision item.
+            .filter(|action| {
+                !matches!(action.kind, ContinuationActionKind::AuthorizeImplementation)
+            })
+            .filter(|action| {
+                !json_text(&action.binding, "recovery_id")
+                    .is_some_and(|id| open_recoveries.contains(id))
+            })
+            .filter_map(|action| {
+                let target = self.continuation_target(action);
+                match &target {
+                    Some(AttentionTarget::ProjectSetup { project_id, .. })
+                        if unready_projects.contains(project_id.as_str()) =>
+                    {
+                        None
+                    }
+                    _ => Some(continuation_item(action, target)),
+                }
+            })
+            .collect()
+    }
+
+    fn continuation_target(&self, action: &ContinuationAction) -> Option<AttentionTarget> {
+        let binding = &action.binding;
+        if let Some(setup_operation_id) = json_text(binding, "setup_operation_id") {
+            return self.setup_target(setup_operation_id);
+        }
+        if let Some(session_id) = json_text(binding, "session_id") {
+            let session = self
+                .sessions
+                .iter()
+                .find(|session| json_text(session, "id") == Some(session_id))?;
+            let Some(task) = json_text(session, "task_id").and_then(|id| self.task(id)) else {
+                return json_text(session, "setup_operation_id")
+                    .and_then(|id| self.setup_target(id));
+            };
+            return Some(AttentionTarget::Session {
+                project_id: task.project_id.clone(),
+                task_id: task.id.clone(),
+                attempt_id: json_text(session, "attempt_id")?.to_owned(),
+                session_id: session_id.to_owned(),
+                role_generation_id: json_text(session, "role_generation_id")?.to_owned(),
+            });
+        }
+        let attempt_id = json_text(binding, "attempt_id");
+        let task = json_text(binding, "task_id")
+            .and_then(|id| self.task(id))
+            .or_else(|| attempt_id.and_then(|id| self.task_with_active_attempt(id)));
+        if let Some(task) = task {
+            return match attempt_id {
+                Some(attempt_id) => attempt_target(task, attempt_id),
+                None => Some(AttentionTarget::Task(task_target(task))),
+            };
+        }
+        let project = json_text(binding, "project_id").and_then(|id| self.project(id))?;
+        Some(AttentionTarget::ProjectSetup {
+            project_id: project.id.clone(),
+            setup_operation_id: json_text(&project.trip, "setup_operation_id").map(str::to_owned),
+        })
+    }
+
+    fn task_item(&self, task: &TaskDto, listed: &[AttentionItem]) -> Option<AttentionItem> {
+        let attempt_id = active_attempt_id(task);
+        // Acceptance and cancellation end the task but keep the attempt's last
+        // phase, which is then history rather than a pending decision.
+        let terminal = task.archived || matches!(task.lifecycle.as_str(), "done" | "cancelled");
+        let phase = task
+            .active_attempt
+            .as_ref()
+            .and_then(|attempt| json_text(attempt, "phase"))
+            .filter(|_| !terminal);
+        let task_scope = || Some(AttentionTarget::Task(task_target(task)));
+        let (id, category, reason, target) = match (phase, task.attention.as_str()) {
+            (Some(phase @ "awaiting_plan_approval"), _) => (
+                format!("attempt:{}:{phase}", attempt_id?),
+                AttentionCategory::Decision,
+                "The reviewed plan is waiting for your approval.".to_owned(),
+                attempt_target(task, attempt_id?),
+            ),
+            (Some(phase @ "awaiting_implementation_authorization"), _) => (
+                format!("attempt:{}:{phase}", attempt_id?),
+                AttentionCategory::Decision,
+                "The approved plan needs a separate implementation authorization.".to_owned(),
+                attempt_target(task, attempt_id?),
+            ),
+            (Some(phase @ "awaiting_human_review"), _) => (
+                format!("attempt:{}:{phase}", attempt_id?),
+                AttentionCategory::AwaitingAcceptance,
+                "The candidate passed its checks and final review and awaits your acceptance."
+                    .to_owned(),
+                attempt_target(task, attempt_id?),
+            ),
+            (_, "none") => {
+                let decision = self.decisions.iter().find(|decision| {
+                    decision.subject.task_id.as_deref() == Some(task.id.as_str())
+                        && (task.lifecycle == "ready"
+                            || decision.disposition == DecisionDisposition::RetryDeferred)
+                        && decision.disposition != DecisionDisposition::Ready
+                })?;
+                let reason = decision
+                    .primary_blocker
+                    .as_ref()
+                    .and_then(|blocker| blocker.message.clone())
+                    .unwrap_or_else(|| decision.reason_code.replace(['.', '_'], " "));
+                (
+                    format!("task:{}:decision", task.id),
+                    AttentionCategory::Blocked,
+                    reason,
+                    task_scope(),
+                )
+            }
+            (_, attention @ ("needs_recovery" | "restart_parked")) => {
+                let explained = listed.iter().any(|item| {
+                    item.category == AttentionCategory::Recovery
+                        && item.target.as_ref().and_then(attention_task_id)
+                            == Some(task.id.as_str())
+                });
+                if explained {
+                    return None;
+                }
+                (
+                    format!("task:{}:{attention}", task.id),
+                    AttentionCategory::Recovery,
+                    self.task_reason(task),
+                    task_scope(),
+                )
+            }
+            (_, attention) => (
+                format!("task:{}:{attention}", task.id),
+                match attention {
+                    "needs_human_review" => AttentionCategory::AwaitingAcceptance,
+                    "needs_input" | "needs_review_budget" => AttentionCategory::Decision,
+                    _ => AttentionCategory::Blocked,
+                },
+                self.task_reason(task),
+                task_scope(),
+            ),
+        };
+        Some(AttentionItem {
+            id,
+            category,
+            title: format!("{} · {}", task.id, task.title),
+            reason,
+            target,
+            held_tasks: Vec::new(),
+        })
+    }
+
+    fn task_reason(&self, task: &TaskDto) -> String {
+        self.decisions
+            .iter()
+            .find(|decision| decision.subject.task_id.as_deref() == Some(task.id.as_str()))
+            .and_then(|decision| decision.primary_blocker.as_ref()?.message.clone())
+            .unwrap_or_else(|| match task.attention.as_str() {
+                "needs_input" => "The task needs your input before it can continue.".into(),
+                "needs_review_budget" => {
+                    "The review allowance is exhausted and needs a human decision.".into()
+                }
+                "needs_recovery" => {
+                    "The task needs recovery before automatic work can continue.".into()
+                }
+                "restart_parked" => "The task is parked until its restart is resolved.".into(),
+                "paused" => "Automatic progress is paused for this task.".into(),
+                other => other.replace('_', " "),
+            })
+    }
+
+    fn task(&self, task_id: &str) -> Option<&TaskDto> {
+        self.tasks.iter().find(|task| task.id == task_id)
+    }
+
+    fn task_with_active_attempt(&self, attempt_id: &str) -> Option<&TaskDto> {
+        self.tasks
+            .iter()
+            .find(|task| active_attempt_id(task) == Some(attempt_id))
+    }
+
+    fn project(&self, project_id: &str) -> Option<&ProjectDto> {
+        self.projects
+            .iter()
+            .find(|project| project.id == project_id)
+    }
+
+    fn setup_owning_recovery(&self, recovery_id: &str) -> Option<&serde_json::Value> {
+        self.trip_setups.iter().find(|setup| {
+            setup
+                .get("recoveries")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|rows| {
+                    rows.iter()
+                        .any(|row| json_text(row, "record_id") == Some(recovery_id))
+                })
+        })
+    }
+
+    /// The dashboard shows only a project's current setup operation, so an
+    /// older operation's binding has no target rather than the newer setup.
+    fn setup_target(&self, setup_operation_id: &str) -> Option<AttentionTarget> {
+        let setup = self
+            .trip_setups
+            .iter()
+            .find(|setup| json_text(setup, "setup_operation_id") == Some(setup_operation_id))?;
+        let project = self.project(json_text(setup, "project_id")?)?;
+        (json_text(&project.trip, "setup_operation_id") == Some(setup_operation_id)).then(|| {
+            AttentionTarget::ProjectSetup {
+                project_id: project.id.clone(),
+                setup_operation_id: Some(setup_operation_id.to_owned()),
+            }
+        })
+    }
+}
+
+fn continuation_item(
+    action: &ContinuationAction,
+    target: Option<AttentionTarget>,
+) -> AttentionItem {
+    let (category, label) = continuation_attention(&action.kind);
+    let identity = [
+        "session_id",
+        "recovery_id",
+        "control_id",
+        "switch_intent_id",
+        "admission_id",
+        "setup_operation_id",
+        "attempt_id",
+        "task_id",
+        "project_id",
+    ]
+    .into_iter()
+    .find_map(|key| json_text(&action.binding, key))
+    .unwrap_or("instance");
+    let subject = match &target {
+        Some(AttentionTarget::ProjectSetup { .. }) => Some("project setup"),
+        Some(target) => attention_task_id(target),
+        None => json_text(&action.binding, "task_id"),
+    };
+    AttentionItem {
+        id: format!("continuation:{}:{identity}", action.operation),
+        category,
+        title: subject.map_or_else(
+            || label.to_owned(),
+            |subject| format!("{label} · {subject}"),
+        ),
+        reason: match &action.waiting_for {
+            Some(waiting_for) => format!("{} Waiting for {waiting_for}.", action.reason),
+            None => action.reason.clone(),
+        },
+        target,
+        held_tasks: Vec::new(),
+    }
+}
+
+fn continuation_attention(kind: &ContinuationActionKind) -> (AttentionCategory, &'static str) {
+    use AttentionCategory::{Blocked, Compatibility, Decision, Recovery};
+    match kind {
+        ContinuationActionKind::ExactResume => (Recovery, "Exact resume"),
+        ContinuationActionKind::FreshAccountedRetry => (Recovery, "Fresh accounted retry"),
+        ContinuationActionKind::ReplaceStaleAuthority => (Recovery, "Replace stale authority"),
+        ContinuationActionKind::WaitForExit => (Recovery, "Waiting for exit"),
+        ContinuationActionKind::WaitForCapacity => (Blocked, "Waiting for capacity"),
+        ContinuationActionKind::WaitForService => (Blocked, "Waiting for service"),
+        ContinuationActionKind::RecoverOwnership => (Recovery, "Recover ownership"),
+        ContinuationActionKind::RetryGracefulStop => (Recovery, "Retry graceful stop"),
+        ContinuationActionKind::ForceStopExactProcess => (Recovery, "Force stop exact process"),
+        ContinuationActionKind::PrepareCorrectedRuntime => {
+            (Compatibility, "Prepare corrected runtime")
+        }
+        ContinuationActionKind::AuthorizeImplementation => (Decision, "Authorize implementation"),
+        ContinuationActionKind::MigrateAttempt => (Compatibility, "Migrate attempt"),
+        ContinuationActionKind::AuthorizeAdditionalExplorer => {
+            (Decision, "Authorize additional Explorer")
+        }
+        ContinuationActionKind::RecoverSetupApply => (Recovery, "Recover setup installation"),
+        ContinuationActionKind::RecoverWorkspaceReservation => {
+            (Recovery, "Recover workspace reservation")
+        }
+        ContinuationActionKind::ContinueFreshDispatch => (Recovery, "Continue with fresh dispatch"),
+        ContinuationActionKind::StartManagedLegacyAttempt => {
+            (Compatibility, "Start managed legacy attempt")
+        }
+        ContinuationActionKind::RefreshAndReconcile => (Recovery, "Refresh and reconcile"),
+        ContinuationActionKind::AuthorizationRequired => (Decision, "Authorization required"),
+        ContinuationActionKind::TerminalIncomplete => (Recovery, "Terminal incomplete"),
+    }
+}
+
+/// Only the task's active attempt has a dashboard view; any other attempt
+/// yields no target rather than the newer one.
+fn attempt_target(task: &TaskDto, attempt_id: &str) -> Option<AttentionTarget> {
+    let attempt = task
+        .active_attempt
+        .as_ref()
+        .filter(|attempt| json_text(attempt, "id") == Some(attempt_id))?;
+    Some(AttentionTarget::Attempt {
+        project_id: task.project_id.clone(),
+        task_id: task.id.clone(),
+        attempt_id: attempt_id.to_owned(),
+        phase: json_text(attempt, "phase")?.to_owned(),
+        plan_hash: json_text(attempt, "plan_hash").map(str::to_owned),
+        candidate_hash: json_text(attempt, "candidate_hash").map(str::to_owned),
+    })
+}
+
+fn task_target(task: &TaskDto) -> TaskAttentionTarget {
+    TaskAttentionTarget {
+        project_id: task.project_id.clone(),
+        task_id: task.id.clone(),
+        task_version: task.version,
+    }
+}
+
+fn attention_task_id(target: &AttentionTarget) -> Option<&str> {
+    match target {
+        AttentionTarget::Task(target) => Some(&target.task_id),
+        AttentionTarget::Attempt { task_id, .. }
+        | AttentionTarget::Session { task_id, .. }
+        | AttentionTarget::PermissionRequest { task_id, .. }
+        | AttentionTarget::RecoveryRecord { task_id, .. } => Some(task_id),
+        AttentionTarget::ProjectSetup { .. } => None,
+    }
+}
+
+fn active_attempt_id(task: &TaskDto) -> Option<&str> {
+    task.active_attempt
+        .as_ref()
+        .and_then(|attempt| json_text(attempt, "id"))
+}
+
+fn json_text<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(serde_json::Value::as_str)
 }
 
 fn capacity_status(connection: &rusqlite::Connection) -> Result<serde_json::Value> {
@@ -4013,6 +5852,61 @@ fn resource_observations(connection: &rusqlite::Connection) -> Result<Vec<serde_
         }
     }
     Ok(recorded.into_iter().map(|(session,pid,start,last)|match live.get(&pid){Some((rss,cpu,observed))if observed==&start=>serde_json::json!({"session_id":session,"pid":pid,"native_start_marker":start,"state":"observed","rss_bytes":rss*1024,"cpu_percent":cpu,"observed_at":Utc::now().to_rfc3339()}),Some(_)=>serde_json::json!({"session_id":session,"pid":pid,"native_start_marker":start,"state":"stale_pid_reused","last_identity_observed_at":last}),None=>serde_json::json!({"session_id":session,"pid":pid,"native_start_marker":start,"state":"stale_absent","last_identity_observed_at":last})}).collect())
+}
+
+pub(crate) fn insert_task_rows(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    title: &str,
+    description: &str,
+    criteria: &[String],
+    priority: i64,
+    role_overrides: &serde_json::Value,
+    defaults: Option<&serde_json::Value>,
+    ready: bool,
+    now: &str,
+) -> Result<String> {
+    validate_task(title, criteria)?;
+    if !role_overrides.is_null() && !role_overrides.is_object() {
+        bail!("role_overrides must be a role-keyed JSON object")
+    }
+    let id = format!(
+        "AJ-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8].to_ascii_uppercase()
+    );
+    transaction.execute(
+        "INSERT INTO tasks(id,project_id,title,description,acceptance_criteria_json,priority,manual_order,lifecycle,attention,version,created_at,updated_at,role_overrides_json,ready_at)
+         VALUES(?1,?2,?3,?4,?5,?6,0,?7,'none',1,?8,?8,?9,?10)",
+        params![id,project_id,title.trim(),description,serde_json::to_string(criteria)?,priority,
+            if ready { "ready" } else { "backlog" },now,serde_json::to_string(role_overrides)?,ready.then_some(now)],
+    )?;
+    for role in [
+        "manager",
+        "explorer",
+        "plan_reviewer",
+        "implementer",
+        "code_reviewer",
+        "final_verifier",
+    ] {
+        let selected = role_overrides.get(role).or_else(|| {
+            defaults
+                .and_then(|value| value.get("roles"))
+                .and_then(|roles| roles.get(role))
+        });
+        let Some(selected) = selected else {
+            if ready {
+                bail!("Ready tasks require provider, model, and effort settings for role {role}")
+            }
+            continue;
+        };
+        let config: crate::domain::RoleOverride = serde_json::from_value(selected.clone())?;
+        if config.model.trim().is_empty() || config.effort.trim().is_empty() {
+            bail!("role {role} model and effort are required")
+        }
+        transaction.execute("INSERT INTO role_settings(id,task_id,role,revision,config_json,created_at) VALUES(?1,?2,?3,1,?4,?5)",
+            params![uuid::Uuid::new_v4().to_string(),id,role,serde_json::to_string(&config)?,now])?;
+    }
+    Ok(id)
 }
 
 fn validate_task(title: &str, criteria: &[String]) -> Result<()> {

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { command, operationId } from "../api";
 import type { Project, Task } from "../types";
 export function History(
@@ -11,27 +11,33 @@ export function History(
 ) {
   const [showArchived, setShowArchived] = useState(false);
   const [error, setError] = useState("");
+  const operationIds = useRef(new Map<string, string>());
   const toggle = async (task: Task) => {
+    const key = `${task.archived ? "restore" : "archive"}:${task.id}:${task.version}`;
+    const id = operationIds.current.get(key) || operationId();
+    operationIds.current.set(key, id);
     try {
       await command({
         kind: task.archived ? "restore" : "archive",
-        operation_id: operationId(),
+        operation_id: id,
         task_id: task.id,
         expected_version: task.version,
       });
+      operationIds.current.delete(key);
       onChanged();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
   const rows = tasks.filter((t) =>
-    t.lifecycle === "done" && (showArchived || !t.archived)
+    (t.lifecycle === "done" && (showArchived || !t.archived)) ||
+    (t.lifecycle === "backlog" && t.archived)
   );
   return (
     <section className="history">
       <header className="page-heading">
         <div>
-          <span className="eyebrow">Completed tasks</span>
+          <span className="eyebrow">Completed tasks and archived drafts</span>
           <h1>History and archive</h1>
           <p>Accepted results and evidence stay available when hidden.</p>
         </div>
@@ -56,8 +62,8 @@ export function History(
               </small>
             </button>
             <span>{task.archived ? "Archived" : "Visible"}</span>
-            <button onClick={() => toggle(task)}>
-              {task.archived ? "Restore visibility" : "Archive"}
+            <button disabled={!task.archived && !task.can_archive} onClick={() => toggle(task)}>
+              {task.archived ? "Restore" : "Archive"}
             </button>
           </article>
         ))}

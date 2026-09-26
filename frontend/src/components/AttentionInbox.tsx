@@ -1,37 +1,163 @@
 import { useMemo, useState } from "react";
 import { command, operationId } from "../api";
-import type { AppState, Task } from "../types";
+import type {
+  AppState,
+  AttentionCategory,
+  AttentionItem,
+  AttentionTarget,
+} from "../types";
+
+const attentionGroups: Array<{ category: AttentionCategory; label: string }> = [
+  { category: "permission", label: "Permissions" },
+  { category: "decision", label: "Decisions" },
+  { category: "recovery", label: "Recovery" },
+  { category: "compatibility", label: "Compatibility" },
+  { category: "blocked", label: "Blocked" },
+  { category: "awaiting_acceptance", label: "Completed · awaiting acceptance" },
+];
+
+const sameTarget = (left: AttentionTarget, right: AttentionTarget) => {
+  const entries = Object.entries(left);
+  return entries.length === Object.keys(right).length &&
+    entries.every(([key, value]) => Reflect.get(right, key) === value);
+};
+
+function unresolvedTarget(
+  state: AppState,
+  target: AttentionTarget,
+): string | undefined {
+  if (target.kind === "permission_request") {
+    const request = state.permission_requests.find((candidate) =>
+      candidate.id === target.request_id
+    );
+    return request?.state === "pending" &&
+        request.revision === target.request_revision
+      ? undefined
+      : "the permission request was already decided or changed.";
+  }
+  if (target.kind === "project_setup") {
+    const project = state.projects.find((candidate) =>
+      candidate.id === target.project_id
+    );
+    if (!project) return "the project is no longer registered.";
+    return (project.trip?.setup_operation_id ?? null) ===
+        target.setup_operation_id
+      ? undefined
+      : "a different setup operation is now current.";
+  }
+  const task = state.tasks.find((candidate) =>
+    candidate.id === target.task_id &&
+    candidate.project_id === target.project_id
+  );
+  if (!task) return "the task is no longer shown.";
+  const attempt = task.active_attempt;
+  switch (target.kind) {
+    case "task":
+      return task.version === target.task_version
+        ? undefined
+        : "the task changed.";
+    case "attempt":
+      return attempt?.id === target.attempt_id &&
+          attempt.phase === target.phase &&
+          (attempt.plan_hash ?? null) === target.plan_hash &&
+          (attempt.candidate_hash ?? null) === target.candidate_hash
+        ? undefined
+        : "a newer attempt or decision replaced it.";
+    case "session": {
+      const session = state.active_sessions.find((candidate) =>
+        candidate.id === target.session_id
+      );
+      return session?.task_id === target.task_id &&
+          session.attempt_id === target.attempt_id &&
+          session.role_generation_id === target.role_generation_id
+        ? undefined
+        : "the session was replaced.";
+    }
+    case "recovery_record":
+      return attempt?.id === target.attempt_id &&
+          state.recovery.some((record) =>
+            record.id === target.recovery_id &&
+            record.attempt_id === target.attempt_id &&
+            record.state === "attention_required"
+          )
+        ? undefined
+        : "the recovery record was resolved or its attempt was superseded.";
+  }
+}
+
+/**
+ * Why `target`, offered by `item`, cannot be opened exactly in `state`; an
+ * old binding is refused rather than retargeted to a newer entity.
+ */
+export function attentionTargetProblem(
+  state: AppState,
+  item: AttentionItem,
+  target: AttentionTarget,
+): string | undefined {
+  const current = state.attention.find((candidate) => candidate.id === item.id);
+  if (!current) return "it is no longer in the attention list.";
+  const offered = [
+    current.target,
+    ...current.held_tasks.map((held): AttentionTarget => ({
+      kind: "task",
+      ...held,
+    })),
+  ];
+  if (
+    !offered.some((candidate) =>
+      candidate !== null && sameTarget(candidate, target)
+    )
+  ) return "its target was replaced.";
+  return unresolvedTarget(state, target);
+}
+
+// Panels mark their focus container with `data-attention-target="<kind>:<id>"`.
+const attentionMarker = (target: AttentionTarget) => {
+  switch (target.kind) {
+    case "task":
+      return `task:${target.task_id}`;
+    case "attempt":
+      return `attempt:${target.attempt_id}`;
+    case "session":
+      return `session:${target.session_id}`;
+    case "permission_request":
+      return `permission_request:${target.request_id}`;
+    case "recovery_record":
+      return `recovery_record:${target.recovery_id}`;
+    case "project_setup":
+      return `project_setup:${target.project_id}`;
+  }
+};
+
+/** The rendered element marked for exactly `target`; no other panel stands in. */
+export function attentionFocusElement(
+  target: AttentionTarget,
+): HTMLElement | undefined {
+  const marker = attentionMarker(target);
+  return [...document.querySelectorAll<HTMLElement>("[data-attention-target]")]
+    .find((element) => element.dataset.attentionTarget === marker);
+}
 
 export function AttentionInbox(
-  { state, onSelect, onChanged, onOpenSetup = () => {} }: {
+  { state, onNavigate, onChanged }: {
     state: AppState;
-    onSelect: (task: Task) => void;
+    onNavigate: (
+      item: AttentionItem,
+      target: AttentionTarget,
+    ) => string | undefined;
     onChanged: () => void;
-    onOpenSetup?: (projectId: string) => void;
   },
 ) {
   const [message, setMessage] = useState("");
   const [target, setTarget] = useState("");
   const [error, setError] = useState("");
-  const attention = state.tasks.filter((task) =>
-    task.attention !== "none" || task.permission_waiting
-  );
-  const setupAttention = state.projects.filter((project) =>
-    project.trip && project.trip.readiness !== "ready"
-  );
-  const livenessItems = state.continuation_actions.filter((action) =>
-    action.owner !== "service" || action.waiting_for || action.enabled
-  );
-  const taskForAction = (action: typeof livenessItems[number]) => {
-    const taskId = action.binding.task_id;
-    if (typeof taskId === "string") {
-      return state.tasks.find((task) => task.id === taskId);
-    }
-    const attemptId = action.binding.attempt_id;
-    return typeof attemptId === "string"
-      ? state.tasks.find((task) => task.active_attempt?.id === attemptId)
-      : undefined;
-  };
+  const [notice, setNotice] = useState("");
+  const open = (item: AttentionItem, destination: AttentionTarget) =>
+    setNotice(onNavigate(item, destination) ?? "");
+  const projectName = (projectId: string) =>
+    state.projects.find((project) => project.id === projectId)?.display_name;
+  const taskTitle = (taskId: string) =>
+    state.tasks.find((task) => task.id === taskId)?.title;
   const targets = useMemo(() =>
     state.active_sessions
       .filter((session) =>
@@ -73,57 +199,77 @@ export function AttentionInbox(
   };
 
   return (
-    <section className="panel inbox">
+    <section className="panel inbox" aria-label="Attention inbox">
       <header>
         <h3>Attention inbox</h3>
-        <span>
-          {attention.length + setupAttention.length + livenessItems.length}
-        </span>
+        <span>{state.attention.length}</span>
       </header>
-      {attention.map((task) => (
-        <button
-          key={task.id}
-          onClick={() => onSelect(task)}
-        >
-          <strong>{task.id} · {task.title}</strong>
-          <small>
-            {task.permission_waiting
-              ? "waiting for permission"
-              : task.attention.replaceAll("_", " ")}
-          </small>
-        </button>
-      ))}
-      {setupAttention.map((project) => (
-        <button
-          key={`setup:${project.id}`}
-          onClick={() => onOpenSetup(project.id)}
-        >
-          <strong>{project.display_name} · project setup</strong>
-          <small>{project.trip?.reason}</small>
-        </button>
-      ))}
-      {livenessItems.map((action, index) => {
-        const task = taskForAction(action);
-        const projectId = action.binding.project_id;
+      {notice && (
+        <p className="attention-notice" role="status">
+          {notice}
+          <button type="button" onClick={() => setNotice("")}>Dismiss</button>
+        </p>
+      )}
+      {attentionGroups.map(({ category, label }) => {
+        const items = state.attention.filter((item) =>
+          item.category === category
+        );
+        if (!items.length) return null;
         return (
-          <button
-            key={`continuation:${action.kind}:${action.operation}:${index}`}
-            disabled={!task && typeof projectId !== "string"}
-            onClick={() => {
-              if (task) onSelect(task);
-              else if (typeof projectId === "string") onOpenSetup(projectId);
-            }}
+          <div
+            key={category}
+            className="attention-group"
+            role="group"
+            aria-label={`${label} (${items.length})`}
           >
-            <strong>{action.kind.replaceAll("_", " ")}</strong>
-            <small>
-              {action.reason}
-              {action.waiting_for ? ` Waiting for ${action.waiting_for}.` : ""}
-            </small>
-          </button>
+            <h4>
+              {label} <span>{items.length}</span>
+            </h4>
+            {items.map((item) => {
+              const { target: destination } = item;
+              const project = destination &&
+                projectName(destination.project_id);
+              return destination
+                ? (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className="attention-item"
+                    data-attention-id={item.id}
+                    onClick={() => open(item, destination)}
+                  >
+                    <strong>{item.title}</strong>
+                    <small>{item.reason}</small>
+                    {project && <em>{project}</em>}
+                  </button>
+                )
+                : (
+                  <div
+                    key={item.id}
+                    className="attention-item restore-hold-item"
+                    data-attention-id={item.id}
+                  >
+                    <strong>{item.title}</strong>
+                    <small>{item.reason}</small>
+                    {item.held_tasks.map((held) => (
+                      <button
+                        key={held.task_id}
+                        type="button"
+                        onClick={() => open(item, { kind: "task", ...held })}
+                      >
+                        {held.task_id} · {taskTitle(held.task_id)}
+                      </button>
+                    ))}
+                  </div>
+                );
+            })}
+          </div>
         );
       })}
-      {!attention.length && !setupAttention.length && !livenessItems.length && (
-        <p className="empty">No task needs a human decision.</p>
+      {!state.attention.length && (
+        <p className="empty">
+          No task needs a human decision.
+        </p>
       )}
       <div className="guidance">
         <h4>Manager guidance</h4>

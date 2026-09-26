@@ -3,7 +3,8 @@ use crate::checks::CheckService;
 use crate::config::InstancePaths;
 use crate::diagnostics::DiagnosticSink;
 use crate::domain::{
-    HumanCommand, LaunchConfig, OperationResult, ProcessIdentity, RoleContext, TripHumanAction,
+    HumanCommand, LaunchConfig, OperationResult, ProcessIdentity, RestartAdmissionV1,
+    RestartBatchMembership, RestartBatchV1, RestartCandidateResult, RoleContext, TripHumanAction,
     ValidationLaunchRequest, ValidationLaunchResult, WorkflowValidationRequest,
     ROLE_RESULT_REPORT_CONTRACT,
 };
@@ -12,18 +13,24 @@ use crate::review::ReviewService;
 use crate::roles::RoleService;
 use crate::scheduler::Scheduler;
 use crate::store::{
-    json_hash, BrowserLaunchReceipt, BrowserLaunchReservation, PreparedResumeIdentity, Store,
+    json_hash, BrowserLaunchReceipt, BrowserLaunchReservation, PreparedResumeIdentity,
+    RoleResumeCapacityError, Store,
 };
 use crate::supervisor::{SpawnFailure, Supervisor};
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::Utc;
-use rusqlite::OptionalExtension;
+use chrono::{Duration as ChronoDuration, Utc};
+use rusqlite::{OptionalExtension, Transaction};
 use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+
+#[cfg(test)]
+thread_local! {
+    static TEST_INTERRUPT_DRAIN_AFTER_CAPTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Clone)]
 pub struct Application {
@@ -41,9 +48,11 @@ pub struct Application {
     dispatch_enabled: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
     coordinator_lock: Arc<Mutex<()>>,
+    intake_lock: Arc<Mutex<()>>,
     rework_lock: Arc<Mutex<()>>,
     permission_boot_id: Arc<String>,
     permission_notify: Arc<tokio::sync::Notify>,
+    pub(crate) blocking_operations: Arc<tokio::sync::Semaphore>,
     cmux_host_ancestry: Option<Arc<crate::supervisor::CmuxHostAncestry>>,
     synthetic_dispatch_for_tests: bool,
 }
@@ -51,6 +60,30 @@ pub struct Application {
 enum BrowserLaunchDispatch {
     Launched(ValidationLaunchResult),
     Existing(serde_json::Value),
+}
+
+const MAX_RESTART_SELECTION: usize = 200;
+const MAX_RESTART_BATCH: usize = 4;
+const MAX_RESTART_REPLACEMENT_FAILURES: u8 = 3;
+const MAX_BLOCKING_OPERATIONS: usize = 16;
+
+#[derive(Clone, Debug)]
+struct RestartAdmissionTicket {
+    session_id: String,
+    attempt_id: String,
+    task_id: String,
+    role_generation_id: String,
+    expected_task_version: i64,
+    admission_id: String,
+    expected_resume_ordinal: u32,
+    prior_transcript_epoch: String,
+    automatic: bool,
+    receipt: Option<(String, String)>,
+}
+
+enum RestartAdmissionStart {
+    Started(RestartAdmissionTicket),
+    Finished(serde_json::Value),
 }
 
 fn lane_source_binding_schema() -> serde_json::Value {
@@ -174,10 +207,13 @@ fn manager_command_schemas() -> serde_json::Value {
             "properties":{
                 "candidate_hash":{"type":"string","minLength":1},
                 "config_hash":{"type":"string","minLength":1},
-                "acceptance":{"type":"array","items":{"type":"object","required":["criterion","evidence"],"properties":{"criterion":{"type":"string"},"evidence":{"type":"array","minItems":1}}}},
-                "ownership":{},"documentation":{},"test_policy":{},"readability":{}
+                "acceptance":{"type":"array","items":{"type":"object","required":["criterion","evidence"],"properties":{"criterion":{"type":"string"},"evidence":{"type":"array","minItems":1,"maxItems":64,"items":{"anyOf":[{"type":"string","minLength":1,"maxLength":4096,"pattern":"\\S"},{"type":"object","minProperties":1}]}}}}},
+                "ownership":{"type":"object","minProperties":1,"maxProperties":32},
+                "documentation":{"type":"object","minProperties":1,"maxProperties":32},
+                "test_policy":{"type":"object","minProperties":1,"maxProperties":32},
+                "readability":{"type":"object","minProperties":1,"maxProperties":32}
             },
-            "constraints":["the serialized conformance input must be at most 262144 bytes","candidate_hash and config_hash must match the current attempt and activated project configuration","acceptance rows must exactly cover task.acceptance_criteria in order and each row requires evidence","all required lanes must have yielded and all implementer writers must be quiescent"]
+            "constraints":["the serialized conformance input must be at most 262144 bytes","ownership, documentation, test_policy, and readability must each serialize to at most 16384 bytes and contain only nonblank keys with meaningful nonempty values","candidate_hash and config_hash must match the current attempt and activated project configuration","acceptance rows must exactly cover task.acceptance_criteria in order; each row requires 1 to 64 evidence items, each either a nonblank string of at most 4096 characters or a meaningful nonempty object of at most 16384 bytes","all required lanes must have yielded and all implementer writers must be quiescent"]
         }
     })
 }
@@ -185,11 +221,11 @@ fn manager_command_schemas() -> serde_json::Value {
 fn lane_yield_schema() -> serde_json::Value {
     serde_json::json!({
         "type":"object",
-        "required":["source_hashes","changed_paths","output_hash"],
+        "required":["source_hashes","changed_paths","agent_claimed_output_hash"],
         "properties":{
             "source_hashes":{"type":"object","maxProperties":4096,"additionalProperties":lane_source_binding_schema()},
             "changed_paths":{"type":"array","uniqueItems":true,"items":{"type":"string"}},
-            "output_hash":{"type":"string","pattern":"^[0-9A-Fa-f]{64}$"}
+            "agent_claimed_output_hash":{"type":"string","pattern":"^[0-9A-Fa-f]{64}$"}
         },
         "constraints":["the serialized lane-yield input must be at most 131072 bytes","the source_hashes object must exactly equal the admitted lane source hashes","changed paths must remain within owned paths and outside protected paths","only the current active generation for the exact lane may yield"]
     })
@@ -207,6 +243,22 @@ impl Application {
         executable: PathBuf,
         hooks: HookAssets,
     ) -> Result<Self> {
+        if store.compatibility_bundles.is_synthetic() {
+            bail!("use the synthetic compatibility constructor for a synthetic Store")
+        }
+        Self::new_inner(paths, store, executable, true, Some(hooks))
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_synthetic_compatibility_for_tests(
+        paths: InstancePaths,
+        store: Store,
+        executable: PathBuf,
+        hooks: HookAssets,
+    ) -> Result<Self> {
+        if !store.compatibility_bundles.is_synthetic() {
+            bail!("synthetic compatibility constructor requires a synthetic Store")
+        }
         Self::new_inner(paths, store, executable, true, Some(hooks))
     }
 
@@ -229,6 +281,9 @@ impl Application {
         synthetic_dispatch_for_tests: bool,
         synthetic_hooks: Option<HookAssets>,
     ) -> Result<Self> {
+        if store.compatibility_bundles.is_synthetic() && !synthetic_dispatch_for_tests {
+            bail!("production application cannot use a synthetic compatibility Store")
+        }
         let permission_boot_id = Arc::new(uuid::Uuid::new_v4().to_string());
         crate::permissions::expire_prior_boot(&store, permission_boot_id.as_str())?;
         let hooks = match synthetic_hooks {
@@ -250,6 +305,7 @@ impl Application {
             executable.clone(),
         );
         let checks = CheckService::new(store.clone(), supervisor.clone(), paths.artifacts.clone());
+        let dispatch_enabled = !crate::database::hold_active(&store)?;
         Ok(Self {
             paths,
             store,
@@ -262,12 +318,14 @@ impl Application {
             checks,
             executable,
             role_tokens: Arc::new(RwLock::new(HashMap::new())),
-            dispatch_enabled: Arc::new(AtomicBool::new(true)),
+            dispatch_enabled: Arc::new(AtomicBool::new(dispatch_enabled)),
             draining: Arc::new(AtomicBool::new(false)),
             coordinator_lock: Arc::new(Mutex::new(())),
+            intake_lock: Arc::new(Mutex::new(())),
             rework_lock: Arc::new(Mutex::new(())),
             permission_boot_id,
             permission_notify: Arc::new(tokio::sync::Notify::new()),
+            blocking_operations: Arc::new(tokio::sync::Semaphore::new(MAX_BLOCKING_OPERATIONS)),
             cmux_host_ancestry,
             synthetic_dispatch_for_tests,
         })
@@ -533,13 +591,27 @@ impl Application {
 
     pub fn begin_drain(&self) -> Result<serde_json::Value> {
         self.dispatch_enabled.store(false, Ordering::SeqCst);
-        self.draining.store(true, Ordering::SeqCst);
+        // A fire holding intake_lock commits before drain activation; later fires see the disabled gate.
+        {
+            let _intake = self
+                .intake_lock
+                .lock()
+                .map_err(|_| anyhow!("intake mutex is poisoned"))?;
+            self.draining.store(true, Ordering::SeqCst);
+        }
         let _guard = self
             .coordinator_lock
             .lock()
             .map_err(|_| anyhow!("coordinator mutex is poisoned"))?;
         self.supervisor.reconcile()?;
         let desired_running = crate::recovery::capture_desired_running_before_drain(&self.store)?;
+        #[cfg(test)]
+        if TEST_INTERRUPT_DRAIN_AFTER_CAPTURE.with(|armed| armed.replace(false)) {
+            bail!(
+                "injected interruption after desired-running capture: {}",
+                desired_running.len()
+            )
+        }
         let active = self.supervisor.active_session_ids()?;
         let mut interrupted = Vec::new();
         let mut already_interrupt_requested = Vec::new();
@@ -576,12 +648,43 @@ impl Application {
         )
     }
 
+    pub fn restart_preview(&self) -> Result<crate::domain::RestartPreview> {
+        crate::recovery::restart_preview(
+            &self.store,
+            self.dispatch_enabled.load(Ordering::SeqCst),
+            self.draining.load(Ordering::SeqCst),
+        )
+    }
+
     pub fn coordinator_tick(&self) -> Result<serde_json::Value> {
+        self.store
+            .require_execution_unheld("coordinator execution")?;
         let _guard = self
             .coordinator_lock
             .lock()
             .map_err(|_| anyhow!("coordinator mutex is poisoned"))?;
         crate::coordinator::tick(self)
+    }
+
+    pub fn scheduled_intake_tick(
+        &self,
+        now: chrono::DateTime<Utc>,
+        service_started_at: chrono::DateTime<Utc>,
+    ) -> Result<usize> {
+        if !self.dispatch_enabled() || self.draining.load(Ordering::SeqCst) {
+            return Ok(0);
+        }
+        if self.store.restore_hold()?.is_some() {
+            return Ok(0);
+        }
+        crate::recipes::scheduled_intake_tick_gated(
+            &self.store,
+            now,
+            service_started_at,
+            &self.intake_lock,
+            &self.dispatch_enabled,
+            &self.draining,
+        )
     }
 
     pub fn resume_restart_sessions(
@@ -593,7 +696,7 @@ impl Application {
             .coordinator_lock
             .lock()
             .map_err(|_| anyhow!("coordinator mutex is poisoned"))?;
-        self.resume_restart_sessions_inner(Some(operation_id), selected, false)
+        self.resume_restart_sessions_inner(operation_id, selected)
     }
 
     pub(crate) fn auto_resume_one(&self) -> Result<Option<serde_json::Value>> {
@@ -605,27 +708,62 @@ impl Application {
                 |row| row.get(0),
             )?
         };
-        if !enabled {
-            return Ok(None);
-        }
-        let session: Option<String> = {
+        let due = Utc::now();
+        let candidates = {
             let connection = self.store.lock()?;
-            connection.query_row(
-                "SELECT rc.session_id FROM restart_candidates rc JOIN sessions s ON s.id=rc.session_id
+            let mut statement = connection.prepare(
+                "SELECT rc.session_id,rc.requested_by,rc.state,rc.result_json
+                 FROM restart_candidates rc JOIN sessions s ON s.id=rc.session_id
                  JOIN role_generations rg ON rg.id=s.role_generation_id
                  WHERE rc.state IN ('parked','queued_capacity')
-                   AND NOT EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=rc.attempt_id
-                     AND c.kind IN ('manager_stop','manager_change')
-                     AND c.state NOT IN ('finished','cancelled','superseded','rejected'))
-                 ORDER BY CASE rg.role WHEN 'manager' THEN 0 ELSE 1 END,rc.created_at LIMIT 1",
-                [],
-                |row| row.get(0),
-            ).optional()?
+                 ORDER BY CASE rg.role WHEN 'manager' THEN 0 ELSE 1 END,rc.created_at,rc.session_id",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
         };
-        let Some(session) = session else {
+        let mut due_human = None;
+        let mut due_automatic = None;
+        for (session, requested_by, state, result_json) in candidates {
+            let result = match RestartCandidateResult::parse(&result_json).and_then(|result| {
+                result.validate_candidate_state(&state, &session)?;
+                Ok(result)
+            }) {
+                Ok(result) => result,
+                Err(_) => continue,
+            };
+            if result.restart.replacement_failures >= MAX_RESTART_REPLACEMENT_FAILURES
+                || !restart_due(&result.restart.next_due_at, &due)?
+            {
+                continue;
+            }
+            let human_member =
+                requested_by.as_deref() == Some("human") && result.restart.active_batch().is_some();
+            if human_member && due_human.is_none() {
+                due_human = Some(session);
+            } else if !human_member && due_automatic.is_none() {
+                due_automatic = Some(session);
+            }
+        }
+        let selected = due_human.map(|session| (session, false)).or_else(|| {
+            enabled
+                .then_some(due_automatic)
+                .flatten()
+                .map(|session| (session, true))
+        });
+        let Some((session, automatic)) = selected else {
             return Ok(None);
         };
-        let result = self.resume_restart_sessions_inner(None, Some(&[session]), true)?;
+        let start = self.start_restart_admission(&session, automatic, false, None)?;
+        let result = self.finish_restart_admission(start)?;
         Ok(Some(
             serde_json::json!({"action":"auto_resume","result":result}),
         ))
@@ -633,232 +771,837 @@ impl Application {
 
     fn resume_restart_sessions_inner(
         &self,
-        operation_id: Option<&str>,
+        operation_id: &str,
         selected: Option<&[String]>,
-        automatic: bool,
     ) -> Result<serde_json::Value> {
+        self.store
+            .require_execution_unheld("restart session resume")?;
         if !self.dispatch_enabled() {
             bail!("service is draining; restart resume is disabled")
         }
         if selected.is_some_and(|sessions| sessions.is_empty()) {
             bail!("Resume selected requires at least one session")
         }
-        let request = serde_json::json!({"selected":selected,"automatic":automatic});
-        let request_hash = json_hash(&request)?;
-        if let Some(operation_id) = operation_id {
-            if operation_id.trim().is_empty() {
-                bail!("operation_id is required")
-            }
-            if let Some(receipt) = self.store.operation_receipt(
-                operation_id,
-                "human_control",
-                "restart_resume",
-                &request_hash,
-            )? {
-                return Ok(receipt);
-            }
+        if operation_id.trim().is_empty() || operation_id.len() > 512 {
+            bail!("operation_id is required and must be at most 512 bytes")
         }
-        let mut ids = {
-            let connection = self.store.lock()?;
-            if let Some(selected) = selected {
-                selected.iter().take(200).cloned().collect::<Vec<_>>()
-            } else {
-                let mut statement=connection.prepare("SELECT rc.session_id FROM restart_candidates rc JOIN sessions s ON s.id=rc.session_id JOIN role_generations rg ON rg.id=s.role_generation_id WHERE rc.state IN ('parked','queued_capacity') AND NOT EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=rc.attempt_id AND c.kind IN ('manager_stop','manager_change') AND c.state NOT IN ('finished','cancelled','superseded','rejected')) ORDER BY CASE rg.role WHEN 'manager' THEN 0 ELSE 1 END,rc.created_at LIMIT 200")?;
-                let rows = statement
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                rows
-            }
-        };
+        let mut ids = Vec::new();
         let mut seen = HashSet::new();
-        ids.retain(|session| seen.insert(session.clone()));
-        let mut outcomes = Vec::new();
-        for session in ids {
-            let parked_state: Option<(String, String)> = {
-                let connection = self.store.lock()?;
-                connection
-                    .query_row(
-                        "SELECT state,reason FROM restart_candidates WHERE session_id=?1",
-                        rusqlite::params![session],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()?
-            };
-            if let Some((state, reason)) = parked_state.as_ref() {
-                if !matches!(state.as_str(), "parked" | "queued_capacity" | "failed") {
-                    outcomes.push(serde_json::json!({
-                        "session_id":session,
-                        "state":if state=="resumed"{"skipped"}else{state.as_str()},
-                        "reason":if state=="resumed"{"session was already resumed"}else{reason.as_str()},
-                    }));
-                    continue;
+        if let Some(selected) = selected {
+            for session in selected {
+                if session.trim().is_empty() || session.len() > 512 {
+                    bail!("Resume selected contains a blank or oversized session ID")
                 }
-            }
-            let admission = (|| -> Result<()> {
-                let now = chrono::Utc::now().to_rfc3339();
-                let mut connection = self.store.lock()?;
-                let tx = connection
-                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let row: Option<(String,String,String,String,bool,bool,bool,bool,bool,bool)> = tx.query_row(
-                    "SELECT rc.attempt_id,rc.task_id,rc.state,t.attention,
-                            s.status='exited' AND s.desired_running=1 AND s.native_session_id IS NOT NULL AND s.native_session_id!=''
-                              AND s.capability_identity_json IS NOT NULL AND s.validation_cell IS NULL
-                              AND EXISTS(SELECT 1 FROM capabilities current_capability
-                                WHERE current_capability.rowid=(
-                                  SELECT latest_capability.rowid FROM capabilities latest_capability
-                                  WHERE latest_capability.provider=s.provider
-                                    AND latest_capability.executable_version=s.executable_version
-                                    AND latest_capability.role=rg.role
-                                    AND latest_capability.mode='interactive_pty'
-                                  ORDER BY latest_capability.checked_at DESC,
-                                           latest_capability.rowid DESC LIMIT 1)
-                                  AND current_capability.config_hash=s.capability_key
-                                  AND current_capability.status='supported'
-                                  AND current_capability.proof_json!='{}'),
-                            a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=t.id ORDER BY latest.created_at DESC LIMIT 1)
-                              AND (a.status IN ('restart_parked','needs_input') OR (a.status='running' AND EXISTS(
-                                SELECT 1 FROM restart_candidates admitted JOIN sessions running ON running.id=admitted.session_id
-                                WHERE admitted.attempt_id=a.id AND admitted.state='resumed' AND running.status='running')))
-                              AND t.lifecycle IN ('in_progress','validation') AND t.archived_at IS NULL,
-                            rg.status='exited' AND NOT EXISTS(SELECT 1 FROM role_generations newer WHERE newer.attempt_id=a.id AND newer.role=rg.role AND newer.lane_id=rg.lane_id AND newer.generation>rg.generation),
-                            EXISTS(SELECT 1 FROM role_settings rs WHERE rs.task_id=t.id AND rs.role=rg.role AND rs.revision=rg.config_revision AND rs.effective_generation_id=rg.id)
-                              OR (rg.role='implementer' AND rg.lane_id!='default' AND EXISTS(
-                                SELECT 1 FROM lane_generations lg WHERE lg.lane_id=rg.lane_id AND lg.effective_generation_id=rg.id)),
-                            p.queue_paused=0 AND (rg.role NOT IN ('explorer','plan_reviewer','code_reviewer','final_verifier') OR rg.role='explorer' OR EXISTS(SELECT 1 FROM review_requests r WHERE r.session_id=s.id AND r.role_generation_id=rg.id AND r.delivery_state='delivered'))
-                              AND NOT EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=a.id
-                                AND c.kind IN ('manager_stop','manager_change')
-                                AND c.state NOT IN ('finished','cancelled','superseded','rejected')),
-                            EXISTS(SELECT 1 FROM restart_candidates admitted JOIN sessions running ON running.id=admitted.session_id
-                              WHERE admitted.attempt_id=a.id AND admitted.state='resumed' AND running.status='running')
-                     FROM restart_candidates rc JOIN sessions s ON s.id=rc.session_id
-                     JOIN role_generations rg ON rg.id=s.role_generation_id JOIN attempts a ON a.id=rg.attempt_id
-                     JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id WHERE rc.session_id=?1",
-                    rusqlite::params![session],
-                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
-                ).optional()?;
-                let Some((
-                    attempt,
-                    task,
-                    state,
-                    attention,
-                    binding,
-                    current_attempt,
-                    current_generation,
-                    current_config,
-                    authorized,
-                    restored_peer,
-                )) = row
-                else {
-                    bail!("session is not a durable restart candidate")
-                };
-                if !matches!(state.as_str(), "parked" | "queued_capacity" | "failed")
-                    || (automatic && state == "failed")
-                {
-                    bail!("candidate is not parked for this resume mode")
-                }
-                if !binding {
-                    bail!("exact native binding, current Supported frozen capability identity, or verified exited state is unavailable")
-                }
-                if !current_attempt {
-                    bail!("task attempt is terminal, stale, archived, or no longer parked")
-                }
-                if !current_generation {
-                    bail!("role generation was replaced or is stale")
-                }
-                if !current_config {
-                    bail!("saved policy or configuration is stale")
-                }
-                if !authorized {
-                    bail!("project queue, saved authorization, or review request does not permit resume")
-                }
-                let attention_allowed = attention == "restart_parked"
-                    || (restored_peer && attention == "none")
-                    || (!automatic && state == "failed" && attention == "resume_failed");
-                if !attention_allowed {
-                    bail!("task is paused, input-required, terminal, or no longer parked for restoration")
-                }
-                crate::trip::require_attempt_ready(&tx, &attempt, None)?;
-                tx.execute("UPDATE restart_candidates SET state='admitting',requested_by=?1,reason='serialized exact-resume admission granted',updated_at=?2 WHERE session_id=?3",rusqlite::params![if automatic{"auto"}else{"human"},now,session])?;
-                tx.execute(
-                    "UPDATE attempts SET status='running',updated_at=?1 WHERE id=?2",
-                    rusqlite::params![now, attempt],
-                )?;
-                tx.execute(
-                    "UPDATE tasks SET attention='none',updated_at=?1 WHERE id=?2",
-                    rusqlite::params![now, task],
-                )?;
-                tx.execute("UPDATE claims SET state='running',updated_at=?1 WHERE attempt_id=?2 AND state='unknown'",rusqlite::params![now,attempt])?;
-                tx.commit()?;
-                Ok(())
-            })();
-            if let Err(error) = admission {
-                let reason = format!("{error:#}");
-                let connection = self.store.lock()?;
-                connection.execute(
-                    "UPDATE restart_candidates SET state='blocked',reason=?1,result_json=?2,updated_at=?3 WHERE session_id=?4",
-                    rusqlite::params![reason,serde_json::json!({"automatic":automatic,"admission":"rejected"}).to_string(),chrono::Utc::now().to_rfc3339(),session],
-                )?;
-                outcomes.push(
-                    serde_json::json!({"session_id":session,"state":"blocked","reason":reason}),
-                );
-                continue;
-            }
-            match self.resume_role_session(&session, "") {
-                Ok(result) => {
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let connection = self.store.lock()?;
-                    connection.execute("UPDATE restart_candidates SET state='resumed',reason='exact native resume is running',result_json=?1,updated_at=?2 WHERE session_id=?3",rusqlite::params![serde_json::to_string(&result)?,now,session])?;
-                    connection.execute(
-                        "UPDATE sessions SET desired_running=0 WHERE id=?1",
-                        rusqlite::params![session],
-                    )?;
-                    outcomes.push(serde_json::json!({"session_id":session,"state":"resumed","reason":"exact native resume is running","role_generation_id":result.role_generation_id}));
-                }
-                Err(error) => {
-                    let reason = format!("{error:#}");
-                    let capacity = reason.contains("capacity");
-                    let status: String = {
-                        let connection = self.store.lock()?;
-                        connection.query_row(
-                            "SELECT status FROM sessions WHERE id=?1",
-                            rusqlite::params![session],
-                            |row| row.get(0),
-                        )?
-                    };
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let connection = self.store.lock()?;
-                    if capacity || status == "exited" {
-                        let (attempt, task): (String, String) = connection.query_row(
-                            "SELECT attempt_id,task_id FROM restart_candidates WHERE session_id=?1",
-                            rusqlite::params![session],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )?;
-                        let active_restored: bool = connection.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM restart_candidates rc JOIN sessions s ON s.id=rc.session_id WHERE rc.attempt_id=?1 AND rc.state='resumed' AND s.status='running')",
-                            rusqlite::params![attempt],
-                            |row| row.get(0),
-                        )?;
-                        let candidate_state = if capacity {
-                            "queued_capacity"
-                        } else {
-                            "failed"
-                        };
-                        connection.execute("UPDATE attempts SET status=CASE WHEN ?1 THEN 'running' WHEN ?2 THEN 'restart_parked' ELSE 'needs_input' END,updated_at=?3 WHERE id=?4",rusqlite::params![active_restored,capacity,now,attempt])?;
-                        connection.execute("UPDATE tasks SET attention=CASE WHEN ?1 AND ?2 THEN 'none' WHEN ?2 THEN 'restart_parked' ELSE 'resume_failed' END,updated_at=?3 WHERE id=?4",rusqlite::params![active_restored,capacity,now,task])?;
-                        connection.execute("UPDATE restart_candidates SET state=?1,reason=?2,result_json=?3,updated_at=?4 WHERE session_id=?5",rusqlite::params![candidate_state,reason,serde_json::json!({"automatic":automatic,"delivery":if capacity{"not_attempted"}else{"proven_nondelivery_or_preflight"}}).to_string(),now,session])?;
-                        outcomes.push(serde_json::json!({"session_id":session,"state":candidate_state,"reason":reason}));
-                    } else {
-                        connection.execute("UPDATE restart_candidates SET state='blocked',reason=?1,result_json=?2,updated_at=?3 WHERE session_id=?4",rusqlite::params![reason,serde_json::json!({"automatic":automatic,"recovery_required":true}).to_string(),now,session])?;
-                        outcomes.push(serde_json::json!({"session_id":session,"state":"blocked","reason":reason}));
+                if seen.insert(session.clone()) {
+                    ids.push(session.clone());
+                    if ids.len() > MAX_RESTART_SELECTION {
+                        bail!("Resume selected accepts at most {MAX_RESTART_SELECTION} distinct session IDs")
                     }
                 }
             }
         }
-        let result = serde_json::json!({"mode":if automatic{"auto"}else if selected.is_some(){"selected"}else{"eligible"},"outcomes":outcomes});
-        if let Some(operation_id) = operation_id {
-            let connection = self.store.lock()?;
-            connection.execute("INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at) VALUES(?1,'human_control','restart_resume',?2,?3,?4)",rusqlite::params![operation_id,request_hash,result.to_string(),chrono::Utc::now().to_rfc3339()])?;
+        let request = if selected.is_some() {
+            serde_json::json!({"mode":"selected","selected":ids})
+        } else {
+            serde_json::json!({"mode":"eligible"})
+        };
+        let request_hash = json_hash(&request)?;
+        if let Some(receipt) = self.store.operation_receipt(
+            operation_id,
+            "human_control",
+            "restart_resume",
+            &request_hash,
+        )? {
+            return Ok(receipt);
         }
+        if selected.is_some() && ids.len() == 1 {
+            let start = self.start_restart_admission(
+                &ids[0],
+                false,
+                true,
+                Some((operation_id, &request_hash)),
+            )?;
+            return self.finish_restart_admission(start);
+        }
+        self.queue_restart_batch(
+            operation_id,
+            &request_hash,
+            selected.map(|_| ids.as_slice()),
+        )
+    }
+
+    fn queue_restart_batch(
+        &self,
+        operation_id: &str,
+        request_hash: &str,
+        selected: Option<&[String]>,
+    ) -> Result<serde_json::Value> {
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.store.lock()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(receipt) = restart_receipt_in(&tx, operation_id, request_hash)? {
+            return Ok(receipt);
+        }
+        let selected_set = selected.map(|ids| ids.iter().cloned().collect::<HashSet<_>>());
+        let candidates = {
+            let mut statement = tx.prepare(
+                "SELECT rc.session_id,rg.role,rc.state,rc.reason,rc.result_json,rc.created_at
+                 FROM restart_candidates rc JOIN sessions s ON s.id=rc.session_id
+                 JOIN role_generations rg ON rg.id=s.role_generation_id
+                 ORDER BY CASE rg.role WHEN 'manager' THEN 0 ELSE 1 END,rc.created_at,rc.session_id",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let known = candidates
+            .iter()
+            .map(|candidate| candidate.0.clone())
+            .collect::<HashSet<_>>();
+        let mut queued = Vec::new();
+        let mut omitted = Vec::new();
+        let mut outcomes = Vec::new();
+        let mut accepted = Vec::new();
+        for (session, _role, state, reason, raw_result, _created_at) in candidates {
+            if selected.is_none()
+                && !matches!(state.as_str(), "parked" | "queued_capacity" | "failed")
+            {
+                continue;
+            }
+            if selected_set
+                .as_ref()
+                .is_some_and(|selection| !selection.contains(&session))
+            {
+                continue;
+            }
+            if !matches!(state.as_str(), "parked" | "queued_capacity" | "failed") {
+                omitted.push(session.clone());
+                outcomes.push(serde_json::json!({
+                    "session_id":session,
+                    "state":"omitted",
+                    "reason":if state=="resumed"{"session was already resumed"}else{reason.as_str()},
+                    "candidate_state":state,
+                }));
+                continue;
+            }
+            let result = RestartCandidateResult::parse(&raw_result).with_context(|| {
+                format!("restart candidate {session} has invalid durable accounting")
+            })?;
+            result
+                .validate_candidate_state(&state, &session)
+                .with_context(|| {
+                    format!("restart candidate {session} has invalid durable accounting")
+                })?;
+            if let Some(batch) = result.restart.active_batch() {
+                omitted.push(session.clone());
+                outcomes.push(serde_json::json!({
+                    "session_id":session,
+                    "state":"omitted",
+                    "reason":"candidate already belongs to an active restart batch",
+                    "batch_operation_id":batch.operation_id,
+                }));
+                continue;
+            }
+            let mut facts = crate::recovery::restart_session_facts(&tx, Some(&session))?;
+            let Some(facts) = facts.pop() else {
+                omitted.push(session.clone());
+                outcomes.push(serde_json::json!({"session_id":session,"state":"omitted","reason":"session is not a durable restart candidate"}));
+                continue;
+            };
+            if let Some(gate) = facts.admission_gate(false) {
+                omitted.push(session.clone());
+                outcomes.push(serde_json::json!({
+                    "session_id":session,"state":"omitted","reason":gate.message(),"reason_code":gate.reason_code()
+                }));
+                continue;
+            }
+            if let Err(error) = crate::trip::require_attempt_ready(&tx, &facts.attempt_id, None) {
+                omitted.push(session.clone());
+                outcomes.push(serde_json::json!({
+                    "session_id":session,"state":"omitted","reason":format!("{error:#}"),"reason_code":"restart.trip_not_ready"
+                }));
+                continue;
+            }
+            if accepted.len() == MAX_RESTART_BATCH {
+                omitted.push(session.clone());
+                outcomes.push(serde_json::json!({
+                    "session_id":session,"state":"omitted","reason":"bounded restart batch capacity is four sessions"
+                }));
+                continue;
+            }
+            accepted.push((session, state, raw_result, result));
+        }
+        if let Some(selected) = selected {
+            for session in selected {
+                if !known.contains(session) {
+                    omitted.push(session.clone());
+                    outcomes.push(serde_json::json!({
+                        "session_id":session,"state":"omitted","reason":"session is not a durable restart candidate"
+                    }));
+                }
+            }
+        }
+        let members = accepted
+            .iter()
+            .map(|candidate| candidate.0.clone())
+            .collect::<Vec<_>>();
+        for (index, (session, state, raw_result, mut result)) in accepted.into_iter().enumerate() {
+            result.restart.begin_batch(RestartBatchV1 {
+                operation_id: operation_id.to_owned(),
+                ordinal: u8::try_from(index + 1).expect("restart batch is bounded to four"),
+                members: members.clone(),
+                membership: RestartBatchMembership::Queued,
+            })?;
+            result.restart.next_due_at = Some(now.clone());
+            result.restart.admission = None;
+            result.set(
+                "queue",
+                serde_json::json!({"operation_id":operation_id,"ordinal":index + 1}),
+            );
+            let changed = tx.execute(
+                "UPDATE restart_candidates SET state='queued_capacity',requested_by='human',
+                        reason='queued for serialized exact-resume admission',result_json=?1,updated_at=?2
+                 WHERE session_id=?3 AND state=?4 AND result_json=?5",
+                rusqlite::params![result.encode()?, now, session, state, raw_result],
+            )?;
+            if changed != 1 {
+                bail!("restart candidate {session} changed while its batch was being recorded")
+            }
+            queued.push(session.clone());
+            outcomes.push(serde_json::json!({
+                "session_id":session,"state":"queued","reason":"queued for serialized exact-resume admission",
+                "batch_operation_id":operation_id,"ordinal":index + 1
+            }));
+        }
+        let result = restart_operation_result(
+            Some(operation_id),
+            if selected.is_some() {
+                "selected"
+            } else {
+                "eligible"
+            },
+            selected.unwrap_or_default(),
+            &queued,
+            &omitted,
+            outcomes,
+        );
+        insert_restart_receipt_in(&tx, operation_id, request_hash, &result, &now)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn start_restart_admission(
+        &self,
+        session: &str,
+        automatic: bool,
+        bypass_capacity_delay: bool,
+        receipt: Option<(&str, &str)>,
+    ) -> Result<RestartAdmissionStart> {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let mut connection = self.store.lock()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some((operation_id, request_hash)) = receipt {
+            if let Some(existing) = restart_receipt_in(&tx, operation_id, request_hash)? {
+                return Ok(RestartAdmissionStart::Finished(existing));
+            }
+        }
+        let candidate: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT state,reason,result_json FROM restart_candidates WHERE session_id=?1",
+                rusqlite::params![session],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((candidate_state, candidate_reason, raw_result)) = candidate else {
+            let outcome = serde_json::json!({
+                "session_id":session,"state":"omitted","reason":"session is not a durable restart candidate"
+            });
+            let result = restart_operation_result(
+                receipt.map(|value| value.0),
+                if automatic { "auto" } else { "selected" },
+                &[session.to_owned()],
+                &[],
+                &[session.to_owned()],
+                vec![outcome],
+            );
+            if let Some((operation_id, request_hash)) = receipt {
+                insert_restart_receipt_in(&tx, operation_id, request_hash, &result, &now_text)?;
+            }
+            tx.commit()?;
+            return Ok(RestartAdmissionStart::Finished(result));
+        };
+        let mut candidate_result =
+            RestartCandidateResult::parse(&raw_result).with_context(|| {
+                format!("restart candidate {session} has invalid durable accounting")
+            })?;
+        candidate_result
+            .validate_candidate_state(&candidate_state, session)
+            .with_context(|| {
+                format!("restart candidate {session} has invalid durable accounting")
+            })?;
+        if candidate_state == "admitting" {
+            let outcome = serde_json::json!({
+                "session_id":session,
+                "state":"omitted",
+                "reason":"an existing serialized restart admission still owns this candidate"
+            });
+            let result = restart_operation_result(
+                receipt.map(|value| value.0),
+                if automatic { "auto" } else { "selected" },
+                &[session.to_owned()],
+                &[],
+                &[session.to_owned()],
+                vec![outcome],
+            );
+            if let Some((operation_id, request_hash)) = receipt {
+                insert_restart_receipt_in(&tx, operation_id, request_hash, &result, &now_text)?;
+            }
+            tx.commit()?;
+            return Ok(RestartAdmissionStart::Finished(result));
+        }
+        if !matches!(
+            candidate_state.as_str(),
+            "parked" | "queued_capacity" | "failed"
+        ) {
+            let outcome = serde_json::json!({
+                "session_id":session,
+                "state":"omitted",
+                "reason":candidate_reason,
+                "candidate_state":candidate_state
+            });
+            let result = restart_operation_result(
+                receipt.map(|value| value.0),
+                if automatic { "auto" } else { "selected" },
+                &[session.to_owned()],
+                &[],
+                &[session.to_owned()],
+                vec![outcome],
+            );
+            if let Some((operation_id, request_hash)) = receipt {
+                insert_restart_receipt_in(&tx, operation_id, request_hash, &result, &now_text)?;
+            }
+            tx.commit()?;
+            return Ok(RestartAdmissionStart::Finished(result));
+        }
+        if !bypass_capacity_delay && !restart_due(&candidate_result.restart.next_due_at, &now)? {
+            let outcome = serde_json::json!({
+                "session_id":session,"state":"queued_capacity","reason":"restart candidate is not due yet",
+                "next_due_at":candidate_result.restart.next_due_at
+            });
+            tx.commit()?;
+            return Ok(RestartAdmissionStart::Finished(restart_operation_result(
+                receipt.map(|value| value.0),
+                if automatic { "auto" } else { "selected" },
+                &[session.to_owned()],
+                &[],
+                &[session.to_owned()],
+                vec![outcome],
+            )));
+        }
+        if let Some((operation_id, _)) = receipt {
+            if candidate_result.restart.active_batch().is_none() {
+                candidate_result.restart.begin_batch(RestartBatchV1 {
+                    operation_id: operation_id.to_owned(),
+                    ordinal: 1,
+                    members: vec![session.to_owned()],
+                    membership: RestartBatchMembership::Queued,
+                })?;
+            }
+        }
+        let mut facts = crate::recovery::restart_session_facts(&tx, Some(session))?;
+        let facts = facts
+            .pop()
+            .ok_or_else(|| anyhow!("session is not a durable restart candidate"))?;
+        let refusal = facts
+            .admission_gate(automatic)
+            .map(|gate| (gate.reason_code().to_owned(), gate.message().to_owned()))
+            .or_else(|| {
+                crate::trip::require_attempt_ready(&tx, &facts.attempt_id, None)
+                    .err()
+                    .map(|error| ("restart.trip_not_ready".to_owned(), format!("{error:#}")))
+            });
+        if let Some((reason_code, reason)) = refusal {
+            candidate_result.restart.terminalize_batch();
+            candidate_result.set(
+                "admission_rejection",
+                serde_json::json!({"reason_code":reason_code,"reason":reason}),
+            );
+            let changed = tx.execute(
+                "UPDATE restart_candidates SET state='blocked',reason=?1,result_json=?2,updated_at=?3
+                 WHERE session_id=?4 AND state=?5 AND result_json=?6",
+                rusqlite::params![
+                    reason,
+                    candidate_result.encode()?,
+                    now_text,
+                    session,
+                    candidate_state,
+                    raw_result
+                ],
+            )?;
+            if changed != 1 {
+                bail!("restart candidate changed while admission refusal was recorded")
+            }
+            let outcome = serde_json::json!({
+                "session_id":session,"state":"blocked","reason":reason,"reason_code":reason_code,
+                "prior_reason":candidate_reason
+            });
+            let result = restart_operation_result(
+                receipt.map(|value| value.0),
+                if automatic { "auto" } else { "selected" },
+                &[session.to_owned()],
+                &[],
+                &[session.to_owned()],
+                vec![outcome],
+            );
+            if let Some((operation_id, request_hash)) = receipt {
+                insert_restart_receipt_in(&tx, operation_id, request_hash, &result, &now_text)?;
+            }
+            tx.commit()?;
+            return Ok(RestartAdmissionStart::Finished(result));
+        }
+        let (prior_transcript_epoch, resume_count): (String, i64) = tx.query_row(
+            "SELECT transcript_epoch,resume_count FROM sessions WHERE id=?1",
+            rusqlite::params![session],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let expected_resume_ordinal = u32::try_from(
+            resume_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("resume ordinal overflow"))?,
+        )
+        .map_err(|_| anyhow!("resume ordinal is outside the supported range"))?;
+        let admission_id = uuid::Uuid::new_v4().to_string();
+        candidate_result.restart.admission = Some(RestartAdmissionV1 {
+            id: admission_id.clone(),
+            attempt_id: facts.attempt_id.clone(),
+            role_generation_id: facts.role_generation_id.clone(),
+            expected_task_version: facts.task_version,
+            prior_candidate_state: candidate_state.clone(),
+            prior_transcript_epoch: prior_transcript_epoch.clone(),
+            expected_resume_ordinal,
+            requested_by: if automatic { "auto" } else { "human" }.to_owned(),
+        });
+        if let Some(batch) = candidate_result.restart.batch.as_mut() {
+            if batch.membership.active() {
+                batch.membership = RestartBatchMembership::Admitting;
+            }
+        }
+        candidate_result.set(
+            "last_admission",
+            serde_json::json!({"id":admission_id,"expected_resume_ordinal":expected_resume_ordinal}),
+        );
+        let changed = tx.execute(
+            "UPDATE restart_candidates SET state='admitting',requested_by=?1,
+                    reason='serialized exact-resume admission granted',result_json=?2,updated_at=?3
+             WHERE session_id=?4 AND state=?5 AND result_json=?6",
+            rusqlite::params![
+                if automatic { "auto" } else { "human" },
+                candidate_result.encode()?,
+                now_text,
+                session,
+                candidate_state,
+                raw_result
+            ],
+        )?;
+        if changed != 1 {
+            bail!("restart candidate changed while admission authority was reserved")
+        }
+        tx.execute(
+            "UPDATE attempts SET status='running',updated_at=?1 WHERE id=?2",
+            rusqlite::params![now_text, facts.attempt_id],
+        )?;
+        tx.execute(
+            "UPDATE tasks SET attention='none',updated_at=?1 WHERE id=?2",
+            rusqlite::params![now_text, facts.task_id],
+        )?;
+        tx.execute(
+            "UPDATE claims SET state='running',updated_at=?1 WHERE attempt_id=?2 AND state='unknown'",
+            rusqlite::params![now_text, facts.attempt_id],
+        )?;
+        if let Some((operation_id, request_hash)) = receipt {
+            let reserved = restart_operation_result(
+                Some(operation_id),
+                "selected",
+                &[session.to_owned()],
+                &[],
+                &[],
+                vec![serde_json::json!({
+                    "session_id":session,"state":"admitting","admission_id":admission_id
+                })],
+            );
+            insert_restart_receipt_in(&tx, operation_id, request_hash, &reserved, &now_text)?;
+        }
+        tx.commit()?;
+        Ok(RestartAdmissionStart::Started(RestartAdmissionTicket {
+            session_id: session.to_owned(),
+            attempt_id: facts.attempt_id,
+            task_id: facts.task_id,
+            role_generation_id: facts.role_generation_id,
+            expected_task_version: facts.task_version,
+            admission_id,
+            expected_resume_ordinal,
+            prior_transcript_epoch,
+            automatic,
+            receipt: receipt.map(|(operation_id, request_hash)| {
+                (operation_id.to_owned(), request_hash.to_owned())
+            }),
+        }))
+    }
+
+    fn finish_restart_admission(&self, start: RestartAdmissionStart) -> Result<serde_json::Value> {
+        let ticket = match start {
+            RestartAdmissionStart::Started(ticket) => ticket,
+            RestartAdmissionStart::Finished(result) => return Ok(result),
+        };
+        let resume = self
+            .resume_role_session_inner(&ticket.session_id, "", None, false)
+            .and_then(browser_launch_dispatch_result);
+        self.record_restart_admission_outcome(ticket, resume)
+    }
+
+    fn record_restart_admission_outcome(
+        &self,
+        ticket: RestartAdmissionTicket,
+        resume: Result<ValidationLaunchResult>,
+    ) -> Result<serde_json::Value> {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let mut connection = self.store.lock()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: Option<(String, String)> = tx
+            .query_row(
+                "SELECT state,result_json FROM restart_candidates WHERE session_id=?1",
+                rusqlite::params![ticket.session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((candidate_state, raw_result)) = current else {
+            let result = finish_stale_restart_outcome(
+                &tx,
+                &ticket,
+                "restart candidate was removed",
+                &now_text,
+            )?;
+            tx.commit()?;
+            return Ok(result);
+        };
+        let mut candidate_result = RestartCandidateResult::parse(&raw_result)?;
+        candidate_result.validate_candidate_state(&candidate_state, &ticket.session_id)?;
+        let admission_matches = candidate_state == "admitting"
+            && candidate_result
+                .restart
+                .admission
+                .as_ref()
+                .is_some_and(|admission| {
+                    admission.id == ticket.admission_id
+                        && admission.attempt_id == ticket.attempt_id
+                        && admission.role_generation_id == ticket.role_generation_id
+                        && admission.expected_task_version == ticket.expected_task_version
+                        && admission.expected_resume_ordinal == ticket.expected_resume_ordinal
+                        && admission.prior_transcript_epoch == ticket.prior_transcript_epoch
+                });
+        if !admission_matches {
+            let result = finish_stale_restart_outcome(
+                &tx,
+                &ticket,
+                "newer restart authority replaced this admission",
+                &now_text,
+            )?;
+            tx.commit()?;
+            return Ok(result);
+        }
+        let (
+            session_status,
+            resume_count,
+            transcript_epoch,
+            generation,
+            attempt_status,
+            task_attention,
+            task_version,
+            current_configuration,
+            controls_clear,
+        ): (String, i64, String, String, String, String, i64, bool, bool) = tx.query_row(
+            "SELECT s.status,s.resume_count,s.transcript_epoch,s.role_generation_id,
+                    a.status,t.attention,t.version,
+                    EXISTS(SELECT 1 FROM role_settings setting
+                      WHERE setting.task_id=t.id AND setting.role=rg.role
+                        AND setting.revision=rg.config_revision
+                        AND setting.effective_generation_id=rg.id)
+                      OR (rg.role='implementer' AND rg.lane_id!='default' AND EXISTS(
+                        SELECT 1 FROM lane_generations lane WHERE lane.lane_id=rg.lane_id
+                          AND lane.effective_generation_id=rg.id)),
+                    NOT EXISTS(SELECT 1 FROM controls control WHERE control.attempt_id=a.id
+                      AND ((control.kind IN ('pause_now','pause_after_role','cancel')
+                            AND control.state IN ('requested','draining','recovery_required'))
+                        OR (control.kind IN ('manager_stop','manager_change')
+                            AND control.state NOT IN ('finished','cancelled','superseded','rejected'))))
+             FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
+             JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
+             WHERE s.id=?1 AND rg.attempt_id=?2 AND t.id=?3",
+            rusqlite::params![ticket.session_id, ticket.attempt_id, ticket.task_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )?;
+        let invocation: Option<(String, String)> = tx
+            .query_row(
+                "SELECT state,transcript_epoch FROM resume_invocations
+                 WHERE session_id=?1 AND resume_ordinal=?2",
+                rusqlite::params![ticket.session_id, ticket.expected_resume_ordinal],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let authority_current = attempt_status == "running"
+            && task_attention == "none"
+            && task_version == ticket.expected_task_version
+            && current_configuration
+            && controls_clear;
+        if !authority_current {
+            let result = finish_stale_restart_outcome(
+                &tx,
+                &ticket,
+                "task, attempt, control, or role-generation authority changed during exact resume",
+                &now_text,
+            )?;
+            tx.commit()?;
+            return Ok(result);
+        }
+        let exact_success = resume.as_ref().ok().is_some_and(|result| {
+            result.session_id == ticket.session_id
+                && result.role_generation_id == ticket.role_generation_id
+                && generation == ticket.role_generation_id
+                && session_status == "running"
+                && resume_count == i64::from(ticket.expected_resume_ordinal)
+                && invocation
+                    .as_ref()
+                    .is_some_and(|(state, epoch)| state == "running" && epoch == &transcript_epoch)
+        });
+        let unchanged_preflight = invocation.is_none()
+            && session_status == "exited"
+            && resume_count + 1 == i64::from(ticket.expected_resume_ordinal)
+            && transcript_epoch == ticket.prior_transcript_epoch
+            && generation == ticket.role_generation_id;
+        let proven_nondelivery = invocation.as_ref().is_some_and(|(state, _)| {
+            state == "proven_nondelivery"
+                && session_status == "exited"
+                && resume_count == i64::from(ticket.expected_resume_ordinal)
+                && transcript_epoch == ticket.prior_transcript_epoch
+                && generation == ticket.role_generation_id
+        });
+        let typed_capacity = resume
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.downcast_ref::<RoleResumeCapacityError>().is_some());
+        let (state, reason, delivery) = if exact_success {
+            (
+                "resumed",
+                "exact native resume is running".to_owned(),
+                "running",
+            )
+        } else if typed_capacity && unchanged_preflight {
+            candidate_result.restart.capacity_deferrals = candidate_result
+                .restart
+                .capacity_deferrals
+                .saturating_add(1);
+            let delay = restart_capacity_delay(candidate_result.restart.capacity_deferrals);
+            let due = now + ChronoDuration::seconds(delay);
+            candidate_result.restart.next_due_at = Some(due.to_rfc3339());
+            candidate_result.restart.admission = None;
+            if let Some(batch) = candidate_result.restart.batch.as_mut() {
+                if batch.membership.active() {
+                    batch.membership = RestartBatchMembership::Queued;
+                }
+            }
+            (
+                "queued_capacity",
+                format!(
+                    "role capacity is full for exact resume; retry deferred until {}",
+                    due.to_rfc3339()
+                ),
+                "not_attempted_capacity",
+            )
+        } else {
+            let counted = resume.is_err() && (unchanged_preflight || proven_nondelivery);
+            if counted {
+                candidate_result.restart.replacement_failures = candidate_result
+                    .restart
+                    .replacement_failures
+                    .saturating_add(1)
+                    .min(MAX_RESTART_REPLACEMENT_FAILURES);
+            }
+            candidate_result.restart.terminalize_batch();
+            let uncertain = !counted;
+            let capped =
+                candidate_result.restart.replacement_failures >= MAX_RESTART_REPLACEMENT_FAILURES;
+            let error = resume
+                .as_ref()
+                .err()
+                .map(|error| format!("{error:#}"))
+                .unwrap_or_else(|| {
+                    "resume returned success without matching durable invocation evidence"
+                        .to_owned()
+                });
+            (
+                if uncertain || capped {
+                    "blocked"
+                } else {
+                    "failed"
+                },
+                if capped {
+                    format!(
+                        "three proven preflight or nondelivery failures exhausted exact retry authority; last failure: {error}"
+                    )
+                } else if uncertain {
+                    format!("resume delivery is uncertain and cannot retry automatically: {error}")
+                } else {
+                    error
+                },
+                if uncertain {
+                    "uncertain_or_delivered"
+                } else if proven_nondelivery {
+                    "proven_nondelivery"
+                } else {
+                    "preflight_failure"
+                },
+            )
+        };
+        if exact_success {
+            candidate_result.restart.admission = None;
+            candidate_result.restart.next_due_at = None;
+            if let Some(batch) = candidate_result.restart.batch.as_mut() {
+                if batch.membership.active() {
+                    batch.membership = RestartBatchMembership::Completed;
+                }
+            }
+        }
+        candidate_result.set(
+            "last_resume_outcome",
+            serde_json::json!({
+                "admission_id":ticket.admission_id,"state":state,"delivery":delivery,
+                "expected_resume_ordinal":ticket.expected_resume_ordinal,
+                "invocation_state":invocation.as_ref().map(|value| value.0.as_str())
+            }),
+        );
+        let replacement_failures = candidate_result.restart.replacement_failures;
+        let encoded = candidate_result.encode()?;
+        let changed = tx.execute(
+            "UPDATE restart_candidates SET state=?1,reason=?2,result_json=?3,updated_at=?4
+             WHERE session_id=?5 AND state='admitting' AND result_json=?6",
+            rusqlite::params![
+                state,
+                reason,
+                encoded,
+                now_text,
+                ticket.session_id,
+                raw_result
+            ],
+        )?;
+        if changed != 1 {
+            let result = finish_stale_restart_outcome(
+                &tx,
+                &ticket,
+                "restart candidate changed before its outcome committed",
+                &now_text,
+            )?;
+            tx.commit()?;
+            return Ok(result);
+        }
+        let active_restored: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM restart_candidates rc JOIN sessions s ON s.id=rc.session_id
+             WHERE rc.attempt_id=?1 AND rc.session_id!=?2 AND rc.state='resumed' AND s.status='running')",
+            rusqlite::params![ticket.attempt_id, ticket.session_id],
+            |row| row.get(0),
+        )?;
+        match state {
+            "resumed" => {
+                tx.execute(
+                    "UPDATE sessions SET desired_running=0 WHERE id=?1 AND role_generation_id=?2",
+                    rusqlite::params![ticket.session_id, ticket.role_generation_id],
+                )?;
+                tx.execute(
+                    "UPDATE attempts SET status='running',updated_at=?1 WHERE id=?2",
+                    rusqlite::params![now_text, ticket.attempt_id],
+                )?;
+                tx.execute(
+                    "UPDATE tasks SET attention='none',updated_at=?1 WHERE id=?2",
+                    rusqlite::params![now_text, ticket.task_id],
+                )?;
+            }
+            "queued_capacity" => {
+                tx.execute(
+                    "UPDATE attempts SET status=CASE WHEN ?1 THEN 'running' ELSE 'restart_parked' END,updated_at=?2 WHERE id=?3",
+                    rusqlite::params![active_restored, now_text, ticket.attempt_id],
+                )?;
+                tx.execute(
+                    "UPDATE tasks SET attention=CASE WHEN ?1 THEN 'none' ELSE 'restart_parked' END,updated_at=?2 WHERE id=?3",
+                    rusqlite::params![active_restored, now_text, ticket.task_id],
+                )?;
+            }
+            "failed" => {
+                tx.execute(
+                    "UPDATE attempts SET status=CASE WHEN ?1 THEN 'running' ELSE 'needs_input' END,updated_at=?2 WHERE id=?3",
+                    rusqlite::params![active_restored, now_text, ticket.attempt_id],
+                )?;
+                tx.execute(
+                    "UPDATE tasks SET attention=CASE WHEN ?1 THEN 'none' ELSE 'resume_failed' END,updated_at=?2 WHERE id=?3",
+                    rusqlite::params![active_restored, now_text, ticket.task_id],
+                )?;
+            }
+            _ => {
+                tx.execute(
+                    "UPDATE attempts SET status=CASE WHEN ?1 THEN 'running' ELSE 'needs_recovery' END,updated_at=?2 WHERE id=?3",
+                    rusqlite::params![active_restored, now_text, ticket.attempt_id],
+                )?;
+                tx.execute(
+                    "UPDATE tasks SET attention=CASE WHEN ?1 THEN 'none' ELSE 'needs_recovery' END,updated_at=?2 WHERE id=?3",
+                    rusqlite::params![active_restored, now_text, ticket.task_id],
+                )?;
+                if !active_restored {
+                    tx.execute(
+                        "UPDATE claims SET state='unknown',updated_at=?1 WHERE attempt_id=?2",
+                        rusqlite::params![now_text, ticket.attempt_id],
+                    )?;
+                }
+            }
+        }
+        let outcome = serde_json::json!({
+            "session_id":ticket.session_id,"state":state,"reason":reason,"delivery":delivery,
+            "replacement_failures":replacement_failures,
+        });
+        let queued = (state == "queued_capacity").then(|| vec![ticket.session_id.clone()]);
+        let omitted = (!matches!(state, "resumed" | "queued_capacity"))
+            .then(|| vec![ticket.session_id.clone()]);
+        let result = restart_operation_result(
+            ticket.receipt.as_ref().map(|value| value.0.as_str()),
+            if ticket.automatic { "auto" } else { "selected" },
+            &[ticket.session_id.clone()],
+            queued.as_deref().unwrap_or_default(),
+            omitted.as_deref().unwrap_or_default(),
+            vec![outcome],
+        );
+        update_restart_receipt_in(&tx, &ticket, &result)?;
+        tx.commit()?;
         Ok(result)
     }
 
@@ -1426,6 +2169,7 @@ impl Application {
         &self,
         request: ValidationLaunchRequest,
     ) -> Result<ValidationLaunchResult> {
+        self.store.require_execution_unheld("validation launches")?;
         if !self.dispatch_enabled() {
             bail!("service is draining; new provider dispatch is disabled")
         }
@@ -1470,7 +2214,7 @@ impl Application {
         let session_id = uuid::Uuid::new_v4().to_string();
         let transcript_epoch = uuid::Uuid::new_v4().to_string();
         let role_token = auth::issue_secret();
-        let launch = providers::prepare_role_launch(
+        let launch = providers::prepare_role_launch_with_bundles(
             request.provider,
             request.role,
             &request.model,
@@ -1484,6 +2228,7 @@ impl Application {
             None,
             &self.hooks,
             &self.executable,
+            &self.store.compatibility_bundles,
         )?;
         self.store.reserve_validation(
             &request,
@@ -1569,6 +2314,8 @@ impl Application {
         service_instruction: Option<&str>,
         runtime_probe: bool,
     ) -> Result<ValidationLaunchResult> {
+        self.store
+            .require_execution_unheld("validation session resume")?;
         let result = self
             .resume_validation_with_instruction_inner(
                 session_id,
@@ -1674,7 +2421,7 @@ impl Application {
             bail!("runtime probe resume cannot inherit setup target read denials")
         }
         let launch = if let Some(policy) = runtime_policy.as_ref() {
-            providers::prepare_runtime_probe_role_launch(
+            providers::prepare_runtime_probe_role_launch_with_bundles(
                 prior.provider,
                 prior.role,
                 &prior.model,
@@ -1689,9 +2436,10 @@ impl Application {
                 &self.hooks,
                 &self.executable,
                 policy,
+                &self.store.compatibility_bundles,
             )?
         } else {
-            providers::prepare_role_launch_with_read_denials(
+            providers::prepare_role_launch_with_read_denials_and_bundles(
                 prior.provider,
                 prior.role,
                 &prior.model,
@@ -1706,14 +2454,16 @@ impl Application {
                 &self.hooks,
                 &self.executable,
                 &read_denials,
+                &self.store.compatibility_bundles,
             )?
         };
         let attempted = PreparedResumeIdentity::from_launch(&launch.config)?;
-        let runtime = crate::trip::CapabilityRuntime {
-            hooks: self.hooks.clone(),
-            role_socket: self.paths.role_socket.clone(),
-            executable: self.executable.clone(),
-        };
+        let runtime = crate::trip::CapabilityRuntime::from_store(
+            &self.store,
+            self.hooks.clone(),
+            self.paths.role_socket.clone(),
+            self.executable.clone(),
+        );
         let reservation = if let Some(receipt) = browser_receipt {
             self.store
                 .reserve_session_resume_with_runtime_and_browser_receipt(
@@ -1796,6 +2546,8 @@ impl Application {
         &self,
         request: WorkflowValidationRequest,
     ) -> Result<ValidationLaunchResult> {
+        self.store
+            .require_execution_unheld("workflow validation launches")?;
         if !matches!(
             request.launch.cell.as_str(),
             "L03" | "L04" | "L05" | "L06" | "L07" | "L08" | "L09" | "L10"
@@ -2077,11 +2829,12 @@ impl Application {
             task,
             &attempt,
             &repository.root,
-            &crate::trip::CapabilityRuntime {
-                hooks: self.hooks.clone(),
-                role_socket: self.paths.role_socket.clone(),
-                executable: self.executable.clone(),
-            },
+            &crate::trip::CapabilityRuntime::from_store(
+                &self.store,
+                self.hooks.clone(),
+                self.paths.role_socket.clone(),
+                self.executable.clone(),
+            ),
             &now,
         )?;
         for (kind, allowance) in [("plan", 2), ("code", 2), ("final", 1)] {
@@ -2126,15 +2879,7 @@ impl Application {
                 error.context("workflow validation policy materialization requires recovery")
             );
         }
-        let connection = self.store.lock()?;
-        connection.execute(
-            "UPDATE claims SET state='running',updated_at=?1 WHERE attempt_id=?2",
-            params![chrono::Utc::now().to_rfc3339(), attempt],
-        )?;
-        connection.execute(
-            "UPDATE attempts SET status='held',updated_at=?1 WHERE id=?2",
-            params![chrono::Utc::now().to_rfc3339(), attempt],
-        )?;
+        crate::scheduler::promote_workspace_reservation(&self.store, &workspace_id, &attempt)?;
         let _ = project;
         Ok(attempt)
     }
@@ -2144,8 +2889,9 @@ impl Application {
         session_id: &str,
         prompt: &str,
     ) -> Result<ValidationLaunchResult> {
+        self.store.require_execution_unheld("role session resume")?;
         let result = self
-            .resume_role_session_inner(session_id, prompt, None)
+            .resume_role_session_inner(session_id, prompt, None, true)
             .and_then(browser_launch_dispatch_result);
         if let Err(error) = &result {
             self.record_permanent_resume_rejection(session_id, error, None)?;
@@ -2159,6 +2905,7 @@ impl Application {
         session_id: &str,
         prompt: &str,
     ) -> Result<ValidationLaunchResult> {
+        self.store.require_execution_unheld("role session resume")?;
         let request_hash =
             json_hash(&serde_json::json!({"session_id":session_id,"prompt":prompt}))?;
         if let Some(existing) =
@@ -2173,7 +2920,7 @@ impl Application {
             input_hash: &request_hash,
             entity_id: session_id,
         };
-        let result = self.resume_role_session_inner(session_id, prompt, Some(receipt));
+        let result = self.resume_role_session_inner(session_id, prompt, Some(receipt), true);
         if let Err(error) = &result {
             self.record_permanent_resume_rejection(session_id, error, None)?;
         }
@@ -2185,6 +2932,7 @@ impl Application {
         session_id: &str,
         prompt: &str,
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
+        record_permanent_rejection: bool,
     ) -> Result<BrowserLaunchDispatch> {
         if !self.dispatch_enabled() {
             bail!("service is draining; role resume is disabled")
@@ -2262,7 +3010,7 @@ impl Application {
             &self.store,
             record["attempt_id"].as_str().unwrap_or_default(),
         )?;
-        let launch = providers::prepare_role_launch_with_read_denials(
+        let launch = providers::prepare_role_launch_with_read_denials_and_bundles(
             prior.provider,
             prior.role,
             &prior.model,
@@ -2277,6 +3025,7 @@ impl Application {
             &self.hooks,
             &self.executable,
             &read_denials,
+            &self.store.compatibility_bundles,
         )?;
         let attempted = PreparedResumeIdentity::from_launch(&launch.config)?;
         let reservation = if let Some(receipt) = browser_receipt {
@@ -2295,7 +3044,9 @@ impl Application {
         let reservation = match reservation {
             Ok(reservation) => reservation,
             Err(error) => {
-                self.record_permanent_resume_rejection(session_id, &error, Some(&attempted))?;
+                if record_permanent_rejection {
+                    self.record_permanent_resume_rejection(session_id, &error, Some(&attempted))?;
+                }
                 return Err(error);
             }
         };
@@ -2657,8 +3408,19 @@ impl Application {
             return Ok(());
         };
         let reason = format!("{error:#}");
-        self.store
-            .record_permanent_resume_rejection(session_id, category, &reason, attempted)?;
+        let compatibility = error
+            .chain()
+            .find_map(|cause| {
+                cause.downcast_ref::<crate::provider_compatibility::CompatibilityError>()
+            })
+            .map(crate::provider_compatibility::CompatibilityError::explanation);
+        self.store.record_permanent_resume_rejection(
+            session_id,
+            category,
+            &reason,
+            attempted,
+            compatibility,
+        )?;
         Ok(())
     }
 
@@ -2831,6 +3593,7 @@ impl Application {
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
         fresh_resume_rejection: Option<&serde_json::Value>,
     ) -> Result<BrowserLaunchDispatch> {
+        self.store.require_execution_unheld("role launches")?;
         let release_permit = |error: anyhow::Error, reason: &str| match self
             .store
             .release_unconsumed_launch_permits(Some(&context.permit_id), reason)
@@ -2865,7 +3628,7 @@ impl Application {
             ));
         }
         let prepared_launch = if let Some(policy) = runtime_probe_policy {
-            providers::prepare_runtime_probe_role_launch(
+            providers::prepare_runtime_probe_role_launch_with_bundles(
                 context.config.provider,
                 role,
                 &context.config.model,
@@ -2880,9 +3643,10 @@ impl Application {
                 &self.hooks,
                 &self.executable,
                 policy,
+                &self.store.compatibility_bundles,
             )
         } else {
-            providers::prepare_role_launch_with_read_denials(
+            providers::prepare_role_launch_with_read_denials_and_bundles(
                 context.config.provider,
                 role,
                 &context.config.model,
@@ -2897,6 +3661,7 @@ impl Application {
                 &self.hooks,
                 &self.executable,
                 &read_denials,
+                &self.store.compatibility_bundles,
             )
         };
         let launch = match prepared_launch {
@@ -3144,6 +3909,35 @@ impl Application {
     }
 
     pub fn execute_human_command(&self, command: &HumanCommand) -> Result<OperationResult> {
+        if let HumanCommand::ResolveRecovery {
+            operation_id,
+            recovery_id,
+            task_id,
+            attempt_id,
+            session_id,
+            ..
+        } = command
+        {
+            let connection = self.store.lock()?;
+            let receipt: Option<(String, String)> = connection.query_row(
+                "SELECT request_hash,result_json FROM operation_receipts WHERE operation_id=?1 AND actor_key='human_control' AND operation_kind='human_command'",
+                rusqlite::params![operation_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            if let Some((receipt_hash, result_json)) = receipt {
+                if receipt_hash != json_hash(command)? {
+                    bail!("operation_id was already used for another request")
+                }
+                return Ok(serde_json::from_str(&result_json)?);
+            } else {
+                crate::workflow::validate_recovery_identity(
+                    &connection,
+                    recovery_id,
+                    task_id,
+                    attempt_id,
+                    session_id.as_deref(),
+                )?;
+            }
+        }
         self.supervisor.reconcile()?;
         match command {
             HumanCommand::RetryWorkspaceReservation {
@@ -3235,11 +4029,12 @@ impl Application {
                     signal_delivery,
                 );
             }
-            let runtime = crate::trip::CapabilityRuntime {
-                hooks: self.hooks.clone(),
-                role_socket: self.paths.role_socket.clone(),
-                executable: self.executable.clone(),
-            };
+            let runtime = crate::trip::CapabilityRuntime::from_store(
+                &self.store,
+                self.hooks.clone(),
+                self.paths.role_socket.clone(),
+                self.executable.clone(),
+            );
             return crate::trip::execute_human_with_runtime(
                 &self.store,
                 &self.paths,
@@ -3256,11 +4051,12 @@ impl Application {
             expected_version,
         } = command
         {
-            let runtime = crate::trip::CapabilityRuntime {
-                hooks: self.hooks.clone(),
-                role_socket: self.paths.role_socket.clone(),
-                executable: self.executable.clone(),
-            };
+            let runtime = crate::trip::CapabilityRuntime::from_store(
+                &self.store,
+                self.hooks.clone(),
+                self.paths.role_socket.clone(),
+                self.executable.clone(),
+            );
             return crate::trip::activate_task_profile(
                 &self.store,
                 &runtime,
@@ -3278,21 +4074,35 @@ impl Application {
                 self.permission_boot_id.as_str(),
             )?;
         }
-        if let HumanCommand::ResolveRecovery {
+        let recovery_prior_receipt = if let HumanCommand::ResolveRecovery {
+            operation_id,
+            recovery_id,
+            task_id,
             attempt_id,
             session_id,
             decision,
             ..
         } = command
         {
-            if matches!(decision.as_str(), "confirm_quiescent" | "cancel") {
+            let prior_receipt: bool = self.store.lock()?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operation_receipts WHERE operation_id=?1 AND actor_key='human_control' AND operation_kind='human_command')",
+                rusqlite::params![operation_id], |row| row.get(0),
+            )?;
+            if !prior_receipt && matches!(decision.as_str(), "confirm_quiescent" | "cancel") {
                 let rework_recovery = {
                     let connection = self.store.lock()?;
+                    crate::workflow::validate_recovery_identity(
+                        &connection,
+                        recovery_id,
+                        task_id,
+                        attempt_id,
+                        session_id.as_deref(),
+                    )?;
                     let workspace_recovery: bool = connection.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=?1
+                        "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE id=?1 AND attempt_id=?2
                            AND state='attention_required'
                            AND json_extract(detail_json,'$.kind')='workspace_reservation')",
-                        rusqlite::params![attempt_id],
+                        rusqlite::params![recovery_id, attempt_id],
                         |row| row.get(0),
                     )?;
                     if workspace_recovery {
@@ -3317,29 +4127,31 @@ impl Application {
                     crate::recovery::verify_attempt_quiescent(&self.store, attempt_id)?;
                 }
             }
-        }
-        let runtime = crate::trip::CapabilityRuntime {
-            hooks: self.hooks.clone(),
-            role_socket: self.paths.role_socket.clone(),
-            executable: self.executable.clone(),
+            prior_receipt
+        } else {
+            false
         };
+        let runtime = crate::trip::CapabilityRuntime::from_store(
+            &self.store,
+            self.hooks.clone(),
+            self.paths.role_socket.clone(),
+            self.executable.clone(),
+        );
         let result = crate::workflow::execute_with_runtime(&self.store, command, Some(&runtime))?;
-        if let HumanCommand::ResolveRecovery {
-            attempt_id,
-            session_id,
-            decision,
-            ..
-        } = command
-        {
-            if decision == "confirm_quiescent" {
-                if let Some(session_id) = session_id.as_deref() {
-                    self.store
-                        .preserve_proven_nondelivery_recovery_detail(session_id)?;
+        if !recovery_prior_receipt {
+            if let HumanCommand::ResolveRecovery {
+                recovery_id,
+                session_id,
+                decision,
+                ..
+            } = command
+            {
+                if decision == "confirm_quiescent" {
+                    if let Some(session_id) = session_id.as_deref() {
+                        self.store
+                            .preserve_proven_nondelivery_recovery_detail(session_id, recovery_id)?;
+                    }
                 }
-            }
-            if decision == "confirm_quiescent" && result.state == "recovery_quiescence_confirmed" {
-                self.store
-                    .release_restart_hold_for_fresh_dispatch(attempt_id, "human_recovery")?;
             }
         }
         if matches!(
@@ -3703,10 +4515,19 @@ impl Application {
         if !eligible {
             return Ok(false);
         }
-        transaction.execute(
-            "UPDATE workspaces SET state='ready',updated_at=?1 WHERE attempt_id=?2",
+        let policy_json: String = transaction.query_row(
+            "SELECT policy_json FROM workspaces WHERE attempt_id=?1 AND state='reserved'",
+            params![attempt_id],
+            |row| row.get(0),
+        )?;
+        crate::trip::validate_materialized_policy(&policy_json)?;
+        let workspace_changed = transaction.execute(
+            "UPDATE workspaces SET state='ready',updated_at=?1 WHERE attempt_id=?2 AND state='reserved'",
             params![finished, attempt_id],
         )?;
+        if workspace_changed != 1 {
+            bail!("rework workspace changed before atomic publication")
+        }
         let moved=transaction.execute("UPDATE claims SET attempt_id=?1,task_id=?2,updated_at=?3 WHERE attempt_id=?4 AND state='running'",params![attempt_id,task,finished,parent])?;
         if moved != 1 {
             let reason = "parent repository claim is not safely transferable";
@@ -3750,6 +4571,140 @@ impl Application {
     }
 }
 
+fn restart_due(next_due_at: &Option<String>, now: &chrono::DateTime<Utc>) -> Result<bool> {
+    let Some(next_due_at) = next_due_at.as_deref() else {
+        return Ok(true);
+    };
+    let due = chrono::DateTime::parse_from_rfc3339(next_due_at)
+        .map_err(|_| anyhow!("restart candidate next_due_at is malformed"))?;
+    Ok(due.with_timezone(&Utc) <= now.clone())
+}
+
+fn restart_capacity_delay(deferrals: u32) -> i64 {
+    match deferrals {
+        0 | 1 => 2,
+        2 => 4,
+        3 => 8,
+        4 => 16,
+        5 => 30,
+        _ => 60,
+    }
+}
+
+fn restart_operation_result(
+    operation_id: Option<&str>,
+    mode: &str,
+    selected: &[String],
+    queued: &[String],
+    omitted: &[String],
+    outcomes: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let state = if outcomes.iter().any(|outcome| {
+        outcome.get("state").and_then(serde_json::Value::as_str) == Some("admitting")
+    }) {
+        "admitting"
+    } else if outcomes
+        .iter()
+        .any(|outcome| outcome.get("state").and_then(serde_json::Value::as_str) == Some("resumed"))
+    {
+        "resumed"
+    } else if !queued.is_empty() {
+        "queued"
+    } else {
+        "completed"
+    };
+    serde_json::json!({
+        "operation_id":operation_id,
+        "mode":mode,
+        "state":state,
+        "selected_ids":selected,
+        "queued_ids":queued,
+        "omitted_ids":omitted,
+        "omitted_count":omitted.len(),
+        "outcomes":outcomes,
+    })
+}
+
+fn restart_receipt_in(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    request_hash: &str,
+) -> Result<Option<serde_json::Value>> {
+    let receipt: Option<(String, String)> = tx
+        .query_row(
+            "SELECT request_hash,result_json FROM operation_receipts
+             WHERE operation_id=?1 AND actor_key='human_control' AND operation_kind='restart_resume'",
+            rusqlite::params![operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((stored_hash, result_json)) = receipt else {
+        return Ok(None);
+    };
+    if stored_hash != request_hash {
+        bail!("operation ID was already used with different input")
+    }
+    Ok(Some(serde_json::from_str(&result_json)?))
+}
+
+fn insert_restart_receipt_in(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    request_hash: &str,
+    result: &serde_json::Value,
+    now: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at)
+         VALUES(?1,'human_control','restart_resume',?2,?3,?4)",
+        rusqlite::params![operation_id, request_hash, result.to_string(), now],
+    )?;
+    Ok(())
+}
+
+fn update_restart_receipt_in(
+    tx: &Transaction<'_>,
+    ticket: &RestartAdmissionTicket,
+    result: &serde_json::Value,
+) -> Result<()> {
+    let Some((operation_id, request_hash)) = ticket.receipt.as_ref() else {
+        return Ok(());
+    };
+    let changed = tx.execute(
+        "UPDATE operation_receipts SET result_json=?1
+         WHERE operation_id=?2 AND actor_key='human_control' AND operation_kind='restart_resume'
+           AND request_hash=?3",
+        rusqlite::params![result.to_string(), operation_id, request_hash],
+    )?;
+    if changed != 1 {
+        bail!("durable restart operation receipt changed before outcome publication")
+    }
+    Ok(())
+}
+
+fn finish_stale_restart_outcome(
+    tx: &Transaction<'_>,
+    ticket: &RestartAdmissionTicket,
+    reason: &str,
+    _now: &str,
+) -> Result<serde_json::Value> {
+    let result = restart_operation_result(
+        ticket.receipt.as_ref().map(|value| value.0.as_str()),
+        if ticket.automatic { "auto" } else { "selected" },
+        &[ticket.session_id.clone()],
+        &[],
+        &[ticket.session_id.clone()],
+        vec![serde_json::json!({
+            "session_id":ticket.session_id,
+            "state":"stale_outcome_ignored",
+            "reason":reason,
+            "admission_id":ticket.admission_id,
+        })],
+    );
+    update_restart_receipt_in(tx, ticket, &result)?;
+    Ok(result)
+}
+
 fn browser_launch_dispatch_result(result: BrowserLaunchDispatch) -> Result<ValidationLaunchResult> {
     match result {
         BrowserLaunchDispatch::Launched(result) => Ok(result),
@@ -3774,6 +4729,12 @@ fn browser_launch_receipt(receipt: serde_json::Value) -> Result<ValidationLaunch
 }
 
 fn permanent_resume_rejection_category(error: &anyhow::Error) -> Option<&'static str> {
+    if let Some(compatibility) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::provider_compatibility::CompatibilityError>())
+    {
+        return Some(compatibility.category());
+    }
     const FROZEN_IDENTITY_MISMATCH: &str = "executable, hook, security policy, arguments, environment, model, or effort changed; exact resume requires a fresh accounted session";
     const MISSING_FROZEN_IDENTITY: &str =
         "session predates frozen capability identity; exact resume requires a fresh accounted session";
@@ -3914,4 +4875,262 @@ fn git(cwd: &Path, arguments: &[&str]) -> Result<String> {
         )
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+#[cfg(test)]
+mod compatibility_error_tests {
+    use super::*;
+
+    #[test]
+    fn typed_compatibility_precedes_frozen_identity_string_fallback() {
+        let error = crate::provider_compatibility::BundleSet::embedded()
+            .resolve(
+                crate::domain::Provider::Claude,
+                "unknown",
+                crate::domain::RoleKind::Manager,
+            )
+            .unwrap_err();
+        let contextual = anyhow::Error::new(error).context("frozen runtime identity changed");
+        assert_eq!(
+            permanent_resume_rejection_category(&contextual),
+            Some("provider_compatibility_unsupported")
+        );
+    }
+}
+
+#[cfg(test)]
+mod drain_interruption_tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_drain_preserves_capture_without_signalling_or_relaunching() {
+        let root = std::env::temp_dir().join(format!("llmrelay-drain-{}", uuid::Uuid::new_v4()));
+        let paths = InstancePaths::resolve(Some(root.clone())).unwrap();
+        paths.create().unwrap();
+        let store = Store::open(&paths.database).unwrap();
+        store.lock().unwrap().execute_batch(
+            "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+               VALUES('p','p','/tmp/llmrelay-drain-fixture','drain-fixture','base','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO tasks(id,project_id,title,lifecycle,created_at,updated_at)
+               VALUES('t','p','t','in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+               VALUES('a','t','context','implementation','base',1,'running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+               VALUES('g','a','manager','codex',1,1,'running','authority','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+               VALUES('settings','t','manager',1,'{}','g','2026-01-01T00:00:00Z');
+             INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,desired_running,created_at,updated_at)
+               VALUES('s','g','codex','running','{}','fixture','epoch',0,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');"
+        ).unwrap();
+        let app = Application::new(paths.clone(), store, std::env::current_exe().unwrap()).unwrap();
+        TEST_INTERRUPT_DRAIN_AFTER_CAPTURE.with(|armed| armed.set(true));
+        let error = app.begin_drain().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected interruption after desired-running capture: 1"));
+        assert!(!app.dispatch_enabled());
+        assert!(app.draining.load(Ordering::SeqCst));
+        let connection = app.store.lock().unwrap();
+        let captured: i64 = connection
+            .query_row(
+                "SELECT desired_running FROM sessions WHERE id='s'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(captured, 1);
+        let capture_events: i64 = connection.query_row("SELECT COUNT(*) FROM audit_events WHERE event_code='restart.desired_running.captured' AND json_extract(detail_json,'$.sessions[0]')='s'", [], |row| row.get(0)).unwrap();
+        assert_eq!(capture_events, 1);
+        let interrupt_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE event_code LIKE '%interrupt%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(interrupt_events, 0);
+        drop(connection);
+        drop(app);
+
+        let reopened = Store::open_current_writable(&paths.database).unwrap();
+        let candidates = crate::recovery::prepare_restart_candidates(&reopened).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0]["source"], "planned_shutdown");
+        assert_eq!(candidates[0]["state"], "skipped");
+        let reason: String = reopened
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT reason FROM restart_candidates WHERE session_id='s'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "same-generation native history is unavailable");
+        let status: String = reopened
+            .lock()
+            .unwrap()
+            .query_row("SELECT status FROM sessions WHERE id='s'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "running");
+        let quiescent: i64 = reopened.lock().unwrap().query_row(
+            "SELECT COALESCE(json_extract(exit_json,'$.process_group_quiescent'),0) FROM sessions WHERE id='s'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(quiescent, 0);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+fn assert_drain_started_or_inventory_denied(app: &Application, result: Result<serde_json::Value>) {
+    assert!(!app.dispatch_enabled());
+    assert!(app.draining.load(Ordering::SeqCst));
+    if let Err(error) = result {
+        assert!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error)
+                == Some(libc::EPERM)
+                && error.to_string() == std::io::Error::from_raw_os_error(libc::EPERM).to_string(),
+            "unexpected drain error: {error:#}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scheduled_intake_gate_tests {
+    use super::*;
+    use chrono::DateTime;
+
+    fn time(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn application_rechecks_drain_and_hold_after_discovery_and_before_each_fire() {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-intake-gate-{}", uuid::Uuid::new_v4()));
+        let paths = InstancePaths::resolve(Some(root)).unwrap();
+        paths.create().unwrap();
+        let store = Store::open(&paths.database).unwrap();
+        store.lock().unwrap().execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+               VALUES('p','p','/tmp/llmrelay-intake','intake','base','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO recipe_schedules(id,project_id,name,recipe_revision_id,cadence,anchor_utc,next_fire_utc,paused,version,created_at,updated_at)
+               VALUES('s1','p','first','revision','daily','2026-09-25T09:00:00Z','2026-09-25T09:00:00Z',0,1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'),
+                     ('s2','p','second','revision','daily','2026-09-25T09:00:00Z','2026-09-25T09:00:00Z',0,1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');"
+        ).unwrap();
+        let app = Application::new(
+            paths.clone(),
+            store.clone(),
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        let drain_app = app.clone();
+        crate::recipes::set_test_before_fire(Some(Box::new(move |_| {
+            let result = drain_app.begin_drain();
+            assert_drain_started_or_inventory_denied(&drain_app, result);
+        })));
+        assert_eq!(
+            app.scheduled_intake_tick(time("2026-09-25T09:00:00Z"), time("2026-09-26T00:00:00Z"))
+                .unwrap(),
+            0
+        );
+        crate::recipes::set_test_before_fire(None);
+        let counts = || -> (i64, i64, i64, String) {
+            store.lock().unwrap().query_row(
+                "SELECT (SELECT COUNT(*) FROM tasks),(SELECT COUNT(*) FROM recipe_schedule_fires),
+                        (SELECT COUNT(*) FROM audit_events WHERE event_code='recipe.schedule.fire'),
+                        (SELECT group_concat(next_fire_utc,',') FROM recipe_schedules ORDER BY id)",
+                [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            ).unwrap()
+        };
+        assert_eq!(
+            counts(),
+            (0, 0, 0, "2026-09-25T09:00:00Z,2026-09-25T09:00:00Z".into())
+        );
+
+        let app = Application::new(
+            paths.clone(),
+            store.clone(),
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        let held_store = store.clone();
+        crate::recipes::set_test_before_fire(Some(Box::new(move |_| {
+            held_store.lock().unwrap().execute(
+                "INSERT INTO recovery_records(id,state,detail_json,created_at,updated_at)
+                 VALUES('database-restore-hold','attention_required','{}','2026-09-25T09:00:00Z','2026-09-25T09:00:00Z')", []
+            ).unwrap();
+        })));
+        assert_eq!(
+            app.scheduled_intake_tick(time("2026-09-25T09:00:00Z"), time("2026-09-26T00:00:00Z"))
+                .unwrap(),
+            0
+        );
+        crate::recipes::set_test_before_fire(None);
+        assert_eq!(counts().0, 0);
+        assert_eq!(counts().1, 0);
+        assert_eq!(counts().2, 0);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM recovery_records WHERE id='database-restore-hold'",
+                [],
+            )
+            .unwrap();
+
+        let close_app = app.clone();
+        crate::recipes::set_test_before_fire(Some(Box::new(move |index| {
+            if index == 1 {
+                let result = close_app.begin_drain();
+                assert_drain_started_or_inventory_denied(&close_app, result);
+            }
+        })));
+        assert_eq!(
+            app.scheduled_intake_tick(time("2026-09-25T09:00:00Z"), time("2026-09-26T00:00:00Z"))
+                .unwrap(),
+            1
+        );
+        crate::recipes::set_test_before_fire(None);
+        let after = counts();
+        assert_eq!((after.0, after.1, after.2), (0, 1, 1));
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT next_fire_utc FROM recipe_schedules WHERE id='s2'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "2026-09-25T09:00:00Z"
+        );
+        let independent =
+            Application::new(paths, store.clone(), std::env::current_exe().unwrap()).unwrap();
+        let poison = independent.coordinator_lock.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("injected coordinator mutex failure");
+        })
+        .join();
+        assert!(independent.coordinator_tick().is_err());
+        assert_eq!(
+            independent
+                .scheduled_intake_tick(time("2026-09-25T09:00:00Z"), time("2026-09-26T00:00:00Z"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(counts().1, 2);
+    }
 }

@@ -302,6 +302,7 @@ pub fn begin_request(
     service_boot_id: &str,
     connection_nonce: &str,
 ) -> Result<BridgeStart> {
+    store.require_execution_unheld("permission requests")?;
     let source_tool_name = payload
         .get("tool_name")
         .and_then(serde_json::Value::as_str)
@@ -1074,6 +1075,14 @@ pub fn apply_human_decision(
     lifetime: Option<PermissionLifetime>,
     reason: &str,
 ) -> Result<OperationResult> {
+    let held: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE id='database-restore-hold' AND state='attention_required')",
+        [],
+        |row| row.get(0),
+    )?;
+    if held {
+        bail!("permission decisions are disabled by the database restore hold")
+    }
     if reason.len() > 8192 {
         bail!("permission decision reason is limited to 8192 characters")
     }

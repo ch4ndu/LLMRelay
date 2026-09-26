@@ -9,9 +9,17 @@ import { WorkSummary } from "./WorkSummary";
 import { ServiceCheckPermissionActions } from "./ApprovalInbox";
 
 export function TaskDetail(
-  { task, state, onClose, onChanged, onOpenSetup = () => {} }: {
+  {
+    task,
+    state,
+    selectedRecoveryId,
+    onClose,
+    onChanged,
+    onOpenSetup = () => {},
+  }: {
     task: Task;
     state: AppState;
+    selectedRecoveryId?: string;
     onClose: () => void;
     onChanged: () => void;
     onOpenSetup?: (projectId: string) => void;
@@ -44,7 +52,7 @@ export function TaskDetail(
       ? `${String(body.action)}:${
         String(body.attempt_id || body.task_id || "")
       }:${String(body.check_id || "")}`
-      : "";
+      : body.kind === "archive" ? `archive:${task.id}:${task.version}` : "";
     const prior = key ? commandIdentities.current.get(key) : undefined;
     const stable = reuseOperationIdentity(prior, body);
     const { id, request } = stable;
@@ -95,12 +103,29 @@ export function TaskDetail(
   const tripExplorer = state.trip_explorer || [];
   const tripLanes = state.trip_lanes || [];
   const continuationActions = state.continuation_actions || [];
+  const taskDecisions = state.decisions.filter((decision) =>
+    decision.subject.task_id === task.id
+  );
+  const workflowDecision = taskDecisions.find((decision) =>
+    !decision.reason_code.startsWith("restart.")
+  );
+  const restoreDecision = state.decisions.find((decision) =>
+    decision.subject.recovery_id === "database-restore-hold"
+  );
+  const affectedByRestore = restoreDecision?.prerequisites.some((item) =>
+    typeof item.evidence === "object" && item.evidence !== null &&
+    "task_id" in item.evidence && item.evidence.task_id === task.id
+  );
   const proposals = state.controls.filter((value) =>
     value.attempt_id === attempt?.id && value.kind === "transition_proposal"
   );
 
   return (
-    <aside className="detail">
+    <aside
+      className="detail"
+      data-attention-target={`task:${task.id}`}
+      tabIndex={-1}
+    >
       <header>
         <div>
           <span className="eyebrow">{task.id}</span>
@@ -116,6 +141,70 @@ export function TaskDetail(
         </button>
       </header>
       <div className="detail-scroll">
+        {task.recipe_provenance && <section className="panel">
+          <h3>Recipe provenance</h3>
+          <p>{task.recipe_provenance.recipe_name} · recipe revision {task.recipe_provenance.recipe_revision}</p>
+          <small>Exact recipe revision {task.recipe_provenance.recipe_revision_id} · profile revision {task.recipe_provenance.profile_revision_id}</small>
+          {task.recipe_provenance.schedule_id && <p>Created by schedule {task.recipe_provenance.schedule_id} at {task.recipe_provenance.scheduled_for_utc}.</p>}
+          <p className="hint">If these pins are stale, save a current profile set and recipe, archive this draft, then create a fresh draft. Restore keeps the original pins.</p>
+        </section>}
+        {!task.archived && (
+          <section className="panel">
+            <h3>Archive task</h3>
+            <p className="hint">
+              {task.can_archive
+                ? "This task can be restored from History later."
+                : "Only completed tasks and backlog drafts with no attempts or Ready history can be archived."}
+            </p>
+            <button
+              disabled={!task.can_archive}
+              onClick={() => apply({
+                kind: "archive",
+                task_id: task.id,
+                expected_version: task.version,
+              })}
+            >Archive</button>
+          </section>
+        )}
+        {affectedByRestore && (
+          <p className="warning">
+            This task is held by the instance restore fence. See the single
+            restore hold explanation in the attention inbox.
+          </p>
+        )}
+        {taskDecisions.map((decision, index) => (
+          <section
+            className="panel decision-explanation"
+            key={`${decision.reason_code}:${index}`}
+          >
+            <h3>
+              {decision.disposition.replaceAll("_", " ")} ·{" "}
+              {decision.reason_code.replaceAll("_", " ")}
+            </h3>
+            <p>
+              {decision.primary_blocker?.message ||
+                "Current recorded prerequisites are shown below."}
+            </p>
+            <small>
+              Owner: {decision.ownership.owner} ·{" "}
+              {decision.ownership.state.replaceAll("_", " ")}
+            </small>
+            {decision.prerequisites.map((item, itemIndex) => (
+              <small key={`${item.code}:${itemIndex}`}>
+                {item.state}: {item.message || item.code}
+              </small>
+            ))}
+            {decision.next_action && (
+              <small>
+                Next action:{" "}
+                {decision.next_action.operation.replaceAll("_", " ")}
+                {decision.next_action.enabled
+                  ? " (available after current revalidation)"
+                  : " (unavailable)"}
+              </small>
+            )}
+          </section>
+        ))}
         <ReviewPanel
           task={task}
           verification={selectedChecks}
@@ -129,6 +218,7 @@ export function TaskDetail(
           sessions={state.active_sessions}
           switches={state.switches}
           actions={continuationActions}
+          decision={workflowDecision}
           onOpenSetup={onOpenSetup}
           onChanged={onChanged}
         />
@@ -386,6 +476,7 @@ export function TaskDetail(
             value.attempt_id === attempt?.id &&
             value.state === "attention_required"
           )}
+          selectedRecordId={selectedRecoveryId}
           onChanged={onChanged}
         />
         <section className="panel">

@@ -56,3 +56,20 @@ The DOM suite runs without launching provider sessions. `deno task build` produc
 ## Package contents
 
 The package includes `bin/llmrelay`, the compatibility executable `bin/agenticjira`, and documentation under `share/llmrelay/`. The `docs/` subdirectory keeps the same relative layout as this source tree so the README links work after extraction. Packaging also includes the research plan and third-party notices. Local packaging does not grant release or publication authority.
+
+Provider compatibility manifests under `resources/provider-compatibility/` are
+compiled into the executable. Changing them requires a rebuild; there is no runtime
+manifest installation or remote refresh step. Fixture checks validate contract
+handling but do not qualify a native provider profile.
+
+## Matched local clients
+
+Build and distribute the CLI and embedded dashboard together. Local clients use
+an exact protocol generation rather than a historical compatibility range. After
+changing service binaries, reload browser tabs and use the matching package's CLI
+and attachment executable. See [local protocol recovery](OPERATIONS.md#local-client-protocol-compatibility).
+
+The explicit foundation-only build override does not include the normal dashboard.
+Its fallback page's legacy health probe does not declare protocol generation 1 and
+therefore reports a connection failure. Use the normal frontend build and matched
+package for dashboard operation; this limitation does not indicate a failed service.

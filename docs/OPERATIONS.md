@@ -6,6 +6,27 @@ Examples below use `llmrelay` on PATH. If you have not added it to PATH, substit
 
 ## Startup and browser authentication
 
+The dashboard waits for committed state changes instead of refreshing every two
+seconds. A separate 30-second reconciliation read refreshes process observations,
+lease expiry and other time-dependent data, and recovers missed notifications.
+Transient failures use bounded retry delays while retaining the last snapshot.
+The existing refresh/reconcile control requests a fresh authoritative read.
+After a service restart, the dashboard resets its cursor to the new service
+identity; if its browser session is no longer valid, use the current startup
+authentication flow below.
+
+The grouped Attention inbox includes items across projects. Selecting an item
+opens its exact task, attempt, session, permission, recovery record or project
+setup when that binding is still current. If it changed or its panel is absent,
+the dashboard explains the failure and refreshes once; opening an item never
+executes its action. A selected recovery record that resolves stays non-actionable
+instead of silently selecting another record. Open the task normally from the
+board, history or **Open task recovery** to return to its current recovery view.
+Recovery drafts stay with their record and are not transferred to another record.
+
+Native OS notifications are deferred; the dashboard attention rail is the
+implemented notification surface for this milestone.
+
 The default macOS data directory is `~/Library/Application Support/AgenticJira`. An explicit data directory must be absolute and must be reused for every command targeting that instance.
 
 ```sh
@@ -87,6 +108,44 @@ llmrelay import --data-dir <INSTANCE> apply --project <PROJECT_ID> \
 
 ## Stop and recover
 
+### Preview and bounded restoration
+
+Use **Restart preview** in Workspace, or run
+`llmrelay restart-preview --data-dir <INSTANCE>` against the running service, to
+inspect recorded sessions before stopping work. Preview runs only when requested.
+It does not drain, signal, reconcile, reserve a launch, or change saved state.
+It distinguishes resumable, fresh-only, blocked, uncertain, awaiting-approval and
+completed work. Running-session eligibility is conditional on verified quiescence;
+a preview never authorizes a resume. The CLI control channel retains its 1 MiB
+response limit and returns an explicit error when a complete preview exceeds it.
+It does not silently truncate the result.
+
+One distinct selected session uses the direct resume path. **Resume eligible**
+and selections with two or more distinct sessions create a durable batch of at
+most four, ordered by manager role, candidate creation time and session ID.
+Responses distinguish queued work from resumed sessions and list every omitted
+session. Replaying an operation returns its original result without adding work.
+Selected input is limited to 200 distinct IDs.
+
+The coordinator admits at most one due restoration per tick. Human batches take
+priority even when automatic restoration is off. Capacity delays persist at 2,
+4, 8, 16, 30 and then 60 seconds; a delayed member does not block other due work.
+Explicit single-session retry can bypass the delay but never ownership, approvals,
+stale identity or uncertain delivery. Capacity does not spend a replacement
+attempt. Three proven preflight or nondelivery failures exhaust the candidate's
+allowance; failed or uncertain deliveries are not automatically retried. Counters
+and consumed batch membership survive restart.
+
+### Exact recovery records
+
+Recovery commands carry the displayed `recovery_id` with the current task,
+attempt, optional session and task version. Refresh after a stale-record refusal.
+The service resolves that exact supported record; it does not select a different
+record because it is newer. Human evidence annotates the decision and does not
+replace process-ownership verification.
+
+### Drain
+
 Request a safe drain with:
 
 ```sh
@@ -153,6 +212,28 @@ Otherwise the task retains a fresh-dispatch hold: **Continue with fresh dispatch
 explicitly releases that hold through the normal control path. Settling the stop
 never automatically resumes the old native session or launches a provider.
 
+Interrupted restart admission is classified separately from the validity of the
+original request. Proven nondelivery with stale task or configuration authority
+shows `restart.admission_authority_stale`; exhausting the replacement limit keeps
+its existing limit reason. Both retain a hold rather than inventing evidence that
+a process is still running. Pending pause, cancel and manager controls still apply.
+
+Uncertain delivery has an exact recovery record. Confirming quiescence verifies
+the current invocation, not merely the absence of an earlier process from the same
+session. A same-boot spawn with only a prior-generation anchor remains held; the
+operator needs applicable current-generation evidence or verified reboot evidence.
+After successful resolution, the attempt retains an explicit fresh-Continue hold,
+including when another recovery record is resolved last. Confirmation does not
+launch work or reset retry counts. An already active lane retains its ownership.
+`restart.fresh_dispatch_hold_releasable` identifies a hold that can be explicitly
+released after the existing checks pass; other unresolved records remain blockers.
+`restart.ownership_reconciliation_required` remains a defensive explanation for
+unbound evidence, not permission to bypass it.
+
+Continue requests are idempotent by operation ID. While a Continue is pending, a
+different operation ID is refused. A queued Continue that has become ineligible
+is rejected with a recorded reason instead of advancing the task again.
+
 Browser reads have an eight-second response deadline and mutations have a
 15-second response deadline. These bound browser waiting, not the lifetime of an
 accepted operation. Selected checks return after reservation and spawn are
@@ -172,3 +253,142 @@ identity separately from the old session. Fresh recovery requires the latest
 applicable evidence itself to be Supported for that identity and role profile.
 A newer unverified or unsupported result blocks a stale dashboard action, and the
 service rechecks the evidence at final dispatch before reserving provider work.
+
+## Bundled workflow identity changes
+
+A new application build can change the bundled workflow identity even when its
+upstream revision stays the same. For example, replacing a machine-specific source
+path with portable provenance changes the manifest hash. Existing project setup,
+attempt workspaces and retained sessions remain bound to their recorded identity;
+the new build does not silently rewrite those bindings.
+
+When the dashboard reports stale project readiness, use the project setup flow to
+review and activate the current bundled workflow and complete the required fresh
+role qualification. An attempt pinned to the previous workflow or workspace policy
+still needs fresh attempt lineage through the available task recovery controls.
+Project reactivation alone does not make an old attempt or native session current.
+An exact-resume refusal requires the appropriate fresh accounted session flow and
+current capability evidence; repeatedly retrying the old binding cannot repair it.
+If no applicable recovery action is available, preserve the old task as history and
+create a new task under the current project setup. Do not edit stored hashes or
+reuse old qualification evidence to bypass these checks.
+
+## Database restore points
+
+The database commands operate on the instance selected by `--data-dir`. Current
+schema only is supported: they do not upgrade an earlier installation. Fresh
+service initialization still creates the current schema.
+
+```sh
+llmrelay database --data-dir <ABSOLUTE_INSTANCE_PATH> inspect
+llmrelay database --data-dir <ABSOLUTE_INSTANCE_PATH> check
+llmrelay database --data-dir <ABSOLUTE_INSTANCE_PATH> backup
+llmrelay database --data-dir <ABSOLUTE_INSTANCE_PATH> verify <BACKUP_DIRECTORY>
+llmrelay database --data-dir <ABSOLUTE_INSTANCE_PATH> restore <BACKUP_DIRECTORY>
+llmrelay database --data-dir <ABSOLUTE_INSTANCE_PATH> release-hold
+```
+
+Inspection, integrity checks and sanitized export do not create or migrate a
+missing database. Backup, restore and hold release require exclusive instance
+ownership: stop the service first and wait for drain to finish. A command refuses
+if the instance lock is held; it does not stop the service for you.
+
+Backup defaults to a private sibling directory named `<instance-directory>.backups`.
+`backup --backup-dir <ABSOLUTE_DIRECTORY>` selects another private location outside
+the instance and registered repositories. A restore point includes SQLite state
+and a versioned manifest with length, schema and SHA-256. SQLite's backup API
+includes committed WAL data. Only successfully published restore points are usable.
+Retention targets ten backups, thirty days and five GiB, always preserving the
+newest verified restore point. Incomplete evidence and displaced-state quarantine
+are not automatically removed.
+
+Restore replaces database state, not repository files, native provider history,
+worktrees, transcripts or external effects. The displaced database and sidecars
+are preserved under `state/database-quarantine/`. A durable journal tracks file
+replacement and the restore hold. Preserve both when investigating interruptions;
+do not manually delete the journal or move SQLite sidecars to bypass a refusal.
+
+If interruption occurred before displacement, startup and backup refuse the
+unfinished operation. Explicitly repeat `database restore` with the same backup;
+the command continues only if the backup, staging file and original live file
+bindings still match the journal. Changed evidence is a refusal, not permission
+to overwrite it. Later replacement phases are reconciled from the journal.
+
+A restored instance is held for reconciliation. Old credentials, reusable
+permission rules and automatic resume authority are invalidated. The dashboard
+may be available for inspection and safe recovery, but execution remains fenced.
+Resolve the reported process, claim, check and external-reference prerequisites,
+stop the host, and run `release-hold` offline. Success leaves projects and work
+paused: resuming normal work is a separate explicit action and requires current
+authority. Release does not restore old approvals or launch agents.
+
+The dashboard shows one instance restore-hold explanation with exact recorded
+session, claim, check, freeze and recovery blockers, plus affected-task links.
+Current boot, displaced-process, journal and external-path checks remain marked
+unobserved until offline verification. Offline release uses the same recorded
+prerequisite enumeration and still performs its current environment checks.
+A dashboard explanation cannot release the hold.
+
+If the displaced database was unreadable, LLMRelay cannot inventory all old
+processes. It records a valid OS boot identity before replacement and requires a
+verified machine reboot after that point before release, in addition to the
+other prerequisites. A reboot performed before restore does not satisfy this
+condition. The command never reboots the machine, and acknowledgment alone cannot
+release the hold. Unavailable boot evidence refuses unsafe replacement/release.
+
+## Provider compatibility explanations
+
+Role settings, project setup and diagnostics show the reviewed contract candidate,
+missing evidence and next step for a provider profile. Expand details for the pack,
+contract revision and observed version. A candidate match is not a Supported profile:
+the existing exact-profile qualification requirements still apply.
+
+Unknown provider versions cannot use a matching contract's launch or resume paths.
+Follow the displayed next step rather than repeatedly retrying the old session.
+The initial bundle names Codex CLI 0.155.1 as a candidate. The Claude bundle has no
+production version selector yet, so it directs operators to an updated LLMRelay
+release. Native role qualification is deferred; engineering fixtures do not supply
+that evidence. Manifests are shipped with the application, not downloaded or edited
+through dashboard settings.
+
+## Local client protocol compatibility
+
+The dashboard, human CLI, and cmux attachment client use protocol generation 1.
+Use the CLI packaged with the running service. The browser discovers the
+authenticated `/api/protocol` descriptor before operational requests and refreshes
+that discovery after observing a different service incarnation. Every operational
+HTTP request must declare a compatible generation and required transport features.
+The human control socket requires a compatible Hello before any business request;
+attachment connections identify themselves separately from ordinary CLI clients.
+
+A protocol refusal occurs before business dispatch. Reload the dashboard or use
+a matching packaged CLI; do not automatically restart the service or replay a
+mutation. An old or closed control connection may prevent discovery entirely.
+That does not establish whether the server is old or merely unavailable. Ordinary
+revision conflicts and uncertain mutation outcomes retain their existing refresh
+and operation-ID reconciliation behavior.
+
+These descriptors describe local transport support only. They do not qualify a
+provider, replace native capability evidence, or grant workflow or input authority.
+
+## Foreground recipe schedules
+
+In a project's Recipes page, create a daily or weekly schedule for an exact recipe
+revision. New schedules start paused. **Enable** or **Resume** arms the next strictly
+future occurrence; **Pause** stops intake. Times are canonical UTC, with a local-time
+preview; daily means 24 hours and weekly means 7 days, not a DST-aware local calendar.
+Edits reanchor to a future occurrence without changing already-created tasks.
+
+Scheduling runs only while the foreground service runs and execution is enabled,
+with drain and restore holds respected. It creates backlog drafts only, including
+when a project queue is paused. It never requests run-next, starts an attempt, grants
+approval or accepts work. Due events before this service start are recorded as missed,
+not backfilled. After a delay, at most the newest eligible occurrence creates a draft;
+earlier missed events are summarized. Schedule/fire identity prevents duplicate tasks.
+
+The page shows next fire and last outcome, including missed or skipped-ineligible
+events. Ineligible pinned configuration/checks are reported and that occurrence is
+not retried; re-save the recipe and explicitly edit the schedule to its new revision.
+Archiving a recipe pauses its schedules; archiving schedules preserves fire history.
+A profile set cannot be archived while active recipe/schedule references depend on it.
+Created tasks retain their provenance and ordinary authority checks.

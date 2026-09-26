@@ -5,14 +5,21 @@ import type { Root } from "react-dom/client";
 import { ROLES } from "./types";
 import type {
   AppState,
+  AttentionItem,
+  AttentionTarget,
   CmuxSessionSurface,
   CmuxViewOutcome,
+  DecisionExplanation,
+  PermissionRequest,
   Project,
   Session,
+  StateCursor,
+  StateWaitResult,
   Task,
   TripSetupState,
   TripTaskVerification,
 } from "./types";
+import type { LiveEnvironment, LiveStatus } from "./liveState";
 
 const window = new Window({ url: "http://127.0.0.1/" });
 for (
@@ -20,6 +27,7 @@ for (
     window,
     document: window.document,
     localStorage: window.localStorage,
+    sessionStorage: window.sessionStorage,
     Event: window.Event,
     Node: window.Node,
     HTMLElement: window.HTMLElement,
@@ -42,16 +50,967 @@ const { ApprovalInbox } = await import("./components/ApprovalInbox");
 const { ReviewPanel } = await import("./components/ReviewPanel");
 const { ResourceStatus } = await import("./components/ResourceStatus");
 const { RoleSettings } = await import("./components/RoleSettings");
+const { DiagnosticsPanel } = await import("./components/DiagnosticsPanel");
 const { RecoveryPanel } = await import("./components/RecoveryPanel");
 const { ProjectSetup } = await import("./components/ProjectSetup");
 const { ProjectPicker } = await import("./components/ProjectPicker");
 const { TaskForm } = await import("./components/TaskForm");
 const { TaskDetail } = await import("./components/TaskDetail");
+const { TaskBoard } = await import("./components/TaskBoard");
+const { History } = await import("./components/History");
+const { Recipes } = await import("./components/Recipes");
 const { WorkflowControls } = await import("./components/WorkflowControls");
 const { ModelSelector } = await import("./components/ModelSelector");
 const { Workspace } = await import("./components/Workspace");
-const { ApiError, command, transportTimeouts } = await import("./api");
+const { ApiError, ProtocolError, command, getState, transportTimeouts } = await import("./api");
+const { liveEnvironment, liveTiming, startLiveState } = await import(
+  "./liveState"
+);
+const { attentionTargetProblem } = await import("./components/AttentionInbox");
+const { App } = await import("./App");
 const nativeFetch = globalThis.fetch;
+const fixtureSource = Symbol("protocol fixture source");
+type FixtureFetch = typeof fetch & { [fixtureSource]?: typeof fetch };
+const protocolFixture = () => new Response(JSON.stringify({
+  generation: 1,
+  server_version: "fixture",
+  instance_id: "test-instance",
+  supported_features: ["http_operational_v1"],
+}), { headers: { "content-type": "application/json" } });
+let protocolFixtureResponder = () => Promise.resolve(protocolFixture());
+const wrapFetch = (source: typeof fetch): FixtureFetch => {
+  const wrapped = ((input: string | URL | Request, init?: RequestInit) =>
+    String(input) === "/api/protocol"
+      ? protocolFixtureResponder()
+      : source(input, init)) as FixtureFetch;
+  wrapped[fixtureSource] = source;
+  return wrapped;
+};
+let fixtureFetch = wrapFetch(nativeFetch);
+Object.defineProperty(globalThis, "fetch", {
+  configurable: true,
+  get: () => fixtureFetch,
+  set: (value: FixtureFetch) => {
+    fixtureFetch = wrapFetch(value[fixtureSource] ?? value);
+  },
+});
+
+Deno.test("M9 Recipes creates an exact draft and explicitly arms a paused schedule", async () => {
+  sessionStorage.clear();
+  const requests: Record<string, unknown>[] = [];
+  const opened: string[] = [];
+  let refreshes = 0;
+  const refreshed = () => { refreshes += 1; };
+  let failNextSave = false;
+  let failNextConflict = false;
+  const currentProject: Project = {
+    ...initialized,
+    trip: { ...initialized.trip!, active_config_revision_id: "config-1" },
+  };
+  const state: AppState = {
+    ...liveBase,
+    projects: [currentProject],
+    profile_sets: [{ id: "profile-1", project_id: "p1", name: "Saved roles", version: 1,
+      archived: false, revision: 1, revision_id: "profile-rev-1",
+      roles: inheritedRoles as Record<(typeof ROLES)[number], { provider: "codex"; model: string; effort: string }>,
+      config_revision_id: "config-1", configuration_hash: "hash-1" }],
+    task_recipes: [{ id: "recipe-1", project_id: "p1", name: "Review", version: 2,
+      archived: false, revision: 2, revision_id: "recipe-rev-2", title: "Review change",
+      description: "", acceptance_criteria: ["Evidence"], priority: 0,
+      profile_revision_id: "profile-rev-1", required_check_ids: ["old-check"],
+      config_revision_id: "config-1", configuration_hash: "hash-1",
+      workflow_version: "workflow-1", workflow_hash: "workflow-hash" }],
+    recipe_schedules: [{ id: "schedule-1", project_id: "p1", name: "Morning", version: 1,
+      archived: false, paused: true, recipe_revision_id: "recipe-rev-2", recipe_name: "Review",
+      recipe_config_revision_id: "config-1",
+      recipe_archived: false, cadence: "daily", anchor_utc: "2026-10-01T09:00:00Z",
+      next_fire_utc: null, last_fire: null }],
+  };
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    requests.push(body);
+    if (failNextSave) {
+      failNextSave = false;
+      throw new ApiError("unknown save outcome", 0, String(body.operation_id), true);
+    }
+    if (failNextConflict) {
+      failNextConflict = false;
+      throw new ApiError("version conflict", 409);
+    }
+    return new Response(JSON.stringify({ result: { entity_id: "AJ-created", version: 1 } }));
+  }) as typeof fetch;
+  try {
+    mount(<Recipes state={state} project={currentProject} onChanged={refreshed} onOpenTask={(id) => opened.push(id)} />);
+    field("Name", "Unsaved profile edits");
+    rerender(<Recipes state={{ ...state, revision: "2" }} project={currentProject} onChanged={noop} onOpenTask={(id) => opened.push(id)} />);
+    check(findField("Name").value === "Unsaved profile edits", "polling reset the dirty profile form");
+    click("Save profile set");
+    await settle();
+    const profileSave = requests.find((body) => body.kind === "upsert_profile_set");
+    check(profileSave?.name === "Unsaved profile edits" && profileSave.profile_set_id === null &&
+      profileSave.expected_version === null && Object.keys(profileSave.roles as object).length === 6,
+      "profile save did not submit the six-role configuration");
+    const sections = [...document.querySelectorAll("section.panel")];
+    const profilePanel = sections.find((element) => element.querySelector("h2")?.textContent === "Profile sets")!;
+    act(() => profilePanel.querySelector<HTMLButtonElement>("article button")!.click());
+    field("Name", "Edited saved roles");
+    click("Save profile set");
+    await settle();
+    check(requests.some((body) => body.kind === "upsert_profile_set" && body.profile_set_id === "profile-1" &&
+      body.expected_version === 1 && body.name === "Edited saved roles"),
+      "profile edit lost its identity or version");
+    act(() => profilePanel.querySelectorAll<HTMLButtonElement>("article button")[1].click());
+    await settle();
+    check(requests.some((body) => body.kind === "archive_profile_set" &&
+      body.profile_set_id === "profile-1" && body.expected_version === 1),
+      "profile Archive lost its identity or version");
+    const recipePanel = sections.find((element) => element.querySelector("h2")?.textContent === "Task recipes")!;
+    const recipeFields = recipePanel.querySelectorAll<HTMLInputElement>("input");
+    change(recipeFields[0], "New review");
+    change(recipeFields[1], "Review exact revision");
+    change(recipePanel.querySelector<HTMLSelectElement>("select")!, "profile-rev-1");
+    click("Save recipe");
+    await settle();
+    const recipeSave = requests.find((body) => body.kind === "upsert_task_recipe");
+    check(recipeSave?.title === "Review exact revision" && recipeSave.profile_revision_id === "profile-rev-1" &&
+      recipeSave.recipe_id === null && recipeSave.expected_version === null,
+      "recipe save did not submit the selected profile revision");
+    act(() => recipePanel.querySelector<HTMLButtonElement>("article button")!.click());
+    click("Save recipe");
+    await settle();
+    check(requests.some((body) => body.kind === "upsert_task_recipe" &&
+      body.recipe_id === "recipe-1" && body.expected_version === 2 &&
+      Array.isArray(body.required_check_ids) && body.required_check_ids.length === 0),
+      "recipe edit reused a historical check instead of requiring reselection");
+    const schedulePanel = sections.find((element) => element.querySelector("h2")?.textContent === "Foreground schedules")!;
+    const scheduleInputs = schedulePanel.querySelectorAll<HTMLInputElement>("input");
+    change(scheduleInputs[0], "Weekly review");
+    change(schedulePanel.querySelector<HTMLSelectElement>("select")!, "recipe-rev-2");
+    change(schedulePanel.querySelectorAll<HTMLSelectElement>("select")[1], "weekly");
+    change(scheduleInputs[1], "2026-10-01T09:00:00Z");
+    click("Save schedule");
+    await settle();
+    const scheduleSave = requests.find((body) => body.kind === "upsert_recipe_schedule");
+    check(scheduleSave?.cadence === "weekly" && scheduleSave.recipe_revision_id === "recipe-rev-2" &&
+      scheduleSave.schedule_id === null && scheduleSave.expected_version === null,
+      "schedule create did not submit the selected revision and cadence");
+    click("Create draft");
+    await settle();
+    const draft = requests.find((body) => body.kind === "create_draft_from_recipe");
+    check(draft?.recipe_id === "recipe-1" && draft.recipe_revision_id === "recipe-rev-2" &&
+      draft.expected_recipe_version === 2 && opened[0] === "AJ-created",
+      "manual draft did not use exact recipe identity or navigate to the task");
+    act(() => recipePanel.querySelectorAll<HTMLButtonElement>("article button")[2].click());
+    await settle();
+    check(requests.some((body) => body.kind === "archive_task_recipe" &&
+      body.recipe_id === "recipe-1" && body.expected_version === 2),
+      "recipe Archive lost its identity or version");
+    click("Enable");
+    await settle();
+    const enable = requests.find((body) => body.kind === "resume_recipe_schedule");
+    check(enable?.schedule_id === "schedule-1" && enable.expected_version === 1,
+      "Enable did not submit the sole arming command");
+    act(() => schedulePanel.querySelector<HTMLButtonElement>("article button")!.click());
+    change(schedulePanel.querySelectorAll<HTMLSelectElement>("select")[1], "weekly");
+    click("Save schedule");
+    await settle();
+    check(requests.some((body) => body.kind === "upsert_recipe_schedule" &&
+      body.schedule_id === "schedule-1" && body.expected_version === 1 && body.cadence === "weekly"),
+      "schedule edit lost its identity or expected version");
+    rerender(<Recipes state={{ ...state, recipe_schedules: [{ ...state.recipe_schedules[0], paused: false, version: 2 }] }}
+      project={currentProject} onChanged={noop} onOpenTask={noop} />);
+    click("Pause");
+    await settle();
+    check(requests.some((body) => body.kind === "pause_recipe_schedule" &&
+      body.schedule_id === "schedule-1" && body.expected_version === 2),
+      "Pause did not submit the schedule version");
+    rerender(<Recipes state={{ ...state, recipe_schedules: [{ ...state.recipe_schedules[0], paused: true,
+      version: 3, last_fire: { outcome: "missed", scheduled_for_utc: "2026-10-01T09:00:00Z",
+        task_id: null, reason: null, missed_count: 1, missed_first_utc: "2026-10-01T09:00:00Z",
+        missed_last_utc: "2026-10-01T09:00:00Z" } }] }}
+      project={currentProject} onChanged={refreshed} onOpenTask={noop} />);
+    click("Resume");
+    await settle();
+    check(requests.some((body) => body.kind === "resume_recipe_schedule" &&
+      body.schedule_id === "schedule-1" && body.expected_version === 3),
+      "Resume did not submit the paused schedule version");
+    const activeSchedule = [...document.querySelectorAll("section.panel")].find((element) =>
+      element.querySelector("h2")?.textContent === "Foreground schedules")!;
+    act(() => activeSchedule.querySelectorAll<HTMLButtonElement>("article button")[2].click());
+    await settle();
+    check(requests.some((body) => body.kind === "archive_recipe_schedule" &&
+      body.schedule_id === "schedule-1" && body.expected_version === 3),
+      "schedule Archive did not submit the exact version");
+    act(() => profilePanel.querySelector<HTMLButtonElement>("article button")!.click());
+    field("Name", "Unknown profile result");
+    failNextSave = true;
+    const refreshBefore = refreshes;
+    click("Save profile set");
+    await settle();
+    const ambiguousSave = requests.at(-1)!;
+    check(refreshes > refreshBefore, "unknown result did not refresh current state");
+    field("Name", "Changed after unknown result");
+    const beforeBlocked = requests.length;
+    click("Save profile set");
+    await settle();
+    check(requests.length === beforeBlocked && document.body.textContent?.includes("unknown result"),
+      "editing an ambiguous save dispatched a second operation");
+    act(() => profilePanel.querySelectorAll<HTMLButtonElement>("article button")[1].click());
+    await settle();
+    check(requests.length === beforeBlocked, "cross-action Archive bypassed the pending profile edit");
+    const refreshedState = { ...state, profile_sets: [{ ...state.profile_sets[0], version: 2,
+      name: "Unknown profile result" }] };
+    rerender(<Recipes state={refreshedState} project={currentProject} onChanged={refreshed} onOpenTask={noop} />);
+    act(() => profilePanel.querySelector<HTMLButtonElement>("article button")!.click());
+    check(findField("Name").value === "Unknown profile result", "refreshed profile was not selectable");
+    unmount();
+    mount(<Recipes state={refreshedState} project={currentProject} onChanged={refreshed} onOpenTask={noop} />);
+    const remountedProfile = [...document.querySelectorAll("section.panel")].find((element) =>
+      element.querySelector("h2")?.textContent === "Profile sets")!;
+    act(() => remountedProfile.querySelector<HTMLButtonElement>("article button")!.click());
+    field("Name", "Modified after remount");
+    click("Save profile set");
+    await settle();
+    check(requests.length === beforeBlocked && document.body.textContent?.includes("Retry exact pending request"),
+      "remount lost the pending guard");
+    click("Retry exact pending request");
+    await settle();
+    check(requests.at(-1)?.operation_id === ambiguousSave.operation_id &&
+      JSON.stringify(requests.at(-1)) === JSON.stringify(ambiguousSave),
+      "explicit retry changed the pending body or operation identity");
+    click("Save profile set");
+    await settle();
+    check(requests.at(-1)?.name === "Modified after remount" &&
+      requests.at(-1)?.profile_set_id === "profile-1" &&
+      requests.at(-1)?.operation_id !== ambiguousSave.operation_id,
+      "existing-ID edit did not remain bound after exact retry receipt");
+    field("Name", "Conflict profile result");
+    failNextConflict = true;
+    click("Save profile set");
+    await settle();
+    const conflictId = requests.at(-1)?.operation_id;
+    field("Name", "Edited after conflict");
+    click("Save profile set");
+    await settle();
+    check(requests.at(-1)?.operation_id !== conflictId &&
+      requests.at(-1)?.name === "Edited after conflict",
+      "conflict retry failed to submit the edited intent with a fresh identity");
+    click("New");
+    field("Name", "Creation with lost response");
+    failNextSave = true;
+    click("Save profile set");
+    await settle();
+    const unknownCreate = requests.at(-1)!;
+    const beforeCreateRetry = requests.length;
+    check(unknownCreate.profile_set_id === null &&
+      sessionStorage.getItem("llmrelay.m9.pending-commands.v1")?.includes(String(unknownCreate.operation_id)),
+      "unknown create was not retained before navigation");
+    const otherProject = { ...currentProject, id: "p2", display_name: "Other project" };
+    rerender(<Recipes state={{ ...state, projects: [currentProject, otherProject] }}
+      project={otherProject} onChanged={refreshed} onOpenTask={noop} />);
+    rerender(<Recipes state={state} project={currentProject} onChanged={refreshed} onOpenTask={noop} />);
+    unmount();
+    mount(<Recipes state={state} project={currentProject} onChanged={refreshed} onOpenTask={noop} />);
+    field("Name", "Another creation after reload");
+    click("Save profile set");
+    await settle();
+    check(requests.length === beforeCreateRetry, "unknown create became a fresh create after remount");
+    click("Retry exact pending request");
+    await settle();
+    check(requests.length === beforeCreateRetry + 1 &&
+      JSON.stringify(requests.at(-1)) === JSON.stringify(unknownCreate) &&
+      document.body.textContent?.includes("New profile set") &&
+      findField("Name").value === "Another creation after reload",
+      "unknown create retry changed the request or rebound an unrelated New profile");
+    field("Name", "Project one draft");
+    rerender(<Recipes state={{ ...state, projects: [currentProject, otherProject] }}
+      project={otherProject} onChanged={noop} onOpenTask={noop} />);
+    check(findField("Name").value === "", "project change retained another project's dirty form");
+    check(requests.every((body) => !["make_ready", "scheduler_run_once", "approve_plan"].includes(String(body.kind))),
+      "recipe controls submitted execution or approval authority");
+  } finally {
+    unmount();
+    sessionStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("A05 recipe New controls preserve each form identity during deferred saves", async () => {
+  sessionStorage.clear();
+  const currentProject: Project = {
+    ...initialized,
+    trip: { ...initialized.trip!, active_config_revision_id: "config-1" },
+  };
+  const state: AppState = {
+    ...liveBase,
+    projects: [currentProject],
+    profile_sets: [{
+      id: "profile-1",
+      project_id: "p1",
+      name: "Saved profile",
+      version: 1,
+      archived: false,
+      revision: 1,
+      revision_id: "profile-rev-1",
+      roles: inheritedRoles as Record<
+        (typeof ROLES)[number],
+        { provider: "codex"; model: string; effort: string }
+      >,
+      config_revision_id: "config-1",
+      configuration_hash: "profile-hash",
+    }],
+    task_recipes: [{
+      id: "recipe-1",
+      project_id: "p1",
+      name: "Saved recipe",
+      version: 1,
+      archived: false,
+      revision: 1,
+      revision_id: "recipe-rev-1",
+      title: "Saved task",
+      description: "",
+      acceptance_criteria: [],
+      priority: 0,
+      profile_revision_id: "profile-rev-1",
+      required_check_ids: [],
+      config_revision_id: "config-1",
+      configuration_hash: "recipe-hash",
+      workflow_version: "workflow-1",
+      workflow_hash: "workflow-hash",
+    }],
+    recipe_schedules: [],
+  };
+  const deferred: Array<{
+    body: Record<string, unknown>;
+    resolve: (response: Response) => void;
+  }> = [];
+  globalThis.fetch = (async (
+    _input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return await new Promise<Response>((resolve) => {
+      deferred.push({ body, resolve });
+    });
+  }) as typeof fetch;
+  const panel = (heading: string) =>
+    [...document.querySelectorAll<HTMLElement>("section.panel")].find(
+      (element) => element.querySelector("h2")?.textContent === heading,
+    )!;
+  const newButton = (owner: HTMLElement) =>
+    [...owner.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "New",
+    )!;
+  try {
+    mount(
+      <Recipes
+        state={state}
+        project={currentProject}
+        onChanged={noop}
+        onOpenTask={noop}
+      />,
+    );
+
+    const profilePanel = panel("Profile sets");
+    field("Name", "Profile being saved");
+    click("Save profile set");
+    await settle();
+    const profileNew = newButton(profilePanel);
+    check(profileNew.disabled, "profile New remained enabled during its save");
+    act(() => profileNew.click());
+    check(
+      findField("Name").value === "Profile being saved",
+      "profile New changed identity while its save was pending",
+    );
+    field("Name", "Profile edit made while saving");
+    deferred[0].resolve(new Response(JSON.stringify({
+      result: { entity_id: "profile-created", version: 1 },
+    })));
+    await settle();
+    check(
+      profilePanel.querySelector("h3")?.textContent === "Edit profile set" &&
+        findField("Name").value === "Profile edit made while saving",
+      "profile response lost a same-form edit or attached to another draft",
+    );
+
+    const recipePanel = panel("Task recipes");
+    const recipeInputs = recipePanel.querySelectorAll<HTMLInputElement>("input");
+    change(recipeInputs[0], "Recipe being saved");
+    change(recipeInputs[1], "Original recipe task");
+    change(
+      recipePanel.querySelector<HTMLSelectElement>("select")!,
+      "profile-rev-1",
+    );
+    click("Save recipe");
+    await settle();
+    const recipeNew = newButton(recipePanel);
+    check(recipeNew.disabled, "recipe New remained enabled during its save");
+    act(() => recipeNew.click());
+    check(
+      recipeInputs[0].value === "Recipe being saved",
+      "recipe New changed identity while its save was pending",
+    );
+    change(recipeInputs[0], "Recipe edit made while saving");
+    deferred[1].resolve(new Response(JSON.stringify({
+      result: { entity_id: "recipe-created", version: 1 },
+    })));
+    await settle();
+    check(
+      recipePanel.querySelector("h3")?.textContent === "Edit recipe" &&
+        recipeInputs[0].value === "Recipe edit made while saving",
+      "recipe response lost a same-form edit or attached to another draft",
+    );
+
+    const schedulePanel = panel("Foreground schedules");
+    const scheduleInputs = schedulePanel.querySelectorAll<HTMLInputElement>(
+      "input",
+    );
+    change(scheduleInputs[0], "Schedule being saved");
+    change(
+      schedulePanel.querySelector<HTMLSelectElement>("select")!,
+      "recipe-rev-1",
+    );
+    click("Save schedule");
+    await settle();
+    const scheduleNew = newButton(schedulePanel);
+    check(scheduleNew.disabled, "schedule New remained enabled during its save");
+    act(() => scheduleNew.click());
+    check(
+      scheduleInputs[0].value === "Schedule being saved",
+      "schedule New changed identity while its save was pending",
+    );
+    change(scheduleInputs[0], "Schedule edit made while saving");
+    deferred[2].resolve(new Response(JSON.stringify({
+      result: { entity_id: "schedule-created", version: 1 },
+    })));
+    await settle();
+    check(
+      schedulePanel.querySelector("h3")?.textContent === "Edit schedule" &&
+        scheduleInputs[0].value === "Schedule edit made while saving",
+      "schedule response lost a same-form edit or attached to another draft",
+    );
+    check(
+      deferred.map((entry) => entry.body.kind).join(",") ===
+        "upsert_profile_set,upsert_task_recipe,upsert_recipe_schedule",
+      "deferred saves did not exercise all three ordinary form paths",
+    );
+  } finally {
+    unmount();
+    sessionStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("M9 App opens created and recovered recipe drafts after authoritative refresh", async () => {
+  const projectWithRecipe = {
+    ...initialized,
+    trip: { ...initialized.trip!, active_config_revision_id: "config-1" },
+  };
+  const initial: AppState = {
+    ...liveBase,
+    projects: [projectWithRecipe],
+    tasks: [],
+    task_recipes: [{ id: "recipe-1", project_id: "p1", name: "Review", version: 2,
+      archived: false, revision: 2, revision_id: "recipe-rev-2", title: "Review change",
+      description: "", acceptance_criteria: [], priority: 0,
+      profile_revision_id: "profile-rev-1", required_check_ids: [],
+      config_revision_id: "config-1", configuration_hash: "hash-1",
+      workflow_version: "workflow-1", workflow_hash: "workflow-hash" }],
+  };
+  const created: AppState = { ...initial, revision: "2", tasks: [{
+    ...task, id: "AJ-created", title: "Review change", lifecycle: "backlog",
+    active_attempt: undefined,
+  }] };
+  const priorEnvironment = { ...liveEnvironment };
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    requests.push(body);
+    return new Response(JSON.stringify({ result: { entity_id: "AJ-created", version: 1 } }));
+  }) as typeof fetch;
+  try {
+    for (const outcome of ["created", "recovered", "missing", "left"] as const) {
+      const recovered = outcome === "recovered";
+      const live = liveHarness();
+      liveEnvironment.transport = live.environment.transport;
+      liveEnvironment.scheduler = live.environment.scheduler;
+      localStorage.clear();
+      localStorage.setItem("agenticjira.page", "recipes");
+      localStorage.setItem("agenticjira.project", "p1");
+      sessionStorage.clear();
+      if (recovered) {
+        const body = { kind: "create_draft_from_recipe", project_id: "p1",
+          operation_id: "pending-create", recipe_id: "recipe-1",
+          recipe_revision_id: "recipe-rev-2", expected_recipe_version: 2 };
+        sessionStorage.setItem("llmrelay.m9.pending-commands.v1", JSON.stringify([{
+          version: 1, resource: "p1:recipe:recipe-1", body,
+        }]));
+      }
+      mount(<App />);
+      await settle();
+      live.reads[0].resolve(initial);
+      await settle();
+      click(recovered ? "Retry exact pending request" : "Create draft");
+      await settle();
+      check(!document.querySelector("aside.detail") && live.reads.length >= 2,
+        "task detail opened before the authoritative read");
+      if (outcome === "left") click("Board");
+      const next = outcome === "missing" ? initial : created;
+      live.reads[1].resolve(next);
+      await settle();
+      for (let index = 2; index < live.reads.length; index++) {
+        live.reads[index].resolve(next);
+        await settle();
+      }
+      check(requests.at(-1)?.kind === "create_draft_from_recipe" &&
+        (!recovered || requests.at(-1)?.operation_id === "pending-create"),
+        `${outcome} draft did not submit the exact command`);
+      if (outcome === "created" || outcome === "recovered") {
+        check(document.querySelector("aside.detail header .eyebrow")?.textContent === "AJ-created",
+          `${outcome} draft did not open its task detail`);
+      } else {
+        check(!document.querySelector("aside.detail") &&
+          (outcome === "left" || document.body.textContent?.includes("not in the latest state")),
+          `${outcome} draft crossed navigation or selected a task missing from the refresh`);
+      }
+      unmount();
+    }
+  } finally {
+    unmount();
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    sessionStorage.clear();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("M9 exact create retry leaves unrelated recipe and schedule New forms unbound", async () => {
+  const requests: Record<string, unknown>[] = [];
+  const currentProject = { ...initialized,
+    trip: { ...initialized.trip!, active_config_revision_id: "config-1" } };
+  const state: AppState = { ...liveBase, projects: [currentProject], tasks: [] };
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ result: { entity_id: "recovered", version: 1 } }));
+  }) as typeof fetch;
+  try {
+    for (const kind of ["upsert_task_recipe", "upsert_recipe_schedule"] as const) {
+      sessionStorage.clear();
+      const recipe = kind === "upsert_task_recipe";
+      const body = recipe
+        ? { kind, project_id: "p1", operation_id: "pending-recipe", recipe_id: null,
+          expected_version: null, name: "Original", title: "Original task",
+          description: "", acceptance_criteria: [], priority: 0,
+          profile_revision_id: "profile-rev-1", required_check_ids: [] }
+        : { kind, project_id: "p1", operation_id: "pending-schedule", schedule_id: null,
+          expected_version: null, name: "Original", recipe_revision_id: "recipe-rev-2",
+          cadence: "daily", anchor_utc: "2026-10-01T09:00:00Z" };
+      sessionStorage.setItem("llmrelay.m9.pending-commands.v1", JSON.stringify([{
+        version: 1, resource: recipe ? "p1:recipe:new" : "p1:schedule:new", body,
+      }]));
+      mount(<Recipes state={state} project={currentProject} onChanged={noop} onOpenTask={noop} />);
+      const heading = recipe ? "Task recipes" : "Foreground schedules";
+      const panel = [...document.querySelectorAll("section.panel")].find((element) =>
+        element.querySelector("h2")?.textContent === heading)!;
+      change(panel.querySelector<HTMLInputElement>("input")!, "Unrelated");
+      click("Retry exact pending request");
+      await settle();
+      check(panel.querySelector("h3")?.textContent === (recipe ? "New recipe" : "New schedule") &&
+        panel.querySelector<HTMLInputElement>("input")?.value === "Unrelated" &&
+        requests.at(-1)?.operation_id === body.operation_id &&
+        document.body.textContent?.includes("Pending request recovered"),
+        `${heading} exact retry rebound or erased an unrelated New form`);
+      unmount();
+    }
+  } finally {
+    unmount();
+    sessionStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("M9 archived backlog drafts stay visible in History for Restore", async () => {
+  const requests: Record<string, unknown>[] = [];
+  const archivedDraft: Task = { ...task, id: "AJ-archived", lifecycle: "backlog",
+    archived: true, active_attempt: undefined, version: 3, can_archive: false };
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.body) requests.push(JSON.parse(String(init.body)));
+    return new Response(JSON.stringify({ result: { entity_id: archivedDraft.id, version: 4 } }));
+  }) as typeof fetch;
+  try {
+    mount(<History tasks={[archivedDraft]} projects={[initialized]} onOpen={noop} onChanged={noop} />);
+    check(document.body.textContent?.includes("AJ-archived"), "archived draft is missing from History");
+    click("Restore");
+    await settle();
+    check(requests[0]?.kind === "restore" && requests[0]?.task_id === archivedDraft.id &&
+      requests[0]?.expected_version === 3, "History did not submit the ordinary Restore command");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("M9 task detail Archive submits the never-attempted draft version", async () => {
+  const requests: Record<string, unknown>[] = [];
+  const draft: Task = { ...task, id: "AJ-draft", lifecycle: "backlog", archived: false,
+    active_attempt: undefined, version: 4, can_archive: true };
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.body) requests.push(JSON.parse(String(init.body)));
+    return new Response(JSON.stringify({ result: { entity_id: draft.id, version: 5 } }));
+  }) as typeof fetch;
+  try {
+    mount(<TaskDetail task={draft} state={{ ...liveBase, tasks: [draft] }} onClose={noop} onChanged={noop} />);
+    click("Archive");
+    await settle();
+    check(requests.some((body) => body.kind === "archive" && body.task_id === draft.id &&
+      body.expected_version === 4), "Task detail did not archive the exact draft version");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("M9 malformed can_archive state is rejected before controls render", async () => {
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    ...liveBase,
+    tasks: [{ ...task, can_archive: "false" }],
+  }))) as typeof fetch;
+  try {
+    let refused = false;
+    try {
+      await getState();
+    } catch (error) {
+      refused = error instanceof Error && error.message.includes("unsupported recipe state");
+    }
+    check(refused, "non-boolean can_archive crossed the snapshot boundary");
+    mount(<TaskDetail task={task} state={liveBase} onClose={noop} onChanged={noop} />);
+    const archive = [...document.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
+      button.textContent?.includes("Archive"));
+    check(archive?.disabled, "last known good state unexpectedly enabled Archive");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("M9 board and detail display exact scheduled draft provenance", () => {
+  const scheduled: Task = { ...task, id: "AJ-scheduled", lifecycle: "backlog", can_archive: true,
+    recipe_provenance: {
+      recipe_id: "recipe-1", recipe_name: "Review", recipe_revision_id: "revision-2",
+      recipe_revision: 2, profile_revision_id: "profile-revision-3", required_check_ids: [],
+      config_revision_id: "config-1", configuration_hash: "hash-1",
+      workflow_version: "workflow-1", workflow_hash: "workflow-hash",
+      schedule_id: "schedule-1", scheduled_for_utc: "2026-09-25T09:00:00Z",
+    } };
+  try {
+    mount(<TaskBoard tasks={[scheduled]} projects={[initialized]} onOpen={noop} onEdit={noop} onChanged={noop} />);
+    check(document.body.textContent?.includes("Scheduled draft · Review revision 2"),
+      "board omitted the scheduled recipe revision");
+    rerender(<TaskDetail task={scheduled} state={{ ...liveBase, tasks: [scheduled] }} onClose={noop} onChanged={noop} />);
+    check(document.body.textContent?.includes("Exact recipe revision revision-2") &&
+      document.body.textContent?.includes("Created by schedule schedule-1 at 2026-09-25T09:00:00Z"),
+      "detail omitted exact scheduled provenance");
+  } finally {
+    unmount();
+  }
+});
+
+Deno.test("M7 unknown Claude contract explains the release route and blocks setup verification", () => {
+  const compatibility = {
+    status: "unknown_version" as const,
+    observed_version: null,
+    pack_id: "claude",
+    pack_revision: "1",
+    contract_id: null,
+    contract_revision: null,
+    short_hash: null,
+    predicate_id: null,
+    missing_evidence: ["reviewed_exact_version_predicate"],
+    action: "update_llmrelay_release" as const,
+    message: "This provider version has no reviewed contract in this release.",
+  };
+  try {
+    mount(<ProjectSetup
+      project={initialized}
+      setup={{
+        setup_operation_id: "claude-unknown", project_id: initialized.id,
+        state: "activated", target_inventory: {}, final_files: [],
+        installation_source_binding_complete: true,
+        installation_source_binding_reason: "activated",
+        selected_profiles: [{
+          role: "explorer", selection_state: "selected",
+          profile: { provider: "claude", model: "advisory-model", effort: "high" },
+          compatibility,
+        }],
+        probe_receipts: [], sessions: [], runtime_admissions: [],
+        agents_file: {}, created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+      }}
+      onChanged={noop}
+      onViewSession={async () => ({ state: "failed", message: "unavailable", retry_available: false })}
+    />);
+    if (!document.body.textContent?.includes("Update LLMRelay for a reviewed contract") ||
+      !document.body.textContent?.includes("reviewed_exact_version_predicate") ||
+      ![...document.querySelectorAll("button")].some((button) =>
+        button.textContent?.includes("Prepare exact runtime verification") && button.disabled)) {
+      throw new Error("unknown Claude contract was presented as qualification eligible");
+    }
+    unmount();
+    mount(<ProjectSetup
+      project={initialized}
+      setup={{
+        setup_operation_id: "claude-discovery", project_id: initialized.id,
+        state: "discovery", discovery_attempt_id: "claude-attempt",
+        target_inventory: {}, final_files: [],
+        installation_source_binding_complete: false,
+        installation_source_binding_reason: "discovery",
+        selected_profiles: [{
+          role: "manager", selection_state: "selected",
+          profile: { provider: "claude", model: "advisory-model", effort: "high" },
+          compatibility,
+        }],
+        probe_receipts: [], sessions: [], runtime_admissions: [],
+        agents_file: {}, created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+      }}
+      onChanged={noop}
+      onViewSession={async () => ({ state: "failed", message: "unavailable", retry_available: false })}
+    />);
+    if ([...document.querySelectorAll("button")].some((button) =>
+      button.textContent?.includes("Launch manager discovery"))) {
+      throw new Error("unknown Claude contract exposed a failing discovery launch");
+    }
+    unmount();
+    mount(<DiagnosticsPanel capabilities={[{
+      provider: "claude", role: "explorer", mode: "interactive_pty",
+      status: "unverified", gaps: [], compatibility,
+    }]} />);
+    if (!document.body.textContent?.includes("Compatibility needs attention") ||
+      !document.body.textContent?.includes("Update LLMRelay for a reviewed contract")) {
+      throw new Error("diagnostics omitted the structured compatibility action");
+    }
+  } finally {
+    unmount();
+  }
+});
+Deno.test("M7 fresh qualification stays reachable while stale exact resume is held", async () => {
+  localStorage.clear();
+  const priorFetch = globalThis.fetch;
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ result: { state: "ready" } }));
+  }) as typeof fetch;
+  const compatibility = (status: "matched" | "evidence_stale" | "contract_changed" | "unknown_version" | "ambiguous_manifest" | "manifest_invalid") => ({
+    status,
+    observed_version: status === "evidence_stale" ? null : "codex-cli 0.155.1",
+    pack_id: status === "evidence_stale" ? null : "codex",
+    pack_revision: status === "evidence_stale" ? null : "1",
+    contract_id: status === "evidence_stale" ? null : "codex-explorer",
+    contract_revision: status === "evidence_stale" ? null : "1",
+    short_hash: status === "evidence_stale" ? null : "123456789abc",
+    predicate_id: status === "evidence_stale" ? null : "codex-cli-0.155.1",
+    missing_evidence: status === "matched" ? [] : ["exact_selected_profile_observation"],
+    action: "requalify_exact_profile" as const,
+    message: status === "matched" ? "Candidate is reviewed." : "Exact observation is missing.",
+  });
+  const probe = (role: "explorer" | "plan_reviewer") => ({
+    role,
+    profile: { provider: "codex" as const, model: "model", effort: "high" },
+    profile_hash: `${role}-profile`,
+    project_config_revision_id: `${role}-config`,
+    project_configuration_hash: `${role}-configuration`,
+    adapter: "llmrelay_codex",
+    adapter_hash: `${role}-adapter`,
+    capability_key: `${role}-capability`,
+    nonce: "fixture-only",
+    state: "authorized" as const,
+    has_native_session: false,
+  });
+  const setup: TripSetupState = {
+    setup_operation_id: "m7-role-scope", project_id: initialized.id,
+    state: "activated", target_inventory: {}, final_files: [],
+    installation_source_binding_complete: true,
+    installation_source_binding_reason: "activated",
+    selected_profiles: [
+      { role: "explorer", selection_state: "selected", profile: probe("explorer").profile, compatibility: compatibility("evidence_stale") },
+      { role: "plan_reviewer", selection_state: "selected", profile: probe("plan_reviewer").profile, compatibility: compatibility("matched") },
+    ],
+    probe_receipts: [], sessions: [],
+    runtime_admissions: [{ id: "m7-admission", scope_hash: "m7-scope", state: "running", fresh_call_count: 2, probes: [probe("explorer"), probe("plan_reviewer")] }],
+    agents_file: {}, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+  };
+  try {
+    mount(<ProjectSetup project={initialized} setup={setup} onChanged={noop} onViewSession={cmuxFixture} />);
+    const probeRows = [...document.querySelectorAll(".profile-list > div")];
+    const explorerRow = probeRows.find((row) => row.querySelector("strong")?.textContent === "Explorer");
+    const reviewerRow = probeRows.find((row) => row.querySelector("strong")?.textContent === "Plan Reviewer");
+    if (!explorerRow?.textContent?.includes("Launch bounded probe") ||
+      !reviewerRow?.textContent?.includes("Launch bounded probe")) {
+      throw new Error(`fresh stale and unaffected roles did not retain bounded launches: ${document.body.textContent?.slice(-1800)}`);
+    }
+    const staleLaunch = [...explorerRow.querySelectorAll("button")].find((button) => button.textContent?.includes("Launch bounded probe"))!;
+    act(() => staleLaunch.click());
+    await settle();
+    if (requests.at(-1)?.kind !== "runtime_probe_launch" || requests.at(-1)?.role !== "explorer") {
+      throw new Error("fresh stale role launch was not routed to backend admission");
+    }
+    unmount();
+
+    for (const status of ["unknown_version", "ambiguous_manifest", "manifest_invalid"] as const) {
+      mount(<ProjectSetup project={initialized} setup={{ ...setup, runtime_admissions: [], selected_profiles: [
+        ...setup.selected_profiles,
+        { role: "manager", selection_state: "selected", profile: probe("explorer").profile, compatibility: compatibility(status) },
+      ] }} onChanged={noop} onViewSession={cmuxFixture} />);
+      const prepare = [...document.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Prepare exact runtime verification"));
+      if (!prepare?.disabled) throw new Error(`${status} enabled runtime preparation`);
+      unmount();
+    }
+
+    mount(<ProjectSetup project={initialized} setup={{ ...setup, runtime_admissions: [] }} onChanged={noop} onViewSession={cmuxFixture} />);
+    click("Prepare exact runtime verification");
+    await settle();
+    if (requests.at(-1)?.action !== "prepare_runtime_admission") {
+      throw new Error("stale observation blocked fresh runtime preparation");
+    }
+    unmount();
+
+    const retainedProbe = {
+      ...probe("explorer"), state: "running" as const,
+      session_id: "retained-explorer", session_status: "exited",
+      has_native_session: true,
+    };
+    const retainedSetup = {
+      ...setup, runtime_admissions: [{
+        ...setup.runtime_admissions[0], probes: [retainedProbe, probe("plan_reviewer")],
+      }],
+    };
+    mount(<ProjectSetup project={initialized} setup={retainedSetup} onChanged={noop} onViewSession={cmuxFixture} />);
+    const staleRow = [...document.querySelectorAll(".profile-list > div")].find((row) => row.querySelector("strong")?.textContent === "Explorer");
+    if (staleRow?.textContent?.includes("Resume same native session")) {
+      throw new Error("stale runtime binding exposed exact native resume");
+    }
+    unmount();
+
+    mount(<ProjectSetup project={initialized} setup={{ ...retainedSetup, selected_profiles: [
+      { ...setup.selected_profiles[0], compatibility: compatibility("matched") },
+      setup.selected_profiles[1],
+    ] }} onChanged={noop} onViewSession={cmuxFixture} />);
+    const matchedRow = [...document.querySelectorAll(".profile-list > div")].find((row) => row.querySelector("strong")?.textContent === "Explorer");
+    const resume = [...matchedRow?.querySelectorAll("button") || []].find((button) => button.textContent?.includes("Resume same native session"));
+    if (!resume) throw new Error("matched role lost exact runtime resume");
+    act(() => resume.click());
+    await settle();
+    if (requests.at(-1)?.kind !== "runtime_probe_resume" || requests.at(-1)?.role !== "explorer") {
+      throw new Error("matched exact resume did not retain its role binding");
+    }
+    unmount();
+
+    mount(<ProjectSetup project={initialized} setup={{ ...retainedSetup, selected_profiles: [
+      { ...setup.selected_profiles[0], compatibility: compatibility("contract_changed") },
+      setup.selected_profiles[1],
+    ] }} onChanged={noop} onViewSession={cmuxFixture} />);
+    const changedRow = [...document.querySelectorAll(".profile-list > div")].find((row) => row.querySelector("strong")?.textContent === "Explorer");
+    if (changedRow?.textContent?.includes("Resume same native session")) {
+      throw new Error("changed contract exposed exact native resume");
+    }
+    unmount();
+
+    mount(<ProjectSetup project={initialized} setup={{ ...retainedSetup, runtime_admissions: [], selected_profiles: [
+      { ...setup.selected_profiles[0], compatibility: compatibility("contract_changed") },
+      setup.selected_profiles[1],
+    ] }} onChanged={noop} onViewSession={cmuxFixture} />);
+    click("Prepare exact runtime verification");
+    await settle();
+    if (requests.at(-1)?.action !== "prepare_runtime_admission") {
+      throw new Error("changed contract could not request fresh backend admission");
+    }
+  } finally {
+    unmount();
+    globalThis.fetch = priorFetch;
+  }
+});
+Deno.test("M7 fresh Codex discovery and stale probe retry preserve exact resume hold", async () => {
+  localStorage.clear();
+  const priorFetch = globalThis.fetch;
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ result: {} }));
+  }) as typeof fetch;
+  const profile = { provider: "codex" as const, model: "gpt-6-sol", effort: "medium" };
+  const compatibility = {
+    status: "evidence_stale" as const, observed_version: null,
+    pack_id: null, pack_revision: null, contract_id: null,
+    contract_revision: null, short_hash: null, predicate_id: null,
+    missing_evidence: ["exact_selected_profile_observation"],
+    action: "requalify_exact_profile" as const,
+    message: "No exact compatibility observation is recorded for this selected profile.",
+  };
+  const setup: TripSetupState = {
+    setup_operation_id: "fresh-codex", project_id: initialized.id,
+    state: "discovery", discovery_attempt_id: "discovery-attempt",
+    target_inventory: {}, final_files: [],
+    installation_source_binding_complete: false,
+    installation_source_binding_reason: "discovery",
+    selected_profiles: [{ role: "manager", selection_state: "selected", profile, compatibility }],
+    probe_receipts: [], sessions: [], runtime_admissions: [], agents_file: {},
+    created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+  };
+  const session: TripSetupState["sessions"][number] = {
+    id: "stale-probe-session", attempt_id: "probe-attempt", role: "explorer",
+    provider: "codex", generation: 1, lane_id: "probe-lane",
+    status: "exited", launch_state: "started", readiness: "idle_candidate",
+    capture_state: "complete", has_native_session: true, resume_count: 0,
+    updated_at: "2026-01-01T00:00:00Z",
+  };
+  try {
+    mount(<ProjectSetup project={initialized} setup={setup} onChanged={noop} onViewSession={cmuxFixture} />);
+    click("Launch manager discovery");
+    await settle();
+    if (requests.at(-1)?.kind !== "trip_setup_dispatch" ||
+      requests.at(-1)?.attempt_id !== "discovery-attempt" || requests.at(-1)?.role !== "manager") {
+      throw new Error("fresh Codex manager discovery did not reach its exact backend route");
+    }
+    unmount();
+
+    const probing: TripSetupState = {
+      ...setup, state: "probing", probe_attempt_id: "probe-attempt",
+      selected_profiles: [{ role: "explorer", selection_state: "selected", profile, compatibility }],
+    };
+    mount(<ProjectSetup project={initialized} setup={probing} onChanged={noop} onViewSession={cmuxFixture} />);
+    click("Agents");
+    const explorer = [...document.querySelectorAll(".setup-invocation")].find((row) => row.querySelector("strong")?.textContent === "Explorer");
+    const firstProbe = [...explorer?.querySelectorAll("button") || []].find((button) => button.textContent?.includes("Launch bounded probe"));
+    if (!firstProbe) throw new Error(`fresh delegated Codex probe was hidden without a receipt: ${document.body.textContent?.slice(-1800)}`);
+    act(() => firstProbe.click());
+    await settle();
+    if (requests.at(-1)?.kind !== "trip_setup_dispatch" ||
+      requests.at(-1)?.attempt_id !== "probe-attempt" || requests.at(-1)?.role !== "explorer") {
+      throw new Error("first delegated probe did not retain exact role routing");
+    }
+    unmount();
+
+    mount(<ProjectSetup project={initialized} setup={{ ...probing, sessions: [session] }} onChanged={noop} onViewSession={cmuxFixture} />);
+    click("Agents");
+    const staleRow = [...document.querySelectorAll(".setup-invocation")].find((row) => row.querySelector("strong")?.textContent === "Explorer");
+    if (!staleRow?.textContent?.includes("Launch exact-profile retry") ||
+      staleRow.textContent.includes("Resume retained session")) {
+      throw new Error("stale probe did not offer fresh retry while holding exact resume");
+    }
+    const retry = [...staleRow.querySelectorAll("button")].find((button) => button.textContent?.includes("Launch exact-profile retry"))!;
+    act(() => retry.click());
+    await settle();
+    if (requests.at(-1)?.kind !== "trip_setup_dispatch" ||
+      requests.at(-1)?.attempt_id !== "probe-attempt" || requests.at(-1)?.role !== "explorer") {
+      throw new Error("stale retry did not route the selected profile to backend validation");
+    }
+  } finally {
+    unmount();
+    globalThis.fetch = priorFetch;
+  }
+});
 const noop = () => {};
 const encodedBytes = (bytes: Uint8Array) => {
   let binary = "";
@@ -119,6 +1078,7 @@ const task: Task = {
   attention: "none",
   version: 7,
   archived: false,
+  can_archive: false,
   permission_waiting: false,
   role_overrides: {},
   dependencies: [],
@@ -337,8 +1297,9 @@ Deno.test("T14 New task inherits roles, submits explicit overrides, and retains 
       JSON.stringify(requests.at(-1)?.acceptance_criteria) !==
         JSON.stringify(["first", "second"]) ||
       JSON.stringify(requests.at(-1)?.role_overrides) !==
-        JSON.stringify({ implementer: roleOverride })
+      JSON.stringify({ implementer: roleOverride })
     ) throw new Error("repaired draft command did not preserve exact fields");
+    const rejectedCreateOperation = requests.at(-1)?.operation_id;
     fail = false;
     if (
       !document.querySelector<HTMLButtonElement>(".primary")!.disabled ||
@@ -349,9 +1310,14 @@ Deno.test("T14 New task inherits roles, submits explicit overrides, and retains 
     if (
       requests.at(-1)?.kind !== "create_task" ||
       requests.at(-1)?.ready !== false ||
+      requests.at(-1)?.operation_id === rejectedCreateOperation ||
       JSON.stringify(requests.at(-1)?.role_overrides) !==
         JSON.stringify({ implementer: roleOverride })
-    ) throw new Error("pending override was not retained in the draft");
+    ) {
+      throw new Error(
+        "definitively rejected create did not retain the draft with a fresh identity",
+      );
+    }
 
     unmount();
     localStorage.removeItem("agenticjira.new-task");
@@ -415,6 +1381,272 @@ Deno.test("T14 New task inherits roles, submits explicit overrides, and retains 
     }
   } finally {
     unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("A09 unresolved task create blocks edited intent and reloads its exact reconciliation", async () => {
+  localStorage.clear();
+  const requests: Record<string, unknown>[] = [];
+  const committedOperations = new Set<string>();
+  let committedCreates = 0;
+  let saved = 0;
+  globalThis.fetch = (async (
+    _input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    requests.push(body);
+    const operation = String(body.operation_id);
+    if (!committedOperations.has(operation)) {
+      committedOperations.add(operation);
+      committedCreates++;
+    }
+    if (requests.length === 1) {
+      throw new ApiError(
+        "task committed but its response was lost",
+        0,
+        operation,
+        true,
+      );
+    }
+    return new Response(JSON.stringify({
+      result: { entity_id: "AJ-ambiguous", version: 1 },
+    }));
+  }) as typeof fetch;
+  const form = () => (
+    <TaskForm
+      projects={[initialized]}
+      onSaved={() => saved++}
+      onClose={noop}
+    />
+  );
+  try {
+    mount(form());
+    field("Title", "Original unresolved task");
+    click("Save draft");
+    await settle();
+    const original = requests[0];
+    check(
+      original?.kind === "create_task" && original.ready === false &&
+        document.body.textContent?.includes("may already be committed") &&
+        localStorage.getItem("agenticjira.new-task.operation")?.includes(
+          String(original.operation_id),
+        ),
+      "ambiguous task create did not retain its exact persisted request",
+    );
+
+    field("Title", "Edited after response loss");
+    unmount();
+    mount(form());
+    check(
+      findField("Title").value === "Edited after response loss" &&
+        document.body.textContent?.includes("Retry exact unresolved create"),
+      "reload lost the edited draft or unresolved-create recovery",
+    );
+    click("Save draft");
+    await settle();
+    check(
+      requests.length === 1 && committedCreates === 1 &&
+        document.body.textContent?.includes(
+          "earlier task create still has an unknown result",
+        ),
+      "edited task submission bypassed the unresolved-create guard",
+    );
+    field("Title", "Original unresolved task");
+    click("Create Ready task");
+    await settle();
+    check(
+      requests.length === 1 && committedCreates === 1,
+      "a different Ready mode bypassed the unresolved-create guard",
+    );
+
+    field("Title", "Edited after response loss");
+    click("Retry exact unresolved create");
+    await settle();
+    check(
+      requests.length === 2 && committedCreates === 1 && saved === 1 &&
+        JSON.stringify(requests[1]) === JSON.stringify(original) &&
+        localStorage.getItem("agenticjira.new-task.operation") === null &&
+        localStorage.getItem("agenticjira.new-task")?.includes(
+          "Edited after response loss",
+        ),
+      "exact task-create reconciliation changed intent, duplicated the commit, stayed pending, or discarded edited draft fields",
+    );
+  } finally {
+    unmount();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("A04 setup clears definite stale identity but preserves an ambiguous exact retry", async () => {
+  localStorage.clear();
+  const definiteRequests: Record<string, unknown>[] = [];
+  let definiteRefreshes = 0;
+  globalThis.fetch = (async (
+    _input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    definiteRequests.push(body);
+    return definiteRequests.length === 1
+      ? new Response(JSON.stringify({ error: "stale project version" }), {
+        status: 409,
+      })
+      : new Response(JSON.stringify({ result: { state: "prepared" } }));
+  }) as typeof fetch;
+  try {
+    mount(
+      <ProjectSetup
+        project={{ ...initialized, version: 1 }}
+        onChanged={() => {
+          definiteRefreshes++;
+        }}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    click("Prepare exact runtime verification");
+    await settle();
+    const stale = definiteRequests[0];
+    check(
+      stale?.expected_version === 1 && definiteRefreshes === 1 &&
+        document.body.textContent?.includes("stale project version"),
+      "definite setup rejection did not surface and refresh current state",
+    );
+    rerender(
+      <ProjectSetup
+        project={{ ...initialized, version: 2 }}
+        onChanged={() => {
+          definiteRefreshes++;
+        }}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    await settle();
+    click("Prepare exact runtime verification");
+    await settle();
+    check(
+      definiteRequests[1]?.expected_version === 2 &&
+        definiteRequests[1]?.operation_id !== stale.operation_id &&
+        definiteRefreshes === 2,
+      "same setup action replayed a definitively rejected stale version",
+    );
+
+    unmount();
+    localStorage.clear();
+    const ambiguousRequests: Record<string, unknown>[] = [];
+    let ambiguousRefreshes = 0;
+    globalThis.fetch = (async (
+      _input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      ambiguousRequests.push(body);
+      if (ambiguousRequests.length === 1) {
+        throw new ApiError(
+          "setup response was lost",
+          0,
+          String(body.operation_id),
+          true,
+        );
+      }
+      return new Response(JSON.stringify({ result: { state: "prepared" } }));
+    }) as typeof fetch;
+    mount(
+      <ProjectSetup
+        project={{ ...initialized, version: 3 }}
+        onChanged={() => {
+          ambiguousRefreshes++;
+        }}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    click("Prepare exact runtime verification");
+    await settle();
+    unmount();
+    mount(
+      <ProjectSetup
+        project={{ ...initialized, version: 3 }}
+        onChanged={() => {
+          ambiguousRefreshes++;
+        }}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    click("Prepare exact runtime verification");
+    await settle();
+    check(
+      ambiguousRequests.length === 2 && ambiguousRefreshes === 2 &&
+        JSON.stringify(ambiguousRequests[1]) ===
+          JSON.stringify(ambiguousRequests[0]),
+      "ambiguous setup retry did not preserve the exact request and identity",
+    );
+  } finally {
+    unmount();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("A13 setup storage failure stays visible and releases the command guard", async () => {
+  localStorage.clear();
+  const originalSetItem = localStorage.setItem;
+  const operationKey = "llmrelay.trip.operations.p1";
+  let operationStorageAttempts = 0;
+  let requests = 0;
+  let refreshes = 0;
+  Object.defineProperty(localStorage, "setItem", {
+    configurable: true,
+    writable: true,
+    value: (key: string, value: string) => {
+      if (key === operationKey) {
+        operationStorageAttempts++;
+        throw new Error("fixture browser storage denied");
+      }
+      originalSetItem(key, value);
+    },
+  });
+  globalThis.fetch = (async () => {
+    requests++;
+    return new Response(JSON.stringify({ result: { state: "prepared" } }));
+  }) as typeof fetch;
+  try {
+    mount(
+      <ProjectSetup
+        project={initialized}
+        onChanged={() => {
+          refreshes++;
+        }}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    click("Prepare exact runtime verification");
+    await settle();
+    check(
+      document.body.textContent?.includes("fixture browser storage denied") &&
+        requests === 0 && refreshes === 1,
+      "setup storage failure was hidden or allowed an unretained request",
+    );
+    click("Prepare exact runtime verification");
+    await settle();
+    const retry = [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) =>
+        button.textContent?.includes("Prepare exact runtime verification")
+      );
+    check(
+      operationStorageAttempts >= 2 && requests === 0 && refreshes === 2 &&
+        retry !== undefined && !retry.disabled,
+      "setup storage failure left the real command guard latched",
+    );
+  } finally {
+    unmount();
+    Object.defineProperty(localStorage, "setItem", {
+      configurable: true,
+      writable: true,
+      value: originalSetItem,
+    });
+    localStorage.clear();
     globalThis.fetch = nativeFetch;
   }
 });
@@ -487,6 +1719,7 @@ Deno.test("Project add validates, guards repeats, and selects the created ID", a
       submit.click();
       submit.click();
     });
+    await settle();
     if (
       requestCount() !== 1 ||
       requests[0].kind !== "add_project" ||
@@ -572,6 +1805,14 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
             adapter: "codex",
             status: "unverified",
             reason: "fresh corrected verification required",
+            compatibility: {
+              status: "matched", observed_version: "codex-cli 0.155.1",
+              pack_id: "codex", pack_revision: "1", contract_id: "manager",
+              contract_revision: "1", short_hash: "123456789abc",
+              predicate_id: "codex-exact", missing_evidence: ["native_proof"],
+              action: "requalify_exact_profile",
+              message: "The exact contract is eligible for capability qualification; proof is pending.",
+            },
             runtime_admission: {
               id: "failed-task-runtime",
               scope_hash: "failed-task-scope",
@@ -600,6 +1841,14 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
           task_profile_source: preparationSource,
           adapter: "codex",
           status: proofReady ? "supported" : "unverified",
+          compatibility: {
+            status: "matched", observed_version: "codex-cli 0.155.1",
+            pack_id: "codex", pack_revision: "1", contract_id: "manager",
+            contract_revision: "1", short_hash: "123456789abc",
+            predicate_id: "codex-exact", missing_evidence: ["native_proof"],
+            action: "requalify_exact_profile",
+            message: "The exact contract is eligible for capability qualification; proof is pending.",
+          },
           reason: proofReady
             ? "Exact current runtime-scoped authority is supported"
             : "The generic prepared tuple is Supported, but exact current scoped authority is missing; it is not a usable replacement until corrected",
@@ -650,6 +1899,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
   try {
     mount(<WorkflowControls task={task} onChanged={() => {}} />);
     click("Pause after role");
+    await settle();
     if (
       requests.at(-1)?.kind !== "control" ||
       requests.at(-1)?.task_id !== "AJ-1" ||
@@ -1329,6 +2579,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     if (
       requests.at(-1)?.kind !== "resolve_recovery" ||
       requests.at(-1)?.task_id !== "hidden-setup-task" ||
+      requests.at(-1)?.recovery_id !== "setup-recovery-record" ||
       requests.at(-1)?.attempt_id !== recoverySession.attempt_id ||
       requests.at(-1)?.session_id !== recoverySession.id ||
       requests.at(-1)?.expected_version !== 50 ||
@@ -1528,6 +2779,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     await settle();
     if (
       requests.at(-1)?.kind !== "resolve_recovery" ||
+      requests.at(-1)?.recovery_id !== "runtime-recovery-record" ||
       requests.at(-1)?.session_id !== runtimeSession.id ||
       requests.at(-1)?.attempt_id !== runtimeSession.attempt_id ||
       recoveryRefreshCount() !== refreshesBeforeRuntime + 5
@@ -1788,6 +3040,9 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     const terminalState = {
       schema: 2,
       generated_at: "",
+      incarnation: "fixture",
+      revision: "1",
+      attention: [],
       projects: [project],
       tasks: [terminalHistory],
       production_role_restrictions: [],
@@ -1813,7 +3068,11 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       switches: [],
       recovery: [],
       history: [],
+      profile_sets: [],
+      task_recipes: [],
+      recipe_schedules: [],
       continuation_actions: [],
+      decisions: [],
       instance_settings: {
         version: 1,
         auto_resume_eligible: false,
@@ -1915,6 +3174,9 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     const restoreState = {
       schema: 2,
       generated_at: "",
+      incarnation: "fixture",
+      revision: "1",
+      attention: [],
       projects: [project],
       tasks: [task],
       production_role_restrictions: [],
@@ -1952,6 +3214,9 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       switches: [],
       recovery: [],
       history: [],
+      profile_sets: [],
+      task_recipes: [],
+      recipe_schedules: [],
       continuation_actions: [{
         kind: "exact_resume",
         enabled: true,
@@ -1966,6 +3231,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         },
         accounting_note: "Reuses the retained native session.",
       }],
+      decisions: [],
       instance_settings: {
         version: 4,
         auto_resume_eligible: false,
@@ -2308,6 +3574,97 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         "restart reason was not restored",
       );
     }
+    const fetchBeforePreview = globalThis.fetch;
+    const previewPaths: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      previewPaths.push(String(input));
+      return new Response(JSON.stringify({
+        decision_schema: 1,
+        snapshot: {
+          captured_at: "now",
+          process_inventory: "satisfied",
+          boot_identity: "satisfied",
+          dispatch_enabled: true,
+          draining: false,
+          revalidation_required: true,
+          notice: "No drain or resume was requested",
+        },
+        sessions: [{
+          classification: "fresh_only",
+          can_resume_now: false,
+          could_resume_after_confirmed_shutdown: false,
+          decision: {
+            decision_schema: 1,
+            reason_code: "restart.fresh_only",
+            disposition: "waiting",
+            subject: { session_id: "restore-s" },
+            observed_revision: {},
+            prerequisites: [],
+            ownership: { owner: "human", state: "recorded", binding: {} },
+            control_policy: { allowed_controls: [] },
+          },
+        }],
+      }));
+    }) as typeof fetch;
+    if (previewPaths.length !== 0) {
+      throw new Error("restart preview was polled on render");
+    }
+    click("Preview restart");
+    await settle();
+    if (
+      previewPaths.join(",") !== "/api/restart-preview" ||
+      !document.body.textContent?.includes("fresh only") ||
+      !document.body.textContent.includes("No current resume route")
+    ) {
+      throw new Error(
+        "explicit preview did not render its read-only classification",
+      );
+    }
+    globalThis.fetch =
+      (async (input: string | URL | Request, init?: RequestInit) => {
+        if (String(input) !== "/api/operation") {
+          throw new Error("resume used an unexpected route");
+        }
+        const request = JSON.parse(String(init?.body));
+        if (request.kind !== "restart_resume" || "session_ids" in request) {
+          throw new Error(
+            "Resume eligible did not use its explicit bounded route",
+          );
+        }
+        return new Response(JSON.stringify({
+          result: {
+            operation_id: request.operation_id,
+            mode: "eligible",
+            state: "queued",
+            selected_ids: [],
+            queued_ids: ["restore-s"],
+            omitted_ids: ["restore-s-2"],
+            omitted_count: 1,
+            outcomes: [
+              {
+                session_id: "restore-s",
+                state: "queued",
+                reason: "serialized admission",
+              },
+              {
+                session_id: "restore-s-2",
+                state: "omitted",
+                reason: "bounded batch",
+              },
+            ],
+          },
+        }));
+      }) as typeof fetch;
+    click("Resume eligible");
+    await settle();
+    if (
+      !document.body.textContent?.includes("Queued 1: restore-s") ||
+      !document.body.textContent.includes("Omitted 1: restore-s-2") ||
+      document.body.textContent.includes("Restart resume · resumed")
+    ) {
+      throw new Error("bulk result hid queued or omitted work");
+    }
+    globalThis.fetch = fetchBeforePreview;
     if (
       !document.body.textContent.includes("Project setup session") ||
       !document.body.textContent.includes(
@@ -2630,6 +3987,9 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     const state = {
       schema: 2,
       generated_at: "",
+      incarnation: "fixture",
+      revision: "1",
+      attention: [],
       projects: [project],
       tasks: [task],
       production_role_restrictions: [],
@@ -2646,7 +4006,11 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       switches: [],
       recovery: [],
       history: [],
+      profile_sets: [],
+      task_recipes: [],
+      recipe_schedules: [],
       continuation_actions: [],
+      decisions: [],
       instance_settings: {
         version: 1,
         auto_resume_eligible: false,
@@ -2665,7 +4029,11 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       },
     } as AppState;
     mount(
-      <AttentionInbox state={state} onSelect={() => {}} onChanged={() => {}} />,
+      <AttentionInbox
+        state={state}
+        onNavigate={() => undefined}
+        onChanged={() => {}}
+      />,
     );
     for (const label of ["queued", "submitted", "acknowledged"]) {
       if (!document.body.textContent?.includes(label)) {
@@ -2682,11 +4050,22 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
   const requests: Record<string, unknown>[] = [];
   const selections: Array<[string, string | undefined]> = [];
   let conflict = false;
+  let protocolConflict = false;
   let changed = 0;
   globalThis.fetch =
     (async (_input: string | URL | Request, init?: RequestInit) => {
       requests.push(JSON.parse(String(init?.body)));
-      return conflict
+      return protocolConflict
+        ? new Response(JSON.stringify({
+          error: "protocol mismatch",
+          protocol_error: {
+            reason: "incompatible_generation",
+            observed_generation: 1,
+            expected_generation: 2,
+            guidance: "Reload the dashboard for the matching protocol.",
+          },
+        }), { status: 409 })
+        : conflict
         ? new Response(JSON.stringify({ error: "stale request" }), {
           status: 409,
         })
@@ -2751,6 +4130,9 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
   const state = {
     schema: 3,
     generated_at: "",
+    incarnation: "fixture",
+    revision: "1",
+    attention: [],
     projects: [project],
     tasks: [{ ...task, permission_waiting: true }],
     production_role_restrictions: [],
@@ -2763,7 +4145,11 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
     switches: [],
     recovery: [],
     history: [],
+      profile_sets: [],
+      task_recipes: [],
+      recipe_schedules: [],
     continuation_actions: [],
+    decisions: [],
     instance_settings: {
       version: 1,
       auto_resume_eligible: false,
@@ -2965,7 +4351,20 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
       changed < 3 ||
       !document.body.textContent?.includes("State was refreshed")
     ) throw new Error("stale decision did not request a conflict refresh");
+    conflict = false;
+    protocolConflict = true;
+    const changesBeforeProtocol = changed;
+    const requestsBeforeProtocol = requests.length;
+    click("Approve once");
+    await settle();
+    if (changed !== changesBeforeProtocol ||
+      requests.length !== requestsBeforeProtocol + 1 ||
+      !document.body.textContent?.includes("Reload the dashboard for the matching protocol.") ||
+      document.body.textContent?.includes("The request changed in another view")) {
+      throw new Error("protocol refusal entered the ordinary 409 revision branch");
+    }
     unmount();
+    protocolConflict = false;
     conflict = false;
     const serviceCheck: TripTaskVerification = {
       attempt_id: "a1",
@@ -3689,5 +5088,1598 @@ Deno.test("T21 ambiguous mutation transport failures preserve durable operation 
   } finally {
     transportTimeouts.mutation = priorTimeout;
     globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("M8A protocol refusal is definitive before mutation reconciliation", async () => {
+  const priorFetch = globalThis.fetch;
+  let businessCalls = 0;
+  let expectedGeneration = 2;
+  let observedGeneration: number | null = 1;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    businessCalls++;
+    const declaration = JSON.parse(String(new Headers(init?.headers).get("x-llmrelay-protocol")));
+    if (declaration.generation !== 1 || declaration.client_kind !== "browser" ||
+      declaration.required_features[0] !== "http_operational_v1") {
+      throw new Error("business request omitted the protocol declaration");
+    }
+    return new Response(JSON.stringify({
+      error: "protocol mismatch",
+      protocol_error: {
+        reason: "incompatible_generation",
+        observed_generation: observedGeneration,
+        expected_generation: expectedGeneration,
+        guidance: "Reload the dashboard for the matching protocol.",
+      },
+    }), { status: 409 });
+  }) as typeof fetch;
+  try {
+    let failure: unknown;
+    try {
+      await command({ kind: "retry", operation_id: "protocol-refused" });
+    } catch (error) {
+      failure = error;
+    }
+    if (!(failure instanceof ProtocolError) || failure instanceof ApiError ||
+      failure.message !== "Reload the dashboard for the matching protocol." ||
+      businessCalls !== 1) {
+      throw new Error("protocol refusal became an ambiguous or replayed mutation");
+    }
+    for (const [expected, observed] of [[-1, 1], [0x1_0000_0000, 1], [2, -1], [2, 0x1_0000_0000]]) {
+      expectedGeneration = expected;
+      observedGeneration = observed;
+      let invalidFailure: unknown;
+      try {
+        await command({ kind: "retry", operation_id: "invalid-protocol-wire" });
+      } catch (error) {
+        invalidFailure = error;
+      }
+      if (!(invalidFailure instanceof ApiError) || invalidFailure.status !== 409) {
+        throw new Error("out-of-range protocol generation was accepted as a structured refusal");
+      }
+    }
+    const requestCount = () => businessCalls;
+    if (requestCount() !== 5) {
+      throw new Error("protocol refusals triggered an automatic replay");
+    }
+  } finally {
+    globalThis.fetch = priorFetch;
+  }
+});
+
+Deno.test("M5 decision policy keeps the permitted control and explains the blocked one", async () => {
+  mount(
+    <WorkflowControls
+      task={task}
+      onChanged={() => {}}
+      decision={{
+        decision_schema: 1,
+        reason_code: "workflow.waiting_for_exact_review",
+        disposition: "waiting",
+        subject: { task_id: task.id },
+        observed_revision: { task_version: task.version },
+        primary_blocker: {
+          code: "review",
+          state: "unknown",
+          owner: "human",
+          evidence: null,
+          message: "Review evidence is not current",
+        },
+        prerequisites: [],
+        ownership: { owner: "human", state: "awaiting_review", binding: {} },
+        next_action: null,
+        control_policy: { allowed_controls: ["pause_now"] },
+      }}
+    />,
+  );
+  const retry = [...document.querySelectorAll<HTMLButtonElement>("button")]
+    .find((button) => button.textContent?.trim() === "Retry");
+  const pause = [...document.querySelectorAll<HTMLButtonElement>("button")]
+    .find((button) => button.textContent?.trim() === "Pause now");
+  if (
+    !retry?.disabled || pause?.disabled ||
+    !document.body.textContent?.includes("Review evidence is not current")
+  ) {
+    throw new Error("backend policy did not disable only the refused control");
+  }
+  unmount();
+  const requests: Record<string, unknown>[] = [];
+  const priorFetch = globalThis.fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ result: { state: "ready" } }));
+    }) as typeof fetch;
+  try {
+    const backlogTask = {
+      ...task,
+      lifecycle: "backlog",
+      active_attempt: undefined,
+    };
+    const readiness: DecisionExplanation = {
+      decision_schema: 1,
+      reason_code: "task.backlog_readiness",
+      disposition: "waiting",
+      subject: { task_id: task.id },
+      observed_revision: { task_version: task.version },
+      primary_blocker: null,
+      prerequisites: [],
+      ownership: {
+        owner: "human",
+        state: "recorded_task_status",
+        binding: { task_id: task.id, expected_task_version: task.version },
+      },
+      next_action: {
+        operation: "make_ready",
+        enabled: true,
+        owner: "human",
+        binding: { task_id: task.id, expected_task_version: task.version },
+      },
+      control_policy: { allowed_controls: ["make_ready"] },
+    };
+    mount(
+      <WorkflowControls
+        task={backlogTask}
+        project={initialized}
+        decision={readiness}
+        onChanged={() => {}}
+      />,
+    );
+    const ready = [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim() === "Make Ready");
+    if (!ready || ready.disabled) {
+      throw new Error("backend permitted Backlog action was disabled");
+    }
+    click("Make Ready");
+    await settle();
+    if (
+      requests.at(-1)?.kind !== "make_ready" ||
+      requests.at(-1)?.task_id !== task.id ||
+      requests.at(-1)?.expected_version !== task.version
+    ) {
+      throw new Error("Backlog action did not send exact task and version");
+    }
+    unmount();
+    mount(
+      <WorkflowControls
+        task={backlogTask}
+        project={initialized}
+        decision={{
+          ...readiness,
+          primary_blocker: {
+            code: "task.six_role_settings",
+            state: "missing",
+            owner: "human",
+            evidence: null,
+            message: "Configure six app roles",
+          },
+          control_policy: {
+            allowed_controls: [],
+            disabled_reason_code: "task.six_role_settings",
+          },
+        }}
+        onChanged={() => {}}
+      />,
+    );
+    const blocked = [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim() === "Make Ready");
+    if (!blocked?.disabled || blocked.title !== "Configure six app roles") {
+      throw new Error("Backlog missing-prerequisite policy was not shown");
+    }
+    unmount();
+    const readyTask: Task = {
+      ...task,
+      lifecycle: "ready",
+      active_attempt: undefined,
+    };
+    mount(
+      <WorkflowControls
+        task={readyTask}
+        decision={{
+          ...readiness,
+          reason_code: "scheduler.queue_paused",
+          control_policy: { allowed_controls: ["run_next"] },
+        }}
+        onChanged={() => {}}
+      />,
+    );
+    const runNext = [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim() === "Run next");
+    if (!runNext || runNext.disabled) {
+      throw new Error("Ready Run next policy was disabled");
+    }
+    click("Run next");
+    await settle();
+    if (
+      requests.at(-1)?.kind !== "control" ||
+      requests.at(-1)?.action !== "run_next" ||
+      requests.at(-1)?.task_id !== task.id ||
+      requests.at(-1)?.expected_version !== task.version
+    ) {
+      throw new Error("Ready Run next lost the exact task and version");
+    }
+    unmount();
+    mount(
+      <WorkflowControls
+        task={task}
+        decision={{
+          ...readiness,
+          reason_code: "workflow.awaiting_human_plan_approval",
+          control_policy: {
+            allowed_controls: ["pause_after_role", "pause_now", "cancel"],
+          },
+        }}
+        onChanged={() => {}}
+      />,
+    );
+    click("Pause now");
+    await settle();
+    if (
+      requests.at(-1)?.kind !== "control" ||
+      requests.at(-1)?.action !== "pause_now" ||
+      requests.at(-1)?.task_id !== task.id ||
+      requests.at(-1)?.expected_version !== task.version
+    ) {
+      throw new Error("active attempt pause lost the exact task and version");
+    }
+    unmount();
+  } finally {
+    globalThis.fetch = priorFetch;
+  }
+});
+
+Deno.test("T22 restore claim and freeze records submit generic recovery without a session", async () => {
+  const requests: Record<string, unknown>[] = [];
+  let refreshes = 0;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(
+        JSON.stringify({ result: { state: "resolved_quiescent" } }),
+      );
+    }) as typeof fetch;
+  try {
+    for (
+      const [kind, explanation] of [
+        ["database_restore_claim", "prelaunch claim reservation"],
+        ["database_restore_freeze", "interrupted local freeze"],
+      ]
+    ) {
+      mount(
+        <RecoveryPanel
+          task={task}
+          records={[
+            {
+              id: `historical-before-${kind}`,
+              attempt_id: "a1",
+              state: "attention_required",
+              detail: { kind: "control_failure" },
+            },
+            {
+              id: `restore-${kind}`,
+              attempt_id: "a1",
+              state: "attention_required",
+              detail: {
+                kind,
+                operation_id: "restore-operation",
+              },
+            },
+          ]}
+          onChanged={() => {
+            refreshes++;
+          }}
+        />,
+      );
+      if (
+        !document.body.textContent?.includes(explanation) ||
+        !document.body.textContent.includes(
+          "Verify quiescence and reconcile",
+        ) || document.body.textContent.includes("Verify and cancel")
+      ) {
+        throw new Error(`${kind} did not expose its generic recovery action`);
+      }
+      field("Recovery evidence", `operator annotation for ${kind}`);
+      click("Verify quiescence and reconcile");
+      await settle();
+      const request = requests.at(-1);
+      if (
+        !request ||
+        request.kind !== "resolve_recovery" ||
+        request.task_id !== task.id ||
+        request.attempt_id !== task.active_attempt?.id ||
+        request.recovery_id !== `restore-${kind}` ||
+        request.expected_version !== task.version ||
+        request.decision !== "confirm_quiescent" ||
+        request.evidence !== `operator annotation for ${kind}` ||
+        "session_id" in request
+      ) {
+        throw new Error(
+          `${kind} did not submit generic attempt recovery without a session`,
+        );
+      }
+    }
+    if (refreshes !== 2 || requests.length !== 2) {
+      throw new Error("restore recovery actions did not refresh exactly once");
+    }
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+const check = (condition: unknown, message: string) => {
+  if (!condition) throw new Error(message);
+};
+const liveBase: AppState = {
+  schema: 8,
+  generated_at: "2026-09-23T00:00:00Z",
+  incarnation: "service-a",
+  revision: "1",
+  projects: [initialized],
+  tasks: [task],
+  production_role_restrictions: [],
+  capabilities: [],
+  active_sessions: [],
+  controls: [],
+  guidance: [],
+  check_suites: [],
+  checks: [],
+  switches: [],
+  recovery: [],
+  history: [],
+      profile_sets: [],
+      task_recipes: [],
+      recipe_schedules: [],
+  instance_settings: {
+    version: 1,
+    auto_resume_eligible: false,
+    updated_at: "",
+  },
+  restart_candidates: [],
+  permission_requests: [],
+  permission_rules: [],
+  continuation_actions: [],
+  decisions: [],
+  attention: [],
+  resources: {
+    active_sessions: 0,
+    active_controls: 0,
+    queued_guidance: 0,
+    running_checks: 0,
+    observed_at: "",
+    processes: [],
+  },
+};
+const snapshotAt = (
+  incarnation: string,
+  revision: string,
+  overrides: Partial<AppState> = {},
+): AppState => ({ ...liveBase, ...overrides, incarnation, revision });
+const changedTo = (state: AppState): StateWaitResult => ({
+  outcome: "state_changed",
+  incarnation: state.incarnation,
+  revision: state.revision,
+  state,
+});
+
+Deno.test("M8A concurrent negotiation and incarnation reset fence descriptor cache", async () => {
+  const priorFetch = globalThis.fetch;
+  let incarnation = "m8a-reset-a";
+  let businessCalls = 0;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    if (String(input) === "/api/state") {
+      return new Response(JSON.stringify(snapshotAt(incarnation, "1")));
+    }
+    businessCalls++;
+    return new Response(JSON.stringify({ result: { state: "applied" } }));
+  }) as typeof fetch;
+  try {
+    await getState();
+    let resolveFirst: ((response: Response) => void) | undefined;
+    let descriptorCalls = 0;
+    protocolFixtureResponder = () => {
+      descriptorCalls++;
+      return new Promise<Response>((resolve) => { resolveFirst = resolve; });
+    };
+    const first = command({ kind: "retry", operation_id: "m8a-first" });
+    const second = command({ kind: "retry", operation_id: "m8a-second" });
+    await Promise.resolve();
+    check(descriptorCalls === 1 && businessCalls === 0, "concurrent operations did not share protocol discovery");
+    resolveFirst!(new Response(JSON.stringify({
+      generation: 1, server_version: "fixture", instance_id: incarnation,
+      supported_features: ["http_operational_v1"],
+    })));
+    await Promise.all([first, second]);
+    check(businessCalls === 2, "negotiated operations did not dispatch once each");
+    incarnation = "m8a-reset-b";
+    await getState();
+    protocolFixtureResponder = () => {
+      descriptorCalls++;
+      return Promise.resolve(new Response(JSON.stringify({
+        generation: 1, server_version: "fixture", instance_id: incarnation,
+        supported_features: ["http_operational_v1"],
+      })));
+    };
+    await command({ kind: "retry", operation_id: "m8a-third" });
+    check(descriptorCalls === 2 && businessCalls === 3,
+      "incarnation reset kept a stale descriptor or replayed a mutation");
+  } finally {
+    protocolFixtureResponder = () => Promise.resolve(protocolFixture());
+    globalThis.fetch = priorFetch;
+  }
+});
+
+Deno.test("M8A a newer observed incarnation fences unresolved descriptor discovery", async () => {
+  const priorFetch = globalThis.fetch;
+  let stateCalls = 0;
+  let businessCalls = 0;
+  let resolveNewState: ((response: Response) => void) | undefined;
+  let resolveOldDescriptor: ((response: Response) => void) | undefined;
+  const descriptor = (instanceId: string) => new Response(JSON.stringify({
+    generation: 1, server_version: "fixture", instance_id: instanceId,
+    supported_features: ["http_operational_v1"],
+  }));
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    if (String(input) === "/api/state") {
+      stateCalls++;
+      if (stateCalls === 2) {
+        return new Promise<Response>((resolve) => { resolveNewState = resolve; });
+      }
+      return new Response(JSON.stringify(snapshotAt(
+        stateCalls === 1 ? "m8a-order-a" : "m8a-order-b", String(stateCalls),
+      )));
+    }
+    businessCalls++;
+    return new Response(JSON.stringify({ result: { state: "applied" } }));
+  }) as typeof fetch;
+  try {
+    await getState();
+    protocolFixtureResponder = () => Promise.resolve(descriptor("m8a-order-a"));
+    await command({ kind: "retry", operation_id: "m8a-order-seed" });
+    const newState = getState();
+    await Promise.resolve();
+    check(!!resolveNewState, "newer state read was not dispatched before renegotiation");
+    await getState();
+    let descriptorCalls = 0;
+    protocolFixtureResponder = () => {
+      descriptorCalls++;
+      return descriptorCalls === 1
+        ? new Promise<Response>((resolve) => { resolveOldDescriptor = resolve; })
+        : Promise.resolve(descriptor("m8a-order-c"));
+    };
+    const mutation = command({ kind: "retry", operation_id: "m8a-order-mutation" });
+    await Promise.resolve();
+    check(descriptorCalls === 1 && !!resolveOldDescriptor && businessCalls === 1,
+      "older descriptor discovery did not remain pending before newer state");
+    resolveNewState!(new Response(JSON.stringify(snapshotAt("m8a-order-c", "4"))));
+    await newState;
+    resolveOldDescriptor!(descriptor("m8a-order-b"));
+    await mutation;
+    check(descriptorCalls === 2 && businessCalls === 2,
+      "late older descriptor was cached or mutation replayed");
+    await command({ kind: "retry", operation_id: "m8a-order-next" });
+    check(descriptorCalls === 2 && businessCalls === 3,
+      "current descriptor was not cached after fenced discovery");
+  } finally {
+    protocolFixtureResponder = () => Promise.resolve(protocolFixture());
+    globalThis.fetch = priorFetch;
+  }
+});
+
+Deno.test("M8A an older state observation allows bounded replacement discovery", async () => {
+  const priorFetch = globalThis.fetch;
+  let descriptorCalls = 0;
+  let businessCalls = 0;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    if (String(input) === "/api/state") {
+      return new Response(JSON.stringify(snapshotAt("m8a-replaced-a", "1")));
+    }
+    businessCalls++;
+    return new Response(JSON.stringify({ result: { state: "applied" } }));
+  }) as typeof fetch;
+  protocolFixtureResponder = () => {
+    descriptorCalls++;
+    return Promise.resolve(new Response(JSON.stringify({
+      generation: 1, server_version: "fixture", instance_id: "m8a-replaced-b",
+      supported_features: ["http_operational_v1"],
+    })));
+  };
+  try {
+    await getState();
+    descriptorCalls = 0;
+    await command({ kind: "retry", operation_id: "m8a-replaced" });
+    check(descriptorCalls === 2 && businessCalls === 1,
+      "service replacement retried without a bound or dispatched a duplicate mutation");
+  } finally {
+    protocolFixtureResponder = () => Promise.resolve(protocolFixture());
+    globalThis.fetch = priorFetch;
+  }
+});
+
+interface PendingRequest<T> {
+  resolve: (value: T) => void;
+  reject: (cause: unknown) => void;
+  signal: AbortSignal;
+  at: number;
+}
+/** Scripted transport and manual clock for the live-state lifecycle. */
+function liveHarness() {
+  let now = 0;
+  let nextHandle = 1;
+  let replyToRead: ((read: PendingRequest<AppState>) => void) | undefined;
+  let replyToWait:
+    | ((wait: PendingRequest<StateWaitResult>) => void)
+    | undefined;
+  const timers = new Map<number, { due: number; callback: () => void }>();
+  const reads: PendingRequest<AppState>[] = [];
+  const waits: Array<
+    PendingRequest<StateWaitResult> & { cursor: StateCursor }
+  > = [];
+  const pending = <T,>(signal: AbortSignal) => {
+    const entry: PendingRequest<T> = {
+      resolve: () => {},
+      reject: () => {},
+      signal,
+      at: now,
+    };
+    const promise = new Promise<T>((resolve, reject) => {
+      entry.resolve = resolve;
+      entry.reject = reject;
+      signal.addEventListener(
+        "abort",
+        () => reject(new DOMException("aborted", "AbortError")),
+        { once: true },
+      );
+    });
+    return { entry, promise };
+  };
+  const environment: LiveEnvironment = {
+    transport: {
+      read: (signal) => {
+        const { entry, promise } = pending<AppState>(signal);
+        reads.push(entry);
+        replyToRead?.(entry);
+        return promise;
+      },
+      wait: (cursor, _timing, signal) => {
+        const { entry, promise } = pending<StateWaitResult>(signal);
+        waits.push({ ...entry, cursor });
+        replyToWait?.(entry);
+        return promise;
+      },
+    },
+    scheduler: {
+      setTimeout: (callback, delayMs) => {
+        const handle = nextHandle++;
+        timers.set(handle, { due: now + delayMs, callback });
+        return handle;
+      },
+      clearTimeout: (handle) => {
+        timers.delete(handle);
+      },
+    },
+  };
+  return {
+    environment,
+    reads,
+    waits,
+    /** Settles each later request immediately, or queues it when undefined. */
+    replyToReads: (reply: typeof replyToRead) => {
+      replyToRead = reply;
+    },
+    replyToWaits: (reply: typeof replyToWait) => {
+      replyToWait = reply;
+    },
+    now: () => now,
+    timerCount: () => timers.size,
+    async advance(milliseconds: number) {
+      const until = now + milliseconds;
+      for (;;) {
+        // Pending continuations must schedule their timers at the current time.
+        await settle();
+        const [due] = [...timers].filter(([, timer]) => timer.due <= until)
+          .sort(([, left], [, right]) => left.due - right.due);
+        if (!due) break;
+        timers.delete(due[0]);
+        now = due[1].due;
+        due[1].callback();
+      }
+      now = until;
+    },
+  };
+}
+
+Deno.test("M6 live state keeps only newer snapshots, queues post-mutation reads, and fences resets", async () => {
+  const live = liveHarness();
+  const states: AppState[] = [];
+  const controller = startLiveState({
+    onState: (state) => states.push(state),
+    onStatus: () => {},
+  }, live.environment);
+  const shown = () =>
+    `${states.at(-1)?.incarnation}/${states.at(-1)?.revision}`;
+  try {
+    live.reads[0].resolve(snapshotAt("service-a", "9"));
+    await settle();
+    check(
+      live.waits.length === 1 && live.waits[0].cursor.revision === "9",
+      "the long poll did not start from the accepted cursor",
+    );
+    void controller.refresh();
+    let reconciled = false;
+    const afterMutation = controller.refresh().then(() => {
+      reconciled = true;
+    });
+    void controller.refresh();
+    check(
+      live.reads.length === 2,
+      "invalidations overlapped the in-flight read",
+    );
+    live.waits[0].resolve(changedTo(snapshotAt("service-a", "10")));
+    await settle();
+    live.reads[1].resolve(snapshotAt("service-a", "9"));
+    await settle();
+    check(
+      shown() === "service-a/10",
+      "a delayed older read replaced a newer snapshot",
+    );
+    check(
+      live.reads.length === 3 && !reconciled,
+      "the post-mutation refresh reused the read that started before it",
+    );
+    const rendered = states.length;
+    live.waits[1].resolve(changedTo(snapshotAt("service-a", "10")));
+    await settle();
+    check(
+      states.length === rendered,
+      "a duplicated wake re-rendered its revision",
+    );
+    live.reads[2].resolve(snapshotAt("service-a", "10", {
+      resources: { ...liveBase.resources, observed_at: "volatile" },
+    }));
+    await afterMutation;
+    check(
+      reconciled && states.at(-1)?.resources.observed_at === "volatile",
+      "a same-revision read did not refresh volatile observations",
+    );
+    live.waits[2].resolve(
+      changedTo(snapshotAt("service-a", "9007199254740993")),
+    );
+    await settle();
+    void controller.refresh();
+    live.reads[3].resolve(snapshotAt("service-a", "9007199254740992"));
+    await settle();
+    check(
+      shown() === "service-a/9007199254740993",
+      "revision order lost precision beyond Number.MAX_SAFE_INTEGER",
+    );
+    void controller.refresh();
+    live.waits[3].resolve({
+      outcome: "reset",
+      incarnation: "service-b",
+      revision: "2",
+      state: snapshotAt("service-b", "2"),
+    });
+    await settle();
+    live.reads[4].resolve(snapshotAt("service-a", "9007199254740999"));
+    await settle();
+    check(
+      shown() === "service-b/2",
+      "a response issued before the reset restored the retired incarnation",
+    );
+    check(
+      live.waits.at(-1)?.cursor.incarnation === "service-b" &&
+        live.waits.at(-1)?.cursor.revision === "2",
+      "the long poll did not re-arm on the reset cursor",
+    );
+    void controller.refresh();
+    live.reads[5].resolve(snapshotAt("service-a", "9223372036854775807"));
+    await settle();
+    check(
+      shown() === "service-b/2",
+      "a later answer from the retired incarnation flipped the dashboard back",
+    );
+    void controller.refresh();
+    live.reads[6].resolve(snapshotAt("service-b", "3"));
+    await settle();
+    check(shown() === "service-b/3", "the retired incarnation was not fenced");
+    void controller.refresh();
+    live.waits[live.waits.length - 1].resolve({
+      outcome: "reset",
+      incarnation: "service-b",
+      revision: "1",
+      state: snapshotAt("service-b", "1"),
+    });
+    await settle();
+    live.reads[7].resolve(snapshotAt("service-b", "3"));
+    await settle();
+    check(
+      shown() === "service-b/1",
+      "a read issued before a same-incarnation reset was applied",
+    );
+    const accepted = states.length;
+    const parked = live.waits[live.waits.length - 1];
+    controller.dispose();
+    await controller.refresh();
+    await settle();
+    check(
+      parked.signal.aborted && live.timerCount() === 0 &&
+        live.reads.length === 8 && states.length === accepted,
+      "dispose left a request, timer, or listener active",
+    );
+  } finally {
+    controller.dispose();
+  }
+});
+
+Deno.test("M6 live state backs off failures, keeps an independent watchdog, and converges without a wake", async () => {
+  const live = liveHarness();
+  const states: AppState[] = [];
+  const statuses: LiveStatus[] = [];
+  const configuredWatchdog = liveTiming.watchdogMs;
+  liveTiming.watchdogMs = 300_001;
+  let unboundedRejected = false;
+  try {
+    startLiveState({ onState: noop, onStatus: noop }, live.environment)
+      .dispose();
+  } catch (cause) {
+    unboundedRejected = cause instanceof RangeError;
+  } finally {
+    liveTiming.watchdogMs = configuredWatchdog;
+  }
+  check(
+    unboundedRejected && live.reads.length === 0,
+    "an out-of-range watchdog interval was accepted",
+  );
+  live.replyToReads((read) =>
+    read.reject(new ApiError("browser session required", 401))
+  );
+  const controller = startLiveState({
+    onState: (state) => states.push(state),
+    onStatus: (status) => statuses.push(status),
+  }, live.environment);
+  const latestStatus = () => statuses.at(-1);
+  try {
+    await live.advance(60_000);
+    const readTimes = live.reads.map((read) => read.at).join(",");
+    check(
+      readTimes === "0,1000,3000,7000,15000,30000,31000,60000",
+      `authentication failures were not bounded backoff plus watchdog: ${readTimes}`,
+    );
+    check(
+      live.waits.length === 0 && !latestStatus()?.online &&
+        latestStatus()?.error === "browser session required",
+      "an unauthenticated dashboard waited or hid the failure",
+    );
+    live.replyToReads(undefined);
+    await live.advance(1_000);
+    live.reads[8].resolve(snapshotAt("service-a", "5"));
+    await settle();
+    check(
+      latestStatus()?.online && live.waits.length === 1,
+      "recovery did not resume the long poll",
+    );
+    live.waits[0].resolve({
+      outcome: "unchanged",
+      incarnation: "service-a",
+      revision: "5",
+    });
+    await settle();
+    check(
+      live.waits.length === 2 && live.waits[1].cursor.revision === "5" &&
+        states.length === 1,
+      "a timed-out wait re-rendered or did not re-arm",
+    );
+    for (const revision of ["6", "7", "8"]) {
+      live.waits[live.waits.length - 1].resolve(
+        changedTo(snapshotAt("service-a", revision)),
+      );
+      await settle();
+    }
+    const beforeWatchdog = live.reads.length;
+    await live.advance(90_000 - live.now());
+    check(
+      live.reads.length === beforeWatchdog + 1,
+      "continuous wakes starved the watchdog",
+    );
+    live.reads[live.reads.length - 1].resolve(snapshotAt("service-a", "9"));
+    await settle();
+    check(
+      states.at(-1)?.revision === "9",
+      "the watchdog did not converge on an external change that sent no wake",
+    );
+    const offline = statuses.filter((status) => !status.online).length;
+    const waits = live.waits.length;
+    live.waits[waits - 1].reject(
+      new ApiError("too many dashboard state waits are active", 503),
+    );
+    await settle();
+    await live.advance(1_000);
+    check(
+      live.waits.length === waits + 1 &&
+        live.reads.length === beforeWatchdog + 1 &&
+        statuses.filter((status) => !status.online).length === offline,
+      "waiter back-pressure flashed offline or triggered a read storm",
+    );
+    live.waits[live.waits.length - 1].reject(new TypeError("Failed to fetch"));
+    await settle();
+    check(
+      !latestStatus()?.online && latestStatus()?.error === "Failed to fetch",
+      "a lost connection was not reported",
+    );
+    await live.advance(2_000);
+    live.reads[live.reads.length - 1].resolve(snapshotAt("service-a", "9"));
+    await settle();
+    check(
+      latestStatus()?.online && live.waits.at(-1)?.cursor.revision === "9" &&
+        live.waits.length === waits + 2,
+      "reconnect did not read authoritatively before re-arming the wait",
+    );
+    const requests = live.reads.length + live.waits.length;
+    live.replyToReads((read) => read.resolve(snapshotAt("service-a", "9")));
+    live.replyToWaits((wait) => wait.reject(new ApiError("Not Found", 404)));
+    live.waits[live.waits.length - 1].reject(new ApiError("Not Found", 404));
+    await live.advance(60_000);
+    const issued = live.reads.length + live.waits.length - requests;
+    check(
+      issued <= 12,
+      `a service that reads but cannot wait caused a request storm: ${issued} in 60s`,
+    );
+  } finally {
+    controller.dispose();
+  }
+});
+
+const secondProject: Project = {
+  ...project,
+  id: "p2",
+  display_name: "Second",
+  trip: {
+    readiness: "needs_upgrade_review",
+    reason: "Upgrade review required",
+    detected_installation: "compatible",
+    setup_operation_id: null,
+  },
+};
+const managerSession: Session = {
+  id: "s1",
+  role_generation_id: "g1",
+  provider: "codex",
+  status: "running",
+  readiness: "idle",
+  capture_state: "capturing",
+  updated_at: "",
+  task_id: "AJ-1",
+  attempt_id: "a1",
+  role: "manager",
+  generation: 1,
+  config_revision: 1,
+  launch: {
+    model: "gpt-5.6-sol",
+    effort: "high",
+    permission_policy: "read-only",
+    security_policy: {},
+  },
+};
+const pendingPermission: PermissionRequest = {
+  id: "pr1",
+  project_id: "p1",
+  task_id: "AJ-1",
+  attempt_id: "a1",
+  session_id: "s1",
+  role_generation_id: "g1",
+  role: "manager",
+  provider: "codex",
+  native_session_id: "native-1",
+  tool_name: "shell",
+  input: {},
+  requested_access: null,
+  created_at: "2026-09-23T00:00:00Z",
+  deadline_at: "2999-01-01T00:00:00Z",
+  state: "pending",
+  revision: 3,
+  delivery_state: "not_reserved",
+};
+const railItem = (
+  id: string,
+  category: AttentionItem["category"],
+  title: string,
+  target: AttentionTarget | null,
+  held_tasks: AttentionItem["held_tasks"] = [],
+): AttentionItem => ({
+  id,
+  category,
+  title,
+  reason: `${title} reason`,
+  target,
+  held_tasks,
+});
+const railState = snapshotAt("service-a", "40", {
+  projects: [initialized, secondProject],
+  tasks: [
+    {
+      ...task,
+      active_attempt: {
+        id: "a1",
+        phase: "awaiting_plan_approval",
+        status: "running",
+        base_revision: "abc",
+        plan_hash: "plan-1",
+        plan: "Reviewed plan text",
+      },
+    },
+    {
+      ...task,
+      id: "AJ-2",
+      title: "Recovering",
+      attention: "needs_recovery",
+      active_attempt: {
+        id: "a2",
+        phase: "implementation",
+        status: "needs_recovery",
+        base_revision: "abc",
+      },
+    },
+    {
+      ...task,
+      id: "AJ-3",
+      project_id: "p2",
+      title: "Paused",
+      attention: "paused",
+      active_attempt: undefined,
+    },
+  ],
+  active_sessions: [managerSession],
+  recovery: ["r-first", "r-target"].map((id) => ({
+    id,
+    session_id: "s-other",
+    attempt_id: "a2",
+    state: "attention_required",
+    detail: {},
+  })),
+  permission_requests: [pendingPermission],
+  continuation_actions: [{
+    kind: "wait_for_exit",
+    enabled: false,
+    reason: "A verified exit is required.",
+    owner: "service",
+    waiting_for: "verified process-group exit",
+    operation: "wait_for_exit",
+    binding: { task_id: "AJ-1", attempt_id: "a1", session_id: "s1" },
+  }],
+  attention: [
+    railItem("permission_request:pr1", "permission", "AJ-1 · shell", {
+      kind: "permission_request",
+      project_id: "p1",
+      task_id: "AJ-1",
+      attempt_id: "a1",
+      session_id: "s1",
+      request_id: "pr1",
+      request_revision: 3,
+    }),
+    railItem("attempt:a1:awaiting_plan_approval", "decision", "AJ-1 plan", {
+      kind: "attempt",
+      project_id: "p1",
+      task_id: "AJ-1",
+      attempt_id: "a1",
+      phase: "awaiting_plan_approval",
+      plan_hash: "plan-1",
+      candidate_hash: null,
+    }),
+    railItem("restore_hold", "recovery", "Instance restore hold", null, [{
+      project_id: "p1",
+      task_id: "AJ-1",
+      task_version: 7,
+    }]),
+    railItem("recovery_record:r-target", "recovery", "AJ-2 recovery", {
+      kind: "recovery_record",
+      project_id: "p1",
+      task_id: "AJ-2",
+      attempt_id: "a2",
+      recovery_id: "r-target",
+    }),
+    railItem("continuation:wait_for_exit:s1", "recovery", "Waiting for exit", {
+      kind: "session",
+      project_id: "p1",
+      task_id: "AJ-1",
+      attempt_id: "a1",
+      session_id: "s1",
+      role_generation_id: "g1",
+    }),
+    railItem("project_setup:p2", "compatibility", "Second setup", {
+      kind: "project_setup",
+      project_id: "p2",
+      setup_operation_id: null,
+    }),
+    railItem("task:AJ-3:paused", "blocked", "AJ-3 · Paused", {
+      kind: "task",
+      project_id: "p2",
+      task_id: "AJ-3",
+      task_version: 7,
+    }),
+    railItem(
+      "attempt:a-old:awaiting_human_review",
+      "awaiting_acceptance",
+      "AJ-2 acceptance",
+      {
+        kind: "attempt",
+        project_id: "p1",
+        task_id: "AJ-2",
+        attempt_id: "a-old",
+        phase: "awaiting_human_review",
+        plan_hash: null,
+        candidate_hash: "candidate-old",
+      },
+    ),
+  ],
+});
+
+Deno.test("M6 attention rail groups exact items, preserves forms across snapshots, and opens only current targets", async () => {
+  const live = liveHarness();
+  const priorEnvironment = { ...liveEnvironment };
+  const methods: string[] = [];
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      methods.push(init?.method ?? "GET");
+      return new Response("[]");
+    }) as typeof fetch;
+  liveEnvironment.transport = live.environment.transport;
+  liveEnvironment.scheduler = live.environment.scheduler;
+  localStorage.clear();
+  localStorage.setItem("agenticjira.page", "workspace");
+  const focused = () =>
+    document.activeElement?.getAttribute("data-attention-target");
+  const open = (selector: string) => {
+    const button = document.querySelector<HTMLButtonElement>(selector);
+    if (!button) throw new Error(`attention control not found: ${selector}`);
+    act(() => button.click());
+  };
+  try {
+    mount(<App />);
+    await settle();
+    live.reads[0].resolve(railState);
+    await settle();
+    const groups = [...document.querySelectorAll('.inbox [role="group"]')]
+      .map((group) => group.getAttribute("aria-label")).join("|");
+    check(
+      groups ===
+        "Permissions (1)|Decisions (1)|Recovery (3)|Compatibility (1)|Blocked (1)|Completed · awaiting acceptance (1)",
+      `attention groups drifted: ${groups}`,
+    );
+    check(
+      document.querySelector(".inbox header span")?.textContent === "8" &&
+        document.querySelector('[data-attention-id="task:AJ-3:paused"]')
+          ?.textContent?.includes("Second"),
+      "the rail miscounted items or hid another project's item",
+    );
+
+    open('[data-attention-id="attempt:a1:awaiting_plan_approval"]');
+    await settle();
+    check(
+      focused() === "attempt:a1" &&
+        document.activeElement?.classList.contains("review-panel"),
+      `the plan decision did not focus its review panel: ${focused()}`,
+    );
+    const scroller = document.querySelector(".detail-scroll");
+    change(
+      document.querySelector<HTMLTextAreaElement>(
+        '[aria-label="Guidance message"]',
+      )!,
+      "Keep this draft",
+    );
+    change(
+      document.querySelector<HTMLSelectElement>(
+        '[aria-label="Guidance target"]',
+      )!,
+      "g1",
+    );
+    check(
+      live.waits[0]?.cursor.incarnation === "service-a" &&
+        live.waits[0].cursor.revision === "40",
+      "the dashboard did not long-poll from its snapshot cursor",
+    );
+    live.waits[0].resolve(changedTo({ ...railState, revision: "41" }));
+    await settle();
+    live.waits[1].resolve({
+      outcome: "unchanged",
+      incarnation: "service-a",
+      revision: "41",
+    });
+    await settle();
+    check(
+      document.querySelector<HTMLTextAreaElement>(
+            '[aria-label="Guidance message"]',
+          )?.value === "Keep this draft" &&
+        document.querySelector<HTMLSelectElement>(
+            '[aria-label="Guidance target"]',
+          )?.value === "g1" &&
+        document.querySelector(".detail-scroll") === scroller &&
+        document.querySelector(".detail header .eyebrow")?.textContent ===
+          "AJ-1",
+      "a new snapshot reset the guidance draft, target, or open task",
+    );
+    check(
+      document.body.textContent?.includes("Connected") &&
+        !document.body.textContent.includes("Service offline") &&
+        !document.querySelector(".boot"),
+      "live waits flashed offline or loading state",
+    );
+
+    open('[data-attention-id="recovery_record:r-target"]');
+    await settle();
+    check(
+      focused() === "recovery_record:r-target",
+      `the exact recovery record was not selected: ${focused()}`,
+    );
+    open('[data-attention-id="continuation:wait_for_exit:s1"]');
+    await settle();
+    check(
+      focused() === "session:s1",
+      `the session action was not focused: ${focused()}`,
+    );
+    open('[data-attention-id="restore_hold"] button');
+    await settle();
+    check(
+      focused() === "task:AJ-1",
+      `the held task did not open: ${focused()}`,
+    );
+    open('[data-attention-id="permission_request:pr1"]');
+    await settle();
+    check(
+      focused() === "permission_request:pr1" &&
+        !document.querySelector("aside.detail"),
+      `the permission request was not focused in the approval inbox: ${focused()}`,
+    );
+
+    const reads = live.reads.length;
+    open('[data-attention-id="attempt:a-old:awaiting_human_review"]');
+    await settle();
+    check(
+      live.reads.length === reads + 1 &&
+        focused() === "permission_request:pr1" &&
+        !document.querySelector("aside.detail") &&
+        document.querySelector(".attention-notice")?.textContent?.includes(
+          "a newer attempt or decision replaced it",
+        ),
+      "a superseded attempt was opened, not explained, or not refreshed once",
+    );
+    live.reads[reads].resolve({ ...railState, revision: "41" });
+    await settle();
+
+    open('[data-attention-id="task:AJ-3:paused"]');
+    await settle();
+    check(
+      focused() === "task:AJ-3" &&
+        document.querySelector(".topbar")?.textContent?.includes("Second"),
+      "the cross-project task did not switch project and open exactly",
+    );
+    open('[data-attention-id="project_setup:p2"]');
+    await settle();
+    check(
+      focused() === "project_setup:p2",
+      `the project setup was not focused: ${focused()}`,
+    );
+    check(
+      methods.every((method) => method === "GET"),
+      `navigation or refresh dispatched a mutation: ${methods}`,
+    );
+  } finally {
+    unmount();
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("M6 attention reconciliation refuses superseded bindings instead of retargeting", () => {
+  const item = (id: string) => {
+    const found = railState.attention.find((candidate) => candidate.id === id);
+    if (!found) throw new Error(`fixture attention item missing: ${id}`);
+    return found;
+  };
+  const problem = (id: string, latest: AppState, target = item(id).target) => {
+    if (!target) throw new Error(`fixture attention item has no target: ${id}`);
+    return attentionTargetProblem(latest, item(id), target);
+  };
+  const [plan, recovering, paused] = railState.tasks;
+  const withTasks = (...tasks: Task[]) => ({ ...railState, tasks });
+  const cases: Array<[string, AppState, string | undefined]> = [
+    ["attempt:a1:awaiting_plan_approval", railState, undefined],
+    ["recovery_record:r-target", railState, undefined],
+    ["continuation:wait_for_exit:s1", railState, undefined],
+    ["permission_request:pr1", railState, undefined],
+    ["project_setup:p2", railState, undefined],
+    ["task:AJ-3:paused", railState, undefined],
+    [
+      "attempt:a1:awaiting_plan_approval",
+      withTasks(
+        {
+          ...plan,
+          active_attempt: {
+            id: "a9",
+            phase: "awaiting_plan_approval",
+            status: "running",
+            base_revision: "abc",
+            plan_hash: "plan-1",
+          },
+        },
+        recovering,
+        paused,
+      ),
+      "a newer attempt or decision replaced it.",
+    ],
+    [
+      "continuation:wait_for_exit:s1",
+      {
+        ...railState,
+        active_sessions: [{ ...managerSession, role_generation_id: "g2" }],
+      },
+      "the session was replaced.",
+    ],
+    [
+      "permission_request:pr1",
+      {
+        ...railState,
+        permission_requests: [{ ...pendingPermission, revision: 4 }],
+      },
+      "the permission request was already decided or changed.",
+    ],
+    [
+      "recovery_record:r-target",
+      {
+        ...railState,
+        recovery: railState.recovery.map((record) =>
+          record.id === "r-target" ? { ...record, state: "resolved" } : record
+        ),
+      },
+      "the recovery record was resolved or its attempt was superseded.",
+    ],
+    [
+      "project_setup:p2",
+      {
+        ...railState,
+        projects: [initialized, {
+          ...secondProject,
+          trip: { ...secondProject.trip!, setup_operation_id: "setup-new" },
+        }],
+      },
+      "a different setup operation is now current.",
+    ],
+    [
+      "task:AJ-3:paused",
+      withTasks(plan, recovering, { ...paused, version: 8 }),
+      "the task changed.",
+    ],
+    [
+      "task:AJ-3:paused",
+      { ...railState, attention: [] },
+      "it is no longer in the attention list.",
+    ],
+  ];
+  for (const [id, latest, expected] of cases) {
+    const actual = problem(id, latest);
+    check(actual === expected, `${id}: expected ${expected}, got ${actual}`);
+  }
+  const held: AttentionTarget = {
+    kind: "task",
+    project_id: "p1",
+    task_id: "AJ-1",
+    task_version: 7,
+  };
+  check(
+    problem("restore_hold", railState, held) === undefined &&
+      problem("restore_hold", railState, { ...held, task_id: "AJ-2" }) ===
+        "its target was replaced." &&
+      problem("attempt:a1:awaiting_plan_approval", railState, {
+          kind: "attempt",
+          project_id: "p1",
+          task_id: "AJ-1",
+          attempt_id: "a0",
+          phase: "awaiting_plan_approval",
+          plan_hash: "plan-1",
+          candidate_hash: null,
+        }) === "its target was replaced.",
+    "a held-task or rebound target was not checked against the offered item",
+  );
+});
+
+Deno.test("M6 selected recovery record keeps its own draft and fails closed when it vanishes", async () => {
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ error: "fixture outage" }), {
+        status: 503,
+      });
+    }) as typeof fetch;
+  const panel = (selected: string, ...ids: string[]) => (
+    <RecoveryPanel
+      task={task}
+      records={ids.map((id) => ({
+        id,
+        session_id: `session-${id}`,
+        attempt_id: "a1",
+        state: "attention_required",
+        detail: {},
+      }))}
+      selectedRecordId={selected}
+      onChanged={noop}
+    />
+  );
+  const shown = () => ({
+    marker: document.querySelector("[data-attention-target]")
+      ?.getAttribute("data-attention-target"),
+    evidence: document.querySelector<HTMLTextAreaElement>(
+      '[aria-label="Recovery evidence"]',
+    )?.value,
+    error: document.querySelector(".recovery .error")?.textContent,
+  });
+  const submit = async () => {
+    click("Verify quiescence and reconcile");
+    await settle();
+    return requests.at(-1);
+  };
+  try {
+    mount(panel("A", "A", "B"));
+    field("Recovery evidence", "evidence for A");
+    const first = await submit();
+    rerender(panel("A", "A", "B"));
+    check(
+      shown().evidence === "evidence for A" &&
+        shown().error === "fixture outage",
+      "a same-record snapshot reset the draft or its error",
+    );
+    const retried = await submit();
+    check(
+      first?.recovery_id === "A" &&
+        retried?.operation_id === first.operation_id,
+      "a same-record snapshot dropped the retry identity",
+    );
+    rerender(panel("B", "A", "B"));
+    check(
+      shown().marker === "recovery_record:B" && shown().evidence === "" &&
+        shown().error === undefined,
+      "another record inherited the draft or its error",
+    );
+    rerender(panel("A", "A", "B"));
+    check(shown().evidence === "", "the draft survived a change of record");
+    field("Recovery evidence", "evidence for A");
+    const reopened = await submit();
+    check(
+      requests.length === 3 && reopened?.recovery_id === "A" &&
+        reopened.operation_id !== first?.operation_id,
+      "a retry identity survived a change of record",
+    );
+    const sent = requests.length;
+    rerender(panel("A", "B"));
+    check(
+      document.body.textContent?.includes("was resolved or changed") &&
+        !document.querySelector("button, textarea, [data-attention-target]") &&
+        requests.length === sent,
+      "a vanished selection retargeted the remaining record",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("M6 attention routes fail closed when the exact record or marker is gone", async () => {
+  const live = liveHarness();
+  const priorEnvironment = { ...liveEnvironment };
+  const methods: string[] = [];
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      methods.push(init?.method ?? "GET");
+      return new Response("[]");
+    }) as typeof fetch;
+  liveEnvironment.transport = live.environment.transport;
+  liveEnvironment.scheduler = live.environment.scheduler;
+  localStorage.clear();
+  localStorage.setItem("agenticjira.page", "workspace");
+  const open = (id: string) => {
+    const button = document.querySelector<HTMLButtonElement>(
+      `[data-attention-id="${id}"]`,
+    );
+    if (!button) throw new Error(`attention control not found: ${id}`);
+    act(() => button.click());
+  };
+  try {
+    mount(<App />);
+    await settle();
+    live.reads[0].resolve(railState);
+    await settle();
+
+    open("recovery_record:r-target");
+    await settle();
+    field("Recovery evidence", "evidence for r-target");
+    live.waits[0].resolve(changedTo({
+      ...railState,
+      revision: "41",
+      recovery: railState.recovery.map((record) =>
+        record.id === "r-target" ? { ...record, state: "resolved" } : record
+      ),
+    }));
+    await settle();
+    const recovery = document.querySelector(".detail .recovery");
+    check(
+      recovery?.textContent?.includes("was resolved or changed") &&
+        !recovery.querySelector("button, textarea") &&
+        !document.querySelector('[data-attention-target^="recovery_record:"]'),
+      "a resolved exact record retargeted its sibling or kept its draft",
+    );
+
+    // Schema-valid, but no rendered panel carries the session's exact marker.
+    const unmarked = { ...railState, revision: "42", continuation_actions: [] };
+    live.waits[1].resolve(changedTo(unmarked));
+    await settle();
+    const reads = live.reads.length;
+    open("continuation:wait_for_exit:s1");
+    await settle();
+    const explained = () =>
+      document.querySelector("main.content > .attention-notice")?.textContent
+        ?.includes("Waiting for exit could not be opened");
+    check(
+      live.reads.length === reads + 1 && explained() &&
+        !document.querySelector("aside.detail") &&
+        document.activeElement?.getAttribute("data-attention-target") !==
+          "task:AJ-1",
+      "a missing exact marker was accepted, unexplained, or not refreshed once",
+    );
+    live.reads[reads].resolve(unmarked);
+    await settle();
+    check(
+      live.reads.length === reads + 1 && explained() &&
+        methods.every((method) => method === "GET"),
+      `a failed route refreshed again, lost its explanation, or mutated: ${methods}`,
+    );
+  } finally {
+    unmount();
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("M6 direct task opens drop a stale attention selection and route notice", async () => {
+  const live = liveHarness();
+  const priorEnvironment = { ...liveEnvironment };
+  const mutations: Record<string, unknown>[] = [];
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method !== "POST") return new Response("[]");
+      mutations.push(JSON.parse(String(init.body)));
+      return new Response(JSON.stringify({ error: "fixture outage" }), {
+        status: 503,
+      });
+    }) as typeof fetch;
+  liveEnvironment.transport = live.environment.transport;
+  liveEnvironment.scheduler = live.environment.scheduler;
+  localStorage.clear();
+  localStorage.setItem("agenticjira.page", "workspace");
+  const initial: AppState = {
+    ...railState,
+    tasks: [...railState.tasks, {
+      ...task,
+      id: "AJ-4",
+      title: "Finished",
+      lifecycle: "done",
+      active_attempt: undefined,
+    }],
+    restart_candidates: [{
+      session_id: "s-other",
+      attempt_id: "a2",
+      task_id: "AJ-2",
+      source: "planned_shutdown",
+      state: "parked",
+      reason: "fixture parked session",
+      result: {},
+      updated_at: "now",
+    }],
+  };
+  const resolved: AppState = {
+    ...initial,
+    revision: "41",
+    recovery: initial.recovery.map((record) =>
+      record.id === "r-target" ? { ...record, state: "resolved" } : record
+    ),
+  };
+  const open = (id: string) => {
+    const button = document.querySelector<HTMLButtonElement>(
+      `[data-attention-id="${id}"]`,
+    );
+    if (!button) throw new Error(`attention control not found: ${id}`);
+    act(() => button.click());
+  };
+  const recovery = () => {
+    const panel = document.querySelector(".detail .recovery");
+    return {
+      record: panel?.getAttribute("data-attention-target"),
+      stale: panel?.textContent?.includes("was resolved or changed"),
+      evidence: panel?.querySelector("textarea")?.value,
+      error: panel?.querySelector(".error")?.textContent,
+    };
+  };
+  const notice = () =>
+    document.querySelector("main.content > .attention-notice")?.textContent;
+  try {
+    mount(<App />);
+    await settle();
+    live.reads[0].resolve(initial);
+    await settle();
+
+    open("recovery_record:r-target");
+    await settle();
+    const routed = recovery().record;
+    click("Board");
+    click("AJ-2 · Normal");
+    check(
+      routed === "recovery_record:r-target" &&
+        recovery().record === "recovery_record:r-first",
+      `a board open kept the attention-selected record: ${routed} -> ${recovery().record}`,
+    );
+
+    click("Workspace");
+    open("recovery_record:r-target");
+    await settle();
+    field("Recovery evidence", "evidence for r-target");
+    click("Verify quiescence and reconcile");
+    await settle();
+    const failed = recovery().error;
+    live.waits[0].resolve(changedTo(resolved));
+    await settle();
+    check(
+      failed === "fixture outage" && recovery().stale &&
+        mutations[0]?.recovery_id === "r-target",
+      "the selected record did not fail closed after its failed submission",
+    );
+    click("Open task recovery");
+    await settle();
+    const reopened = recovery();
+    check(
+      !reopened.stale && reopened.record === "recovery_record:r-first" &&
+        reopened.evidence === "" && reopened.error === undefined &&
+        mutations.length === 1,
+      `a direct open kept the stale selection, its draft, or mutated: ${
+        JSON.stringify(reopened)
+      }`,
+    );
+    field("Recovery evidence", "evidence for r-target");
+    click("Verify quiescence and reconcile");
+    await settle();
+    check(
+      mutations[1]?.recovery_id === "r-first" &&
+        mutations[1].operation_id !== mutations[0].operation_id,
+      "the remaining record reused the resolved record's retry identity",
+    );
+
+    // Without its continuation row the session has no exact marker.
+    live.waits[1].resolve(
+      changedTo({ ...resolved, revision: "42", continuation_actions: [] }),
+    );
+    await settle();
+    open("continuation:wait_for_exit:s1");
+    await settle();
+    check(
+      notice()?.includes("Waiting for exit could not be opened"),
+      "the unmarked route was not explained",
+    );
+    click("History");
+    click("AJ-4 · Finished");
+    check(
+      notice() === undefined &&
+        document.querySelector(".detail header .eyebrow")?.textContent ===
+          "AJ-4" &&
+        mutations.length === 2,
+      `a history open kept the obsolete route notice or mutated: ${notice()}`,
+    );
+  } finally {
+    unmount();
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
   }
 });

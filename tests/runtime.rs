@@ -15,6 +15,26 @@ use agenticjira::{
 };
 use base64::Engine;
 
+fn synthetic_claude_contract() -> agenticjira::provider_compatibility::BundleSet {
+    let codex = include_str!("../resources/provider-compatibility/codex.json");
+    let mut claude: serde_json::Value = serde_json::from_str(include_str!(
+        "../resources/provider-compatibility/claude.json"
+    ))
+    .unwrap();
+    let codex_pack: serde_json::Value = serde_json::from_str(codex).unwrap();
+    let mut selector = codex_pack["selectors"][0].clone();
+    selector["predicate_id"] = "synthetic-claude-v1".into();
+    selector["exact_version"] = "synthetic-claude-v1".into();
+    for contract in selector["contracts"].as_array_mut().unwrap() {
+        contract["contract_id"] =
+            format!("synthetic-claude-{}", contract["role"].as_str().unwrap()).into();
+        contract["native_policy_revision"] =
+            providers::claude::NATIVE_SANDBOX_POLICY_REVISION.into();
+    }
+    claude["selectors"] = serde_json::json!([selector]);
+    agenticjira::provider_compatibility::BundleSet::synthetic_for_tests(codex, &claude.to_string())
+}
+
 fn install_synthetic_codex_home(root: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -446,6 +466,7 @@ async fn service_requested_stop_crosses_settling_deadline() {
     let executable = std::env::current_exe().unwrap();
     let launch = PreparedLaunch {
         config: LaunchConfig {
+            compatibility: None,
             provider: Provider::Codex,
             role: RoleKind::Manager,
             executable: executable.clone(),
@@ -660,6 +681,7 @@ async fn service_requested_stop_allows_exact_descendant_to_settle() {
     let executable = std::env::current_exe().unwrap();
     let launch = PreparedLaunch {
         config: LaunchConfig {
+            compatibility: None,
             provider: Provider::Codex,
             role: RoleKind::Manager,
             executable: executable.clone(),
@@ -839,8 +861,10 @@ async fn t10_role_auth_hook_and_human_boundary() {
         assert_eq!(settings["env"]["DISABLE_AUTOUPDATER"], "1");
         assert_eq!(settings["env"]["DISABLE_UPDATES"], "1");
     }
+    let claude_contract = synthetic_claude_contract();
     for claude_role in [RoleKind::PlanReviewer, RoleKind::Implementer] {
-        let launch = providers::claude::prepare(
+        let launch = providers::prepare_role_launch_with_bundles(
+            Provider::Claude,
             claude_role,
             "local-child",
             "none",
@@ -853,7 +877,7 @@ async fn t10_role_auth_hook_and_human_boundary() {
             None,
             &app.hooks,
             &executable,
-            &[],
+            &claude_contract,
         )
         .unwrap();
         for key in ["DISABLE_AUTOUPDATER", "DISABLE_UPDATES"] {
@@ -1353,7 +1377,8 @@ async fn t10_role_auth_hook_and_human_boundary() {
                 operation_id: "t10-root-gone-descendant-cancel".into(),
                 task_id: "t10-task".into(),
                 attempt_id: "t10-attempt".into(),
-                session_id: None,
+                recovery_id: observation.query_row("SELECT id FROM recovery_records WHERE attempt_id='t10-attempt' AND session_id=?1 AND state='attention_required' ORDER BY created_at DESC, rowid DESC LIMIT 1", rusqlite::params![session], |row| row.get::<_, String>(0)).unwrap(),
+                session_id: Some(session.clone()),
                 expected_version: version,
                 decision: "cancel".into(),
                 evidence: "exact recorded descendant generation exited before cancellation".into(),

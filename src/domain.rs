@@ -106,6 +106,8 @@ pub struct LaunchConfig {
     pub security_policy: serde_json::Value,
     pub hook_revision: String,
     pub capability_status: CapabilityStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<crate::provider_compatibility::ProviderCompatibilityBinding>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -133,6 +135,8 @@ pub struct CapabilityIdentity {
     pub hook_revision: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_status: Option<CapabilityStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<crate::provider_compatibility::AuthorityBinding>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -349,7 +353,7 @@ pub enum CmuxAttachmentControlDisposition {
     Retire,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProcessGenerationAnchor {
     pub pid: u32,
     pub process_group_id: i32,
@@ -844,6 +848,8 @@ pub struct TaskDto {
     pub attention: String,
     pub version: i64,
     pub archived: bool,
+    pub can_archive: bool,
+    pub recipe_provenance: Option<serde_json::Value>,
     pub permission_waiting: bool,
     pub role_overrides: serde_json::Value,
     pub dependencies: Vec<serde_json::Value>,
@@ -853,6 +859,549 @@ pub struct TaskDto {
     pub snapshots: Vec<serde_json::Value>,
     pub review_budgets: Vec<serde_json::Value>,
     pub legacy: serde_json::Value,
+}
+
+pub const DECISION_SCHEMA_V1: u8 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionDisposition {
+    Ready,
+    Waiting,
+    Held,
+    RetryDeferred,
+    Terminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionEvidenceState {
+    Satisfied,
+    Missing,
+    Stale,
+    Pending,
+    Uncertain,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionOwner {
+    Service,
+    Human,
+    Provider,
+    External,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DecisionSubject {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role_generation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DecisionObservedRevision {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configuration_revision: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_checks_revision: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DecisionPrerequisite {
+    pub code: String,
+    pub state: DecisionEvidenceState,
+    pub owner: DecisionOwner,
+    #[serde(default)]
+    pub evidence: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DecisionActionBinding {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role_generation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_task_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_project_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_instance_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings_revision: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_checks_revision: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desired_queue_paused: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DecisionOwnership {
+    pub owner: DecisionOwner,
+    pub state: String,
+    #[serde(default)]
+    pub binding: DecisionActionBinding,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DecisionNextAction {
+    pub operation: String,
+    pub enabled: bool,
+    pub owner: DecisionOwner,
+    pub binding: DecisionActionBinding,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accounting_note: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DecisionControlPolicy {
+    #[serde(default)]
+    pub allowed_controls: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason_code: Option<String>,
+}
+
+/// A descriptive snapshot of owner-evaluated facts. It is never mutation authority.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DecisionExplanation {
+    pub decision_schema: u8,
+    pub reason_code: String,
+    pub disposition: DecisionDisposition,
+    pub subject: DecisionSubject,
+    pub observed_revision: DecisionObservedRevision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_blocker: Option<DecisionPrerequisite>,
+    pub prerequisites: Vec<DecisionPrerequisite>,
+    pub ownership: DecisionOwnership,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<DecisionNextAction>,
+    pub control_policy: DecisionControlPolicy,
+}
+
+impl DecisionExplanation {
+    pub fn canonical_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "decision_schema": self.decision_schema,
+            "reason_code": self.reason_code,
+            "disposition": self.disposition,
+            "subject": self.subject,
+            "observed_revision": self.observed_revision,
+            "primary_blocker": self.primary_blocker.as_ref().map(|item| serde_json::json!({
+                "code": item.code,
+                "state": item.state,
+                "owner": item.owner,
+                "evidence": canonical_decision_evidence(&item.evidence),
+            })),
+            "prerequisites": self.prerequisites.iter().map(|item| serde_json::json!({
+                "code": item.code,
+                "state": item.state,
+                "owner": item.owner,
+                "evidence": canonical_decision_evidence(&item.evidence),
+            })).collect::<Vec<_>>(),
+            "ownership": self.ownership,
+            "next_action": self.next_action.as_ref().map(|action| serde_json::json!({
+                "operation": action.operation,
+                "enabled": action.enabled,
+                "owner": action.owner,
+                "binding": action.binding,
+            })),
+            "control_policy": self.control_policy,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartPreviewClassification {
+    Resumable,
+    FreshOnly,
+    Blocked,
+    Uncertain,
+    AwaitingApproval,
+    Complete,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RestartPreviewSession {
+    pub classification: RestartPreviewClassification,
+    pub can_resume_now: bool,
+    pub could_resume_after_confirmed_shutdown: bool,
+    pub decision: DecisionExplanation,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RestartPreviewSnapshot {
+    pub captured_at: String,
+    pub process_inventory: DecisionEvidenceState,
+    pub boot_identity: DecisionEvidenceState,
+    pub dispatch_enabled: bool,
+    pub draining: bool,
+    pub revalidation_required: bool,
+    pub notice: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RestartPreview {
+    pub decision_schema: u8,
+    pub snapshot: RestartPreviewSnapshot,
+    pub sessions: Vec<RestartPreviewSession>,
+}
+
+pub(crate) const RESTART_METADATA_KEY: &str = "llmrelay_restart_v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RestartBatchMembership {
+    Queued,
+    Admitting,
+    Completed,
+    Terminated,
+}
+
+impl RestartBatchMembership {
+    pub(crate) fn active(self) -> bool {
+        matches!(self, Self::Queued | Self::Admitting)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RestartBatchV1 {
+    pub(crate) operation_id: String,
+    pub(crate) ordinal: u8,
+    pub(crate) members: Vec<String>,
+    pub(crate) membership: RestartBatchMembership,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RestartAdmissionV1 {
+    pub(crate) id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) role_generation_id: String,
+    pub(crate) expected_task_version: i64,
+    pub(crate) prior_candidate_state: String,
+    pub(crate) prior_transcript_epoch: String,
+    pub(crate) expected_resume_ordinal: u32,
+    pub(crate) requested_by: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RestartMetadataV1 {
+    pub(crate) version: u8,
+    pub(crate) batch: Option<RestartBatchV1>,
+    pub(crate) batch_history: Vec<RestartBatchV1>,
+    pub(crate) replacement_failures: u8,
+    pub(crate) capacity_deferrals: u32,
+    pub(crate) next_due_at: Option<String>,
+    pub(crate) admission: Option<RestartAdmissionV1>,
+}
+
+impl Default for RestartMetadataV1 {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            batch: None,
+            batch_history: Vec::new(),
+            replacement_failures: 0,
+            capacity_deferrals: 0,
+            next_due_at: None,
+            admission: None,
+        }
+    }
+}
+
+impl RestartMetadataV1 {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.version != 1 {
+            anyhow::bail!("restart metadata version {} is unsupported", self.version)
+        }
+        if self.replacement_failures > 3 {
+            anyhow::bail!("restart replacement failure count exceeds the supported cap")
+        }
+        if let Some(next_due_at) = self.next_due_at.as_deref() {
+            chrono::DateTime::parse_from_rfc3339(next_due_at)
+                .map_err(|_| anyhow::anyhow!("restart metadata next_due_at is malformed"))?;
+        }
+        for batch in self.batch.iter().chain(self.batch_history.iter()) {
+            if batch.operation_id.trim().is_empty()
+                || batch.operation_id.len() > 512
+                || batch.members.is_empty()
+                || batch.members.len() > 4
+                || batch.ordinal == 0
+                || usize::from(batch.ordinal) > batch.members.len()
+                || batch.members[usize::from(batch.ordinal) - 1]
+                    .trim()
+                    .is_empty()
+            {
+                anyhow::bail!("restart batch metadata is incomplete or out of bounds")
+            }
+            let mut unique = std::collections::HashSet::new();
+            if batch.members.iter().any(|member| {
+                member.trim().is_empty() || member.len() > 512 || !unique.insert(member)
+            }) {
+                anyhow::bail!("restart batch metadata contains blank or duplicate members")
+            }
+        }
+        if self
+            .batch_history
+            .iter()
+            .any(|batch| batch.membership.active())
+        {
+            anyhow::bail!("restart batch history contains active authority")
+        }
+        if let Some(admission) = self.admission.as_ref() {
+            if admission.id.trim().is_empty()
+                || admission.attempt_id.trim().is_empty()
+                || admission.role_generation_id.trim().is_empty()
+                || admission.expected_task_version < 1
+                || !matches!(
+                    admission.prior_candidate_state.as_str(),
+                    "parked" | "queued_capacity" | "failed"
+                )
+                || admission.prior_transcript_epoch.trim().is_empty()
+                || admission.expected_resume_ordinal == 0
+                || !matches!(admission.requested_by.as_str(), "human" | "auto")
+            {
+                anyhow::bail!("restart admission metadata is incomplete")
+            }
+        }
+        if let Some(batch) = self.batch.as_ref() {
+            if (batch.membership == RestartBatchMembership::Admitting) != self.admission.is_some() {
+                anyhow::bail!("restart batch and admission metadata disagree")
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn active_batch(&self) -> Option<&RestartBatchV1> {
+        self.batch
+            .as_ref()
+            .filter(|batch| batch.membership.active())
+    }
+
+    pub(crate) fn terminalize_batch(&mut self) {
+        if let Some(batch) = self.batch.as_mut() {
+            if batch.membership.active() {
+                batch.membership = RestartBatchMembership::Terminated;
+            }
+        }
+        self.admission = None;
+    }
+
+    pub(crate) fn begin_batch(&mut self, batch: RestartBatchV1) -> anyhow::Result<()> {
+        if self.active_batch().is_some() {
+            anyhow::bail!("an active restart batch membership already owns this candidate")
+        }
+        if let Some(previous) = self.batch.replace(batch) {
+            self.batch_history.push(previous);
+        }
+        self.validate()
+    }
+}
+
+/// A restart candidate owns a versioned namespace inside its existing result
+/// object. Parsing is deliberately strict once that namespace exists so partial
+/// durable accounting cannot silently become a fresh set of counters.
+#[derive(Clone, Debug)]
+pub(crate) struct RestartCandidateResult {
+    root: serde_json::Map<String, serde_json::Value>,
+    pub(crate) restart: RestartMetadataV1,
+}
+
+impl RestartCandidateResult {
+    pub(crate) fn parse(raw: &str) -> anyhow::Result<Self> {
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|error| anyhow::anyhow!("restart candidate result is malformed: {error}"))?;
+        let serde_json::Value::Object(root) = value else {
+            anyhow::bail!("restart candidate result must be a JSON object")
+        };
+        let restart = match root.get(RESTART_METADATA_KEY) {
+            None => RestartMetadataV1::default(),
+            Some(value) => {
+                let object = value.as_object().ok_or_else(|| {
+                    anyhow::anyhow!("restart metadata namespace must be a JSON object")
+                })?;
+                for required in [
+                    "version",
+                    "batch",
+                    "batch_history",
+                    "replacement_failures",
+                    "capacity_deferrals",
+                    "next_due_at",
+                    "admission",
+                ] {
+                    if !object.contains_key(required) {
+                        anyhow::bail!("restart metadata is partial: missing {required}")
+                    }
+                }
+                serde_json::from_value::<RestartMetadataV1>(value.clone())
+                    .map_err(|error| anyhow::anyhow!("restart metadata is malformed: {error}"))?
+            }
+        };
+        restart.validate()?;
+        Ok(Self { root, restart })
+    }
+
+    pub(crate) fn validate_candidate_state(
+        &self,
+        state: &str,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        if !matches!(
+            state,
+            "pending_reconciliation"
+                | "parked"
+                | "queued_capacity"
+                | "failed"
+                | "blocked"
+                | "skipped"
+                | "admitting"
+                | "resumed"
+                | "released_fresh_dispatch"
+                | "cancelled"
+        ) {
+            anyhow::bail!("restart candidate state is unsupported")
+        }
+        for batch in self
+            .restart
+            .batch
+            .iter()
+            .chain(self.restart.batch_history.iter())
+        {
+            if batch.members[usize::from(batch.ordinal) - 1] != session_id {
+                anyhow::bail!("restart candidate and exact batch membership disagree")
+            }
+        }
+        if (state == "admitting") != self.restart.admission.is_some() {
+            anyhow::bail!("restart candidate state and admission ownership disagree")
+        }
+        if let Some(batch) = self.restart.active_batch() {
+            let matches_state = match state {
+                "queued_capacity" | "pending_reconciliation" => {
+                    batch.membership == RestartBatchMembership::Queued
+                }
+                "admitting" => batch.membership == RestartBatchMembership::Admitting,
+                _ => false,
+            };
+            if !matches_state {
+                anyhow::bail!("restart candidate state and active batch membership disagree")
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set(&mut self, key: &str, value: serde_json::Value) {
+        if key != RESTART_METADATA_KEY {
+            self.root.insert(key.to_owned(), value);
+        }
+    }
+
+    pub(crate) fn get(&self, key: &str) -> Option<&serde_json::Value> {
+        self.root.get(key)
+    }
+
+    pub(crate) fn encode(mut self) -> anyhow::Result<String> {
+        self.restart.validate()?;
+        self.root.insert(
+            RESTART_METADATA_KEY.to_owned(),
+            serde_json::to_value(self.restart)?,
+        );
+        Ok(serde_json::Value::Object(self.root).to_string())
+    }
+}
+
+fn canonical_decision_evidence(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => serde_json::Value::Object(
+            object
+                .iter()
+                .filter(|(key, _)| {
+                    key.ends_with("_id")
+                        || key.ends_with("_code")
+                        || key.ends_with("_hash")
+                        || key.ends_with("_state")
+                        || key.ends_with("_status")
+                        || key.ends_with("_revision")
+                        || key.ends_with("_identity")
+                        || key.ends_with("_count")
+                        || matches!(
+                            key.as_str(),
+                            "attention"
+                                | "candidate_state"
+                                | "claims"
+                                | "evaluated"
+                                | "kind"
+                                | "lane_key"
+                                | "lifecycle"
+                                | "phase"
+                                | "process_group_quiescent"
+                                | "profile_session"
+                                | "provider"
+                                | "queue_paused"
+                                | "role"
+                                | "run_next_requested"
+                                | "short_circuit"
+                                | "state"
+                                | "status"
+                        )
+                })
+                .map(|(key, value)| (key.clone(), canonical_decision_evidence(value)))
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonical_decision_evidence).collect())
+        }
+        _ => value.clone(),
+    }
 }
 
 /// A current, non-authoritative explanation of the next liveness transition.
@@ -974,12 +1523,94 @@ pub struct PermissionRuleDto {
     pub revision: i64,
 }
 
+/// Dashboard attention groups, rendered in declaration order.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionCategory {
+    Permission,
+    Decision,
+    Recovery,
+    Compatibility,
+    Blocked,
+    AwaitingAcceptance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskAttentionTarget {
+    pub project_id: String,
+    pub task_id: String,
+    pub task_version: i64,
+}
+
+/// The exact entity an attention item opens. The dashboard refuses a target
+/// that no longer matches its latest snapshot instead of retargeting it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AttentionTarget {
+    Task(TaskAttentionTarget),
+    Attempt {
+        project_id: String,
+        task_id: String,
+        attempt_id: String,
+        phase: String,
+        plan_hash: Option<String>,
+        candidate_hash: Option<String>,
+    },
+    Session {
+        project_id: String,
+        task_id: String,
+        attempt_id: String,
+        session_id: String,
+        role_generation_id: String,
+    },
+    PermissionRequest {
+        project_id: String,
+        task_id: String,
+        attempt_id: String,
+        session_id: String,
+        request_id: String,
+        request_revision: i64,
+    },
+    RecoveryRecord {
+        project_id: String,
+        task_id: String,
+        attempt_id: String,
+        recovery_id: String,
+    },
+    ProjectSetup {
+        project_id: String,
+        setup_operation_id: Option<String>,
+    },
+}
+
+/// Presentation of one reason for human attention, dated by the enclosing
+/// snapshot cursor. It grants nothing: every action rechecks its own revision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AttentionItem {
+    /// Stable while the same entity needs the same attention.
+    pub id: String,
+    pub category: AttentionCategory,
+    pub title: String,
+    pub reason: String,
+    /// `None` when no current dashboard entity can act on the item: the
+    /// offline-released restore hold, or a binding to a superseded entity.
+    pub target: Option<AttentionTarget>,
+    /// Tasks fenced by the instance restore hold; empty for other items.
+    pub held_tasks: Vec<TaskAttentionTarget>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppStateDto {
     pub schema: u8,
     pub generated_at: String,
+    /// Committed state revision read under the same store guard as every
+    /// projected row. A canonical decimal string, so browsers never round it.
+    pub revision: String,
     pub projects: Vec<ProjectDto>,
     pub tasks: Vec<TaskDto>,
+    pub profile_sets: Vec<serde_json::Value>,
+    pub task_recipes: Vec<serde_json::Value>,
+    pub recipe_schedules: Vec<serde_json::Value>,
     pub production_role_restrictions: Vec<serde_json::Value>,
     pub capabilities: Vec<serde_json::Value>,
     pub active_sessions: Vec<serde_json::Value>,
@@ -1000,7 +1631,10 @@ pub struct AppStateDto {
     pub trip_lanes: Vec<serde_json::Value>,
     pub trip_checks: Vec<serde_json::Value>,
     pub trip_task_verification: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub decisions: Vec<DecisionExplanation>,
     pub continuation_actions: Vec<ContinuationAction>,
+    pub attention: Vec<AttentionItem>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1129,6 +1763,74 @@ fn approved_check_decision() -> String {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HumanCommand {
+    UpsertProfileSet {
+        operation_id: String,
+        project_id: String,
+        profile_set_id: Option<String>,
+        expected_version: Option<i64>,
+        name: String,
+        roles: serde_json::Value,
+    },
+    ArchiveProfileSet {
+        operation_id: String,
+        project_id: String,
+        profile_set_id: String,
+        expected_version: i64,
+    },
+    UpsertTaskRecipe {
+        operation_id: String,
+        project_id: String,
+        recipe_id: Option<String>,
+        expected_version: Option<i64>,
+        name: String,
+        title: String,
+        description: String,
+        acceptance_criteria: Vec<String>,
+        priority: i64,
+        profile_revision_id: String,
+        required_check_ids: Vec<String>,
+    },
+    ArchiveTaskRecipe {
+        operation_id: String,
+        project_id: String,
+        recipe_id: String,
+        expected_version: i64,
+    },
+    CreateDraftFromRecipe {
+        operation_id: String,
+        project_id: String,
+        recipe_id: String,
+        recipe_revision_id: String,
+        expected_recipe_version: i64,
+    },
+    UpsertRecipeSchedule {
+        operation_id: String,
+        project_id: String,
+        schedule_id: Option<String>,
+        expected_version: Option<i64>,
+        name: String,
+        recipe_revision_id: String,
+        cadence: String,
+        anchor_utc: String,
+    },
+    PauseRecipeSchedule {
+        operation_id: String,
+        project_id: String,
+        schedule_id: String,
+        expected_version: i64,
+    },
+    ResumeRecipeSchedule {
+        operation_id: String,
+        project_id: String,
+        schedule_id: String,
+        expected_version: i64,
+    },
+    ArchiveRecipeSchedule {
+        operation_id: String,
+        project_id: String,
+        schedule_id: String,
+        expected_version: i64,
+    },
     Trip {
         operation_id: String,
         #[serde(flatten)]
@@ -1288,6 +1990,7 @@ pub enum HumanCommand {
         operation_id: String,
         task_id: String,
         attempt_id: String,
+        recovery_id: String,
         session_id: Option<String>,
         expected_version: i64,
         decision: String,
@@ -1367,7 +2070,16 @@ pub enum HumanCommand {
 impl HumanCommand {
     pub fn operation_id(&self) -> &str {
         match self {
-            Self::Trip { operation_id, .. }
+            Self::UpsertProfileSet { operation_id, .. }
+            | Self::ArchiveProfileSet { operation_id, .. }
+            | Self::UpsertTaskRecipe { operation_id, .. }
+            | Self::ArchiveTaskRecipe { operation_id, .. }
+            | Self::CreateDraftFromRecipe { operation_id, .. }
+            | Self::UpsertRecipeSchedule { operation_id, .. }
+            | Self::PauseRecipeSchedule { operation_id, .. }
+            | Self::ResumeRecipeSchedule { operation_id, .. }
+            | Self::ArchiveRecipeSchedule { operation_id, .. }
+            | Self::Trip { operation_id, .. }
             | Self::AddProject { operation_id, .. }
             | Self::RelinkProject { operation_id, .. }
             | Self::CreateTask { operation_id, .. }

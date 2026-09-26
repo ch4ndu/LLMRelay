@@ -17,7 +17,10 @@ pub const MCP_COVERAGE_CLASS: &str = "personal_ineligible_observed_prelaunch";
 pub const APPROVAL_OWNERSHIP_REVISION: &str = "codex-native-approval-ownership-v1";
 pub const LEGACY_MCP_COVERAGE_GAP: &str = "historical Codex configuration predates exact local MCP-source coverage; fresh native validation is required";
 pub const LEGACY_APPROVAL_OWNERSHIP_GAP: &str = "historical Codex Implementer configuration predates native approval ownership; fresh native validation is required";
-const EXACT_CODEX_VERSION: &str = "codex-cli 0.155.1";
+pub const EXACT_CODEX_VERSION: &str = "codex-cli 0.155.1";
+pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-provider-launch-v1";
+pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-provider-resume-v1";
+pub const CREDENTIAL_CONTRACT_REVISION: &str = "llmrelay-local-credential-v1";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_AUTH_BYTES: u64 = 256 * 1024;
 const ACCESS_TOKEN_MARGIN_SECONDS: i64 = 15 * 60;
@@ -67,7 +70,43 @@ pub fn prepare(
     executable_path: &Path,
     read_denials: &[PathBuf],
 ) -> Result<PreparedLaunch> {
+    prepare_with_bundles(
+        role,
+        model,
+        effort,
+        cwd,
+        prompt,
+        role_socket,
+        role_token,
+        role_generation_id,
+        session_id,
+        native_session_id,
+        assets,
+        executable_path,
+        read_denials,
+        &crate::provider_compatibility::BundleSet::embedded(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_with_bundles(
+    role: RoleKind,
+    model: &str,
+    effort: &str,
+    cwd: &Path,
+    prompt: &str,
+    role_socket: &Path,
+    role_token: &str,
+    role_generation_id: &str,
+    session_id: &str,
+    native_session_id: Option<&str>,
+    assets: &HookAssets,
+    executable_path: &Path,
+    read_denials: &[PathBuf],
+    bundles: &crate::provider_compatibility::BundleSet,
+) -> Result<PreparedLaunch> {
     let (executable, version) = super::executable_and_version(Provider::Codex)?;
+    let contract_binding = bundles.resolve(Provider::Codex, &version, role)?;
     let compatibility = inspect_native_compatibility(cwd, &version)?;
     let hook_command = shell_quote(&assets.runner.to_string_lossy());
     let (canonical_role_socket, canonical_control_socket) =
@@ -248,6 +287,7 @@ pub fn prepare(
             security_policy,
             hook_revision: format!("{HOOK_REVISION}:{}", assets.codex_revision_hash),
             capability_status: CapabilityStatus::Unverified,
+            compatibility: Some(contract_binding),
         },
         executable,
         arguments,

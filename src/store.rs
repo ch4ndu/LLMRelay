@@ -3,18 +3,38 @@ use crate::domain::{
     AttachmentBinding, CapabilityIdentity, CapabilityProofInput, CmuxAttachmentControlDirective,
     CmuxAttachmentControlDisposition, CmuxAttachmentMode, CmuxAttachmentRoute,
     CmuxKeyboardControlAction, CmuxKeyboardControlOutcome, CmuxSessionSurface, CmuxTaskWorkspace,
-    CmuxViewOutcome, HookEnvelope, LaunchConfig, ObservedProcessIdentity, RoleContext, RoleKind,
-    RolePeerProvenance, RoleResultReport, ValidationLaunchRequest,
+    CmuxViewOutcome, HookEnvelope, LaunchConfig, ObservedProcessIdentity, RestartCandidateResult,
+    RoleContext, RoleKind, RolePeerProvenance, RoleResultReport, ValidationLaunchRequest,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::sync::Notify;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_INTERRUPT_ROLE_REPORT_AFTER_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[derive(Debug)]
+pub(crate) struct RoleResumeCapacityError;
+
+impl std::fmt::Display for RoleResumeCapacityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("role capacity is full for exact resume")
+    }
+}
+
+impl std::error::Error for RoleResumeCapacityError {}
 
 #[derive(Clone, Debug)]
 pub struct RoleLaunchContext {
@@ -45,6 +65,8 @@ pub(crate) enum BrowserLaunchReservation {
     Existing(serde_json::Value),
 }
 
+pub const CAPABILITY_PROOF_REVISION: &str = "llmrelay-capability-proof-v1";
+
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedResumeIdentity {
     capability_key: String,
@@ -53,6 +75,7 @@ pub(crate) struct PreparedResumeIdentity {
     role: String,
     model: String,
     effort: String,
+    compatibility_hash: Option<String>,
 }
 
 impl PreparedResumeIdentity {
@@ -65,6 +88,7 @@ impl PreparedResumeIdentity {
             role: identity.role.to_string(),
             model: identity.model,
             effort: identity.effort,
+            compatibility_hash: identity.compatibility.map(|binding| binding.effective_hash),
         })
     }
 
@@ -76,6 +100,7 @@ impl PreparedResumeIdentity {
             "model": self.model.as_str(),
             "effort": self.effort.as_str(),
             "mode": "interactive_pty",
+            "compatibility_hash": self.compatibility_hash,
         })
     }
 }
@@ -116,6 +141,8 @@ const MIGRATION_025: &str =
 const MIGRATION_026: &str = include_str!("../migrations/026_runtime_cmux_socket_observation.sql");
 const MIGRATION_027: &str = include_str!("../migrations/027_cmux_task_workspace_routing.sql");
 const MIGRATION_028: &str = include_str!("../migrations/028_session_interrupt_deadline.sql");
+const MIGRATION_029: &str = include_str!("../migrations/029_state_revision.sql");
+const MIGRATION_030: &str = include_str!("../migrations/030_recipes.sql");
 
 type CmuxRouteRow = (
     String,
@@ -779,29 +806,174 @@ fn validate_role_report_contract(
 #[derive(Clone)]
 pub struct Store {
     pub(crate) connection: Arc<Mutex<Connection>>,
+    state_changes: Arc<Notify>,
+    pub(crate) compatibility_bundles: Arc<crate::provider_compatibility::BundleSet>,
+}
+
+/// Exclusive access to the state connection. Releasing it wakes state waiters
+/// only when the committed revision advanced while it was held.
+pub(crate) struct StoreGuard<'a> {
+    connection: MutexGuard<'a, Connection>,
+    state_changes: &'a Notify,
+    total_changes_at_acquire: u64,
+    revision_at_acquire: Option<i64>,
+}
+
+impl<'a> StoreGuard<'a> {
+    fn acquire(connection: MutexGuard<'a, Connection>, state_changes: &'a Notify) -> Self {
+        Self {
+            total_changes_at_acquire: connection.total_changes(),
+            revision_at_acquire: read_state_revision(&connection).ok(),
+            connection,
+            state_changes,
+        }
+    }
+}
+
+impl Deref for StoreGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+impl DerefMut for StoreGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.connection
+    }
+}
+
+impl Drop for StoreGuard<'_> {
+    fn drop(&mut self) {
+        // total_changes also counts rolled-back work, so only a re-read committed
+        // revision proves there is newer state. Missed wakes are reconciled by the
+        // dashboard's watchdog read, never by failing the already committed write.
+        if self.connection.total_changes() == self.total_changes_at_acquire
+            || !self.connection.is_autocommit()
+        {
+            return;
+        }
+        let Some(acquired) = self.revision_at_acquire else {
+            tracing::warn!("state revision was unreadable when the store lock was acquired");
+            return;
+        };
+        match read_state_revision(&self.connection) {
+            Ok(released) if released > acquired => self.state_changes.notify_waiters(),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(error = %error, "state revision observation failed"),
+        }
+    }
 }
 
 impl Store {
+    fn from_connection(connection: Connection) -> Self {
+        Self {
+            connection: Arc::new(Mutex::new(connection)),
+            state_changes: Arc::new(Notify::new()),
+            compatibility_bundles: Arc::new(crate::provider_compatibility::BundleSet::embedded()),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn with_synthetic_compatibility_for_tests(mut self, codex: &str, claude: &str) -> Self {
+        self.compatibility_bundles =
+            Arc::new(crate::provider_compatibility::BundleSet::synthetic_for_tests(codex, claude));
+        self
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let mut connection = Connection::open(path)
             .with_context(|| format!("open state database {}", path.display()))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         migrate(&mut connection)?;
-        Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self::from_connection(connection))
+    }
+
+    pub(crate) fn open_service(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Self::open(path);
+        }
+        Self::open_current_writable(path).and_then(|store| {
+            let connection = store.lock()?;
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+            drop(connection);
+            Ok(store)
         })
     }
 
-    pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>> {
-        self.connection
+    pub fn open_current_readonly(path: &Path) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("open state database read-only {}", path.display()))?;
+        connection.pragma_update(None, "query_only", "ON")?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        require_current_schema(&connection)?;
+        Ok(Self::from_connection(connection))
+    }
+
+    pub(crate) fn open_current_writable(path: &Path) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("open current state database {}", path.display()))?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        require_current_schema(&connection)?;
+        Ok(Self::from_connection(connection))
+    }
+
+    pub(crate) fn restore_hold(&self) -> Result<Option<serde_json::Value>> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT detail_json FROM recovery_records
+                 WHERE id='database-restore-hold' AND state='attention_required'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_str(&value).context("parse database restore hold"))
+            .transpose()
+    }
+
+    pub(crate) fn require_execution_unheld(&self, action: &str) -> Result<()> {
+        if self.restore_hold()?.is_some() {
+            bail!("{action} is disabled by the database restore hold")
+        }
+        Ok(())
+    }
+
+    pub(crate) fn lock(&self) -> Result<StoreGuard<'_>> {
+        let connection = self
+            .connection
             .lock()
-            .map_err(|_| anyhow!("state database lock poisoned"))
+            .map_err(|_| anyhow!("state database lock poisoned"))?;
+        Ok(StoreGuard::acquire(connection, &self.state_changes))
+    }
+
+    /// Woken after a commit through any clone of this store advances the state
+    /// revision. Wakes are lossy hints; the durable revision stays authoritative.
+    pub(crate) fn state_changes(&self) -> &Notify {
+        &self.state_changes
+    }
+
+    pub(crate) fn state_revision(&self) -> Result<i64> {
+        let connection = self.lock()?;
+        read_state_revision(&connection).context("read committed state revision")
     }
 
     pub fn role_context(&self, token: &str) -> Result<RoleContext> {
+        if self.restore_hold()?.is_some() {
+            bail!("role authority is disabled by the database restore hold")
+        }
         let hash = auth::hash_secret(token);
         let connection = self.lock()?;
         let row = connection.query_row(
@@ -1049,6 +1221,10 @@ impl Store {
             params![report.operation_id, context.role_generation_id, request_hash, serde_json::to_string(&result)?, now],
         )?;
         transaction.commit()?;
+        #[cfg(test)]
+        if TEST_INTERRUPT_ROLE_REPORT_AFTER_COMMIT.with(|armed| armed.replace(false)) {
+            bail!("injected interruption after role report commit")
+        }
         Ok(result)
     }
 
@@ -2024,12 +2200,13 @@ impl Store {
             )?;
             let role: RoleKind = role.parse().map_err(|error: String| anyhow!(error))?;
             let launch: LaunchConfig = serde_json::from_str(&launch_json)?;
-            let authority = crate::trip::current_task_profile_authority(
+            let authority = crate::trip::current_task_profile_authority_with_bundles(
                 &connection,
                 &task,
                 role,
                 revision,
                 &launch,
+                &self.compatibility_bundles,
             )?;
             crate::trip::replace_attempt_profile(&connection, &attempt, &authority, &now)?;
             if role == RoleKind::Manager {
@@ -2379,7 +2556,7 @@ impl Store {
         }
         let candidates = {
             let mut statement = transaction.prepare(
-                "SELECT rc.session_id,s.status,COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)
+                "SELECT rc.session_id,s.status,COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0),rc.state,rc.result_json
                  FROM restart_candidates rc JOIN sessions s ON s.id=rc.session_id
                  WHERE rc.attempt_id=?1 AND rc.state NOT IN ('resumed','released_fresh_dispatch','cancelled')",
             )?;
@@ -2389,6 +2566,8 @@ impl Store {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, bool>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2399,7 +2578,7 @@ impl Store {
         }
         if candidates
             .iter()
-            .any(|(_, status, quiescent)| status != "exited" || !quiescent)
+            .any(|(_, status, quiescent, _, _)| status != "exited" || !quiescent)
         {
             bail!("restart hold release requires every captured prior-running session to have positive quiescence evidence")
         }
@@ -2411,12 +2590,31 @@ impl Store {
         if unresolved_recovery {
             bail!("restart hold release is blocked by unresolved recovery evidence")
         }
-        for (session_id, _, _) in &candidates {
+        for (session_id, _, _, state, result_json) in &candidates {
+            if !matches!(
+                state.as_str(),
+                "pending_reconciliation"
+                    | "parked"
+                    | "queued_capacity"
+                    | "failed"
+                    | "blocked"
+                    | "skipped"
+                    | "admitting"
+            ) {
+                bail!("restart hold has an unsupported durable candidate state")
+            }
+            let mut result = RestartCandidateResult::parse(result_json)?;
+            result.validate_candidate_state(state, session_id)?;
+            result.restart.terminalize_batch();
+            result.set(
+                "fresh_dispatch_release",
+                serde_json::json!({"source":source,"native_resume_implied":false}),
+            );
             transaction.execute(
                 "UPDATE restart_candidates SET state='released_fresh_dispatch',requested_by=?1,
                         reason='explicit human action released the restart hold after positive quiescence; no native resume or fresh launch was implied',
-                        updated_at=?2 WHERE session_id=?3",
-                params![source, now, session_id],
+                        result_json=?2,updated_at=?3 WHERE session_id=?4",
+                params![source, result.encode()?, now, session_id],
             )?;
             transaction.execute(
                 "UPDATE sessions SET desired_running=0 WHERE id=?1",
@@ -2443,7 +2641,11 @@ impl Store {
         Ok(candidates.len())
     }
 
-    pub fn preserve_proven_nondelivery_recovery_detail(&self, session_id: &str) -> Result<()> {
+    pub fn preserve_proven_nondelivery_recovery_detail(
+        &self,
+        session_id: &str,
+        recovery_id: &str,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2463,8 +2665,8 @@ impl Store {
         };
         let record: Option<(String, String)> = transaction
             .query_row(
-                "SELECT id,detail_json FROM recovery_records WHERE session_id=?1 ORDER BY created_at DESC LIMIT 1",
-                params![session_id],
+                "SELECT id,detail_json FROM recovery_records WHERE id=?1 AND session_id=?2 AND state='resolved_quiescent'",
+                params![recovery_id, session_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
@@ -2786,6 +2988,48 @@ impl Store {
                 "UPDATE sessions SET desired_running=0 WHERE id=?1",
                 params![session_id],
             )?;
+            let prior_candidate: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT state,result_json FROM restart_candidates WHERE session_id=?1",
+                    params![session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if prior_candidate.as_ref().is_some_and(|(state, _)| {
+                !matches!(
+                    state.as_str(),
+                    "pending_reconciliation"
+                        | "parked"
+                        | "queued_capacity"
+                        | "failed"
+                        | "blocked"
+                        | "skipped"
+                        | "admitting"
+                )
+            }) {
+                bail!("graceful-stop recovery found an unsupported restart candidate state")
+            }
+            let mut candidate_result = RestartCandidateResult::parse(
+                prior_candidate
+                    .as_ref()
+                    .map(|(_, result)| result.as_str())
+                    .unwrap_or("{}"),
+            )?;
+            if let Some((state, _)) = prior_candidate.as_ref() {
+                candidate_result.validate_candidate_state(state, session_id)?;
+            }
+            candidate_result.restart.terminalize_batch();
+            candidate_result.set(
+                "kind",
+                serde_json::Value::String("graceful_stop_quiescent".to_owned()),
+            );
+            candidate_result.set("native_resume_forbidden", serde_json::Value::Bool(true));
+            candidate_result.set(
+                "fresh_dispatch_requires_explicit_continue",
+                serde_json::Value::Bool(true),
+            );
+            candidate_result.set("automatic_resume", serde_json::Value::Bool(false));
+            candidate_result.set("fresh_dispatch_started", serde_json::Value::Bool(false));
             transaction.execute(
                 "INSERT INTO restart_candidates(session_id,attempt_id,task_id,source,state,reason,result_json,created_at,updated_at)
                  VALUES(?1,?2,?3,'graceful_stop_recovery','parked',?4,?5,?6,?6)
@@ -2797,13 +3041,7 @@ impl Store {
                     attempt_id,
                     task_id,
                     "exact graceful-stop recovery reached positive quiescence; native resume remains forbidden until a separate human action releases the fresh-dispatch hold",
-                    serde_json::json!({
-                        "kind":"graceful_stop_quiescent",
-                        "native_resume_forbidden":true,
-                        "fresh_dispatch_requires_explicit_continue":true,
-                        "automatic_resume":false,
-                        "fresh_dispatch_started":false
-                    }).to_string(),
+                    candidate_result.encode()?,
                     now
                 ],
             )?;
@@ -3170,9 +3408,10 @@ impl Store {
             bail!("frozen capability identity is inconsistent with the reserved session")
         }
         let current_cwd = workspace_path.as_deref().unwrap_or(&project_path);
-        crate::providers::require_current_capability_identity(
+        crate::providers::require_current_capability_identity_with_bundles(
             &session_identity,
             Path::new(current_cwd),
+            &self.compatibility_bundles,
         )?;
         if role_kind == RoleKind::Implementer {
             if !(proof.workspace_write_observed
@@ -3279,9 +3518,10 @@ impl Store {
             {
                 bail!("runtime probe base capability identity is inconsistent with its frozen admission")
             }
-            crate::providers::require_current_capability_identity(
+            crate::providers::require_current_capability_identity_with_bundles(
                 &base_identity,
                 Path::new(current_cwd),
+                &self.compatibility_bundles,
             )?;
             (base_key, base_identity)
         } else {
@@ -3442,7 +3682,10 @@ impl Store {
             "local_mcp_coverage_revision":identity.security_policy.pointer("/local_mcp_coverage/revision"),
             "native_approval_ownership_revision":identity.security_policy.pointer("/native_approval_ownership/revision"),
             "config_hash":config_hash,"hook_hash":hook_hash,"session_id":proof.session_id,"native_session_id":native_id,"evidence_reference":proof.evidence_reference,
-            "runtime_scope":proof.runtime_scope,"runtime_scopes":runtime_scopes});
+            "runtime_scope":proof.runtime_scope,"runtime_scopes":runtime_scopes,
+            "compatibility":identity.compatibility,
+            "compatibility_provenance":serde_json::from_str::<crate::domain::LaunchConfig>(&transaction.query_row(
+                "SELECT launch_config_json FROM sessions WHERE id=?1", params![proof.session_id], |row| row.get::<_,String>(0))?)?.compatibility});
         let now = Utc::now().to_rfc3339();
         transaction.execute("UPDATE sessions SET native_identity_verified_at=?1,hook_trust_state='verified_live',updated_at=?1 WHERE id=?2", params![now,proof.session_id])?;
         transaction.execute("INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,hook_hash,proof_json)
@@ -3680,7 +3923,7 @@ impl Store {
 
     pub fn require_supported_capability(&self, config: &LaunchConfig) -> Result<()> {
         let connection = self.lock()?;
-        require_supported_capability_in(&connection, config)
+        require_supported_capability_in(&connection, config, &self.compatibility_bundles)
     }
 
     pub fn switched_role_launch_context(&self, intent_id: &str) -> Result<RoleLaunchContext> {
@@ -4036,8 +4279,13 @@ impl Store {
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
         fresh_resume_rejection: Option<&serde_json::Value>,
     ) -> Result<BrowserLaunchReservation> {
+        self.require_execution_unheld("role launch reservations")?;
         let capability_identity = crate::providers::capability_identity(config)?;
-        crate::providers::require_current_capability_identity(&capability_identity, &config.cwd)?;
+        crate::providers::require_current_capability_identity_with_bundles(
+            &capability_identity,
+            &config.cwd,
+            &self.compatibility_bundles,
+        )?;
         let capability_key = crate::providers::capability_identity_key(&capability_identity)?;
         let capability_identity_json = serde_json::to_string(&capability_identity)?;
         let now = Utc::now().to_rfc3339();
@@ -4104,22 +4352,24 @@ impl Store {
             }
         }
         if !validation_dispatch {
-            require_supported_capability_in(&transaction, config)?;
+            require_supported_capability_in(&transaction, config, &self.compatibility_bundles)?;
             if switch_intent.is_some() {
-                crate::trip::current_task_profile_authority(
+                crate::trip::current_task_profile_authority_with_bundles(
                     &transaction,
                     &context.task_id,
                     config.role,
                     context.settings_revision,
                     config,
+                    &self.compatibility_bundles,
                 )?;
             } else {
-                crate::trip::require_attempt_profile_launch(
+                crate::trip::require_attempt_profile_launch_with_bundles(
                     &transaction,
                     &attempt_id,
                     config.role,
                     context.settings_revision,
                     config,
+                    &self.compatibility_bundles,
                 )?;
             }
         }
@@ -6555,8 +6805,13 @@ impl Store {
         transcript_epoch: &str,
         launch: &LaunchConfig,
     ) -> Result<()> {
+        self.require_execution_unheld("validation launch reservations")?;
         let capability_identity = crate::providers::capability_identity(launch)?;
-        crate::providers::require_current_capability_identity(&capability_identity, &launch.cwd)?;
+        crate::providers::require_current_capability_identity_with_bundles(
+            &capability_identity,
+            &launch.cwd,
+            &self.compatibility_bundles,
+        )?;
         let capability_key = crate::providers::capability_identity_key(&capability_identity)?;
         let capability_identity_json = serde_json::to_string(&capability_identity)?;
         let now = Utc::now().to_rfc3339();
@@ -6916,6 +7171,7 @@ impl Store {
         category: &str,
         reason: &str,
         attempted: Option<&PreparedResumeIdentity>,
+        compatibility: Option<&crate::provider_compatibility::CompatibilityExplanation>,
     ) -> Result<bool> {
         let allowed = [
             "frozen_runtime_identity_changed",
@@ -6927,6 +7183,9 @@ impl Store {
             "stale_generation",
             "stale_review_or_scope",
             "authority_consumed",
+            "provider_compatibility_unsupported",
+            "provider_compatibility_contract_changed",
+            "provider_compatibility_invalid_manifest",
         ];
         if !allowed.contains(&category) {
             bail!("invalid permanent resume rejection category")
@@ -7001,6 +7260,9 @@ impl Store {
         };
         let observed_key = attempted.map(|identity| identity.capability_key.clone());
         let observed_identity = attempted.map(PreparedResumeIdentity::audit_value);
+        let frozen_contract_hash: Option<String> = transaction.query_row(
+            "SELECT json_extract(capability_identity_json,'$.compatibility.effective_hash') FROM sessions WHERE id=?1",
+            params![session_id], |row| row.get(0))?;
         let active_typed_setup_session: bool = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM sessions s
@@ -7131,6 +7393,9 @@ impl Store {
                         "session_id":session_id,"role_generation_id":generation_id,
                         "transcript_epoch":transcript_epoch,"resume_count":resume_count,
                         "frozen_capability_key":frozen_key,"observed_capability_key":observed_key,
+                        "frozen_contract_hash":frozen_contract_hash,
+                        "observed_contract_hash":attempted.and_then(|identity| identity.compatibility_hash.as_deref()),
+                        "compatibility":compatibility,
                         "observed_identity":observed_identity,
                         "attempt_id":attempt_id,"role":role,"lane_id":lane_id,
                         "config_revision":config_revision,"setup_permit_id":setup_permit_id,
@@ -7631,8 +7896,13 @@ impl Store {
         runtime: Option<&crate::trip::CapabilityRuntime>,
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
     ) -> Result<BrowserLaunchReservation> {
+        self.require_execution_unheld("session resume reservations")?;
         let capability_identity = crate::providers::capability_identity(launch)?;
-        crate::providers::require_current_capability_identity(&capability_identity, &launch.cwd)?;
+        crate::providers::require_current_capability_identity_with_bundles(
+            &capability_identity,
+            &launch.cwd,
+            &self.compatibility_bundles,
+        )?;
         let capability_key = crate::providers::capability_identity_key(&capability_identity)?;
         let launch_json = serde_json::to_string(launch)?;
         let capability_identity_json = serde_json::to_string(&capability_identity)?;
@@ -7652,7 +7922,13 @@ impl Store {
             "SELECT rg.attempt_id,s.setup_permit_id,a.status FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id JOIN attempts a ON a.id=rg.attempt_id WHERE s.id=?1",
             params![session_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
         )?;
-        validate_frozen_capability(&transaction, session_id, &capability_key)?;
+        validate_frozen_capability(
+            &transaction,
+            session_id,
+            &capability_key,
+            &launch.cwd,
+            &self.compatibility_bundles,
+        )?;
         let typed_setup_resume =
             validate_typed_setup_resume(&transaction, session_id, launch, &capability_key)?;
         let runtime_probe_resume = crate::trip::validate_runtime_probe_resume_authority(
@@ -8093,6 +8369,7 @@ impl Store {
         token: &str,
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
     ) -> Result<BrowserLaunchReservation> {
+        self.require_execution_unheld("role resume reservations")?;
         if launch.role == RoleKind::FinalReviewer {
             bail!("final verifier sessions are always fresh and cannot resume")
         }
@@ -8159,7 +8436,11 @@ impl Store {
         }
         crate::providers::require_production_capability(launch)?;
         let capability_identity = crate::providers::capability_identity(launch)?;
-        crate::providers::require_current_capability_identity(&capability_identity, &launch.cwd)?;
+        crate::providers::require_current_capability_identity_with_bundles(
+            &capability_identity,
+            &launch.cwd,
+            &self.compatibility_bundles,
+        )?;
         let capability_key = crate::providers::capability_identity_key(&capability_identity)?;
         let launch_json = serde_json::to_string(launch)?;
         let capability_identity_json = serde_json::to_string(&capability_identity)?;
@@ -8168,7 +8449,13 @@ impl Store {
             params![session_id], |row| Ok((row.get(0)?,row.get(1)?))
         )?;
         crate::trip::require_attempt_ready(&tx, &admission_attempt, setup_permit.as_deref())?;
-        validate_frozen_capability(&tx, session_id, &capability_key)?;
+        validate_frozen_capability(
+            &tx,
+            session_id,
+            &capability_key,
+            &launch.cwd,
+            &self.compatibility_bundles,
+        )?;
         let capability_supported: bool = tx.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM capabilities current_capability
@@ -8254,7 +8541,7 @@ impl Store {
             bail!("resume role changed")
         }
         if !role_capacity_available(&tx, &provider, role, Some(session_id), None)? {
-            bail!("role capacity is full for exact resume")
+            return Err(RoleResumeCapacityError.into());
         }
         if let Some(receipt) = browser_receipt {
             let (task_id, attempt_status, phase, lifecycle, attention, config_revision, resume_count):
@@ -8589,6 +8876,27 @@ impl Store {
     }
 }
 
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 30;
+
+/// Reads the durable state cursor. It is committed state only when the
+/// connection is in autocommit mode.
+pub(crate) fn read_state_revision(connection: &Connection) -> rusqlite::Result<i64> {
+    connection
+        .prepare_cached("SELECT revision FROM state_revision WHERE singleton=1")?
+        .query_row([], |row| row.get(0))
+}
+
+pub(crate) fn require_current_schema(connection: &Connection) -> Result<()> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != CURRENT_SCHEMA_VERSION {
+        bail!(
+            "unsupported database schema version {version}; current schema version {} is required and this command will not migrate it",
+            CURRENT_SCHEMA_VERSION
+        )
+    }
+    Ok(())
+}
+
 pub(crate) fn browser_launch_receipt_in(
     transaction: &Transaction<'_>,
     operation_id: &str,
@@ -8872,7 +9180,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             transaction.pragma_update(None, "user_version", 14)?;
             transaction.commit().context("commit schema migration 14")?;
         }
-        14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 => {}
+        14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 => {}
         other => bail!("database schema {other} is newer than this LLMRelay build"),
     }
     if version <= 14 {
@@ -8986,6 +9294,20 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction
             .commit()
             .context("commit session interrupt-deadline migration")?;
+    }
+    if version <= 28 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_029)?;
+        transaction.pragma_update(None, "user_version", 29)?;
+        transaction
+            .commit()
+            .context("commit state revision migration")?;
+    }
+    if version <= 29 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_030)?;
+        transaction.pragma_update(None, "user_version", 30)?;
+        transaction.commit().context("commit recipe migration")?;
     }
     Ok(())
 }
@@ -9725,16 +10047,30 @@ fn validate_frozen_capability(
     connection: &rusqlite::Connection,
     session_id: &str,
     current_key: &str,
+    cwd: &std::path::Path,
+    bundles: &crate::provider_compatibility::BundleSet,
 ) -> Result<()> {
-    let frozen: Option<String> = connection
+    let frozen: Option<(Option<String>, Option<String>)> = connection
         .query_row(
-            "SELECT capability_key FROM sessions WHERE id=?1",
+            "SELECT capability_key,capability_identity_json FROM sessions WHERE id=?1",
             params![session_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .optional()?
-        .flatten();
-    let frozen = frozen.ok_or_else(|| {
+        .optional()?;
+    let (frozen_key, frozen_identity) = frozen.ok_or_else(|| {
+        anyhow!("session predates frozen capability identity; exact resume requires a fresh accounted session")
+    })?;
+    let frozen_identity = frozen_identity.ok_or_else(|| {
+        anyhow!("session predates frozen capability identity; exact resume requires a fresh accounted session")
+    })?;
+    let frozen_identity: crate::domain::CapabilityIdentity =
+        serde_json::from_str(&frozen_identity)?;
+    crate::providers::require_current_capability_identity_with_bundles(
+        &frozen_identity,
+        cwd,
+        bundles,
+    )?;
+    let frozen = frozen_key.ok_or_else(|| {
         anyhow!("session predates frozen capability identity; exact resume requires a fresh accounted session")
     })?;
     if frozen != current_key {
@@ -10255,9 +10591,15 @@ pub(crate) fn role_capacity_available(
 pub(crate) fn require_supported_capability_in(
     connection: &rusqlite::Connection,
     config: &LaunchConfig,
+    bundles: &crate::provider_compatibility::BundleSet,
 ) -> Result<()> {
     crate::providers::require_production_capability(config)?;
-    crate::providers::require_current_capability_policy(config)?;
+    let identity = crate::providers::capability_identity(config)?;
+    crate::providers::require_current_capability_identity_with_bundles(
+        &identity,
+        &config.cwd,
+        bundles,
+    )?;
     let key = crate::providers::capability_key(config)?;
     let exact: bool = connection.query_row(
         "SELECT EXISTS(
@@ -10307,4 +10649,215 @@ pub fn role_permissions(role: RoleKind) -> Vec<String> {
         permissions.push("request_next_role".to_owned());
     }
     permissions
+}
+
+#[cfg(test)]
+mod interruption_tests {
+    use super::*;
+    use crate::domain::Provider;
+
+    #[test]
+    fn committed_role_report_replays_receipt_without_duplicate_result_or_audit() {
+        let root = std::env::temp_dir().join(format!("llmrelay-report-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("state.sqlite3");
+        let store = Store::open(&database).unwrap();
+        store.lock().unwrap().execute_batch(
+            "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+               VALUES('p','p','/tmp/llmrelay-report-fixture','report-fixture','base','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO tasks(id,project_id,title,lifecycle,created_at,updated_at)
+               VALUES('t','p','t','in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+               VALUES('a','t','context','planning','base',1,'running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+               VALUES('g','a','manager','codex',1,1,'running','authority','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+               VALUES('settings','t','manager',1,'{}','g','2026-01-01T00:00:00Z');
+             INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at)
+               VALUES('credential','g','fixture-hash','[\"report_result\"]','2026-01-01T00:00:00Z');
+             INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+               VALUES('s','g','codex','running','{}','fixture','epoch','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');"
+        ).unwrap();
+        let context = RoleContext {
+            project_id: "p".into(),
+            task_id: "t".into(),
+            attempt_id: "a".into(),
+            role_generation_id: "g".into(),
+            session_id: "s".into(),
+            credential_id: "credential".into(),
+            transcript_epoch: "epoch".into(),
+            role: RoleKind::Manager,
+            provider: Provider::Codex,
+            configuration_revision: 1,
+            lane_id: "default".into(),
+            permissions: vec!["report_result".into()],
+        };
+        let report = RoleResultReport {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            outcome: "blocked".into(),
+            summary: "fixture report".into(),
+            evidence: vec![],
+            metadata: serde_json::json!({}),
+        };
+        TEST_INTERRUPT_ROLE_REPORT_AFTER_COMMIT.with(|armed| armed.set(true));
+        let error = store.save_role_result(&context, &report).unwrap_err();
+        assert!(error.to_string().contains("injected interruption"));
+        drop(store);
+
+        let reopened = Store::open_current_writable(&database).unwrap();
+        let committed_json: String = reopened.lock().unwrap().query_row(
+            "SELECT result_json FROM operation_receipts WHERE operation_id=?1 AND operation_kind='role_report'",
+            params![report.operation_id], |row| row.get(0),
+        ).unwrap();
+        let receipt = reopened.save_role_result(&context, &report).unwrap();
+        assert_eq!(
+            receipt,
+            serde_json::from_str::<serde_json::Value>(&committed_json).unwrap()
+        );
+        assert_eq!(receipt["accepted"], true);
+        let changed = RoleResultReport {
+            summary: "changed payload".into(),
+            ..report.clone()
+        };
+        assert!(reopened
+            .save_role_result(&context, &changed)
+            .unwrap_err()
+            .to_string()
+            .contains("operation ID was already used with different input"));
+        let connection = reopened.lock().unwrap();
+        for (table, expected) in [
+            ("role_results", 1),
+            ("operation_receipts", 1),
+            ("audit_events", 1),
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE operation_id=?1"),
+                    params![report.operation_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, expected, "{table}");
+        }
+        drop(connection);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn wakes_registered_waiter(store: &Store, write: impl FnOnce()) -> bool {
+        use std::future::Future;
+        let changed = store.state_changes().notified();
+        let mut changed = std::pin::pin!(changed);
+        changed.as_mut().enable();
+        write();
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        changed.as_mut().poll(&mut context).is_ready()
+    }
+
+    #[test]
+    fn store_guard_wakes_waiters_only_after_a_committed_revision_advance() {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-state-wake-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("state.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let writer = store.clone();
+        let insert_project = |id: &str| {
+            format!(
+                "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+                 VALUES('{id}','{id}','/tmp/{id}','{id}','base','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');"
+            )
+        };
+        let before = store.state_revision().unwrap();
+
+        assert!(!wakes_registered_waiter(&store, || {
+            writer
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM projects", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap();
+        }));
+        assert!(!wakes_registered_waiter(&store, || {
+            writer.lock().unwrap().execute(
+                "INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at)
+                 VALUES('unprojected','actor','kind','hash','{}','2026-01-01T00:00:00Z')",
+                [],
+            ).unwrap();
+        }));
+        assert!(!wakes_registered_waiter(&store, || {
+            let mut connection = writer.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute_batch(&insert_project("rolled-back"))
+                .unwrap();
+        }));
+        assert!(!wakes_registered_waiter(&store, || {
+            writer
+                .lock()
+                .unwrap()
+                .execute_batch(&format!("BEGIN;{}", insert_project("open-transaction")))
+                .unwrap();
+        }));
+        writer.lock().unwrap().execute_batch("ROLLBACK").unwrap();
+        assert_eq!(store.state_revision().unwrap(), before);
+
+        assert!(wakes_registered_waiter(&store, || {
+            writer
+                .lock()
+                .unwrap()
+                .execute_batch(&insert_project("committed"))
+                .unwrap();
+        }));
+        // Mirrors the state wait: register, read the cursor, then a commit lands.
+        assert!(wakes_registered_waiter(&store, || {
+            assert_eq!(writer.state_revision().unwrap(), before + 1);
+            writer
+                .lock()
+                .unwrap()
+                .execute_batch(&insert_project("after-read"))
+                .unwrap();
+        }));
+
+        let readonly = Store::open_current_readonly(&database).unwrap();
+        assert!(!wakes_registered_waiter(&readonly, || {
+            readonly
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM projects", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap();
+        }));
+        assert_eq!(readonly.state_revision().unwrap(), before + 2);
+
+        writer
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE state_revision")
+            .unwrap();
+        assert!(!wakes_registered_waiter(&store, || {
+            writer
+                .lock()
+                .unwrap()
+                .execute(
+                    "DELETE FROM operation_receipts WHERE operation_id='unprojected'",
+                    [],
+                )
+                .unwrap();
+        }));
+        assert_eq!(
+            writer
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM operation_receipts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "an unobservable revision must not fail or panic the committed write"
+        );
+        drop((store, writer, readonly));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 pub const WORKFLOW_ID: &str = "trip-explorer-0.9.0-llmrelay-1";
 pub const PACKAGE_VERSION: &str = "0.9.0";
@@ -202,6 +203,32 @@ pub struct CapabilityRuntime {
     pub hooks: crate::providers::HookAssets,
     pub role_socket: PathBuf,
     pub executable: PathBuf,
+    pub(crate) compatibility_bundles: Arc<crate::provider_compatibility::BundleSet>,
+}
+
+impl CapabilityRuntime {
+    pub fn from_store(
+        store: &Store,
+        hooks: crate::providers::HookAssets,
+        role_socket: PathBuf,
+        executable: PathBuf,
+    ) -> Self {
+        Self {
+            hooks,
+            role_socket,
+            executable,
+            compatibility_bundles: store.compatibility_bundles.clone(),
+        }
+    }
+
+    fn require_current_policy(&self, config: &LaunchConfig) -> Result<()> {
+        let identity = crate::providers::capability_identity(config)?;
+        crate::providers::require_current_capability_identity_with_bundles(
+            &identity,
+            &config.cwd,
+            &self.compatibility_bundles,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -373,7 +400,7 @@ pub fn require_task_profiles_activated(
             .ok_or_else(|| anyhow!("Ready tasks require a current setting for role {role}"))?;
         let role_kind: RoleKind = role.parse().map_err(|error: String| anyhow!(error))?;
         let config: RoleOverride = serde_json::from_str(&config_json)?;
-        let prepared = crate::providers::prepare_role_launch(
+        let prepared = crate::providers::prepare_role_launch_with_bundles(
             config.provider,
             role_kind,
             &config.model,
@@ -387,9 +414,17 @@ pub fn require_task_profiles_activated(
             None,
             &runtime.hooks,
             &runtime.executable,
+            &runtime.compatibility_bundles,
         )?;
-        current_task_profile_authority(connection, task_id, role_kind, revision, &prepared.config)
-            .with_context(|| format!("role {role} lacks exact current runtime authority"))?;
+        current_task_profile_authority_with_bundles(
+            connection,
+            task_id,
+            role_kind,
+            revision,
+            &prepared.config,
+            &runtime.compatibility_bundles,
+        )
+        .with_context(|| format!("role {role} lacks exact current runtime authority"))?;
     }
     Ok(())
 }
@@ -553,12 +588,13 @@ pub(crate) struct TaskProfilePreparationAuthority {
     pub task_profile_reason: Option<String>,
 }
 
-pub(crate) fn task_profile_preparation_authority(
+pub(crate) fn task_profile_preparation_authority_with_bundles(
     connection: &Connection,
     task_id: &str,
     role: RoleKind,
     revision: i64,
     launch: &crate::domain::LaunchConfig,
+    bundles: &crate::provider_compatibility::BundleSet,
 ) -> Result<TaskProfilePreparationAuthority> {
     let (mut descriptor, requested) =
         task_profile_descriptor(connection, task_id, &role.to_string(), revision)?;
@@ -569,18 +605,19 @@ pub(crate) fn task_profile_preparation_authority(
     {
         bail!("prepared launch differs from the exact task role setting revision")
     }
-    let (capability, key, proof) = match capability_binding(connection, launch, &descriptor) {
-        Ok(binding) => binding,
-        Err(error) => {
-            return Ok(TaskProfilePreparationAuthority {
-                descriptor,
-                exact_runtime_authority: false,
-                exact_runtime_reason: Some(format!("{error:#}")),
-                task_profile_activated: false,
-                task_profile_reason: None,
-            })
-        }
-    };
+    let (capability, key, proof) =
+        match capability_binding(connection, launch, &descriptor, bundles) {
+            Ok(binding) => binding,
+            Err(error) => {
+                return Ok(TaskProfilePreparationAuthority {
+                    descriptor,
+                    exact_runtime_authority: false,
+                    exact_runtime_reason: Some(format!("{error:#}")),
+                    task_profile_activated: false,
+                    task_profile_reason: None,
+                })
+            }
+        };
     descriptor.capability_id = capability;
     descriptor.capability_key = key;
     descriptor.capability_proof_hash = proof;
@@ -722,8 +759,14 @@ fn scoped_capability_binding(
     connection: &Connection,
     config: &crate::domain::LaunchConfig,
     expected: &RuntimeScopeExpectation<'_>,
+    bundles: &crate::provider_compatibility::BundleSet,
 ) -> Result<Option<(String, String, String)>> {
-    crate::providers::require_current_capability_policy(config)?;
+    let identity = crate::providers::capability_identity(config)?;
+    crate::providers::require_current_capability_identity_with_bundles(
+        &identity,
+        &config.cwd,
+        bundles,
+    )?;
     let key = crate::providers::capability_key(config)?;
     if key != expected.capability_key {
         return Ok(None);
@@ -759,6 +802,7 @@ fn capability_binding(
     connection: &Connection,
     config: &crate::domain::LaunchConfig,
     descriptor: &TaskProfileAuthority,
+    bundles: &crate::provider_compatibility::BundleSet,
 ) -> Result<(String, String, String)> {
     let (setup_id, fixture_project, fixture_root, fixture_identity, _) =
         runtime_fixture_scope(connection, &descriptor.project_id)?;
@@ -786,6 +830,7 @@ fn capability_binding(
             fixture_repository_identity: &fixture_identity,
             fixture_root_hash: &sha256(fixture_root.as_bytes()),
         },
+        bundles,
     )?
     .ok_or_else(|| anyhow!("exact current runtime-scoped ordinary production capability proof is missing or stale; complete runtime verification for this project, setup, fixture, configuration, adapter, profile, and prepared identity"))
 }
@@ -817,12 +862,13 @@ pub(crate) fn require_recorded_task_profile_authority(
     Ok(descriptor)
 }
 
-pub(crate) fn current_task_profile_authority(
+pub(crate) fn current_task_profile_authority_with_bundles(
     connection: &Connection,
     task_id: &str,
     role: RoleKind,
     revision: i64,
     launch: &crate::domain::LaunchConfig,
+    bundles: &crate::provider_compatibility::BundleSet,
 ) -> Result<TaskProfileAuthority> {
     let (mut descriptor, requested) =
         task_profile_descriptor(connection, task_id, &role.to_string(), revision)?;
@@ -833,7 +879,7 @@ pub(crate) fn current_task_profile_authority(
     {
         bail!("prepared launch differs from the exact task role setting revision")
     }
-    let (capability, key, proof) = capability_binding(connection, launch, &descriptor)?;
+    let (capability, key, proof) = capability_binding(connection, launch, &descriptor, bundles)?;
     if descriptor.source == "task_override" {
         let recorded = require_recorded_task_profile_authority(
             connection,
@@ -869,7 +915,7 @@ pub(crate) fn bind_attempt_profiles(
             params![task_id,role_name],|row|Ok((row.get(0)?,row.get(1)?)))?;
         let role: RoleKind = role_name.parse().map_err(|error: String| anyhow!(error))?;
         let config: RoleOverride = serde_json::from_str(&config_json)?;
-        let prepared = crate::providers::prepare_role_launch(
+        let prepared = crate::providers::prepare_role_launch_with_bundles(
             config.provider,
             role,
             &config.model,
@@ -883,20 +929,28 @@ pub(crate) fn bind_attempt_profiles(
             None,
             &runtime.hooks,
             &runtime.executable,
+            &runtime.compatibility_bundles,
         )?;
-        let authority =
-            current_task_profile_authority(connection, task_id, role, revision, &prepared.config)?;
+        let authority = current_task_profile_authority_with_bundles(
+            connection,
+            task_id,
+            role,
+            revision,
+            &prepared.config,
+            &runtime.compatibility_bundles,
+        )?;
         connection.execute("INSERT INTO trip_attempt_profiles(attempt_id,role,settings_revision,activation_id,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![attempt_id,role_name,revision,authority.activation_id,authority.source,authority.profile_json.to_string(),authority.profile_hash,authority.project_config_revision_id,authority.project_configuration_hash,authority.adapter_name,authority.adapter_hash,authority.capability_id,authority.capability_key,authority.capability_proof_hash,now])?;
     }
     Ok(())
 }
 
-pub(crate) fn require_attempt_profile_launch(
+pub(crate) fn require_attempt_profile_launch_with_bundles(
     connection: &Connection,
     attempt_id: &str,
     role: RoleKind,
     revision: i64,
     launch: &crate::domain::LaunchConfig,
+    bundles: &crate::provider_compatibility::BundleSet,
 ) -> Result<()> {
     let (capability_id,capability_key,proof_hash):(String,String,String)=connection.query_row(
         "SELECT capability_id,capability_key,capability_proof_hash FROM trip_attempt_profiles WHERE attempt_id=?1 AND role=?2 AND settings_revision=?3",
@@ -907,7 +961,9 @@ pub(crate) fn require_attempt_profile_launch(
         params![attempt_id],
         |row| row.get(0),
     )?;
-    let authority = current_task_profile_authority(connection, &task_id, role, revision, launch)?;
+    let authority = current_task_profile_authority_with_bundles(
+        connection, &task_id, role, revision, launch, bundles,
+    )?;
     let (current_id, current_key, current_proof) = (
         authority.capability_id,
         authority.capability_key,
@@ -992,7 +1048,7 @@ pub fn activate_task_profile(
     }
     let (mut authority, config) =
         task_profile_descriptor(&connection, task_id, &role.to_string(), settings_revision)?;
-    let launch = crate::providers::prepare_role_launch(
+    let launch = crate::providers::prepare_role_launch_with_bundles(
         config.provider,
         role,
         &config.model,
@@ -1006,8 +1062,14 @@ pub fn activate_task_profile(
         None,
         &runtime.hooks,
         &runtime.executable,
+        &runtime.compatibility_bundles,
     )?;
-    let (capability, key, proof) = capability_binding(&connection, &launch.config, &authority)?;
+    let (capability, key, proof) = capability_binding(
+        &connection,
+        &launch.config,
+        &authority,
+        &runtime.compatibility_bundles,
+    )?;
     authority.capability_id = capability;
     authority.capability_key = key;
     authority.capability_proof_hash = proof;
@@ -1139,19 +1201,109 @@ fn verify_ready_workspace_policy(connection: &Connection, attempt_id: &str) -> R
         return Ok(());
     }
     let root = PathBuf::from(path).canonicalize()?;
-    let policy: serde_json::Value = serde_json::from_str(&policy_json)?;
-    if policy.get("workflow_id").and_then(|value| value.as_str()) != Some(WORKFLOW_ID)
-        || policy
-            .get("upstream_source_hash")
-            .and_then(|value| value.as_str())
-            != Some(source_hash().as_str())
-        || policy.get("overlay_hash").and_then(|value| value.as_str())
-            != Some(overlay_hash().as_str())
-    {
-        bail!("ready worktree policy identity does not match the pinned TRIP workflow")
-    }
+    let policy = validate_materialized_policy(&policy_json)?;
     verified_policy_paths(&root, &policy)?;
     Ok(())
+}
+
+pub(crate) fn validate_materialized_policy(policy_json: &str) -> Result<serde_json::Value> {
+    let policy: serde_json::Value = serde_json::from_str(policy_json)?;
+    if policy
+        .get("workflow_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(WORKFLOW_ID)
+        || policy
+            .get("upstream_source_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(source_hash().as_str())
+        || policy
+            .get("overlay_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(overlay_hash().as_str())
+    {
+        bail!("materialized worktree policy identity does not match the pinned TRIP workflow")
+    }
+    let files = policy
+        .get("files")
+        .and_then(serde_json::Value::as_object)
+        .filter(|files| !files.is_empty())
+        .ok_or_else(|| anyhow!("materialized worktree policy requires a nonempty file map"))?;
+    if files
+        .values()
+        .any(|hash| hash.as_str().is_none_or(|hash| !valid_sha256(hash)))
+    {
+        bail!("materialized worktree policy contains an invalid file identity")
+    }
+    match policy.get("kind").and_then(serde_json::Value::as_str) {
+        Some("activated_project") => {
+            let task_profiles = policy
+                .get("task_profiles")
+                .and_then(serde_json::Value::as_array)
+                .filter(|profiles| profiles.len() == APP_ROLES.len())
+                .ok_or_else(|| {
+                    anyhow!("activated-project worktree policy requires six task profiles")
+                })?;
+            let mut roles = BTreeSet::new();
+            for profile in task_profiles {
+                let profile = profile
+                    .as_object()
+                    .ok_or_else(|| anyhow!("activated-project task profiles must be objects"))?;
+                let role = profile
+                    .get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|role| APP_ROLES.contains(role))
+                    .ok_or_else(|| anyhow!("activated-project task profile role is invalid"))?;
+                if !roles.insert(role) {
+                    bail!("activated-project task profile roles must be unique")
+                }
+                if profile
+                    .get("settings_revision")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_none_or(|revision| revision < 1)
+                    || !profile
+                        .get("profile")
+                        .is_some_and(serde_json::Value::is_object)
+                    || [
+                        "source",
+                        "profile_hash",
+                        "project_config_revision_id",
+                        "project_configuration_hash",
+                        "adapter",
+                        "adapter_hash",
+                        "capability_id",
+                        "capability_key",
+                        "capability_proof_hash",
+                    ]
+                    .iter()
+                    .any(|field| {
+                        profile
+                            .get(*field)
+                            .and_then(serde_json::Value::as_str)
+                            .is_none_or(str::is_empty)
+                    })
+                {
+                    bail!("activated-project task profile binding is incomplete")
+                }
+            }
+            if roles.len() != APP_ROLES.len()
+                || policy
+                    .get("manifest_hash")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|hash| !valid_sha256(hash))
+                || policy.get("base_project_configuration_distinct")
+                    != Some(&serde_json::Value::Bool(true))
+            {
+                bail!("activated-project worktree policy is incomplete")
+            }
+        }
+        Some("setup_fixture") => {
+            if policy.get("target_files_copied") != Some(&serde_json::Value::Bool(false)) {
+                bail!("setup-fixture worktree policy is incomplete")
+            }
+        }
+        _ => bail!("materialized worktree policy kind is unsupported"),
+    }
+    Ok(policy)
 }
 
 pub fn inspect_registered_project(store: &Store, project_id: &str) -> Result<serde_json::Value> {
@@ -1274,11 +1426,12 @@ pub fn execute_human(
 ) -> Result<OperationResult> {
     paths.create()?;
     let executable = std::env::current_exe()?;
-    let runtime = CapabilityRuntime {
-        hooks: crate::providers::install_hook_assets(paths, &executable)?,
-        role_socket: paths.role_socket.clone(),
+    let runtime = CapabilityRuntime::from_store(
+        store,
+        crate::providers::install_hook_assets(paths, &executable)?,
+        paths.role_socket.clone(),
         executable,
-    };
+    );
     execute_human_with_runtime(store, paths, &runtime, operation_id, action)
 }
 
@@ -2688,7 +2841,7 @@ fn current_runtime_probe_plan(
         project_runtime_profile(connection, project_id, role)?
     };
     let prepare = |cwd: &Path| {
-        crate::providers::prepare_role_launch(
+        crate::providers::prepare_role_launch_with_bundles(
             plan.config.provider,
             role,
             &plan.config.model,
@@ -2702,12 +2855,13 @@ fn current_runtime_probe_plan(
             None,
             &runtime.hooks,
             &runtime.executable,
+            &runtime.compatibility_bundles,
         )
     };
     let target = prepare(Path::new(&target_cwd))?;
     let fixture = prepare(Path::new(fixture_root))?;
-    crate::providers::require_current_capability_policy(&target.config)?;
-    crate::providers::require_current_capability_policy(&fixture.config)?;
+    runtime.require_current_policy(&target.config)?;
+    runtime.require_current_policy(&fixture.config)?;
     let target_key = crate::providers::capability_key(&target.config)?;
     let fixture_key = crate::providers::capability_key(&fixture.config)?;
     if target_key != fixture_key {
@@ -2752,6 +2906,7 @@ fn current_runtime_probe_plan(
             fixture_repository_identity: &fixture_identity,
             fixture_root_hash: &sha256(fixture_root.as_bytes()),
         },
+        &runtime.compatibility_bundles,
     )?
     .map(|binding| binding.0);
     Ok(plan)
@@ -2994,7 +3149,7 @@ fn authorize_runtime_admission(
             refresh_runtime_admission_state(&connection, admission_id, &now)?;
             return Err(anyhow!(reason));
         }
-        let ordinary_launch = crate::providers::prepare_role_launch(
+        let ordinary_launch = crate::providers::prepare_role_launch_with_bundles(
             config.provider,
             role,
             &config.model,
@@ -3008,8 +3163,9 @@ fn authorize_runtime_admission(
             None,
             &runtime.hooks,
             &runtime.executable,
+            &runtime.compatibility_bundles,
         )?;
-        crate::providers::require_current_capability_policy(&ordinary_launch.config)?;
+        runtime.require_current_policy(&ordinary_launch.config)?;
         let key = crate::providers::capability_key(&ordinary_launch.config)?;
         let expected: String = store.lock()?.query_row(
             "SELECT capability_key FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2",
@@ -3021,23 +3177,25 @@ fn authorize_runtime_admission(
         }
         let diagnostic_key =
             if let Some(policy) = runtime_probe_launch_policy(store, &attempt, role, None)? {
-                let diagnostic_launch = crate::providers::prepare_runtime_probe_role_launch(
-                    config.provider,
-                    role,
-                    &config.model,
-                    &config.effort,
-                    &workspace,
-                    "ordinary runtime capability preparation",
-                    &runtime.role_socket,
-                    "normalized-runtime-token",
-                    "normalized-runtime-generation",
-                    "normalized-runtime-session",
-                    None,
-                    &runtime.hooks,
-                    &runtime.executable,
-                    &policy,
-                )?;
-                crate::providers::require_current_capability_policy(&diagnostic_launch.config)?;
+                let diagnostic_launch =
+                    crate::providers::prepare_runtime_probe_role_launch_with_bundles(
+                        config.provider,
+                        role,
+                        &config.model,
+                        &config.effort,
+                        &workspace,
+                        "ordinary runtime capability preparation",
+                        &runtime.role_socket,
+                        "normalized-runtime-token",
+                        "normalized-runtime-generation",
+                        "normalized-runtime-session",
+                        None,
+                        &runtime.hooks,
+                        &runtime.executable,
+                        &policy,
+                        &runtime.compatibility_bundles,
+                    )?;
+                runtime.require_current_policy(&diagnostic_launch.config)?;
                 Some(crate::providers::capability_key(&diagnostic_launch.config)?)
             } else {
                 None
@@ -4669,12 +4827,31 @@ fn migrate_attempt(
         )?;
         bail!("legacy migration policy materialization requires recovery: {error:#}")
     }
-    let connection = store.lock()?;
-    connection.execute("UPDATE attempts SET status=CASE WHEN status='needs_recovery' THEN 'needs_input' ELSE status END,updated_at=?1 WHERE id=?2",params![Utc::now().to_rfc3339(),attempt_id])?;
-    connection.execute(
-        "UPDATE tasks SET attention='needs_input',updated_at=?1 WHERE id=?2",
-        params![Utc::now().to_rfc3339(), task_id],
+    let published_at = Utc::now().to_rfc3339();
+    let mut connection = store.lock()?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let policy_json: String = tx.query_row(
+        "SELECT policy_json FROM workspaces WHERE attempt_id=?1 AND state='reserved'",
+        params![attempt_id],
+        |row| row.get(0),
     )?;
+    validate_materialized_policy(&policy_json)?;
+    let workspace_changed = tx.execute(
+        "UPDATE workspaces SET state='ready',updated_at=?1 WHERE attempt_id=?2 AND state='reserved'",
+        params![published_at, attempt_id],
+    )?;
+    let attempt_changed = tx.execute(
+        "UPDATE attempts SET status='needs_input',updated_at=?1 WHERE id=?2 AND status IN ('running','held','needs_input','needs_recovery')",
+        params![published_at, attempt_id],
+    )?;
+    let task_changed = tx.execute(
+        "UPDATE tasks SET attention='needs_input',updated_at=?1 WHERE id=?2 AND lifecycle NOT IN ('done','cancelled')",
+        params![published_at, task_id],
+    )?;
+    if workspace_changed != 1 || attempt_changed != 1 || task_changed != 1 {
+        bail!("legacy migration tuple changed before atomic policy publication")
+    }
+    tx.commit()?;
     Ok(operation_result(
         operation_id,
         "attempt",
@@ -4696,6 +4873,7 @@ fn authorize_check(
     decision: &str,
     lifetime: &str,
 ) -> Result<OperationResult> {
+    store.require_execution_unheld("selected-check authorization")?;
     if !matches!(decision, "approved" | "denied") {
         bail!("check permission decision must be approved or denied")
     }
@@ -7526,6 +7704,33 @@ pub fn runtime_probe_resume_prompt(
     Ok(format!("PHASE: RETAINED NATIVE RESUME REPORT. Your first and only action is the one authenticated report; execute no command or probe before it. This is the service-owned recall turn for the exact retained ordinary runtime probe. Report based solely on the nonce, instructions, and actual outcomes you remember from this native conversation. Before reporting, do not call role context, read any file, inspect external or application history/context, or repeat any command or probe. This runtime retained first-action/no-context rule overrides every later or subsequently appended generic instruction, including any instruction to use `role context`; do not call `role context` even if a later instruction directs you to do so. The runtime typed-report rule likewise overrides every later or subsequently appended generic JSON reporting instruction. If exact recall is unavailable, use --status=missing_context with only a new --operation-id, then stop; never guess or reconstruct the nonce. If recall is available, use --session-mode=retained and --status=passed only when every required observation actually passed, otherwise use --status=failed with a concrete --failure-category and the remembered actual outcomes. {RUNTIME_TYPED_REPORT_SCHEMA} {RUNTIME_OUTCOME_REPORT_SCHEMA} Submit exactly one report; whether it is accepted or rejected, stop without changing its operation ID or contents and without submitting a successor report. The report remains non-authoritative and requires separate authenticated human publication. END PHASE: RETAINED NATIVE RESUME REPORT permits the report as the first and only action, then stop."))
 }
 
+fn require_current_manager_authority(connection: &Connection, context: &RoleContext) -> Result<()> {
+    let current: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM role_credentials rc
+           JOIN role_generations rg ON rg.id=rc.role_generation_id
+           JOIN sessions s ON s.role_generation_id=rg.id
+           JOIN attempts a ON a.id=rg.attempt_id
+           WHERE rc.id=?1 AND rc.role_generation_id=?2 AND rc.revoked_at IS NULL
+             AND rg.id=?2 AND rg.attempt_id=?5 AND rg.role='manager' AND rg.status='running'
+             AND s.id=?3 AND s.transcript_epoch=?4 AND s.status='running'
+             AND EXISTS(SELECT 1 FROM role_settings rs
+               WHERE rs.task_id=a.task_id AND rs.role='manager'
+                 AND rs.effective_generation_id=rg.id))",
+        params![
+            context.credential_id,
+            context.role_generation_id,
+            context.session_id,
+            context.transcript_epoch,
+            context.attempt_id,
+        ],
+        |row| row.get(0),
+    )?;
+    if !current {
+        bail!("manager authority was revoked, replaced, or stopped before persistence")
+    }
+    Ok(())
+}
+
 pub fn record_explorer_decision(
     store: &Store,
     context: &RoleContext,
@@ -7563,6 +7768,7 @@ pub fn record_explorer_decision(
     let id = uuid::Uuid::new_v4().to_string();
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_manager_authority(&tx, context)?;
     require_attempt_ready(&tx, &context.attempt_id, None)?;
     let (phase, candidate): (String, Option<String>) = tx.query_row(
         "SELECT phase,candidate_hash FROM attempts WHERE id=?1",
@@ -7906,6 +8112,7 @@ pub fn configure_lanes(
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_manager_authority(&tx, context)?;
     require_attempt_ready(&tx, &context.attempt_id, None)?;
     let reviewed = approved_lane_ownership(&tx, &context.attempt_id)?.ok_or_else(|| {
         anyhow!("approved structured plan does not declare parallel ownership lanes")
@@ -8126,6 +8333,7 @@ pub fn request_integration(
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_manager_authority(&tx, context)?;
     require_attempt_ready(&tx, &context.attempt_id, None)?;
     let phase: String = tx.query_row(
         "SELECT phase FROM attempts WHERE id=?1",
@@ -8355,7 +8563,11 @@ pub fn yield_lane(
     if !input.is_object() || serde_json::to_vec(input)?.len() > 128 * 1024 {
         bail!("lane yield requires a bounded structured receipt")
     }
-    for field in ["source_hashes", "changed_paths", "output_hash"] {
+    for field in [
+        "source_hashes",
+        "changed_paths",
+        "agent_claimed_output_hash",
+    ] {
         if input.get(field).is_none() {
             bail!("lane yield receipt is missing {field}")
         }
@@ -8368,13 +8580,13 @@ pub fn yield_lane(
         .get("source_hashes")
         .filter(|value| value.is_object())
         .ok_or_else(|| anyhow!("source_hashes must be an object"))?;
-    let output_hash = input
-        .get("output_hash")
+    let agent_claimed_output_hash = input
+        .get("agent_claimed_output_hash")
         .and_then(|value| value.as_str())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("output_hash is required"))?;
-    if !valid_sha256(output_hash) {
-        bail!("output_hash is not SHA-256")
+        .ok_or_else(|| anyhow!("agent_claimed_output_hash is required"))?;
+    if !valid_sha256(agent_claimed_output_hash) {
+        bail!("agent_claimed_output_hash is not SHA-256")
     }
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
@@ -8412,7 +8624,7 @@ pub fn yield_lane(
     )?;
     tx.commit()?;
     Ok(
-        serde_json::json!({"lane_id":context.lane_id,"state":"yielded","output_hash":output_hash,"manager_integration_required":true}),
+        serde_json::json!({"lane_id":context.lane_id,"state":"yielded","agent_claimed_output_hash":agent_claimed_output_hash,"manager_integration_required":true}),
     )
 }
 
@@ -8432,6 +8644,7 @@ pub fn select_checks(
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_manager_authority(&tx, context)?;
     require_attempt_ready(&tx, &context.attempt_id, None)?;
     let (phase, revision): (String, i64) = tx.query_row(
         "SELECT phase,selected_checks_revision+1 FROM attempts WHERE id=?1",
@@ -8440,6 +8653,16 @@ pub fn select_checks(
     )?;
     if phase != "planning" {
         bail!("plan checks are immutable after planning")
+    }
+    let bound_checks: Option<String> = tx.query_row(
+        "SELECT b.required_check_ids_json FROM attempts a JOIN task_recipe_bindings b ON b.task_id=a.task_id WHERE a.id=?1",
+        params![context.attempt_id], |row| row.get(0),
+    ).optional()?;
+    if let Some(bound_checks) = bound_checks {
+        let required: Vec<String> = serde_json::from_str(&bound_checks)?;
+        if required.iter().any(|check_id| !unique.contains(check_id)) {
+            bail!("manager check selection must include every recipe-required check")
+        }
     }
     for check_id in &check_ids {
         let eligible:bool=tx.query_row(
@@ -8490,9 +8713,13 @@ pub fn submit_conformance(
     if serde_json::to_vec(input)?.len() > 256 * 1024 {
         bail!("conformance evidence is too large")
     }
+    for field in ["ownership", "documentation", "test_policy", "readability"] {
+        validate_conformance_section(&input[field], field)?;
+    }
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_manager_authority(&tx, context)?;
     require_attempt_ready(&tx, &context.attempt_id, None)?;
     let (candidate, configured_hash, criteria_json): (String, String, String) = tx.query_row(
         "SELECT a.candidate_hash,r.configuration_hash,t.acceptance_criteria_json FROM attempts a
@@ -8515,12 +8742,24 @@ pub fn submit_conformance(
     let covered = acceptance
         .iter()
         .map(|row| {
-            if row
+            let evidence = row
                 .get("evidence")
                 .and_then(|value| value.as_array())
-                .is_none_or(Vec::is_empty)
-            {
-                bail!("every acceptance row requires evidence")
+                .filter(|evidence| !evidence.is_empty() && evidence.len() <= 64)
+                .ok_or_else(|| anyhow!("every acceptance row requires 1 to 64 evidence items"))?;
+            for item in evidence {
+                match item {
+                    serde_json::Value::String(text)
+                        if !text.trim().is_empty() && text.chars().count() <= 4096 => {}
+                    serde_json::Value::Object(_) => {
+                        if serde_json::to_vec(item)?.len() > 16 * 1024
+                            || !meaningful_conformance_value(item)
+                        {
+                            bail!("acceptance evidence objects must be meaningful and at most 16384 bytes")
+                        }
+                    }
+                    _ => bail!("acceptance evidence items must be bounded nonblank strings or meaningful objects"),
+                }
             }
             row.get("criterion")
                 .and_then(|value| value.as_str())
@@ -8558,6 +8797,40 @@ pub fn submit_conformance(
     Ok(
         serde_json::json!({"receipt_id":id,"revision":revision,"candidate_hash":candidate,"human_acceptance":false}),
     )
+}
+
+fn validate_conformance_section(value: &serde_json::Value, field: &str) -> Result<()> {
+    let object = value
+        .as_object()
+        .filter(|object| !object.is_empty() && object.len() <= 32)
+        .ok_or_else(|| anyhow!("conformance {field} must be an object with 1 to 32 properties"))?;
+    if serde_json::to_vec(value)?.len() > 16 * 1024 {
+        bail!("conformance {field} exceeds 16384 bytes")
+    }
+    if object
+        .iter()
+        .any(|(key, value)| key.trim().is_empty() || !meaningful_conformance_value(value))
+    {
+        bail!("conformance {field} requires nonblank keys and meaningful nonempty values")
+    }
+    Ok(())
+}
+
+fn meaningful_conformance_value(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(text) => !text.trim().is_empty(),
+        serde_json::Value::Array(values) => {
+            !values.is_empty() && values.iter().all(meaningful_conformance_value)
+        }
+        serde_json::Value::Object(values) => {
+            !values.is_empty()
+                && values.iter().all(|(key, value)| {
+                    !key.trim().is_empty() && meaningful_conformance_value(value)
+                })
+        }
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+    }
 }
 
 pub fn state_rows(
@@ -10054,7 +10327,7 @@ fn effective_receipt_id(
         };
         let launch: crate::domain::LaunchConfig = serde_json::from_str(&launch_json)?;
         let denials = setup_read_denials(&frozen)?;
-        let prepared = crate::providers::prepare_role_launch_with_read_denials(
+        let prepared = crate::providers::prepare_role_launch_with_read_denials_and_bundles(
             launch.provider,
             launch.role,
             &launch.model,
@@ -10069,8 +10342,9 @@ fn effective_receipt_id(
             &runtime.hooks,
             &runtime.executable,
             &denials,
+            &runtime.compatibility_bundles,
         )?;
-        crate::providers::require_current_capability_policy(&prepared.config)?;
+        runtime.require_current_policy(&prepared.config)?;
         let current = crate::providers::capability_identity(&prepared.config)?;
         if crate::providers::capability_identity_key(&current)? == stored_key
             && serde_json::to_value(current)? == serde_json::to_value(frozen)?
@@ -10283,11 +10557,16 @@ fn materialize_setup_package(store: &Store, attempt_id: &str, workspace: &Path) 
         sha256(OVERLAY.as_bytes()),
     );
     let now = Utc::now().to_rfc3339();
+    let policy = serde_json::json!({"kind":"setup_fixture","workflow_id":WORKFLOW_ID,"upstream_source_hash":source_hash(),"overlay_hash":overlay_hash(),"files":policy_files,"target_files_copied":false});
+    validate_materialized_policy(&policy.to_string())?;
     let connection = store.lock()?;
-    connection.execute(
+    let changed = connection.execute(
         "UPDATE workspaces SET policy_json=?1,state='ready',updated_at=?2 WHERE attempt_id=?3 AND state='reserved'",
-        params![serde_json::json!({"kind":"setup_fixture","workflow_id":WORKFLOW_ID,"upstream_source_hash":source_hash(),"overlay_hash":overlay_hash(),"files":policy_files,"target_files_copied":false}).to_string(),now,attempt_id],
+        params![policy.to_string(),now,attempt_id],
     )?;
+    if changed != 1 {
+        bail!("setup workspace reservation changed before package publication")
+    }
     Ok(())
 }
 
@@ -10454,7 +10733,14 @@ pub fn materialize_project_policy(
         bail!("attempt policy materialization requires six frozen effective task profiles")
     }
     let policy = serde_json::json!({"kind":"activated_project","workflow_id":WORKFLOW_ID,"upstream_source_hash":source_hash(),"overlay_hash":overlay_hash(),"manifest_hash":manifest_hash,"files":copied,"allowed_prefixes":allowed_prefixes,"base_project_configuration_distinct":true,"task_profiles":task_profiles,"uncommitted_guidance":"approved overlay; not asserted present in base Git revision"});
-    connection.execute("UPDATE workspaces SET policy_json=?1,state='ready',updated_at=?2 WHERE attempt_id=?3 AND state='reserved'",params![policy.to_string(),Utc::now().to_rfc3339(),attempt_id])?;
+    validate_materialized_policy(&policy.to_string())?;
+    let changed = connection.execute(
+        "UPDATE workspaces SET policy_json=?1,updated_at=?2 WHERE attempt_id=?3 AND state IN ('reserved','unknown','recovery_required')",
+        params![policy.to_string(),Utc::now().to_rfc3339(),attempt_id],
+    )?;
+    if changed != 1 {
+        bail!("workspace reservation changed before policy persistence")
+    }
     Ok(policy)
 }
 

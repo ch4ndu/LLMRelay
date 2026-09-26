@@ -4,6 +4,22 @@
 
 ## Required TRIP workflow
 
+The Attention inbox groups permissions, decisions, recovery, compatibility,
+blocked work and completed work awaiting acceptance. These entries are derived
+from service-owned state, not terminal output. Duplicate explanations are folded
+while distinct permission requests and recovery records remain separate. Setup
+and instance restore holds remain visible alongside task work. Navigation does
+not approve or resume anything; use the existing action in the selected panel.
+
+Task details and the attention inbox show backend-owned decision explanations:
+the reason work cannot progress, the responsible owner, prerequisite evidence,
+and the current control policy. Missing, stale and unobserved evidence remain
+distinct. An explanation is a snapshot; every action rechecks its exact binding
+and current authority before changing work. The dashboard's restart preview is
+an explicit read, separate from normal state refresh. See
+[restoration and recovery](OPERATIONS.md#stop-and-recover) for batch limits,
+capacity delays and exact recovery-record selection.
+
 LLMRelay hosts the selected standalone TRIP Explorer v0.9.0 package. Its versioned skills, references, and optional helper scripts are copied verbatim from the selected source snapshot. Content hashes pin that snapshot, including its local changes. A separately versioned LLMRelay overlay maps role launch, context records, build execution, and integration writes onto the local engine. It does not remove the workflow's independent reviews, human approvals, test policy, ownership boundaries, or manager completion gate.
 
 Registering a Git repository creates a project record. Running ordinary tasks additionally requires a compatible, initialized project. The app's host manager remains the engineering owner; the five delegated roles are Explorer, plan reviewer, implementer/fixer, code reviewer, and fresh final verifier. Explorer runs only when the workflow's recorded conditions require it. Existing `final_reviewer` identifiers remain a storage compatibility detail.
@@ -123,3 +139,30 @@ Imported `in_progress` or `implemented` tasks without managed attempt history
 retain their original metadata but enter backlog with input required. **Start a
 fresh managed attempt** normalizes eligible older imports before normal Ready
 admission. It does not fabricate a completed plan, workspace, review or acceptance.
+
+A changed provider compatibility contract invalidates the affected evidence.
+Matching replacement proof can authorize the existing fresh-session recovery route;
+it does not make the old frozen session eligible for exact resume. Follow the
+current compatibility explanation and existing review/approval gates. A reviewed
+contract candidate alone is not a qualified role profile.
+
+## Recipes and reusable project profiles
+
+Select a project, then open **Recipes**. Save a profile set containing the six role
+configurations, then a recipe with task content, acceptance criteria, priority, an
+exact profile revision and required checks. Saved configurations are not capability
+proofs; ordinary task-specific activation and Ready admission still apply. Templates
+are literal editable text, with no executable substitution language.
+
+**Create draft** creates an ordinary backlog task and opens its detail view. Inspect
+and edit it before making it Ready. Its provenance retains the exact recipe/profile
+revision. Required recipe checks constrain the Manager's later selection; they do
+not impersonate a Manager-selected check set. Revisions of recipes and profile sets
+do not silently change existing tasks or schedules.
+
+If project reactivation supersedes a recipe's configuration pin, re-save its profile
+set and recipe using the active configuration and explicitly select current checks.
+Copy any needed draft edits, archive the stale draft, and create a new draft. An
+archived recipe can be replaced by a new recipe. Never-started backlog drafts may be
+archived from task detail and listed in History. Restore
+returns them to backlog; it does not repair stale pins or make them Ready.

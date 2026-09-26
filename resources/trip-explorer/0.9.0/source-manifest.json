@@ -1,6 +1,6 @@
 {
   "version": "0.9.0",
-  "source_repository": "/Users/murali/Private/GitHub/trip-explorer-workflow",
+  "source_repository": "trip-explorer-workflow",
   "source_head": "a7c53c4e5cfbdab4c66eafc84f79c0c73dc80ef7",
   "files": {
     "bin/cmux_observer.py": "2b6f3eeb68a84a0f711c38c723cf81a51221d98b491564d6ca82d50e742eaf4b",

@@ -5,7 +5,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { command, operationId } from "../api";
+import { command, getRestartPreview, operation, operationId } from "../api";
 import {
   cmuxNewestSurface,
   cmuxOutcomeWithDurableSurface,
@@ -16,10 +16,14 @@ import {
 } from "../cmuxRouting";
 import type {
   AppState,
+  AttentionItem,
+  AttentionTarget,
   CmuxKeyboardControlAction,
   CmuxKeyboardControlOutcome,
   CmuxSessionSurface,
   CmuxViewOutcome,
+  RestartPreview,
+  RestartResumeResult,
   Task,
 } from "../types";
 import { ActivityTimeline } from "./ActivityTimeline";
@@ -39,6 +43,7 @@ export function Workspace(
     onSelect,
     onChanged,
     onOpenSetup = () => {},
+    onNavigateAttention = () => undefined,
     onViewCmuxSession = async () => {
       throw new Error("persistent cmux presentation is not available");
     },
@@ -53,6 +58,10 @@ export function Workspace(
     onSelect: (task: Task) => void;
     onChanged: () => void;
     onOpenSetup?: (projectId: string) => void;
+    onNavigateAttention?: (
+      item: AttentionItem,
+      target: AttentionTarget,
+    ) => string | undefined;
     onViewCmuxSession?: (sessionId: string) => Promise<CmuxViewOutcome>;
     onSetCmuxKeyboardControl?: (
       sessionId: string,
@@ -69,6 +78,13 @@ export function Workspace(
   const [sideWidth, setSideWidth] = useState(savedSideWidth);
   const [restoreBusy, setRestoreBusy] = useState(false);
   const [autoResumeError, setAutoResumeError] = useState("");
+  const [preview, setPreview] = useState<RestartPreview>();
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewError, setPreviewError] = useState("");
+  const [resumeResult, setResumeResult] = useState<RestartResumeResult>();
+  const [resumeBusy, setResumeBusy] = useState(false);
+  const [resumeError, setResumeError] = useState("");
+  const resumeOperation = useRef<string | undefined>(undefined);
   const [routes, setRoutes] = useState<Record<string, CmuxViewOutcome>>({});
   const [discardingRoutes, setDiscardingRoutes] = useState<
     Record<string, boolean>
@@ -315,6 +331,47 @@ export function Workspace(
       setRestoreBusy(false);
     }
   };
+  const requestPreview = async () => {
+    setPreviewBusy(true);
+    setPreviewError("");
+    setPreview(undefined);
+    try {
+      setPreview(await getRestartPreview());
+    } catch (cause) {
+      setPreviewError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setPreviewBusy(false);
+    }
+  };
+  const resumeEligible = async () => {
+    const id = resumeOperation.current || operationId();
+    resumeOperation.current = id;
+    setResumeBusy(true);
+    setResumeError("");
+    try {
+      const result = await operation<RestartResumeResult>({
+        kind: "restart_resume",
+        operation_id: id,
+      });
+      if (
+        !Array.isArray(result.queued_ids) ||
+        !Array.isArray(result.omitted_ids) ||
+        !Array.isArray(result.outcomes) ||
+        typeof result.omitted_count !== "number"
+      ) {
+        throw new Error(
+          "Restart resume returned an unsupported result; refresh before retrying the same operation ID.",
+        );
+      }
+      setResumeResult(result);
+      resumeOperation.current = undefined;
+      onChanged();
+    } catch (cause) {
+      setResumeError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setResumeBusy(false);
+    }
+  };
 
   return (
     <div
@@ -360,6 +417,22 @@ export function Workspace(
               action. Automatic restoration still rechecks the same frozen
               identity and current authority before any resume.
             </small>
+            <button
+              disabled={previewBusy}
+              onClick={() => void requestPreview()}
+            >
+              {previewBusy ? "Checking restart preview…" : "Preview restart"}
+            </button>
+            <button
+              disabled={resumeBusy || state.restart_candidates.length === 0}
+              onClick={() => void resumeEligible()}
+            >
+              {resumeBusy ? "Submitting resume…" : "Resume eligible"}
+            </button>
+            {resumeError && <p className="error" role="alert">{resumeError}</p>}
+            {previewError && (
+              <p className="error" role="alert">{previewError}</p>
+            )}
             {autoResumeError && <p className="error">{autoResumeError}</p>}
           </fieldset>
         </div>
@@ -480,6 +553,67 @@ export function Workspace(
             ))}
           </section>
         )}
+        {preview && (
+          <section
+            className="panel restart-preview"
+            aria-label="Restart preview"
+          >
+            <h3>Restart preview</h3>
+            <p>{preview.snapshot.notice}</p>
+            <small>
+              Observed {preview.snapshot.captured_at} · process inventory{" "}
+              {preview.snapshot.process_inventory} · boot identity{" "}
+              {preview.snapshot.boot_identity}. This preview grants no resume
+              authority.
+            </small>
+            {preview.sessions.map((session, index) => (
+              <article
+                className="restart-candidate"
+                key={`${session.decision.subject.session_id || index}`}
+              >
+                <strong>
+                  {session.decision.subject.session_id || "Unknown session"} ·
+                  {" "}
+                  {session.classification.replaceAll("_", " ")}
+                </strong>
+                <small>
+                  {session.decision.primary_blocker?.message ||
+                    session.decision.reason_code}
+                </small>
+                <small>
+                  {session.can_resume_now
+                    ? "Admission may be available after current revalidation"
+                    : session.could_resume_after_confirmed_shutdown
+                    ? "Needs verified quiescence before eligibility"
+                    : "No current resume route"}
+                </small>
+              </article>
+            ))}
+          </section>
+        )}
+        {resumeResult && (
+          <section
+            className="panel restart-resume-result"
+            aria-label="Restart resume result"
+          >
+            <h3>Restart resume · {resumeResult.state}</h3>
+            <p>
+              Queued {resumeResult.queued_ids.length}:{" "}
+              {resumeResult.queued_ids.join(", ") || "none"}. Omitted{" "}
+              {resumeResult.omitted_count}:{" "}
+              {resumeResult.omitted_ids.join(", ") || "none"}.
+            </p>
+            {resumeResult.outcomes.map((outcome, index) => (
+              <small key={`${outcome.session_id}:${index}`}>
+                {outcome.session_id}: {outcome.state}
+                {outcome.reason ? ` · ${outcome.reason}` : ""}
+                {outcome.next_due_at
+                  ? ` · retry after ${outcome.next_due_at}`
+                  : ""}
+              </small>
+            ))}
+          </section>
+        )}
         <ActivityTimeline events={state.history} />
       </div>
       <div
@@ -509,9 +643,8 @@ export function Workspace(
         />
         <AttentionInbox
           state={state}
-          onSelect={onSelect}
+          onNavigate={onNavigateAttention}
           onChanged={onChanged}
-          onOpenSetup={onOpenSetup}
         />
         <ResourceStatus resources={state.resources} />
       </aside>

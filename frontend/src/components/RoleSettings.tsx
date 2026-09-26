@@ -9,6 +9,7 @@ import {
 import { ModelSelector } from "./ModelSelector";
 import {
   type CapabilityEvidence,
+  type CompatibilityExplanation,
   type ContinuationAction,
   type ProductionRoleRestriction,
   type Project,
@@ -23,6 +24,45 @@ import {
   type Task,
   type TripLaneState,
 } from "../types";
+
+const compatibilityActions: Record<CompatibilityExplanation["action"], string> = {
+  install_supported_provider_version: "Install a reviewed provider version",
+  update_llmrelay_release: "Update LLMRelay for a reviewed contract",
+  requalify_exact_profile: "Validate this exact profile",
+  inspect_local_provider_configuration: "Inspect local provider configuration",
+  contact_operator: "Contact the operator",
+};
+
+export function CompatibilityDetails({
+  compatibility,
+}: {
+  compatibility?: CompatibilityExplanation | null;
+}) {
+  if (!compatibility) return null;
+  const candidate = compatibility.status === "matched";
+  return (
+    <div className="compatibility-details">
+      <p>
+        <strong>{candidate ? "Reviewed contract candidate" : "Compatibility needs attention"}</strong>
+        {" · "}{compatibility.message}
+      </p>
+      <p className="hint">Next step: {compatibilityActions[compatibility.action]}</p>
+      <details>
+        <summary>Contract details</summary>
+        <small>
+          Pack {compatibility.pack_id || "unavailable"} revision {compatibility.pack_revision || "unavailable"}
+          {compatibility.observed_version ? ` · observed ${compatibility.observed_version}` : ""}
+          {" · "}contract {compatibility.contract_id || "unavailable"} revision {compatibility.contract_revision || "unavailable"}
+          {" · "}predicate {compatibility.predicate_id || "unavailable"}
+          {" · "}hash {compatibility.short_hash || "unavailable"}
+        </small>
+        {compatibility.missing_evidence.length > 0 && (
+          <small>Missing evidence: {compatibility.missing_evidence.join(" · ")}</small>
+        )}
+      </details>
+    </div>
+  );
+}
 
 export function RoleSettings(
   {
@@ -398,6 +438,10 @@ export function RoleSettings(
               capability.config_hash === preparation.capability_key
             )
             : undefined;
+          const compatibility = preparation?.compatibility;
+          const contractUnavailable = compatibility &&
+            compatibility.status !== "matched" &&
+            compatibility.status !== "evidence_stale";
           const activated = projectRoles[role];
           const matchesActivated = !!value && !!activated &&
             value.provider === activated.provider &&
@@ -588,6 +632,7 @@ export function RoleSettings(
                     {!task.archived &&
                       !["done", "cancelled"].includes(task.lifecycle) &&
                       role !== "final_verifier" && exactResume &&
+                      !contractUnavailable &&
                       exactResume.operation !== "runtime_probe_resume" && (
                       <button onClick={() => resume(session, exactResume)}>
                         Resume exact native session
@@ -616,6 +661,7 @@ export function RoleSettings(
                   {productionRestriction.reason}
                 </small>
               )}
+              <CompatibilityDetails compatibility={compatibility} />
               {requested && preparation?.task_profile_source && (
                 <small>
                   Authority source: {preparation.task_profile_source ===
@@ -626,6 +672,7 @@ export function RoleSettings(
                 </small>
               )}
               {!terminal && requested && preparation?.status === "unverified" &&
+                preparation.compatibility?.status === "matched" &&
                 !currentProof && (
                 <div className="inline-form runtime-proof-control">
                   {value?.provider === "claude" && (

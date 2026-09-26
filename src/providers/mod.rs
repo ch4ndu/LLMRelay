@@ -235,6 +235,44 @@ pub fn prepare_role_launch(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn prepare_role_launch_with_bundles(
+    provider: Provider,
+    role: RoleKind,
+    model: &str,
+    effort: &str,
+    cwd: &Path,
+    prompt: &str,
+    role_socket: &Path,
+    role_token: &str,
+    role_generation_id: &str,
+    session_id: &str,
+    native_session_id: Option<&str>,
+    assets: &HookAssets,
+    executable_path: &Path,
+    bundles: &crate::provider_compatibility::BundleSet,
+) -> Result<PreparedLaunch> {
+    prepare_role_launch_with_policies(
+        provider,
+        role,
+        model,
+        effort,
+        cwd,
+        prompt,
+        role_socket,
+        role_token,
+        role_generation_id,
+        session_id,
+        native_session_id,
+        assets,
+        executable_path,
+        &[],
+        None,
+        bundles,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_role_launch_with_read_denials(
     provider: Provider,
     role: RoleKind,
@@ -267,6 +305,46 @@ pub fn prepare_role_launch_with_read_denials(
         executable_path,
         read_denials,
         None,
+        &crate::provider_compatibility::BundleSet::embedded(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn prepare_role_launch_with_read_denials_and_bundles(
+    provider: Provider,
+    role: RoleKind,
+    model: &str,
+    effort: &str,
+    cwd: &Path,
+    prompt: &str,
+    role_socket: &Path,
+    role_token: &str,
+    role_generation_id: &str,
+    session_id: &str,
+    native_session_id: Option<&str>,
+    assets: &HookAssets,
+    executable_path: &Path,
+    read_denials: &[PathBuf],
+    bundles: &crate::provider_compatibility::BundleSet,
+) -> Result<PreparedLaunch> {
+    prepare_role_launch_with_policies(
+        provider,
+        role,
+        model,
+        effort,
+        cwd,
+        prompt,
+        role_socket,
+        role_token,
+        role_generation_id,
+        session_id,
+        native_session_id,
+        assets,
+        executable_path,
+        read_denials,
+        None,
+        bundles,
     )
 }
 
@@ -303,6 +381,46 @@ pub fn prepare_runtime_probe_role_launch(
         executable_path,
         &[],
         Some(policy),
+        &crate::provider_compatibility::BundleSet::embedded(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn prepare_runtime_probe_role_launch_with_bundles(
+    provider: Provider,
+    role: RoleKind,
+    model: &str,
+    effort: &str,
+    cwd: &Path,
+    prompt: &str,
+    role_socket: &Path,
+    role_token: &str,
+    role_generation_id: &str,
+    session_id: &str,
+    native_session_id: Option<&str>,
+    assets: &HookAssets,
+    executable_path: &Path,
+    policy: &RuntimeProbeCommandPolicy,
+    bundles: &crate::provider_compatibility::BundleSet,
+) -> Result<PreparedLaunch> {
+    prepare_role_launch_with_policies(
+        provider,
+        role,
+        model,
+        effort,
+        cwd,
+        prompt,
+        role_socket,
+        role_token,
+        role_generation_id,
+        session_id,
+        native_session_id,
+        assets,
+        executable_path,
+        &[],
+        Some(policy),
+        bundles,
     )
 }
 
@@ -323,6 +441,7 @@ fn prepare_role_launch_with_policies(
     executable_path: &Path,
     read_denials: &[PathBuf],
     runtime_probe_policy: Option<&RuntimeProbeCommandPolicy>,
+    bundles: &crate::provider_compatibility::BundleSet,
 ) -> Result<PreparedLaunch> {
     if !read_denials.is_empty() {
         let role_executable = executable_path
@@ -335,7 +454,7 @@ fn prepare_role_launch_with_policies(
         }
     }
     match provider {
-        Provider::Codex => codex::prepare(
+        Provider::Codex => codex::prepare_with_bundles(
             role,
             model,
             effort,
@@ -349,8 +468,9 @@ fn prepare_role_launch_with_policies(
             assets,
             executable_path,
             read_denials,
+            bundles,
         ),
-        Provider::Claude => claude::prepare_with_runtime_probe_policy(
+        Provider::Claude => claude::prepare_with_bundles(
             role,
             model,
             effort,
@@ -365,11 +485,15 @@ fn prepare_role_launch_with_policies(
             executable_path,
             read_denials,
             runtime_probe_policy,
+            bundles,
         ),
     }
 }
 
 pub fn capability_key(config: &LaunchConfig) -> Result<String> {
+    if config.compatibility.is_none() {
+        bail!("current capability key requires a resolved provider compatibility binding")
+    }
     capability_identity_key(&capability_identity(config)?)
 }
 
@@ -406,6 +530,7 @@ pub fn capability_identity(config: &LaunchConfig) -> Result<CapabilityIdentity> 
         capability_status: (config.provider == Provider::Codex
             && config.role == RoleKind::Implementer)
             .then_some(config.capability_status),
+        compatibility: config.compatibility.as_ref().map(Into::into),
     })
 }
 
@@ -427,6 +552,45 @@ pub fn require_current_capability_identity(
     identity: &CapabilityIdentity,
     cwd: &Path,
 ) -> Result<()> {
+    require_current_capability_identity_with_bundles(
+        identity,
+        cwd,
+        &crate::provider_compatibility::BundleSet::embedded(),
+    )
+}
+
+#[doc(hidden)]
+pub fn require_current_capability_identity_with_bundles(
+    identity: &CapabilityIdentity,
+    cwd: &Path,
+    bundles: &crate::provider_compatibility::BundleSet,
+) -> Result<()> {
+    let current = bundles.resolve(
+        identity.provider,
+        &identity.executable_version,
+        identity.role,
+    )?;
+    if identity.compatibility.as_ref() != Some(&(&current).into()) {
+        return Err(
+            crate::provider_compatibility::CompatibilityError::ContractChanged {
+                explanation: crate::provider_compatibility::CompatibilityExplanation {
+                    status: crate::provider_compatibility::CompatibilityStatus::ContractChanged,
+                    observed_version: None,
+                    pack_id: Some(current.pack_id),
+                    pack_revision: Some(current.pack_revision),
+                    contract_id: Some(current.contract_id),
+                    contract_revision: Some(current.contract_revision),
+                    short_hash: Some(current.effective_hash.chars().take(12).collect()),
+                    predicate_id: Some(current.predicate_id),
+                    missing_evidence: vec!["current_contract_proof".into()],
+                    action: crate::provider_compatibility::SafeAction::RequalifyExactProfile,
+                    message: "The frozen capability has no matching current compatibility binding."
+                        .into(),
+                },
+            }
+            .into(),
+        );
+    }
     match identity.provider {
         Provider::Codex => codex::require_current_native_policy(identity, cwd),
         Provider::Claude => claude::require_current_native_policy(identity),
@@ -484,11 +648,11 @@ fn normalize_value(value: serde_json::Value, config: &LaunchConfig) -> serde_jso
 
 fn normalize_text(value: &str, config: &LaunchConfig) -> String {
     let mut normalized = value.to_owned();
-    if let Some(policy) = config
+    let policy = config
         .security_policy
         .get("runtime_probe_command_policy")
-        .and_then(|value| serde_json::from_value::<RuntimeProbeCommandPolicy>(value.clone()).ok())
-    {
+        .and_then(|value| serde_json::from_value::<RuntimeProbeCommandPolicy>(value.clone()).ok());
+    if let Some(policy) = &policy {
         let mut command_replacements = policy
             .commands
             .iter()
@@ -503,32 +667,37 @@ fn normalize_text(value: &str, config: &LaunchConfig) -> String {
         for (raw, replacement) in command_replacements {
             normalized = normalized.replace(&raw, &replacement);
         }
-        normalized = normalized.replace(
-            &config.cwd.to_string_lossy().to_string(),
-            "<attempt-worktree>",
-        );
+    }
+    let cwd = config.cwd.to_string_lossy();
+    let cwd = cwd.trim_end_matches('/');
+    let mut paths = Vec::new();
+    if !cwd.is_empty() {
+        paths.push((cwd.to_owned(), "<attempt-worktree>".to_owned()));
+    }
+    if let Some(policy) = &policy {
         for (index, path) in policy.write_denials.iter().enumerate() {
-            if path != &config.cwd {
-                let path = path.to_string_lossy();
-                normalized = normalized.replace(
-                    path.as_ref(),
-                    &format!("<runtime-probe-write-denial:{index}>"),
-                );
+            let path = path.to_string_lossy();
+            let path = path.trim_end_matches('/');
+            if !path.is_empty() && path != cwd {
+                paths.push((
+                    path.to_owned(),
+                    format!("<runtime-probe-write-denial:{index}>"),
+                ));
             }
         }
         for (index, path) in policy.read_denials.iter().enumerate() {
             let path = path.to_string_lossy();
-            normalized = normalized.replace(
-                path.as_ref(),
-                &format!("<runtime-probe-read-denial:{index}>"),
-            );
+            let path = path.trim_end_matches('/');
+            if !path.is_empty() {
+                paths.push((
+                    path.to_owned(),
+                    format!("<runtime-probe-read-denial:{index}>"),
+                ));
+            }
         }
-    } else {
-        normalized = normalized.replace(
-            &config.cwd.to_string_lossy().to_string(),
-            "<attempt-worktree>",
-        );
     }
+    paths.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+    normalized = replace_bounded_paths(&normalized, &paths);
     if config.provider == Provider::Claude {
         normalize_path_ending(&mut normalized, "/role.sock", "<role-socket>");
     }
@@ -546,6 +715,49 @@ fn normalize_text(value: &str, config: &LaunchConfig) -> String {
         normalize_path_ending(&mut normalized, suffix, replacement);
     }
     normalized
+}
+
+fn replace_bounded_paths(value: &str, paths: &[(String, String)]) -> String {
+    // Scan the source once so a path inside an emitted placeholder is never matched again.
+    let mut result = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while let Some(offset) = value[cursor..].find('/') {
+        let start = cursor + offset;
+        result.push_str(&value[cursor..start]);
+        let preceding = start == 0
+            || value[..start].chars().next_back().is_some_and(|character| {
+                character.is_whitespace()
+                    || matches!(character, '"' | '\'' | '=' | ',' | ';' | '(' | '{' | '[')
+            })
+            // Claude spells absolute roots in tool rules as Read(//path/**).
+            || value[..start].ends_with("(/");
+        let replacement = if preceding {
+            paths.iter().find(|(path, _)| {
+                value[start..].starts_with(path)
+                    && value[start + path.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|character| {
+                            character.is_whitespace()
+                                || matches!(
+                                    character,
+                                    '/' | '"' | '\'' | ',' | ';' | ')' | '}' | ']' | '='
+                                )
+                        })
+            })
+        } else {
+            None
+        };
+        if let Some((path, placeholder)) = replacement {
+            result.push_str(placeholder);
+            cursor = start + path.len();
+        } else {
+            result.push('/');
+            cursor = start + 1;
+        }
+    }
+    result.push_str(&value[cursor..]);
+    result
 }
 
 fn normalize_path_ending(value: &mut String, suffix: &str, replacement: &str) {

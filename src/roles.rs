@@ -472,7 +472,7 @@ impl RoleService {
             (serde_json::from_str(&config)?, workspace.into())
         };
         let read_denials = crate::trip::setup_target_read_denials(&self.store, attempt)?;
-        let replacement = crate::providers::prepare_role_launch_with_read_denials(
+        let replacement = crate::providers::prepare_role_launch_with_read_denials_and_bundles(
             requested.provider,
             role_kind,
             &requested.model,
@@ -487,6 +487,7 @@ impl RoleService {
             &runtime.hooks,
             &runtime.executable,
             &read_denials,
+            &self.store.compatibility_bundles,
         )?
         .config;
         let now = Utc::now().to_rfc3339();
@@ -684,13 +685,14 @@ impl RoleService {
         {
             bail!("prepared replacement no longer matches the exact requested role revision and workspace")
         }
-        crate::trip::current_task_profile_authority(
+        crate::trip::current_task_profile_authority_with_bundles(
             &transaction,
             &task_id,
             replacement.role,
             settings_revision,
             &replacement,
-        ).map_err(|error| anyhow!("requested replacement is pending exact task-profile activation: {error:#}; current role authority remains active"))?;
+            &self.store.compatibility_bundles,
+        ).context("requested replacement is pending exact task-profile activation; current role authority remains active")?;
         let manager_preplan = if role == "manager" {
             manager_preplan_snapshot_valid(&transaction, snapshot_id, attempt, old_generation)?
         } else {
@@ -862,6 +864,7 @@ impl RoleService {
     }
 
     pub fn deliver_guidance(&self, guidance_id: &str) -> Result<serde_json::Value> {
+        self.store.require_execution_unheld("guidance delivery")?;
         let (session, body, reason, attention, attempt, transcript_epoch, resume_invocation): (
             String,
             String,

@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "provider": "claude",
+  "pack_id": "llmrelay-claude-compatibility",
+  "pack_revision": "1",
+  "description": "Embedded claude provider compatibility candidates.",
+  "selectors": []
+}

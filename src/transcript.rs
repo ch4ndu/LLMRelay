@@ -47,7 +47,7 @@ struct TranscriptState {
 impl TranscriptSink {
     pub fn create(root: &Path, session_id: &str, epoch: &str) -> Result<Self> {
         fs::create_dir_all(root)?;
-        let path = root.join(format!("{session_id}.jsonl"));
+        let path = transcript_path(root, session_id)?;
         let coordinator = session_coordinator(&path)?;
         let mut coordination = coordinator
             .lock()
@@ -162,7 +162,7 @@ impl TranscriptSink {
 /// the transcript. An attachment can use it to prove that a poll cursor is
 /// already current without reparsing the retained file.
 pub fn current_watermark(root: &Path, session_id: &str) -> Result<Option<TranscriptWatermark>> {
-    let path = root.join(format!("{session_id}.jsonl"));
+    let path = transcript_path(root, session_id)?;
     let coordinator = session_coordinator(&path)?;
     let coordination = coordinator
         .lock()
@@ -197,6 +197,29 @@ fn session_coordinator(path: &Path) -> Result<SessionCoordinator> {
     let coordinator = Arc::new(Mutex::new(SessionCoordination::default()));
     coordinators.insert(path.to_path_buf(), Arc::downgrade(&coordinator));
     Ok(coordinator)
+}
+
+fn transcript_path(root: &Path, session_id: &str) -> Result<PathBuf> {
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        bail!("transcript session ID must match [A-Za-z0-9_-]{{1,128}}")
+    }
+    let path = root.join(format!("{session_id}.jsonl"));
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!("transcript path is not an owned regular file")
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect transcript {}", path.display()))
+        }
+    }
+    Ok(path)
 }
 
 fn scan_complete_frames(path: &Path) -> Result<(Vec<(TranscriptFrame, usize)>, Vec<u8>, bool)> {
@@ -391,7 +414,7 @@ pub fn recent_output_summary(
     epoch: &str,
     max_chars: usize,
 ) -> Result<Option<String>> {
-    let path = root.join(format!("{session_id}.jsonl"));
+    let path = transcript_path(root, session_id)?;
     let (frames, _, _) = scan_complete_frames(&path)?;
     let mut plain = BoundedPlainText::new(max_chars);
     let mut saw_bytes = false;
@@ -551,7 +574,7 @@ pub fn read_frames(
     const MAX_PAGE_BYTES: usize = 512 * 1024;
     const MAX_PAGE_FRAMES: usize = 512;
     let page_bytes = requested_bytes.clamp(1024, MAX_PAGE_BYTES);
-    let path = root.join(format!("{session_id}.jsonl"));
+    let path = transcript_path(root, session_id)?;
     if let (Some(epoch), Some(watermark)) = (after_epoch, current_watermark(root, session_id)?) {
         if epoch == watermark.epoch && after_sequence == watermark.sequence {
             return Ok(TranscriptPage {
@@ -724,7 +747,7 @@ pub fn initialize_gap_transcript(
     epoch: &str,
     reason: &str,
 ) -> Result<()> {
-    let path = root.join(format!("{session_id}.jsonl"));
+    let path = transcript_path(root, session_id)?;
     let coordinator = session_coordinator(&path)?;
     let _coordination = coordinator
         .lock()
@@ -747,6 +770,29 @@ pub fn initialize_gap_transcript(
 #[cfg(test)]
 mod summary_tests {
     use super::*;
+
+    #[test]
+    fn transcript_paths_reject_traversal_and_symlink_targets_without_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "agenticjira-transcript-paths-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = root.parent().unwrap().join(format!(
+            "agenticjira-transcript-outside-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let sentinel = b"malformed outside transcript sentinel";
+        std::fs::write(&outside, sentinel).unwrap();
+        assert!(read_frames(&root, "../outside", None, 0, 1024).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), sentinel);
+
+        std::os::unix::fs::symlink(&outside, root.join("linked.jsonl")).unwrap();
+        assert!(read_frames(&root, "linked", None, 0, 1024).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), sentinel);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(outside);
+    }
 
     #[test]
     fn recent_output_summary_is_bounded_and_strips_terminal_controls() {

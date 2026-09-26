@@ -135,7 +135,11 @@ export function ReviewPanel(
     return typeof value === "string" ? value : undefined;
   };
   return (
-    <section className="panel review-panel">
+    <section
+      className="panel review-panel"
+      data-attention-target={`attempt:${attempt.id}`}
+      tabIndex={-1}
+    >
       <span className="eyebrow">Your decision</span>
       <h3>
         {implementation

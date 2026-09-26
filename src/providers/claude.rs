@@ -4,6 +4,9 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
 pub const NATIVE_SANDBOX_POLICY_REVISION: &str = "claude-native-sandbox-role-socket-v1";
+pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-provider-launch-v1";
+pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-provider-resume-v1";
+pub const CREDENTIAL_CONTRACT_REVISION: &str = "llmrelay-local-credential-v1";
 
 #[allow(clippy::too_many_arguments)]
 pub fn prepare(
@@ -56,7 +59,50 @@ pub fn prepare_with_runtime_probe_policy(
     read_denials: &[PathBuf],
     runtime_probe_policy: Option<&RuntimeProbeCommandPolicy>,
 ) -> Result<PreparedLaunch> {
-    let (executable, version) = super::executable_and_version(Provider::Claude)?;
+    prepare_with_bundles(
+        role,
+        model,
+        effort,
+        cwd,
+        prompt,
+        role_socket,
+        role_token,
+        role_generation_id,
+        session_id,
+        native_session_id,
+        assets,
+        executable_path,
+        read_denials,
+        runtime_probe_policy,
+        &crate::provider_compatibility::BundleSet::embedded(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_with_bundles(
+    role: RoleKind,
+    model: &str,
+    effort: &str,
+    cwd: &Path,
+    prompt: &str,
+    role_socket: &Path,
+    role_token: &str,
+    role_generation_id: &str,
+    session_id: &str,
+    native_session_id: Option<&str>,
+    assets: &HookAssets,
+    executable_path: &Path,
+    read_denials: &[PathBuf],
+    runtime_probe_policy: Option<&RuntimeProbeCommandPolicy>,
+    bundles: &crate::provider_compatibility::BundleSet,
+) -> Result<PreparedLaunch> {
+    let (executable, version) = if bundles.is_synthetic() {
+        // Synthetic bundle preparation stays inside the fixture and never inspects or launches Claude.
+        (executable_path.to_path_buf(), "synthetic-claude-v1".into())
+    } else {
+        super::executable_and_version(Provider::Claude)?
+    };
+    let contract_binding = bundles.resolve(Provider::Claude, &version, role)?;
     let report_prefix = format!("Bash({} role report:*)", executable_path.display());
     let context_command = format!("Bash({} role context)", executable_path.display());
     let readonly = role != RoleKind::Implementer;
@@ -279,6 +325,7 @@ pub fn prepare_with_runtime_probe_policy(
             security_policy,
             hook_revision: format!("{HOOK_REVISION}:{hook_hash}"),
             capability_status: CapabilityStatus::Unverified,
+            compatibility: Some(contract_binding),
         },
         executable,
         arguments,
@@ -608,4 +655,127 @@ fn augmented_prompt(prompt: &str, role: RoleKind, executable: &Path, socket: &Pa
         "{prompt}\n\n{}",
         super::role_channel_instructions(role, executable, socket)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_compatibility_preparation_preserves_claude_native_policy() {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-claude-policy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let paths = crate::config::InstancePaths::resolve(Some(root.join("app"))).unwrap();
+        paths.create().unwrap();
+        let assets =
+            crate::providers::install_hook_assets(&paths, &std::env::current_exe().unwrap())
+                .unwrap();
+        let mut claude: serde_json::Value = serde_json::from_str(include_str!(
+            "../../resources/provider-compatibility/claude.json"
+        ))
+        .unwrap();
+        let codex: serde_json::Value = serde_json::from_str(include_str!(
+            "../../resources/provider-compatibility/codex.json"
+        ))
+        .unwrap();
+        let mut selector = codex["selectors"][0].clone();
+        selector["predicate_id"] = "synthetic-claude-v1".into();
+        selector["exact_version"] = "synthetic-claude-v1".into();
+        for contract in selector["contracts"].as_array_mut().unwrap() {
+            contract["contract_id"] =
+                format!("synthetic-claude-{}", contract["role"].as_str().unwrap()).into();
+            contract["native_policy_revision"] = NATIVE_SANDBOX_POLICY_REVISION.into();
+        }
+        claude["selectors"] = serde_json::json!([selector]);
+        let bundles = crate::provider_compatibility::BundleSet::synthetic_for_tests(
+            include_str!("../../resources/provider-compatibility/codex.json"),
+            &claude.to_string(),
+        );
+        let prepared = prepare_with_bundles(
+            RoleKind::Manager,
+            "claude-opus-4-1",
+            "high",
+            &root,
+            "synthetic preparation",
+            &paths.role_socket,
+            "fixture-token",
+            "fixture-generation",
+            "fixture-session",
+            None,
+            &assets,
+            &std::env::current_exe().unwrap(),
+            &[],
+            None,
+            &bundles,
+        )
+        .unwrap();
+        assert_eq!(prepared.executable, executable);
+        assert_eq!(prepared.config.argv, prepared.arguments);
+        assert_eq!(prepared.config.executable_version, "synthetic-claude-v1");
+        assert!(prepared.arguments.iter().any(|arg| arg == "--restricted"));
+        assert!(prepared
+            .arguments
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "dontAsk"]));
+        assert!(prepared
+            .environment
+            .iter()
+            .any(|pair| pair == &("AGENTICJIRA_ROLE_TOKEN".into(), "fixture-token".into())));
+        assert!(prepared
+            .environment
+            .iter()
+            .any(|pair| pair == &("DISABLE_UPDATES".into(), "1".into())));
+        let command = prepared.command(&root.join("anchor"));
+        assert!(command.get_argv().iter().any(|arg| arg == &executable));
+        assert_eq!(
+            command.get_env("AGENTICJIRA_ROLE_TOKEN"),
+            Some(std::ffi::OsStr::new("fixture-token"))
+        );
+        assert_eq!(command.get_cwd(), Some(&root.as_os_str().to_owned()));
+        let binding = prepared.config.compatibility.as_ref().unwrap();
+        assert_eq!(binding.contract_id, "synthetic-claude-manager");
+        assert!(binding.synthetic_origin);
+        let identity = crate::providers::capability_identity(&prepared.config).unwrap();
+        assert_eq!(
+            identity.compatibility.as_ref().unwrap().effective_hash,
+            binding.effective_hash
+        );
+        assert_eq!(identity.hook_revision, prepared.config.hook_revision);
+        assert!(identity.hook_revision.starts_with(HOOK_REVISION));
+        assert_eq!(
+            identity.environment_contract,
+            prepared.config.environment_keys
+        );
+        assert!(identity
+            .effective_argv
+            .iter()
+            .any(|arg| arg == "--settings"));
+        assert_eq!(
+            identity.security_policy["native_sandbox"]["policy_revision"],
+            NATIVE_SANDBOX_POLICY_REVISION
+        );
+        crate::providers::require_current_capability_identity_with_bundles(
+            &identity, &root, &bundles,
+        )
+        .unwrap();
+
+        let mut corrupted = identity.clone();
+        let settings = corrupted
+            .effective_argv
+            .iter_mut()
+            .find(|arg| arg.starts_with("{\"env\""))
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(settings).unwrap();
+        value["sandbox"]["failIfUnavailable"] = false.into();
+        *settings = value.to_string();
+        let error = crate::providers::require_current_capability_identity_with_bundles(
+            &corrupted, &root, &bundles,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("/sandbox/failIfUnavailable=true"));
+    }
 }

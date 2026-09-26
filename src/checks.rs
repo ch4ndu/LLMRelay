@@ -196,6 +196,8 @@ impl CheckService {
         background: bool,
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
     ) -> Result<BrowserCheckRun> {
+        self.store
+            .require_execution_unheld("selected check execution")?;
         let (
             workspace,
             candidate,
@@ -326,6 +328,9 @@ impl CheckService {
     }
 
     pub fn selected_authorized(&self, attempt: &str, check_id: &str) -> Result<bool> {
+        if crate::database::hold_active(&self.store)? {
+            return Ok(false);
+        }
         let connection = self.store.lock()?;
         let row: Option<(i64,String,Option<String>,Option<String>,Option<String>,String)> = connection.query_row(
             "SELECT a.selected_checks_revision,c.command_kind,c.executable,c.arguments_json,c.shell_command,c.cwd

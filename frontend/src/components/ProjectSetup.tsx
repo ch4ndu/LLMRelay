@@ -17,10 +17,12 @@ import {
   recordedOutputText,
 } from "../cmuxRouting";
 import { ModelSelector } from "./ModelSelector";
+import { CompatibilityDetails } from "./RoleSettings";
 import type {
   CmuxKeyboardControlAction,
   CmuxSessionSurface,
   CmuxViewOutcome,
+  CompatibilityExplanation,
   ContinuationAction,
   Project,
   Provider,
@@ -99,6 +101,14 @@ const setupStages: Array<{ id: SetupStage; label: string }> = [
   { id: "review", label: "Review changes" },
   { id: "activate", label: "Activate" },
 ];
+const freshQualificationUnavailable = (compatibility?: CompatibilityExplanation | null) =>
+  compatibility?.status === "unknown_version" ||
+  compatibility?.status === "ambiguous_manifest" ||
+  compatibility?.status === "manifest_invalid";
+const exactResumeUnavailable = (compatibility?: CompatibilityExplanation | null) =>
+  freshQualificationUnavailable(compatibility) ||
+  compatibility?.status === "contract_changed" ||
+  compatibility?.status === "evidence_stale";
 const stageForProject = (
   setup: TripSetupState | undefined,
   trip: TripProjectState,
@@ -481,6 +491,18 @@ export function ProjectSetup({
     item.role === "manager"
   )?.profile as RoleConfig | undefined;
   const managerControl = setup?.manager_control;
+  const freshUnavailableRoles = new Set(
+    setup?.selected_profiles.filter((selection) =>
+      selection.selection_state === "selected" &&
+      freshQualificationUnavailable(selection.compatibility)
+    ).map((selection) => selection.role) || [],
+  );
+  const exactResumeUnavailableRoles = new Set(
+    setup?.selected_profiles.filter((selection) =>
+      selection.selection_state === "selected" &&
+      exactResumeUnavailable(selection.compatibility)
+    ).map((selection) => selection.role) || [],
+  );
   const trip: TripProjectState = project.trip || {
     readiness: "not_initialized",
     reason: "Project setup has not been inspected",
@@ -611,40 +633,74 @@ export function ProjectSetup({
   const runTrip = async (key: string, action: Record<string, unknown>) => {
     if (commandGuard.current) return;
     commandGuard.current = true;
-    const stable = reuseOperationIdentity(
-      commandIdentities.current.get(key),
-      action,
-    );
-    const { id, request } = stable;
-    commandIdentities.current.set(key, { body: JSON.stringify(request), id });
-    localStorage.setItem(
-      operationStorageKey,
-      JSON.stringify([...commandIdentities.current]),
-    );
     setBusy(key);
     setError("");
     setNotice("");
     try {
+      const { id, request } = reuseOperationIdentity(
+        commandIdentities.current.get(key),
+        action,
+      );
+      commandIdentities.current.set(key, {
+        body: JSON.stringify(request),
+        id,
+      });
+      try {
+        localStorage.setItem(
+          operationStorageKey,
+          JSON.stringify([...commandIdentities.current]),
+        );
+      } catch (cause) {
+        throw new Error(
+          `Browser storage could not retain the setup request, so it was not sent: ${
+            cause instanceof Error ? cause.message : String(cause)
+          }`,
+        );
+      }
       const response = await command({
         kind: "trip",
         operation_id: id,
         ...request,
       });
       commandIdentities.current.delete(key);
-      localStorage.setItem(
-        operationStorageKey,
-        JSON.stringify([...commandIdentities.current]),
-      );
+      try {
+        localStorage.setItem(
+          operationStorageKey,
+          JSON.stringify([...commandIdentities.current]),
+        );
+      } catch (cause) {
+        throw new Error(
+          `The setup action completed, but browser storage cleanup failed: ${
+            cause instanceof Error ? cause.message : String(cause)
+          }`,
+        );
+      }
       setNotice(String(response.result.state || "Saved"));
       await onChanged();
       return response.result;
     } catch (cause) {
+      const ambiguous = cause instanceof ApiError && cause.ambiguous;
+      let storageFailure = "";
+      if (!ambiguous) {
+        commandIdentities.current.delete(key);
+        try {
+          localStorage.setItem(
+            operationStorageKey,
+            JSON.stringify([...commandIdentities.current]),
+          );
+        } catch (storageCause) {
+          storageFailure = ` Browser storage also failed while clearing the rejected request: ${
+            storageCause instanceof Error
+              ? storageCause.message
+              : String(storageCause)
+          }`;
+        }
+      }
+      const message = cause instanceof Error ? cause.message : String(cause);
       setError(
-        cause instanceof ApiError && cause.ambiguous
-          ? `${cause.message} Refresh and reconcile before retrying.`
-          : cause instanceof Error
-          ? cause.message
-          : String(cause),
+        `${message}${
+          ambiguous ? " Refresh and reconcile before retrying." : ""
+        }${storageFailure}`,
       );
       await onChanged();
     } finally {
@@ -1253,6 +1309,8 @@ export function ProjectSetup({
     <section
       className="trip-setup"
       aria-label={`TRIP Explorer setup for ${project.display_name}`}
+      data-attention-target={`project_setup:${project.id}`}
+      tabIndex={-1}
     >
       <header>
         <div>
@@ -1268,6 +1326,23 @@ export function ProjectSetup({
           {trip.readiness.replaceAll("_", " ")}
         </span>
       </header>
+      {setup?.selected_profiles.some((selection) => selection.selection_state === "selected") && (
+        <section className="panel" aria-label="Selected profile compatibility">
+          <h5>Selected profile compatibility</h5>
+          {setup.selected_profiles.filter((selection) => selection.selection_state === "selected")
+            .map((selection) => {
+              const profile = selection.profile;
+              return (
+                <div key={selection.role}>
+                  <strong>{selection.role} · {profile?.provider || "unselected"}</strong>
+                  {selection.compatibility
+                    ? <CompatibilityDetails compatibility={selection.compatibility} />
+                    : <p className="hint">No current compatibility observation is recorded for this profile.</p>}
+                </div>
+              );
+            })}
+        </section>
+      )}
       <div className="setup-summary">
         <span>
           Detected: <strong>{detectedKind.replaceAll("_", " ")}</strong>
@@ -1636,6 +1711,8 @@ export function ProjectSetup({
                   onViewSession={onViewSession}
                   cmuxSurfaces={cmuxSurfaces}
                   recoveries={setup.recoveries || []}
+                  unavailableRoles={freshUnavailableRoles}
+                  exactResumeUnavailableRoles={exactResumeUnavailableRoles}
                   onChanged={onChanged}
                   dispatchHeld={!!managerControl?.hold}
                 />
@@ -2259,6 +2336,8 @@ export function ProjectSetup({
                   onViewSession={onViewSession}
                   cmuxSurfaces={cmuxSurfaces}
                   recoveries={setup.recoveries || []}
+                  unavailableRoles={freshUnavailableRoles}
+                  exactResumeUnavailableRoles={exactResumeUnavailableRoles}
                   onChanged={onChanged}
                 />
               ))}
@@ -2483,7 +2562,7 @@ export function ProjectSetup({
           {!runtimeAdmission && (
             <button
               className="primary"
-              disabled={!!busy}
+              disabled={!!busy || freshUnavailableRoles.size > 0}
               onClick={() => void prepareRuntime()}
             >
               Prepare exact runtime verification
@@ -2503,6 +2582,8 @@ export function ProjectSetup({
                 onViewSession={onViewSession}
                 cmuxSurfaces={cmuxSurfaces}
                 recoveries={setup?.recoveries || []}
+                unavailableRoles={freshUnavailableRoles}
+                exactResumeUnavailableRoles={exactResumeUnavailableRoles}
                 onChanged={onChanged}
               />
             </>
@@ -2518,8 +2599,8 @@ export function ProjectSetup({
         <p className="error" role="alert">
           {error}
           <small>
-            Inputs and the operation identity are retained for an unchanged
-            retry.
+            Ambiguous delivery retains the exact operation identity. A
+            definitive rejection permits a fresh request after refresh.
           </small>
         </p>
       )}
@@ -2621,6 +2702,8 @@ function SetupInvocation(
     onDispatch,
     onViewSession,
     recoveries,
+    unavailableRoles,
+    exactResumeUnavailableRoles,
     onChanged,
     dispatchHeld = false,
   }: {
@@ -2636,6 +2719,8 @@ function SetupInvocation(
       sessionId: string,
     ) => Promise<CmuxViewOutcome>;
     recoveries: TripSetupRecovery[];
+    unavailableRoles: Set<Role>;
+    exactResumeUnavailableRoles: Set<Role>;
     onChanged: () => Promise<void> | void;
     dispatchHeld?: boolean;
   },
@@ -2683,12 +2768,14 @@ function SetupInvocation(
     presentationOutcome?.state === "pending",
   );
   const recovery = recoveries.find((item) => item.session_id === session?.id);
-  const resumable = !dispatchHeld && role !== "final_verifier" &&
+  const contractReady = !unavailableRoles.has(role);
+  const resumable = contractReady && !exactResumeUnavailableRoles.has(role) &&
+    !dispatchHeld && role !== "final_verifier" &&
     session?.status === "exited" &&
     session.has_native_session && session.resume_count === 0 && !receipt;
   const retainedResumeSpent = role !== "final_verifier" &&
     !!session && session.resume_count > 0 && !receipt;
-  const freshRetry = !dispatchHeld && !receipt && !!session &&
+  const freshRetry = contractReady && !dispatchHeld && !receipt && !!session &&
     ["launch_failed", "exited"].includes(session.status) && !resumable;
   const keyboardControlActive = !!session?.input_control;
   const sessionStatus = !session
@@ -2857,7 +2944,7 @@ function SetupInvocation(
           is completed or superseded.
         </small>
       )}
-      {!receipt && !session && (
+      {contractReady && !receipt && !session && (
         <button
           disabled={!!busy || dispatchHeld}
           onClick={() => onDispatch(attemptId, role)}
@@ -2923,6 +3010,7 @@ function SetupRecovery(
     const request = {
       task_id: recovery.task_id,
       attempt_id: recovery.attempt_id,
+      recovery_id: recovery.record_id,
       session_id: recovery.session_id,
       expected_version: recovery.task_version,
       decision,
@@ -2996,6 +3084,8 @@ function RuntimeAdmission(
     onViewSession,
     cmuxSurfaces,
     recoveries,
+    unavailableRoles,
+    exactResumeUnavailableRoles,
     onChanged,
   }: {
     admission: RuntimeAdmissionState;
@@ -3010,6 +3100,8 @@ function RuntimeAdmission(
     ) => Promise<CmuxViewOutcome>;
     cmuxSurfaces: Record<string, CmuxSessionSurface>;
     recoveries: TripSetupRecovery[];
+    unavailableRoles: Set<Role>;
+    exactResumeUnavailableRoles: Set<Role>;
     onChanged: () => Promise<void> | void;
   },
 ) {
@@ -3171,12 +3263,15 @@ function RuntimeAdmission(
             item.session_id === probe.session_id &&
             item.runtime_admission_id === admission.id
           );
-          const retainedResume = probe.role !== "final_verifier" &&
+          const contractReady = !unavailableRoles.has(probe.role);
+          const retainedResume = contractReady &&
+            !exactResumeUnavailableRoles.has(probe.role) &&
+            probe.role !== "final_verifier" &&
             probe.session_status === "exited" && probe.has_native_session &&
             probe.state === "running";
           const publish = probe.state === "evidence_recorded" &&
             probe.session_status === "exited";
-          const launch = probe.state === "authorized";
+          const launch = contractReady && probe.state === "authorized";
           const cmuxOutcome = probe.session_id
             ? presentationOutcomeForSession(probe.session_id)
             : undefined;
@@ -3273,7 +3368,7 @@ function RuntimeAdmission(
                   Publish exact ordinary proof
                 </button>
               )}
-              {["failed", "stale"].includes(probe.state) && (
+              {contractReady && ["failed", "stale"].includes(probe.state) && (
                 <button
                   className="primary"
                   disabled={!!busy}

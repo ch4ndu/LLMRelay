@@ -1,0 +1,117 @@
+{
+  "schema": 1,
+  "provider": "codex",
+  "pack_id": "llmrelay-codex-compatibility",
+  "pack_revision": "1",
+  "description": "Embedded codex provider compatibility candidates.",
+  "selectors": [
+    {
+      "predicate_id": "codex-cli-0.155.1",
+      "exact_version": "codex-cli 0.155.1",
+      "contracts": [
+        {
+          "role": "manager",
+          "contract_id": "codex-manager",
+          "contract_revision": "codex-role-contract-v1",
+          "launch_revision": "llmrelay-provider-launch-v1",
+          "resume_revision": "llmrelay-provider-resume-v1",
+          "native_policy_revision": "codex-denied-read-floor-v2",
+          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "credential_revision": "llmrelay-local-credential-v1",
+          "evidence_revision": "llmrelay-capability-proof-v1",
+          "required_evidence": [
+            "exact_native_policy",
+            "hook_trust",
+            "local_credential",
+            "role_capability_proof"
+          ]
+        },
+        {
+          "role": "explorer",
+          "contract_id": "codex-explorer",
+          "contract_revision": "codex-role-contract-v1",
+          "launch_revision": "llmrelay-provider-launch-v1",
+          "resume_revision": "llmrelay-provider-resume-v1",
+          "native_policy_revision": "codex-denied-read-floor-v2",
+          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "credential_revision": "llmrelay-local-credential-v1",
+          "evidence_revision": "llmrelay-capability-proof-v1",
+          "required_evidence": [
+            "exact_native_policy",
+            "hook_trust",
+            "local_credential",
+            "role_capability_proof"
+          ]
+        },
+        {
+          "role": "plan_reviewer",
+          "contract_id": "codex-plan_reviewer",
+          "contract_revision": "codex-role-contract-v1",
+          "launch_revision": "llmrelay-provider-launch-v1",
+          "resume_revision": "llmrelay-provider-resume-v1",
+          "native_policy_revision": "codex-denied-read-floor-v2",
+          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "credential_revision": "llmrelay-local-credential-v1",
+          "evidence_revision": "llmrelay-capability-proof-v1",
+          "required_evidence": [
+            "exact_native_policy",
+            "hook_trust",
+            "local_credential",
+            "role_capability_proof"
+          ]
+        },
+        {
+          "role": "implementer",
+          "contract_id": "codex-implementer",
+          "contract_revision": "codex-role-contract-v1",
+          "launch_revision": "llmrelay-provider-launch-v1",
+          "resume_revision": "llmrelay-provider-resume-v1",
+          "native_policy_revision": "codex-native-approval-ownership-v1",
+          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "credential_revision": "llmrelay-local-credential-v1",
+          "evidence_revision": "llmrelay-capability-proof-v1",
+          "required_evidence": [
+            "exact_native_policy",
+            "hook_trust",
+            "local_credential",
+            "role_capability_proof"
+          ]
+        },
+        {
+          "role": "code_reviewer",
+          "contract_id": "codex-code_reviewer",
+          "contract_revision": "codex-role-contract-v1",
+          "launch_revision": "llmrelay-provider-launch-v1",
+          "resume_revision": "llmrelay-provider-resume-v1",
+          "native_policy_revision": "codex-denied-read-floor-v2",
+          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "credential_revision": "llmrelay-local-credential-v1",
+          "evidence_revision": "llmrelay-capability-proof-v1",
+          "required_evidence": [
+            "exact_native_policy",
+            "hook_trust",
+            "local_credential",
+            "role_capability_proof"
+          ]
+        },
+        {
+          "role": "final_verifier",
+          "contract_id": "codex-final_verifier",
+          "contract_revision": "codex-role-contract-v1",
+          "launch_revision": "llmrelay-provider-launch-v1",
+          "resume_revision": "llmrelay-provider-resume-v1",
+          "native_policy_revision": "codex-denied-read-floor-v2",
+          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "credential_revision": "llmrelay-local-credential-v1",
+          "evidence_revision": "llmrelay-capability-proof-v1",
+          "required_evidence": [
+            "exact_native_policy",
+            "hook_trust",
+            "local_credential",
+            "role_capability_proof"
+          ]
+        }
+      ]
+    }
+  ]
+}

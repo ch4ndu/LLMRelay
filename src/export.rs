@@ -6,7 +6,8 @@ use chrono::Utc;
 use std::path::Path;
 
 pub fn export_sanitized(paths: &InstancePaths, output: &Path) -> Result<serde_json::Value> {
-    let store = Store::open(&paths.database)?;
+    crate::database::validate_live_database_family(paths)?;
+    let store = Store::open_current_readonly(&paths.database)?;
     let state = sanitize_state(serde_json::to_value(crate::workflow::state(&store)?)?);
     let diagnostics = sanitize_value(serde_json::Value::Array(
         DiagnosticSink::new(paths.logs.clone())?.read_sanitized(2_000)?,

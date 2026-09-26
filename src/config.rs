@@ -77,10 +77,45 @@ impl InstancePaths {
         ] {
             fs::create_dir_all(path)
                 .with_context(|| format!("create instance directory {}", path.display()))?;
+            let metadata = fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != unsafe { libc::geteuid() }
+            {
+                bail!(
+                    "instance directory must be owned and must not be a symlink: {}",
+                    path.display()
+                )
+            }
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            validate_private_directory(path)?;
         }
         create_private_socket_directory(&self.socket_dir)?;
         Ok(())
     }
+}
+
+fn validate_private_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "instance directory must not be a symlink: {}",
+            path.display()
+        )
+    }
+    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "instance directory must be owned by the current user: {}",
+            path.display()
+        )
+    }
+    if metadata.mode() & 0o077 != 0 {
+        bail!(
+            "instance directory must have owner-only permissions: {}",
+            path.display()
+        )
+    }
+    Ok(())
 }
 
 fn canonical_identity(path: &Path) -> Result<PathBuf> {

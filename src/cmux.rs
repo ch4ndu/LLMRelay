@@ -954,6 +954,10 @@ fn create_reserved_surface(
                 )?;
                 return Ok(uncertain_surface_outcome(surface));
             }
+            #[cfg(test)]
+            if TEST_INTERRUPT_WORKSPACE_CREATE_BEFORE_BIND.with(|armed| armed.replace(false)) {
+                anyhow::bail!("injected interruption before cmux binding persistence")
+            }
             let surface = app.store.mark_cmux_workspace_and_initial_surface_open(
                 &workspace.id,
                 &surface.id,
@@ -1868,6 +1872,7 @@ thread_local! {
     static TEST_CMUX_RPC_RESULTS: RefCell<VecDeque<std::result::Result<Value, CmuxCommandError>>> = RefCell::new(VecDeque::new());
     static TEST_CMUX_RPC_HOOKS: RefCell<VecDeque<Box<dyn FnOnce()>>> = RefCell::new(VecDeque::new());
     static TEST_CMUX_COMMAND_RESULTS: RefCell<VecDeque<std::result::Result<String, CmuxCommandError>>> = RefCell::new(VecDeque::new());
+    static TEST_INTERRUPT_WORKSPACE_CREATE_BEFORE_BIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -2139,6 +2144,128 @@ mod g14_tests {
     use crate::operations::Application;
     use crate::store::Store;
     use rusqlite::params;
+
+    #[test]
+    fn interrupted_successful_workspace_create_reconciles_without_second_rpc() {
+        let (root, app) = cmux_test_application();
+        let binding = seed_attachment(&app, "interrupted-workspace-create");
+        let boot = uuid::Uuid::new_v4().to_string();
+        let (workspace, created) = app
+            .store
+            .reserve_cmux_task_workspace(&boot, "task")
+            .unwrap();
+        assert!(created);
+        let (surface, created) = app
+            .store
+            .reserve_cmux_session_surface(&boot, &workspace.id, &binding)
+            .unwrap();
+        assert!(created);
+        let remote_workspace = uuid::Uuid::new_v4().to_string();
+        let remote_surface = uuid::Uuid::new_v4().to_string();
+        clear_test_cmux_rpc_results();
+        push_test_cmux_rpc_result(Ok(serde_json::json!({
+            "workspace_id":remote_workspace,"surface_id":remote_surface
+        })));
+        push_test_cmux_rpc_result(Ok(serde_json::json!({
+            "workspace_id":remote_workspace,
+            "surfaces":[{"id":remote_surface,"type":"terminal"}]
+        })));
+        push_test_cmux_rpc_result(Ok(serde_json::json!({
+            "workspace_id":remote_workspace,"surface_id":remote_surface,
+            "restore_record":null,"resume_binding":null
+        })));
+        TEST_INTERRUPT_WORKSPACE_CREATE_BEFORE_BIND.with(|armed| armed.set(true));
+        let error =
+            create_reserved_surface(&app, &boot, workspace.clone(), surface.clone(), "first")
+                .unwrap_err();
+        assert!(error.to_string().contains("injected interruption"));
+        assert_eq!(test_cmux_rpc_result_count(), 0);
+        assert_eq!(
+            app.store.cmux_task_workspace(&workspace.id).unwrap().state,
+            "opening"
+        );
+        assert_eq!(
+            app.store
+                .cmux_task_workspace(&workspace.id)
+                .unwrap()
+                .opening_surface_id
+                .as_deref(),
+            Some(surface.id.as_str())
+        );
+        assert_eq!(
+            app.store
+                .cmux_session_surface(&surface.id)
+                .unwrap()
+                .surface_state,
+            "opening"
+        );
+        drop(app);
+
+        let paths = InstancePaths::resolve(Some(root.clone())).unwrap();
+        let reopened_store = Store::open_current_writable(&paths.database).unwrap();
+        let reopened =
+            Application::new(paths, reopened_store, std::env::current_exe().unwrap()).unwrap();
+        push_test_cmux_rpc_result(Ok(serde_json::json!({"unexpected":"second RPC"})));
+        let reconciled = create_reserved_surface(
+            &reopened,
+            &boot,
+            reopened.store.cmux_task_workspace(&workspace.id).unwrap(),
+            reopened.store.cmux_session_surface(&surface.id).unwrap(),
+            "reconcile",
+        )
+        .unwrap();
+        assert_eq!(reconciled.state, "unknown");
+        assert_eq!(
+            test_cmux_rpc_result_count(),
+            1,
+            "no second create, focus, or close RPC"
+        );
+        assert_eq!(
+            reopened
+                .store
+                .cmux_task_workspace(&workspace.id)
+                .unwrap()
+                .state,
+            "unknown"
+        );
+        assert_eq!(
+            reopened
+                .store
+                .cmux_session_surface(&surface.id)
+                .unwrap()
+                .surface_state,
+            "unknown"
+        );
+        assert!(!reconciled.retry_available);
+        let next_boot = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            reopened
+                .store
+                .retire_prior_cmux_presentation_boots(&next_boot)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            reopened
+                .store
+                .cmux_task_workspace(&workspace.id)
+                .unwrap()
+                .state,
+            "retired"
+        );
+        assert_eq!(
+            reopened
+                .store
+                .cmux_session_surface(&surface.id)
+                .unwrap()
+                .surface_state,
+            "retired"
+        );
+        assert_eq!(test_cmux_rpc_result_count(), 1);
+        clear_test_cmux_rpc_results();
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn seed_attachment(app: &Application, suffix: &str) -> AttachmentBinding {
         let binding = AttachmentBinding {

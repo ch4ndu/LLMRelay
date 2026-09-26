@@ -6,6 +6,12 @@ export type Role =
   | "code_reviewer"
   | "final_verifier";
 export type Provider = "codex" | "claude";
+export interface ProtocolDescriptor {
+  generation: number;
+  server_version: string;
+  instance_id: string;
+  supported_features: string[];
+}
 export interface RoleConfig {
   provider: Provider;
   model: string;
@@ -131,6 +137,7 @@ export interface TripSetupSelection {
   profile?: RoleConfig | TripSetupProfile | null;
   profile_hash?: string | null;
   selected_at?: string | null;
+  compatibility?: CompatibilityExplanation | null;
 }
 export interface TripSetupProbeReceipt {
   id: string;
@@ -450,6 +457,61 @@ export interface Project {
   settings: Record<string, unknown>;
   trip?: TripProjectState;
 }
+export interface ProfileSet {
+  id: string;
+  project_id: string;
+  name: string;
+  version: number;
+  archived: boolean;
+  revision: number;
+  revision_id: string;
+  roles: Record<Role, RoleConfig>;
+  config_revision_id: string;
+  configuration_hash: string;
+}
+export interface TaskRecipe {
+  id: string;
+  project_id: string;
+  name: string;
+  version: number;
+  archived: boolean;
+  revision: number;
+  revision_id: string;
+  title: string;
+  description: string;
+  acceptance_criteria: string[];
+  priority: number;
+  profile_revision_id: string;
+  required_check_ids: string[];
+  config_revision_id: string;
+  configuration_hash: string;
+  workflow_version: string;
+  workflow_hash: string;
+}
+export interface RecipeSchedule {
+  id: string;
+  project_id: string;
+  name: string;
+  version: number;
+  archived: boolean;
+  paused: boolean;
+  recipe_revision_id: string;
+  recipe_name: string;
+  recipe_config_revision_id: string;
+  recipe_archived: boolean;
+  cadence: "daily" | "weekly";
+  anchor_utc: string;
+  next_fire_utc: string | null;
+  last_fire: null | {
+    scheduled_for_utc: string;
+    outcome: "task_created" | "skipped_ineligible" | "missed";
+    task_id: string | null;
+    reason: string | null;
+    missed_first_utc: string | null;
+    missed_last_utc: string | null;
+    missed_count: number;
+  };
+}
 export interface Review {
   id: string;
   kind: string;
@@ -518,6 +580,21 @@ export interface Task {
   attention: string;
   version: number;
   archived: boolean;
+  can_archive: boolean;
+  recipe_provenance?: null | {
+    recipe_id: string;
+    recipe_name: string;
+    recipe_revision_id: string;
+    recipe_revision: number;
+    profile_revision_id: string;
+    required_check_ids: string[];
+    config_revision_id: string;
+    configuration_hash: string;
+    workflow_version: string;
+    workflow_hash: string;
+    schedule_id: string | null;
+    scheduled_for_utc: string | null;
+  };
   permission_waiting: boolean;
   role_overrides: Partial<Record<Role, RoleConfig>>;
   dependencies: Array<Record<string, unknown>>;
@@ -740,6 +817,33 @@ export interface CapabilityEvidence {
   proof?: Record<string, unknown>;
   gaps: string[];
   checked_at?: string;
+  compatibility?: CompatibilityExplanation | null;
+}
+export type CompatibilityStatus =
+  | "matched"
+  | "unknown_version"
+  | "ambiguous_manifest"
+  | "contract_changed"
+  | "evidence_stale"
+  | "manifest_invalid";
+export type CompatibilitySafeAction =
+  | "install_supported_provider_version"
+  | "update_llmrelay_release"
+  | "requalify_exact_profile"
+  | "inspect_local_provider_configuration"
+  | "contact_operator";
+export interface CompatibilityExplanation {
+  status: CompatibilityStatus;
+  observed_version: string | null;
+  pack_id: string | null;
+  pack_revision: string | null;
+  contract_id: string | null;
+  contract_revision: string | null;
+  short_hash: string | null;
+  predicate_id: string | null;
+  missing_evidence: string[];
+  action: CompatibilitySafeAction;
+  message: string;
 }
 export interface RolePreparation {
   task_id: string;
@@ -757,12 +861,84 @@ export interface RolePreparation {
   runtime_admission?: RuntimeAdmissionState | null;
   status: "unverified" | "supported" | "unsupported";
   reason: string;
+  compatibility?: CompatibilityExplanation | null;
 }
-export interface AppState {
+export type AttentionCategory =
+  | "permission"
+  | "decision"
+  | "recovery"
+  | "compatibility"
+  | "blocked"
+  | "awaiting_acceptance";
+export interface TaskAttentionTarget {
+  project_id: string;
+  task_id: string;
+  task_version: number;
+}
+export type AttentionTarget =
+  | ({ kind: "task" } & TaskAttentionTarget)
+  | {
+    kind: "attempt";
+    project_id: string;
+    task_id: string;
+    attempt_id: string;
+    phase: string;
+    plan_hash: string | null;
+    candidate_hash: string | null;
+  }
+  | {
+    kind: "session";
+    project_id: string;
+    task_id: string;
+    attempt_id: string;
+    session_id: string;
+    role_generation_id: string;
+  }
+  | {
+    kind: "permission_request";
+    project_id: string;
+    task_id: string;
+    attempt_id: string;
+    session_id: string;
+    request_id: string;
+    request_revision: number;
+  }
+  | {
+    kind: "recovery_record";
+    project_id: string;
+    task_id: string;
+    attempt_id: string;
+    recovery_id: string;
+  }
+  | {
+    kind: "project_setup";
+    project_id: string;
+    setup_operation_id: string | null;
+  };
+export interface AttentionItem {
+  id: string;
+  category: AttentionCategory;
+  title: string;
+  reason: string;
+  target: AttentionTarget | null;
+  held_tasks: TaskAttentionTarget[];
+}
+/** Revisions are opaque canonical decimals, comparable only within one incarnation. */
+export interface StateCursor {
+  incarnation: string;
+  revision: string;
+}
+export type StateWaitResult =
+  | (StateCursor & { outcome: "state_changed" | "reset"; state: AppState })
+  | (StateCursor & { outcome: "unchanged" });
+export interface AppState extends StateCursor {
   schema: number;
   generated_at: string;
   projects: Project[];
   tasks: Task[];
+  profile_sets: ProfileSet[];
+  task_recipes: TaskRecipe[];
+  recipe_schedules: RecipeSchedule[];
   production_role_restrictions: ProductionRoleRestriction[];
   capabilities: CapabilityEvidence[];
   active_sessions: Session[];
@@ -797,6 +973,8 @@ export interface AppState {
   trip_checks?: TripVerificationCheck[];
   trip_task_verification?: TripTaskVerification[];
   continuation_actions: ContinuationAction[];
+  decisions: DecisionExplanation[];
+  attention: AttentionItem[];
   resources: {
     active_sessions: number;
     active_controls: number;
@@ -817,6 +995,88 @@ export interface AppState {
     };
     processes: Array<Record<string, unknown>>;
   };
+}
+
+export type DecisionEvidenceState =
+  | "satisfied"
+  | "missing"
+  | "stale"
+  | "pending"
+  | "uncertain"
+  | "unknown";
+export type DecisionOwner = "service" | "human" | "provider" | "external";
+export interface DecisionPrerequisite {
+  code: string;
+  state: DecisionEvidenceState;
+  owner: DecisionOwner;
+  evidence: unknown;
+  message?: string;
+}
+export interface DecisionBinding {
+  project_id?: string;
+  task_id?: string;
+  attempt_id?: string;
+  session_id?: string;
+  role_generation_id?: string;
+  recovery_id?: string;
+  expected_task_version?: number;
+  expected_project_version?: number;
+  expected_instance_version?: number;
+  candidate_state?: string;
+}
+export interface DecisionExplanation {
+  decision_schema: 1;
+  reason_code: string;
+  disposition: "ready" | "waiting" | "held" | "retry_deferred" | "terminal";
+  subject: DecisionBinding;
+  observed_revision: Record<string, unknown>;
+  primary_blocker?: DecisionPrerequisite | null;
+  prerequisites: DecisionPrerequisite[];
+  ownership: { owner: DecisionOwner; state: string; binding: DecisionBinding };
+  next_action?: {
+    operation: string;
+    enabled: boolean;
+    owner: DecisionOwner;
+    binding: DecisionBinding;
+    accounting_note?: string;
+  } | null;
+  control_policy: { allowed_controls: string[]; disabled_reason_code?: string };
+}
+export interface RestartPreview {
+  decision_schema: 1;
+  snapshot: {
+    captured_at: string;
+    process_inventory: DecisionEvidenceState;
+    boot_identity: DecisionEvidenceState;
+    dispatch_enabled: boolean;
+    draining: boolean;
+    revalidation_required: boolean;
+    notice: string;
+  };
+  sessions: Array<{
+    classification:
+      | "resumable"
+      | "fresh_only"
+      | "blocked"
+      | "uncertain"
+      | "awaiting_approval"
+      | "complete";
+    can_resume_now: boolean;
+    could_resume_after_confirmed_shutdown: boolean;
+    decision: DecisionExplanation;
+  }>;
+}
+export interface RestartResumeResult {
+  operation_id?: string | null;
+  mode: "selected" | "eligible";
+  state: "admitting" | "resumed" | "queued" | "completed";
+  selected_ids: string[];
+  queued_ids: string[];
+  omitted_ids: string[];
+  omitted_count: number;
+  outcomes: Array<
+    { session_id: string; state: string; reason?: string; next_due_at?: string }
+  >;
 }
 export interface PermissionRequest {
   id: string;

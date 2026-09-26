@@ -4,6 +4,7 @@ use crate::domain::{
     WorkflowValidationRequest,
 };
 use crate::operations::Application;
+use crate::protocol::{self, ClientKind, Declaration, Hello, HelloKind};
 use crate::transcript;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
@@ -12,6 +13,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
@@ -27,6 +29,7 @@ const CONTROL_IDLE_READ_DEADLINE: std::time::Duration = std::time::Duration::fro
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlRequest {
     Status,
+    RestartPreview,
     Stop {
         drain: bool,
     },
@@ -246,13 +249,96 @@ pub struct ControlConnection {
 
 impl ControlConnection {
     pub async fn connect(socket: &Path) -> Result<Self> {
+        Self::connect_for_kind(socket, ClientKind::HumanCli).await
+    }
+
+    pub async fn connect_for_kind(socket: &Path, kind: ClientKind) -> Result<Self> {
         let stream = UnixStream::connect(socket)
             .await
             .with_context(|| format!("connect to {}", socket.display()))?;
         set_close_on_exec(stream.as_raw_fd())?;
-        let (reader, writer) = stream.into_split();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let hello = Hello {
+            kind: HelloKind::Hello,
+            declaration: Declaration {
+                generation: protocol::GENERATION,
+                client_kind: kind,
+                required_features: kind
+                    .features()
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect(),
+            },
+        };
+        let mut frame = serde_json::to_vec(&hello)?;
+        frame.push(b'\n');
+        writer.write_all(&frame).await?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            read_control_message(&mut reader),
+        )
+        .await
+        .map_err(|_| anyhow!("Protocol negotiation timed out. {}", protocol::GUIDANCE))??;
+        let response = response.ok_or_else(|| {
+            anyhow!(
+                "The service may be older or may have closed the connection. {}",
+                protocol::GUIDANCE
+            )
+        })?;
+        let response: serde_json::Value = serde_json::from_slice(&response).map_err(|_| {
+            anyhow!(
+                "The service returned an invalid protocol response. {}",
+                protocol::GUIDANCE
+            )
+        })?;
+        if let Some(error) = response.get("protocol_error") {
+            let reason = error
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("malformed");
+            bail!(
+                "Protocol negotiation refused ({reason}). {}",
+                protocol::GUIDANCE
+            );
+        }
+        let descriptor = response.get("descriptor").ok_or_else(|| {
+            anyhow!(
+                "The service may be older or may have closed the connection. {}",
+                protocol::GUIDANCE
+            )
+        })?;
+        let generation = descriptor
+            .get("generation")
+            .and_then(serde_json::Value::as_u64);
+        let instance = descriptor
+            .get("instance_id")
+            .and_then(serde_json::Value::as_str);
+        let version = descriptor
+            .get("server_version")
+            .and_then(serde_json::Value::as_str);
+        let features = descriptor
+            .get("supported_features")
+            .and_then(serde_json::Value::as_array);
+        if response.get("ok") != Some(&serde_json::Value::Bool(true))
+            || generation != Some(protocol::GENERATION as u64)
+            || !instance.is_some_and(|value| !value.is_empty())
+            || !version.is_some_and(|value| !value.is_empty())
+            || !features.is_some_and(|values| {
+                values.iter().all(serde_json::Value::is_string)
+                    && kind
+                        .features()
+                        .iter()
+                        .all(|required| values.iter().any(|value| value.as_str() == Some(required)))
+            })
+        {
+            bail!(
+                "The service returned an incompatible protocol descriptor. {}",
+                protocol::GUIDANCE
+            );
+        }
         Ok(Self {
-            reader: Some(BufReader::new(reader)),
+            reader: Some(reader),
             writer: Some(writer),
         })
     }
@@ -689,6 +775,50 @@ async fn serve_connection(
     idle_read_deadline: std::time::Duration,
 ) -> Result<()> {
     let result = async {
+        let first = tokio::time::timeout(idle_read_deadline, read_control_message(reader))
+            .await
+            .map_err(|_| anyhow!("control connection idle read deadline expired"))?;
+        let first = match first {
+            Ok(first) => first,
+            Err(_) => {
+                let error = protocol::ProtocolError::new("malformed", None);
+                let response = serde_json::json!({"ok":false,"error":error.guidance,"protocol_error":error});
+                write_protocol_response(writer, &response).await?;
+                return Ok(());
+            }
+        };
+        let Some(first) = first else {
+            return Ok(());
+        };
+        let hello: std::result::Result<Hello, protocol::ProtocolError> = if first.len() > protocol::MAX_DECLARATION_BYTES {
+            Err(protocol::ProtocolError::new("malformed", None))
+        } else {
+            serde_json::from_slice(&first).map_err(|_| {
+                let kind = serde_json::from_slice::<serde_json::Value>(&first).ok()
+                    .and_then(|value| value.get("kind").and_then(|kind| kind.as_str()).map(str::to_owned));
+                protocol::ProtocolError::new(if kind.as_deref().is_some_and(|kind| kind != "hello") { "missing" } else { "malformed" }, None)
+            })
+        };
+        let negotiation = hello.and_then(|hello| {
+            if !matches!(hello.declaration.client_kind, ClientKind::HumanCli | ClientKind::Attachment) {
+                return Err(protocol::ProtocolError::new("wrong_client_kind", Some(hello.declaration.generation)));
+            }
+            protocol::validate(&hello.declaration, hello.declaration.client_kind)?;
+            Ok(hello.declaration.client_kind)
+        });
+        let _negotiated = match negotiation {
+            Ok(kind) => {
+                let instance_id = instance.get("instance_id").and_then(serde_json::Value::as_str).unwrap_or_default();
+                let response = serde_json::json!({"ok":true,"descriptor":protocol::Descriptor::new(instance_id.to_owned(), kind)});
+                write_protocol_response(writer, &response).await?;
+                (protocol::GENERATION, kind)
+            }
+            Err(error) => {
+                let response = serde_json::json!({"ok":false,"error":error.guidance,"protocol_error":error});
+                write_protocol_response(writer, &response).await?;
+                return Ok(());
+            }
+        };
         loop {
             let line = tokio::time::timeout(idle_read_deadline, read_control_message(reader))
                 .await
@@ -697,10 +827,54 @@ async fn serve_connection(
                 break;
             };
             debug_assert!(connection.peer_identity.pid > 0);
-            let request: ControlRequest = serde_json::from_slice(&line)?;
-            let response = match dispatch(request, &app, &shutdown, &instance, &mut connection) {
-                Ok(response) => response,
-                Err(error) => ControlResponse::failure(error),
+            let request: ControlRequest = match serde_json::from_slice(&line) {
+                Ok(request) => request,
+                Err(_) => {
+                    let reason = if serde_json::from_slice::<serde_json::Value>(&line).ok()
+                        .and_then(|value| value.get("kind").and_then(|kind| kind.as_str()).map(str::to_owned))
+                        .as_deref() == Some("hello") { "duplicate hello" } else { "malformed control request" };
+                    write_control_response(writer, &ControlResponse::failure(anyhow!(reason))).await?;
+                    break;
+                }
+            };
+            let response = if blocking_control_request(&request) {
+                let permit = Arc::clone(&app.blocking_operations).acquire_owned().await;
+                let blocking_app = app.clone();
+                let blocking_shutdown = shutdown.clone();
+                let blocking_instance = instance.clone();
+                let peer_identity = connection.peer_identity.clone();
+                match permit {
+                    Ok(permit) => match tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let mut stateless_connection = ConnectionState {
+                            peer_identity,
+                            attachment: None,
+                        };
+                        dispatch(
+                            request,
+                            &blocking_app,
+                            &blocking_shutdown,
+                            &blocking_instance,
+                            &mut stateless_connection,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(response)) => response,
+                        Ok(Err(error)) => ControlResponse::failure(error),
+                        Err(error) => ControlResponse::failure(anyhow!(
+                            "control blocking task failed: {error}"
+                        )),
+                    },
+                    Err(_) => ControlResponse::failure(anyhow!(
+                        "blocking operation admission is unavailable"
+                    )),
+                }
+            } else {
+                match dispatch(request, &app, &shutdown, &instance, &mut connection) {
+                    Ok(response) => response,
+                    Err(error) => ControlResponse::failure(error),
+                }
             };
             write_control_response(writer, &response).await?;
         }
@@ -709,6 +883,16 @@ async fn serve_connection(
     .await;
     connection.release_attachment(&app);
     result
+}
+
+async fn write_protocol_response(
+    writer: &mut OwnedWriteHalf,
+    response: &serde_json::Value,
+) -> Result<()> {
+    let mut frame = serde_json::to_vec(response)?;
+    frame.push(b'\n');
+    writer.write_all(&frame).await?;
+    Ok(())
 }
 
 fn set_close_on_exec(fd: RawFd) -> Result<()> {
@@ -740,6 +924,7 @@ fn dispatch(
                 serde_json::json!({"instance": instance, "sessions": app.store.list_sessions()?,"coordinator":app.drain_status()?}),
             )
         }
+        ControlRequest::RestartPreview => ControlResponse::success(app.restart_preview()?),
         ControlRequest::Stop { drain } => {
             if drain {
                 let status = app.begin_drain()?;
@@ -791,13 +976,16 @@ fn dispatch(
             after_epoch,
             after_sequence,
             limit_bytes,
-        } => ControlResponse::success(transcript::read_frames(
-            &app.paths.transcripts,
-            &session_id,
-            after_epoch.as_deref(),
-            after_sequence,
-            limit_bytes,
-        )?),
+        } => {
+            app.store.session_json(&session_id)?;
+            ControlResponse::success(transcript::read_frames(
+                &app.paths.transcripts,
+                &session_id,
+                after_epoch.as_deref(),
+                after_sequence,
+                limit_bytes,
+            )?)
+        }
         ControlRequest::CapabilityAcquireInput {
             session_id,
             owner_id,
@@ -1406,6 +1594,53 @@ fn dispatch(
     }
 }
 
+fn blocking_control_request(request: &ControlRequest) -> bool {
+    match request {
+        ControlRequest::Attach { .. }
+        | ControlRequest::AttachmentTranscript { .. }
+        | ControlRequest::AttachmentRenew { .. }
+        | ControlRequest::AttachmentControlSync
+        | ControlRequest::AttachmentSendInput { .. }
+        | ControlRequest::AttachmentResize { .. }
+        | ControlRequest::AttachmentDetach => false,
+        ControlRequest::Status
+        | ControlRequest::RestartPreview
+        | ControlRequest::Stop { .. }
+        | ControlRequest::CapabilityLaunch { .. }
+        | ControlRequest::CapabilityWorkflowLaunch { .. }
+        | ControlRequest::CapabilityList
+        | ControlRequest::CapabilityInspect { .. }
+        | ControlRequest::CapabilityTranscript { .. }
+        | ControlRequest::CapabilityAcquireInput { .. }
+        | ControlRequest::CapabilityRenewInput { .. }
+        | ControlRequest::CapabilityTakeoverInput { .. }
+        | ControlRequest::CapabilitySendInput { .. }
+        | ControlRequest::CapabilityReleaseInput { .. }
+        | ControlRequest::CapabilityResize { .. }
+        | ControlRequest::CmuxAttachmentFailed { .. }
+        | ControlRequest::CmuxSessionSurfaceFailed { .. }
+        | ControlRequest::CapabilityInterrupt { .. }
+        | ControlRequest::CapabilityResume { .. }
+        | ControlRequest::CapabilityRecordProof { .. }
+        | ControlRequest::HumanCommand { .. }
+        | ControlRequest::SchedulerRunOnce
+        | ControlRequest::SnapshotFreeze { .. }
+        | ControlRequest::SnapshotVerify { .. }
+        | ControlRequest::RoleDispatch { .. }
+        | ControlRequest::TripSetupDispatch { .. }
+        | ControlRequest::RoleSwitchFinish { .. }
+        | ControlRequest::RoleResume { .. }
+        | ControlRequest::RestartResume { .. }
+        | ControlRequest::RoleSwitchRequest { .. }
+        | ControlRequest::GuidanceDeliver { .. }
+        | ControlRequest::State
+        | ControlRequest::Diagnostics { .. }
+        | ControlRequest::CheckRun { .. }
+        | ControlRequest::LegacyPreview { .. }
+        | ControlRequest::LegacyImport { .. } => true,
+    }
+}
+
 fn signal_shutdown(shutdown: &watch::Sender<bool>) -> Result<()> {
     match shutdown.send(true) {
         Ok(()) => Ok(()),
@@ -1630,6 +1865,67 @@ mod tests {
         drop(connection);
         let app = Application::new(paths, store, std::env::current_exe().unwrap()).unwrap();
         (root, app, binding)
+    }
+
+    #[test]
+    fn transcript_request_rejects_outside_path_without_mutating_sentinel() {
+        let (root, app, _) = control_test_application();
+        let outside = root.join("outside.jsonl");
+        let sentinel = b"malformed control transcript sentinel";
+        std::fs::write(&outside, sentinel).unwrap();
+        let (shutdown, _) = watch::channel(false);
+        let mut connection = ConnectionState {
+            peer_identity: PeerProcessIdentity::new(1, "control-transcript-test".into()).unwrap(),
+            attachment: None,
+        };
+        let _error = dispatch(
+            ControlRequest::CapabilityTranscript {
+                session_id: "../outside".to_owned(),
+                after_epoch: None,
+                after_sequence: 0,
+                limit_bytes: 1024,
+            },
+            &app,
+            &shutdown,
+            &serde_json::json!({}),
+            &mut connection,
+        )
+        .unwrap_err();
+        assert_eq!(std::fs::read(&outside).unwrap(), sentinel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn attachment_stateful_requests_remain_on_the_ordered_connection_path() {
+        let requests = [
+            ControlRequest::Attach {
+                session_id: "session".into(),
+                owner_id: "owner".into(),
+                seconds: 30,
+                takeover: false,
+                view_only: true,
+                expected_binding: None,
+                cmux_route_id: None,
+                cmux_surface_route_id: None,
+                cmux_binding_revision: None,
+            },
+            ControlRequest::AttachmentTranscript {
+                after_epoch: None,
+                after_sequence: 0,
+                limit_bytes: 1024,
+            },
+            ControlRequest::AttachmentRenew { seconds: 30 },
+            ControlRequest::AttachmentControlSync,
+            ControlRequest::AttachmentSendInput {
+                data_base64: "eA==".into(),
+            },
+            ControlRequest::AttachmentResize { rows: 24, cols: 80 },
+            ControlRequest::AttachmentDetach,
+        ];
+        assert!(requests
+            .iter()
+            .all(|request| !blocking_control_request(request)));
+        assert!(blocking_control_request(&ControlRequest::Status));
     }
 
     fn open_persistent_surface(
@@ -1940,18 +2236,164 @@ mod tests {
     async fn control_socket_client_listener_and_accepted_descriptors_are_close_on_exec() {
         let (root, app, _) = control_test_application();
         let listener = bind(&app).unwrap();
-        let client = ControlConnection::connect(&app.paths.control_socket)
-            .await
-            .unwrap();
-        let accepted = accept_control_stream(&listener).await.unwrap();
         assert!(close_on_exec(listener.as_raw_fd()));
+        let accepted = async {
+            let mut accepted = accept_control_stream(&listener).await.unwrap();
+            let accepted_close_on_exec = close_on_exec(accepted.as_raw_fd());
+            let mut frame = Vec::new();
+            BufReader::new(&mut accepted)
+                .read_until(b'\n', &mut frame)
+                .await
+                .unwrap();
+            assert!(serde_json::from_slice::<Hello>(&frame).is_ok());
+            let response = serde_json::json!({"ok":true,"descriptor":protocol::Descriptor::new("fixture".into(), ClientKind::HumanCli)});
+            let mut encoded = serde_json::to_vec(&response).unwrap();
+            encoded.push(b'\n');
+            accepted.write_all(&encoded).await.unwrap();
+            accepted_close_on_exec
+        };
+        let (client, accepted_close_on_exec) = tokio::join!(
+            ControlConnection::connect(&app.paths.control_socket),
+            accepted
+        );
+        let client = client.unwrap();
         assert!(close_on_exec(
             client.writer.as_ref().unwrap().as_ref().as_raw_fd()
         ));
-        assert!(close_on_exec(accepted.as_raw_fd()));
-        drop(accepted);
+        assert!(accepted_close_on_exec);
         drop(client);
         drop(listener);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn hello_refuses_business_first_and_duplicate_without_dispatch() {
+        let (root, app, _) = control_test_application();
+        let (shutdown, _) = watch::channel(false);
+        for (first, reason) in [
+            (br#"{"kind":"status"}"#.as_slice(), "missing"),
+            (br#"{"kind":"hello","generation":2,"client_kind":"human_cli","required_features":[]}"#.as_slice(), "incompatible_generation"),
+            (br#"{"kind":"hello","generation":0,"client_kind":"human_cli","required_features":[]}"#.as_slice(), "incompatible_generation"),
+            (br#"{"kind":"hello","generation":1,"client_kind":"browser","required_features":[]}"#.as_slice(), "wrong_client_kind"),
+            (br#"{"kind":"hello","generation":1,"client_kind":"human_cli","required_features":["native_provider_supported"]}"#.as_slice(), "missing_required_feature"),
+            (br#"{"kind":"hello","generation":1,"client_kind":"human_cli","required_features":[],"extra":true}"#.as_slice(), "malformed"),
+        ] {
+            let (server, client) = UnixStream::pair().unwrap();
+            let (server_reader, mut server_writer) = server.into_split();
+            let app = app.clone();
+            let shutdown = shutdown.clone();
+            let task = tokio::spawn(async move {
+                serve_connection(
+                    &mut BufReader::new(server_reader), &mut server_writer,
+                    app, shutdown, serde_json::json!({"instance_id":"fixture"}),
+                    ConnectionState {
+                        peer_identity: PeerProcessIdentity::new(1, "fixture".into()).unwrap(),
+                        attachment: None,
+                    },
+                    std::time::Duration::from_secs(1),
+                ).await
+            });
+            let (client_reader, mut client_writer) = client.into_split();
+            let mut client_reader = BufReader::new(client_reader);
+            client_writer.write_all(first).await.unwrap();
+            client_writer.write_all(b"\n").await.unwrap();
+            let mut response = Vec::new();
+            client_reader.read_until(b'\n', &mut response).await.unwrap();
+            let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+            assert_eq!(response["protocol_error"]["reason"], reason);
+            assert_eq!(client_reader.read_u8().await.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+            task.await.unwrap().unwrap();
+        }
+
+        let (server, client) = UnixStream::pair().unwrap();
+        let (server_reader, mut server_writer) = server.into_split();
+        let server_app = app.clone();
+        let task = tokio::spawn(async move {
+            serve_connection(
+                &mut BufReader::new(server_reader),
+                &mut server_writer,
+                server_app,
+                shutdown,
+                serde_json::json!({"instance_id":"fixture"}),
+                ConnectionState {
+                    peer_identity: PeerProcessIdentity::new(1, "fixture".into()).unwrap(),
+                    attachment: None,
+                },
+                std::time::Duration::from_secs(1),
+            )
+            .await
+        });
+        let (client_reader, mut client_writer) = client.into_split();
+        let mut client_reader = BufReader::new(client_reader);
+        let hello = b"{\"kind\":\"hello\",\"generation\":1,\"client_kind\":\"human_cli\",\"required_features\":[\"control_requests_v1\"]}\n";
+        client_writer.write_all(hello).await.unwrap();
+        let mut response = Vec::new();
+        client_reader
+            .read_until(b'\n', &mut response)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response).unwrap()["ok"],
+            true
+        );
+        client_writer
+            .write_all(b"{\"kind\":\"status\"}\n")
+            .await
+            .unwrap();
+        response.clear();
+        client_reader
+            .read_until(b'\n', &mut response)
+            .await
+            .unwrap();
+        assert!(
+            serde_json::from_slice::<ControlResponse>(&response)
+                .unwrap()
+                .ok
+        );
+        client_writer.write_all(hello).await.unwrap();
+        response.clear();
+        client_reader
+            .read_until(b'\n', &mut response)
+            .await
+            .unwrap();
+        assert!(
+            !serde_json::from_slice::<ControlResponse>(&response)
+                .unwrap()
+                .ok
+        );
+        assert_eq!(
+            client_reader.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        task.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn closed_older_server_does_not_receive_a_business_request() {
+        let (root, app, _) = control_test_application();
+        let listener = bind(&app).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut first = Vec::new();
+            reader.read_until(b'\n', &mut first).await.unwrap();
+            assert!(serde_json::from_slice::<Hello>(&first).is_ok());
+            let mut second = Vec::new();
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                reader.read_until(b'\n', &mut second),
+            )
+            .await
+            .is_err());
+        });
+        let error = ControlConnection::connect(&app.paths.control_socket)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("may be older or may have closed"));
+        server.await.unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2025,6 +2467,13 @@ mod tests {
         });
         let (client_reader, mut client_writer) = client.into_split();
         let mut client_reader = BufReader::new(client_reader);
+        client_writer.write_all(b"{\"kind\":\"hello\",\"generation\":1,\"client_kind\":\"attachment\",\"required_features\":[\"attachment_v1\"]}\n").await.unwrap();
+        let mut descriptor = Vec::new();
+        client_reader
+            .read_until(b'\n', &mut descriptor)
+            .await
+            .unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&descriptor).unwrap()["ok"] == true);
         for _ in 0..3 {
             client_writer
                 .write_all(b"{\"kind\":\"status\"}\n")

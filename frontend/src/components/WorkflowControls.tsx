@@ -8,6 +8,7 @@ import {
 } from "../api";
 import type {
   ContinuationAction,
+  DecisionExplanation,
   Project,
   Session,
   SwitchIntent,
@@ -23,6 +24,7 @@ export function WorkflowControls(
     sessions = [],
     switches = [],
     actions = [],
+    decision,
     onChanged,
     onOpenSetup = () => {},
   }: {
@@ -32,6 +34,7 @@ export function WorkflowControls(
     sessions?: Session[];
     switches?: SwitchIntent[];
     actions?: ContinuationAction[];
+    decision?: DecisionExplanation;
     onChanged: () => void;
     onOpenSetup?: (projectId: string) => void;
   },
@@ -204,6 +207,10 @@ export function WorkflowControls(
         "recover_ownership",
       ].includes(action.kind)
     );
+  const allows = (controlName: string) =>
+    decision
+      ? decision.control_policy.allowed_controls.includes(controlName)
+      : !projectedControlsBlocked;
   const actionValue = (action: ContinuationAction, key: string) => {
     const value = action.binding[key];
     return typeof value === "string" ? value : undefined;
@@ -374,13 +381,26 @@ export function WorkflowControls(
   };
 
   return (
-    <section className="panel controls">
+    <section
+      className="panel controls"
+      data-attention-target={attemptId ? `attempt:${attemptId}` : undefined}
+      tabIndex={-1}
+    >
       <header>
         <h3>Workflow controls</h3>
         <span>
           {task.active_attempt?.phase?.replaceAll("_", " ") || task.lifecycle}
         </span>
       </header>
+      {decision && (
+        <p className="hint">
+          {decision.primary_blocker?.message ||
+            decision.reason_code.replaceAll("_", " ")}. Owner:{" "}
+          {decision.ownership.owner}. {decision.next_action
+            ? `Next: ${decision.next_action.operation.replaceAll("_", " ")}.`
+            : "No current action is offered."}
+        </p>
+      )}
       {terminal
         ? (
           <p className="hint">
@@ -388,67 +408,70 @@ export function WorkflowControls(
           </p>
         )
         : task.lifecycle === "backlog"
-        ? projectedControlsBlocked
-          ? (
-            <p className="hint">
-              Use the exact continuation action below before normal admission
-              controls.
-            </p>
-          )
-          : (
-            <div className="button-row">
-              <button
-                className="primary"
-                disabled={!!busy || project?.trip?.readiness !== "ready"}
-                title={project?.trip?.readiness !== "ready"
-                  ? project?.trip?.reason
-                  : undefined}
-                onClick={() => send("make_ready")}
-              >
-                Make Ready
-              </button>
-              {project && project.trip?.readiness !== "ready" && (
-                <button onClick={() => onOpenSetup(project.id)}>
+        ? (
+          <div className="button-row">
+            <button
+              className="primary"
+              disabled={!!busy || !allows("make_ready")}
+              title={decision?.control_policy.disabled_reason_code
+                ? decision.primary_blocker?.message ||
+                  decision.control_policy.disabled_reason_code
+                : project?.trip?.readiness !== "ready"
+                ? project?.trip?.reason
+                : undefined}
+              onClick={() => send("make_ready")}
+            >
+              Make Ready
+            </button>
+            {project && (project.trip?.readiness !== "ready" ||
+              decision?.next_action?.operation === "inspect_project") &&
+              (
+                <button
+                  onClick={() =>
+                    onOpenSetup(
+                      decision?.next_action?.binding.project_id || project.id,
+                    )}
+                >
                   Open project setup
                 </button>
               )}
-            </div>
-          )
+          </div>
+        )
         : (
           <div className="button-row">
             <button
-              disabled={!!busy || projectedControlsBlocked}
+              disabled={!!busy || !allows("continue")}
               onClick={() => control("continue")}
             >
               Continue
             </button>
             <button
-              disabled={!!busy || projectedControlsBlocked}
+              disabled={!!busy || !allows("run_next")}
               onClick={() => control("run_next")}
             >
               Run next
             </button>
             <button
-              disabled={!!busy || projectedControlsBlocked}
+              disabled={!!busy || !allows("pause_after_role")}
               onClick={() => control("pause_after_role")}
             >
               Pause after role
             </button>
             <button
-              disabled={!!busy || projectedControlsBlocked}
+              disabled={!!busy || !allows("pause_now")}
               onClick={() => control("pause_now")}
             >
               Pause now
             </button>
             <button
-              disabled={!!busy || projectedControlsBlocked}
+              disabled={!!busy || !allows("retry")}
               onClick={() => control("retry")}
             >
               Retry
             </button>
             <button
               className="danger"
-              disabled={!!busy || projectedControlsBlocked}
+              disabled={!!busy || !allows("cancel")}
               onClick={() => control("cancel")}
             >
               Cancel
@@ -549,6 +572,11 @@ export function WorkflowControls(
             <article
               className="review-row"
               key={`${action.kind}:${action.operation}:${index}`}
+              data-attention-target={typeof action.binding.session_id ===
+                  "string"
+                ? `session:${action.binding.session_id}`
+                : undefined}
+              tabIndex={-1}
             >
               <strong>{action.kind.replaceAll("_", " ")}</strong>
               <span>{action.reason}</span>

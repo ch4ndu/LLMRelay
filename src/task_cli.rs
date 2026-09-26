@@ -6,9 +6,13 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
+
+const MAX_FIRST_FRAME_CONNECTIONS: usize = 64;
+const FIRST_FRAME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RoleRequest {
@@ -80,9 +84,36 @@ pub fn bind(app: &Application) -> Result<UnixListener> {
 pub async fn serve_bound(
     app: Application,
     listener: UnixListener,
-    mut stop: watch::Receiver<bool>,
+    stop: watch::Receiver<bool>,
 ) -> Result<()> {
+    serve_bound_with_limits(
+        app,
+        listener,
+        stop,
+        MAX_FIRST_FRAME_CONNECTIONS,
+        FIRST_FRAME_DEADLINE,
+    )
+    .await
+}
+
+async fn serve_bound_with_limits(
+    app: Application,
+    listener: UnixListener,
+    mut stop: watch::Receiver<bool>,
+    max_first_frame_connections: usize,
+    first_frame_deadline: std::time::Duration,
+) -> Result<()> {
+    let first_frame_admission = Arc::new(Semaphore::new(max_first_frame_connections));
     loop {
+        let permit = tokio::select! {
+            permit = Arc::clone(&first_frame_admission).acquire_owned() => {
+                permit.map_err(|_| anyhow::anyhow!("role first-frame admission closed"))?
+            }
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() { return Ok(()) }
+                continue
+            }
+        };
         let stream = tokio::select! {
             accepted = listener.accept() => accepted?.0,
             changed = stop.changed() => {
@@ -91,21 +122,48 @@ pub async fn serve_bound(
             }
         };
         let app = app.clone();
+        let connection_stop = stop.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle(stream, app).await {
+            if let Err(error) =
+                handle(stream, app, connection_stop, first_frame_deadline, permit).await
+            {
                 tracing::warn!(error = %error, "role request failed");
             }
         });
     }
 }
 
-async fn handle(stream: UnixStream, app: Application) -> Result<()> {
+async fn handle(
+    stream: UnixStream,
+    app: Application,
+    mut stop: watch::Receiver<bool>,
+    first_frame_deadline: std::time::Duration,
+    first_frame_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<()> {
     let peer_pid = peer_pid(&stream)?;
     let connection_nonce = uuid::Uuid::new_v4().to_string();
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    (&mut reader).take(1024 * 1024).read_line(&mut line).await?;
+    let first_frame_result = {
+        let mut bounded_reader = (&mut reader).take(1024 * 1024);
+        let first_frame =
+            tokio::time::timeout(first_frame_deadline, bounded_reader.read_line(&mut line));
+        tokio::pin!(first_frame);
+        loop {
+            tokio::select! {
+                biased;
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        return Ok(())
+                    }
+                }
+                result = &mut first_frame => break result,
+            }
+        }
+    };
+    first_frame_result.map_err(|_| anyhow::anyhow!("role first-frame deadline expired"))??;
+    drop(first_frame_permit);
     let request: RoleRequest = serde_json::from_str(&line)?;
     let operation_kind = match &request.operation {
         RoleOperation::Context => "context",
@@ -361,4 +419,129 @@ fn peer_pid(stream: &UnixStream) -> Result<u32> {
         return Err(std::io::Error::last_os_error()).context("read role peer credentials");
     }
     Ok(credentials.pid as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::InstancePaths;
+    use crate::store::Store;
+
+    fn test_application() -> (std::path::PathBuf, Application) {
+        let root = std::env::temp_dir().join(format!(
+            "agenticjira-role-admission-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = InstancePaths::resolve(Some(root.clone())).unwrap();
+        paths.create().unwrap();
+        let store = Store::open(&paths.database).unwrap();
+        let app = Application::new(paths, store, std::env::current_exe().unwrap()).unwrap();
+        (root, app)
+    }
+
+    #[tokio::test]
+    async fn first_frame_timeout_releases_admission_for_the_next_connection() {
+        let (root, app) = test_application();
+        let socket = app.paths.role_socket.clone();
+        let listener = bind(&app).unwrap();
+        let (stop_tx, stop) = watch::channel(false);
+        let server = tokio::spawn(serve_bound_with_limits(
+            app,
+            listener,
+            stop,
+            1,
+            std::time::Duration::from_millis(50),
+        ));
+        let _parked = UnixStream::connect(&socket).await.unwrap();
+        let mut next = UnixStream::connect(&socket).await.unwrap();
+        next.write_all(b"{\"credential\":\"unknown\",\"kind\":\"context\"}\n")
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(next);
+        let mut line = String::new();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            reader.read_line(&mut line),
+        )
+        .await
+        .is_err());
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            reader.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response: RoleResponse = serde_json::from_str(&line).unwrap();
+        assert!(!response.ok);
+        stop_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn first_frame_disconnect_releases_admission_for_the_next_connection() {
+        let (root, app) = test_application();
+        let socket = app.paths.role_socket.clone();
+        let listener = bind(&app).unwrap();
+        let (stop_tx, stop) = watch::channel(false);
+        let server = tokio::spawn(serve_bound_with_limits(
+            app,
+            listener,
+            stop,
+            1,
+            std::time::Duration::from_secs(60),
+        ));
+        let disconnected = UnixStream::connect(&socket).await.unwrap();
+        drop(disconnected);
+        let mut next = UnixStream::connect(&socket).await.unwrap();
+        next.write_all(b"{\"credential\":\"unknown\",\"kind\":\"context\"}\n")
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(next);
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            reader.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response: RoleResponse = serde_json::from_str(&line).unwrap();
+        assert!(!response.ok);
+        stop_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_a_parked_first_frame_reader() {
+        let (root, app) = test_application();
+        let socket = app.paths.role_socket.clone();
+        let listener = bind(&app).unwrap();
+        let (stop_tx, stop) = watch::channel(false);
+        let server = tokio::spawn(serve_bound_with_limits(
+            app,
+            listener,
+            stop,
+            1,
+            std::time::Duration::from_secs(60),
+        ));
+        let client = UnixStream::connect(&socket).await.unwrap();
+        tokio::task::yield_now().await;
+        stop_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            reader.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(read, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

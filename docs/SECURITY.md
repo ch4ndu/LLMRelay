@@ -4,6 +4,26 @@
 
 This guide describes the implemented native CLI permission boundaries. Setup and ordinary runtime proof remain separate; see [project setup](PROJECT_SETUP.md).
 
+## Recovery and decision authority
+
+Dashboard state waits use the same browser cookie, Host and Origin checks as
+ordinary state reads. Their service-identity/revision cursor is presentation
+metadata, not approval or execution authority. Responses use the existing
+redacted state projection. Waits are capped at 64; backing database reads retain
+their capacity slot after cancellation until the read finishes. Shutdown closes
+wait responses with a retryable failure rather than granting continued authority.
+Every mutation still validates its own exact identity and revision independently
+of the dashboard's snapshot or attention navigation.
+
+Decision explanations and restart previews convey no launch or recovery authority.
+Recovery mutations require the exact displayed record and matching task, attempt,
+session and version; stale or mismatched requests cannot resolve another record.
+Bulk restoration saves its bounded membership and operation receipt before
+provider work, then revalidates each admission. A timer cannot reset ownership,
+human approvals, consumed membership, failure limits or uncertain delivery.
+Preview reads do not reconcile processes or change saved authority, and unknown
+environment evidence is never reported as proof of safety.
+
 ## Supported Codex installation
 
 The v1 Codex path additionally requires exact `codex-cli 0.155.1`, the ordinary native CLI signed in through file-backed personal ChatGPT Free/Plus/Pro credentials, no parent `CODEX_HOME`, no shared app-server control socket or cloud-config bundle cache beneath `~/.codex`, and no `/etc/codex/managed_config.toml` or `/etc/codex/requirements.toml`. On macOS the native managed preferences `config_toml_base64` and `requirements_toml_base64` under `com.openai.codex` must also be absent. LLMRelay reports an actionable preflight error for an unsupported form; it does not modify provider configuration, credentials, organization policy, or native approvals to make the check pass.
@@ -73,3 +93,52 @@ realtime conversation are explicitly disabled in the qualified launch. Local
 system, user, or project configuration enabling these excluded features is
 rejected during preflight; default-off settings alone are not the boundary.
 The disabled feature list participates in the capability identity.
+
+## Database restore confidentiality and authority
+
+Database restore points contain sensitive application state, unlike sanitized
+diagnostic exports. Keep their private directories and quarantine under the
+instance owner's control. Manifest hashes detect corruption; they do not prove
+authenticity against an actor who can replace both the database and its manifest.
+Restore trusts the operator's selected backup. Encryption and signing are not
+provided by this milestone.
+
+Restoring a snapshot invalidates old credentials, permission rules and launch/
+resume authority before service execution becomes available. A durable hold
+survives restarts until verified reconciliation and explicit offline release.
+Missing inventory requires positive OS reboot evidence, never operator assertion.
+Release preserves paused work. See [database operations](OPERATIONS.md#database-restore-points).
+
+## Bundled provider compatibility
+
+Provider compatibility manifests are embedded in the executable. They select
+reviewed compiled contracts; they cannot supply command arguments, environment
+overrides or executable policy. Matching a contract does not qualify a native
+profile or bypass sandbox, hook, credential and launch-identity checks.
+
+Effective contract identity is bound to capability and launch evidence. Descriptive
+bundle metadata is separate from authority. Missing historical bindings remain
+visible but do not authorize current execution. Synthetic compatibility contexts
+are restricted to fixture constructors and cannot launch provider processes.
+
+## Local transport compatibility gate
+
+Protocol generation and feature declarations supplement authentication. Browser
+Host/Origin/session checks precede protocol validation, and validation precedes
+operational request extraction and dispatch. Bootstrap and static assets remain
+available without negotiation; descriptor discovery still requires authentication.
+The control socket admits the OS peer and checks managed-process ancestry before
+reading Hello. A compatible declaration cannot elevate a role process to human
+authority or replace exact attachment bindings and input leases. The separate
+role-agent socket keeps its existing contract.
+
+## Recipe and schedule authority
+
+Recipe/profile mutations use authenticated human commands with optimistic revisions
+and operation receipts. Saving a profile performs structural validation, not native
+qualification. Materialization copies task content and role settings into a backlog
+draft without copying capability proofs, activations, approval or launch authority.
+Workflow/configuration pins and required checks are revalidated at Ready and claim;
+only the current Manager selects checks. Internal setup projects cannot receive
+recipe intake. Scheduled fire records, task insertion, provenance and next-fire
+advancement are transactional, with a unique schedule/time identity.

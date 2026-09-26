@@ -338,6 +338,11 @@ impl Supervisor {
         transcript_epoch: &str,
         launch: &PreparedLaunch,
     ) -> std::result::Result<ProcessIdentity, SpawnFailure> {
+        if self.store.compatibility_bundles.is_synthetic() {
+            return Err(SpawnFailure::proven(
+                "synthetic compatibility context cannot spawn a native provider",
+            ));
+        }
         let transcript =
             TranscriptSink::create(&self.transcripts_root, session_id, transcript_epoch)
                 .map_err(SpawnFailure::proven)?;
@@ -2466,6 +2471,52 @@ fn newly_spawned_service_descendants(
 mod tests {
     use super::*;
 
+    #[test]
+    fn synthetic_compatibility_cannot_reach_spawn_side_effects() {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-synthetic-spawn-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&root.join("state.sqlite3"))
+            .unwrap()
+            .with_synthetic_compatibility_for_tests("{}", "{}");
+        let transcripts = root.join("transcripts");
+        let supervisor = Supervisor::new(store, transcripts.clone());
+        let config = crate::domain::LaunchConfig {
+            provider: Provider::Codex,
+            role: crate::domain::RoleKind::Manager,
+            executable: "/fixture/no-native-process".into(),
+            executable_version: "fixture".into(),
+            model: "fixture".into(),
+            effort: "fixture".into(),
+            cwd: root.clone(),
+            argv: Vec::new(),
+            environment_keys: Vec::new(),
+            permission_policy: "fixture".into(),
+            security_policy: serde_json::json!({}),
+            hook_revision: "fixture".into(),
+            capability_status: crate::domain::CapabilityStatus::Unverified,
+            compatibility: None,
+        };
+        let launch = PreparedLaunch {
+            config,
+            executable: "/fixture/no-native-process".into(),
+            arguments: Vec::new(),
+            environment: Vec::new(),
+            supervision_executable: "/fixture/no-wrapper".into(),
+        };
+        let error = supervisor
+            .spawn(
+                "fixture-session",
+                "fixture-generation",
+                "fixture-epoch",
+                &launch,
+            )
+            .unwrap_err();
+        assert!(error.reason().contains("synthetic compatibility context"));
+        assert!(!transcripts.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[derive(Debug)]
     struct RunningChild {
         kill_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -3425,6 +3476,7 @@ mod tests {
             security_policy: serde_json::json!({}),
             hook_revision: "fixture".into(),
             capability_status: crate::domain::CapabilityStatus::Unverified,
+            compatibility: None,
         };
         let manager_projection = crate::workflow::state(&manager_store).unwrap();
         assert!(manager_projection

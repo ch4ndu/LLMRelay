@@ -2,6 +2,24 @@
 
 Decision recorded: September 18, 2026.
 
+Initial-v1 boundary updated September 23, 2026: the user explicitly excludes
+deferred milestones from v1 completion. M2, M3, M8B and native notifications are
+post-v1. M7 and M8A engineering verification is complete; M8A local packaging is
+complete. M9 engineering verification is complete; its local packaging is complete.
+The bounded M5 path-normalization repair and consolidated initial-v1 automated
+verification passed September 25. All agreed initial-v1 engineering milestones
+are complete. M4A/M4B, M5 and the M6 dashboard slice are verified.
+Hands-on acceptance and deferred native qualification remain explicit evidence
+boundaries, not completed checks. See [current scope](NEXT_MILESTONE_PLAN.md#initial-v1-scope-decision--september-23-2026).
+
+September 22 planning update: the user selected the Herdr/Jinn-derived work as
+the next product scope and deferred personal hands-on acceptance until the
+selected feature set is incorporated. See [the proposed delivery sequence and
+milestone 4A implementation plan](NEXT_MILESTONE_PLAN.md). Engineering verification
+continues at each checkpoint. Historical status and gates below describe the
+earlier decisions; the new plan proposes their ordering and acceptance changes
+without claiming implementation approval or completed user validation.
+
 The selected direction combines a per-user macOS LaunchAgent (option A) with
 a later menu-bar application backed by that same service (option D). Deliver
 A first, then D. Both are deferred while the user validates the current service
@@ -96,7 +114,9 @@ the background-service milestone. No automatic transition to implementation.
 
 ## Milestone 2 — Per-user macOS background service (A)
 
-**Status: selected direction; deferred until milestone 1 is accepted.**
+**Status: selected direction; explicitly deferred from the unattended run by the
+user on 2026-09-23. Revisit after the user returns; service-flow acceptance remains
+pending.**
 
 Run the engine as a LaunchAgent under the signed-in user's account, independent
 of the terminal that starts it. Keep the browser dashboard and native CLI agent
@@ -133,7 +153,8 @@ documentation.
 
 ## Milestone 3 — Menu-bar companion (D)
 
-**Status: selected follow-on; deferred until milestone 2 is validated.**
+**Status: selected follow-on; explicitly deferred from the unattended run by the
+user on 2026-09-23. Milestone 2 validation remains a dependency.**
 
 Add a native menu-bar interface that controls the same LaunchAgent and opens
 the existing browser dashboard.
@@ -175,6 +196,15 @@ Research snapshots used for this comparison:
 ### Milestone 4 — Durable state protection and recovery rehearsal
 
 **Candidate priority: highest.**
+
+**Engineering status (2026-09-23): approved current-schema M4A and crash-boundary
+M4B scope complete.** M4B passed independent code and fresh final review, 44 Rust
+unit tests, 78 contract tests and two runtime tests; unchanged frontend checks
+remain valid. Coverage uses durable-state reconstruction and four bounded test
+hooks, not physical power-loss or live-provider crash claims. Historical migration
+rehearsal remains outside the user-selected fresh-install scope. Hands-on user
+acceptance and installation remain deferred. See [the M4B plan](MILESTONE_4B_PLAN.md)
+for the precise accepted scope and [operations](OPERATIONS.md) for recovery actions.
 
 LLMRelay already opens SQLite with foreign keys, WAL, `synchronous=FULL`, and a
 busy timeout. Its startup path then runs migrations directly. Add a recovery
@@ -246,6 +276,21 @@ decision or authorizing milestone 4 work.
 
 ### Milestone 5 — Explainable holds, guarded retries, and restart readiness
 
+**Implementation verified on September 22, 2026.** The approved scope in
+[Milestone 5 plan](MILESTONE_5_PLAN.md) passed independent ordinary and fresh final
+reviews, the Rust/DOM verification matrix, and focused repair checks. Personal
+hands-on acceptance remains deferred. Next is milestone 4B crash-boundary planning;
+this result does not establish recovery at every crash boundary.
+
+Capability path-boundary follow-up, September 25: the bounded repair now replaces
+only complete working-directory/denial roots and descendants, preserving lexical
+siblings such as `/fixture/control.sock` beside `/fixture/c`. Focused public
+identity/key tests preserve Claude rule syntax, probe-policy equivalence and raw
+reservation drift checks. The earlier repo-name fixture explanation was inaccurate;
+those fixtures do not cover capability identity. Ordinary and fresh final reviews approved; integrated verification passed
+29 DOM, 67 library, 103 contract and 2 runtime tests. See the
+[repair plan](CAPABILITY_PATH_BOUNDARY_PLAN.md).
+
 **Candidate priority: highest, after the durable-state foundation.**
 
 Turn LLMRelay's existing transition guards, capability checks, claims, restart
@@ -316,7 +361,13 @@ state.
 
 **Candidate priority: high after milestones 4 and 5.**
 
-The dashboard currently refreshes its full state every two seconds while the
+Engineering status: live-state/attention slice complete, with ordinary and fresh
+final approval and integrated verification (15 DOM, 51 Rust library, 84 contract,
+and 2 runtime tests, plus formatting, type checking and builds). Native OS
+notifications, delivery/deduplication and OS acceptance remain deferred under the
+unattended-work decision. This is not completion of the entire original M6 scope.
+
+Before this milestone, the dashboard refreshed full state every two seconds while the
 coordinator reconciles every second. Keep periodic reconciliation as a safety
 net, but add a revisioned event path so the UI can react quickly without treating
 delivery as durable truth. Start with a monotonic state revision and the existing
@@ -367,6 +418,12 @@ fault injection.
 
 ### Milestone 7 — Versioned provider compatibility packs
 
+**Engineering status (2026-09-25): ordinary and fresh final review plus integrated
+verification passed; the engineering slice is locally packaged and complete.** Native six-role
+qualification remains deferred. The initial Claude pack has no production selector;
+synthetic fixtures do not establish usable native Claude support. The approved
+[M7 plan](MILESTONE_7_PLAN.md) narrows the candidate description below.
+
 **Candidate priority: medium.**
 
 LLMRelay already records the adapter name and hash and requires exact local
@@ -380,9 +437,10 @@ Planned scope:
   supported provider. It may describe executable identity and version range,
   launch and resume syntax, model-discovery behavior, supported hooks/events,
   credential type, sandbox and permission requirements, and fixture expectations.
-  Include its version and hash in the existing capability key. It ships inside
-  the signed application artifact and does not need a second signing pipeline.
-- Bind each active role profile and capability proof to the manifest revision in
+  Bind the effective selected contract hash in the existing capability key; keep
+  descriptive pack revision and full bundle hash separate as provenance. The pack
+  ships in the executable and needs no independent update or signing pipeline.
+- Bind each active role profile and capability proof to the effective contract in
   addition to the executable and adapter hashes. Changed compatibility policy
   invalidates only the evidence whose effective contract changed.
 - Add a compatibility explanation showing the matched pack, failed predicate,
@@ -409,6 +467,11 @@ specific reason; stale evidence cannot satisfy the new pack; and no compatibilit
 update can silently weaken sandbox or approval policy.
 
 ### Milestone 8 — Stable local client protocol and verified distribution
+
+M8A source approved September 25: generation-1 local browser/CLI/attachment
+negotiation, authenticated compatibility refusals, and existing authority checks.
+The stable matrix passed 22 DOM, 65 library, 91 contract, and 2 runtime tests.
+Local packaging is complete. M8B signing/update activation remains post-v1.
 
 **Candidate priority: medium, naturally aligned with the background service and
 menu-bar work.**
@@ -457,7 +520,15 @@ enough.
 
 ### Milestone 9 — Reusable task recipes without an organization model
 
-**Candidate priority: later product fit; validate demand before implementation.**
+**Status: engineering implementation verified September 25; local packaging complete.**
+
+Delivered immutable project profile sets and task recipes, draft-only creation, and
+explicitly enabled daily/weekly UTC foreground intake. Ordinary and fresh final
+reviews approved after one final repair. Verification: 29 DOM, 67 library, 100
+contract and 2 runtime tests; typecheck, frontend build, Rust formatting/check pass.
+Live-service, provider and hands-on acceptance remain separate. The original
+research scope below is historical; [the approved plan](MILESTONE_9_PLAN.md) defines
+the delivered boundary.
 
 Jinn's company metaphor is not LLMRelay's paradigm. The reusable parts can be
 expressed in project and task terms without employees, departments, ranks, a COO,

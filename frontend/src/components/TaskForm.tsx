@@ -1,5 +1,5 @@
 import { type FormEvent, useEffect, useRef, useState } from "react";
-import { command, operationId } from "../api";
+import { ApiError, command, operationId } from "../api";
 import { ModelSelector } from "./ModelSelector";
 import {
   type Project,
@@ -26,6 +26,18 @@ export interface TaskDraft {
 
 export type TaskRoleDraft = Omit<RoleConfig, "provider"> & {
   provider: Provider | "";
+};
+
+type PendingTaskOperation = { body: string; id: string };
+type TaskCreateRequest = {
+  kind: "create_task";
+  project_id: string;
+  title: string;
+  description: string;
+  acceptance_criteria: string[];
+  priority: number;
+  ready: boolean;
+  role_overrides: Partial<Record<Role, RoleConfig>>;
 };
 
 const blank = (project = ""): TaskDraft => ({
@@ -60,6 +72,45 @@ const normalizeRole = (value: unknown): TaskRoleDraft | undefined => {
     model: typeof value.model === "string" ? value.model : "",
     effort: typeof value.effort === "string" ? value.effort : "",
   };
+};
+
+const pendingCreateRequest = (
+  pending: PendingTaskOperation | undefined,
+): TaskCreateRequest | undefined => {
+  if (!pending) return undefined;
+  try {
+    const value: unknown = JSON.parse(pending.body);
+    if (
+      !isRecord(value) || value.kind !== "create_task" ||
+      Object.keys(value).sort().join() !== [
+        "kind",
+        "project_id",
+        "title",
+        "description",
+        "acceptance_criteria",
+        "priority",
+        "ready",
+        "role_overrides",
+      ].sort().join() ||
+      typeof value.project_id !== "string" ||
+      typeof value.title !== "string" ||
+      typeof value.description !== "string" ||
+      !Array.isArray(value.acceptance_criteria) ||
+      value.acceptance_criteria.some((item) => typeof item !== "string") ||
+      typeof value.priority !== "number" || !Number.isFinite(value.priority) ||
+      typeof value.ready !== "boolean" || !isRecord(value.role_overrides) ||
+      Object.entries(value.role_overrides).some(([role, config]) =>
+        !ROLES.some((candidate) => candidate === role) ||
+        !isRecord(config) ||
+        Object.keys(config).sort().join() !== "effort,model,provider" ||
+        !["codex", "claude"].includes(String(config.provider)) ||
+        typeof config.model !== "string" || typeof config.effort !== "string"
+      )
+    ) return undefined;
+    return value as TaskCreateRequest;
+  } catch {
+    return undefined;
+  }
 };
 
 const normalizeDraft = (value: unknown): TaskDraft | undefined => {
@@ -167,11 +218,16 @@ export function TaskForm(
   });
   const restoredDraft = useRef(initial.restored);
   const saveGuard = useRef(false);
-  const pendingOperation = useRef<{ body: string; id: string } | undefined>(
+  const pendingOperation = useRef<PendingTaskOperation | undefined>(
     (() => {
       try {
-        return JSON.parse(localStorage.getItem(`${key}.operation`) || "null") ||
-          undefined;
+        const value: unknown = JSON.parse(
+          localStorage.getItem(`${key}.operation`) || "null",
+        );
+        return isRecord(value) && typeof value.body === "string" &&
+            typeof value.id === "string"
+          ? { body: value.body, id: value.id }
+          : undefined;
       } catch {
         return undefined;
       }
@@ -180,6 +236,13 @@ export function TaskForm(
   const [draft, setDraft] = useState<TaskDraft>(initial.draft);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const [unresolvedCreate, setUnresolvedCreate] = useState<
+    PendingTaskOperation | undefined
+  >(() =>
+    !editing && pendingCreateRequest(pendingOperation.current)
+      ? pendingOperation.current
+      : undefined
+  );
 
   useEffect(() => {
     localStorage.setItem(key, JSON.stringify(draft));
@@ -310,6 +373,7 @@ export function TaskForm(
     setError("");
     const criteria = draft.criteria.split("\n").map((value) => value.trim())
       .filter(Boolean);
+    let submittedCreate = false;
     try {
       if (editing) {
         const body = {
@@ -352,10 +416,17 @@ export function TaskForm(
           role_overrides: roleOverrides,
         };
         const serialized = JSON.stringify(body);
+        if (unresolvedCreate && unresolvedCreate.body !== serialized) {
+          setError(
+            "An earlier task create still has an unknown result. Refresh the board to inspect it or use Retry exact unresolved create before submitting edited fields or a different Ready mode.",
+          );
+          return;
+        }
         const id = pendingOperation.current?.body === serialized
           ? pendingOperation.current.id
           : operationId();
         pendingOperation.current = { body: serialized, id };
+        submittedCreate = true;
         localStorage.setItem(
           `${key}.operation`,
           JSON.stringify(pendingOperation.current),
@@ -363,11 +434,85 @@ export function TaskForm(
         await command({ ...body, operation_id: id });
       }
       pendingOperation.current = undefined;
+      setUnresolvedCreate(undefined);
       localStorage.removeItem(`${key}.operation`);
       localStorage.removeItem(key);
       onSaved();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      const ambiguous = cause instanceof ApiError && cause.ambiguous;
+      if (submittedCreate) {
+        if (ambiguous) {
+          setUnresolvedCreate(pendingOperation.current);
+        } else {
+          pendingOperation.current = undefined;
+          setUnresolvedCreate(undefined);
+          localStorage.removeItem(`${key}.operation`);
+        }
+      }
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(
+        ambiguous && submittedCreate
+          ? `${message} The exact create request is retained for explicit reconciliation; edited fields and a different Ready mode cannot be submitted yet.`
+          : message,
+      );
+    } finally {
+      saveGuard.current = false;
+      setSaving(false);
+    }
+  };
+  const retryUnresolvedCreate = async () => {
+    if (saveGuard.current || !unresolvedCreate) return;
+    const request = pendingCreateRequest(unresolvedCreate);
+    if (!request) {
+      setError(
+        "The saved unresolved create request is invalid. Leave it unchanged and refresh the task board before taking another create action.",
+      );
+      return;
+    }
+    saveGuard.current = true;
+    setSaving(true);
+    setError("");
+    const currentRoleOverrides = Object.fromEntries(
+      ROLES.flatMap((role) =>
+        draft.roleOverrides[role] && draft.roles[role]
+          ? [[role, draft.roles[role]]]
+          : []
+      ),
+    );
+    const currentRequest = {
+      kind: "create_task",
+      project_id: draft.project_id,
+      title: draft.title,
+      description: draft.description,
+      acceptance_criteria: draft.criteria.split("\n").map((value) =>
+        value.trim()
+      ).filter(Boolean),
+      priority: draft.priority,
+      ready: request.ready,
+      role_overrides: currentRoleOverrides,
+    };
+    const preserveEditedDraft = JSON.stringify(currentRequest) !==
+      unresolvedCreate.body;
+    try {
+      await command({ ...request, operation_id: unresolvedCreate.id });
+      pendingOperation.current = undefined;
+      setUnresolvedCreate(undefined);
+      localStorage.removeItem(`${key}.operation`);
+      if (!preserveEditedDraft) localStorage.removeItem(key);
+      onSaved();
+    } catch (cause) {
+      const ambiguous = cause instanceof ApiError && cause.ambiguous;
+      if (!ambiguous) {
+        pendingOperation.current = undefined;
+        setUnresolvedCreate(undefined);
+        localStorage.removeItem(`${key}.operation`);
+      }
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(
+        ambiguous
+          ? `${message} The exact create request remains unresolved and retained for another explicit reconciliation.`
+          : message,
+      );
     } finally {
       saveGuard.current = false;
       setSaving(false);
@@ -561,6 +706,20 @@ export function TaskForm(
               </div>
             </details>
           )}
+        {unresolvedCreate && (
+          <div className="warning" role="status">
+            An earlier create may already be committed. Refresh and inspect the
+            task board, or reconcile only that saved request with its original
+            operation identity. Current form edits remain saved separately.
+            <button
+              type="button"
+              disabled={saving}
+              onClick={() => void retryUnresolvedCreate()}
+            >
+              Retry exact unresolved create
+            </button>
+          </div>
+        )}
         {error && (
           <div className="error" role="alert">
             {error}

@@ -38,11 +38,13 @@ enum Command {
     DeliverGuidance(GuidanceArgs),
     SwitchRole(SwitchRoleArgs),
     Diagnostics(DiagnosticsArgs),
+    Database(DatabaseArgs),
     Logs(LogsArgs),
     Import(ImportArgs),
     Check(CheckArgs),
     Role(RoleArgs),
     ResumeWork(ResumeWorkArgs),
+    RestartPreview(InstanceArgs),
     #[command(hide = true)]
     Hook(HookArgs),
     #[command(hide = true)]
@@ -376,6 +378,31 @@ struct DiagnosticsArgs {
     command: Option<DiagnosticsCommand>,
 }
 
+#[derive(Debug, Args)]
+struct DatabaseArgs {
+    #[arg(long, global = true)]
+    data_dir: Option<PathBuf>,
+    #[command(subcommand)]
+    command: DatabaseCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DatabaseCommand {
+    Inspect,
+    Check,
+    Backup {
+        #[arg(long)]
+        backup_dir: Option<PathBuf>,
+    },
+    Verify {
+        backup: PathBuf,
+    },
+    Restore {
+        backup: PathBuf,
+    },
+    ReleaseHold,
+}
+
 #[derive(Debug, Subcommand)]
 enum DiagnosticsCommand {
     Export {
@@ -635,6 +662,21 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Database(args) => {
+            let paths = InstancePaths::resolve(args.data_dir)?;
+            let result = match args.command {
+                DatabaseCommand::Inspect => crate::database::inspect(&paths),
+                DatabaseCommand::Check => crate::database::check(&paths),
+                DatabaseCommand::Backup { backup_dir } => {
+                    crate::database::backup(&paths, backup_dir.as_deref())
+                }
+                DatabaseCommand::Verify { backup } => crate::database::verify(&backup),
+                DatabaseCommand::Restore { backup } => crate::database::restore(&paths, &backup),
+                DatabaseCommand::ReleaseHold => crate::database::release_hold(&paths),
+            }?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
         Command::Logs(args) => {
             let paths = InstancePaths::resolve(args.data_dir)?;
             println!(
@@ -675,6 +717,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                         Some(args.session)
                     },
                 },
+            )
+            .await
+        }
+        Command::RestartPreview(args) => {
+            print_control(
+                &InstancePaths::resolve(args.data_dir)?,
+                ControlRequest::RestartPreview,
             )
             .await
         }
@@ -1253,7 +1302,11 @@ async fn run_attach(args: AttachArgs) -> Result<()> {
         bail!("a persistent cmux attachment must begin with --view-only and cannot use --takeover")
     }
     let paths = InstancePaths::resolve(args.data_dir)?;
-    let mut connection = control::ControlConnection::connect(&paths.control_socket).await?;
+    let mut connection = control::ControlConnection::connect_for_kind(
+        &paths.control_socket,
+        crate::protocol::ClientKind::Attachment,
+    )
+    .await?;
     let owner_id = format!("terminal-{}", uuid::Uuid::new_v4());
     let attach_request = ControlRequest::Attach {
         session_id: args.session.clone(),

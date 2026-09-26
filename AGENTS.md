@@ -1,42 +1,26 @@
-# Project Agent Instructions
+# LLMRelay Project Instructions
 
-## Default Engineering Gate
+LLMRelay is a local Rust workflow host with a React/TypeScript dashboard and SQLite state.
+Read the current implementation and only the guides relevant to the task.
 
-Before calling any coding task complete, verify the delivered work against the user's actual request.
+## Contract Routing
 
-- Re-read the latest user request and the constraints added during the task.
-- Check each named behavior, screen, flow, and platform path against the implementation.
-- For UI work, trace the exact clicks/actions the user mentioned and confirm they are wired, not just that the project compiles.
-- Treat build/compile success as necessary but not sufficient.
-- If anything remains incomplete or descoped, state it explicitly and continue working unless the user has explicitly accepted the gap.
-- Final responses should separate request verification from build/compile verification.
+| Area | Guide |
+| --- | --- |
+| Scope, completion verification, Git identity/authority, completion-driven waits | [Engineering workflow](docs/ENGINEERING_WORKFLOW.md) |
+| Rust implementation/tests, general code quality, TypeScript rules, deslop | [Coding standards](docs/CODING_STANDARDS.md) |
+| Product architecture and design decisions | [Research and plan](RESEARCH_AND_PLAN.md) |
+| Application TRIP workflow, roles and review gates | [Workflows](docs/WORKFLOWS.md) |
+| Project initialization and configuration | [Project setup](docs/PROJECT_SETUP.md) |
+| Sessions, recovery, startup and diagnostics | [Operations](docs/OPERATIONS.md) |
+| Authentication, permissions and isolation | [Security](docs/SECURITY.md) |
+| Build, test commands and local packaging | [Building](docs/BUILDING.md) |
+| Roadmap and current milestone plan | [Milestones](docs/MILESTONES.md), [Next milestone](docs/NEXT_MILESTONE_PLAN.md) |
 
-## Git Identity and Attribution
+## Required Gates
 
-- Use only the configured Git `user.name` and `user.email` when creating or amending commits and tags.
-- Never add AI attribution to commit messages, annotated tags, pull-request descriptions, release notes, or generated changelogs.
-- Never add `Co-Authored-By`, `Generated-By`, `Generated with`, `Claude-Session`, or similar attribution for Codex, OpenAI, Claude, Anthropic, or any other AI system.
-- Before creating a commit, inspect the complete proposed commit message for prohibited attribution.
-- After creating or amending a commit, run `git log -1 --format=%B` and immediately amend it if prohibited attribution is present.
-
-## Completion-driven engineering waits
-
-- Prefer supported completion notifications or a blocking tool wait over repeated
-  model turns that sleep, read unchanged logs, and check again.
-- For external CLI roles/jobs, save the result and atomic completion receipt,
-  then use a local watcher to call `codex queue --thread <manager-session-UUID>
-  --message <completion-reference>` once. Bind the exact task/generation and
-  result paths; never infer success from a wake-up message.
-- The current project-local operational helper is
-  `.local/trip-explorer/completion-wakeup/notify.py`. It is local tooling, not
-  shipped application code. Use a unique receipt per invocation, explicit parent
-  thread UUID, and the real Codex executable. Keep its `.wake.json` delivery record.
-- Do independent useful work while waiting. Once exhausted, leave only safely
-  detached work running and yield; the completion message should resume the
-  manager. Do not promise automatic resumption until the notification path has
-  been verified. Progress updates should follow actual events, not model polling.
-- On wake-up, inspect the receipt/result once and continue under existing role,
-  approval, review, and accounting gates. A duplicate wake-up must not repeat work.
-- A watcher deadline requests inspection; it never kills or retries the worker.
-  Failed or ambiguous queue delivery remains visible in its delivery record and
-  must not be retried automatically. This helper is not machine-restart recovery.
+All engineering tasks follow [Engineering workflow](docs/ENGINEERING_WORKFLOW.md)
+and the applicable [Coding standards](docs/CODING_STANDARDS.md).
+Completion requires verifying the actual requested behavior, separately from build success.
+When TRIP Explorer is invoked, follow the [installed skill](.agents/skills/trip-explorer-workflow/SKILL.md)
+and its configured roles, approval boundaries and review gates.

@@ -1,60 +1,145 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { command, operationId } from "../api";
 import type { Task } from "../types";
+
+const exactRecoveryKinds = [
+  "workspace_reservation",
+  "graceful_stop_deadline",
+];
+const restoreEvidenceKinds = [
+  "database_restore_claim",
+  "database_restore_freeze",
+];
+
+function recoveryDetail(record: Record<string, unknown>) {
+  const detail = record.detail;
+  return typeof detail === "object" && detail !== null && !Array.isArray(detail)
+    ? detail as Record<string, unknown>
+    : undefined;
+}
+
 export function RecoveryPanel(
-  { task, records, onChanged }: {
+  { task, records, selectedRecordId, onChanged }: {
     task: Task;
     records: Array<Record<string, unknown>>;
+    /** An exact record opened from attention; no other record replaces it. */
+    selectedRecordId?: string;
+    onChanged: () => void;
+  },
+) {
+  const unresolved = records.filter((candidate) =>
+    candidate.state === "attention_required"
+  );
+  const attempt = task.active_attempt;
+  const record = selectedRecordId === undefined
+    ? unresolved.find((candidate) => {
+      const detail = recoveryDetail(candidate);
+      const kind = String(detail?.kind || "");
+      return typeof candidate.session_id === "string" ||
+        typeof detail?.check_id === "string" ||
+        exactRecoveryKinds.includes(kind) ||
+        restoreEvidenceKinds.includes(kind);
+    }) || unresolved[0]
+    : unresolved.find((candidate) => candidate.id === selectedRecordId);
+  if (attempt && record) {
+    return (
+      <RecoveryDecision
+        // Evidence, errors and retry identity belong to one record, so a
+        // different record starts from a clean form.
+        key={typeof record.id === "string" ? record.id : ""}
+        task={task}
+        attemptId={attempt.id}
+        record={record}
+        onChanged={onChanged}
+      />
+    );
+  }
+  if (selectedRecordId === undefined) return null;
+  return (
+    <section className="panel recovery" role="status">
+      <h3>Recovery decision</h3>
+      <p>
+        The recovery record opened from the attention inbox was resolved or
+        changed, so no recovery action is offered for it. Open a current item
+        from the attention inbox, or close and reopen this task.
+      </p>
+    </section>
+  );
+}
+
+function RecoveryDecision(
+  { task, attemptId, record, onChanged }: {
+    task: Task;
+    attemptId: string;
+    record: Record<string, unknown>;
     onChanged: () => void;
   },
 ) {
   const [evidence, setEvidence] = useState("");
   const [error, setError] = useState("");
-  const unresolved = records.filter((candidate) =>
-    candidate.state === "attention_required"
-  );
-  if (!task.active_attempt || !unresolved.length) return null;
-  const record = unresolved.find((candidate) => {
-    const detail = candidate.detail as Record<string, unknown> | undefined;
-    return typeof candidate.session_id === "string" ||
-      typeof detail?.check_id === "string" ||
-      ["workspace_reservation", "graceful_stop_deadline"].includes(
-        String(detail?.kind || ""),
-      );
-  }) || unresolved[0];
-  const recoveryKind = String(
-    (record.detail as Record<string, unknown> | undefined)?.kind || "",
-  );
+  const retry = useRef<{ body: string; id: string } | undefined>(undefined);
+  const detail = recoveryDetail(record);
+  const recoveryKind = String(detail?.kind || "");
+  const sessionId = typeof record.session_id === "string"
+    ? record.session_id
+    : undefined;
   const materialization = recoveryKind.includes("materialization");
-  const exactRecovery = ["workspace_reservation", "graceful_stop_deadline"]
-    .includes(recoveryKind);
+  const exactRecovery = exactRecoveryKinds.includes(recoveryKind);
+  const restoreEvidence = restoreEvidenceKinds.includes(recoveryKind);
   const genericResolver = !exactRecovery &&
-    (typeof record.session_id === "string" ||
-      typeof (record.detail as Record<string, unknown> | undefined)?.check_id ===
-        "string");
+    (sessionId !== undefined ||
+      typeof detail?.check_id === "string" || restoreEvidence ||
+      materialization);
   const resolve = async (decision: string) => {
+    const recoveryId = typeof record.id === "string" ? record.id : "";
+    if (!recoveryId) {
+      setError(
+        "The displayed recovery record has no ID. Refresh before resolving it.",
+      );
+      return;
+    }
+    const request = {
+      task_id: task.id,
+      attempt_id: attemptId,
+      recovery_id: recoveryId,
+      ...(sessionId === undefined ? {} : { session_id: sessionId }),
+      expected_version: task.version,
+      decision,
+      evidence,
+    };
+    const body = JSON.stringify(request);
+    const id = retry.current?.body === body ? retry.current.id : operationId();
+    retry.current = { body, id };
     try {
       await command({
         kind: "resolve_recovery",
-        operation_id: operationId(),
-        task_id: task.id,
-        attempt_id: task.active_attempt!.id,
-        session_id: record.session_id,
-        expected_version: task.version,
-        decision,
-        evidence,
+        operation_id: id,
+        ...request,
       });
+      retry.current = undefined;
       onChanged();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
   return (
-    <section className="panel recovery">
+    <section
+      className="panel recovery"
+      data-attention-target={typeof record.id === "string"
+        ? `recovery_record:${record.id}`
+        : undefined}
+      tabIndex={-1}
+    >
       <h3>Recovery decision</h3>
       <p>
         {exactRecovery
           ? "This record has an exact recovery command. Generic recovery decisions are intentionally unavailable because they cannot recheck its complete immutable binding."
+          : recoveryKind === "database_restore_claim"
+          ? "This restore recorded a prelaunch claim reservation without a session or check. Human text only annotates the decision; the service confirms that the recorded prior state is eligible before reconciliation."
+          : recoveryKind === "database_restore_freeze"
+          ? "This restore recorded an interrupted local freeze with no external process identity. Human text only annotates the decision; the service confirms the operation-bound record and current recovery-required freeze before reconciliation."
+          : materialization
+          ? "Rework materialization needs a decision for this exact intent. Retry uses its recorded intent ID; cancellation verifies the whole parent and child lineage."
           : genericResolver
           ? "Process ownership is unresolved. Human text annotates the decision; the service still verifies every recorded PID and start identity. After reconciliation, use the exact session Resume action in role settings."
           : "This historical control record has no exact process, check, workspace, or claim tuple. It was definitively rejected, so generic recovery would be guaranteed to fail; refresh and submit a corrected versioned control."}
@@ -85,13 +170,15 @@ export function RecoveryPanel(
                 ? "Retry materialization"
                 : "Verify quiescence and reconcile"}
             </button>
-            <button
-              className="danger"
-              disabled={!evidence.trim()}
-              onClick={() => resolve("cancel")}
-            >
-              Verify and cancel
-            </button>
+            {!restoreEvidence && (
+              <button
+                className="danger"
+                disabled={!evidence.trim()}
+                onClick={() => resolve("cancel")}
+              >
+                Verify and cancel
+              </button>
+            )}
           </div>
         </>
       )}
