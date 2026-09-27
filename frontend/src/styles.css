@@ -578,6 +578,15 @@ button:disabled {
   gap: 3px;
   min-width: 0;
 }
+
+.session-startup-notice {
+  border-left: 3px solid currentColor;
+  padding: 0.5rem 0.75rem;
+  overflow-wrap: anywhere;
+}
+.session-startup-notice p {
+  margin: 0.4rem 0 0;
+}
 .session-tree .session-actions {
   grid-column: 2;
   display: flex;
@@ -888,6 +897,8 @@ button:disabled {
   flex-direction: column;
 }
 .detail {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   position: fixed;
   right: 0;
   top: 0;
@@ -902,9 +913,20 @@ button:disabled {
 .detail > header {
   background: #fff;
   padding: 20px;
-  display: flex;
-  justify-content: space-between;
   border-bottom: 1px solid var(--line);
+}
+.detail-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.detail-heading button {
+  flex-shrink: 0;
+}
+.detail .task-description {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .detail h2 {
   margin: 4px 0;
@@ -914,7 +936,7 @@ button:disabled {
 }
 .detail-scroll {
   overflow: auto;
-  height: calc(100vh - 150px);
+  min-height: 0;
   padding: 16px;
 }
 .review-panel {
@@ -1776,3 +1798,8 @@ button:disabled {
 .recipe-role-row { display: grid; grid-template-columns: minmax(9rem, 1fr) repeat(3, minmax(8rem, 1fr)); gap: .6rem; align-items: end; }
 .recipe-role-row label { display: flex; flex-direction: column; gap: .25rem; }
 @media (max-width: 800px) { .recipe-role-row { grid-template-columns: 1fr; } }
+
+.error-notice { min-width: 0; overflow-wrap: anywhere; }
+.error-notice p { margin: 0.35rem 0; }
+.error-notice details, .technical-details { margin-top: 0.4rem; }
+.error-notice pre, .technical-details pre { white-space: pre-wrap; overflow-wrap: anywhere; }

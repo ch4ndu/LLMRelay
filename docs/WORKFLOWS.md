@@ -91,6 +91,8 @@ The Workspace page lists service-owned sessions and opens live output in cmux. I
 
 The existing attachment connection holds a short, renewed human input lease only after its exact revision-bound acquire succeeds, and serializes bytes through the exact session and process generation. Another viewer or automatic guidance delivery cannot write through the same lease concurrently. A blocked acquire, ownership loss, or stale acknowledgement remains view-only and never silently reacquires or takes over control. Detach when finished answering a prompt so automatic guidance can proceed.
 
+A current manager code-review transition proposal suppresses further frozen-candidate reminders while its native turn finishes. This checks the exact manager generation, source phase, task version, plan, and candidate; it does not authorize transition before verified idle or process quiescence. Stale proposals do not suppress the reminder.
+
 Manager guidance is submitted once. It remains queued while a viewer owns input or while native work is active, and is delivered automatically after matching native submit/stop evidence and known helper descendants have exited. Claude must explicitly report empty background-task and scheduled-wakeup registries; missing or nonempty registries keep guidance queued, including after denied commands. Outstanding permission requests also prevent automatic delivery. For an exact pending service-owned Manager obligation, an otherwise current native turn whose latest real Stop has incomplete tool-hook bookkeeping may receive one service-initiated SIGINT stop request, distinct from verified native idle; the service still requires current generation, credential, invocation, candidate, permission, input, guidance, control, recovery, and whole-process-quiescence fences before it can retain-resume or transition. The atomic claim and the signal path are one-shot: another interrupt entry point does not send another signal, and drain reports the request separately as already pending. Completed checks/final-Explorer evidence and a completed final handoff are also held until the exact current Manager is either at a verified idle boundary or has exited with positively recorded whole-process quiescence; evidence recorded during a live busy turn is not consumed early. The stop has no timeout-based escalation and grants no blanket permission. If the process does not exit within the durable graceful-stop deadline, it enters explicit recovery with revoked role credentials and exact process controls; the service never fabricates idle, delivery, acknowledgement, or completion. Retained resume replays the saved native invocation unchanged, and the Manager loads current obligations and queued notices from role context. Guidance uses a framed terminal paste and a separate Enter under the same input lease. Only matching native submission evidence advances it to submitted; only the role acknowledgement advances it to acknowledged. The dashboard shows queued, written, submitted, and acknowledged states separately.
 
 Use **Continue**, **Run next**, **Pause after role**, **Pause now**, **Retry**, or **Cancel** from task details. These are versioned requests. A draining control remains visible until owned process state is reconciled. **Run next** arms one coordinator action and then pauses again.
@@ -108,6 +110,19 @@ The verification view shows inherited commands, the task's selected matrix, appr
 A check executes only after its actual command and scope are approved. Its permission controls offer **Approve once**, **Always approve matching actions**, and **Deny**. A reusable rule is available only when the structured executable and arguments can be represented safely; its preview explains the executable family, argument coverage, and scope. Shell syntax and unsupported wrapper forms require exact approval. Rules can be revoked, and a matching rule never selects a new check or bypasses the reviewed command, current candidate, working directory, or input-freshness requirements.
 
 Service-run check grants are separate from native agent grants. An approval made for a sandboxed Codex or Claude action does not authorize LLMRelay to execute that command itself. The service holds the one build slot, checks writer quiescence and the frozen candidate, and records command, inputs, configuration, elapsed time, and result. Unaffected evidence can be reused; changed inputs invalidate the relevant checks. A passing build or review alone cannot satisfy the manager's request-verification gate.
+
+During implementation, ordinary implementer role context includes the current
+manager's latest `needs_input` repair feedback when it names the same approved
+plan and candidate. This lets an exact retained resume read the handoff without
+changing its frozen invocation. The feedback is guidance, not scope approval or
+verification evidence; source candidate readiness can retain explicit pending
+checks for the later service verification phase.
+
+A default-lane candidate report bound to the current approved plan remains
+eligible across a pause. Freezing still requires the current implementer
+generation, an unconsumed report, and verified process quiescence. Reports with
+a different plan are rejected; legacy reports without a plan binding retain
+the timestamp freshness check. Publication consumes the exact eligible report.
 
 ## Human gates and continuation authority
 
@@ -166,3 +181,5 @@ Copy any needed draft edits, archive the stale draft, and create a new draft. An
 archived recipe can be replaced by a new recipe. Never-started backlog drafts may be
 archived from task detail and listed in History. Restore
 returns them to backlog; it does not repair stale pins or make them Ready.
+
+A plan/code reviewer stopped before a native session identity was recorded cannot be exact-resumed. A resume inspection can record current prepared runtime identity without reserving or launching a provider. Once the stopped session, unchanged profile, current frozen review, supported runtime proof, and remaining review allowance all match, the dashboard offers an explicit fresh accounted replacement. Missing proof or an existing native identity does not use this startup-replacement route. The original delivered call remains spent; final verification and other roles are excluded. A later inspection may append the missing runtime observation to rejection history without rewriting the original rejection.

@@ -62,6 +62,7 @@ const { Recipes } = await import("./components/Recipes");
 const { WorkflowControls } = await import("./components/WorkflowControls");
 const { ModelSelector } = await import("./components/ModelSelector");
 const { Workspace } = await import("./components/Workspace");
+const { SessionTree } = await import("./components/SessionTree");
 const { ApiError, ProtocolError, command, getState, transportTimeouts } = await import("./api");
 const { liveEnvironment, liveTiming, startLiveState } = await import(
   "./liveState"
@@ -750,7 +751,7 @@ Deno.test("M7 unknown Claude contract explains the release route and blocks setu
       onChanged={noop}
       onViewSession={async () => ({ state: "failed", message: "unavailable", retry_available: false })}
     />);
-    if (!document.body.textContent?.includes("Update LLMRelay for a reviewed contract") ||
+    if (!document.body.textContent?.includes("Update LLMRelay to a release that supports this agent version") ||
       !document.body.textContent?.includes("reviewed_exact_version_predicate") ||
       ![...document.querySelectorAll("button")].some((button) =>
         button.textContent?.includes("Prepare exact runtime verification") && button.disabled)) {
@@ -786,8 +787,8 @@ Deno.test("M7 unknown Claude contract explains the release route and blocks setu
       provider: "claude", role: "explorer", mode: "interactive_pty",
       status: "unverified", gaps: [], compatibility,
     }]} />);
-    if (!document.body.textContent?.includes("Compatibility needs attention") ||
-      !document.body.textContent?.includes("Update LLMRelay for a reviewed contract")) {
+    if (!document.body.textContent?.includes("Agent verification needs attention") ||
+      !document.body.textContent?.includes("Update LLMRelay to a release that supports this agent version")) {
       throw new Error("diagnostics omitted the structured compatibility action");
     }
   } finally {
@@ -1242,7 +1243,7 @@ function assertLiveCmuxLossFence() {
     !document.body.textContent?.includes(
       "fixture validated cmux loss observation",
     ) ||
-    !document.body.textContent.includes("durable retirement interval")
+    !document.body.textContent.includes("previous terminal connection to close")
   ) throw new Error("stale cmux result replaced durable live-loss retirement");
 }
 async function verifyDeferredCmuxView(
@@ -2574,9 +2575,9 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     if (
       recoveryViewedSessions.at(-1) !== recoverySession.id ||
       !document.body.textContent?.includes(
-        "service verifies the recorded operating system identities",
+        "LLMRelay will check the recorded",
       ) ||
-      !document.body.textContent.includes("fresh-only final verifier") ||
+      !document.body.textContent.includes("resume or retry action") ||
       document.body.textContent.includes("Resume retained session")
     ) {
       throw new Error(
@@ -2635,7 +2636,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       "Recovery evidence for manager",
       "Operator observed the stopped setup invocation",
     );
-    click("Verify quiescence and reconcile");
+    click("Check recovery and continue");
     await settle();
     if (
       requests.at(-1)?.kind !== "resolve_recovery" ||
@@ -2771,6 +2772,18 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       }],
     };
     const runtimeViewedSessions: string[] = [];
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={{ ...runtimeRecoveryView, recoveries: [setupRecovery] }}
+        onChanged={() => {}}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    if (!document.querySelector('textarea[aria-label="Recovery evidence for manager"]')) {
+      throw new Error("activated setup hid unresolved recovery from an earlier invocation");
+    }
+    unmount();
     const refreshesBeforeRuntime = recoveryRefreshCount();
     mount(
       <ProjectSetup
@@ -2836,7 +2849,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       "Recovery evidence for plan_reviewer",
       "Operator observed the stopped runtime probe",
     );
-    click("Verify quiescence and reconcile");
+    click("Check recovery and continue");
     await settle();
     if (
       requests.at(-1)?.kind !== "resolve_recovery" ||
@@ -4728,7 +4741,7 @@ Deno.test("T20 durable cmux projections fence stale View results and local contr
   const cardState = () =>
     document.querySelector(".cmux-route strong")?.textContent || "";
   const assertCardState = (expected: string) => {
-    if (!cardState().includes(`cmux presentation ${expected}`)) {
+    if (!cardState().includes(`Terminal connection · ${expected}`)) {
       throw new Error(
         `durable cmux card rendered ${
           JSON.stringify(cardState())
@@ -4877,7 +4890,7 @@ Deno.test("T20 durable cmux projections fence stale View results and local contr
       !document.body.textContent?.includes(
         "fixture validated cmux loss observation",
       ) ||
-      !document.body.textContent?.includes("durable retirement interval")
+      !document.body.textContent?.includes("previous terminal connection to close")
     ) {
       throw new Error(
         "live loss retirement exposed replacement or hid its causal evidence",
@@ -4903,7 +4916,7 @@ Deno.test("T20 durable cmux projections fence stale View results and local contr
     if (
       !freshView || freshView.disabled || !retiredTake?.disabled ||
       !document.body.textContent?.includes(
-        "prior terminal is durably historical",
+        "earlier terminal has closed",
       )
     ) {
       throw new Error(
@@ -4972,6 +4985,23 @@ Deno.test("T20 durable cmux projections fence stale View results and local contr
         .find((button) => button.textContent === "Take keyboard control");
       if (!take || take.disabled) throw new Error("completed opening response kept the live route pending");
     }
+    unmount();
+    const priorSurface = durableSurface("prior-session-route", "2026-09-20T00:00:13Z", {
+      desired_input_state: "view_only", actual_input_state: "view_only", applied_revision: 4,
+    });
+    let finishPriorView: ((outcome: CmuxViewOutcome) => void) | undefined;
+    const delayedView = () => new Promise<CmuxViewOutcome>((resolve) => { finishPriorView = resolve; });
+    mount(setupCard(priorSurface, delayedView));
+    click("View output");
+    await settle();
+    const replacement = setupState(priorSurface);
+    replacement.sessions = [{ ...replacement.sessions[0], id: "replacement-session", cmux_surface: undefined }];
+    rerender(<ProjectSetup project={initialized} setup={replacement} onChanged={noop} onViewSession={delayedView} />);
+    await settle();
+    if (document.querySelector(".cmux-route")) throw new Error("replacement session inherited the previous session's pending presentation");
+    finishPriorView?.({ state: "view_only", message: "Prior session", retry_available: false, surface: priorSurface });
+    await settle();
+    if (document.querySelector(".cmux-route")) throw new Error("late View response attached a prior session's surface to its replacement");
   } finally {
     unmount();
   }
@@ -5154,7 +5184,7 @@ Deno.test("T21 ambiguous mutation transport failures preserve durable operation 
       />,
     );
     if (
-      document.body.textContent?.includes("Verify quiescence and reconcile") ||
+      document.body.textContent?.includes("Check recovery and continue") ||
       document.body.textContent?.includes("Verify and cancel")
     ) {
       throw new Error(
@@ -5456,13 +5486,13 @@ Deno.test("T22 restore claim and freeze records submit generic recovery without 
       if (
         !document.body.textContent?.includes(explanation) ||
         !document.body.textContent.includes(
-          "Verify quiescence and reconcile",
+          "Check recovery and continue",
         ) || document.body.textContent.includes("Verify and cancel")
       ) {
         throw new Error(`${kind} did not expose its generic recovery action`);
       }
       field("Recovery evidence", `operator annotation for ${kind}`);
-      click("Verify quiescence and reconcile");
+      click("Check recovery and continue");
       await settle();
       const request = requests.at(-1);
       if (
@@ -6496,10 +6526,10 @@ Deno.test("M6 selected recovery record keeps its own draft and fails closed when
     evidence: document.querySelector<HTMLTextAreaElement>(
       '[aria-label="Recovery evidence"]',
     )?.value,
-    error: document.querySelector(".recovery .error")?.textContent,
+    error: document.querySelector(".recovery .error details pre")?.textContent,
   });
   const submit = async () => {
-    click("Verify quiescence and reconcile");
+    click("Check recovery and continue");
     await settle();
     return requests.at(-1);
   };
@@ -6682,7 +6712,7 @@ Deno.test("M6 direct task opens drop a stale attention selection and route notic
       record: panel?.getAttribute("data-attention-target"),
       stale: panel?.textContent?.includes("was resolved or changed"),
       evidence: panel?.querySelector("textarea")?.value,
-      error: panel?.querySelector(".error")?.textContent,
+      error: panel?.querySelector(".error details pre")?.textContent,
     };
   };
   const notice = () =>
@@ -6708,7 +6738,7 @@ Deno.test("M6 direct task opens drop a stale attention selection and route notic
     open("recovery_record:r-target");
     await settle();
     field("Recovery evidence", "evidence for r-target");
-    click("Verify quiescence and reconcile");
+    click("Check recovery and continue");
     await settle();
     const failed = recovery().error;
     live.waits[0].resolve(changedTo(resolved));
@@ -6730,7 +6760,7 @@ Deno.test("M6 direct task opens drop a stale attention selection and route notic
       }`,
     );
     field("Recovery evidence", "evidence for r-target");
-    click("Verify quiescence and reconcile");
+    click("Check recovery and continue");
     await settle();
     check(
       mutations[1]?.recovery_id === "r-first" &&
@@ -6764,5 +6794,90 @@ Deno.test("M6 direct task opens drop a stale attention selection and route notic
     liveEnvironment.scheduler = priorEnvironment.scheduler;
     globalThis.fetch = nativeFetch;
     localStorage.clear();
+  }
+});
+
+Deno.test("User errors explain recovery while retaining collapsed diagnostics", async () => {
+  const { ErrorNotice } = await import("./components/ErrorNotice");
+  const cases = [
+    ["role capacity is full", "agent slots are busy", "Wait for an active session"],
+    ["attempt is not dispatchable", "earlier agent session has stopped", "Check recovery and continue"],
+    ["browser session required", "sign-in has expired", "fresh dashboard sign-in link"],
+    ["role manager lacks exact current runtime authority: exact current runtime-scoped ordinary production capability proof is missing or stale; complete runtime verification for this project, setup, fixture, configuration, adapter, profile, and prepared identity", "profile still needs verification", "runtime verification"],
+    ["authentication credentials missing", "agent's current sign-in", "Complete sign-in there"],
+    ["Provider version codex-cli 9.9 has no reviewed contract", "agent version has not been verified", "Update LLMRelay"],
+    ["request deadline exceeded; mutation may have been dispatched", "could not confirm", "do not start a second copy"],
+    ["unexpected SQLite fixture failure <script>alert(1)</script>", "could not complete", "Diagnostics"],
+  ];
+  try {
+    for (const [raw, summary, action] of cases) {
+      mount(<ErrorNotice error={raw} />);
+      const alert = document.querySelector('[role="alert"]');
+      const details = alert?.querySelector("details");
+      check(alert?.querySelector("strong")?.textContent?.includes(summary), `missing plain explanation for ${raw}`);
+      check(alert?.querySelector("p")?.textContent?.includes(action), `missing next step for ${raw}`);
+      check(details && !details.open && details.querySelector("pre")?.textContent === raw, "diagnostic missing or expanded by default");
+      check(!document.querySelector("script"), "diagnostic rendered as HTML");
+      unmount();
+    }
+    const requests: Record<string, unknown>[] = [];
+    globalThis.fetch = async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ error: "attempt is not dispatchable" }), { status: 409 });
+    };
+    mount(<RecoveryPanel task={task} records={[{ id: "plain-error-recovery", session_id: "session", attempt_id: "a1", state: "attention_required", detail: {} }]} onChanged={noop} />);
+    field("Recovery evidence", "Review the earlier session");
+    click("Check recovery and continue");
+    await settle();
+    check(document.querySelector('.recovery .error strong')?.textContent?.includes("earlier agent session"), "real request failure bypassed the plain error presentation");
+    check(requests.length === 1, "displaying guidance retried the action automatically");
+    check(document.querySelector<HTMLTextAreaElement>('textarea')?.value === "Review the earlier session", "error display discarded the user's text");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("session startup notice follows current readiness and preserves explicit console control", () => {
+  const actions: string[] = [];
+  const renderSession = (overrides: Partial<Session> = {}) => (
+    <SessionTree
+      sessions={[{ ...managerSession, readiness: "unknown", ...overrides }]}
+      routes={{}}
+      onView={(id) => actions.push(`view:${id}`)}
+      onTake={(id) => actions.push(`take:${id}`)}
+      onRelease={(id) => actions.push(`release:${id}`)}
+      setupProjectId={() => undefined}
+      onOpenSetup={() => {}}
+    />
+  );
+  try {
+    mount(renderSession());
+    const notice = () => document.querySelector(".session-startup-notice");
+    check(notice()?.getAttribute("role") === "status", "startup wait is not announced");
+    check(document.querySelector(".session-metadata > small")?.textContent?.includes("Waiting for startup"), "primary status still implies active work");
+    check(!document.querySelector(".session-metadata .technical-details")?.hasAttribute("open"), "process diagnostics are not collapsed");
+    check(notice()?.textContent?.includes("has not confirmed"), "process start was treated as readiness");
+    check(notice()?.textContent?.includes("If Codex shows"), "hook trust was asserted without evidence");
+    check(notice()?.textContent?.includes("Release keyboard control"), "recovery omits releasing input");
+    check(actions.length === 0, "startup notice automatically took control");
+    click("View output");
+    click("Take keyboard control");
+    check(actions.join(",") === "view:s1,take:s1", "startup actions targeted the wrong session");
+    rerender(renderSession({ readiness: "busy" }));
+    check(!notice(), "startup notice remained after native work began");
+    rerender(renderSession({ readiness: "idle_candidate" }));
+    check(!notice(), "ready idle session is presented as startup blocked");
+    rerender(renderSession({ transcript_epoch: "resumed-invocation" }));
+    check(!!notice(), "same-session resume retained previous readiness presentation");
+    rerender(renderSession({ id: "replacement", generation: 2, provider: "claude" }));
+    check(!!notice() && !notice()?.textContent?.includes("Codex"), "replacement inherited provider-specific advice");
+    click("View output");
+    check(actions.at(-1) === "view:replacement", "replacement opened the previous session");
+    rerender(renderSession({ status: "exited" }));
+    check(!notice(), "exited session still asks for startup input");
+    check(![...document.querySelectorAll("button")].some((button) => button.textContent === "Take keyboard control"), "exited session offers keyboard input");
+  } finally {
+    unmount();
   }
 });

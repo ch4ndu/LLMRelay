@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 import { command, operationId } from "../api";
 import type { Project } from "../types";
@@ -178,7 +179,7 @@ export function ProjectPicker(
               <span>Full path:</span> {path}
             </output>
           )}
-          {error && <small className="error" role="alert">{error}</small>}
+          {error && <ErrorNotice error={error} />}
           <div className="inline-form-actions">
             <button type="button" disabled={submitting} onClick={closeForm}>
               Cancel

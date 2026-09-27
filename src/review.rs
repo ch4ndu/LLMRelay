@@ -63,7 +63,7 @@ impl ReviewService {
         let source_generation: Option<String> = match kind {
             "plan" => crate::store::eligible_manager_plan(&transaction, attempt_id, true)?
                 .map(|candidate| candidate.generation_id),
-            "candidate" => transaction.query_row("SELECT rr.role_generation_id FROM role_results rr JOIN role_generations rg ON rg.id=rr.role_generation_id JOIN role_settings rs ON rs.effective_generation_id=rg.id AND rs.role='implementer' WHERE rg.attempt_id=?1 AND rr.outcome='candidate_ready' AND rr.consumed_at IS NULL ORDER BY rr.created_at DESC LIMIT 1",params![attempt_id],|row|row.get(0)).optional()?,
+            "candidate" => crate::store::eligible_implementer_candidate(&transaction, attempt_id, true)?.map(|(_, generation, _)| generation),
             "checkpoint" => transaction.query_row("SELECT rg.id FROM role_generations rg JOIN sessions s ON s.role_generation_id=rg.id JOIN role_settings rs ON rs.effective_generation_id=rg.id AND rs.role='implementer' WHERE rg.attempt_id=?1 AND rg.role='implementer' AND s.status='exited' AND json_extract(s.exit_json,'$.process_group_quiescent')=1 ORDER BY rg.generation DESC LIMIT 1",params![attempt_id],|row|row.get(0)).optional()?,
             "accepted" => None,
             _ => unreachable!(),
@@ -236,7 +236,8 @@ impl ReviewService {
         if kind != "checkpoint" {
             let connection = self.store.lock()?;
             let authorized: bool = if kind == "candidate" {
-                connection.query_row("SELECT EXISTS(SELECT 1 FROM role_results rr JOIN role_generations rg ON rg.id=rr.role_generation_id JOIN sessions s ON s.id=rr.session_id JOIN attempts a ON a.id=rg.attempt_id WHERE rg.attempt_id=?1 AND rg.role='implementer' AND rr.outcome='candidate_ready' AND rr.consumed_at IS NULL AND rr.created_at>=a.updated_at AND s.status='exited')",params![attempt_id],|row|row.get(0))?
+                crate::store::eligible_implementer_candidate(&connection, attempt_id, true)?
+                    .is_some()
             } else {
                 connection.query_row("SELECT EXISTS(SELECT 1 FROM review_requests r JOIN attempts a ON a.id=r.attempt_id WHERE a.id=?1 AND r.review_kind='final' AND r.candidate_hash=a.candidate_hash AND r.verdict='approved' AND r.delivery_state='finished')",params![attempt_id],|row|row.get(0))?
             };
@@ -284,10 +285,16 @@ impl ReviewService {
                 params![persisted_id, now, attempt_id],
             )?;
         } else if kind == "candidate" {
-            transaction.execute(
-                "UPDATE role_results SET consumed_at=?1 WHERE id=(SELECT rr.id FROM role_results rr JOIN role_generations rg ON rg.id=rr.role_generation_id JOIN attempts a ON a.id=rg.attempt_id WHERE rg.attempt_id=?2 AND rg.role='implementer' AND rr.outcome='candidate_ready' AND rr.consumed_at IS NULL AND rr.created_at>=a.updated_at ORDER BY rr.created_at DESC LIMIT 1)",
-                params![now, attempt_id],
-            )?;
+            let (result_id, _, _) =
+                crate::store::eligible_implementer_candidate(&transaction, attempt_id, true)?
+                    .ok_or_else(|| anyhow!("candidate source changed before publication"))?;
+            if transaction.execute(
+                "UPDATE role_results SET consumed_at=?1 WHERE id=?2 AND consumed_at IS NULL",
+                params![now, result_id],
+            )? != 1
+            {
+                bail!("candidate result changed before publication")
+            }
             transaction.execute(
                 "UPDATE attempts SET candidate_hash=?1,updated_at=?2 WHERE id=?3",
                 params![hash, now, attempt_id],

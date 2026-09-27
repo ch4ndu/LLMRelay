@@ -30,6 +30,8 @@ fn synthetic_claude_contract() -> agenticjira::provider_compatibility::BundleSet
             format!("synthetic-claude-{}", contract["role"].as_str().unwrap()).into();
         contract["native_policy_revision"] =
             providers::claude::NATIVE_SANDBOX_POLICY_REVISION.into();
+        contract["launch_revision"] = providers::claude::LAUNCH_CONTRACT_REVISION.into();
+        contract["resume_revision"] = providers::claude::RESUME_CONTRACT_REVISION.into();
     }
     claude["selectors"] = serde_json::json!([selector]);
     agenticjira::provider_compatibility::BundleSet::synthetic_for_tests(codex, &claude.to_string())

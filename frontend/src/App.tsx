@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./components/ErrorNotice";
 import {
   Fragment,
   useCallback,
@@ -468,7 +469,7 @@ export function App() {
         </header>
         {(error || connection.error) && (
           <div className="global-error" role="alert">
-            {error || connection.error}
+            <ErrorNotice error={error || connection.error || ""} />
             <button
               disabled={connection.refreshing}
               onClick={() =>
@@ -587,9 +588,7 @@ export function App() {
                       onViewSession={viewCmuxSession}
                     />
                     {setupResolution.warning && (
-                      <p className="error" role="alert">
-                        {setupResolution.warning}
-                      </p>
+                      <ErrorNotice error={setupResolution.warning} />
                     )}
                   </Fragment>
                 );

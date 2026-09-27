@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useMemo, useState } from "react";
 import { command, operationId } from "../api";
 import type { Project, Task } from "../types";
@@ -155,7 +156,7 @@ export function TaskBoard(
           </button>
         </div>
       </div>
-      {error && <p className="error" role="alert">{error}</p>}
+      {error && <ErrorNotice error={error} />}
       {view === "board"
         ? (
           <div className="board">

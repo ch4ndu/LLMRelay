@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useMemo, useState } from "react";
 import { command, operationId } from "../api";
 import type {
@@ -304,7 +305,7 @@ export function AttentionInbox(
         <button disabled={!target || !message.trim()} onClick={send}>
           Queue guidance
         </button>
-        {error && <small className="error">{error}</small>}
+        {error && <ErrorNotice error={error} />}
         <ul>
           {state.guidance.slice(0, 8).map((item) => (
             <li key={String(item.id)}>

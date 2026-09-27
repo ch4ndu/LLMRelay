@@ -1,3 +1,4 @@
+import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getModelCatalog } from "../api";
 import type { ModelCatalog, Provider } from "../types";
@@ -163,9 +164,12 @@ export function ModelSelector(
         </small>
       ) : null}
       {catalog?.state === "unavailable" && (
-        <small className="hint">{catalog.reason}</small>
+        <div className="hint">
+          Model suggestions are unavailable. Enter the model name manually, or choose Refresh local suggestions after checking the agent's sign-in.
+          <TechnicalDetails>{catalog.reason}</TechnicalDetails>
+        </div>
       )}
-      {catalogError && <small className="error">{catalogError}</small>}
+      {catalogError && <ErrorNotice error={catalogError} />}
       {provider === "claude" && !catalog && (
         <small className="hint">
           Claude has no trusted local catalog here. Existing exact profiles and

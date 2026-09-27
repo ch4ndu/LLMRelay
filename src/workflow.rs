@@ -29,8 +29,12 @@ const FRESH_ROUTE_AUTHORITY: &str = "SELECT EXISTS(
                               AND json_extract(event.detail_json,'$.role_generation_id')=generation.id
                               AND json_extract(event.detail_json,'$.category') IN (
                                 'frozen_runtime_identity_changed',
+                                'native_history_unavailable',
                                 'provider_compatibility_unsupported',
                                 'provider_compatibility_contract_changed')
+                              AND (json_extract(event.detail_json,'$.category')!='native_history_unavailable'
+                                   OR (generation.role IN ('plan_reviewer','code_reviewer')
+                                       AND session.native_session_id IS NULL))
                               AND json_extract(event.detail_json,'$.same_profile_authority')=1
                               AND current_attempt.id=(SELECT latest.id FROM attempts latest
                                 WHERE latest.task_id=current_attempt.task_id
@@ -40,8 +44,9 @@ const FRESH_ROUTE_AUTHORITY: &str = "SELECT EXISTS(
                               AND current_attempt.plan_hash IS json_extract(event.detail_json,'$.plan_hash')
                               AND json_type(event.detail_json,'$.frozen_capability_key')='text'
                               AND json_type(event.detail_json,'$.observed_capability_key')='text'
-                              AND json_extract(event.detail_json,'$.frozen_capability_key') IS NOT
-                                  json_extract(event.detail_json,'$.observed_capability_key')
+                              AND (json_extract(event.detail_json,'$.category')='native_history_unavailable'
+                                   OR json_extract(event.detail_json,'$.frozen_capability_key') IS NOT
+                                      json_extract(event.detail_json,'$.observed_capability_key'))
                               AND json_type(event.detail_json,'$.observed_identity')='object'
                               AND json_extract(event.detail_json,'$.observed_identity.provider')=session.provider
                               AND json_extract(event.detail_json,'$.observed_identity.role')=generation.role
@@ -60,7 +65,7 @@ const FRESH_ROUTE_AUTHORITY: &str = "SELECT EXISTS(
                                   AND current_capability.status='supported'
                                   AND current_capability.proof_json!='{}'
                                   AND current_capability.config_hash=json_extract(event.detail_json,'$.observed_capability_key')
-                                  AND (json_extract(event.detail_json,'$.category')='frozen_runtime_identity_changed'
+                                  AND (json_extract(event.detail_json,'$.category') IN ('frozen_runtime_identity_changed','native_history_unavailable')
                                     OR (json_type(current_capability.proof_json,'$.compatibility')='object'
                                       AND json_extract(current_capability.proof_json,'$.compatibility.effective_hash')=
                                         json_extract(event.detail_json,'$.observed_identity.compatibility_hash'))))
@@ -2029,7 +2034,10 @@ pub fn execute_with_runtime(
                 params![attempt_id, plan_hash], |row| row.get(0),
             ).optional()?.ok_or_else(|| anyhow!("human plan approval requires the exact independently reviewed structured plan"))?;
             let changed = transaction.execute(
-                "UPDATE attempts SET phase='awaiting_implementation_authorization',plan_approved_at=?1,updated_at=?1 WHERE id=?2 AND task_id=?3 AND phase='awaiting_plan_approval' AND plan_hash=?4 AND structured_plan_id=?5",
+                "UPDATE attempts SET phase='awaiting_implementation_authorization',plan_approved_at=?1,
+                 structured_plan_id=?5,updated_at=?1
+                 WHERE id=?2 AND task_id=?3 AND phase='awaiting_plan_approval' AND plan_hash=?4
+                   AND (structured_plan_id=?5 OR structured_plan_id IS NULL)",
                 params![now, attempt_id, task_id, plan_hash, structured_plan],
             )?;
             if changed != 1 {
@@ -4973,7 +4981,16 @@ fn continuation_actions(
                         "human", "replace_stale_authority",
                         Some("Fresh dispatch requires a current matching contract and proof."),
                     )
-                } else if category == "frozen_runtime_identity_changed" {
+                } else if category == "frozen_runtime_identity_changed"
+                    || (category == "native_history_unavailable"
+                        && session
+                            .get("native_session_id")
+                            .is_none_or(serde_json::Value::is_null)
+                        && matches!(
+                            session.get("role").and_then(serde_json::Value::as_str),
+                            Some("plan_reviewer" | "code_reviewer")
+                        ))
+                {
                     match reviewer_route {
                             ReviewerFreshRoute::FinalFreshOnly => (
                                 ContinuationActionKind::AuthorizationRequired,

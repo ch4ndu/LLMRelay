@@ -134,12 +134,12 @@ export const cmuxSurfacePresentation = (
     : undefined;
   const guidance = unknown
     ? surface.attachment_state === "live"
-      ? "The exact attachment remains live while cmux presentation is uncertain. View, Take, discard, retry, and recreation stay disabled until that attachment retires."
-      : "The cmux reservation remains uncertain. Explicitly discard it before another View can create a fresh surface."
+      ? "The terminal connection is still active, but LLMRelay cannot confirm its display. Wait for the previous terminal connection to close; the available buttons will update automatically."
+      : "LLMRelay could not confirm whether the terminal opened. Choose Discard unknown reservation, then View output to open a new terminal."
     : liveRetirement
-    ? "The exact attachment is still live in the durable retirement interval. View, Take, discard, retry, and recreation stay disabled until durable retirement is observed."
+    ? "Wait for the previous terminal connection to close. The buttons will become available when LLMRelay confirms it has stopped."
     : historical
-    ? "The prior terminal is durably historical. View fresh view-only surface creates a new presentation; the old terminal is never focused or respawned."
+    ? "The earlier terminal has closed. Choose View fresh view-only surface to open another view of this session."
     : undefined;
   const viewAvailable = readyLiveSurface || historical;
 
@@ -409,3 +409,19 @@ export const recordedOutputText = (outcome?: CmuxViewOutcome) => {
   output += plain.finish();
   return output;
 };
+
+export function terminalGuidance(outcome: CmuxViewOutcome): string {
+  if (outcome.surface) {
+    const presentation = cmuxSurfacePresentation(outcome.surface);
+    if (presentation.guidance) return presentation.guidance;
+  }
+  switch (outcome.state) {
+    case "control": return "Keyboard control is active. Choose Release keyboard control when you finish so the agent can continue.";
+    case "view_only": return "The terminal is open for viewing. Choose Take keyboard control only when you need to answer the agent.";
+    case "pending": return "The terminal connection is being updated. Wait for the controls to become available.";
+    case "unknown": return "LLMRelay could not confirm whether the terminal opened. If Discard unknown reservation is shown, use it before opening another terminal.";
+    case "unknown_live": return "The terminal connection is still active, but its display could not be confirmed. Wait for the connection to close before opening another terminal.";
+    case "blocked": return "Keyboard control is unavailable. Release control in the other terminal, then check this session again.";
+    default: return "LLMRelay could not show this terminal. Check that cmux is running and review Technical details. Use View output again when it becomes available.";
+  }
+}

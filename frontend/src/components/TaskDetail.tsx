@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useRef, useState } from "react";
 import { ApiError, command, operation, reuseOperationIdentity } from "../api";
 import type { AppState, Task } from "../types";
@@ -127,20 +128,19 @@ export function TaskDetail(
       tabIndex={-1}
     >
       <header>
-        <div>
+        <div className="detail-heading">
           <span className="eyebrow">{task.id}</span>
-          <h2>{task.title}</h2>
-          <p>{task.description}</p>
+          <button aria-label="Close task details" onClick={onClose}>
+            Close task details <span aria-hidden="true">×</span>
+          </button>
         </div>
-        <button
-          className="icon"
-          aria-label="Close task details"
-          onClick={onClose}
-        >
-          ×
-        </button>
+        <h2>{task.title}</h2>
       </header>
       <div className="detail-scroll">
+        <section className="panel">
+          <h3>Task description</h3>
+          <p className="task-description">{task.description}</p>
+        </section>
         {task.recipe_provenance && <section className="panel">
           <h3>Recipe provenance</h3>
           <p>{task.recipe_provenance.recipe_name} · recipe revision {task.recipe_provenance.recipe_revision}</p>
@@ -580,7 +580,7 @@ export function TaskDetail(
             <pre>{String(task.legacy.source_text || "")}</pre>
           </details>
         )}
-        {error && <p className="error" role="alert">{error}</p>}
+        {error && <ErrorNotice error={error} />}
       </div>
     </aside>
   );

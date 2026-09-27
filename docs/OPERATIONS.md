@@ -345,10 +345,12 @@ the existing exact-profile qualification requirements still apply.
 
 Unknown provider versions cannot use a matching contract's launch or resume paths.
 Follow the displayed next step rather than repeatedly retrying the old session.
-The initial bundle names Codex CLI 0.155.1 as a candidate. The Claude bundle has no
-production version selector yet, so it directs operators to an updated LLMRelay
-release. Native role qualification is deferred; engineering fixtures do not supply
-that evidence. Manifests are shipped with the application, not downloaded or edited
+The current bundle names exact Codex CLI 0.157.1 as a candidate. Older 0.155.1
+proofs remain historical and cannot authorize the new executable. The Claude
+bundle has no production version selector yet, so it directs operators to an
+updated LLMRelay release. Native role qualification remains required for each
+exact profile; engineering fixtures do not supply that evidence. Manifests are
+shipped with the application, not downloaded or edited
 through dashboard settings.
 
 ## Local client protocol compatibility
@@ -392,3 +394,7 @@ not retried; re-save the recipe and explicitly edit the schedule to its new revi
 Archiving a recipe pauses its schedules; archiving schedules preserves fire history.
 A profile set cannot be archived while active recipe/schedule references depend on it.
 Created tasks retain their provenance and ordinary authority checks.
+
+### Sessions waiting at startup
+
+A running provider process is not proof that work has begun. The session card shows **Waiting for startup** while its current readiness is unknown, including after a retained resume. Choose **View output** to inspect a possible native startup prompt, then **Take keyboard control** if it needs an answer. If Codex displays **Hooks need review**, inspect the listed hooks before deciding whether to trust them. Choose **Release keyboard control** afterward so automatic work can continue. The notice clears when current readiness is reported or the process exits; it does not infer a particular prompt from terminal text or authorize hook trust. Process, launch, readiness, and capture diagnostics remain under **Technical details**.

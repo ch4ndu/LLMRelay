@@ -687,6 +687,8 @@ mod tests {
             contract["contract_id"] =
                 format!("synthetic-claude-{}", contract["role"].as_str().unwrap()).into();
             contract["native_policy_revision"] = NATIVE_SANDBOX_POLICY_REVISION.into();
+            contract["launch_revision"] = LAUNCH_CONTRACT_REVISION.into();
+            contract["resume_revision"] = RESUME_CONTRACT_REVISION.into();
         }
         claude["selectors"] = serde_json::json!([selector]);
         let bundles = crate::provider_compatibility::BundleSet::synthetic_for_tests(

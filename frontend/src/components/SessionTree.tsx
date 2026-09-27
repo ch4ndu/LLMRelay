@@ -1,3 +1,4 @@
+import { TechnicalDetails } from "./ErrorNotice";
 import { useState } from "react";
 import {
   cmuxOutcomeWithDurableSurface,
@@ -52,6 +53,7 @@ export function SessionTree(
           : undefined;
         const reasonExpanded = !!expandedReasons[session.id];
         const running = session.status === "running";
+        const waitingForStartup = running && session.readiness === "unknown";
         // A finished session never routes to cmux again: View resolves to
         // recorded output before it examines any stale presentation row.
         // Keep that safe history path available even if the old row is
@@ -60,24 +62,49 @@ export function SessionTree(
         const canRelease = running && actionability.releaseAvailable;
         return (
           <article key={session.id}>
-            <span className={`status ${session.status}`} />
+            <span
+              className={`status ${
+                waitingForStartup ? "paused" : session.status
+              }`}
+            />
             <div className="session-metadata">
               <strong>
                 {session.setup_operation_id ? "Project setup · " : ""}
                 {session.role.replaceAll("_", " ")} · {session.provider}
               </strong>
               <small>
-                {session.task_id} · gen {session.generation} · {session.status}
-                {" "}
-                · {session.launch_state ?? "legacy launch"} ·{" "}
-                {session.capture_state}
-                {session.workflow_version
-                  ? ` · ${session.workflow_version}`
-                  : ""}
-                {session.lane_id && session.lane_id !== "default"
-                  ? ` · lane ${session.lane_id.slice(0, 8)}`
-                  : ""}
+                {session.task_id} · gen {session.generation} ·{" "}
+                {waitingForStartup ? "Waiting for startup" : session.status}
               </small>
+              {waitingForStartup && (
+                <div className="session-startup-notice warning" role="status">
+                  <strong>Waiting for the coding tool to become ready</strong>
+                  <p>
+                    The process has started, but LLMRelay has not confirmed that
+                    this session is ready to work. It may be waiting for a
+                    startup prompt.
+                  </p>
+                  <p>
+                    Choose View output to inspect the session. If it needs an
+                    answer, choose Take keyboard control.
+                    {session.provider === "codex" &&
+                      " If Codex shows “Hooks need review,” review the listed hooks before deciding whether to trust them."}
+                    {" "}
+                    When finished, choose Release keyboard control so automatic
+                    work can continue. If startup is still loading, wait for
+                    this notice to clear.
+                  </p>
+                </div>
+              )}
+              <TechnicalDetails>
+                Process: {session.status}; launch:{" "}
+                {session.launch_state ?? "unknown"}; readiness:{" "}
+                {session.readiness}; output capture: {session.capture_state}
+                {session.workflow_version
+                  ? `; workflow: ${session.workflow_version}`
+                  : ""}
+                {session.lane_id ? `; lane: ${session.lane_id}` : ""}
+              </TechnicalDetails>
               {(session.exit_reason || session.launch_error ||
                 session.exit_status ||
                 session.exit_code != null) && (
@@ -134,9 +161,7 @@ export function SessionTree(
                 </small>
               )}
               {surface && actionability.diagnostic && (
-                <small className="warning">
-                  Durable cmux diagnostic: {actionability.diagnostic}
-                </small>
+                <TechnicalDetails>{actionability.diagnostic}</TechnicalDetails>
               )}
               {surface && actionability.guidance && (
                 <small className="warning">

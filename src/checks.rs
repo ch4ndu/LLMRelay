@@ -447,7 +447,10 @@ impl CheckService {
                 command.env(key, value);
             }
         }
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         unsafe {
             command.pre_exec(|| {
                 if libc::setpgid(0, 0) != 0 {

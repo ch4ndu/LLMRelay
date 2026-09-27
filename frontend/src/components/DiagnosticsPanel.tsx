@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useState } from "react";
 import { diagnostics } from "../api";
 import type { CapabilityEvidence, TripSetupState } from "../types";
@@ -22,7 +23,7 @@ export function DiagnosticsPanel({ capabilities = [], setups = [] }: {
           <p>Sanitized local events, capability state, and recovery signals.</p>
         </div>
       </header>
-      {error && <p className="error">{error}</p>}
+      {error && <ErrorNotice error={error} />}
       <div className="diagnostic-list">
         {events.map((event, index) => (
           <article key={index}>

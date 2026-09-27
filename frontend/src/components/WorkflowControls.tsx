@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useRef, useState } from "react";
 import {
   ApiError,
@@ -596,7 +597,7 @@ export function WorkflowControls(
           ))}
         </section>
       )}
-      {error && <p className="error" role="alert">{error}</p>}
+      {error && <ErrorNotice error={error} />}
       <small>
         {terminal
           ? "Accepted and cancelled work cannot be resumed or changed from terminal history."

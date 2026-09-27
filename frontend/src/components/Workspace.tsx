@@ -1,3 +1,5 @@
+import { terminalGuidance } from "../cmuxRouting";
+import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import {
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
@@ -429,11 +431,11 @@ export function Workspace(
             >
               {resumeBusy ? "Submitting resume…" : "Resume eligible"}
             </button>
-            {resumeError && <p className="error" role="alert">{resumeError}</p>}
+            {resumeError && <ErrorNotice error={resumeError} />}
             {previewError && (
-              <p className="error" role="alert">{previewError}</p>
+              <ErrorNotice error={previewError} />
             )}
-            {autoResumeError && <p className="error">{autoResumeError}</p>}
+            {autoResumeError && <ErrorNotice error={autoResumeError} />}
           </fieldset>
         </div>
         <SessionTree
@@ -470,31 +472,19 @@ export function Workspace(
               key={key}
             >
               <header>
-                <h3>cmux task presentation</h3>
+                <h3>Task terminal</h3>
                 <span>{cmuxRouteLabel(route.state)}</span>
               </header>
-              <p>{route.message}</p>
-              {route.surface && (
-                <small>
-                  route revision {route.surface.binding_revision} · surface{" "}
-                  {route.surface.surface_state} · attachment{" "}
-                  {route.surface.attachment_state} · desired{" "}
-                  {route.surface.desired_input_state} · actual{" "}
-                  {route.surface.actual_input_state} · control revision{" "}
-                  {route.surface.applied_revision}/{route.surface
-                    .control_revision}
-                </small>
-              )}
-              {output && <pre className="recorded-output">{output}</pre>}
-              {route.surface && presentation.diagnostic && (
-                <p className="warning">
-                  Durable cmux diagnostic: {presentation.diagnostic}
-                </p>
-              )}
-              {route.surface && presentation.guidance && (
-                <p className="warning">{presentation.guidance}</p>
-              )}
-              {route.surface && presentation.discardAvailable && (
+              <p>{terminalGuidance(route)}</p>
+              <TechnicalDetails>
+        <p>{route.message}</p>
+        {route.surface && <p>
+          route revision {route.surface.binding_revision} · surface {route.surface.surface_state} · attachment {route.surface.attachment_state} · desired {route.surface.desired_input_state} · actual {route.surface.actual_input_state} · control revision {route.surface.applied_revision}/{route.surface.control_revision}
+        </p>}
+        {presentation.diagnostic && <p>{presentation.diagnostic}</p>}
+      </TechnicalDetails>
+      {output && <pre className="recorded-output">{output}</pre>}
+      {route.surface && presentation.discardAvailable && (
                 <button
                   disabled={discardingRoutes[key]}
                   onClick={() =>

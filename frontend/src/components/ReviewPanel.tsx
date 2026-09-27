@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useRef, useState } from "react";
 import {
   ApiError,
@@ -287,7 +288,7 @@ export function ReviewPanel(
           </button>
         </section>
       )}
-      {error && <p className="error" role="alert">{error}</p>}
+      {error && <ErrorNotice error={error} />}
     </section>
   );
 }

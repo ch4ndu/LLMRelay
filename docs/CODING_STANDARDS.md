@@ -58,3 +58,15 @@ ledger when relying on a downloaded copy.
   skill suggests it. Existing authorization and exact role assignments remain
   in force.
 
+
+## User-visible errors
+
+Dashboard errors must explain what happened and what the user can do next in
+plain language. Use the shared error presentation for request failures and
+stored failure reasons. Keep backend diagnostics available in collapsed
+Technical details; do not make IDs, hashes, protocol terms, or process-ownership
+terminology the primary explanation. Prefer the actual button or screen name
+when giving recovery steps. An uncertain request must tell the user to refresh
+and check its outcome before retrying; wording must never imply that it failed
+without making changes or authorize an automatic retry. Unknown failures need
+an honest fallback and a way to report the diagnostic details.

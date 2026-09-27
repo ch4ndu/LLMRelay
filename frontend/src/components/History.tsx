@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useRef, useState } from "react";
 import { command, operationId } from "../api";
 import type { Project, Task } from "../types";
@@ -49,7 +50,7 @@ export function History(
           />Show archived
         </label>
       </header>
-      {error && <p className="error">{error}</p>}
+      {error && <ErrorNotice error={error} />}
       <div className="history-list">
         {rows.map((task) => (
           <article key={task.id}>

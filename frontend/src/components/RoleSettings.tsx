@@ -1,3 +1,4 @@
+import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import {
   ApiError,
@@ -26,11 +27,11 @@ import {
 } from "../types";
 
 const compatibilityActions: Record<CompatibilityExplanation["action"], string> = {
-  install_supported_provider_version: "Install a reviewed provider version",
-  update_llmrelay_release: "Update LLMRelay for a reviewed contract",
-  requalify_exact_profile: "Validate this exact profile",
-  inspect_local_provider_configuration: "Inspect local provider configuration",
-  contact_operator: "Contact the operator",
+  install_supported_provider_version: "Install the supported agent version shown below, or update LLMRelay, then verify the profile again.",
+  update_llmrelay_release: "Update LLMRelay to a release that supports this agent version, then verify the profile again.",
+  requalify_exact_profile: "Use Project setup or Agent settings to run verification for these agent settings before starting work.",
+  inspect_local_provider_configuration: "Review the agent setting named in Technical details and correct it before verifying again.",
+  contact_operator: "Ask the person who manages this LLMRelay installation to review Technical details and update or repair it.",
 };
 
 export function CompatibilityDetails({
@@ -43,12 +44,21 @@ export function CompatibilityDetails({
   return (
     <div className="compatibility-details">
       <p>
-        <strong>{candidate ? "Reviewed contract candidate" : "Compatibility needs attention"}</strong>
-        {" · "}{compatibility.message}
+        <strong>{candidate ? "Agent version recognized" : "Agent verification needs attention"}</strong>
+        {" · "}{compatibility.status === "unknown_version"
+          ? `This agent version (${compatibility.observed_version || "unknown"}) is not supported by this LLMRelay release.`
+          : compatibility.status === "contract_changed"
+          ? "The agent connection settings have changed since the last verification."
+          : compatibility.status === "evidence_stale"
+          ? "Verification for these agent settings is missing or out of date."
+          : candidate
+          ? "Version recognition alone does not mean this profile is ready to run. Check its verification status."
+          : "LLMRelay's agent support information could not be validated."}
       </p>
       <p className="hint">Next step: {compatibilityActions[compatibility.action]}</p>
       <details>
-        <summary>Contract details</summary>
+        <summary>Technical details</summary>
+        <p>{compatibility.message}</p>
         <small>
           Pack {compatibility.pack_id || "unavailable"} revision {compatibility.pack_revision || "unavailable"}
           {compatibility.observed_version ? ` · observed ${compatibility.observed_version}` : ""}
@@ -650,7 +660,7 @@ export function RoleSettings(
                 </small>
               )}
               {productionRestriction && (
-                <small>
+                <div className="hint">
                   <span className={`badge ${productionRestriction.status}`}>
                     Production {productionRestriction.status[0].toUpperCase() +
                       productionRestriction.status.slice(1)}
@@ -658,8 +668,11 @@ export function RoleSettings(
                   {productionRestriction.status === "unverified"
                     ? "Validation required: "
                     : "Launch blocked: "}
-                  {productionRestriction.reason}
-                </small>
+                  {productionRestriction.status === "unverified"
+                    ? "Run verification for this agent profile in Project setup or Agent settings before starting work."
+                    : "This agent cannot run with the current settings. Review Technical details and choose a supported configuration."}
+                  <TechnicalDetails>{productionRestriction.reason}</TechnicalDetails>
+                </div>
               )}
               <CompatibilityDetails compatibility={compatibility} />
               {requested && preparation?.task_profile_source && (
@@ -770,9 +783,7 @@ export function RoleSettings(
                     </button>
                   )}
                   {runtimeAdmission?.failure_reason && (
-                    <small className="error">
-                      {runtimeAdmission.failure_reason}
-                    </small>
+                    <ErrorNotice error={runtimeAdmission.failure_reason} />
                   )}
                   <small>
                     Setup receipts do not grant this authority. Profile choice
@@ -848,7 +859,7 @@ export function RoleSettings(
           );
         })}
       </div>
-      {error && <p className="error" role="alert">{error}</p>}
+      {error && <ErrorNotice error={error} />}
       <p className="hint">
         An active change stays requested until a verified immutable checkpoint
         and typed handoff are available. Resume reuses only the exact persisted
@@ -1008,7 +1019,7 @@ export function CheckpointSwitch(
         Request checkpoint switch
       </button>
       {status && <small>{status}</small>}
-      {error && <small className="error">{error}</small>}
+      {error && <ErrorNotice error={error} />}
     </div>
   );
 }

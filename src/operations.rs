@@ -2092,6 +2092,28 @@ impl Application {
         } else {
             None
         };
+        let manager_feedback: Option<String> = if context.role
+            == crate::domain::RoleKind::Implementer
+        {
+            connection.query_row(
+                "SELECT json_object('result_id',r.id,'outcome',r.outcome,'summary',r.summary,
+                   'metadata',json(r.metadata_json),'created_at',r.created_at)
+                 FROM role_results r JOIN role_generations g ON g.id=r.role_generation_id
+                 JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id
+                 JOIN role_settings settings ON settings.task_id=t.id AND settings.role='manager'
+                   AND settings.effective_generation_id=g.id
+                 WHERE t.project_id=?1 AND t.id=?2 AND a.id=?3 AND a.phase='implementation'
+                   AND g.role='manager' AND r.outcome='needs_input'
+                   AND json_extract(r.metadata_json,'$.approved_plan_hash')=a.plan_hash
+                   AND json_extract(r.metadata_json,'$.candidate_hash') IS a.candidate_hash
+                   AND EXISTS(SELECT 1 FROM sessions own WHERE own.id=?4 AND own.validation_cell IS NULL)
+                 ORDER BY r.created_at DESC,r.id DESC LIMIT 1",
+                params![context.project_id,context.task_id,context.attempt_id,context.session_id],
+                |row| row.get(0),
+            ).optional()?
+        } else {
+            None
+        };
         drop(connection);
         let plan = if let Some((id, hash)) = plan_record {
             let path = self
@@ -2158,6 +2180,12 @@ impl Application {
         let mut value = serde_json::json!({"identity":context,"task":serde_json::from_str::<serde_json::Value>(&task)?,"attempt":serde_json::from_str::<serde_json::Value>(&attempt)?,"task_profiles":task_profiles.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"project_policy":project_policy,"verification_catalog":verification_catalog,"selected_checks":selected_checks,"explorer_decisions":explorer_decisions,"approved_plan":plan,"active_review":current_review.map(|value|serde_json::from_str::<serde_json::Value>(&value.5)).transpose()?,"completed_final_review":completed_final_review.map(|value|serde_json::from_str::<serde_json::Value>(&value)).transpose()?,"review_feedback":feedback.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"review_budgets":budgets.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"check_results":checks.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"guidance":guidance,"guidance_contract":guidance_contract,"setup_contract":setup_contract,"commands":commands});
         if let Some(evidence) = ordinary_review_evidence {
             value["ordinary_review_evidence"] = evidence;
+        }
+        if let Some(feedback) = manager_feedback {
+            value["manager_feedback"] = serde_json::json!({
+                "result":serde_json::from_str::<serde_json::Value>(&feedback)?,
+                "authority":"Source repair guidance only. Preserve approved ownership and human approval boundaries. This is not a new approval, a selected-check receipt, or permission to report unverified completion. A source candidate may list pending checks for later service verification."
+            });
         }
         if serde_json::to_vec(&value)?.len() > 1024 * 1024 {
             bail!("task-scoped role context exceeds the 1 MiB response bound")
@@ -2981,11 +3009,16 @@ impl Application {
         {
             bail!("use capability resume for isolated validation sessions")
         }
-        let native_id = self
-            .store
-            .native_session_id(session_id)?
-            .ok_or_else(|| anyhow!("native session identity is unavailable"))?;
+        let native_id = self.store.native_session_id(session_id)?;
         let prior: LaunchConfig = serde_json::from_value(record["launch_config"].clone())?;
+        if native_id.is_none()
+            && !matches!(
+                prior.role,
+                crate::domain::RoleKind::PlanReviewer | crate::domain::RoleKind::CodeReviewer
+            )
+        {
+            bail!("native session identity is unavailable")
+        }
         if prior.role == crate::domain::RoleKind::FinalReviewer {
             bail!("final verifier sessions are always fresh and cannot resume")
         }
@@ -3021,13 +3054,20 @@ impl Application {
             &token,
             &generation,
             session_id,
-            Some(&native_id),
+            native_id.as_deref(),
             &self.hooks,
             &self.executable,
             &read_denials,
             &self.store.compatibility_bundles,
         )?;
         let attempted = PreparedResumeIdentity::from_launch(&launch.config)?;
+        if native_id.is_none() {
+            let error = anyhow!("native session identity is unavailable");
+            if record_permanent_rejection {
+                self.record_permanent_resume_rejection(session_id, &error, Some(&attempted))?;
+            }
+            return Err(error);
+        }
         let reservation = if let Some(receipt) = browser_receipt {
             self.store.reserve_role_resume_with_browser_receipt(
                 session_id,
@@ -3253,6 +3293,7 @@ impl Application {
                 connection.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'human','runtime_probe.launch','runtime_admission',?3,?4,?5)",rusqlite::params![uuid::Uuid::new_v4().to_string(),operation_id,admission_id,serde_json::json!({"role":role,"session_id":result.session_id,"attempt_id":attempt}).to_string(),now])?;
                 Ok(result)
             }
+            Err(error) if error.is::<crate::store::RoleLaunchCapacityError>() => Err(error),
             Err(error) => {
                 let reason = format!("{error:#}");
                 let now = Utc::now().to_rfc3339();
@@ -4746,6 +4787,9 @@ fn permanent_resume_rejection_category(error: &anyhow::Error) -> Option<&'static
     if reason.contains("ordinary runtime probe sessions resume only through resume_runtime_probe") {
         return None;
     }
+    if reason.contains("resume input differs from") {
+        return None;
+    }
     if reason.contains(FROZEN_IDENTITY_MISMATCH) {
         return Some("frozen_runtime_identity_changed");
     }
@@ -4880,6 +4924,22 @@ fn git(cwd: &Path, arguments: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod compatibility_error_tests {
     use super::*;
+
+    #[test]
+    fn changed_resume_request_does_not_poison_retained_session() {
+        assert_eq!(
+            permanent_resume_rejection_category(&anyhow!(
+                "resume input differs from the persisted invocation; create a fresh role or review request"
+            )),
+            None
+        );
+        assert_eq!(
+            permanent_resume_rejection_category(&anyhow!(
+                "session has no persisted invocation input"
+            )),
+            Some("invocation_provenance_missing")
+        );
+    }
 
     #[test]
     fn typed_compatibility_precedes_frozen_identity_string_fallback() {

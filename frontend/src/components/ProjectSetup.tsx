@@ -1,3 +1,5 @@
+import { terminalGuidance } from "../cmuxRouting";
+import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiError,
@@ -1391,7 +1393,7 @@ export function ProjectSetup({
         <p className="warning" key={item}>{item}</p>
       ))}
       {detected.configuration_error && (
-        <p className="error">{detected.configuration_error}</p>
+        <ErrorNotice error={detected.configuration_error} />
       )}
       {activeStage === "discover" && (
         <div className="setup-stage-heading">
@@ -1494,7 +1496,7 @@ export function ProjectSetup({
               </span>
             )}
           </div>
-          {setup.error && <p className="error" role="alert">{setup.error}</p>}
+          {setup.error && <ErrorNotice error={setup.error} />}
           {setupContinuationActions.map((action) => (
             <section
               className="setup-step"
@@ -2064,7 +2066,7 @@ export function ProjectSetup({
                       />
                     </label>
                     {setup.agents_file.error && (
-                      <p className="error">{setup.agents_file.error}</p>
+                      <ErrorNotice error={setup.agents_file.error} />
                     )}
                     <label className="toggle">
                       <input
@@ -2384,7 +2386,7 @@ export function ProjectSetup({
             <fieldset className="setup-step">
               <legend>Approve exact installation</legend>
               {setup.destination_preview_error && (
-                <p className="error">{setup.destination_preview_error}</p>
+                <ErrorNotice error={setup.destination_preview_error} />
               )}
               <div className="destination-list">
                 {setup.destination_preview?.map((entry) => (
@@ -2552,6 +2554,15 @@ export function ProjectSetup({
           runtimeAdmission={runtimeAdmission}
         />
       )}
+      {activeStage === "activate" && setup?.recoveries?.filter((recovery) =>
+        !runtimeAdmission?.probes.some((probe) => probe.session_id === recovery.session_id)
+      ).map((recovery) => (
+        <SetupRecovery
+          key={recovery.record_id}
+          recovery={recovery}
+          onChanged={onChanged}
+        />
+      ))}
       {activeStage === "activate" && trip.readiness === "ready" && (
         <fieldset className="setup-step">
           <legend>Runtime capability readiness</legend>
@@ -2628,13 +2639,7 @@ export function ProjectSetup({
         </p>
       )}
       {error && (
-        <p className="error" role="alert">
-          {error}
-          <small>
-            Ambiguous delivery retains the exact operation identity. A
-            definitive rejection permits a fresh request after refresh.
-          </small>
-        </p>
+        <ErrorNotice error={error} />
       )}
     </section>
   );
@@ -2659,27 +2664,16 @@ function CmuxRouteNotice(
     : outcome.retry_available;
   return (
     <div className={`cmux-route ${outcome.state}`} role="status">
-      <strong>cmux presentation {cmuxRouteLabel(outcome.state)}</strong> ·{" "}
-      {outcome.message}
-      {outcome.surface && (
-        <small>
-          route revision {outcome.surface.binding_revision} · surface{" "}
-          {outcome.surface.surface_state} · attachment{" "}
-          {outcome.surface.attachment_state} · desired{" "}
-          {outcome.surface.desired_input_state} · actual{" "}
-          {outcome.surface.actual_input_state} · control revision{" "}
-          {outcome.surface.applied_revision}/{outcome.surface.control_revision}
-        </small>
-      )}
+      <strong>Terminal connection · {cmuxRouteLabel(outcome.state)}</strong>
+      <p>{terminalGuidance(outcome)}</p>
+      <TechnicalDetails>
+        <p>{outcome.message}</p>
+        {outcome.surface && <p>
+          route revision {outcome.surface.binding_revision} · surface {outcome.surface.surface_state} · attachment {outcome.surface.attachment_state} · desired {outcome.surface.desired_input_state} · actual {outcome.surface.actual_input_state} · control revision {outcome.surface.applied_revision}/{outcome.surface.control_revision}
+        </p>}
+        {presentation.diagnostic && <p>{presentation.diagnostic}</p>}
+      </TechnicalDetails>
       {output && <pre className="recorded-output">{output}</pre>}
-      {outcome.surface && presentation.diagnostic && (
-        <small className="warning">
-          Durable cmux diagnostic: {presentation.diagnostic}
-        </small>
-      )}
-      {outcome.surface && presentation.guidance && (
-        <small className="warning">{presentation.guidance}</small>
-      )}
       {outcome.surface && presentation.discardAvailable && onDiscard && (
         <button disabled={discarding} onClick={onDiscard}>
           {discarding
@@ -2757,7 +2751,7 @@ function SetupInvocation(
     dispatchHeld?: boolean;
   },
 ) {
-  const [viewOutcome, setViewOutcome] = useState<CmuxViewOutcome>();
+  const [sessionView, setSessionView] = useState<{ sessionId: string; outcome: CmuxViewOutcome }>();
   const [discarding, setDiscarding] = useState(false);
   const discardOperation = useRef<
     | { surfaceRouteId: string; sessionId: string; operationId: string }
@@ -2770,6 +2764,10 @@ function SetupInvocation(
   const session = [...sessions].reverse().find((item) =>
     item.attempt_id === attemptId && item.role === role
   );
+  const viewOutcome = sessionView?.sessionId === session?.id ? sessionView?.outcome : undefined;
+  const setViewOutcome = (outcome: CmuxViewOutcome) => {
+    if (session) setSessionView({ sessionId: session.id, outcome });
+  };
   const durableSurface = session?.cmux_surface ||
     (session ? cmuxSurfaces[session.id] : undefined);
   if (durableSurfaceRef.current.sessionId !== session?.id) {
@@ -2784,6 +2782,7 @@ function SetupInvocation(
     );
   }
   const commitViewOutcome = (outcome: CmuxViewOutcome) => {
+    if (durableSurfaceRef.current.sessionId !== session?.id) return outcome;
     const committed = cmuxOutcomeWithDurableSurface(
       outcome,
       durableSurfaceRef.current.surface,
@@ -2848,6 +2847,7 @@ function SetupInvocation(
     action: CmuxKeyboardControlAction,
     requestedSurface = presentationOutcome?.surface,
   ) => {
+    if (durableSurfaceRef.current.sessionId !== session?.id) return;
     const currentSurface = cmuxNewestSurface(
       durableSurfaceRef.current.surface,
       requestedSurface,
@@ -3070,14 +3070,13 @@ function SetupRecovery(
   return (
     <div className="setup-recovery">
       <p className="warning">
-        Process ownership is unresolved for this {roleName(recovery.role)}
+        LLMRelay needs to check whether the earlier {roleName(recovery.role)}
         {recovery.validation_cell === "trip_runtime_probe"
-          ? " runtime admission"
-          : " setup invocation"}. The service verifies the recorded operating
-        system identities; this annotation is not proof. After verification and
-        refresh, use the next action shown for this exact invocation. Retained
-        roles resume this session; the fresh-only final verifier instead uses a
-        separate explicit retry.
+          ? " verification session has stopped"
+          : " setup session has stopped"}. Describe what happened below, then choose
+        Check recovery and continue. LLMRelay will check the recorded
+        processes before letting you continue. After the check, use the resume
+        or retry action shown for this session.
       </p>
       <textarea
         aria-label={`Recovery evidence for ${recovery.role}`}
@@ -3089,7 +3088,7 @@ function SetupRecovery(
           disabled={busy || !evidence.trim()}
           onClick={() => void resolve("confirm_quiescent")}
         >
-          Verify quiescence and reconcile
+          Check recovery and continue
         </button>
         <button
           className="danger"
@@ -3099,7 +3098,7 @@ function SetupRecovery(
           Verify and cancel
         </button>
       </div>
-      {error && <p className="error" role="alert">{error}</p>}
+      {error && <ErrorNotice error={error} />}
     </div>
   );
 }
@@ -3287,7 +3286,7 @@ function RuntimeAdmission(
         </button>
       )}
       {admission.failure_reason && (
-        <p className="error">{admission.failure_reason}</p>
+        <ErrorNotice error={admission.failure_reason} />
       )}
       <div className="profile-list">
         {admission.probes.map((probe) => {
@@ -3329,7 +3328,7 @@ function RuntimeAdmission(
                 <code>{probe.capability_key.slice(0, 12)}</code>
               </small>
               {probe.failure_reason && (
-                <small className="error">{probe.failure_reason}</small>
+                <ErrorNotice error={probe.failure_reason} />
               )}
               {probe.session_id && (
                 <>

@@ -1,3 +1,4 @@
+import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import { useRef, useState } from "react";
 import { command, operationId } from "../api";
 import type { Task } from "../types";
@@ -133,6 +134,16 @@ function RecoveryDecision(
       <h3>Recovery decision</h3>
       <p>
         {exactRecovery
+          ? "Use the recovery action shown above for this task. It checks the affected session before allowing work to continue."
+          : !genericResolver
+          ? "This earlier request no longer has a recovery action. Refresh the task and use its current controls to submit a corrected request."
+          : materialization
+          ? "Describe what happened below, then choose Retry materialization to prepare the task files again."
+          : "Describe what happened below, then choose Check recovery and continue. LLMRelay will check the recorded work before allowing you to proceed."}
+      </p>
+      <TechnicalDetails>
+      <p>
+        {exactRecovery
           ? "This record has an exact recovery command. Generic recovery decisions are intentionally unavailable because they cannot recheck its complete immutable binding."
           : recoveryKind === "database_restore_claim"
           ? "This restore recorded a prelaunch claim reservation without a session or check. Human text only annotates the decision; the service confirms that the recorded prior state is eligible before reconciliation."
@@ -144,6 +155,7 @@ function RecoveryDecision(
           ? "Process ownership is unresolved. Human text annotates the decision; the service still verifies every recorded PID and start identity. After reconciliation, use the exact session Resume action in role settings."
           : "This historical control record has no exact process, check, workspace, or claim tuple. It was definitively rejected, so generic recovery would be guaranteed to fail; refresh and submit a corrected versioned control."}
       </p>
+      </TechnicalDetails>
       {exactRecovery && (
         <p className="hint">
           Use the current recovery and continuation action above this panel.
@@ -168,7 +180,7 @@ function RecoveryDecision(
             >
               {materialization
                 ? "Retry materialization"
-                : "Verify quiescence and reconcile"}
+                : "Check recovery and continue"}
             </button>
             {!restoreEvidence && (
               <button
@@ -189,7 +201,7 @@ function RecoveryDecision(
           </button>
         </div>
       )}
-      {error && <p className="error" role="alert">{error}</p>}
+      {error && <ErrorNotice error={error} />}
     </section>
   );
 }

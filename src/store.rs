@@ -36,6 +36,18 @@ impl std::fmt::Display for RoleResumeCapacityError {
 
 impl std::error::Error for RoleResumeCapacityError {}
 
+// Raised only before issuing a launch permit or creating a native session.
+#[derive(Debug)]
+pub(crate) struct RoleLaunchCapacityError;
+
+impl std::fmt::Display for RoleLaunchCapacityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("role capacity is full; retry when an active session exits")
+    }
+}
+
+impl std::error::Error for RoleLaunchCapacityError {}
+
 #[derive(Clone, Debug)]
 pub struct RoleLaunchContext {
     pub task_id: String,
@@ -3897,7 +3909,7 @@ impl Store {
             bail!("role launch conflicts with a durably owned running check")
         }
         if !role_capacity_available(&transaction, &provider, role, None, None)? {
-            bail!("role capacity is full")
+            return Err(RoleLaunchCapacityError.into());
         }
         let held:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1 AND (t.attention IN ('pause_requested','needs_recovery','restart_parked','resume_failed') OR EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=a.id AND c.kind IN ('pause_now','pause_after_role','cancel') AND c.state='requested') OR (?2='manager' AND EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=a.id AND c.kind='setup_manager_change' AND c.state='held')) OR EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=a.id AND c.kind IN ('manager_stop','manager_change') AND c.state NOT IN ('finished','cancelled','superseded','rejected')) OR EXISTS(SELECT 1 FROM restart_candidates rc WHERE rc.attempt_id=a.id AND rc.state NOT IN ('resumed','released_fresh_dispatch','cancelled'))))",params![attempt_id,role.to_string()],|row|row.get(0))?;
         if held {
@@ -7370,13 +7382,16 @@ impl Store {
                AND json_extract(detail_json,'$.role_generation_id')=?2
                AND json_extract(detail_json,'$.transcript_epoch')=?3
                AND CAST(json_extract(detail_json,'$.resume_count') AS INTEGER)=?4
-               AND json_extract(detail_json,'$.category')=?5)",
+               AND json_extract(detail_json,'$.category')=?5
+               AND (?6 IS NULL OR ?5!='native_history_unavailable'
+                    OR json_extract(detail_json,'$.observed_capability_key')=?6))",
             params![
                 session_id,
                 generation_id,
                 transcript_epoch,
                 resume_count,
-                category
+                category,
+                observed_key
             ],
             |row| row.get(0),
         )?;
@@ -9810,6 +9825,34 @@ pub(crate) fn eligible_manager_service_stop(
         )
         .optional()
         .map_err(Into::into)
+}
+
+pub(crate) fn eligible_implementer_candidate(
+    connection: &rusqlite::Connection,
+    attempt_id: &str,
+    require_quiescent: bool,
+) -> Result<Option<(String, String, String)>> {
+    Ok(connection
+        .query_row(
+            "SELECT r.id,g.id,s.id FROM role_results r
+         JOIN role_generations g ON g.id=r.role_generation_id
+         JOIN sessions s ON s.id=r.session_id AND s.role_generation_id=g.id
+         JOIN attempts a ON a.id=g.attempt_id
+         JOIN role_settings settings ON settings.task_id=a.task_id AND settings.role='implementer'
+           AND settings.effective_generation_id=g.id
+         WHERE a.id=?1 AND a.phase='implementation' AND a.plan_approved_at IS NOT NULL
+           AND g.role='implementer' AND g.lane_id='default'
+           AND r.outcome='candidate_ready' AND r.consumed_at IS NULL
+           AND CASE WHEN json_type(r.metadata_json,'$.lane_yield.plan_hash') IS NULL
+               THEN r.created_at>=a.updated_at
+               ELSE json_extract(r.metadata_json,'$.lane_yield.plan_hash')=a.plan_hash END
+           AND (?2=0 OR (s.status='exited' AND g.status='exited'
+             AND json_extract(s.exit_json,'$.process_group_quiescent')=1))
+         ORDER BY r.created_at DESC,r.id DESC LIMIT 1",
+            params![attempt_id, require_quiescent],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?)
 }
 
 pub(crate) fn eligible_manager_plan(

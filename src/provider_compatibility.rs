@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 const CODEX_BYTES: &str = include_str!("../resources/provider-compatibility/codex.json");
 const CLAUDE_BYTES: &str = include_str!("../resources/provider-compatibility/claude.json");
-pub const CODEX_EXACT_VERSION: &str = "codex-cli 0.155.1";
+pub const CODEX_EXACT_VERSION: &str = "codex-cli 0.157.1";
 const REQUIRED_EVIDENCE: [&str; 4] = [
     "exact_native_policy",
     "hook_trust",
@@ -170,7 +170,7 @@ pub enum SessionClass {
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum CompatibilityError {
-    #[error("provider version has no reviewed compatibility selector")]
+    #[error("{}", .explanation.message)]
     Unsupported {
         explanation: CompatibilityExplanation,
     },
@@ -288,8 +288,22 @@ impl BundleSet {
                     } else {
                         SafeAction::InstallSupportedProviderVersion
                     },
-                    message: "This provider version has no reviewed contract in this release."
-                        .into(),
+                    message: format!(
+                        "Provider version {} has no reviewed contract in this LLMRelay release. {}",
+                        safe_version(version).as_deref().unwrap_or("(unrecognized)"),
+                        if pack.selectors.is_empty() {
+                            "Update LLMRelay to a release supporting this provider.".into()
+                        } else {
+                            format!(
+                                "Use a reviewed version ({}) or update LLMRelay before retrying.",
+                                pack.selectors
+                                    .iter()
+                                    .map(|selector| selector.exact_version.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        }
+                    ),
                 },
             });
         };
@@ -543,6 +557,18 @@ mod tests {
     #[test]
     fn strict_manifest_and_unknown_version_fail_closed() {
         let embedded = BundleSet::embedded();
+        for version in ["codex-cli 0.155.1", "codex-cli 0.157.2"] {
+            let error = embedded
+                .resolve(Provider::Codex, version, RoleKind::Manager)
+                .unwrap_err();
+            assert_eq!(
+                error.explanation().status,
+                CompatibilityStatus::UnknownVersion
+            );
+            assert!(error.to_string().contains(version));
+            assert!(error.to_string().contains(CODEX_EXACT_VERSION));
+            assert!(error.to_string().contains("update LLMRelay"));
+        }
         assert!(matches!(
             embedded.resolve(Provider::Claude, "unqualified", RoleKind::Manager),
             Err(CompatibilityError::Unsupported { .. })

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useMemo, useRef, useState } from "react";
 import { ApiError, command, reuseOperationIdentity } from "../api";
 import type {
@@ -497,7 +498,7 @@ export function ApprovalInbox(
           </article>
         );
       })}
-      {error && <p className="error" role="alert">{error}</p>}
+      {error && <ErrorNotice error={error} />}
       <details className="permission-rules">
         <summary>
           Reusable permission rules ({state.permission_rules.length})

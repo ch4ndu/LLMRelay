@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useRef, useState } from "react";
 import { ApiError, command, operationId } from "../api";
 import {
@@ -435,9 +436,9 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
           recipes.
         </p>
       )}
-      {error && <p className="error" role="alert">{error}</p>}
+      {error && <ErrorNotice error={error} />}
       {notice && <p role="status">{notice}</p>}
-      {recovery.current!.fault && <p className="error" role="alert">{recovery.current!.fault}</p>}
+      {recovery.current!.fault && <ErrorNotice error={recovery.current!.fault} />}
       {recovery.current!.entries.filter((entry) => entry.body.project_id === projectId).map((entry) => (
         <div className="warning" key={entry.resource}>
           {entry.body.kind} has an unknown result for {entry.resource}. The current state can be inspected,

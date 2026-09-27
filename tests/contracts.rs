@@ -1386,6 +1386,8 @@ impl Fixture {
                 format!("synthetic-claude-{}", contract["role"].as_str().unwrap()).into();
             contract["native_policy_revision"] =
                 providers::claude::NATIVE_SANDBOX_POLICY_REVISION.into();
+            contract["launch_revision"] = providers::claude::LAUNCH_CONTRACT_REVISION.into();
+            contract["resume_revision"] = providers::claude::RESUME_CONTRACT_REVISION.into();
         }
         claude["selectors"] = serde_json::json!([selector]);
         let claude = claude.to_string();
@@ -2592,6 +2594,69 @@ fn start_synthetic_runtime_probe(
         insert_fake_hook("UserPromptSubmit", 1, None);
     }
     (context, attempt, nonce, control, prompt)
+}
+
+#[test]
+fn runtime_capacity_rejection_preserves_unspent_authorization() {
+    let (fixture, paths, _, admission) = authorized_runtime_fixture("runtime-capacity-retry");
+    let (manager, ..) =
+        start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Manager, false);
+    let (verifier, ..) =
+        start_synthetic_runtime_probe(&fixture, &admission, RoleKind::FinalReviewer, false);
+    let application = Application::new(
+        paths,
+        fixture.store.clone(),
+        PathBuf::from("/usr/bin/false"),
+    )
+    .unwrap();
+    let snapshot = || {
+        fixture
+            .connection()
+            .query_row(
+                "SELECT p.state,p.failure_reason,p.session_id,permit.state,
+            (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM launch_permits)
+         FROM trip_runtime_probes p JOIN trip_setup_permits permit
+           ON permit.attempt_id=p.attempt_id AND permit.role=p.role
+         WHERE p.admission_id=?1 AND p.role='explorer'",
+                params![admission],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let before = snapshot();
+    let error = application
+        .dispatch_runtime_probe("capacity-rejected", &admission, RoleKind::Explorer)
+        .unwrap_err();
+    assert!(error.to_string().contains("role capacity is full"));
+    assert_eq!(
+        snapshot(),
+        before,
+        "capacity rejection must not consume an unlaunched probe"
+    );
+    fixture.finish_role(&manager);
+    fixture.finish_role(&verifier);
+    let retry = application
+        .dispatch_runtime_probe("capacity-retry", &admission, RoleKind::Explorer)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        retry.contains("launch wrapper") || retry.contains("provider spawn handshake"),
+        "retry did not reach launch: {retry}"
+    );
+    assert_eq!(
+        snapshot().0,
+        "failed",
+        "actual launch failures still require a fresh scope"
+    );
 }
 
 fn authorized_runtime_fixture(name: &str) -> (Fixture, InstancePaths, String, String) {
@@ -3878,6 +3943,81 @@ fn scheduler(fixture: &Fixture, artifacts: PathBuf) -> Scheduler {
     )
 }
 
+#[test]
+fn activated_policy_replaces_only_the_approved_installation_preimage() {
+    for (name, approved, drifted) in [
+        ("approved-policy", true, false),
+        ("unapproved-policy", false, false),
+        ("drifted-policy", true, true),
+    ] {
+        let fixture = Fixture::new(name);
+        let repository = fixture.repository(name);
+        let relative = ".agents/skills/trip-explorer-workflow/SKILL.md";
+        let old = b"# Previous project workflow\n";
+        let base = if drifted {
+            b"# Unreviewed workflow\n".as_slice()
+        } else {
+            old.as_slice()
+        };
+        let path = repository.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, base).unwrap();
+        run(&repository, &["add", relative]);
+        run(
+            &repository,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-qm",
+                "Previous workflow",
+            ],
+        );
+        let project = add_project(&fixture, repository.clone(), name);
+        let installed = std::fs::read(&path).unwrap();
+        let setup: String = fixture
+            .connection()
+            .query_row(
+                "SELECT setup_operation_id FROM trip_project_state WHERE project_id=?1",
+                params![project],
+                |row| row.get(0),
+            )
+            .unwrap();
+        fixture.execute(
+            "INSERT INTO trip_frozen_install_files(setup_operation_id,relative_path,source_hash,preimage_hash,source_bytes,preimage_bytes) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![setup,relative,sha256(&installed),sha256(old),installed,old.as_slice()],
+        );
+        if approved {
+            fixture.execute(
+                "UPDATE trip_setup_operations SET install_authorized_at='2026-01-01T00:00:00Z',approved_source_set_hash='frozen',final_source_set_hash='frozen',approved_preimages_hash='reviewed' WHERE id=?1",
+                params![setup],
+            );
+        }
+        create_task(&fixture, &project, name, 1);
+        seed_supported_capabilities(&fixture);
+        let result = scheduler(&fixture, fixture.root.join("artifacts")).claim_next();
+        let workspace: String = fixture.connection().query_row(
+            "SELECT path FROM workspaces w JOIN attempts a ON a.id=w.attempt_id JOIN tasks t ON t.id=a.task_id WHERE t.project_id=?1",
+            params![project], |row| row.get(0),
+        ).unwrap();
+        let observed = std::fs::read(PathBuf::from(workspace).join(relative)).unwrap();
+        if approved && !drifted {
+            assert!(result.unwrap().is_some());
+            assert_eq!(observed, installed);
+        } else {
+            assert!(format!("{:#}", result.unwrap_err()).contains("policy materialization"));
+            assert_eq!(observed, base);
+        }
+        assert_eq!(std::fs::read(path).unwrap(), installed);
+    }
+}
+
 fn claim(fixture: &Fixture, artifacts: PathBuf) -> DispatchPlan {
     seed_supported_capabilities(fixture);
     scheduler(fixture, artifacts).claim_next().unwrap().unwrap()
@@ -3911,6 +4051,156 @@ fn authorize_ordinary_implementation(fixture: &Fixture, plan: &DispatchPlan) {
         "UPDATE attempts SET phase='implementation',structured_plan_id=?1,plan_hash=?2,plan_approved_at='2026-01-01T00:00:00Z' WHERE id=?3",
         params![plan_id, plan_hash, plan.attempt_id],
     );
+}
+
+#[test]
+fn activated_explorer_dispatches_before_writer_and_waits_for_quiescence() {
+    for stage in ["planning", "rescue"] {
+        let fixture = Fixture::new(&format!("activated-explorer-{stage}"));
+        let (_, _, plan) = new_task(&fixture, "explorer-project", "explorer-task");
+        if stage == "rescue" {
+            authorize_ordinary_implementation(&fixture, &plan);
+        }
+        let mut paths = instance_paths(&fixture);
+        paths.role_socket = fixture.root.join("role.sock");
+        let app = Application::new_with_synthetic_dispatch_for_tests(
+            paths,
+            fixture.store.clone(),
+            std::env::current_exe().unwrap(),
+            test_hooks(&fixture),
+        )
+        .unwrap();
+        fixture.execute(
+            "INSERT INTO trip_explorer_decisions(id,attempt_id,stage,census_json,trigger,activated,limits_json,candidate_hash,created_at)
+             VALUES('activated-decision',?1,?2,'{}','fixture',1,'{\"max_words\":100,\"question\":\"Inspect only\"}',NULL,'2026-01-01T00:00:00Z')",
+            params![plan.attempt_id,stage],
+        );
+        for mutation in [
+            "UPDATE trip_explorer_decisions SET candidate_hash='stale'",
+            "UPDATE trip_explorer_decisions SET candidate_hash=NULL,activated=0",
+        ] {
+            fixture.execute(mutation, []);
+            assert!(!workflow::state(&fixture.store)
+                .unwrap()
+                .decisions
+                .iter()
+                .any(|d| d
+                    .primary_blocker
+                    .as_ref()
+                    .is_some_and(|blocker| blocker.evidence["intended_reason_code"]
+                        == "workflow.explorer_dispatch_available")));
+        }
+        fixture.execute("UPDATE trip_explorer_decisions SET activated=1", []);
+        let dispatched = app.coordinator_tick().unwrap();
+        assert_eq!(dispatched["action"], "explorer_dispatched", "{dispatched}");
+        let session = dispatched["session_id"].as_str().unwrap();
+        assert_eq!(
+            app.coordinator_tick().unwrap()["decision"]["reason_code"],
+            "workflow.activated_explorer_evidence"
+        );
+        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM sessions", 1);
+        fixture.assert_scalar::<i64>(
+            "SELECT COUNT(*) FROM role_generations WHERE role='implementer'",
+            0,
+        );
+        fixture.execute(
+            "UPDATE trip_explorer_decisions SET outcome_json='{}' WHERE id='activated-decision'",
+            [],
+        );
+        assert_eq!(
+            app.coordinator_tick().unwrap()["action"],
+            "completed_explorer_interrupt"
+        );
+        assert_eq!(
+            app.coordinator_tick().unwrap()["decision"]["reason_code"],
+            "workflow.activated_explorer_evidence"
+        );
+        fixture.execute("UPDATE sessions SET status='exited',launch_state='finished',exit_json='{\"process_group_quiescent\":true}' WHERE id=?1",params![session]);
+        fixture.execute("UPDATE role_generations SET status='exited' WHERE id=(SELECT role_generation_id FROM sessions WHERE id=?1)",params![session]);
+        assert_eq!(
+            app.coordinator_tick().unwrap()["action"],
+            "manager_dispatched"
+        );
+        if stage == "rescue" {
+            assert_eq!(
+                app.coordinator_tick().unwrap()["action"],
+                "implementer_dispatched"
+            );
+            fixture.execute(
+                "UPDATE trip_explorer_decisions SET outcome_json=NULL,role_generation_id=NULL",
+                [],
+            );
+            assert_eq!(
+                app.coordinator_tick().unwrap()["decision"]["reason_code"],
+                "workflow.activated_explorer_evidence"
+            );
+            fixture.assert_scalar::<i64>(
+                "SELECT COUNT(*) FROM role_generations WHERE role='explorer'",
+                1,
+            );
+        }
+    }
+}
+
+#[test]
+fn candidate_plan_binding_survives_pause_without_accepting_stale_authority() {
+    for variant in ["current", "wrong-plan", "legacy-stale", "replaced"] {
+        let fixture = Fixture::new(&format!("candidate-pause-{variant}"));
+        let (_, _, plan) = new_task(&fixture, "candidate-project", "candidate-task");
+        authorize_ordinary_implementation(&fixture, &plan);
+        seed_session(
+            &fixture,
+            &plan.attempt_id,
+            "implementer",
+            "candidate-generation",
+            "candidate-session",
+            "exited",
+        );
+        fixture.execute("UPDATE sessions SET exit_json='{\"process_group_quiescent\":true}' WHERE id='candidate-session'",[]);
+        fixture.execute(
+            "UPDATE role_generations SET status='exited' WHERE id='candidate-generation'",
+            [],
+        );
+        fixture.execute("UPDATE role_settings SET effective_generation_id='candidate-generation' WHERE task_id=?1 AND role='implementer'",params![plan.task_id]);
+        let hash: String = fixture
+            .connection()
+            .query_row(
+                "SELECT plan_hash FROM attempts WHERE id=?1",
+                params![plan.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let metadata = match variant {
+            "wrong-plan" => serde_json::json!({"lane_yield":{"plan_hash":"wrong"}}),
+            "legacy-stale" => serde_json::json!({}),
+            _ => serde_json::json!({"lane_yield":{"plan_hash":hash}}),
+        };
+        fixture.execute("INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at) VALUES('candidate-result','candidate-operation','candidate-session','candidate-generation','candidate_ready','source checkpoint','[]',?1,'2026-01-01T00:00:00Z')",params![metadata.to_string()]);
+        fixture.execute(
+            "UPDATE attempts SET status='held',updated_at='2026-02-01T00:00:00Z' WHERE id=?1",
+            params![plan.attempt_id],
+        );
+        if variant == "replaced" {
+            fixture.execute("UPDATE role_settings SET effective_generation_id=NULL WHERE task_id=?1 AND role='implementer'",params![plan.task_id]);
+        }
+        let app = Application::new_with_synthetic_dispatch_for_tests(
+            instance_paths(&fixture),
+            fixture.store.clone(),
+            std::env::current_exe().unwrap(),
+            test_hooks(&fixture),
+        )
+        .unwrap();
+        let result = app.reviews.freeze(&plan.attempt_id, "candidate");
+        if variant == "current" {
+            assert_eq!(result.unwrap()["kind"], "candidate");
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM role_results WHERE id='candidate-result' AND consumed_at IS NOT NULL",1);
+            assert!(app.reviews.freeze(&plan.attempt_id, "candidate").is_err());
+        } else {
+            assert!(result.is_err(), "{variant}");
+            fixture
+                .assert_scalar::<i64>("SELECT COUNT(*) FROM snapshots WHERE kind='candidate'", 0);
+        }
+    }
 }
 
 fn instance_paths(fixture: &Fixture) -> InstancePaths {
@@ -10714,6 +11004,11 @@ fn session_recovery_fresh_route_is_exact_and_single_use() {
 
 #[test]
 fn session_recovery_reviewer_fresh_route_requires_remaining_allowance() {
+    assert_reviewer_fresh_route(false);
+    assert_reviewer_fresh_route(true);
+}
+
+fn assert_reviewer_fresh_route(missing_native: bool) {
     let fixture = Fixture::new("fresh-route-reviewer-accounting");
     seed_permanent_fresh_rejection_authority(
         &fixture,
@@ -10740,6 +11035,13 @@ fn session_recovery_reviewer_fresh_route_requires_remaining_allowance() {
         "code_reviewer",
         true,
     );
+    if missing_native {
+        fixture.execute(
+            "UPDATE sessions SET native_session_id=NULL WHERE id='fresh-reviewer-session'",
+            [],
+        );
+        fixture.execute("UPDATE audit_events SET detail_json=json_set(detail_json,'$.category','native_history_unavailable','$.frozen_capability_key',json_extract(detail_json,'$.observed_capability_key')) WHERE event_code='session.resume.rejected'", []);
+    }
 
     let exhausted = workflow::state(&fixture.store)
         .unwrap()
@@ -10773,6 +11075,41 @@ fn session_recovery_reviewer_fresh_route_requires_remaining_allowance() {
         "UPDATE review_budgets SET extension_allowance=1 WHERE id='fresh-review-budget'",
         [],
     );
+    if missing_native {
+        let original: String = fixture.scalar(
+            "SELECT detail_json FROM audit_events WHERE event_code='session.resume.rejected'",
+        );
+        fixture.execute("UPDATE audit_events SET detail_json=json_remove(detail_json,'$.observed_identity','$.observed_capability_key') WHERE event_code='session.resume.rejected'", []);
+        let missing_proof = workflow::state(&fixture.store)
+            .unwrap()
+            .continuation_actions
+            .into_iter()
+            .find(|action| action.binding["session_id"] == "fresh-reviewer-session")
+            .unwrap();
+        assert!(!matches!(
+            missing_proof.kind,
+            agenticjira::domain::ContinuationActionKind::FreshAccountedRetry
+        ));
+        fixture.execute(
+            "UPDATE audit_events SET detail_json=?1 WHERE event_code='session.resume.rejected'",
+            params![original],
+        );
+        fixture.execute("UPDATE sessions SET native_session_id='known-native' WHERE id='fresh-reviewer-session'", []);
+        let known_native = workflow::state(&fixture.store)
+            .unwrap()
+            .continuation_actions
+            .into_iter()
+            .find(|action| action.binding["session_id"] == "fresh-reviewer-session")
+            .unwrap();
+        assert!(!matches!(
+            known_native.kind,
+            agenticjira::domain::ContinuationActionKind::FreshAccountedRetry
+        ));
+        fixture.execute(
+            "UPDATE sessions SET native_session_id=NULL WHERE id='fresh-reviewer-session'",
+            [],
+        );
+    }
     let authorized = workflow::state(&fixture.store)
         .unwrap()
         .continuation_actions
@@ -13767,6 +14104,28 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
             &["exact candidate inspected".into()],
         )
         .unwrap();
+    // A proposal is saved during the manager's turn. Do not enqueue another
+    // prompt that will steal its next safe idle boundary from the transition.
+    proposal.execute(
+        "UPDATE sessions SET readiness_state='busy' WHERE id=?1",
+        params![proposal_session],
+    );
+    assert_eq!(proposal_app.coordinator_tick().unwrap()["action"], "idle");
+    proposal.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM guidance_messages WHERE body='Implementation candidate is frozen. Inspect the evidence and propose phase code_review.'",
+        0,
+    );
+    proposal.execute(
+        "UPDATE controls SET expected_version=expected_version-1 WHERE kind='transition_proposal'",
+        [],
+    );
+    proposal_app.coordinator_tick().unwrap();
+    proposal.assert_scalar::<i64>("SELECT COUNT(*) FROM guidance_messages", 1);
+    proposal.execute("DELETE FROM guidance_messages", []);
+    proposal.execute(
+        "UPDATE controls SET expected_version=expected_version+1 WHERE kind='transition_proposal'",
+        [],
+    );
     record_unbalanced_manager_stop(
         &proposal,
         &proposal_manager,
@@ -17190,10 +17549,10 @@ fn capability_identity_orders_overlapping_denials_and_preserves_probe_commands()
 #[test]
 fn capability_keys_keep_external_socket_identity_without_probe_policy() {
     let binding = agenticjira::provider_compatibility::BundleSet::embedded()
-        .resolve(Provider::Codex, "codex-cli 0.155.1", RoleKind::Manager)
+        .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
         .unwrap();
     let mut first = launch(RoleKind::Manager, "fixture", "/fixture/c".into());
-    first.executable_version = "codex-cli 0.155.1".into();
+    first.executable_version = "codex-cli 0.157.1".into();
     first.compatibility = Some(binding);
     first.argv = vec![
         "--cd".into(),
@@ -17229,9 +17588,9 @@ fn m7_embedded_provider_selectors_are_exact_and_claude_is_unqualified() {
     use agenticjira::provider_compatibility::{AuthorityBinding, BundleSet, CompatibilityError};
     let bundles = BundleSet::embedded();
     let matched = bundles
-        .resolve(Provider::Codex, "codex-cli 0.155.1", RoleKind::Manager)
+        .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
         .unwrap();
-    assert_eq!(matched.predicate_id, "codex-cli-0.155.1");
+    assert_eq!(matched.predicate_id, "codex-cli-0.157.1");
     assert!(!matched.effective_hash.is_empty());
     assert_ne!(matched.effective_hash, matched.bundle_hash);
     let authority = serde_json::to_value(AuthorityBinding::from(&matched)).unwrap();
@@ -17251,25 +17610,25 @@ fn m7_embedded_provider_selectors_are_exact_and_claude_is_unqualified() {
     changed["description"] = "Different display text".into();
     changed["pack_revision"] = "2".into();
     let reworded = BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes)
-        .resolve(Provider::Codex, "codex-cli 0.155.1", RoleKind::Manager)
+        .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
         .unwrap();
     assert_eq!(matched.effective_hash, reworded.effective_hash);
     assert_ne!(matched.bundle_hash, reworded.bundle_hash);
     changed["selectors"][0]["contracts"][3]["contract_revision"] = "codex-implementer-v2".into();
     let unrelated = BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes)
-        .resolve(Provider::Codex, "codex-cli 0.155.1", RoleKind::Manager)
+        .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
         .unwrap();
     assert_eq!(matched.effective_hash, unrelated.effective_hash);
     changed["selectors"][0]["contracts"][0]["contract_revision"] = "codex-manager-v2".into();
     let affected = BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes)
-        .resolve(Provider::Codex, "codex-cli 0.155.1", RoleKind::Manager)
+        .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
         .unwrap();
     assert_ne!(matched.effective_hash, affected.effective_hash);
     changed["unexpected"] = true.into();
     assert!(matches!(
         BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes).resolve(
             Provider::Codex,
-            "codex-cli 0.155.1",
+            "codex-cli 0.157.1",
             RoleKind::Manager
         ),
         Err(CompatibilityError::InvalidManifest { .. })
@@ -17278,7 +17637,7 @@ fn m7_embedded_provider_selectors_are_exact_and_claude_is_unqualified() {
     let duplicate = changed["selectors"][0].clone();
     changed["selectors"].as_array_mut().unwrap().push(duplicate);
     let overlap = BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes)
-        .resolve(Provider::Codex, "codex-cli 0.155.1", RoleKind::Manager)
+        .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
         .unwrap_err();
     assert!(matches!(
         overlap,
@@ -17305,7 +17664,7 @@ fn m7_legacy_binding_cannot_admit_and_synthetic_store_cannot_enter_production_ap
     let preserved_proof = serde_json::json!({"historical":"preserved"}).to_string();
     let connection = Connection::open(root.join("state.sqlite3")).unwrap();
     connection.execute("INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,hook_hash,proof_json)
-        VALUES('m7-legacy','codex','codex-cli 0.155.1','manager','interactive_pty','legacy-key','supported','historical','[]','2026-09-01T00:00:00Z','historical',?1)", params![preserved_proof]).unwrap();
+        VALUES('m7-legacy','codex','codex-cli 0.157.1','manager','interactive_pty','legacy-key','supported','historical','[]','2026-09-01T00:00:00Z','historical',?1)", params![preserved_proof]).unwrap();
     drop(connection);
     let projected = workflow::state(&store).unwrap();
     let legacy_row = projected
@@ -17370,10 +17729,10 @@ fn m7_persisted_production_equivalent_synthetic_proof_cannot_authorize_normal_re
         .unwrap()
         .with_synthetic_compatibility_for_tests(codex, claude);
     let mut synthetic_launch = launch(RoleKind::Manager, "fixture", root.clone());
-    synthetic_launch.executable_version = "codex-cli 0.155.1".into();
+    synthetic_launch.executable_version = "codex-cli 0.157.1".into();
     synthetic_launch.compatibility = Some(
         BundleSet::synthetic_for_tests(codex, claude)
-            .resolve(Provider::Codex, "codex-cli 0.155.1", RoleKind::Manager)
+            .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
             .unwrap(),
     );
     let synthetic_key = providers::capability_key(&synthetic_launch).unwrap();
@@ -17403,7 +17762,7 @@ fn m7_persisted_production_equivalent_synthetic_proof_cannot_authorize_normal_re
     let proof = serde_json::json!({"compatibility":synthetic_identity.compatibility});
     Connection::open(&database).unwrap().execute(
         "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,hook_hash,proof_json)
-         VALUES('synthetic-proof','codex','codex-cli 0.155.1','manager','interactive_pty',?1,'supported','fixture','[]','2026-09-23T00:00:00Z','fixture',?2)",
+         VALUES('synthetic-proof','codex','codex-cli 0.157.1','manager','interactive_pty',?1,'supported','fixture','[]','2026-09-23T00:00:00Z','fixture',?2)",
         params![synthetic_key, proof.to_string()],
     ).unwrap();
     drop(synthetic);
@@ -17411,7 +17770,7 @@ fn m7_persisted_production_equivalent_synthetic_proof_cannot_authorize_normal_re
     let mut production_launch = synthetic_launch.clone();
     production_launch.compatibility = Some(
         BundleSet::embedded()
-            .resolve(Provider::Codex, "codex-cli 0.155.1", RoleKind::Manager)
+            .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
             .unwrap(),
     );
     let production_key = providers::capability_key(&production_launch).unwrap();
@@ -17663,6 +18022,8 @@ fn m7_claude_fixture_selector_is_isolated_from_embedded_production() {
         contract["contract_id"] =
             format!("synthetic-claude-{}", contract["role"].as_str().unwrap()).into();
         contract["native_policy_revision"] = "claude-native-sandbox-role-socket-v1".into();
+        contract["launch_revision"] = providers::claude::LAUNCH_CONTRACT_REVISION.into();
+        contract["resume_revision"] = providers::claude::RESUME_CONTRACT_REVISION.into();
     }
     claude["selectors"] = serde_json::json!([selector]);
     let fixture = BundleSet::synthetic_for_tests(
@@ -17686,10 +18047,10 @@ fn m7_retained_launch_and_resume_share_exact_bound_identity() {
         .join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&root).unwrap();
     let binding = agenticjira::provider_compatibility::BundleSet::embedded()
-        .resolve(Provider::Codex, "codex-cli 0.155.1", RoleKind::Manager)
+        .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
         .unwrap();
     let mut fresh = launch(RoleKind::Manager, "fixture", root);
-    fresh.executable_version = "codex-cli 0.155.1".into();
+    fresh.executable_version = "codex-cli 0.157.1".into();
     fresh.compatibility = Some(binding);
     fresh.argv = vec!["prompt".into()];
     let mut resumed = fresh.clone();
@@ -23354,6 +23715,48 @@ fn ordinary_role_context_exposes_exact_bounded_contract_without_new_authority() 
         .unwrap();
     assert!(yield_required.contains(&serde_json::json!("agent_claimed_output_hash")));
     assert!(!yield_required.contains(&serde_json::json!("output_hash")));
+    fixture.execute(
+        "UPDATE attempts SET phase='implementation',plan_hash='feedback-plan' WHERE id=?1",
+        params![manager.attempt_id],
+    );
+    fixture.execute(
+        "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+         VALUES('context-manager-feedback','context-manager-feedback-op',?1,?2,'needs_input','Repair the narrow controls using existing layout.','[]','{\"approved_plan_hash\":\"feedback-plan\",\"candidate_hash\":null}','2026-01-01T00:00:00Z')",
+        params![manager.session_id,manager.role_generation_id],
+    );
+    let repair_context = app
+        .role_context_payload(&explicit_lane_implementer)
+        .unwrap();
+    assert_eq!(
+        repair_context["manager_feedback"]["result"]["result_id"],
+        "context-manager-feedback"
+    );
+    assert!(repair_context["manager_feedback"]["authority"]
+        .as_str()
+        .unwrap()
+        .contains("not a new approval"));
+    assert_eq!(repair_context["commands"], implementer_context["commands"]);
+    assert!(app
+        .role_context_payload(&manager)
+        .unwrap()
+        .get("manager_feedback")
+        .is_none());
+    for mutation in [
+        "UPDATE attempts SET plan_hash='different-plan'",
+        "UPDATE attempts SET plan_hash='feedback-plan',candidate_hash='different-candidate'",
+        "UPDATE attempts SET candidate_hash=NULL; UPDATE role_settings SET effective_generation_id='context-other-manager-generation' WHERE role='manager'",
+    ] {
+        fixture.execute_batch(mutation);
+        assert!(app.role_context_payload(&explicit_lane_implementer).unwrap().get("manager_feedback").is_none());
+    }
+    fixture.execute(
+        "UPDATE role_settings SET effective_generation_id=?1 WHERE task_id=?2 AND role='manager'",
+        params![manager.role_generation_id, manager.task_id],
+    );
+    fixture.execute(
+        "UPDATE attempts SET phase='planning',plan_hash=NULL WHERE id=?1",
+        params![manager.attempt_id],
+    );
     assert_eq!(
         context["commands"]["schemas"]["submit_conformance"]["properties"]["ownership"]
             ["minProperties"],
@@ -24786,6 +25189,194 @@ fn assert_mb10_needs_rework_returns_to_plan_review(automatic: bool) {
     }
     drop(app);
     let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+#[test]
+fn reviewed_unapproved_plan_revision_requires_exact_binding_and_review_allowance() {
+    let fixture = Fixture::new("reviewed-plan-revision");
+    let paths = instance_paths(&fixture);
+    let project = add_project(&fixture, fixture.repository("repo"), "p");
+    let task = create_task(&fixture, &project, "task", 1);
+    let plan = claim(&fixture, paths.artifacts.clone());
+    seed_session(
+        &fixture,
+        &plan.attempt_id,
+        "manager",
+        "manager-generation",
+        "manager-session",
+        "running",
+    );
+    let connection = fixture.connection();
+    connection.execute("UPDATE role_settings SET effective_generation_id='manager-generation' WHERE task_id=?1 AND role='manager'", params![task]).unwrap();
+    connection.execute("INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at) VALUES('manager-credential','manager-generation','manager-hash','[\"report_result\"]','2026-01-01T00:00:00Z')", []).unwrap();
+    let context = RoleContext {
+        project_id: project,
+        task_id: task.clone(),
+        attempt_id: plan.attempt_id.clone(),
+        role_generation_id: "manager-generation".into(),
+        session_id: "manager-session".into(),
+        credential_id: "manager-credential".into(),
+        transcript_epoch: "e".into(),
+        role: RoleKind::Manager,
+        provider: Provider::Codex,
+        configuration_revision: 1,
+        lane_id: "default".into(),
+        permissions: vec!["report_result".into()],
+    };
+    connection
+        .execute(
+            "UPDATE sessions SET readiness_state='idle_candidate' WHERE id='manager-session'",
+            [],
+        )
+        .unwrap();
+    let structured = mb10_plan(&fixture, &context, "revision");
+    fixture
+        .store
+        .save_role_result(
+            &context,
+            &RoleResultReport {
+                operation_id: "revised-plan".into(),
+                outcome: "plan_ready".into(),
+                summary: "revision".into(),
+                evidence: vec!["navigation source".into()],
+                metadata: serde_json::json!({
+                    "plan":"corrected navigation plan", "structured_plan":structured,
+                    "supersedes_plan_hash":"reviewed-plan"
+                }),
+            },
+        )
+        .unwrap();
+    connection.execute("UPDATE attempts SET phase='awaiting_plan_approval',plan_hash='reviewed-plan' WHERE id=?1", params![plan.attempt_id]).unwrap();
+    connection.execute("UPDATE review_budgets SET spent=initial_allowance WHERE attempt_id=?1 AND review_kind='plan'", params![plan.attempt_id]).unwrap();
+    let app = Application::new(
+        paths,
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        app.coordinator_tick().unwrap()["action"],
+        "unapproved_plan_superseded"
+    );
+    let version: i64 = connection
+        .query_row(
+            "SELECT version FROM tasks WHERE id=?1",
+            params![task],
+            |row| row.get(0),
+        )
+        .unwrap();
+    app.execute_human_command(&HumanCommand::ExtendReviewBudget {
+        operation_id: "authorize-extra-review".into(),
+        task_id: task.clone(),
+        attempt_id: plan.attempt_id.clone(),
+        expected_version: version,
+        review_kind: "plan".into(),
+        additional: 1,
+    })
+    .unwrap();
+    connection.execute("UPDATE role_results SET metadata_json=json_set(metadata_json,'$.supersedes_plan_hash','wrong-plan') WHERE operation_id='revised-plan'", []).unwrap();
+    assert_ne!(
+        app.coordinator_tick().unwrap()["action"],
+        "unapproved_plan_superseded"
+    );
+    connection.execute("UPDATE role_results SET metadata_json=json_set(metadata_json,'$.supersedes_plan_hash','reviewed-plan') WHERE operation_id='revised-plan'", []).unwrap();
+    connection
+        .execute(
+            "UPDATE attempts SET plan_approved_at='2026-01-01T00:00:00Z' WHERE id=?1",
+            params![plan.attempt_id],
+        )
+        .unwrap();
+    assert_ne!(
+        app.coordinator_tick().unwrap()["action"],
+        "unapproved_plan_superseded"
+    );
+    connection
+        .execute(
+            "UPDATE attempts SET plan_approved_at=NULL WHERE id=?1",
+            params![plan.attempt_id],
+        )
+        .unwrap();
+    assert_eq!(
+        app.coordinator_tick().unwrap()["action"],
+        "unapproved_plan_superseded"
+    );
+    assert_eq!(
+        fixture.scalar::<String>("SELECT phase FROM attempts LIMIT 1"),
+        "planning"
+    );
+    assert_eq!(app.coordinator_tick().unwrap()["action"], "plan_frozen");
+    assert_eq!(
+        app.coordinator_tick().unwrap()["action"],
+        "manager_transition_applied"
+    );
+    assert_eq!(
+        fixture.scalar::<String>("SELECT phase FROM attempts LIMIT 1"),
+        "plan_review"
+    );
+    assert_eq!(
+        fixture.scalar::<i64>("SELECT spent FROM review_budgets WHERE review_kind='plan'"),
+        2
+    );
+    assert_eq!(
+        fixture.scalar::<i64>("SELECT count(*) FROM attempts WHERE plan_approved_at IS NOT NULL"),
+        0
+    );
+    let (plan_hash, structured_id): (String, String) = connection
+        .query_row(
+            "SELECT plan_hash,structured_plan_id FROM attempts WHERE id=?1",
+            params![plan.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let version = connection
+        .query_row(
+            "SELECT version FROM tasks WHERE id=?1",
+            params![task],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let approval = HumanCommand::ApprovePlan {
+        operation_id: "approve-revised-plan".into(),
+        task_id: task,
+        attempt_id: plan.attempt_id.clone(),
+        expected_version: version,
+        plan_hash: plan_hash.clone(),
+    };
+    assert!(app.execute_human_command(&approval).is_err());
+    let request = app
+        .reviews
+        .reserve_request(
+            &plan.attempt_id,
+            "plan",
+            "review revised plan",
+            serde_json::json!({"plan_hash":plan_hash}),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE review_requests SET verdict='approved',delivery_state='finished' WHERE id=?1",
+            params![request.request_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE trip_structured_plans SET reviewed_at='2026-01-01T00:00:00Z' WHERE id=?1",
+            params![structured_id],
+        )
+        .unwrap();
+    connection.execute("UPDATE attempts SET phase='awaiting_plan_approval',structured_plan_id=NULL WHERE id=?1",params![plan.attempt_id]).unwrap();
+    assert_eq!(
+        app.execute_human_command(&approval).unwrap().state,
+        "plan_approved"
+    );
+    assert_eq!(
+        fixture.scalar::<String>("SELECT structured_plan_id FROM attempts LIMIT 1"),
+        structured_id
+    );
+    assert_eq!(
+        fixture.scalar::<String>("SELECT phase FROM attempts LIMIT 1"),
+        "awaiting_implementation_authorization"
+    );
 }
 
 #[test]
@@ -28028,6 +28619,23 @@ fn c8_codex_native_policy_identity_and_current_admission_are_fail_closed() {
     };
     for prepared in [&manager_fresh, &manager_resume] {
         assert_eq!(
+            prepared
+                .arguments
+                .iter()
+                .filter(|argument| *argument == "--no-daemon")
+                .count(),
+            1
+        );
+        let mut shared_daemon_identity = providers::capability_identity(&prepared.config).unwrap();
+        shared_daemon_identity
+            .effective_argv
+            .retain(|argument| argument != "--no-daemon");
+        assert!(providers::codex::require_current_native_policy(
+            &shared_daemon_identity,
+            &floor_repo
+        )
+        .is_err());
+        assert_eq!(
             prepared.arguments.first().map(String::as_str),
             Some("--strict-config")
         );
@@ -29293,7 +29901,7 @@ args = ["--unicode"]
             old_rejection["observed_identity"],
             serde_json::json!({
                 "provider":"codex",
-                "executable_version":"codex-cli 0.155.1",
+                "executable_version":"codex-cli 0.157.1",
                 "role":"implementer",
                 "model":"gpt-5.6-sol",
                 "effort":"high",

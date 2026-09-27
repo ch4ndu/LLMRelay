@@ -7,6 +7,7 @@ use crate::operations::Application;
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use sha2::{Digest, Sha256};
 
 /// Executes at most one durable workflow action. The foreground server calls this
 /// repeatedly; the public scheduler command calls the same seam for deterministic
@@ -100,12 +101,27 @@ pub fn tick(app: &Application) -> Result<serde_json::Value> {
         }
         let advanced = match advance {
             AttemptAdvance::None => Ok(legacy),
+            AttemptAdvance::DispatchExplorer { prompt } => {
+                let launch = app.dispatch_attempt_role(&attempt.id, RoleKind::Explorer, &prompt)?;
+                Ok(
+                    serde_json::json!({"action":"explorer_dispatched","attempt_id":attempt.id,"session_id":launch.session_id}),
+                )
+            }
+            AttemptAdvance::QuiesceExplorer { session_id } => {
+                app.interrupt_completed_role(&session_id)?;
+                Ok(
+                    serde_json::json!({"action":"completed_explorer_interrupt","attempt_id":attempt.id,"session_id":session_id}),
+                )
+            }
             AttemptAdvance::ConsumeBlockedResult => match consume_blocked_result(app, &attempt.id)?
             {
                 Some(value) => return Ok(value),
                 None => Ok(legacy),
             },
             AttemptAdvance::Planning(selection) => advance_planning(app, &attempt, selection),
+            AttemptAdvance::SupersedeUnapprovedPlan { result_id } => {
+                supersede_unapproved_plan(app, &attempt, &result_id)
+            }
             AttemptAdvance::Review(selection) => advance_review(app, &attempt, selection),
             AttemptAdvance::Implementation(selection) => {
                 advance_implementation(app, &attempt, selection)
@@ -392,7 +408,10 @@ enum AttemptDecisionFlow {
 
 enum AttemptAdvance {
     None,
+    DispatchExplorer { prompt: String },
+    QuiesceExplorer { session_id: String },
     ConsumeBlockedResult,
+    SupersedeUnapprovedPlan { result_id: String },
     Planning(PlanningSelection),
     Review(ReviewSelection),
     Implementation(ImplementationSelection),
@@ -776,8 +795,31 @@ fn evaluate_attempt_owner(connection: &Connection, attempt: &Attempt) -> Result<
         decision.advance = AttemptAdvance::ConsumeBlockedResult;
         return Ok(decision);
     }
+    if let Some(decision) = evaluate_activated_explorer(connection, attempt, prerequisites.clone())?
+    {
+        return Ok(decision);
+    }
     match attempt.phase.as_str() {
         "awaiting_plan_approval" => {
+            if let Some(candidate) = superseding_unapproved_plan(connection, &attempt.id)? {
+                let mut decision = ready_attempt_decision(
+                    attempt,
+                    prerequisites,
+                    "workflow.revised_plan_pending_review",
+                );
+                decision.advance = if candidate.session_status == "running"
+                    && candidate.readiness_state != "idle_candidate"
+                {
+                    AttemptAdvance::Planning(PlanningSelection::QuiesceCompletedManager {
+                        session_id: candidate.session_id,
+                    })
+                } else {
+                    AttemptAdvance::SupersedeUnapprovedPlan {
+                        result_id: candidate.result_id,
+                    }
+                };
+                return Ok(decision);
+            }
             let Some(plan_hash) = attempt.plan_hash.clone() else {
                 return Ok(blocked_attempt_decision(
                     attempt,
@@ -878,6 +920,77 @@ fn evaluate_attempt_owner(connection: &Connection, attempt: &Attempt) -> Result<
             Vec::new(),
         )),
     }
+}
+
+fn superseding_unapproved_plan(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<Option<crate::store::EligibleManagerPlan>> {
+    let Some(candidate) = crate::store::eligible_manager_plan(connection, attempt_id, false)?
+    else {
+        return Ok(None);
+    };
+    let eligible: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempts a
+         JOIN review_budgets b ON b.attempt_id=a.id AND b.review_kind='plan'
+         JOIN role_results rr ON rr.id=?2
+         JOIN trip_structured_plans p ON p.attempt_id=a.id AND p.plan_hash=?3
+         WHERE a.id=?1 AND a.phase='awaiting_plan_approval' AND a.status='running'
+           AND a.plan_approved_at IS NULL AND a.candidate_hash IS NULL
+           AND a.accepted_snapshot_id IS NULL
+           AND json_extract(rr.metadata_json,'$.supersedes_plan_hash')=a.plan_hash
+           AND p.plan_hash!=a.plan_hash
+           AND b.extension_allowance>0 AND b.spent<b.initial_allowance+b.extension_allowance)",
+        params![
+            attempt_id,
+            candidate.result_id,
+            hex::encode(Sha256::digest(candidate.plan.as_bytes()))
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(eligible.then_some(candidate))
+}
+
+fn supersede_unapproved_plan(
+    app: &Application,
+    attempt: &Attempt,
+    result_id: &str,
+) -> Result<serde_json::Value> {
+    let mut connection = app.store.lock()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let candidate = superseding_unapproved_plan(&transaction, &attempt.id)?
+        .filter(|candidate| candidate.result_id == result_id)
+        .ok_or_else(|| anyhow!("The revised plan changed. Refresh the task before continuing."))?;
+    if candidate.session_status != "exited" && candidate.readiness_state != "idle_candidate" {
+        bail!("The manager is still working. Wait for it to finish before reviewing the revised plan.")
+    }
+    if transaction.execute(
+        "UPDATE tasks SET version=version+1,updated_at=?1
+         WHERE id=?2 AND version=?3 AND attention='none'",
+        params![
+            Utc::now().to_rfc3339(),
+            attempt.task_id,
+            attempt.task_version
+        ],
+    )? != 1
+    {
+        bail!("The task changed. Refresh it before continuing with the revised plan.")
+    }
+    transaction.execute(
+        "UPDATE attempts SET phase='planning',plan_hash=NULL,
+         updated_at=?1 WHERE id=?2",
+        params![Utc::now().to_rfc3339(), attempt.id],
+    )?;
+    transaction.execute(
+        "UPDATE controls SET state='superseded',updated_at=?1
+         WHERE attempt_id=?2 AND kind='transition_proposal' AND state='proposed'",
+        params![Utc::now().to_rfc3339(), attempt.id],
+    )?;
+    transaction.commit()?;
+    Ok(
+        serde_json::json!({"action":"unapproved_plan_superseded","attempt_id":attempt.id,
+        "previous_plan_hash":attempt.plan_hash,"role_result_id":result_id}),
+    )
 }
 
 fn classify_planning(connection: &Connection, attempt: &Attempt) -> Result<PlanningSelection> {
@@ -1082,6 +1195,81 @@ fn evaluate_review(
     };
     decision.advance = AttemptAdvance::Review(selection);
     Ok(decision)
+}
+
+fn evaluate_activated_explorer(
+    connection: &Connection,
+    attempt: &Attempt,
+    prerequisites: Vec<DecisionPrerequisite>,
+) -> Result<Option<AttemptDecision>> {
+    if !matches!(
+        attempt.phase.as_str(),
+        "planning" | "implementation" | "code_review" | "checks" | "final_review"
+    ) {
+        return Ok(None);
+    }
+    let pending: Option<(String, String, String, String, Option<String>, bool)> = connection.query_row(
+        "SELECT d.id,d.stage,d.census_json,d.limits_json,d.role_generation_id,d.outcome_json IS NOT NULL
+         FROM trip_explorer_decisions d WHERE d.attempt_id=?1 AND d.activated=1
+           AND d.candidate_hash IS ?2
+           AND (d.outcome_json IS NULL OR EXISTS(SELECT 1 FROM role_generations g
+             WHERE g.id=d.role_generation_id AND g.status IN ('launch_reserved','running','stopping')))
+         ORDER BY d.created_at DESC,d.id DESC LIMIT 1",
+        params![attempt.id, attempt.candidate_hash],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+    ).optional()?;
+    let Some((id, stage, census, limits, generation, completed)) = pending else {
+        return Ok(None);
+    };
+    let mut decision = phase_wait_decision(
+        attempt,
+        prerequisites.clone(),
+        "workflow.activated_explorer_evidence",
+        DecisionDisposition::Waiting,
+        DecisionEvidenceState::Pending,
+        DecisionOwner::Service,
+        serde_json::json!({"explorer_decision_id":id,"stage":stage}),
+        serde_json::json!({"action":"waiting","for":"activated_explorer_evidence","attempt_id":attempt.id,"explorer_decision_id":id}),
+    );
+    if let Some(blocker) = decision.explanation.primary_blocker.as_mut() {
+        blocker.message = Some("The task is waiting for its requested source review. Check the Explorer session in Workspace if it needs attention; implementation will continue after the review returns.".into());
+    }
+    if let Some(generation) = generation {
+        if completed {
+            let session: Option<String> = connection.query_row(
+                "SELECT id FROM sessions WHERE role_generation_id=?1 AND status='running' ORDER BY created_at DESC LIMIT 1",
+                params![generation], |row| row.get(0),
+            ).optional()?;
+            if let Some(session_id) = session {
+                decision = ready_attempt_decision(
+                    attempt,
+                    prerequisites,
+                    "workflow.completed_explorer_quiescence",
+                );
+                decision.advance = AttemptAdvance::QuiesceExplorer { session_id };
+            }
+        }
+        return Ok(Some(decision));
+    }
+    if active_role_on(connection, &attempt.id, "implementer")? {
+        if let Some(blocker) = decision.explanation.primary_blocker.as_mut() {
+            blocker.message = Some("The requested source review is waiting for the implementer to stop. Let the current work finish, or use Pause now before resuming the task.".into());
+        }
+        return Ok(Some(decision));
+    }
+    decision = role_dispatch_decision(
+        connection,
+        attempt,
+        prerequisites,
+        RoleKind::Explorer,
+        "workflow.explorer_dispatch_available",
+    )?;
+    decision.advance = AttemptAdvance::DispatchExplorer {
+        prompt: format!(
+            "You are already the assigned Explorer. Perform this bounded read-only evidence task directly, without delegation, edits, builds, tests, or workflow invocation. Read your current role context and obey its authority and reporting schema. Decision: {id}. Stage: {stage}. Census: {census}. Limits and question: {limits}. Return findings_ready with metadata.explorer_decision_id set to {id}. Evidence is not approval or permission to expand scope."
+        ),
+    };
+    Ok(Some(decision))
 }
 
 fn classify_implementation(
@@ -3351,6 +3539,15 @@ fn eligible_manager_transition(
     attempt: &Attempt,
     target: &str,
 ) -> Result<Option<(String, String)>> {
+    current_manager_transition(connection, attempt, target, true)
+}
+
+fn current_manager_transition(
+    connection: &Connection,
+    attempt: &Attempt,
+    target: &str,
+    require_safe_boundary: bool,
+) -> Result<Option<(String, String)>> {
     Ok(connection
         .query_row(
             "SELECT c.id,c.payload_json FROM controls c JOIN role_generations rg ON rg.id=c.role_generation_id
@@ -3364,12 +3561,12 @@ fn eligible_manager_transition(
                AND json_extract(c.payload_json,'$.role_generation_id')=rg.id
                AND c.expected_version=t.version
                AND json_extract(c.payload_json,'$.expected_task_version')=t.version
-               AND ((rg.status='exited' AND s.status='exited'
+               AND (NOT ?3 OR (rg.status='exited' AND s.status='exited'
                       AND COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)=1)
                     OR (rg.status='running' AND s.status='running'
                       AND s.readiness_state='idle_candidate'))
              ORDER BY c.created_at LIMIT 1",
-            params![attempt.id, target],
+            params![attempt.id, target, require_safe_boundary],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?)
@@ -4925,6 +5122,11 @@ fn has_result_on(
     role: &str,
     outcome: &str,
 ) -> Result<bool> {
+    if role == "implementer" && outcome == "candidate_ready" {
+        return Ok(
+            crate::store::eligible_implementer_candidate(connection, attempt, false)?.is_some(),
+        );
+    }
     if role == "manager" && outcome == "plan_ready" {
         return Ok(crate::store::eligible_manager_plan(connection, attempt, true)?.is_some());
     }
@@ -4935,6 +5137,20 @@ fn running_result_session_on(
     attempt: &str,
     role: &str,
 ) -> Result<Option<String>> {
+    if role == "implementer" {
+        if let Some((_, _, session)) =
+            crate::store::eligible_implementer_candidate(connection, attempt, false)?
+        {
+            return Ok(connection
+                .query_row(
+                    "SELECT id FROM sessions WHERE id=?1 AND status='running'",
+                    params![session],
+                    |row| row.get(0),
+                )
+                .optional()?);
+        }
+        return Ok(None);
+    }
     Ok(connection.query_row("SELECT s.id FROM role_results rr JOIN role_generations rg ON rg.id=rr.role_generation_id JOIN sessions s ON s.id=rr.session_id JOIN attempts a ON a.id=rg.attempt_id JOIN role_settings rs ON rs.effective_generation_id=rg.id AND rs.role=rg.role WHERE rg.attempt_id=?1 AND rg.role=?2 AND s.status='running' AND rr.consumed_at IS NULL AND rr.created_at>=a.updated_at ORDER BY rr.created_at DESC LIMIT 1",params![attempt,role],|row|row.get(0)).optional()?)
 }
 fn exact_handoff_ready_on(connection: &Connection, attempt: &Attempt) -> Result<bool> {
@@ -4997,6 +5213,13 @@ fn queue_manager_notice(
     one_shot: bool,
 ) -> Result<bool> {
     let connection = app.store.lock()?;
+    // The proposal is submitted during the native turn. Re-prompting here can
+    // consume its next idle boundary before the coordinator applies it.
+    if body == CANDIDATE_FROZEN_NOTICE
+        && current_manager_transition(&connection, attempt, "code_review", false)?.is_some()
+    {
+        return Ok(false);
+    }
     let generation:Option<String>=connection.query_row("SELECT rg.id FROM role_generations rg JOIN attempts a ON a.id=rg.attempt_id JOIN role_settings rs ON rs.task_id=a.task_id AND rs.role='manager' AND rs.effective_generation_id=rg.id WHERE rg.attempt_id=?1 AND rg.role='manager' AND rg.status='running' ORDER BY rg.generation DESC LIMIT 1",params![attempt.id],|row|row.get(0)).optional()?;
     if let Some(generation) = generation {
         let changed=connection.execute("INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,reason,created_at) SELECT ?1,?2,?3,?4,'queued','awaiting_supported_idle_boundary',?6 WHERE NOT EXISTS(SELECT 1 FROM guidance_messages WHERE attempt_id=?2 AND role_generation_id=?3 AND body=?4 AND (?5 OR state IN ('queued','delivery_reserved','written_awaiting_submit','submitted')))",params![uuid::Uuid::new_v4().to_string(),attempt.id,generation,body,one_shot,Utc::now().to_rfc3339()])?;

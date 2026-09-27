@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 import { ApiError, command, operationId } from "../api";
 import { ModelSelector } from "./ModelSelector";
@@ -721,8 +722,8 @@ export function TaskForm(
           </div>
         )}
         {error && (
-          <div className="error" role="alert">
-            {error}
+          <div>
+            <ErrorNotice error={error} />
             <small>Your draft is still here.</small>
           </div>
         )}

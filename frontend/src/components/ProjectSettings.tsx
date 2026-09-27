@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useState } from "react";
 import { command, operation, operationId } from "../api";
 import type {
@@ -193,7 +194,7 @@ export function ProjectSettings(
           </div>
         )}
       </details>
-      {error && <p className="error" role="alert">{error}</p>}
+      {error && <ErrorNotice error={error} />}
     </section>
   );
 }

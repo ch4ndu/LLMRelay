@@ -12,14 +12,14 @@ pub const IMPLEMENTER_NATIVE_POLICY_REASON: &str = "Codex Implementer requires e
 pub const DENIED_READ_FLOOR_VERSION: &str = "codex-denied-read-floor-v2";
 pub const DENIED_READ_FLOOR_PROFILE: &str = "agenticjira_role";
 pub const LEGACY_DENIED_READ_FLOOR_GAP: &str = "historical Codex configuration predates the canonical control-socket denied-read and restricted-proxy floor; fresh native validation is required";
-pub const MCP_COVERAGE_REVISION: &str = "codex-local-mcp-coverage-v1-0.155.1";
+pub const MCP_COVERAGE_REVISION: &str = "codex-local-mcp-coverage-v1-0.157.1";
 pub const MCP_COVERAGE_CLASS: &str = "personal_ineligible_observed_prelaunch";
 pub const APPROVAL_OWNERSHIP_REVISION: &str = "codex-native-approval-ownership-v1";
 pub const LEGACY_MCP_COVERAGE_GAP: &str = "historical Codex configuration predates exact local MCP-source coverage; fresh native validation is required";
 pub const LEGACY_APPROVAL_OWNERSHIP_GAP: &str = "historical Codex Implementer configuration predates native approval ownership; fresh native validation is required";
-pub const EXACT_CODEX_VERSION: &str = "codex-cli 0.155.1";
-pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-provider-launch-v1";
-pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-provider-resume-v1";
+pub const EXACT_CODEX_VERSION: &str = "codex-cli 0.157.1";
+pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-codex-launch-v2";
+pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-codex-resume-v2";
 pub const CREDENTIAL_CONTRACT_REVISION: &str = "llmrelay-local-credential-v1";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_AUTH_BYTES: u64 = 256 * 1024;
@@ -33,6 +33,7 @@ const DISABLED_FEATURES: &[&str] = &[
     "browser_use_full_cdp_access",
     "codex_apps_mcp_2026_07_28",
     "computer_use",
+    "daemon_auto_start",
     "enable_mcp_apps",
     "external_agent_memory_import",
     "image_generation",
@@ -46,6 +47,7 @@ const DISABLED_FEATURES: &[&str] = &[
     "skill_mcp_dependency_install",
     "skill_search",
     "tool_call_mcp_elicitation",
+    "use_xaa",
 ];
 
 #[derive(Debug)]
@@ -126,6 +128,7 @@ pub(crate) fn prepare_with_bundles(
     };
     let mut arguments = vec![
         "--strict-config".to_owned(),
+        "--no-daemon".to_owned(),
         "--no-alt-screen".to_owned(),
         "--cd".to_owned(),
         cwd.to_string_lossy().into_owned(),
@@ -405,6 +408,12 @@ pub fn require_denied_read_floor(identity: &CapabilityIdentity) -> Result<()> {
     let proxy = network_proxy(&role_socket)?;
     let argv_matches = identity.effective_argv.first().map(String::as_str)
         == Some("--strict-config")
+        && identity
+            .effective_argv
+            .iter()
+            .filter(|argument| *argument == "--no-daemon")
+            .count()
+            == 1
         && argument_pair_count(
             &identity.effective_argv,
             "--ask-for-approval",
@@ -521,6 +530,10 @@ pub fn require_native_policy_identity(identity: &CapabilityIdentity) -> Result<(
             .get("remote_executor")
             .and_then(serde_json::Value::as_str)
             == Some("not_forwarded_by_cleared_child_environment")
+        && coverage
+            .get("executor_environment_config")
+            .and_then(serde_json::Value::as_str)
+            == Some("absent_at_prelaunch_check")
         && coverage
             .get("credential_store")
             .and_then(serde_json::Value::as_str)
@@ -698,6 +711,7 @@ fn inspect_native_compatibility(cwd: &Path, version: &str) -> Result<NativeCompa
         .filter(|path| path.is_absolute())
         .ok_or_else(|| anyhow::anyhow!("Codex local compatibility requires an absolute HOME"))?;
     let codex_home = home.join(".codex");
+    require_local_executor_home(&codex_home)?;
     for (path, label) in [
         (
             Path::new("/etc/codex/managed_config.toml"),
@@ -765,6 +779,7 @@ fn inspect_native_compatibility(cwd: &Path, version: &str) -> Result<NativeCompa
         "shared_app_server": "absent",
         "capability_roots": "not_supplied_by_local_cli_adapter",
         "remote_executor": "not_forwarded_by_cleared_child_environment",
+        "executor_environment_config": "absent_at_prelaunch_check",
         "credential_store": "file",
         "cloud_cache": "absent_at_prelaunch_check",
         "disabled_features": DISABLED_FEATURES,
@@ -774,6 +789,38 @@ fn inspect_native_compatibility(cwd: &Path, version: &str) -> Result<NativeCompa
         disabled_mcp_servers: unconditional,
         identity,
     })
+}
+
+fn require_local_executor_home(codex_home: &Path) -> Result<()> {
+    if path_exists(&codex_home.join("environments.toml"))? {
+        bail!("Codex local compatibility requires environments.toml to be absent; configured executor environments are not qualified and LLMRelay never removes them")
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod executor_environment_tests {
+    use super::*;
+
+    #[test]
+    fn configured_executor_is_rejected_without_reading_or_modifying_it() {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-environments-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        require_local_executor_home(&root).unwrap();
+        let path = root.join("environments.toml");
+        let content = b"default = 'external'\n[[environments]]\nid = 'external'\nurl = 'ws://example.invalid'\n";
+        fs::write(&path, content).unwrap();
+        assert!(require_local_executor_home(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("environments.toml"));
+        assert_eq!(fs::read(&path).unwrap(), content);
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(root.join("missing"), &path).unwrap();
+        assert!(require_local_executor_home(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn parse_config(path: &Path, label: &str) -> Result<Option<toml::Value>> {

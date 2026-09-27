@@ -10625,7 +10625,9 @@ pub fn materialize_project_policy(
             .join(PACKAGE_VERSION)
             .join(relative);
         let bytes = read_verified_regular(&root, &source, expected.as_str().unwrap_or_default())?;
-        write_new_verified(
+        write_activated_policy_file(
+            store,
+            attempt_id,
             workspace,
             &destination,
             &bytes,
@@ -10646,7 +10648,9 @@ pub fn materialize_project_policy(
                 &active_source,
                 expected.as_str().unwrap_or_default(),
             )?;
-            write_new_verified(
+            write_activated_policy_file(
+                store,
+                attempt_id,
                 workspace,
                 &active_destination,
                 &active_bytes,
@@ -10671,7 +10675,9 @@ pub fn materialize_project_policy(
         let source = root.join(".agents/trip-explorer/bin").join(relative);
         let destination = workspace.join(".agents/trip-explorer/bin").join(relative);
         let bytes = read_verified_regular(&root, &source, expected.as_str().unwrap_or_default())?;
-        write_new_verified(
+        write_activated_policy_file(
+            store,
+            attempt_id,
             workspace,
             &destination,
             &bytes,
@@ -10697,13 +10703,22 @@ pub fn materialize_project_policy(
             .ok_or_else(|| anyhow!("activated manifest is missing {hash_key}"))?;
         let source = root.join(relative);
         let bytes = read_verified_regular(&root, &source, expected)?;
-        write_new_verified(workspace, &workspace.join(relative), &bytes, expected)?;
+        write_activated_policy_file(
+            store,
+            attempt_id,
+            workspace,
+            &workspace.join(relative),
+            &bytes,
+            expected,
+        )?;
         copied.insert(
             relative.into(),
             serde_json::Value::String(expected.to_owned()),
         );
     }
-    write_new_verified(
+    write_activated_policy_file(
+        store,
+        attempt_id,
         workspace,
         &workspace.join(".agents/trip-explorer/manifest.json"),
         &manifest_bytes,
@@ -10726,7 +10741,14 @@ pub fn materialize_project_policy(
                 bail!("approved guidance collides with different worktree content: {relative}")
             }
         } else {
-            write_new_verified(workspace, &destination, &bytes, &expected)?;
+            write_activated_policy_file(
+                store,
+                attempt_id,
+                workspace,
+                &destination,
+                &bytes,
+                &expected,
+            )?;
         }
         copied.insert(relative, serde_json::Value::String(expected));
     }
@@ -11475,6 +11497,69 @@ fn ensure_safe_parent(root: &Path, path: &Path) -> Result<()> {
     fs::create_dir_all(parent)?;
     ensure_no_symlink_ancestry(root, path)
 }
+fn write_activated_policy_file(
+    store: &Store,
+    attempt_id: &str,
+    root: &Path,
+    destination: &Path,
+    bytes: &[u8],
+    expected: &str,
+) -> Result<()> {
+    ensure_no_symlink_ancestry(root, destination)?;
+    let observed = hash_file(destination)?;
+    if observed.is_none() || observed.as_deref() == Some(expected) {
+        return write_new_verified(root, destination, bytes, expected);
+    }
+    let relative = destination.strip_prefix(root)?.to_string_lossy();
+    let approved: Option<(String, Vec<u8>, Vec<u8>)> = store
+        .lock()?
+        .query_row(
+            "SELECT f.preimage_hash,f.source_bytes,f.preimage_bytes
+         FROM attempts a JOIN tasks t ON t.id=a.task_id
+         JOIN projects p ON p.id=t.project_id
+         JOIN workspaces w ON w.attempt_id=a.id
+         JOIN trip_project_state s ON s.project_id=p.id
+         JOIN trip_setup_operations so ON so.id=s.setup_operation_id AND so.project_id=p.id
+         JOIN trip_frozen_install_files f ON f.setup_operation_id=so.id
+         WHERE a.id=?1 AND w.path=?2 AND w.path!=p.repository_path
+           AND w.state IN ('reserved','unknown','recovery_required')
+           AND s.readiness='ready' AND so.state='activated'
+           AND so.install_authorized_at IS NOT NULL
+           AND so.approved_source_set_hash=so.final_source_set_hash
+           AND so.approved_preimages_hash IS NOT NULL
+           AND f.relative_path=?3 AND f.source_hash=?4 AND f.preimage_hash IS NOT NULL",
+            params![attempt_id, root.to_string_lossy(), relative, expected],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((preimage, source_bytes, preimage_bytes)) = approved else {
+        bail!(
+            "policy materialization collision: {}",
+            destination.display()
+        )
+    };
+    if observed.as_deref() != Some(preimage.as_str())
+        || sha256(&preimage_bytes) != preimage
+        || sha256(&source_bytes) != expected
+        || source_bytes != bytes
+    {
+        bail!(
+            "policy materialization collision: {}",
+            destination.display()
+        )
+    }
+    // The activated installation authorizes only this exact old-to-new byte pair.
+    ensure_safe_parent(root, destination)?;
+    if hash_file(destination)? != observed {
+        bail!("approved policy preimage changed before worktree replacement")
+    }
+    atomic_write(destination, bytes)?;
+    if hash_file(destination)?.as_deref() != Some(expected) {
+        bail!("policy materialization hash mismatch")
+    }
+    Ok(())
+}
+
 fn write_new_verified(root: &Path, destination: &Path, bytes: &[u8], expected: &str) -> Result<()> {
     if sha256(bytes) != expected {
         bail!(
