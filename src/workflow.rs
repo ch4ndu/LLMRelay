@@ -1075,7 +1075,7 @@ pub fn execute_with_runtime(
         } => {
             let (identity, active) = transaction.query_row(
                 "SELECT repository_identity, EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
-                  WHERE t.project_id=projects.id AND a.status NOT IN ('done','cancelled','failed')) FROM projects WHERE id=?1 AND version=?2",
+                  WHERE t.project_id=projects.id AND a.status NOT IN ('done','cancelled','failed','reworked')) FROM projects WHERE id=?1 AND version=?2",
                 params![project_id, expected_version], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
             ).optional()?.ok_or_else(|| anyhow!("project version is stale"))?;
             if active {

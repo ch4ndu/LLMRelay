@@ -6295,6 +6295,28 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
     .unwrap();
     assert_eq!(activated.state, "activated");
     assert_eq!(activated.detail["recovered"], true);
+    let validation = std::process::Command::new("python3")
+        .arg("-B")
+        .arg(repository.join(".agents/trip-explorer/bin/validate_installed.py"))
+        .arg("--project")
+        .arg(&repository)
+        .output()
+        .unwrap();
+    assert!(
+        validation.status.success(),
+        "installed package validation failed: {} {}",
+        String::from_utf8_lossy(&validation.stdout),
+        String::from_utf8_lossy(&validation.stderr)
+    );
+    let installed_preflight: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(repository.join(".agents/trip-explorer/preflight.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(installed_preflight["receipts"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        installed_preflight["llmrelay"]["host_manager_receipt"]["role"],
+        "manager"
+    );
     assert_eq!(
         sha256(&std::fs::read(repository.join(".agents/trip-explorer/manifest.json")).unwrap()),
         manifest_source
@@ -26263,6 +26285,198 @@ fn t09_rework_is_idempotent_materializes_full_candidate_and_fences_carry() {
         .is_err());
     drop(app);
     let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+#[test]
+fn audit_snapshot_recovery_rejects_additional_source_leaves() {
+    let fixture = Fixture::new("audit-extra-leaves");
+    let repo = fixture.repository("repo");
+    let repository = workspace::inspect(&repo).unwrap();
+    let frozen = fixture.root.join("snapshot");
+    let (manifest, _) = snapshot::capture(&repository, &repo, &frozen).unwrap();
+    let destination = fixture.root.join("rework");
+    workspace::create_detached_worktree(&repository, &destination, &manifest.snapshot_base)
+        .unwrap();
+    snapshot::materialize(&manifest, &frozen, &destination).unwrap();
+    assert!(snapshot::verify_materialized(&manifest, &destination).unwrap());
+    std::fs::create_dir(destination.join("new-module")).unwrap();
+    let extra = destination.join("new-module/extra.rs");
+    std::fs::write(&extra, "unreviewed source\n").unwrap();
+    assert!(!snapshot::verify_materialized(&manifest, &destination).unwrap());
+    run(&destination, &["add", "new-module/extra.rs"]);
+    assert!(!snapshot::verify_materialized(&manifest, &destination).unwrap());
+    run(
+        &destination,
+        &["reset", "-q", "HEAD", "--", "new-module/extra.rs"],
+    );
+    std::fs::remove_file(&extra).unwrap();
+    std::os::unix::fs::symlink("../fixture.txt", &extra).unwrap();
+    assert!(!snapshot::verify_materialized(&manifest, &destination).unwrap());
+    std::fs::remove_file(&extra).unwrap();
+    let exclude = repository.common_directory.join("info/exclude");
+    let mut patterns = std::fs::OpenOptions::new()
+        .append(true)
+        .open(exclude)
+        .unwrap();
+    writeln!(patterns, "\n.runtime-audit/").unwrap();
+    std::fs::create_dir(destination.join(".runtime-audit")).unwrap();
+    std::fs::write(
+        destination.join(".runtime-audit/receipt"),
+        "ignored runtime artifact",
+    )
+    .unwrap();
+    assert!(snapshot::verify_materialized(&manifest, &destination).unwrap());
+    std::fs::write(destination.join("fixture.txt"), "changed reviewed bytes").unwrap();
+    assert!(!snapshot::verify_materialized(&manifest, &destination).unwrap());
+}
+
+#[test]
+fn audit_snapshot_file_directory_transitions_round_trip_and_verify_integration() {
+    for committed in [false, true] {
+        for file_to_directory in [false, true] {
+            let fixture = Fixture::new("audit-path-transition");
+            let repo = fixture.repository("repo");
+            let replaced = repo.join("item");
+            if file_to_directory {
+                std::fs::write(&replaced, "old leaf\n").unwrap();
+            } else {
+                std::fs::create_dir(&replaced).unwrap();
+                std::fs::write(replaced.join("child.txt"), "old child\n").unwrap();
+            }
+            run(&repo, &["add", "item"]);
+            run(
+                &repo,
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "-qm",
+                    "transition base",
+                ],
+            );
+            let repository = workspace::inspect(&repo).unwrap();
+            if file_to_directory {
+                std::fs::remove_file(&replaced).unwrap();
+                std::fs::create_dir(&replaced).unwrap();
+                std::fs::write(replaced.join("child.txt"), "new child\n").unwrap();
+            } else {
+                std::fs::remove_file(replaced.join("child.txt")).unwrap();
+                std::fs::remove_dir(&replaced).unwrap();
+                std::fs::write(&replaced, "new leaf\n").unwrap();
+            }
+            if committed {
+                run(&repo, &["add", "-A"]);
+                run(
+                    &repo,
+                    &[
+                        "-c",
+                        "commit.gpgsign=false",
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "commit",
+                        "-qm",
+                        "transition candidate",
+                    ],
+                );
+            }
+            let frozen = fixture.root.join("snapshot");
+            let (manifest, _) = snapshot::capture(&repository, &repo, &frozen).unwrap();
+            assert_eq!(
+                snapshot::clean_candidate_commit(&repository, &manifest)
+                    .unwrap()
+                    .is_some(),
+                committed
+            );
+            assert!(
+                snapshot::verify_integration(&repository, &manifest, &repository.head).is_err()
+            );
+            let destination = fixture.root.join("rework");
+            workspace::create_detached_worktree(&repository, &destination, &manifest.snapshot_base)
+                .unwrap();
+            snapshot::materialize(&manifest, &frozen, &destination).unwrap();
+            snapshot::materialize(&manifest, &frozen, &destination).unwrap();
+            assert!(snapshot::verify_materialized(&manifest, &destination).unwrap());
+            let (recaptured, _) =
+                snapshot::capture(&repository, &destination, &fixture.root.join("recaptured"))
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&manifest).unwrap(),
+                serde_json::to_value(recaptured).unwrap()
+            );
+            if !committed {
+                run(&repo, &["add", "-A"]);
+                run(
+                    &repo,
+                    &[
+                        "-c",
+                        "commit.gpgsign=false",
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "commit",
+                        "-qm",
+                        "integrate transition",
+                    ],
+                );
+            }
+            let integrated = workspace::inspect(&repo).unwrap();
+            assert_eq!(
+                snapshot::verify_integration(&repository, &manifest, &integrated.head).unwrap(),
+                vec!["item", "item/child.txt"]
+            );
+        }
+    }
+}
+
+#[test]
+fn audit_relink_allows_completed_rework_but_rejects_live_successor() {
+    let fixture = Fixture::new("audit-relink-rework");
+    let repo = fixture.repository("repo");
+    let project = workflow::execute(
+        &fixture.store,
+        &HumanCommand::AddProject {
+            operation_id: "add".into(),
+            path: repo.clone(),
+            display_name: "Fixture".into(),
+        },
+    )
+    .unwrap()
+    .entity_id;
+    let task = workflow::execute(
+        &fixture.store,
+        &HumanCommand::CreateTask {
+            operation_id: "task".into(),
+            project_id: project.clone(),
+            title: "Reworked task".into(),
+            description: "".into(),
+            acceptance_criteria: vec![],
+            priority: 0,
+            ready: false,
+            role_overrides: serde_json::json!({}),
+        },
+    )
+    .unwrap()
+    .entity_id;
+    for (id, status) in [("parent", "reworked"), ("child", "running")] {
+        fixture.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at) VALUES(?1,?2,'context','final_verification','base',1,?3,'now','now')", params![id,task,status]);
+    }
+    let relink = HumanCommand::RelinkProject {
+        operation_id: "relink".into(),
+        project_id: project,
+        path: repo,
+        expected_version: 1,
+    };
+    assert!(workflow::execute(&fixture.store, &relink)
+        .unwrap_err()
+        .to_string()
+        .contains("attempts are active"));
+    fixture.execute("UPDATE attempts SET status='done' WHERE id='child'", []);
+    fixture.execute("UPDATE tasks SET lifecycle='done' WHERE id=?1", [&task]);
+    assert_eq!(
+        workflow::execute(&fixture.store, &relink).unwrap().state,
+        "relinked"
+    );
 }
 
 #[test]

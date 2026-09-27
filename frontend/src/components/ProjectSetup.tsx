@@ -109,6 +109,17 @@ const exactResumeUnavailable = (compatibility?: CompatibilityExplanation | null)
   freshQualificationUnavailable(compatibility) ||
   compatibility?.status === "contract_changed" ||
   compatibility?.status === "evidence_stale";
+const qualificationResumeUnavailable = (compatibility?: CompatibilityExplanation | null) => {
+  // A qualification probe must resume before it can produce its first receipt.
+  // The resume endpoint still validates the frozen session and launch identity.
+  if (compatibility?.status === "evidence_stale" &&
+    compatibility.observed_version === null &&
+    compatibility.missing_evidence.length === 1 &&
+    compatibility.missing_evidence[0] === "exact_selected_profile_observation") {
+    return false;
+  }
+  return exactResumeUnavailable(compatibility);
+};
 const stageForProject = (
   setup: TripSetupState | undefined,
   trip: TripProjectState,
@@ -497,10 +508,10 @@ export function ProjectSetup({
       freshQualificationUnavailable(selection.compatibility)
     ).map((selection) => selection.role) || [],
   );
-  const exactResumeUnavailableRoles = new Set(
+  const qualificationResumeUnavailableRoles = new Set(
     setup?.selected_profiles.filter((selection) =>
       selection.selection_state === "selected" &&
-      exactResumeUnavailable(selection.compatibility)
+      qualificationResumeUnavailable(selection.compatibility)
     ).map((selection) => selection.role) || [],
   );
   const trip: TripProjectState = project.trip || {
@@ -960,8 +971,9 @@ export function ProjectSetup({
       expected_project_version: project.version,
       configuration: setup.proposal,
     });
-  const prepareRuntime = (role?: Role) =>
-    runTrip(
+  const prepareRuntime = (role?: Role) => {
+    setRuntimeAdmissionId(null);
+    return runTrip(
       role ? `prepare-runtime:${role}` : "prepare-runtime",
       {
         action: "prepare_runtime_admission",
@@ -973,6 +985,7 @@ export function ProjectSetup({
           : {}),
       },
     );
+  };
   const authorizeRuntime = (admissionId: string, scopeHash: string) =>
     runTrip(`authorize-runtime:${admissionId}`, {
       action: "authorize_runtime_admission",
@@ -1106,10 +1119,11 @@ export function ProjectSetup({
 
   const managerValid = !!manager.provider && !!manager.model.trim() &&
     !!manager.effort;
-  const managerMatchesCurrent = !!managerControl?.current &&
-    manager.provider === managerControl.current.provider &&
-    manager.model.trim() === managerControl.current.model &&
-    manager.effort === managerControl.current.effort;
+  const currentManagerSelection = selectedManager || managerControl?.requested;
+  const managerMatchesCurrent = !!currentManagerSelection &&
+    manager.provider === currentManagerSelection.provider &&
+    manager.model.trim() === currentManagerSelection.model &&
+    manager.effort === currentManagerSelection.effort;
   const managerProfileLabel = (profile?: RoleConfig | null) =>
     profile
       ? `provider ${profile.provider} · model ${profile.model} · effort ${profile.effort}`
@@ -1226,9 +1240,12 @@ export function ProjectSetup({
   const showProposalEditor = !!setup &&
     !discoveryManagerHeld &&
     (editingRevision || ["discovery", "draft"].includes(setup.state));
-  const runtimeAdmission = setup?.runtime_admissions?.find((item) =>
+  const [runtimeAdmissionId, setRuntimeAdmissionId] = useState<string | null>(null);
+  const runtimeAdmissions = setup?.runtime_admissions?.filter((item) =>
     !item.task_id
-  );
+  ) || [];
+  const runtimeAdmission = runtimeAdmissions.find((item) => item.id === runtimeAdmissionId) ||
+    runtimeAdmissions[0];
   const setupContinuationActions = (setup?.continuation_actions || []).filter(
     (action) => action.operation === "trip_setup_dispatch",
   );
@@ -1712,7 +1729,7 @@ export function ProjectSetup({
                   cmuxSurfaces={cmuxSurfaces}
                   recoveries={setup.recoveries || []}
                   unavailableRoles={freshUnavailableRoles}
-                  exactResumeUnavailableRoles={exactResumeUnavailableRoles}
+                  exactResumeUnavailableRoles={qualificationResumeUnavailableRoles}
                   onChanged={onChanged}
                   dispatchHeld={!!managerControl?.hold}
                 />
@@ -2337,7 +2354,7 @@ export function ProjectSetup({
                   cmuxSurfaces={cmuxSurfaces}
                   recoveries={setup.recoveries || []}
                   unavailableRoles={freshUnavailableRoles}
-                  exactResumeUnavailableRoles={exactResumeUnavailableRoles}
+                  exactResumeUnavailableRoles={qualificationResumeUnavailableRoles}
                   onChanged={onChanged}
                 />
               ))}
@@ -2570,6 +2587,21 @@ export function ProjectSetup({
           )}
           {runtimeAdmission && (
             <>
+              {runtimeAdmissions.length > 1 && (
+                <label>
+                  Runtime verification group
+                  <select
+                    value={runtimeAdmission.id}
+                    onChange={(event) => setRuntimeAdmissionId(event.target.value)}
+                  >
+                    {runtimeAdmissions.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.probes.map((probe) => roleName(probe.role)).join(", ")} · {item.state.replaceAll("_", " ")} · {item.id.slice(0, 8)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
               <RuntimeAdmission
                 admission={runtimeAdmission}
                 busy={busy}
@@ -2583,7 +2615,7 @@ export function ProjectSetup({
                 cmuxSurfaces={cmuxSurfaces}
                 recoveries={setup?.recoveries || []}
                 unavailableRoles={freshUnavailableRoles}
-                exactResumeUnavailableRoles={exactResumeUnavailableRoles}
+                exactResumeUnavailableRoles={qualificationResumeUnavailableRoles}
                 onChanged={onChanged}
               />
             </>

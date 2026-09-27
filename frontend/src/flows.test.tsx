@@ -858,6 +858,29 @@ Deno.test("M7 fresh qualification stays reachable while stale exact resume is he
     }
     unmount();
 
+    mount(<ProjectSetup project={initialized} setup={{ ...setup, runtime_admissions: [
+      { ...setup.runtime_admissions[0], id: "newer-correction", state: "ready", probes: [] },
+      setup.runtime_admissions[0],
+    ] }} onChanged={noop} onViewSession={cmuxFixture} />);
+    const verificationGroup = [...document.querySelectorAll("label")]
+      .find((label) => label.textContent?.includes("Runtime verification group"))
+      ?.querySelector("select");
+    if (!verificationGroup) throw new Error("earlier runtime verification group became unreachable");
+    act(() => {
+      verificationGroup.value = "m7-admission";
+      verificationGroup.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    const earlierExplorer = [...document.querySelectorAll(".runtime-admission .profile-list > div")]
+      .find((row) => row.querySelector("strong")?.textContent === "Explorer");
+    const earlierLaunch = earlierExplorer?.querySelector("button");
+    if (!earlierLaunch) throw new Error("earlier authorized probe was not restored");
+    act(() => earlierLaunch.click());
+    await settle();
+    if (requests.at(-1)?.admission_id !== "m7-admission" || requests.at(-1)?.role !== "explorer") {
+      throw new Error("earlier probe launch lost its exact admission binding");
+    }
+    unmount();
+
     for (const status of ["unknown_version", "ambiguous_manifest", "manifest_invalid"] as const) {
       mount(<ProjectSetup project={initialized} setup={{ ...setup, runtime_admissions: [], selected_profiles: [
         ...setup.selected_profiles,
@@ -887,6 +910,20 @@ Deno.test("M7 fresh qualification stays reachable while stale exact resume is he
       }],
     };
     mount(<ProjectSetup project={initialized} setup={retainedSetup} onChanged={noop} onViewSession={cmuxFixture} />);
+    click("Resume same native session");
+    await settle();
+    if (requests.at(-1)?.kind !== "runtime_probe_resume" || requests.at(-1)?.role !== "explorer") {
+      throw new Error("first runtime qualification could not resume to produce its missing proof");
+    }
+    unmount();
+
+    mount(<ProjectSetup project={initialized} setup={{ ...retainedSetup, selected_profiles: [
+      { ...setup.selected_profiles[0], compatibility: {
+        ...compatibility("evidence_stale"), observed_version: "codex-cli 0.155.1",
+        missing_evidence: ["executable_identity_changed"],
+      } },
+      setup.selected_profiles[1],
+    ] }} onChanged={noop} onViewSession={cmuxFixture} />);
     const staleRow = [...document.querySelectorAll(".profile-list > div")].find((row) => row.querySelector("strong")?.textContent === "Explorer");
     if (staleRow?.textContent?.includes("Resume same native session")) {
       throw new Error("stale runtime binding exposed exact native resume");
@@ -993,6 +1030,30 @@ Deno.test("M7 fresh Codex discovery and stale probe retry preserve exact resume 
     unmount();
 
     mount(<ProjectSetup project={initialized} setup={{ ...probing, sessions: [session] }} onChanged={noop} onViewSession={cmuxFixture} />);
+    click("Agents");
+    click("Resume retained session");
+    await settle();
+    if (requests.at(-1)?.kind !== "role_resume" || requests.at(-1)?.session_id !== session.id) {
+      throw new Error("first setup probe could not resume to produce its missing qualification receipt");
+    }
+    unmount();
+
+    mount(<ProjectSetup project={initialized} setup={{ ...setup, sessions: [{
+      ...session, id: "discovery-session", attempt_id: "discovery-attempt", role: "manager",
+    }] }} onChanged={noop} onViewSession={cmuxFixture} />);
+    click("Discover");
+    click("Resume retained session");
+    await settle();
+    if (requests.at(-1)?.kind !== "role_resume" || requests.at(-1)?.session_id !== "discovery-session") {
+      throw new Error("first discovery turn could not resume before its qualification receipt exists");
+    }
+    unmount();
+
+    mount(<ProjectSetup project={initialized} setup={{ ...probing, sessions: [session],
+      selected_profiles: [{ ...probing.selected_profiles[0], compatibility: {
+        ...compatibility, observed_version: "codex-cli 0.155.1", missing_evidence: ["current_executable"],
+      } }],
+    }} onChanged={noop} onViewSession={cmuxFixture} />);
     click("Agents");
     const staleRow = [...document.querySelectorAll(".setup-invocation")].find((row) => row.querySelector("strong")?.textContent === "Explorer");
     if (!staleRow?.textContent?.includes("Launch exact-profile retry") ||
@@ -2305,7 +2366,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
           state: "discovery",
           discovery_attempt_id: "setup-unchanged-manager-attempt",
           manager_control: {
-            current: config,
+            current: { ...config, model: "previous-discovery-model" },
             requested: config,
             effective: config,
             interrupt_requested: false,
@@ -4889,6 +4950,28 @@ Deno.test("T20 durable cmux projections fence stale View results and local contr
     await verifyLifecycle(renderRuntime, "6");
     await verifyStaleView(setupCard, "7");
     await verifyStaleView(runtimeCard, "8");
+    for (const card of [setupCard, runtimeCard]) {
+      unmount();
+      const opening = durableSurface("opening-route", "2026-09-20T00:00:11Z", {
+        surface_state: "opening", attachment_state: "pending",
+        desired_input_state: "view_only", actual_input_state: "view_only",
+        control_revision: 0, applied_revision: 0,
+      });
+      const view = async (): Promise<CmuxViewOutcome> => ({
+        state: "pending", message: "Opening", retry_available: false, surface: opening,
+      });
+      mount(card({ ...opening, id: "prior-route", surface_state: "retired", attachment_state: "ended",
+        updated_at: "2026-09-20T00:00:10Z" }, view));
+      click("View fresh view-only surface");
+      await settle();
+      rerender(card({ ...opening, surface_state: "open", attachment_state: "live",
+        updated_at: "2026-09-20T00:00:12Z" }, view));
+      await settle();
+      assertCardState("view only");
+      const take = [...document.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent === "Take keyboard control");
+      if (!take || take.disabled) throw new Error("completed opening response kept the live route pending");
+    }
   } finally {
     unmount();
   }

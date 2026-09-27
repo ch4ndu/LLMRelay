@@ -563,7 +563,9 @@ fn persistent_sync_payload(
     surface: &crate::domain::CmuxSessionSurface,
     message: &str,
 ) -> serde_json::Value {
-    let state = if surface.surface_state == "unknown" && surface.attachment_state == "live" {
+    let state = if matches!(surface.surface_state.as_str(), "opening" | "unknown")
+        && surface.attachment_state == "live"
+    {
         "unknown_live"
     } else if surface.surface_state != "open" || surface.attachment_state != "live" {
         "retired"
@@ -1965,6 +1967,60 @@ mod tests {
                 opened.binding_revision,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn persistent_attachment_sync_during_create_holds_until_surface_is_bound() {
+        let (root, app, binding) = control_test_application();
+        let boot = app.service_boot_id();
+        let (workspace, _) = app.store.reserve_cmux_task_workspace(boot, "task").unwrap();
+        let (surface, _) = app
+            .store
+            .reserve_cmux_session_surface(boot, &workspace.id, &binding)
+            .unwrap();
+        assert!(app
+            .store
+            .claim_cmux_task_workspace_create(&workspace.id, &surface.id, boot)
+            .unwrap());
+        let connected = app
+            .store
+            .mark_cmux_session_surface_connected(
+                &surface.id,
+                boot,
+                &binding,
+                surface.binding_revision,
+            )
+            .unwrap();
+        let mut connection = persistent_connection(binding.clone(), &connected, String::new());
+        connection.attachment.as_mut().unwrap().lease = None;
+        let (shutdown, _) = watch::channel(false);
+        let sync = dispatch(
+            ControlRequest::AttachmentControlSync,
+            &app,
+            &shutdown,
+            &serde_json::json!({}),
+            &mut connection,
+        )
+        .unwrap();
+        assert_eq!(sync.result["state"], "unknown_live");
+        assert_eq!(sync.result["actual_input_state"], "view_only");
+        assert!(connection.attachment.as_ref().unwrap().lease.is_none());
+        let opened = app
+            .store
+            .mark_cmux_workspace_and_initial_surface_open(
+                &workspace.id,
+                &surface.id,
+                boot,
+                &uuid::Uuid::new_v4().to_string(),
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .unwrap();
+        assert_eq!(opened.attachment_state, "live");
+        assert_eq!(
+            persistent_sync_payload(&opened, "bound")["state"],
+            "view_only"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn grant_persistent_controller(

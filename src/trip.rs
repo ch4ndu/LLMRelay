@@ -10078,7 +10078,18 @@ fn installation_files(
     proposal: &SetupProposal,
     runtime: &CapabilityRuntime,
 ) -> Result<Vec<JournalFile>> {
-    let preflight = preflight_json(store, setup_id, runtime)?;
+    let mut preflight = preflight_json(store, setup_id, runtime)?;
+    // The pinned package validates delegated profiles only; the host manager
+    // remains an application receipt rather than an undeclared package profile.
+    let receipts = preflight["receipts"]
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("preflight receipts are missing"))?;
+    let manager_index = receipts
+        .iter()
+        .position(|receipt| receipt["role"] == "manager")
+        .ok_or_else(|| anyhow!("host manager preflight receipt is missing"))?;
+    let manager_receipt = receipts.remove(manager_index);
+    preflight["llmrelay"] = serde_json::json!({"host_manager_receipt": manager_receipt});
     let config = serde_json::json!({
         "project_name":proposal.project_name,"guidance":proposal.guidance,"verification":proposal.verification,
         "documentation":proposal.documentation,"observability":proposal.observability,"roles":proposal.roles,

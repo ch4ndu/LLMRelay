@@ -78,6 +78,8 @@ If a setup or runtime probe reports unresolved process ownership, its project se
 
 After installation, ordinary runtime checks establish evidence for the policy used by task roles. Preparing the scope or editing a setting launches no agent. Human authorization, launching a check, and publishing its evidence are separate actions. Publication is bound to the exact current profile, configuration, adapter, native session, and observed policy. Only selected installed providers are required. A changed executable or proof may require fresh evidence and explicit task-profile reactivation; historical evidence stays available for diagnosis.
 
+When more than one runtime verification group exists, use **Runtime verification group** to return to earlier authorized checks. A correction for one role does not hide the remaining roles in an earlier group or authorize another launch.
+
 For Claude requalification, the runtime-check form asks for the currently live
 cmux Unix-socket path. Run `cmux identify` from your cmux terminal and use its
 `socket_path` value. The path is frozen in the authorized probe scope; changing

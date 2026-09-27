@@ -51,20 +51,7 @@ pub fn capture(
     {
         bail!("registered project base is not an ancestor of the candidate worktree head")
     }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ])
-        .output()?;
-    if !output.status.success() {
-        bail!("git ls-files failed while capturing snapshot")
-    }
+    let mut paths = snapshot_paths(worktree)?;
     let base_output = Command::new("git")
         .arg("-C")
         .arg(&repository.root)
@@ -76,13 +63,13 @@ pub fn capture(
     std::fs::create_dir_all(destination)?;
     let mut entries = Vec::new();
     let mut total = 0_u64;
-    let paths = output
+    let base_paths = base_output
         .stdout
         .split(|byte| *byte == 0)
-        .chain(base_output.stdout.split(|byte| *byte == 0))
         .filter(|part| !part.is_empty())
         .map(|raw| String::from_utf8(raw.to_vec()))
         .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    paths.extend(base_paths);
     for relative in paths {
         validate_relative(&relative)?;
         if Path::new(&relative)
@@ -92,10 +79,9 @@ pub fn capture(
         {
             bail!("snapshot path uses reserved metadata directory")
         }
-        ensure_no_symlink_ancestors(worktree, Path::new(&relative))?;
         let source = worktree.join(&relative);
         let target = destination.join(&relative);
-        if !source.exists() && std::fs::symlink_metadata(&source).is_err() {
+        let Some(metadata) = leaf_metadata(worktree, Path::new(&relative))? else {
             entries.push(SnapshotEntry {
                 path: relative,
                 kind: "deleted".into(),
@@ -106,8 +92,7 @@ pub fn capture(
                 deleted: true,
             });
             continue;
-        }
-        let metadata = std::fs::symlink_metadata(&source)?;
+        };
         if metadata.file_type().is_symlink() {
             let link = std::fs::read_link(&source)?;
             if link.is_absolute() || link.components().any(|part| part == Component::ParentDir) {
@@ -179,18 +164,18 @@ pub fn materialize(
     snapshot_root: &Path,
     worktree: &Path,
 ) -> Result<()> {
-    for entry in &manifest.entries {
+    // Remove old leaves before creating replacements. A deleted Git leaf may
+    // now be a directory, or be beneath a new file, without deleting that replacement.
+    for entry in manifest.entries.iter().filter(|entry| entry.deleted) {
+        validate_relative(&entry.path)?;
+        if leaf_metadata(worktree, Path::new(&entry.path))?.is_some() {
+            std::fs::remove_file(worktree.join(&entry.path))?;
+        }
+    }
+    for entry in manifest.entries.iter().filter(|entry| !entry.deleted) {
         validate_relative(&entry.path)?;
         prepare_owned_ancestors(worktree, Path::new(&entry.path))?;
         let destination = worktree.join(&entry.path);
-        if entry.deleted {
-            if destination.is_dir() {
-                std::fs::remove_dir_all(&destination)?;
-            } else if destination.exists() || std::fs::symlink_metadata(&destination).is_ok() {
-                std::fs::remove_file(&destination)?;
-            }
-            continue;
-        }
         let source = snapshot_root.join(&entry.path);
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent)?;
@@ -225,19 +210,8 @@ pub fn materialize(
             other => bail!("unsupported manifest kind {other}"),
         }
     }
-    let observed = crate::workspace::inspect(worktree)?;
-    if observed.identity != manifest.repository_identity
-        || observed.head != candidate_head(manifest)
-    {
-        bail!("materialized worktree identity/base drifted")
-    }
-    for entry in &manifest.entries {
-        if !entry_matches_path(entry, worktree)? {
-            bail!(
-                "materialized snapshot verification failed for {}",
-                entry.path
-            )
-        }
+    if !verify_materialized(manifest, worktree)? {
+        bail!("materialized snapshot inventory, content, or identity did not verify")
     }
     Ok(())
 }
@@ -300,11 +274,25 @@ pub fn verify_materialized(manifest: &SnapshotManifest, worktree: &Path) -> Resu
         return Ok(false);
     }
     for entry in &manifest.entries {
+        validate_relative(&entry.path)?;
         if !entry_matches_path(entry, worktree)? {
             return Ok(false);
         }
     }
-    Ok(true)
+    let mut actual_paths = BTreeSet::new();
+    for path in snapshot_paths(worktree)? {
+        validate_relative(&path)?;
+        if leaf_metadata(worktree, Path::new(&path))?.is_some() {
+            actual_paths.insert(path);
+        }
+    }
+    let expected_paths = manifest
+        .entries
+        .iter()
+        .filter(|entry| !entry.deleted)
+        .map(|entry| entry.path.clone())
+        .collect::<BTreeSet<_>>();
+    Ok(actual_paths == expected_paths)
 }
 
 #[derive(Clone)]
@@ -339,6 +327,11 @@ fn commit_entry(
     let fields = metadata.split_whitespace().collect::<Vec<_>>();
     if fields.len() != 3 {
         bail!("malformed git tree entry")
+    }
+    // Git directories are containers, not snapshot leaves. A former file at
+    // this path is deleted even when new files now live below the same name.
+    if fields[1] == "tree" {
+        return Ok(None);
     }
     let mode = u32::from_str_radix(fields[0], 8)?;
     let blob = Command::new("git")
@@ -384,7 +377,7 @@ fn entry_matches_commit(entry: &SnapshotEntry, observed: Option<&CommitEntry>) -
 
 fn entry_matches_path(entry: &SnapshotEntry, root: &Path) -> Result<bool> {
     let path = root.join(&entry.path);
-    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+    let Some(metadata) = leaf_metadata(root, Path::new(&entry.path))? else {
         return Ok(entry.deleted);
     };
     if entry.deleted {
@@ -429,26 +422,50 @@ fn expected_git_mode(entry: &SnapshotEntry) -> u32 {
     }
 }
 
-fn ensure_no_symlink_ancestors(root: &Path, relative: &Path) -> Result<()> {
+fn snapshot_paths(worktree: &Path) -> Result<BTreeSet<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .output()?;
+    if !output.status.success() {
+        bail!("git ls-files failed while enumerating snapshot paths")
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|raw| String::from_utf8(raw.to_vec()).map_err(Into::into))
+        .collect()
+}
+
+/// Resolve Git leaves without following symlink ancestors. A file replacing a
+/// directory makes its old descendants absent; a directory replacing a file
+/// makes that old leaf absent. Other I/O failures must not look like deletion.
+fn leaf_metadata(root: &Path, relative: &Path) -> Result<Option<std::fs::Metadata>> {
     let mut current = root.to_path_buf();
     let count = relative.components().count();
     for component in relative.components().take(count.saturating_sub(1)) {
         current.push(component.as_os_str());
         match std::fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-                "snapshot path traverses symlink ancestor {}",
-                current.display()
-            ),
-            Ok(metadata) if !metadata.is_dir() => bail!(
-                "snapshot path traverses non-directory ancestor {}",
-                current.display()
-            ),
+            Ok(metadata) if !metadata.is_dir() => return Ok(None),
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         }
     }
-    Ok(())
+    match std::fs::symlink_metadata(root.join(relative)) {
+        Ok(metadata) if metadata.is_dir() => Ok(None),
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn prepare_owned_ancestors(root: &Path, relative: &Path) -> Result<()> {

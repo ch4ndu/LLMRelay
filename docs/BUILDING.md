@@ -11,6 +11,7 @@ Requirements:
 - macOS with Git.
 - Rust and Cargo 1.86.0.
 - Deno 2.9.5.
+- Python 3 for the installed-workflow validator exercised by the contract suite.
 - Installed and authenticated Codex and/or Claude Code CLIs for the profiles you choose. Setup validates those selected profiles; an unrelated second CLI is not a requirement.
 
 Clone or copy this repository, then fetch the exact locked dependencies and verify the integrated source:
@@ -52,6 +53,44 @@ deno task build
 ```
 
 The DOM suite runs without launching provider sessions. `deno task build` produces `frontend/dist`; the Rust build embeds those assets, so rebuild the executable after changing the dashboard. `deno task dev` starts Vite for frontend development, but it is not a replacement for the authenticated Rust service or its session controls.
+
+## Isolated browser smoke checks
+
+`scripts/browser_smoke.py` drives a dedicated cmux browser against the real local
+service. It requires Python 3 and a running cmux with browser automation. Start a
+fresh service data directory in a cmux terminal with `serve --port 0 --no-open`,
+save its output privately, and create a separate cmux browser profile. Keep the
+service executable and artifacts outside any repository used for setup tests.
+
+```sh
+python3 scripts/browser_smoke.py --artifacts .local/browser-smoke login \
+  --service-log .local/browser-smoke/service.log \
+  --workspace workspace:TEST --profile PROFILE_ID
+python3 scripts/browser_smoke.py --artifacts .local/browser-smoke run \
+  --project-path /absolute/path/to/test-repository --project-name Smoke
+```
+
+Replace the workspace and profile placeholders with the dedicated test handles.
+The runner focuses its selected browser pane before each operation; keep its
+dedicated workspace available while the suite runs.
+Login consumes that service's one-use URL without printing it. The run registers
+the selected repository if needed, requires its queue to be paused, and exercises
+navigation, empty-title validation, unsaved draft recovery, creation, editing,
+reload persistence, filtering, archive and restore. It leaves a uniquely named
+backlog draft in the isolated database. JSON results, snapshots, screenshots and
+browser error output are saved in the artifact directory. Reruns create another
+draft. Screenshots include a 900px viewport to expose narrow-window limitations;
+the current dashboard has a 1080px minimum width.
+
+Before `run`, optionally use `observer --workspace workspace:TEST --profile
+PROFILE_ID` with the same artifact directory and browser profile. The suite then
+also asserts that creation, editing, archive and restore reach the second browser
+without a reload. After restarting the service, `relogin --service-log PATH`
+reauthenticates the recorded browser using the new one-use link.
+
+The suite does not launch providers or install workflow files. Exercise native
+TRIP onboarding separately through [Project setup](PROJECT_SETUP.md), using an
+explicitly authorized target repository and preserving its original files.
 
 ## Package contents
 

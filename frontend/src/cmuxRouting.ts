@@ -204,7 +204,7 @@ export const cmuxOutcomeWithDurableSurface = (
   if (!local) return durableOutcome;
   const durablePresentation = cmuxSurfacePresentation(durable);
   if (
-    local.state === "pending" && durablePresentation.viewAvailable &&
+    local.state === "pending" && !local.surface && durablePresentation.viewAvailable &&
     !durablePresentation.diagnostic && !durablePresentation.guidance
   ) {
     return {

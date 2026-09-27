@@ -365,6 +365,7 @@ button:disabled {
 }
 .card-body strong {
   line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 .card-body small {
   color: var(--muted);

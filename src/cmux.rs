@@ -1003,6 +1003,33 @@ fn create_targeted_surface(
             "Another exact action is already crossing the durable targeted-surface create boundary. This action did not issue a second create, select another terminal, or change keyboard control.",
         ));
     }
+    // Closing the last terminal can remove its workspace. Validate the parent
+    // before creating another role surface in the durable workspace identity.
+    match cmux_rpc(app, "system.tree", json!({})).and_then(|value| parse_global_tree(&value)) {
+        Ok(inventory) if !inventory.contains_key(workspace_id) => {
+            app.store.mark_cmux_task_workspace_lost(
+                &workspace.id,
+                service_boot_id,
+                workspace_id,
+            )?;
+            return Ok(loss_retirement_outcome(
+                app.store.cmux_session_surface(&surface.id)?,
+                "The task workspace no longer exists in cmux. View again to create a fresh view-only workspace.",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            let surface = app.store.mark_cmux_targeted_surface_unknown(
+                &surface.id,
+                service_boot_id,
+                &format!(
+                    "task workspace could not be verified before targeted create: {}",
+                    error.message()
+                ),
+            )?;
+            return Ok(uncertain_surface_outcome(surface));
+        }
+    }
     let command = persistent_attachment_command(app, &surface.binding, &surface)?;
     let cwd = app
         .paths
@@ -2144,6 +2171,40 @@ mod g14_tests {
     use crate::operations::Application;
     use crate::store::Store;
     use rusqlite::params;
+
+    #[test]
+    fn new_role_surface_retires_a_missing_parent_before_targeted_create() {
+        let (root, app) = cmux_test_application();
+        let binding = seed_attachment(&app, "missing-parent");
+        let boot = uuid::Uuid::new_v4().to_string();
+        let (workspace, prior) = open_persistent_surface(&app, &boot, &binding);
+        app.store
+            .mark_cmux_session_surface_ended(&prior.id, &boot, &binding, prior.binding_revision)
+            .unwrap();
+        let (surface, created) = app
+            .store
+            .reserve_cmux_session_surface(&boot, &workspace.id, &binding)
+            .unwrap();
+        assert!(created);
+        clear_test_cmux_rpc_results();
+        push_test_cmux_rpc_result(Ok(json!({"windows":[]})));
+        let outcome =
+            create_targeted_surface(&app, &boot, workspace.clone(), surface, "missing-parent")
+                .unwrap();
+        assert_eq!(outcome.surface.unwrap().surface_state, "lost");
+        assert_eq!(
+            app.store.cmux_task_workspace(&workspace.id).unwrap().state,
+            "lost"
+        );
+        assert_eq!(test_cmux_rpc_result_count(), 0);
+        let (replacement, created) = app
+            .store
+            .reserve_cmux_task_workspace(&boot, "task")
+            .unwrap();
+        assert!(created);
+        assert_ne!(replacement.id, workspace.id);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn interrupted_successful_workspace_create_reconciles_without_second_rpc() {
