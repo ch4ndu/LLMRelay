@@ -1615,7 +1615,14 @@ impl Application {
         // catalog data is assembled. The resumed turn must rely only on retained
         // native-conversation recall.
         let setup_contract = crate::trip::setup_context(&connection, context)?;
-        let ordinary_task = setup_contract.is_none();
+        let isolated_validation: bool = connection.query_row(
+            "SELECT a.status='capability_validation' FROM attempts a
+             JOIN tasks t ON t.id=a.task_id
+             WHERE a.id=?1 AND t.id=?2 AND t.project_id=?3",
+            params![context.attempt_id, context.task_id, context.project_id],
+            |row| row.get(0),
+        )?;
+        let ordinary_task = setup_contract.is_none() && !isolated_validation;
         let task:String=connection.query_row("SELECT json_object('id',id,'project_id',project_id,'title',title,'description',description,'acceptance_criteria',json(acceptance_criteria_json),'priority',priority,'lifecycle',lifecycle,'attention',attention,'version',version) FROM tasks WHERE id=?1",params![context.task_id],|row|row.get(0))?;
         let attempt:String=connection.query_row("SELECT json_object('id',id,'phase',phase,'status',status,'base_revision',base_revision,'plan_hash',plan_hash,'candidate_hash',candidate_hash,'accepted_snapshot_id',accepted_snapshot_id,'parent_attempt_id',parent_attempt_id,'scope_hash',scope_hash,'configuration_hash',configuration_hash,'workflow_version',workflow_version,'workflow_hash',workflow_hash) FROM attempts WHERE id=?1",params![context.attempt_id],|row|row.get(0))?;
         let plan_record: Option<(String, String)> = connection

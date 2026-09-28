@@ -23,26 +23,6 @@
       "executable": "/opt/homebrew/bin/codex",
       "kind": "builtin-cli",
       "provider": "openai"
-    },
-    "llmrelay_claude": {
-      "capabilities": {
-        "fresh_session": true,
-        "read_only": true,
-        "resume": true,
-        "workspace_write": true
-      },
-      "kind": "native-agent",
-      "provider": "claude"
-    },
-    "llmrelay_codex": {
-      "capabilities": {
-        "fresh_session": true,
-        "read_only": true,
-        "resume": true,
-        "workspace_write": true
-      },
-      "kind": "native-agent",
-      "provider": "codex"
     }
   }
 }

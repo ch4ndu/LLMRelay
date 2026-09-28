@@ -39,6 +39,8 @@ If interrupt delivery fails, the dashboard shows the recorded error and **Retry 
 
 A stale-version rejection preserves the edited fields so you can review the latest setup state and try again. Once a proposal has been saved, use the existing configuration-correction and review steps; discovery-manager replacement does not bypass those later approvals. Ordinary task-manager controls are described in [Workflows](WORKFLOWS.md).
 
+After **Stop discovery manager** has positively confirmed exit, **Restart discovery manager** can prepare a fresh discovery revision with the same agent settings. The stopped session stays in history and its authority remains revoked. Preparing the restart does not launch an agent; choose **Launch manager discovery** separately. This also recovers an initial session that finished before newly trusted hooks could record its native identity.
+
 Keep the LLMRelay executable and its data directory outside the repository being initialized. Setup isolates its empty fixture from the target repository and its Git common directory; a development executable built inside that same target cannot also remain accessible to the isolated agent. If this layout is detected, setup explains which location needs to move before launching a probe. Other repositories can still be initialized from a development build when their paths do not overlap.
 
 1. Review the detected TRIP installation and project guidance. A new project needs initialization; an existing installation may need adoption, conflict resolution, or a reviewed upgrade. Existing customized files and alternate skill roots are preserved.

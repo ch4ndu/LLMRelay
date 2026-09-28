@@ -28,7 +28,22 @@ environment evidence is never reported as proof of safety.
 
 The v1 Codex path additionally requires exact `codex-cli 0.157.1`, the ordinary native CLI signed in through file-backed personal ChatGPT Free/Plus/Pro credentials, no parent `CODEX_HOME`, no shared app-server control socket or cloud-config bundle cache beneath `~/.codex`, and no `/etc/codex/managed_config.toml` or `/etc/codex/requirements.toml`. On macOS the native managed preferences `config_toml_base64` and `requirements_toml_base64` under `com.openai.codex` must also be absent. LLMRelay reports an actionable preflight error for an unsupported form; it does not modify provider configuration, credentials, organization policy, or native approvals to make the check pass.
 
+Codex implementer sessions restrict the inherited system temporary-directory
+grants to read-only access. The assigned worktree remains writable, including
+when it is located beneath a temporary directory. This prevents a temporary
+host location from making sibling repositories or service data writable.
+Earlier implementer proofs without this restriction require fresh verification.
+
 ## Claude terminal confinement
+
+The embedded compatibility bundle accepts exact Claude Code `2.1.283 (Claude
+Code)` for all six roles. Other versions require a reviewed compatibility
+update. Matching the bundle makes a profile eligible for verification; it does
+not mark the profile Supported or reuse evidence from another executable,
+model, effort, role, or policy. Run the selected profile's setup and runtime
+verification before assigning it work. Claude's `default` permission mode is
+displayed as Manual; Implementers retain human permission ownership, while
+the other roles use `dontAsk`.
 
 Managed Claude sessions require the native sandbox, fail closed when it is
 unavailable, disable unsandboxed command bypass, and allow only the canonical

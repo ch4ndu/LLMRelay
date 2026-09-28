@@ -8008,7 +8008,7 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
         "SELECT COUNT(*) FROM capabilities WHERE status='supported'",
         0,
     );
-    {
+    for restart_same_profile in [false, true] {
         let fixture = Fixture::new("trip-setup-replacement-unique-order");
         let project = workflow::execute(
             &fixture.store,
@@ -8029,11 +8029,24 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
             &TripHumanAction::BeginSetup {
                 project_id: project.clone(),
                 expected_project_version: 1,
-                host_manager: old,
+                host_manager: old.clone(),
             },
         )
         .unwrap()
         .entity_id;
+        assert!(execute_trip(
+            &fixture,
+            &paths,
+            "reject-unheld-restart",
+            &TripHumanAction::ChangeSetupManager {
+                setup_operation_id: setup.clone(),
+                expected_project_version: 1,
+                host_manager: old.clone(),
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("Stop the discovery manager"));
         let (manager, _) = start_synthetic_setup_resume(&fixture, &setup, RoleKind::Manager);
         fixture.execute("UPDATE sessions SET status='running',launch_state='started',exit_json=NULL WHERE id=?1", params![manager.session_id]);
         fixture.execute(
@@ -8062,6 +8075,19 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
         fixture.assert_scalar::<String>("SELECT status FROM sessions WHERE id=(SELECT id FROM sessions ORDER BY created_at DESC LIMIT 1)", "interrupt_requested".into());
         fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM role_credentials WHERE role_generation_id=(SELECT id FROM role_generations ORDER BY created_at DESC LIMIT 1) AND revoked_at IS NULL", 0);
         fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM trip_setup_permits WHERE setup_operation_id=(SELECT id FROM trip_setup_operations) AND role='manager' AND state='revoked'", 1);
+        assert!(execute_trip(
+            &fixture,
+            &paths,
+            "reject-live-restart",
+            &TripHumanAction::ChangeSetupManager {
+                setup_operation_id: setup.clone(),
+                expected_project_version: 2,
+                host_manager: old.clone(),
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("quiescence"));
         assert!(fixture.store.role_context(&manager.token).is_err());
         fixture.execute("UPDATE sessions SET status='exited',exit_json='{\"process_group_quiescent\":true}' WHERE id=?1", params![manager.session_id]);
         let launch: LaunchConfig = serde_json::from_str(
@@ -8091,10 +8117,14 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
             &TripHumanAction::ChangeSetupManager {
                 setup_operation_id: setup.clone(),
                 expected_project_version: 2,
-                host_manager: RoleOverride {
-                    provider: Provider::Codex,
-                    model: "replacement-manager".into(),
-                    effort: "high".into(),
+                host_manager: if restart_same_profile {
+                    old.clone()
+                } else {
+                    RoleOverride {
+                        provider: Provider::Codex,
+                        model: "replacement-manager".into(),
+                        effort: "high".into(),
+                    }
                 },
             },
         )
@@ -8878,10 +8908,15 @@ fn claude_runtime_probe_policy_allows_only_frozen_commands_and_preserves_native_
     assert!(
         implementer.config.argv[implementer_allowed_index..implementer_allowed_end].contains(
             &format!(
-                "Write(//{}/**)",
+                "Edit(//{}/**)",
                 context.workspace.strip_prefix("/").unwrap().display()
             )
         )
+    );
+    assert!(
+        !implementer.config.argv[implementer_allowed_index..implementer_allowed_end]
+            .iter()
+            .any(|rule| rule.starts_with("Write("))
     );
 }
 
@@ -17584,7 +17619,7 @@ fn capability_keys_keep_external_socket_identity_without_probe_policy() {
 }
 
 #[test]
-fn m7_embedded_provider_selectors_are_exact_and_claude_is_unqualified() {
+fn m7_embedded_provider_selectors_are_exact_and_require_role_qualification() {
     use agenticjira::provider_compatibility::{AuthorityBinding, BundleSet, CompatibilityError};
     let bundles = BundleSet::embedded();
     let matched = bundles
@@ -17604,6 +17639,38 @@ fn m7_embedded_provider_selectors_are_exact_and_claude_is_unqualified() {
         bundles.resolve(Provider::Claude, "any-version", RoleKind::Manager),
         Err(CompatibilityError::Unsupported { .. })
     ));
+    for role in [
+        RoleKind::Manager,
+        RoleKind::Explorer,
+        RoleKind::PlanReviewer,
+        RoleKind::Implementer,
+        RoleKind::CodeReviewer,
+        RoleKind::FinalReviewer,
+    ] {
+        let claude = bundles
+            .resolve(Provider::Claude, "2.1.283 (Claude Code)", role)
+            .unwrap();
+        assert_eq!(claude.predicate_id, "claude-code-2.1.283");
+        assert!(!claude.synthetic_origin);
+        assert!(claude
+            .required_evidence
+            .iter()
+            .any(|item| item == "role_capability_proof"));
+        bundles
+            .resolve(Provider::Codex, "codex-cli 0.157.1", role)
+            .unwrap();
+        for version in [
+            "2.1.282 (Claude Code)",
+            "2.1.284 (Claude Code)",
+            "2.1.283",
+            "synthetic-claude-v1",
+        ] {
+            assert!(matches!(
+                bundles.resolve(Provider::Claude, version, role),
+                Err(CompatibilityError::Unsupported { .. })
+            ));
+        }
+    }
     let codex_bytes = include_str!("../resources/provider-compatibility/codex.json");
     let claude_bytes = include_str!("../resources/provider-compatibility/claude.json");
     let mut changed: serde_json::Value = serde_json::from_str(codex_bytes).unwrap();
@@ -28556,6 +28623,40 @@ fn c8_codex_native_policy_identity_and_current_admission_are_fail_closed() {
     let floor_repo = floor.repository("repo");
     let floor_hooks = test_hooks(&floor);
     let supervision_executable = std::env::current_exe().unwrap();
+    let implementer = providers::prepare_role_launch(
+        Provider::Codex,
+        RoleKind::Implementer,
+        "gpt-5.6-sol",
+        "medium",
+        &floor_repo,
+        "temporary directory confinement",
+        &floor.root.join("role.sock"),
+        "writer-token",
+        "writer-generation",
+        "writer-session",
+        None,
+        &floor_hooks,
+        &supervision_executable,
+    )
+    .unwrap();
+    let writer_identity = providers::capability_identity(&implementer.config).unwrap();
+    providers::codex::require_current_native_policy(&writer_identity, &floor_repo).unwrap();
+    assert!(implementer.arguments.iter().any(|argument| {
+        argument.starts_with("permissions.agenticjira_role=")
+            && argument.contains("\":tmpdir\"=\"read\"")
+            && argument.contains("\":slash_tmp\"=\"read\"")
+    }));
+    let mut legacy_writer = writer_identity.clone();
+    legacy_writer.security_policy["permission_profile"]["filesystem"]
+        .as_object_mut()
+        .unwrap()
+        .remove("temporary_directories");
+    assert!(providers::codex::require_native_policy_identity(&legacy_writer).is_err());
+    let mut broad_writer = writer_identity;
+    for argument in &mut broad_writer.effective_argv {
+        *argument = argument.replace(",\":tmpdir\"=\"read\",\":slash_tmp\"=\"read\"", "");
+    }
+    assert!(providers::codex::require_native_policy_identity(&broad_writer).is_err());
     let manager_fresh = providers::prepare_role_launch(
         Provider::Codex,
         RoleKind::Manager,
@@ -31116,6 +31217,28 @@ args = ["--unicode"]
         lane_id: "default".into(),
         permissions: vec!["report_result".into()],
     };
+    let validation_app = Application::new(
+        InstancePaths::resolve(Some(bootstrap.root.join("context-app"))).unwrap(),
+        bootstrap.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    let payload = validation_app
+        .role_context_payload(&validation_context)
+        .unwrap();
+    assert!(payload["project_policy"].is_null());
+    assert!(payload["verification_catalog"].is_null());
+    bootstrap.execute(
+        "UPDATE attempts SET status='running' WHERE id='bootstrap-attempt'",
+        [],
+    );
+    assert!(validation_app
+        .role_context_payload(&validation_context)
+        .is_err());
+    bootstrap.execute(
+        "UPDATE attempts SET status='capability_validation' WHERE id='bootstrap-attempt'",
+        [],
+    );
     for (operation, outcome, observation) in [
         (
             "isolated-wrong-outcome",

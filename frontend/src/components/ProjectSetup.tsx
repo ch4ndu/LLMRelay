@@ -1126,6 +1126,8 @@ export function ProjectSetup({
     manager.provider === currentManagerSelection.provider &&
     manager.model.trim() === currentManagerSelection.model &&
     manager.effort === currentManagerSelection.effort;
+  const managerRestartAllowed = !!managerControl?.hold &&
+    managerControl.quiescent && managerControl.next_action.action === "change";
   const managerProfileLabel = (profile?: RoleConfig | null) =>
     profile
       ? `provider ${profile.provider} · model ${profile.model} · effort ${profile.effort}`
@@ -1648,17 +1650,25 @@ export function ProjectSetup({
                   </div>
                   <button
                     className="primary"
-                    disabled={!managerValid || managerMatchesCurrent || !!busy}
-                    title={managerMatchesCurrent
+                    disabled={!managerValid || (managerMatchesCurrent && !managerRestartAllowed) || !!busy}
+                    title={managerMatchesCurrent && !managerRestartAllowed
                       ? "Choose a different exact provider, model, or reasoning effort"
                       : undefined}
                     onClick={() => void changeSetupManager()}
                   >
-                    {managerControl.next_action.action === "launch"
+                    {managerMatchesCurrent && managerRestartAllowed
+                      ? "Restart discovery manager"
+                      : managerControl.next_action.action === "launch"
                       ? "Save corrected discovery manager"
                       : "Change discovery manager"}
                   </button>
-                  {managerMatchesCurrent && (
+                  {managerMatchesCurrent && managerRestartAllowed && (
+                    <p className="hint">
+                      Create a fresh discovery session with the same agent settings.
+                      The previous session stays in history. Launch it separately after preparing the restart.
+                    </p>
+                  )}
+                  {managerMatchesCurrent && !managerRestartAllowed && (
                     <p className="hint">
                       Change is disabled because the replacement profile is
                       unchanged. To keep this provider, model, and effort, use

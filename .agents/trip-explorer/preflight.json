@@ -1,65 +1,190 @@
 {
+  "llmrelay": {
+    "host_manager_receipt": {
+      "effort": "xhigh",
+      "llmrelay_evidence": {
+        "cell": "trip_setup_discovery",
+        "effective_sandbox_identity": "Read-only sandbox rooted at /private/tmp/llmrelay-self-setup-20260927/instance/artifacts/worktrees/51d86806-269d-4a1e-aff0-b82c9d036ff5, with direct access to /Users/murali/Private/GitHub/AgenticJira denied and discovery limited to bounded inventory plus service-mediated setup-read.",
+        "model_evidence": "Codex manager runtime declared as based on GPT-5; bounded role context independently identifies provider codex and role manager.",
+        "session_mode_observed": "retained",
+        "setup_proposal_summary": {
+          "documentation": {
+            "no_change_text": "Existing AGENTS.md already provides concise routing to the project guidance for engineering, coding, architecture, workflows, setup, operations, security, building, and milestones. No documentation addition is suggested by this bounded discovery."
+          },
+          "guidance": [
+            "AGENTS.md",
+            "docs/ENGINEERING_WORKFLOW.md",
+            "docs/CODING_STANDARDS.md",
+            "RESEARCH_AND_PLAN.md",
+            "docs/WORKFLOWS.md",
+            "docs/PROJECT_SETUP.md",
+            "docs/OPERATIONS.md",
+            "docs/SECURITY.md",
+            "docs/BUILDING.md",
+            "docs/MILESTONES.md",
+            "docs/NEXT_MILESTONE_PLAN.md"
+          ],
+          "project_name": "LLMRelay",
+          "verification": {
+            "broad": [
+              "cargo fetch --locked",
+              "cd frontend && deno install --frozen",
+              "./scripts/verify.sh"
+            ],
+            "focused": [
+              "cd frontend && deno task typecheck",
+              "cd frontend && deno task test",
+              "cd frontend && deno task build"
+            ]
+          }
+        }
+      },
+      "model": "gpt-5.6-sol",
+      "model_evidence": "Codex manager runtime declared as based on GPT-5; bounded role context independently identifies provider codex and role manager.",
+      "nonce_matched": true,
+      "profile_ids": [
+        "host_manager"
+      ],
+      "provider": "codex",
+      "result": "pass",
+      "role": "manager"
+    }
+  },
   "receipts": [
     {
-      "adapter": "codex-cli",
+      "adapter": "llmrelay_codex",
       "authority": "read-only",
-      "effort": "high",
+      "effort": "medium",
+      "llmrelay_evidence": {
+        "authentication_observed": true,
+        "cell": "trip_setup_probe",
+        "effective_sandbox_identity": "Role context exposed profile authority read-only.",
+        "fallback_observed": false,
+        "model_evidence": "Role context exposed selected profile model gpt-5.6-sol; the provider did not expose an effective runtime model identity.",
+        "nonce": "6ebfa4aebd034dafb081309e5fedbda2",
+        "session_mode_observed": "retained",
+        "target_data_accessed": false,
+        "workspace_write_observed": false
+      },
       "model": "gpt-5.6-sol",
-      "model_evidence": "requested model accepted; provider did not expose effective identity",
+      "model_evidence": "Role context exposed selected profile model gpt-5.6-sol; the provider did not expose an effective runtime model identity.",
       "nonce_matched": true,
       "profile_ids": [
         "codex-sol-read-retained"
       ],
-      "provider": "openai",
+      "provider": "codex",
       "result": "pass",
-      "resume_verified": true,
+      "role": "code_reviewer",
+      "service_tier": null,
       "session": "retained"
     },
     {
-      "adapter": "codex-cli",
-      "authority": "workspace-write",
-      "effort": "max",
-      "model": "gpt-5.6-terra",
-      "model_evidence": "requested model accepted; provider did not expose effective identity",
-      "nonce_matched": true,
-      "profile_ids": [
-        "codex-terra-write-retained"
-      ],
-      "provider": "openai",
-      "result": "pass",
-      "resume_verified": true,
-      "session": "retained",
-      "workspace_write_verified": true
-    },
-    {
-      "adapter": "claude-cli",
+      "adapter": "llmrelay_codex",
       "authority": "read-only",
       "effort": "medium",
-      "model": "fable",
-      "model_evidence": "provider reported canonical claude-fable-5-1",
+      "llmrelay_evidence": {
+        "authentication_observed": true,
+        "cell": "trip_setup_probe",
+        "effective_sandbox_identity": "read-only",
+        "fallback_observed": false,
+        "model_evidence": "Role context exposed requested profile model gpt-5.6-sol; effective model identity was not exposed by the service or provider.",
+        "nonce": "9543a07552114c0bbef4289668d27221",
+        "session_mode_observed": "retained",
+        "target_data_accessed": false,
+        "workspace_write_observed": false
+      },
+      "model": "gpt-5.6-sol",
+      "model_evidence": "Role context exposed requested profile model gpt-5.6-sol; effective model identity was not exposed by the service or provider.",
       "nonce_matched": true,
       "profile_ids": [
-        "claude-fable-read-retained"
+        "codex-sol-read-retained"
       ],
-      "provider": "anthropic",
+      "provider": "codex",
       "result": "pass",
-      "resume_verified": true,
+      "role": "explorer",
+      "service_tier": null,
       "session": "retained"
     },
     {
-      "adapter": "claude-cli",
+      "adapter": "llmrelay_codex",
       "authority": "read-only",
       "effort": "medium",
-      "fresh_session_verified": true,
-      "model": "fable",
-      "model_evidence": "provider reported canonical claude-fable-5-1",
+      "llmrelay_evidence": {
+        "authentication_observed": true,
+        "cell": "trip_setup_probe",
+        "effective_sandbox_identity": "read-only",
+        "fallback_observed": false,
+        "model_evidence": "Requested profile model exposed by role context: gpt-5.6-sol; effective provider model identity was not exposed.",
+        "nonce": "f5880048871b4ed6ab3582e206fd1c93",
+        "session_mode_observed": "fresh",
+        "target_data_accessed": false,
+        "workspace_write_observed": false
+      },
+      "model": "gpt-5.6-sol",
+      "model_evidence": "Requested profile model exposed by role context: gpt-5.6-sol; effective provider model identity was not exposed.",
       "nonce_matched": true,
       "profile_ids": [
         "claude-fable-read-fresh"
       ],
-      "provider": "anthropic",
+      "provider": "codex",
       "result": "pass",
+      "role": "final_verifier",
+      "service_tier": null,
       "session": "fresh"
+    },
+    {
+      "adapter": "llmrelay_claude",
+      "authority": "workspace-write",
+      "effort": "high",
+      "llmrelay_evidence": {
+        "authentication_observed": true,
+        "cell": "trip_setup_probe",
+        "effective_sandbox_identity": "Claude Code Bash OS-level sandbox (macOS Seatbelt) with write allowed in the worktree cwd /private/tmp/llmrelay-self-setup-20260927/instance/artifacts/worktrees/fba691e0-17b7-42ad-8ade-abdef725af1c and unix socket access limited to /private/tmp/agenticjira-f2330ba79865648b4261/role.sock; dangerouslyDisableSandbox disabled",
+        "fallback_observed": false,
+        "model_evidence": "Provider (Claude Code harness) system context states the session is powered by model ID claude-opus-5-5; this is the provider-exposed identity only and was not independently verified.",
+        "nonce": "40b1d65a3fca4f89bfe14cb39b76f126",
+        "session_mode_observed": "retained",
+        "target_data_accessed": false,
+        "workspace_write_observed": true
+      },
+      "model": "claude-opus-5-5",
+      "model_evidence": "Provider (Claude Code harness) system context states the session is powered by model ID claude-opus-5-5; this is the provider-exposed identity only and was not independently verified.",
+      "nonce_matched": true,
+      "profile_ids": [
+        "codex-terra-write-retained"
+      ],
+      "provider": "claude",
+      "result": "pass",
+      "role": "implementer",
+      "service_tier": null,
+      "session": "retained"
+    },
+    {
+      "adapter": "llmrelay_codex",
+      "authority": "read-only",
+      "effort": "medium",
+      "llmrelay_evidence": {
+        "authentication_observed": true,
+        "cell": "trip_setup_probe",
+        "effective_sandbox_identity": "read-only",
+        "fallback_observed": false,
+        "model_evidence": "Role context selected profile requests gpt-5.6-sol; effective model identity was not exposed by the provider.",
+        "nonce": "d620abef050f45e88e514c3cb33852fd",
+        "session_mode_observed": "retained",
+        "target_data_accessed": false,
+        "workspace_write_observed": false
+      },
+      "model": "gpt-5.6-sol",
+      "model_evidence": "Role context selected profile requests gpt-5.6-sol; effective model identity was not exposed by the provider.",
+      "nonce_matched": true,
+      "profile_ids": [
+        "claude-fable-read-retained"
+      ],
+      "provider": "codex",
+      "result": "pass",
+      "role": "plan_reviewer",
+      "service_tier": null,
+      "session": "retained"
     }
   ]
 }

@@ -2266,9 +2266,6 @@ fn change_setup_manager(
         if project_version != expected_project_version {
             bail!("project version is stale; preserve the edited manager profile and refresh before changing")
         }
-        if source_manager_hash == json_hash(host_manager)? {
-            bail!("setup manager change requires a different exact provider, model, or reasoning effort")
-        }
         if !setup_attempt_quiescent(&tx, &source_attempt_id)? {
             bail!("setup manager change requires positively verified whole-process quiescence; stop the live manager and wait for its exit")
         }
@@ -2280,6 +2277,9 @@ fn change_setup_manager(
                 |row| row.get(0),
             )
             .optional()?;
+        if source_manager_hash == json_hash(host_manager)? && held.is_none() {
+            bail!("Stop the discovery manager before restarting with the same agent settings")
+        }
         if held.is_none() {
             let control_id = uuid::Uuid::new_v4().to_string();
             tx.execute(

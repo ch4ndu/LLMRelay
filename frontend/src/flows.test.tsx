@@ -2367,6 +2367,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
           state: "discovery",
           discovery_attempt_id: "setup-unchanged-manager-attempt",
           manager_control: {
+            hold: { id: "stopped-manager", state: "held", requested_operation_id: "stop-manager", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
             current: { ...config, model: "previous-discovery-model" },
             requested: config,
             effective: config,
@@ -2397,28 +2398,17 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         onViewSession={cmuxFixture}
       />,
     );
-    const unchangedChange = [...document.querySelectorAll("button")].find((
-      button,
-    ) => button.textContent === "Change discovery manager") as
-      | HTMLButtonElement
-      | undefined;
-    const requestsBeforeDisabledChange = requests.length;
-    if (
-      !unchangedChange?.disabled ||
-      !document.body.textContent?.includes(
-        "Change is disabled because the replacement profile is unchanged",
-      ) ||
-      !document.body.textContent.includes(
-        "Retry or Launch manager discovery",
-      )
-    ) {
-      throw new Error(
-        "unchanged discovery manager did not explain its disabled Change action",
-      );
+    const restart = [...document.querySelectorAll("button")].find(
+      (button) => button.textContent === "Restart discovery manager",
+    ) as HTMLButtonElement | undefined;
+    if (!restart || restart.disabled) {
+      throw new Error("quiescent held manager cannot restart with the same profile");
     }
-    act(() => unchangedChange.click());
-    if (requests.length !== requestsBeforeDisabledChange) {
-      throw new Error("disabled unchanged manager Change dispatched a request");
+    act(() => restart.click());
+    await settle();
+    if (requests.at(-1)?.action !== "change_setup_manager" ||
+      (requests.at(-1)?.host_manager as Record<string, unknown>)?.model !== config.model) {
+      throw new Error("restart did not preserve the exact selected manager profile");
     }
     field("Exact replacement model", "gpt-5.6-terra");
     const changedManager = [...document.querySelectorAll("button")].find((

@@ -258,6 +258,8 @@ pub(crate) fn prepare_with_bundles(
         "hooks": "native_explicit_trust",
     });
     if role == RoleKind::Implementer {
+        security_policy["permission_profile"]["filesystem"]["temporary_directories"] =
+            serde_json::json!("read-only");
         security_policy["native_approval_ownership"] = serde_json::json!({
             "revision": APPROVAL_OWNERSHIP_REVISION,
             "native_approvals": "honored",
@@ -356,11 +358,15 @@ pub fn require_denied_read_floor(identity: &CapabilityIdentity) -> Result<()> {
     {
         bail!(LEGACY_DENIED_READ_FLOOR_GAP)
     }
-    let expected_permission_profile = serde_json::json!({
+    let mut expected_permission_profile = serde_json::json!({
         "name": DENIED_READ_FLOOR_PROFILE,
         "extends": expected_base,
         "filesystem": {"deny": denied_paths.clone()},
     });
+    if identity.role == RoleKind::Implementer {
+        expected_permission_profile["filesystem"]["temporary_directories"] =
+            serde_json::json!("read-only");
+    }
     let expected_network = serde_json::json!({"enabled": true});
     let expected_network_proxy = serde_json::json!({
         "enabled": true,
@@ -652,7 +658,7 @@ fn permission_profile(
 ) -> Result<String> {
     let mut denied = BTreeSet::from([control_socket.to_path_buf()]);
     denied.extend(read_denials.iter().cloned());
-    let filesystem = denied
+    let mut filesystem = denied
         .iter()
         .map(|path| {
             Ok(format!(
@@ -662,6 +668,9 @@ fn permission_profile(
         })
         .collect::<Result<Vec<_>>>()?
         .join(",");
+    if base == ":workspace" {
+        filesystem.push_str(",\":tmpdir\"=\"read\",\":slash_tmp\"=\"read\"");
+    }
     Ok(format!(
         "permissions.{DENIED_READ_FLOOR_PROFILE}={{extends={},filesystem={{{filesystem}}},network={{enabled=true}}}}",
         toml_string(base)?,

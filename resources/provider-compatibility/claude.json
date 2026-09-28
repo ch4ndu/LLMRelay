@@ -2,7 +2,116 @@
   "schema": 1,
   "provider": "claude",
   "pack_id": "llmrelay-claude-compatibility",
-  "pack_revision": "1",
-  "description": "Embedded claude provider compatibility candidates.",
-  "selectors": []
+  "pack_revision": "2",
+  "description": "Embedded Claude Code 2.1.283 compatibility candidates.",
+  "selectors": [
+    {
+      "predicate_id": "claude-code-2.1.283",
+      "exact_version": "2.1.283 (Claude Code)",
+      "contracts": [
+        {
+          "role": "manager",
+          "contract_id": "claude-manager",
+          "contract_revision": "claude-role-contract-v1",
+          "launch_revision": "llmrelay-claude-launch-v2",
+          "resume_revision": "llmrelay-claude-resume-v2",
+          "native_policy_revision": "claude-native-sandbox-role-socket-v1",
+          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "credential_revision": "llmrelay-local-credential-v1",
+          "evidence_revision": "llmrelay-capability-proof-v1",
+          "required_evidence": [
+            "exact_native_policy",
+            "hook_trust",
+            "local_credential",
+            "role_capability_proof"
+          ]
+        },
+        {
+          "role": "explorer",
+          "contract_id": "claude-explorer",
+          "contract_revision": "claude-role-contract-v1",
+          "launch_revision": "llmrelay-claude-launch-v2",
+          "resume_revision": "llmrelay-claude-resume-v2",
+          "native_policy_revision": "claude-native-sandbox-role-socket-v1",
+          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "credential_revision": "llmrelay-local-credential-v1",
+          "evidence_revision": "llmrelay-capability-proof-v1",
+          "required_evidence": [
+            "exact_native_policy",
+            "hook_trust",
+            "local_credential",
+            "role_capability_proof"
+          ]
+        },
+        {
+          "role": "plan_reviewer",
+          "contract_id": "claude-plan_reviewer",
+          "contract_revision": "claude-role-contract-v1",
+          "launch_revision": "llmrelay-claude-launch-v2",
+          "resume_revision": "llmrelay-claude-resume-v2",
+          "native_policy_revision": "claude-native-sandbox-role-socket-v1",
+          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "credential_revision": "llmrelay-local-credential-v1",
+          "evidence_revision": "llmrelay-capability-proof-v1",
+          "required_evidence": [
+            "exact_native_policy",
+            "hook_trust",
+            "local_credential",
+            "role_capability_proof"
+          ]
+        },
+        {
+          "role": "implementer",
+          "contract_id": "claude-implementer",
+          "contract_revision": "claude-role-contract-v1",
+          "launch_revision": "llmrelay-claude-launch-v2",
+          "resume_revision": "llmrelay-claude-resume-v2",
+          "native_policy_revision": "claude-native-sandbox-role-socket-v1",
+          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "credential_revision": "llmrelay-local-credential-v1",
+          "evidence_revision": "llmrelay-capability-proof-v1",
+          "required_evidence": [
+            "exact_native_policy",
+            "hook_trust",
+            "local_credential",
+            "role_capability_proof"
+          ]
+        },
+        {
+          "role": "code_reviewer",
+          "contract_id": "claude-code_reviewer",
+          "contract_revision": "claude-role-contract-v1",
+          "launch_revision": "llmrelay-claude-launch-v2",
+          "resume_revision": "llmrelay-claude-resume-v2",
+          "native_policy_revision": "claude-native-sandbox-role-socket-v1",
+          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "credential_revision": "llmrelay-local-credential-v1",
+          "evidence_revision": "llmrelay-capability-proof-v1",
+          "required_evidence": [
+            "exact_native_policy",
+            "hook_trust",
+            "local_credential",
+            "role_capability_proof"
+          ]
+        },
+        {
+          "role": "final_verifier",
+          "contract_id": "claude-final_verifier",
+          "contract_revision": "claude-role-contract-v1",
+          "launch_revision": "llmrelay-claude-launch-v2",
+          "resume_revision": "llmrelay-claude-resume-v2",
+          "native_policy_revision": "claude-native-sandbox-role-socket-v1",
+          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "credential_revision": "llmrelay-local-credential-v1",
+          "evidence_revision": "llmrelay-capability-proof-v1",
+          "required_evidence": [
+            "exact_native_policy",
+            "hook_trust",
+            "local_credential",
+            "role_capability_proof"
+          ]
+        }
+      ]
+    }
+  ]
 }

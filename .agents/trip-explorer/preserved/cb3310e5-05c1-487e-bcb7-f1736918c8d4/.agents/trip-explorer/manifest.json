@@ -1,11 +1,10 @@
 {
-  "adapters_sha256": "f38e15b010ec897e83bd8df165d9cc028024f59474f6cdfa95eedd22e6463c3f",
+  "adapters_sha256": "2a8d3a8d58c7be73389c4f2df1c1e8c77c16582c630b7a9667ccabc50e694c20",
   "base": {
     "bin/cmux_observer.py": "2b6f3eeb68a84a0f711c38c723cf81a51221d98b491564d6ca82d50e742eaf4b",
     "bin/cmux_role_runner.py": "8af9608595f52384f9ed1cabc459ea901d4769f76ed36c4ba3cef3de7b3ce754",
     "bin/role_config.py": "5df37514d8639177186a85d1014e74b6c8d551d7224c207a4950edbbde2454ad",
     "bin/validate_installed.py": "249a548553b8fc416a63fb87dfe0dc077a77cb7cc7c311c5e2641ad4db20b44f",
-    "references/adaptation-contract.md": "97017e2092e399f399e722860cd571608ba07e9b3c9e48287ce6f5dd13885d00",
     "skills/trip-explorer-init/SKILL.md": "7c8c274dabc953b2041fa0ab923277b18316b1ade9de79e75245dfa6beed301f",
     "skills/trip-explorer-init/agents/openai.yaml": "680e238c90633f55b137807a5b7369ed278ac7b7f4b99d7f2d18105b6103a414",
     "skills/trip-explorer-upgrade/SKILL.md": "26e166d259b32615d8d58ef1f976d76fb0a168ceab36a122e37195a9f5cd756e",
@@ -20,13 +19,8 @@
     "role_config.py": "5df37514d8639177186a85d1014e74b6c8d551d7224c207a4950edbbde2454ad",
     "validate_installed.py": "249a548553b8fc416a63fb87dfe0dc077a77cb7cc7c311c5e2641ad4db20b44f"
   },
-  "config_sha256": "8f916016901c0b8f82c5a43357589f72723255532f05cd12b5780845d62cfedb",
-  "installed_at": "2026-09-28T00:52:24Z",
-  "llmrelay": {
-    "overlay_hash": "ede5ea9eddcb61eff3b5a790315b8006203feb8bedc4141ea030440e4f7db767",
-    "upstream_source_hash": "66ba1f219199e715723b26fef0fbd55cb1b1d11fc2a803aec4108ef23db799ae",
-    "workflow_id": "trip-explorer-0.9.0-llmrelay-1"
-  },
-  "preflight_sha256": "496192e183a4aa18cb2fa56a4c4a23ffc93e351e162d479c34ead5f7f674189e",
+  "config_sha256": "dbfc40e862088691ef434e6439f574f3b110dea38ddd632ba4be90ab9f251a30",
+  "installed_at": "2026-09-20T02:54:15+00:00",
+  "preflight_sha256": "43ea72297fc2dec2851cde87f345ef9de750d58c2b8a6213fc5f75d7bf811353",
   "version": "0.9.0"
 }

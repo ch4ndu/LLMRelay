@@ -4,8 +4,8 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
 pub const NATIVE_SANDBOX_POLICY_REVISION: &str = "claude-native-sandbox-role-socket-v1";
-pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-provider-launch-v1";
-pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-provider-resume-v1";
+pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-claude-launch-v2";
+pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-claude-resume-v2";
 pub const CREDENTIAL_CONTRACT_REVISION: &str = "llmrelay-local-credential-v1";
 
 #[allow(clippy::too_many_arguments)]
@@ -193,7 +193,6 @@ pub(crate) fn prepare_with_bundles(
     }
     if role == RoleKind::Implementer {
         allowed.push(format!("Edit(//{}/**)", relative.display()));
-        allowed.push(format!("Write(//{}/**)", relative.display()));
         allowed.push(format!(
             "Bash({} role yield-lane:*)",
             executable_path.display()
