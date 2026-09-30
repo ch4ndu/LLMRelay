@@ -51,6 +51,18 @@ impl RoleKind {
             Self::PlanReviewer | Self::CodeReviewer | Self::FinalReviewer
         )
     }
+
+    /// The role name shown to users.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Manager => "Manager",
+            Self::Explorer => "Explorer",
+            Self::PlanReviewer => "Plan reviewer",
+            Self::Implementer => "Implementer",
+            Self::CodeReviewer => "Code reviewer",
+            Self::FinalReviewer => "Final verifier",
+        }
+    }
 }
 
 impl fmt::Display for RoleKind {
@@ -859,6 +871,44 @@ pub struct TaskDto {
     pub snapshots: Vec<serde_json::Value>,
     pub review_budgets: Vec<serde_json::Value>,
     pub legacy: serde_json::Value,
+    /// What the unfinished task is waiting for and whether its work is
+    /// actually advancing. Absent for finished tasks and tasks without work.
+    #[serde(default)]
+    pub progress: Option<TaskProgress>,
+}
+
+/// Where a task stands, derived from authoritative workflow evidence. Hook
+/// traffic and process liveness are reported separately and never count as
+/// progress.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskProgress {
+    /// Stable code of the current decision.
+    pub reason_code: String,
+    /// Plain explanation of the wait.
+    pub waiting_reason: String,
+    /// `you`, `llmrelay`, `agent` or `external`.
+    pub responsible: String,
+    pub responsible_role: Option<RoleKind>,
+    /// The user-facing label of the next supported step and its exact target;
+    /// never an internal operation identifier.
+    pub next_operation: Option<String>,
+    pub next_target: Option<AttentionTarget>,
+    /// When the unresolved thing the task waits on was created: a permission
+    /// request, hold, recovery, control, review request or the agent step in
+    /// progress. `None` while the task can act now, or when not recorded.
+    pub waiting_since: Option<String>,
+    /// The newest authoritative workflow evidence: an accepted, unretired
+    /// report, decision, confirmed delivery, boundary, finished review,
+    /// capture, recovery or audited phase change.
+    pub last_meaningful_at: Option<String>,
+    pub last_meaningful_event: Option<String>,
+    /// Newest hook from any of the attempt's agents; activity, not progress.
+    pub last_agent_activity_at: Option<String>,
+    /// `no_live_agent`; `agent_live_idle` when an agent is running and no hook
+    /// is newer than the newest evidence (which does not prove it is idle);
+    /// `agent_active_without_progress` when its hooks are newer than any
+    /// recorded workflow step.
+    pub activity: String,
 }
 
 pub const DECISION_SCHEMA_V1: u8 = 1;
@@ -970,6 +1020,8 @@ pub struct DecisionActionBinding {
     pub expected_instance_version: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings_revision: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<RoleKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_checks_revision: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1581,22 +1633,87 @@ pub enum AttentionTarget {
         project_id: String,
         setup_operation_id: Option<String>,
     },
+    /// One role's settings in a task's Agent settings.
+    RoleSettings {
+        project_id: String,
+        task_id: String,
+        role: RoleKind,
+        settings_revision: i64,
+    },
+    /// The service-wide Diagnostics page.
+    Diagnostics,
 }
 
-/// Presentation of one reason for human attention, dated by the enclosing
+/// What opening an attention item lets the user do. The dashboard shows this
+/// label on the item's button and routes only to the item's exact target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionActionKind {
+    ReviewPlan,
+    ReviewRequest,
+    ReviewResult,
+    AnswerQuestion,
+    OpenAgentOutput,
+    OpenProjectSetup,
+    OpenAgentSettings,
+    OpenDiagnostics,
+    ResolveIssue,
+}
+
+impl AttentionActionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReviewPlan => "Review plan",
+            Self::ReviewRequest => "Review request",
+            Self::ReviewResult => "Review result",
+            Self::AnswerQuestion => "Answer question",
+            Self::OpenAgentOutput => "Open agent output",
+            Self::OpenProjectSetup => "Open project setup",
+            Self::OpenAgentSettings => "Open agent settings",
+            Self::OpenDiagnostics => "Open diagnostics",
+            Self::ResolveIssue => "Resolve issue",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AttentionAction {
+    pub kind: AttentionActionKind,
+    pub label: String,
+}
+
+impl From<AttentionActionKind> for AttentionAction {
+    fn from(kind: AttentionActionKind) -> Self {
+        Self {
+            kind,
+            label: kind.label().to_owned(),
+        }
+    }
+}
+
+/// Presentation of one reason for the user's attention, dated by the enclosing
 /// snapshot cursor. It grants nothing: every action rechecks its own revision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AttentionItem {
     /// Stable while the same entity needs the same attention.
     pub id: String,
     pub category: AttentionCategory,
+    /// Plain statement of what is waiting; never an internal identifier.
     pub title: String,
     pub reason: String,
+    /// The affected task's title, when the item belongs to one task.
+    pub task_title: Option<String>,
+    /// The affected role, for example `implementer`, when one role is involved.
+    pub role: Option<RoleKind>,
+    pub action: AttentionAction,
     /// `None` when no current dashboard entity can act on the item: the
     /// offline-released restore hold, or a binding to a superseded entity.
     pub target: Option<AttentionTarget>,
     /// Tasks fenced by the instance restore hold; empty for other items.
     pub held_tasks: Vec<TaskAttentionTarget>,
+    /// Raw diagnostic text for collapsed technical details; never primary copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1635,6 +1752,57 @@ pub struct AppStateDto {
     pub decisions: Vec<DecisionExplanation>,
     pub continuation_actions: Vec<ContinuationAction>,
     pub attention: Vec<AttentionItem>,
+    /// One entry per task that has attention items, so the task's board card
+    /// and its header offer the same next step. Derived from `attention`.
+    #[serde(default)]
+    pub task_actions: Vec<TaskAction>,
+}
+
+/// The next step a task offers, taken from the first of its attention items in
+/// precedence order. Opening it routes to that item's exact target.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskAction {
+    pub task_id: String,
+    /// The attention item the action opens.
+    pub item_id: String,
+    pub action: AttentionAction,
+    /// Every attention item that names this task, in precedence order.
+    pub item_ids: Vec<String>,
+}
+
+impl AttentionTarget {
+    /// The task this target belongs to, when it belongs to one.
+    pub fn task_id(&self) -> Option<&str> {
+        match self {
+            Self::Task(target) => Some(&target.task_id),
+            Self::Attempt { task_id, .. }
+            | Self::Session { task_id, .. }
+            | Self::PermissionRequest { task_id, .. }
+            | Self::RecoveryRecord { task_id, .. }
+            | Self::RoleSettings { task_id, .. } => Some(task_id),
+            Self::ProjectSetup { .. } | Self::Diagnostics => None,
+        }
+    }
+}
+
+/// Groups attention items by task, keeping the item order as precedence.
+pub fn task_actions(items: &[AttentionItem]) -> Vec<TaskAction> {
+    let mut actions: Vec<TaskAction> = Vec::new();
+    for item in items {
+        let Some(task_id) = item.target.as_ref().and_then(AttentionTarget::task_id) else {
+            continue;
+        };
+        match actions.iter_mut().find(|action| action.task_id == task_id) {
+            Some(action) => action.item_ids.push(item.id.clone()),
+            None => actions.push(TaskAction {
+                task_id: task_id.to_owned(),
+                item_id: item.id.clone(),
+                action: item.action.clone(),
+                item_ids: vec![item.id.clone()],
+            }),
+        }
+    }
+    actions
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1753,6 +1921,20 @@ pub enum TripHumanAction {
         expected_task_version: i64,
         stage: String,
         justification: String,
+    },
+    /// Your one-shot recovery of a final-repair attempt held in `needs_input`
+    /// by an ordinary `needs_rework` code review of its repaired candidate.
+    /// Every identity must equal the binding the service derives from the
+    /// ledger; the result returns all derived bindings.
+    AuthorizeFinalRepairRecheck {
+        task_id: String,
+        attempt_id: String,
+        expected_task_version: i64,
+        approved_code_request_id: String,
+        prior_candidate_hash: String,
+        final_request_id: String,
+        rejected_code_request_id: String,
+        reviewer_generation_id: String,
     },
 }
 
@@ -2033,6 +2215,45 @@ pub enum HumanCommand {
         task_id: String,
         expected_version: i64,
     },
+    /// Your explicit approval that listed guidance files in the active
+    /// attempt's workspace may keep their approved new content. Every binding
+    /// must still be current: task version, attempt, approved plan, project
+    /// configuration revision, the exact workspace policy being amended, and
+    /// each file's pinned and new hash.
+    ReauthorizeAttemptGuidance {
+        operation_id: String,
+        task_id: String,
+        attempt_id: String,
+        expected_version: i64,
+        plan_hash: String,
+        config_revision_id: String,
+        policy_hash: String,
+        files: Vec<GuidanceReauthorization>,
+    },
+    AbandonUnconfirmedGuidance {
+        operation_id: String,
+        #[serde(flatten)]
+        delivery: UnconfirmedGuidanceAbandonment,
+    },
+    CancelStaleRestartCandidate {
+        operation_id: String,
+        #[serde(flatten)]
+        candidate: StaleRestartCandidateCancellation,
+    },
+    /// Your explicit request for a fresh planning attempt after the attempt's
+    /// terminal nonapproving code or final review. The rejected candidate is
+    /// the new attempt's source only; it never becomes accepted authority.
+    ReplanAfterTerminalReview {
+        operation_id: String,
+        task_id: String,
+        attempt_id: String,
+        expected_version: i64,
+        review_request_id: String,
+        role_result_id: String,
+        candidate_hash: String,
+        snapshot_id: String,
+        reason: String,
+    },
     Archive {
         operation_id: String,
         task_id: String,
@@ -2106,6 +2327,10 @@ impl HumanCommand {
             | Self::RetryGracefulStop { operation_id, .. }
             | Self::ForceStopExactProcess { operation_id, .. }
             | Self::NormalizeLegacyTask { operation_id, .. }
+            | Self::ReauthorizeAttemptGuidance { operation_id, .. }
+            | Self::AbandonUnconfirmedGuidance { operation_id, .. }
+            | Self::CancelStaleRestartCandidate { operation_id, .. }
+            | Self::ReplanAfterTerminalReview { operation_id, .. }
             | Self::Archive { operation_id, .. }
             | Self::Restore { operation_id, .. }
             | Self::SetAutoResume { operation_id, .. }
@@ -2113,6 +2338,54 @@ impl HumanCommand {
             | Self::RevokePermissionRule { operation_id, .. } => operation_id,
         }
     }
+}
+
+/// One guidance file whose pinned hash moves from `previous_sha256` to the
+/// `sha256` of its approved content now in the attempt's workspace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuidanceReauthorization {
+    pub path: String,
+    pub previous_sha256: String,
+    pub sha256: String,
+}
+
+/// Your explicit decision to stop waiting on one guidance delivery whose
+/// outcome was never confirmed. Every recorded binding must be restated
+/// exactly; the delivery session must have exited with its processes proven
+/// absent. The outcome stays unknown: the message is never marked delivered
+/// or replayed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnconfirmedGuidanceAbandonment {
+    pub task_id: String,
+    pub expected_version: i64,
+    pub attempt_id: String,
+    pub guidance_id: String,
+    pub role_generation_id: String,
+    pub delivery_session_id: String,
+    pub delivery_transcript_epoch: String,
+    pub delivery_resume_invocation_id: Option<String>,
+    pub expected_state: String,
+    pub reason: String,
+}
+
+/// Your explicit decision to retire one skipped restart candidate that can
+/// never be restored but still holds its attempt. Every recorded field must be
+/// restated exactly, including the SHA-256 of its stored `result_json`; its
+/// session must have exited with its processes proven absent. Nothing is
+/// resumed, released or dispatched.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleRestartCandidateCancellation {
+    pub task_id: String,
+    pub expected_version: i64,
+    pub attempt_id: String,
+    pub session_id: String,
+    pub role_generation_id: String,
+    pub expected_state: String,
+    pub expected_source: String,
+    pub expected_requested_by: Option<String>,
+    pub expected_updated_at: String,
+    pub expected_result_sha256: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2163,4 +2436,47 @@ pub struct RolePeerProvenance {
     pub managed_root_pid: u32,
     pub managed_root_start_marker: String,
     pub state: String,
+}
+
+#[cfg(test)]
+mod task_action_tests {
+    use super::*;
+
+    fn item(id: &str, task: Option<&str>, kind: AttentionActionKind) -> AttentionItem {
+        AttentionItem {
+            id: id.into(),
+            category: AttentionCategory::Decision,
+            title: id.into(),
+            reason: String::new(),
+            task_title: None,
+            role: None,
+            action: kind.into(),
+            target: task.map(|task_id| {
+                AttentionTarget::Task(TaskAttentionTarget {
+                    project_id: "p".into(),
+                    task_id: task_id.into(),
+                    task_version: 1,
+                })
+            }),
+            held_tasks: Vec::new(),
+            details: None,
+        }
+    }
+
+    #[test]
+    fn each_task_offers_its_first_item_and_counts_the_rest() {
+        let actions = task_actions(&[
+            item("permission", Some("a"), AttentionActionKind::ReviewRequest),
+            item("unbound", None, AttentionActionKind::ResolveIssue),
+            item("question", Some("b"), AttentionActionKind::AnswerQuestion),
+            item("blocked", Some("a"), AttentionActionKind::ResolveIssue),
+        ]);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].task_id, "a");
+        assert_eq!(actions[0].item_id, "permission");
+        assert_eq!(actions[0].action.kind, AttentionActionKind::ReviewRequest);
+        assert_eq!(actions[0].item_ids, ["permission", "blocked"]);
+        assert_eq!(actions[1].task_id, "b");
+        assert_eq!(actions[1].item_ids, ["question"]);
+    }
 }

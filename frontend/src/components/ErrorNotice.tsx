@@ -15,6 +15,52 @@ export function explainError(error: string): ErrorGuidance {
         "Open a fresh dashboard sign-in link from the terminal running LLMRelay. Refreshing this page alone will not sign you in.",
     };
   }
+  if (
+    /files that new tasks need were changed|policy materialization collision|approved guidance collides/
+      .test(text)
+  ) {
+    return {
+      summary:
+        "Some project files have uncommitted changes that new tasks would not get.",
+      nextStep:
+        "Commit or restore the files named in Technical details, then choose Validate and relink in Project settings so new tasks start from the current commit. LLMRelay did not overwrite anything.",
+    };
+  }
+  if (
+    /policy file changed after verified materialization|stay fixed for the whole attempt/
+      .test(text)
+  ) {
+    return {
+      summary:
+        "A workflow or guidance file in the task's workspace was changed during the attempt.",
+      nextStep:
+        "Restore the file named in Technical details in the task's workspace. Changes to guidance files are delivered separately from task work.",
+    };
+  }
+  if (/profile change pending/.test(text)) {
+    return {
+      summary: "New agent settings are waiting to take effect.",
+      nextStep:
+        "They apply when the role's current session finishes. If Technical details asks for verification, verify the profile in the task's Agent settings.",
+    };
+  }
+  if (/project folder is now at commit/.test(text)) {
+    return {
+      summary: "The project folder has moved to a different commit.",
+      nextStep:
+        "Choose Validate and relink in Project settings so new tasks start from the current commit. Relinking is available when no task in this project is running.",
+    };
+  }
+  if (
+    /workflow files in the project folder changed after setup|activated manifest drifted|activated package file drifted/
+      .test(text)
+  ) {
+    return {
+      summary: "The project's workflow files changed after setup.",
+      nextStep:
+        "Open Project setup to review the change. LLMRelay will not overwrite it.",
+    };
+  }
   if (/role capacity|capacity.*full/.test(text)) {
     return {
       summary: "All available agent slots are busy.",

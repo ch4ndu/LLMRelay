@@ -4,10 +4,10 @@ use agenticjira::{
     database,
     diagnostics::DiagnosticSink,
     domain::{
-        AttachmentBinding, AttentionCategory, AttentionTarget, CapabilityProofInput,
-        CapabilityStatus, CmuxAttachmentMode, DecisionDisposition, HookEnvelope, HumanCommand,
-        LaunchConfig, ObservedProcessIdentity, OperationResult, PermissionDecision,
-        PermissionLifetime, ProcessGenerationAnchor, ProcessIdentity, Provider,
+        AttachmentBinding, AttentionActionKind, AttentionCategory, AttentionTarget,
+        CapabilityProofInput, CapabilityStatus, CmuxAttachmentMode, DecisionDisposition,
+        HookEnvelope, HumanCommand, LaunchConfig, ObservedProcessIdentity, OperationResult,
+        PermissionDecision, PermissionLifetime, ProcessGenerationAnchor, ProcessIdentity, Provider,
         RestartPreviewClassification, RoleContext, RoleKind, RoleOverride, RolePeerProvenance,
         RoleResultReport, TaskAttentionTarget, TranscriptFrame, TripHumanAction,
         ValidationLaunchRequest, WorkflowValidationRequest,
@@ -3999,20 +3999,69 @@ fn activated_policy_replaces_only_the_approved_installation_preimage() {
                 params![setup],
             );
         }
-        create_task(&fixture, &project, name, 1);
+        let task = create_task(&fixture, &project, name, 1);
         seed_supported_capabilities(&fixture);
-        let result = scheduler(&fixture, fixture.root.join("artifacts")).claim_next();
-        let workspace: String = fixture.connection().query_row(
-            "SELECT path FROM workspaces w JOIN attempts a ON a.id=w.attempt_id JOIN tasks t ON t.id=a.task_id WHERE t.project_id=?1",
-            params![project], |row| row.get(0),
-        ).unwrap();
-        let observed = std::fs::read(PathBuf::from(workspace).join(relative)).unwrap();
         if approved && !drifted {
+            let result = scheduler(&fixture, fixture.root.join("artifacts")).claim_next();
             assert!(result.unwrap().is_some());
+            let workspace: String = fixture.connection().query_row(
+                "SELECT path FROM workspaces w JOIN attempts a ON a.id=w.attempt_id JOIN tasks t ON t.id=a.task_id WHERE t.project_id=?1",
+                params![project], |row| row.get(0),
+            ).unwrap();
+            let observed = std::fs::read(PathBuf::from(workspace).join(relative)).unwrap();
             assert_eq!(observed, installed);
         } else {
-            assert!(format!("{:#}", result.unwrap_err()).contains("policy materialization"));
-            assert_eq!(observed, base);
+            // The committed copy matches neither the activated bytes nor the
+            // approved original, so the task is never queued or started.
+            assert_eq!(
+                fixture.scalar::<String>(&format!(
+                    "SELECT lifecycle||':'||attention FROM tasks WHERE id='{task}'"
+                )),
+                "backlog:needs_input",
+                "{name} queued a task whose workspace would collide"
+            );
+            // A task already Ready before the change is held at admission.
+            fixture.execute(
+                "UPDATE tasks SET lifecycle='ready',attention='none' WHERE id=?1",
+                params![task],
+            );
+            let result = scheduler(&fixture, fixture.root.join("artifacts")).claim_next();
+            assert!(
+                result.unwrap().is_none(),
+                "{name} claimed a colliding start"
+            );
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM workspaces", 0);
+            assert_eq!(
+                fixture.scalar::<i64>(&format!(
+                    "SELECT COUNT(*) FROM attempts WHERE task_id='{task}'"
+                )),
+                0
+            );
+            assert_eq!(
+                fixture.scalar::<String>(&format!(
+                    "SELECT lifecycle||':'||attention FROM tasks WHERE id='{task}'"
+                )),
+                "ready:needs_input"
+            );
+            let state = workflow::state(&fixture.store).unwrap();
+            let decision = state
+                .decisions
+                .iter()
+                .find(|decision| decision.subject.task_id.as_deref() == Some(task.as_str()))
+                .unwrap();
+            assert_eq!(decision.reason_code, "scheduler.start_baseline_stale");
+            let message = decision
+                .primary_blocker
+                .as_ref()
+                .and_then(|blocker| blocker.message.as_deref())
+                .unwrap();
+            assert!(message.contains(relative), "{message}");
+            assert!(message.contains("Validate and relink"), "{message}");
+            assert!(state
+                .attention
+                .iter()
+                .any(|item| item.id == format!("task:{task}:needs_input")
+                    && item.task_title.as_deref() == Some(name)));
         }
         assert_eq!(std::fs::read(path).unwrap(), installed);
     }
@@ -10570,13 +10619,65 @@ fn trip_materialization_and_profile_drift_fail_closed() {
         "{}\n",
     )
     .unwrap();
-    let error = scheduler(&drift, drift.root.join("artifacts"))
-        .claim_next()
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("activated manifest drifted"));
-    drift.assert_scalar::<String>("SELECT attention FROM tasks", "needs_recovery".into());
-    drift.assert_scalar::<i64>("SELECT COUNT(*) FROM sessions", 0);
+    // Pickup refuses before any reservation and records a durable, actionable
+    // hold instead of failing inside workspace materialization.
+    let pickup = scheduler(&drift, drift.root.join("artifacts"));
+    let nothing_started = || {
+        for table in [
+            "claims",
+            "workspaces",
+            "attempts",
+            "launch_permits",
+            "role_generations",
+            "sessions",
+        ] {
+            drift.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM {table}"), 0);
+        }
+    };
+    assert!(pickup.claim_next().unwrap().is_none());
+    nothing_started();
+    drift.assert_scalar::<String>(
+        "SELECT lifecycle || ':' || attention FROM tasks",
+        "ready:needs_input".into(),
+    );
+    let held_version: i64 = drift.scalar("SELECT version FROM tasks");
+    let state = workflow::state(&drift.store).unwrap();
+    let decision = state
+        .decisions
+        .iter()
+        .find(|decision| {
+            matches!(
+                decision.reason_code.as_str(),
+                "scheduler.start_baseline_stale" | "scheduler.project_readiness_stale"
+            )
+        })
+        .expect("the drift is a projected scheduler hold");
+    let message = decision
+        .primary_blocker
+        .as_ref()
+        .and_then(|blocker| blocker.message.as_deref())
+        .unwrap_or_default();
+    assert!(
+        message.contains(".agents/trip-explorer/manifest.json") && message.contains("changed"),
+        "{message}"
+    );
+    let next = decision
+        .next_action
+        .as_ref()
+        .expect("a supported next step");
+    assert_eq!(next.operation, "inspect_project");
+    assert_eq!(next.binding.project_id.as_deref(), Some(project.as_str()));
+    // The drift itself is still refused wherever a start would read it.
+    let direct = agenticjira::trip::start_baseline_problem(&drift.connection(), &project, true)
+        .unwrap()
+        .expect("the direct baseline check refuses the drifted manifest");
+    assert!(direct.contains("manifest.json"), "{direct}");
+    // Repeated pickup stays a no-op and never dispatches.
+    for _ in 0..2 {
+        assert!(pickup.claim_next().unwrap().is_none());
+    }
+    nothing_started();
+    drift.assert_scalar::<i64>("SELECT version FROM tasks", held_version);
 
     let stale = Fixture::new("trip-profile-drift");
     let (_, _, plan) = new_task(&stale, "stale", "stale-profile");
@@ -11498,10 +11599,54 @@ fn session_recovery_workspace_reservation_reconciles_or_cancels_the_complete_tup
             ) && action.binding["workspace_id"] == inspection_workspace
         }));
 
+    let missing = Fixture::new("workspace-missing-repository-hold").with_synthetic_claude();
+    let missing_project = add_project_with_provider(
+        &missing,
+        missing.repository("missing"),
+        "missing-repository",
+        Provider::Claude,
+    );
+    let missing_task = create_task_with_roles(
+        &missing,
+        &missing_project,
+        "missing-repository-task",
+        1,
+        roles_for(Provider::Claude),
+    );
+    missing.execute(
+        "UPDATE projects SET repository_path=?1 WHERE id=?2",
+        params![
+            missing
+                .root
+                .join("missing-reserved-repository")
+                .to_string_lossy(),
+            missing_project
+        ],
+    );
+    assert!(scheduler(&missing, missing.root.join("artifacts"))
+        .claim_next()
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        workflow::state(&missing.store)
+            .unwrap()
+            .decisions
+            .iter()
+            .find(|decision| decision.subject.task_id.as_deref() == Some(missing_task.as_str()))
+            .unwrap()
+            .reason_code,
+        "scheduler.start_baseline_stale"
+    );
+    missing.assert_scalar::<i64>("SELECT COUNT(*) FROM attempts", 0);
+    missing.assert_scalar::<i64>("SELECT COUNT(*) FROM claims", 0);
+    missing.assert_scalar::<i64>("SELECT COUNT(*) FROM workspaces", 0);
+    missing.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+
     let inspection_error = Fixture::new("workspace-first-inspection-error").with_synthetic_claude();
+    let inspection_error_repository = inspection_error.repository("inspect-error");
     let inspection_error_project = add_project_with_provider(
         &inspection_error,
-        inspection_error.repository("inspect-error"),
+        inspection_error_repository.clone(),
         "first-inspection-error",
         Provider::Claude,
     );
@@ -11512,14 +11657,13 @@ fn session_recovery_workspace_reservation_reconciles_or_cancels_the_complete_tup
         1,
         roles_for(Provider::Claude),
     );
-    let missing_repository = inspection_error.root.join("missing-reserved-repository");
-    inspection_error.execute(
-        "UPDATE projects SET repository_path=?1 WHERE id=?2",
-        params![
-            missing_repository.to_string_lossy(),
-            inspection_error_project
-        ],
-    );
+    // Admission reads only committed objects, so a corrupt index passes it and
+    // fails the `git status` that post-reservation inspection runs.
+    std::fs::write(
+        inspection_error_repository.join(".git/index"),
+        "corrupt index",
+    )
+    .unwrap();
     let error = scheduler(&inspection_error, inspection_error.root.join("artifacts"))
         .claim_next()
         .unwrap_err()
@@ -11528,6 +11672,22 @@ fn session_recovery_workspace_reservation_reconciles_or_cancels_the_complete_tup
     let inspection_error_attempt = inspection_error.scalar::<String>(&format!(
         "SELECT id FROM attempts WHERE task_id='{inspection_error_task}'"
     ));
+    inspection_error.assert_scalar::<String>(
+        &format!("SELECT state FROM workspaces WHERE attempt_id='{inspection_error_attempt}'"),
+        "recovery_required".into(),
+    );
+    inspection_error.assert_scalar::<String>(
+        &format!("SELECT state FROM claims WHERE attempt_id='{inspection_error_attempt}'"),
+        "unknown".into(),
+    );
+    inspection_error.assert_scalar::<String>(
+        &format!("SELECT status FROM attempts WHERE id='{inspection_error_attempt}'"),
+        "needs_recovery".into(),
+    );
+    inspection_error.assert_scalar::<String>(
+        &format!("SELECT attention FROM tasks WHERE id='{inspection_error_task}'"),
+        "needs_recovery".into(),
+    );
     inspection_error.assert_scalar::<String>(
         &format!(
             "SELECT json_extract(detail_json,'$.observed_filesystem.stage') FROM recovery_records WHERE attempt_id='{inspection_error_attempt}'"
@@ -12593,7 +12753,7 @@ fn trip_review_budgets_and_final_sessions_preserve_fresh_only_compatibility() {
         &paths,
         "extend-final",
         &TripHumanAction::ExtendReviewBudget {
-            task_id: task,
+            task_id: task.clone(),
             attempt_id: plan.attempt_id.clone(),
             expected_task_version: 3,
             review_kind: "final".into(),
@@ -12636,6 +12796,46 @@ fn trip_review_budgets_and_final_sessions_preserve_fresh_only_compatibility() {
         "SELECT initial_allowance+extension_allowance FROM review_budgets WHERE review_kind='plan'",
         5,
     );
+
+    let extend = |operation: &str, kind: &str, additional: i64| {
+        agenticjira::trip::execute_human(
+            &fixture.store,
+            &paths,
+            operation,
+            &TripHumanAction::ExtendReviewBudget {
+                task_id: task.clone(),
+                attempt_id: plan.attempt_id.clone(),
+                expected_task_version: fixture
+                    .scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+                review_kind: kind.into(),
+                additional,
+            },
+        )
+    };
+    // The final repair round opens no ordinary sixth call, whatever the
+    // history: the recheck is a separate lane.
+    let code_total = "SELECT (initial_allowance+extension_allowance)||':'||spent FROM review_budgets WHERE review_kind='code'";
+    fixture.execute(
+        "UPDATE review_budgets SET extension_allowance=5-initial_allowance,spent=5 WHERE attempt_id=?1 AND review_kind='code'",
+        params![plan.attempt_id],
+    );
+    fixture.execute(
+        "UPDATE attempts SET final_repair_round=1,candidate_hash='repaired-candidate' WHERE id=?1",
+        params![plan.attempt_id],
+    );
+    fixture.execute(
+        "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,prompt_hash,handoff_hash,delivery_state,verdict,created_at,updated_at)
+         VALUES('prior-approval',?1,'code','approved-candidate','prompt','handoff','finished','approved','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'),
+               ('recheck-changes',?1,'code','rechecked-candidate','prompt','handoff','finished','request_changes','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z')",
+        params![plan.attempt_id],
+    );
+    for (operation, kind) in [("final-repair-code", "code"), ("final-repair-plan", "plan")] {
+        assert!(extend(operation, kind, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot exceed five total calls"));
+    }
+    fixture.assert_scalar::<String>(code_total, "5:5".into());
 }
 
 #[test]
@@ -22275,6 +22475,23 @@ fn t07_input_lease_excludes_guidance_and_rejects_stale_authority() {
         guidance_state("ambiguous-guidance-two"),
         "written_awaiting_submit"
     );
+    // Guidance made uncertain by a restart or a failed write is proven delivered
+    // only by an exact native submit of its body for its own invocation.
+    codex.execute_batch(
+        "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,reason,created_at,written_at,delivery_session_id,delivery_transcript_epoch,delivery_resume_invocation_id)
+           VALUES('uncertain-current-guidance','a','g','Uncertain current body','delivery_unknown','service restarted before delivery was confirmed','2026-01-03T00:00:00Z','2026-01-03T00:00:00Z','s','codex-resume-epoch','codex-resume-invocation')",
+    );
+    submit_codex_prompt(&codex_context, "A different body");
+    assert_eq!(
+        guidance_state("uncertain-current-guidance"),
+        "delivery_unknown"
+    );
+    submit_codex_prompt(&codex_context, "Uncertain current body");
+    assert_eq!(guidance_state("uncertain-current-guidance"), "submitted");
+    assert_eq!(
+        guidance_state("historical-unknown-guidance"),
+        "delivery_unknown"
+    );
     record_codex_event(&codex_context, "PreToolUse");
     record_codex_event(&codex_context, "PostToolUse");
     record_codex_event(&codex_context, "SubagentStart");
@@ -31789,11 +32006,12 @@ const STATE_PROJECTED_TABLES: [&str; 65] = [
     "workspaces",
 ];
 
-const STATE_UNPROJECTED_TABLES: [&str; 10] = [
+const STATE_UNPROJECTED_TABLES: [&str; 11] = [
     "check_processes",
     "cmux_attachment_routes",
     "cmux_task_workspaces",
     "config_revisions",
+    "final_repair_rechecks",
     "import_records",
     "operation_receipts",
     "reviews",
@@ -32068,7 +32286,8 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
     }
     connection
         .execute_batch(
-            "DROP TABLE recipe_schedule_fires;
+            "DROP TABLE final_repair_rechecks;
+         DROP TABLE recipe_schedule_fires;
          DROP TABLE task_recipe_bindings;
          DROP TABLE recipe_schedules;
          DROP TABLE task_recipe_revisions;
@@ -32093,7 +32312,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 30_i64);
+    fixture.assert_scalar("PRAGMA user_version", 32_i64);
     fixture.assert_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%'",
         i64::try_from(triggers.len()).unwrap(),
@@ -32114,7 +32333,8 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
     fixture
         .connection()
         .execute_batch(
-            "DROP TABLE recipe_schedule_fires;
+            "DROP TABLE final_repair_rechecks;
+         DROP TABLE recipe_schedule_fires;
          DROP TABLE task_recipe_bindings;
          DROP TABLE recipe_schedules;
          DROP TABLE task_recipe_revisions;
@@ -32126,7 +32346,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 30_i64);
+    fixture.assert_scalar("PRAGMA user_version", 32_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -32437,5 +32657,6964 @@ fn m6_attention_routes_setup_recovery_only_to_the_current_setup_operation() {
             ),
         ],
         "setup recoveries open only the current setup operation, their actions fold, and the fixture task stays hidden"
+    );
+}
+
+fn commit_all(repository: &std::path::Path, message: &str) {
+    run(repository, &["add", "-A"]);
+    run(
+        repository,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            message,
+        ],
+    );
+}
+
+#[test]
+fn successive_uncommitted_setup_changes_are_detected_before_ready_and_start() {
+    let fixture = Fixture::new("start-baseline");
+    let repository = fixture.repository("start-baseline");
+    std::fs::write(repository.join("AGENTS.md"), "# Committed guidance\n").unwrap();
+    commit_all(&repository, "guidance");
+    let project = add_project(&fixture, repository.clone(), "baseline");
+    let problem = |check_head: bool| {
+        agenticjira::trip::start_baseline_problem(&fixture.connection(), &project, check_head)
+            .unwrap()
+    };
+    // Setup rewrote the approved guidance after the registered commit.
+    let guidance = problem(false).expect("an uncommitted guidance change was not detected");
+    assert!(
+        guidance.contains("AGENTS.md") && guidance.contains("Validate and relink"),
+        "{guidance}"
+    );
+
+    let draft = workflow::execute(
+        &fixture.store,
+        &HumanCommand::CreateTask {
+            operation_id: "baseline-draft".into(),
+            project_id: project.clone(),
+            title: "Baseline draft".into(),
+            description: String::new(),
+            acceptance_criteria: vec!["baseline checked".into()],
+            priority: 0,
+            ready: false,
+            role_overrides: roles(),
+        },
+    )
+    .unwrap()
+    .entity_id;
+    let version = fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{draft}'"));
+    let refused = workflow::execute(
+        &fixture.store,
+        &HumanCommand::MakeReady {
+            operation_id: "baseline-ready".into(),
+            task_id: draft.clone(),
+            expected_version: version,
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{refused:#}").contains("AGENTS.md"), "{refused:#}");
+    assert_eq!(
+        fixture.scalar::<String>(&format!(
+            "SELECT lifecycle||':'||version FROM tasks WHERE id='{draft}'"
+        )),
+        format!("backlog:{version}"),
+        "a refused Make Ready changed the draft"
+    );
+    let decision_for = |state: &agenticjira::domain::AppStateDto, task: &str| {
+        state
+            .decisions
+            .iter()
+            .find(|decision| decision.subject.task_id.as_deref() == Some(task))
+            .cloned()
+            .unwrap()
+    };
+    let state = workflow::state(&fixture.store).unwrap();
+    let blocker = decision_for(&state, &draft).primary_blocker.unwrap();
+    assert_eq!(blocker.code, "task.start_baseline_current");
+    assert!(blocker.message.unwrap().contains("AGENTS.md"));
+
+    let created = workflow::execute(
+        &fixture.store,
+        &HumanCommand::CreateTask {
+            operation_id: "baseline-created-ready".into(),
+            project_id: project.clone(),
+            title: "Created as Ready".into(),
+            description: String::new(),
+            acceptance_criteria: vec!["baseline checked".into()],
+            priority: 0,
+            ready: true,
+            role_overrides: roles(),
+        },
+    )
+    .unwrap();
+    assert_eq!(created.state, "start_baseline_stale");
+    assert_eq!(
+        fixture.scalar::<String>(&format!(
+            "SELECT lifecycle||':'||attention FROM tasks WHERE id='{}'",
+            created.entity_id
+        )),
+        "backlog:needs_input"
+    );
+
+    // A task that became Ready before the change is explained, never queued.
+    fixture.execute(
+        "UPDATE tasks SET lifecycle='ready',attention='none' WHERE id=?1",
+        params![draft],
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    assert_eq!(
+        decision_for(&state, &draft).reason_code,
+        "scheduler.start_baseline_stale"
+    );
+
+    commit_all(&repository, "installed setup");
+    assert!(problem(true)
+        .unwrap()
+        .contains("project folder is now at commit"));
+    let project_version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM projects WHERE id='{project}'"
+    ));
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::RelinkProject {
+            operation_id: "baseline-relink".into(),
+            project_id: project.clone(),
+            path: repository.clone(),
+            expected_version: project_version,
+        },
+    )
+    .unwrap();
+    assert_eq!(problem(true), None);
+    let state = workflow::state(&fixture.store).unwrap();
+    let queued = decision_for(&state, &draft);
+    assert_eq!(queued.reason_code, "scheduler.awaiting_admission");
+    assert_eq!(queued.disposition, DecisionDisposition::Waiting);
+    assert!(
+        !state
+            .attention
+            .iter()
+            .any(|item| item.id == format!("task:{draft}:decision")),
+        "a queued task was presented as waiting for the user"
+    );
+
+    // A second activation changes a workflow file without committing it.
+    let config_relative = ".agents/trip-explorer/config.json";
+    let manifest_relative = ".agents/trip-explorer/manifest.json";
+    let config_path = repository.join(config_relative);
+    let manifest_path = repository.join(manifest_relative);
+    let committed_config = std::fs::read(&config_path).unwrap();
+    let committed_manifest = std::fs::read(&manifest_path).unwrap();
+    let changed_config = b"{\"changed\":true}\n".to_vec();
+    std::fs::write(&config_path, &changed_config).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_slice(&committed_manifest).unwrap();
+    manifest["config_sha256"] = sha256(&changed_config).into();
+    let changed_manifest = serde_json::to_vec_pretty(&manifest).unwrap();
+    std::fs::write(&manifest_path, &changed_manifest).unwrap();
+    fixture.execute(
+        "UPDATE trip_project_state SET manifest_hash=?1 WHERE project_id=?2",
+        params![sha256(&changed_manifest), project],
+    );
+    let collision = problem(false).expect("a second uncommitted activation was not detected");
+    assert!(
+        collision.contains(config_relative) && collision.contains(manifest_relative),
+        "{collision}"
+    );
+    // Only the installation's approved original may be replaced.
+    let setup: String = fixture.scalar(&format!(
+        "SELECT setup_operation_id FROM trip_project_state WHERE project_id='{project}'"
+    ));
+    fixture.execute(
+        "UPDATE trip_setup_operations SET install_authorized_at='2026-01-01T00:00:00Z',approved_source_set_hash='frozen',final_source_set_hash='frozen',approved_preimages_hash='reviewed' WHERE id=?1",
+        params![setup],
+    );
+    for (relative, source, preimage) in [
+        (config_relative, &changed_config, &committed_config),
+        (manifest_relative, &changed_manifest, &committed_manifest),
+    ] {
+        fixture.execute(
+            "INSERT INTO trip_frozen_install_files(setup_operation_id,relative_path,source_hash,preimage_hash,source_bytes,preimage_bytes) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![setup, relative, sha256(source), sha256(preimage), source, preimage],
+        );
+    }
+    assert_eq!(problem(true), None);
+    assert_eq!(std::fs::read(&config_path).unwrap(), changed_config);
+}
+
+#[test]
+fn unreadable_project_baselines_hold_ready_and_start() {
+    let fixture = Fixture::new("start-baseline-unreadable");
+    let repository = fixture.repository("start-baseline-unreadable");
+    let project = add_project(&fixture, repository.clone(), "unreadable");
+    commit_all(&repository, "installed setup");
+    let project_version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM projects WHERE id='{project}'"
+    ));
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::RelinkProject {
+            operation_id: "unreadable-relink".into(),
+            project_id: project.clone(),
+            path: repository.clone(),
+            expected_version: project_version,
+        },
+    )
+    .unwrap();
+    let problem = |check_head: bool| {
+        agenticjira::trip::start_baseline_problem(&fixture.connection(), &project, check_head)
+            .unwrap()
+    };
+    assert_eq!(problem(true), None);
+    let draft = workflow::execute(
+        &fixture.store,
+        &HumanCommand::CreateTask {
+            operation_id: "unreadable-draft".into(),
+            project_id: project.clone(),
+            title: "Unreadable draft".into(),
+            description: String::new(),
+            acceptance_criteria: vec!["baseline checked".into()],
+            priority: 0,
+            ready: false,
+            role_overrides: roles(),
+        },
+    )
+    .unwrap()
+    .entity_id;
+    let version = fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{draft}'"));
+    let decision_for = |task: &str| {
+        workflow::state(&fixture.store)
+            .unwrap()
+            .decisions
+            .into_iter()
+            .find(|decision| decision.subject.task_id.as_deref() == Some(task))
+            .unwrap()
+    };
+    // Each unreadable fact refuses Make Ready and, where the read-only board
+    // checks it, explains the draft and holds an already Ready task instead of
+    // reading as "nothing to report". Only Make Ready compares the checkout.
+    let held = |expected: &str, make_ready: &str, head_only: bool| {
+        let message = problem(head_only).expect("an unreadable baseline was reported as current");
+        assert!(message.contains(expected), "{message}");
+        let refused = workflow::execute(
+            &fixture.store,
+            &HumanCommand::MakeReady {
+                operation_id: format!("unreadable-ready-{expected}"),
+                task_id: draft.clone(),
+                expected_version: version,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{refused:#}").contains(make_ready), "{refused:#}");
+        assert_eq!(
+            fixture.scalar::<String>(&format!(
+                "SELECT lifecycle||':'||version FROM tasks WHERE id='{draft}'"
+            )),
+            format!("backlog:{version}"),
+            "{expected}: a refused Make Ready changed the draft"
+        );
+        if head_only {
+            return;
+        }
+        let blocker = decision_for(&draft).primary_blocker.unwrap();
+        assert_eq!(blocker.code, "task.start_baseline_current", "{expected}");
+        assert!(blocker.message.unwrap().contains(expected), "{expected}");
+        fixture.execute(
+            "UPDATE tasks SET lifecycle='ready',attention='none' WHERE id=?1",
+            params![draft],
+        );
+        assert_eq!(
+            decision_for(&draft).reason_code,
+            "scheduler.start_baseline_stale",
+            "{expected}"
+        );
+        fixture.execute(
+            "UPDATE tasks SET lifecycle='backlog' WHERE id=?1",
+            params![draft],
+        );
+    };
+
+    let moved = repository.with_file_name("start-baseline-unreadable-moved");
+    std::fs::rename(&repository, &moved).unwrap();
+    let opened = "cannot open the project folder";
+    held(opened, opened, false);
+    std::fs::rename(&moved, &repository).unwrap();
+
+    let manifest = repository.join(".agents/trip-explorer/manifest.json");
+    let manifest_bytes = std::fs::read(&manifest).unwrap();
+    std::fs::remove_file(&manifest).unwrap();
+    let missing = "files are missing from the project folder";
+    held(missing, missing, false);
+    std::fs::write(&manifest, &manifest_bytes).unwrap();
+
+    let git_head = repository.join(".git/HEAD");
+    let head_bytes = std::fs::read(&git_head).unwrap();
+    std::fs::write(&git_head, "ref: refs/heads/absent\n").unwrap();
+    let head = "cannot read the current commit";
+    held(head, head, true);
+    std::fs::write(&git_head, &head_bytes).unwrap();
+
+    let base: String = fixture.scalar(&format!(
+        "SELECT base_revision FROM projects WHERE id='{project}'"
+    ));
+    fixture.execute(
+        "UPDATE projects SET base_revision=?1 WHERE id=?2",
+        params!["0".repeat(40), project],
+    );
+    held(
+        "cannot read commit 0000000000",
+        "project folder is now at commit",
+        false,
+    );
+    fixture.execute(
+        "UPDATE projects SET base_revision=?1 WHERE id=?2",
+        params![base, project],
+    );
+
+    assert_eq!(problem(true), None);
+    assert_ne!(
+        decision_for(&draft)
+            .primary_blocker
+            .map(|blocker| blocker.code),
+        Some("task.start_baseline_current".into()),
+        "a restored project still held its draft"
+    );
+}
+
+#[test]
+fn exited_sessions_offer_resume_only_while_current_and_unfinished() {
+    let fixture = Fixture::new("resume-relevance");
+    seed_attempt(&fixture, "implementation");
+    seed_session(&fixture, "a", "implementer", "g-impl", "s-impl", "exited");
+    fixture.execute_batch(
+        "UPDATE sessions SET native_session_id='native-impl' WHERE id='s-impl';
+         UPDATE role_generations SET status='exited' WHERE id='g-impl';
+         INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+           VALUES('rs-impl','t','implementer',1,'{\"provider\":\"codex\",\"model\":\"m\",\"effort\":\"high\"}','g-impl','2026-01-01T00:00:00Z');",
+    );
+    let resume = || {
+        let state = workflow::state(&fixture.store).unwrap();
+        let action = state
+            .continuation_actions
+            .iter()
+            .find(|action| action.binding["session_id"] == "s-impl")
+            .map(|action| (action.operation.clone(), action.enabled));
+        let item = state
+            .attention
+            .iter()
+            .find(|item| item.id == "continuation:role_resume:s-impl")
+            .cloned();
+        (action, item)
+    };
+    let (action, item) = resume();
+    assert_eq!(
+        action,
+        Some(("role_resume".into(), true)),
+        "an interrupted current session lost its exact resume"
+    );
+    let item = item.unwrap();
+    assert_eq!(item.title, "Implementer stopped before finishing");
+    assert_eq!(item.task_title.as_deref(), Some("Task"));
+    assert_eq!(item.role, Some(RoleKind::Implementer));
+    assert_eq!(item.action.kind, AttentionActionKind::ResolveIssue);
+    assert!(!item.title.contains("s-impl") && !item.reason.contains("s-impl"));
+
+    // A session that reported its result finished its turn.
+    fixture.execute(
+        "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at) VALUES('finished','finished-op','s-impl','g-impl','candidate_ready','Done','[]','{}','2026-01-02T00:00:00Z')",
+        [],
+    );
+    assert_eq!(resume(), (None, None), "a finished turn offered resume");
+    fixture.execute("DELETE FROM role_results WHERE id='finished'", []);
+    assert!(resume().0.is_some());
+
+    for (setup, cleanup) in [
+        (
+            "UPDATE tasks SET lifecycle='done' WHERE id='t'",
+            "UPDATE tasks SET lifecycle='in_progress' WHERE id='t'",
+        ),
+        (
+            "UPDATE tasks SET lifecycle='cancelled' WHERE id='t'",
+            "UPDATE tasks SET lifecycle='in_progress' WHERE id='t'",
+        ),
+        (
+            "UPDATE role_settings SET effective_generation_id=NULL WHERE id='rs-impl'",
+            "UPDATE role_settings SET effective_generation_id='g-impl' WHERE id='rs-impl'",
+        ),
+    ] {
+        fixture.execute(setup, []);
+        assert_eq!(resume(), (None, None), "{setup} still offered resume");
+        fixture.execute(cleanup, []);
+    }
+    assert!(resume().0.is_some());
+}
+
+#[test]
+fn attention_routes_a_reported_question_to_its_running_manager() {
+    let fixture = Fixture::new("attention-question");
+    seed_attempt(&fixture, "implementation");
+    seed_session(
+        &fixture,
+        "a",
+        "manager",
+        "g-manager",
+        "s-manager",
+        "running",
+    );
+    let message = "Manager needs your input before it can continue.";
+    fixture.execute_batch(&format!(
+        "UPDATE tasks SET attention='needs_input' WHERE id='t';
+         UPDATE attempts SET status='needs_input',updated_at='2026-01-01T00:00:05Z' WHERE id='a';
+         INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+           VALUES('hold','hold-op','service','attempt.attention.changed','attempt','a',
+                  '{{\"attention\":\"needs_input\",\"reason\":\"role_needs_input\",\"message\":\"{message}\"}}',
+                  '2026-01-01T00:00:05Z');"
+    ));
+    let state = workflow::state(&fixture.store).unwrap();
+    let decision = state
+        .decisions
+        .iter()
+        .find(|decision| decision.reason_code == "workflow.task_attention_required")
+        .unwrap();
+    assert_eq!(
+        decision
+            .primary_blocker
+            .as_ref()
+            .and_then(|blocker| blocker.message.as_deref()),
+        Some(message)
+    );
+    let item = state
+        .attention
+        .iter()
+        .find(|item| item.id == "task:t:needs_input")
+        .unwrap();
+    assert_eq!(item.title, "Needs your input");
+    assert_eq!(item.reason, message);
+    assert_eq!(item.action.kind, AttentionActionKind::AnswerQuestion);
+    assert_eq!(item.action.label, "Answer question");
+    assert!(matches!(
+        &item.target,
+        Some(AttentionTarget::Session { session_id, .. }) if session_id == "s-manager"
+    ));
+    // The board card and task header offer that same item as the next step.
+    let action = state
+        .task_actions
+        .iter()
+        .find(|action| action.task_id == "t")
+        .expect("the task offers its next step");
+    assert_eq!(action.item_id, "task:t:needs_input");
+    assert_eq!(action.action, item.action);
+    assert_eq!(
+        action.item_ids,
+        state
+            .attention
+            .iter()
+            .filter(
+                |candidate| candidate.target.as_ref().and_then(AttentionTarget::task_id)
+                    == Some("t")
+            )
+            .map(|candidate| candidate.id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // A later change to the attempt supersedes the recorded reason.
+    fixture.execute(
+        "UPDATE attempts SET updated_at='2026-01-01T00:00:09Z' WHERE id='a'",
+        [],
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    let item = state
+        .attention
+        .iter()
+        .find(|item| item.id == "task:t:needs_input")
+        .unwrap();
+    assert_eq!(item.action.kind, AttentionActionKind::ResolveIssue);
+    assert!(matches!(item.target, Some(AttentionTarget::Task(_))));
+    assert_ne!(item.reason, message);
+}
+
+#[test]
+fn task_content_returns_bounded_current_attempt_text_with_a_revision() {
+    let fixture = Fixture::new("task-content");
+    seed_attempt(&fixture, "plan_review");
+    seed_session(
+        &fixture,
+        "a",
+        "manager",
+        "g-manager",
+        "s-manager",
+        "running",
+    );
+    fixture.execute_batch(&format!(
+        "INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,scope_hash,configuration_hash,workflow_version,workflow_hash,upstream_source_hash,overlay_hash,legacy_migration_required,created_at,updated_at)
+           VALUES('a-old','t','context-old','planning','base',1,'failed','scope','configuration','{}','{}','{}','{}',0,'2025-12-01T00:00:00Z','2025-12-01T00:00:00Z');",
+        agenticjira::trip::WORKFLOW_ID,
+        workflow_resources::workflow_hash(),
+        agenticjira::trip::source_hash(),
+        agenticjira::trip::overlay_hash(),
+    ));
+    seed_session(&fixture, "a-old", "manager", "g-old", "s-old", "exited");
+    let insert = |id: &str, session: &str, generation: &str, created: &str, metadata: &str| {
+        fixture.execute(
+            "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at) VALUES(?1,?1,?2,?3,'plan_ready',?4,'[]',?5,?6)",
+            params![id, session, generation, format!("Report {id}"), metadata, created],
+        );
+    };
+    insert("old", "s-old", "g-old", "2025-12-02T00:00:00Z", "{}");
+    insert(
+        "plan",
+        "s-manager",
+        "g-manager",
+        "2026-01-02T00:00:00Z",
+        r##"{"plan":"# Plan\n- step","private":"SECRET-METADATA"}"##,
+    );
+    let content = workflow::task_content(&fixture.store, "t").unwrap();
+    assert_eq!(content["attempt_id"], "a");
+    assert_eq!(content["records"].as_array().unwrap().len(), 1);
+    assert_eq!(content["records"][0]["plan"], "# Plan\n- step");
+    assert_eq!(content["records"][0]["role"], "manager");
+    let serialized = content.to_string();
+    assert!(!serialized.contains("SECRET-METADATA") && !serialized.contains("Report old"));
+    let revision = content["content_revision"].as_str().unwrap().to_owned();
+    let state = workflow::state(&fixture.store).unwrap();
+    assert_eq!(
+        state.tasks[0].active_attempt.as_ref().unwrap()["content_revision"],
+        revision.as_str()
+    );
+
+    for index in 0..60 {
+        insert(
+            &format!("r{index:02}"),
+            "s-manager",
+            "g-manager",
+            &format!("2026-01-03T00:00:{index:02}Z"),
+            "{}",
+        );
+    }
+    let content = workflow::task_content(&fixture.store, "t").unwrap();
+    assert_ne!(content["content_revision"], revision.as_str());
+    let records = content["records"].as_array().unwrap();
+    assert_eq!(records.len(), 50);
+    assert_eq!(content["truncated"], true);
+    assert_eq!(records.last().unwrap()["id"], "r59");
+}
+
+/// Makes `generation` the task's current authority for `role`, as the
+/// scheduler and switch paths do for real dispatches.
+fn make_effective(fixture: &Fixture, role: &str, generation: &str) {
+    fixture.execute(
+        "INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+         VALUES(?1,'t',?2,1,'{\"provider\":\"codex\",\"model\":\"fixture-model\",\"effort\":\"fixture-effort\"}',?3,'2026-01-01T00:00:00Z')",
+        params![format!("{generation}-setting"), role, generation],
+    );
+}
+
+#[test]
+fn a_newer_report_from_the_asking_agent_releases_its_hold_exactly_once() {
+    let fixture = Fixture::new("hold-superseded");
+    seed_attempt(&fixture, "planning");
+    seed_session(
+        &fixture,
+        "a",
+        "manager",
+        "g-manager",
+        "s-manager",
+        "running",
+    );
+    seed_session(
+        &fixture,
+        "a",
+        "explorer",
+        "g-explorer",
+        "s-explorer",
+        "running",
+    );
+    make_effective(&fixture, "manager", "g-manager");
+    let hold = |event: &str, detail: &str, at: &str| {
+        fixture.execute_batch(&format!(
+            "UPDATE tasks SET attention='needs_input',version=4 WHERE id='t';
+             UPDATE attempts SET status='needs_input',updated_at='{at}' WHERE id='a';
+             INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+               VALUES('{event}','{event}-op','service','attempt.attention.changed','attempt','a','{detail}','{at}');"
+        ));
+    };
+    let report = |id: &str, generation: &str, outcome: &str, consumed: Option<&str>| {
+        let session = if generation == "g-manager" {
+            "s-manager"
+        } else {
+            "s-explorer"
+        };
+        let metadata = if outcome == "plan_ready" {
+            r#"{"plan":"Answered plan"}"#
+        } else {
+            "{}"
+        };
+        fixture.execute(
+            "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
+             VALUES(?1,?1,?2,?3,?4,'Report','[]',?6,'2026-01-01T00:00:06Z',?5)",
+            params![id, session, generation, outcome, consumed, metadata],
+        );
+    };
+    let released =
+        || agenticjira::coordinator::reconcile_superseded_role_hold(&fixture.store).unwrap();
+    let task_state = || {
+        fixture
+            .connection()
+            .query_row(
+                "SELECT t.attention,t.version,a.status FROM tasks t JOIN attempts a ON a.task_id=t.id WHERE t.id='t'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+            )
+            .unwrap()
+    };
+
+    // A hold recorded before holds named their source result is left alone.
+    report(
+        "question",
+        "g-manager",
+        "needs_input",
+        Some("2026-01-01T00:00:05Z"),
+    );
+    hold(
+        "legacy",
+        r#"{"attention":"needs_input","reason":"role_needs_input","message":"m"}"#,
+        "2026-01-01T00:00:05Z",
+    );
+    report("plan", "g-manager", "plan_ready", None);
+    assert!(released().is_none());
+
+    // A newer report from a different agent does not answer the question.
+    let sourced = r#"{"attention":"needs_input","reason":"role_needs_input","message":"m","result_id":"question","role_generation_id":"g-manager"}"#;
+    fixture.execute("DELETE FROM role_results WHERE id='plan'", []);
+    hold("sourced", sourced, "2026-01-01T00:00:07Z");
+    report("explored", "g-explorer", "exploration_complete", None);
+    assert!(released().is_none());
+    fixture.execute(
+        "UPDATE role_results SET consumed_at='2026-01-01T00:00:08Z' WHERE id='explored'",
+        [],
+    );
+
+    // Guidance whose delivery is unconfirmed keeps the hold.
+    report("plan", "g-manager", "plan_ready", None);
+    fixture.execute(
+        "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at)
+         VALUES('answer','a','g-manager','Use the smaller scope','delivery_unknown','2026-01-01T00:00:07Z')",
+        [],
+    );
+    assert!(released().is_none());
+
+    // So does another blocked report that nobody has read yet.
+    fixture.execute(
+        "UPDATE guidance_messages SET state='acknowledged' WHERE id='answer'",
+        [],
+    );
+    report("stuck", "g-explorer", "blocked", None);
+    assert!(released().is_none());
+    fixture.execute("DELETE FROM role_results WHERE id='stuck'", []);
+
+    // A plan the current phase would not consume does not answer the
+    // question: wrong phase, or a manager that is no longer the authority.
+    fixture.execute(
+        "UPDATE attempts SET phase='implementation' WHERE id='a'",
+        [],
+    );
+    assert!(released().is_none());
+    fixture.execute("UPDATE attempts SET phase='planning' WHERE id='a'", []);
+    fixture.execute(
+        "UPDATE role_settings SET effective_generation_id=NULL WHERE role='manager'",
+        [],
+    );
+    assert!(released().is_none());
+    fixture.execute(
+        "UPDATE role_settings SET effective_generation_id='g-manager' WHERE role='manager'",
+        [],
+    );
+
+    // The asking agent answered with a usable report: release exactly once.
+    let value = released().expect("the answered hold is released");
+    assert_eq!(value["action"], "hold_superseded");
+    assert_eq!(value["result_id"], "plan");
+    assert_eq!(task_state(), ("none".to_owned(), 5, "running".to_owned()));
+    let unconsumed: Option<String> = fixture
+        .connection()
+        .query_row(
+            "SELECT consumed_at FROM role_results WHERE id='plan'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(unconsumed.is_none(), "the phase logic consumes the report");
+    assert!(released().is_none());
+    assert_eq!(task_state(), ("none".to_owned(), 5, "running".to_owned()));
+    let audits: i64 = fixture
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.attention.superseded' AND entity_id='a'
+               AND json_extract(detail_json,'$.hold_event_id')='sourced'
+               AND json_extract(detail_json,'$.newer_result_id')='plan'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(audits, 1);
+    let state = workflow::state(&fixture.store).unwrap();
+    assert!(state
+        .attention
+        .iter()
+        .all(|item| item.id != "task:t:needs_input"));
+}
+
+#[test]
+fn repeated_coordinator_failures_are_recorded_once_and_closed_on_recovery() {
+    let fixture = Fixture::new("tick-deferred");
+    seed_attempt(&fixture, "planning");
+    let deferrals = || -> (i64, i64) {
+        fixture
+            .connection()
+            .query_row(
+                "SELECT SUM(event_code='coordinator.tick.deferred'),SUM(event_code='coordinator.tick.recovered')
+                 FROM audit_events WHERE entity_kind='coordinator'",
+                [],
+                |row| Ok((row.get::<_, Option<i64>>(0)?.unwrap_or(0), row.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+            )
+            .unwrap()
+    };
+    let item = |id: &str| {
+        workflow::state(&fixture.store)
+            .unwrap()
+            .attention
+            .into_iter()
+            .find(|item| item.id == id)
+    };
+    let defer = |cause: &str, attempt: Option<&str>| {
+        agenticjira::coordinator::record_tick_deferred(&fixture.store, cause, attempt).unwrap()
+    };
+    // Nothing to close before anything failed.
+    assert!(!agenticjira::coordinator::record_tick_recovered(&fixture.store).unwrap());
+    assert!(item("coordinator_deferred").is_none());
+
+    let first =
+        "dispatch failed for attempt 1f0c9a7e-5b1d-4c55-9f2a-0d7e3c1b2a99 at 2026-01-01T00:00:01Z";
+    let retried =
+        "dispatch failed for attempt 7a3e1c55-0b9d-4e11-8c2f-5d6a7b8c9d01 at 2026-01-01T00:00:02Z";
+    assert!(defer(first, None));
+    assert!(!defer(retried, None));
+    assert_eq!(deferrals(), (1, 0));
+    // A service-wide failure opens Diagnostics; the raw cause is only in
+    // technical details, never in the primary copy.
+    let shown = item("coordinator_deferred").expect("the paused progress is visible");
+    assert_eq!(shown.title, "Automatic progress is paused");
+    assert!(!shown.reason.contains("1f0c9a7e"), "{}", shown.reason);
+    assert!(shown
+        .details
+        .as_deref()
+        .is_some_and(|details| details.contains(first)));
+    assert_eq!(shown.action.kind, AttentionActionKind::OpenDiagnostics);
+    assert_eq!(shown.target, Some(AttentionTarget::Diagnostics));
+
+    // A different cause is its own record; one bound to an attempt belongs to
+    // that task and opens it.
+    assert!(defer("worktree is missing", Some("a")));
+    assert_eq!(deferrals(), (2, 0));
+    let bound = item("coordinator_deferred:t").expect("the task's paused progress is visible");
+    assert_eq!(bound.task_title.as_deref(), Some("Task"));
+    assert!(matches!(&bound.target, Some(AttentionTarget::Task(target)) if target.task_id == "t"));
+    assert!(!bound.reason.contains("worktree is missing"));
+    assert!(bound
+        .details
+        .as_deref()
+        .is_some_and(|details| details.contains("worktree is missing")));
+    assert!(item("coordinator_deferred").is_none());
+    // The same text for another attempt is a different cause.
+    assert!(!defer("worktree is missing", Some("a")));
+    assert!(defer("worktree is missing", None));
+    assert_eq!(deferrals(), (3, 0));
+
+    assert!(agenticjira::coordinator::record_tick_recovered(&fixture.store).unwrap());
+    assert!(!agenticjira::coordinator::record_tick_recovered(&fixture.store).unwrap());
+    assert_eq!(deferrals(), (3, 1));
+    assert!(item("coordinator_deferred").is_none());
+
+    // The same cause failing again after recovery is a new record.
+    assert!(defer(first, None));
+    assert_eq!(deferrals(), (4, 1));
+}
+
+/// Starts a planning task whose current Codex manager is running under
+/// synthetic dispatch, so the real coordinator, hook, result and guidance
+/// seams can be exercised without a provider process.
+fn ordinary_manager_fixture(
+    name: &str,
+) -> (Fixture, InstancePaths, Application, String, RoleContext) {
+    let fixture = Fixture::new(name);
+    let mut paths = instance_paths(&fixture);
+    paths.role_socket = fixture.root.join("role.sock");
+    let (_, task, _) = new_task(&fixture, name, &format!("{name}-task"));
+    let app = Application::new_with_synthetic_dispatch_for_tests(
+        paths.clone(),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+        test_hooks(&fixture),
+    )
+    .unwrap();
+    let dispatch = app.coordinator_tick().unwrap();
+    assert_eq!(dispatch["action"], "manager_dispatched");
+    let session = dispatch["session_id"].as_str().unwrap().to_owned();
+    let manager = app.synthetic_role_context_for_tests(&session).unwrap();
+    (fixture, paths, app, task, manager)
+}
+
+fn manager_report(
+    fixture: &Fixture,
+    manager: &RoleContext,
+    operation: &str,
+    outcome: &str,
+    metadata: serde_json::Value,
+) {
+    fixture
+        .store
+        .save_role_result(
+            manager,
+            &RoleResultReport {
+                operation_id: operation.into(),
+                outcome: outcome.into(),
+                summary: format!("Manager {outcome} report {operation}"),
+                evidence: vec!["causal fixture".into()],
+                metadata,
+            },
+        )
+        .unwrap();
+}
+
+fn manager_hook_with(
+    fixture: &Fixture,
+    manager: &RoleContext,
+    native: &str,
+    event: &str,
+    extra: serde_json::Value,
+) {
+    let cwd: String = fixture
+        .connection()
+        .query_row(
+            "SELECT COALESCE((SELECT path FROM workspaces WHERE attempt_id=?1),repository_path)
+             FROM projects WHERE id=?2",
+            params![manager.attempt_id, manager.project_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut payload = serde_json::json!({"hook_event_name":event,"session_id":native,"cwd":cwd});
+    for (key, value) in extra.as_object().unwrap() {
+        payload[key] = value.clone();
+    }
+    fixture
+        .store
+        .save_hook_event(
+            manager,
+            &HookEnvelope {
+                provider: manager.provider,
+                payload,
+            },
+            &RolePeerProvenance {
+                peer_pid: 42,
+                peer_process_group_id: 42,
+                peer_start_marker: "manager-handoff-peer".into(),
+                managed_root_pid: 42,
+                managed_root_start_marker: "manager-handoff-root".into(),
+                state: "managed_process_group_untrusted_payload".into(),
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn retry_consumes_the_newer_plan_instead_of_resurrecting_answered_questions() {
+    let (fixture, paths, app, task, manager) = ordinary_manager_fixture("retry-stale-question");
+    let task_version = || fixture.scalar::<i64>("SELECT version FROM tasks");
+    manager_report(
+        &fixture,
+        &manager,
+        "question-1",
+        "needs_input",
+        serde_json::json!({}),
+    );
+    assert_eq!(app.coordinator_tick().unwrap()["action"], "held");
+    fixture.assert_scalar::<String>("SELECT attention FROM tasks", "needs_input".into());
+    // While the task waited the manager asked twice more, then wrote the plan
+    // once it had its answer. This is the recorded Retry 22 -> 25 -> 28 shape.
+    manager_report(
+        &fixture,
+        &manager,
+        "question-2",
+        "needs_input",
+        serde_json::json!({}),
+    );
+    manager_report(
+        &fixture,
+        &manager,
+        "question-3",
+        "needs_input",
+        serde_json::json!({}),
+    );
+    let structured = mb10_plan(&fixture, &manager, "answered plan");
+    manager_report(
+        &fixture,
+        &manager,
+        "answered-plan",
+        "plan_ready",
+        serde_json::json!({"plan":"answered plan bytes","structured_plan":structured}),
+    );
+    // The recorded task was at version 22. Each Retry request and its
+    // application add one version each; the defect then consumed an answered
+    // question and held the task again (+1), giving 22 -> 25 -> 28 and a third
+    // Retry. The fixed path must reach 24 with no new hold.
+    fixture.execute("UPDATE tasks SET version=22 WHERE id=?1", params![task]);
+    let retry = |operation: &str, version: i64| {
+        workflow::execute(
+            &fixture.store,
+            &HumanCommand::Control {
+                operation_id: operation.into(),
+                task_id: task.clone(),
+                expected_version: version,
+                action: "retry".into(),
+                payload: serde_json::json!({}),
+            },
+        )
+    };
+    retry("retry-once", 22).unwrap();
+    let mut actions = Vec::new();
+    let mut versions = Vec::new();
+    for _ in 0..6 {
+        let value = app.coordinator_tick().unwrap();
+        let action = value["action"].as_str().unwrap_or_default().to_owned();
+        assert_ne!(action, "held", "an answered question came back: {value}");
+        versions.push(task_version());
+        actions.push(action.clone());
+        if action == "stale_reports_superseded" {
+            assert_eq!(
+                task_version(),
+                24,
+                "the Retry did not settle at 24: {versions:?}"
+            );
+            fixture.assert_scalar::<String>("SELECT attention FROM tasks", "none".into());
+            // No second Retry is needed, or even offered, once the task runs.
+            assert!(retry("retry-twice", 24).is_err());
+        }
+        if action == "quiescing_completed_role" {
+            fixture.execute(
+                "UPDATE sessions SET status='exited',launch_state='finished',exit_json='{\"process_group_quiescent\":true,\"synthetic_fixture\":true}' WHERE id=?1 AND status='interrupt_requested'",
+                params![manager.session_id],
+            );
+            fixture.execute(
+                "UPDATE role_generations SET status='exited' WHERE id=?1 AND status='running'",
+                params![manager.role_generation_id],
+            );
+        }
+        if action == "plan_frozen" {
+            break;
+        }
+    }
+    assert!(actions.contains(&"retry_enabled".to_owned()), "{actions:?}");
+    // Until the plan is frozen nothing else may change the task: no new hold.
+    let frozen_at = actions
+        .iter()
+        .position(|action| action == "plan_frozen")
+        .unwrap();
+    assert!(
+        versions[..frozen_at].iter().all(|version| *version <= 24),
+        "the defect's 22 -> 25 step recurred: {versions:?} {actions:?}"
+    );
+    assert!(
+        actions.contains(&"stale_reports_superseded".to_owned()),
+        "{actions:?}"
+    );
+    assert_eq!(
+        actions.last().map(String::as_str),
+        Some("plan_frozen"),
+        "{actions:?}"
+    );
+    fixture.assert_scalar::<String>("SELECT attention FROM tasks", "none".into());
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM role_results WHERE outcome='needs_input' AND consumed_at IS NULL",
+        0,
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='role_result.superseded'",
+        2,
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM role_results WHERE operation_id='answered-plan' AND consumed_at IS NOT NULL",
+        1,
+    );
+    // One hold, one Retry: no second hold and no repeated resurrection.
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.attention.changed'
+           AND json_extract(detail_json,'$.attention')='needs_input'",
+        1,
+    );
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+#[test]
+fn an_answered_manager_question_reaches_the_plan_through_the_exact_boundary_once() {
+    let (fixture, paths, app, task, manager) = ordinary_manager_fixture("answered-question");
+    let native = "0c5e2f0a-3f55-4a3a-9d1f-7b2f5f8a9c11";
+    // The manager asks its question inside a turn that then ends with a Codex
+    // tool start that never received its completion hook, so the Stop is not a
+    // safe idle boundary by itself.
+    for event in ["SessionStart", "UserPromptSubmit", "PreToolUse"] {
+        record_manager_hook(&fixture, &manager, native, event);
+    }
+    manager_report(
+        &fixture,
+        &manager,
+        "question",
+        "needs_input",
+        serde_json::json!({}),
+    );
+    assert_eq!(app.coordinator_tick().unwrap()["action"], "held");
+    record_manager_hook(&fixture, &manager, native, "Stop");
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT readiness_state FROM sessions WHERE id='{}'",
+            manager.session_id
+        ),
+        "busy_unresolved_hook_work".into(),
+    );
+    let body = "Use the smaller scope and keep the current API.";
+    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let queued = app
+        .execute_human_command(&HumanCommand::Guidance {
+            operation_id: "answer".into(),
+            task_id: task.clone(),
+            role_generation_id: manager.role_generation_id.clone(),
+            expected_version: version,
+            body: body.into(),
+        })
+        .unwrap();
+    assert_eq!(queued.state, "guidance_queued");
+    let guidance_id: String = fixture.scalar("SELECT id FROM guidance_messages");
+    // The ordinary manager boundary is reconciled once, with native inventory.
+    let reconciled = app.coordinator_tick().unwrap();
+    assert_eq!(
+        reconciled["action"], "codex_stop_idle_reconciled",
+        "{reconciled}"
+    );
+    assert_eq!(reconciled["scope"], "ordinary_manager");
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT readiness_state FROM sessions WHERE id='{}'",
+            manager.session_id
+        ),
+        "idle_candidate".into(),
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='provider.codex_stop_idle.reconciled'
+           AND json_extract(detail_json,'$.scope')='ordinary_manager'
+           AND json_extract(detail_json,'$.completion_inferred')=0",
+        1,
+    );
+    // Queued guidance is not acknowledgeable: acknowledgement needs a native submit.
+    assert!(fixture
+        .store
+        .acknowledge_guidance(&manager, &guidance_id)
+        .is_err());
+    // The terminal write is the one provider I/O seam synthetic dispatch lacks;
+    // the recorded delivery binds the exact session, epoch and invocation.
+    fixture.execute(
+        "UPDATE guidance_messages SET state='written_awaiting_submit',delivery_session_id=?1,
+           delivery_transcript_epoch=(SELECT transcript_epoch FROM sessions WHERE id=?1),
+           written_at='2026-01-01T00:00:00Z' WHERE id=?2 AND state='queued'",
+        params![manager.session_id, guidance_id],
+    );
+    // A submit with a different body is not this guidance.
+    manager_hook_with(
+        &fixture,
+        &manager,
+        native,
+        "UserPromptSubmit",
+        serde_json::json!({"prompt":"something else"}),
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM guidance_messages",
+        "written_awaiting_submit".into(),
+    );
+    manager_hook_with(
+        &fixture,
+        &manager,
+        native,
+        "UserPromptSubmit",
+        serde_json::json!({"prompt":format!("\n{body}\n")}),
+    );
+    fixture.assert_scalar::<String>("SELECT state FROM guidance_messages", "submitted".into());
+    fixture
+        .store
+        .acknowledge_guidance(&manager, &guidance_id)
+        .unwrap();
+    // The answered manager writes its plan and stops cleanly.
+    let structured = mb10_plan(&fixture, &manager, "answered plan");
+    manager_report(
+        &fixture,
+        &manager,
+        "answered-plan",
+        "plan_ready",
+        serde_json::json!({"plan":"answered plan bytes","structured_plan":structured}),
+    );
+    manager_hook_with(&fixture, &manager, native, "Stop", serde_json::json!({}));
+    let released = app.coordinator_tick().unwrap();
+    assert_eq!(released["action"], "hold_superseded", "{released}");
+    fixture.assert_scalar::<String>("SELECT attention FROM tasks", "none".into());
+    let mut frozen = 0;
+    for _ in 0..6 {
+        let value = app.coordinator_tick().unwrap();
+        match value["action"].as_str().unwrap_or_default() {
+            "quiescing_completed_role" => {
+                fixture.execute(
+                    "UPDATE sessions SET status='exited',launch_state='finished',exit_json='{\"process_group_quiescent\":true,\"synthetic_fixture\":true}' WHERE id=?1 AND status='interrupt_requested'",
+                    params![manager.session_id],
+                );
+                fixture.execute(
+                    "UPDATE role_generations SET status='exited' WHERE id=?1 AND status='running'",
+                    params![manager.role_generation_id],
+                );
+            }
+            "plan_frozen" => frozen += 1,
+            "held" => panic!("the answered question held the task again: {value}"),
+            _ => {}
+        }
+    }
+    assert_eq!(frozen, 1);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.attention.superseded'",
+        1,
+    );
+    fixture.assert_scalar::<String>("SELECT state FROM guidance_messages", "acknowledged".into());
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+#[test]
+fn an_ordinary_manager_stop_is_reconciled_only_at_an_exact_current_boundary() {
+    let (fixture, paths, app, _task, manager) = ordinary_manager_fixture("ordinary-stop");
+    let native = "5d6a1c2e-8a4b-4f3e-b1a9-2c7d9e0f1a23";
+    let session = manager.session_id.clone();
+    let attempt = manager.attempt_id.clone();
+    let eligible = || {
+        app.synthetic_codex_stop_idle_native_readiness_for_tests(true)
+            .is_ok()
+    };
+    let readiness = || {
+        fixture.scalar::<String>(&format!(
+            "SELECT readiness_state FROM sessions WHERE id='{session}'"
+        ))
+    };
+    // A turn that stops without any report is never treated as finished.
+    for event in ["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"] {
+        record_manager_hook(&fixture, &manager, native, event);
+    }
+    assert_eq!(readiness(), "busy_unresolved_hook_work");
+    assert!(!eligible(), "a Stop with no report was reconciled");
+    // Nor does a report from before the turn's prompt count for it.
+    fixture.execute(
+        "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+         VALUES('before-prompt','before-prompt',?1,?2,'needs_input','Earlier','[]','{}','2000-01-01T00:00:00Z')",
+        params![session, manager.role_generation_id],
+    );
+    assert!(!eligible(), "a report from before the prompt was accepted");
+    // The next turn reports between its prompt and its Stop.
+    for event in ["UserPromptSubmit", "PreToolUse", "PreToolUse"] {
+        record_manager_hook(&fixture, &manager, native, event);
+    }
+    manager_report(
+        &fixture,
+        &manager,
+        "turn-question",
+        "needs_input",
+        serde_json::json!({}),
+    );
+    record_manager_hook(&fixture, &manager, native, "Stop");
+    assert_eq!(readiness(), "busy_unresolved_hook_work");
+    // A native inventory that is not idle refuses without changing anything.
+    assert!(!app
+        .synthetic_codex_stop_idle_native_readiness_for_tests(false)
+        .unwrap());
+    assert_eq!(readiness(), "busy_unresolved_hook_work");
+    // Every conflicting fact refuses while it is present.
+    let conflicts: Vec<(&str, String, String)> = vec![
+        (
+            "stale generation",
+            format!("UPDATE role_settings SET effective_generation_id=NULL WHERE effective_generation_id='{}'", manager.role_generation_id),
+            format!("UPDATE role_settings SET effective_generation_id='{}' WHERE role='manager' AND revision=(SELECT MAX(revision) FROM role_settings WHERE role='manager')", manager.role_generation_id),
+        ),
+        (
+            "uncertain resume invocation",
+            format!("INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,launch_config_json,capability_key,capability_identity_json,state,hook_event_boundary_rowid,created_at,updated_at)
+               SELECT 'uncertain-resume',id,1,transcript_epoch,launch_config_json,capability_key,capability_identity_json,'delivery_unknown',0,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z' FROM sessions WHERE id='{session}'"),
+            "DELETE FROM resume_invocations WHERE id='uncertain-resume'".into(),
+        ),
+        (
+            "permission wait",
+            format!("INSERT INTO permission_requests(id,hook_invocation_nonce,connection_nonce,provider,project_id,task_id,attempt_id,session_id,role_generation_id,role,service_boot_id,native_session_id,cwd,policy_fingerprint,tool_name,input_digest,input_json,created_at,deadline_at,state,updated_at)
+               VALUES('ordinary-permission','hook','connection','codex','{}','{}','{attempt}','{session}','{}','manager','boot','{native}','.','policy','shell','digest','{{}}','2026-01-01T00:00:00Z','9999-01-01T00:00:00Z','pending','2026-01-01T00:00:00Z')", manager.project_id, manager.task_id, manager.role_generation_id),
+            "DELETE FROM permission_requests WHERE id='ordinary-permission'".into(),
+        ),
+        (
+            "uncertain guidance delivery",
+            format!("INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at) VALUES('uncertain-guidance','{attempt}','{}','body','delivery_unknown','2026-01-01T00:00:00Z')", manager.role_generation_id),
+            "DELETE FROM guidance_messages WHERE id='uncertain-guidance'".into(),
+        ),
+        (
+            "pending control",
+            format!("INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at) VALUES('ordinary-control','{attempt}','pause_now','requested',1,'{{}}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')"),
+            "DELETE FROM controls WHERE id='ordinary-control'".into(),
+        ),
+        (
+            "restart hold",
+            format!("INSERT INTO restart_candidates(session_id,attempt_id,task_id,source,state,reason,result_json,created_at,updated_at) VALUES('{session}','{attempt}','{}','planned_shutdown','queued_capacity','fixture','{{}}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", manager.task_id),
+            format!("DELETE FROM restart_candidates WHERE session_id='{session}'"),
+        ),
+        (
+            "open recovery",
+            format!("INSERT INTO recovery_records(id,attempt_id,state,detail_json,created_at,updated_at) VALUES('ordinary-recovery','{attempt}','attention_required','{{}}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')"),
+            "DELETE FROM recovery_records WHERE id='ordinary-recovery'".into(),
+        ),
+        (
+            "keyboard control",
+            format!("INSERT INTO input_leases(session_id,lease_id_hash,owner_kind,owner_id,role_generation_id,process_identity_json,expires_at,created_at,updated_at) VALUES('{session}','ordinary-lease','human','viewer','{}','{{}}','9999-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", manager.role_generation_id),
+            "DELETE FROM input_leases WHERE lease_id_hash='ordinary-lease'".into(),
+        ),
+        (
+            "pending switch",
+            format!("INSERT INTO switch_intents(id,attempt_id,role,old_generation_id,requested_settings_revision,handoff_json,state,created_at,updated_at) VALUES('ordinary-switch','{attempt}','manager','{}',2,'{{}}','stopping_old','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", manager.role_generation_id),
+            "DELETE FROM switch_intents WHERE id='ordinary-switch'".into(),
+        ),
+        (
+            "capture in progress",
+            format!("INSERT INTO freeze_intents(id,attempt_id,kind,state,created_at,updated_at) VALUES('ordinary-freeze','{attempt}','plan','capturing','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')"),
+            "DELETE FROM freeze_intents WHERE id='ordinary-freeze'".into(),
+        ),
+        (
+            "running check",
+            format!("INSERT INTO check_runs(id,attempt_id,candidate_hash,executable,arguments_json,cwd,status,evidence_json,created_at) VALUES('ordinary-check','{attempt}','candidate','/usr/bin/true','[]','/tmp','running','{{}}','2026-01-01T00:00:00Z')"),
+            "DELETE FROM check_runs WHERE id='ordinary-check'".into(),
+        ),
+        (
+            "second live manager",
+            format!("INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at) VALUES('other-manager','{attempt}','manager','codex',9,1,'running','f','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')"),
+            "DELETE FROM role_generations WHERE id='other-manager'".into(),
+        ),
+    ];
+    for (name, apply, revert) in &conflicts {
+        fixture.execute_batch(apply);
+        assert!(!eligible(), "{name} did not refuse");
+        assert_eq!(readiness(), "busy_unresolved_hook_work", "{name}");
+        fixture.execute_batch(revert);
+    }
+    // A stale transcript epoch between selection and claim refuses.
+    let epoch = manager.transcript_epoch.clone();
+    assert!(!app
+        .synthetic_codex_stop_idle_interleaving_for_tests(|| {
+            fixture.execute(
+                "UPDATE sessions SET transcript_epoch='stale-epoch' WHERE id=?1",
+                params![session],
+            );
+        })
+        .unwrap());
+    fixture.execute(
+        "UPDATE sessions SET transcript_epoch=?1 WHERE id=?2",
+        params![epoch, session],
+    );
+    // So does a phase or plan change between selection and claim.
+    let phase: String = fixture.scalar(&format!("SELECT phase FROM attempts WHERE id='{attempt}'"));
+    assert!(!app
+        .synthetic_codex_stop_idle_interleaving_for_tests(|| {
+            fixture.execute(
+                "UPDATE attempts SET plan_hash='changed-plan' WHERE id=?1",
+                params![attempt],
+            );
+        })
+        .unwrap());
+    fixture.execute(
+        "UPDATE attempts SET plan_hash=NULL,phase=?1 WHERE id=?2",
+        params![phase, attempt],
+    );
+    // Two completion hooks for one tool are not a one-to-one completion.
+    record_manager_hook(&fixture, &manager, native, "PostToolUse");
+    record_manager_hook(&fixture, &manager, native, "PostToolUse");
+    assert!(!eligible(), "a duplicated late completion was accepted");
+    fixture.execute(
+        "DELETE FROM hook_events WHERE rowid=(SELECT MAX(rowid) FROM hook_events WHERE session_id=?1)",
+        params![session],
+    );
+    // One late completion hook after the Stop is bookkeeping, not new work.
+    assert_eq!(readiness(), "busy");
+    let reconciled = app.coordinator_tick().unwrap();
+    assert_eq!(
+        reconciled["action"], "codex_stop_idle_reconciled",
+        "{reconciled}"
+    );
+    assert_eq!(reconciled["scope"], "ordinary_manager");
+    assert_eq!(
+        reconciled["accepted_result_id"],
+        fixture.scalar::<String>("SELECT id FROM role_results WHERE operation_id='turn-question'")
+    );
+    assert_eq!(readiness(), "idle_candidate");
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='provider.codex_stop_idle.reconciled'
+           AND json_extract(detail_json,'$.phase') IS NOT NULL
+           AND json_extract(detail_json,'$.task_version') IS NOT NULL",
+        1,
+    );
+    // Repeated ticks and duplicate hooks do not reconcile again.
+    assert_ne!(
+        app.coordinator_tick().unwrap()["action"],
+        "codex_stop_idle_reconciled"
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='provider.codex_stop_idle.reconciled'",
+        1,
+    );
+    // New work after the Stop keeps the turn busy.
+    record_manager_hook(&fixture, &manager, native, "PreToolUse");
+    assert_eq!(readiness(), "busy");
+    assert!(!eligible());
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+#[test]
+fn a_second_candidate_after_an_implementer_question_is_frozen_exactly_once() {
+    let fixture = Fixture::new("implementer-second-candidate");
+    let mut paths = instance_paths(&fixture);
+    paths.role_socket = fixture.root.join("role.sock");
+    let (_, _, plan) = new_task(&fixture, "second-candidate", "second-candidate-task");
+    authorize_ordinary_implementation(&fixture, &plan);
+    let app = Application::new_with_synthetic_dispatch_for_tests(
+        paths.clone(),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+        test_hooks(&fixture),
+    )
+    .unwrap();
+    let mut implementer_session = None;
+    for _ in 0..4 {
+        let value = app.coordinator_tick().unwrap();
+        if value["action"] == "implementer_dispatched" {
+            implementer_session = value["session_id"].as_str().map(str::to_owned);
+            break;
+        }
+    }
+    let session = implementer_session.expect("the implementer is dispatched");
+    let implementer = app.synthetic_role_context_for_tests(&session).unwrap();
+    manager_report(
+        &fixture,
+        &implementer,
+        "implementer-question",
+        "needs_input",
+        serde_json::json!({}),
+    );
+    assert_eq!(app.coordinator_tick().unwrap()["action"], "held");
+    fixture.assert_scalar::<String>(
+        &format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id),
+        "needs_input".into(),
+    );
+    // Answered, the implementer reports its candidate twice (a replayed report).
+    manager_report(
+        &fixture,
+        &implementer,
+        "first-candidate",
+        "candidate_ready",
+        serde_json::json!({}),
+    );
+    manager_report(
+        &fixture,
+        &implementer,
+        "second-candidate",
+        "candidate_ready",
+        serde_json::json!({}),
+    );
+    let second: String =
+        fixture.scalar("SELECT id FROM role_results WHERE operation_id='second-candidate'");
+    let first: String =
+        fixture.scalar("SELECT id FROM role_results WHERE operation_id='first-candidate'");
+    // The older copy is retired as a duplicate of the eligible newest one, and
+    // the hold is released by that newest candidate.
+    let mut released = None;
+    for _ in 0..3 {
+        let value = app.coordinator_tick().unwrap();
+        if value["action"] == "hold_superseded" {
+            released = Some(value);
+            break;
+        }
+        assert_eq!(value["action"], "stale_reports_superseded", "{value}");
+    }
+    let released = released.expect("the answered hold is released");
+    assert_eq!(released["result_id"], second.as_str());
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT json_extract(detail_json,'$.kind') || ':' || json_extract(detail_json,'$.superseded_by')
+             FROM audit_events WHERE event_code='role_result.superseded' AND entity_id='{first}'"
+        ),
+        format!("duplicate:{second}"),
+    );
+    let mut frozen = 0;
+    let mut dispatched_again = 0;
+    let mut after_freeze = 0;
+    for _ in 0..10 {
+        let value = app.coordinator_tick().unwrap();
+        match value["action"].as_str().unwrap_or_default() {
+            "quiescing_completed_role" => {
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT status FROM sessions WHERE id='{session}'"),
+                    "interrupt_requested".into(),
+                );
+                fixture.execute(
+                    "UPDATE sessions SET status='exited',launch_state='finished',exit_json='{\"process_group_quiescent\":true,\"synthetic_fixture\":true}' WHERE id=?1",
+                    params![session],
+                );
+                fixture.execute(
+                    "UPDATE role_generations SET status='exited' WHERE id=?1",
+                    params![implementer.role_generation_id],
+                );
+            }
+            "candidate_frozen" => frozen += 1,
+            "implementer_dispatched" | "integration_implementer_dispatched" => {
+                dispatched_again += 1
+            }
+            "held" => panic!("the answered implementer question came back: {value}"),
+            _ => {}
+        }
+        if frozen > 0 {
+            after_freeze += 1;
+            if after_freeze > 4 {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        frozen, 1,
+        "the candidate reported during the hold was not frozen exactly once"
+    );
+    assert_eq!(
+        dispatched_again, 0,
+        "a second paid implementer call was started"
+    );
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT COUNT(*) FROM role_results WHERE id='{second}' AND consumed_at IS NOT NULL"
+        ),
+        1,
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM role_results WHERE outcome='candidate_ready' AND consumed_at IS NULL",
+        0,
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM snapshots WHERE kind='candidate'", 1);
+    // Exactly one candidate was selected: the other was retired as a duplicate.
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM role_results rr WHERE rr.outcome='candidate_ready' AND rr.consumed_at IS NOT NULL
+           AND NOT EXISTS(SELECT 1 FROM audit_events e WHERE e.event_code='role_result.superseded' AND e.entity_id=rr.id)",
+        1,
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM role_generations WHERE role='implementer'",
+        1,
+    );
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+#[test]
+fn only_the_newest_report_of_an_agent_can_hold_its_task() {
+    let fixture = Fixture::new("stale-reports");
+    seed_attempt(&fixture, "planning");
+    seed_session(
+        &fixture,
+        "a",
+        "manager",
+        "g-manager",
+        "s-manager",
+        "running",
+    );
+    seed_session(
+        &fixture,
+        "a",
+        "explorer",
+        "g-explorer",
+        "s-explorer",
+        "running",
+    );
+    make_effective(&fixture, "manager", "g-manager");
+    make_effective(&fixture, "explorer", "g-explorer");
+    let report = |id: &str, session: &str, generation: &str, outcome: &str| {
+        let metadata = if outcome == "plan_ready" {
+            format!(r#"{{"plan":"Plan {id}"}}"#)
+        } else {
+            "{}".to_owned()
+        };
+        fixture.execute(
+            "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+             VALUES(?1,?1,?2,?3,?4,'Report','[]',?5,'2026-01-01T00:00:06Z')",
+            params![id, session, generation, outcome, metadata],
+        );
+    };
+    let sweep =
+        || agenticjira::coordinator::supersede_stale_blocked_results(&fixture.store).unwrap();
+    let superseded_by = |id: &str| {
+        fixture.scalar::<String>(&format!(
+            "SELECT json_extract(detail_json,'$.superseded_by') FROM audit_events
+             WHERE event_code='role_result.superseded' AND entity_id='{id}'"
+        ))
+    };
+    // A plan the phase would not consume supersedes nothing.
+    report("question-1", "s-manager", "g-manager", "needs_input");
+    fixture.execute(
+        "UPDATE attempts SET phase='implementation' WHERE id='a'",
+        [],
+    );
+    report("early-plan", "s-manager", "g-manager", "plan_ready");
+    assert!(sweep().is_none(), "a wrong-phase plan retired a question");
+    fixture.execute("UPDATE attempts SET phase='planning' WHERE id='a'", []);
+    // Nor does a plan from a manager that is no longer the authority.
+    fixture.execute(
+        "UPDATE role_settings SET effective_generation_id=NULL WHERE role='manager'",
+        [],
+    );
+    assert!(sweep().is_none(), "replaced authority retired a question");
+    fixture.execute(
+        "UPDATE role_settings SET effective_generation_id='g-manager' WHERE role='manager'",
+        [],
+    );
+    // A second question replaces the first; the newest eligible plan answers
+    // the second and retires the older duplicate plan.
+    report("question-2", "s-manager", "g-manager", "needs_input");
+    report("plan", "s-manager", "g-manager", "plan_ready");
+    // Another agent's newest blocked report is still current.
+    report("explorer-blocked", "s-explorer", "g-explorer", "blocked");
+    let swept = sweep().expect("the answered questions are retired");
+    let mut retired = swept["result_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    retired.sort();
+    assert_eq!(retired, ["early-plan", "question-1", "question-2"]);
+    assert!(sweep().is_none(), "the sweep is exact-once");
+    assert_eq!(superseded_by("question-1"), "question-2");
+    assert_eq!(superseded_by("question-2"), "plan");
+    assert_eq!(superseded_by("early-plan"), "plan");
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM role_results WHERE consumed_at IS NULL",
+        2,
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='role_result.superseded'",
+        3,
+    );
+    // The projection still reports the explorer's current blocker as the next step.
+    let state = workflow::state(&fixture.store).unwrap();
+    assert!(state
+        .decisions
+        .iter()
+        .any(|decision| decision.reason_code == "workflow.blocked_result_available"));
+}
+
+#[test]
+fn restart_makes_in_flight_guidance_uncertain_and_keeps_the_rest() {
+    let fixture = Fixture::new("restart-guidance");
+    seed_attempt(&fixture, "planning");
+    seed_session(
+        &fixture,
+        "a",
+        "manager",
+        "g-manager",
+        "s-manager",
+        "running",
+    );
+    // The manager had started; the explorer's launch never began.
+    fixture.execute(
+        "UPDATE sessions SET launch_state='started' WHERE id='s-manager'",
+        [],
+    );
+    seed_session(
+        &fixture,
+        "a",
+        "explorer",
+        "g-explorer",
+        "s-explorer",
+        "running",
+    );
+    for (id, state) in [
+        ("queued", "queued"),
+        ("reserved", "delivery_reserved"),
+        ("written", "written_awaiting_submit"),
+        ("submitted", "submitted"),
+        ("acknowledged", "acknowledged"),
+        ("earlier-unknown", "delivery_unknown"),
+    ] {
+        fixture.execute(
+            "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at,delivery_session_id,delivery_transcript_epoch)
+             VALUES(?1,'a','g-manager',?1,?2,'2026-01-01T00:00:00Z','s-manager','e')",
+            params![id, state],
+        );
+    }
+    let results = recovery::reconcile_prior_boot(&fixture.store).unwrap();
+    let state = |id: &str| {
+        fixture.scalar::<String>(&format!(
+            "SELECT state FROM guidance_messages WHERE id='{id}'"
+        ))
+    };
+    assert_eq!(state("queued"), "queued");
+    assert_eq!(state("reserved"), "delivery_unknown");
+    assert_eq!(state("written"), "delivery_unknown");
+    assert_eq!(state("submitted"), "submitted");
+    assert_eq!(state("acknowledged"), "acknowledged");
+    let uncertain = results
+        .iter()
+        .filter(|value| value.get("guidance_id").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(uncertain.len(), 2);
+    assert!(uncertain.iter().all(|value| value["replayable"] == false));
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='guidance.delivery.unknown_after_restart'",
+        2,
+    );
+    // A launch that never began is proven nondelivery and may be replaced; a
+    // started session whose process ownership is unknown is not treated as
+    // live or idle: it needs recovery and nothing is delivered to it.
+    let session_result = |id: &str| {
+        results
+            .iter()
+            .find(|value| value["session_id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no startup result for {id}: {results:?}"))
+    };
+    assert_eq!(session_result("s-explorer")["state"], "proven_nondelivery");
+    assert_eq!(session_result("s-explorer")["replacement_allowed"], true);
+    assert_eq!(session_result("s-manager")["replacement_allowed"], false);
+    fixture.assert_scalar::<String>(
+        "SELECT status FROM sessions WHERE id='s-manager'",
+        "recovery_required".into(),
+    );
+    fixture.assert_scalar::<String>("SELECT attention FROM tasks", "needs_recovery".into());
+    // A second startup is a no-op for guidance.
+    let again = recovery::reconcile_prior_boot(&fixture.store).unwrap();
+    assert!(again.iter().all(|value| value.get("guidance_id").is_none()));
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='guidance.delivery.unknown_after_restart'",
+        2,
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM guidance_messages WHERE state='delivery_reserved' OR state='written_awaiting_submit'",
+        0,
+    );
+    // Every row made uncertain at startup has exactly one audit record, and no
+    // audit exists without its transition; earlier uncertainty is untouched.
+    assert_eq!(state("earlier-unknown"), "delivery_unknown");
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM guidance_messages g WHERE g.reason='service restarted before delivery was confirmed'
+           AND (SELECT COUNT(*) FROM audit_events e WHERE e.event_code='guidance.delivery.unknown_after_restart'
+                AND e.entity_id=g.id)=1",
+        2,
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events e WHERE e.event_code='guidance.delivery.unknown_after_restart'
+           AND NOT EXISTS(SELECT 1 FROM guidance_messages g WHERE g.id=e.entity_id
+             AND g.state='delivery_unknown' AND g.reason='service restarted before delivery was confirmed')",
+        0,
+    );
+}
+
+#[test]
+fn a_reviewer_settings_change_binds_the_next_review_and_keeps_the_invalid_one_spent() {
+    let fixture = Fixture::new("reviewer-boundary-integration");
+    let (_, task, plan) = new_task(&fixture, "reviewer-boundary", "reviewer-boundary-task");
+    fixture.execute(
+        "UPDATE attempts SET phase='code_review',candidate_hash='candidate' WHERE id=?1",
+        params![plan.attempt_id],
+    );
+    seed_session(
+        &fixture,
+        &plan.attempt_id,
+        "code_reviewer",
+        "old",
+        "old-session",
+        "exited",
+    );
+    fixture.execute(
+        "UPDATE role_generations SET status='exited' WHERE id='old'",
+        [],
+    );
+    // The earlier review went to the replaced settings. It stays spent and
+    // non-approving; nothing below may revive, refund or reuse it.
+    fixture.execute(
+        "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,session_id,settings_revision,prompt_hash,handoff_hash,delivery_state,verdict,budget_spent_at,created_at,updated_at)
+         VALUES('invalid-review',?1,'code','candidate','old','old-session',1,'prompt','handoff','finished','needs_rework','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![plan.attempt_id],
+    );
+    fixture.execute(
+        "UPDATE review_budgets SET spent=1 WHERE attempt_id=?1 AND review_kind='code'",
+        params![plan.attempt_id],
+    );
+    let replacement = RoleOverride {
+        provider: Provider::Codex,
+        model: "replacement-model".into(),
+        effort: "high".into(),
+    };
+    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::SetRoleSettings {
+            operation_id: "reviewer-settings-2".into(),
+            task_id: task.clone(),
+            role: RoleKind::CodeReviewer,
+            expected_version: version,
+            config: replacement.clone(),
+        },
+    )
+    .unwrap();
+    seed_supported_capabilities_for_config(&fixture, &replacement);
+    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    agenticjira::trip::activate_task_profile(
+        &fixture.store,
+        &capability_runtime(&fixture),
+        "activate-reviewer-2",
+        &task,
+        RoleKind::CodeReviewer,
+        2,
+        version,
+    )
+    .unwrap();
+    let bound = || {
+        fixture.scalar::<i64>(&format!(
+            "SELECT settings_revision FROM trip_attempt_profiles WHERE attempt_id='{}' AND role='code_reviewer'",
+            plan.attempt_id
+        ))
+    };
+    // Activation alone does not touch an attempt whose reviewer already ran.
+    assert_eq!(bound(), 1);
+    let reviews = ReviewService::new(fixture.store.clone(), fixture.root.join("artifacts"));
+    let request = reviews
+        .reserve_request(
+            &plan.attempt_id,
+            "code",
+            "Review the candidate",
+            serde_json::json!({"attempt_id":plan.attempt_id}),
+        )
+        .unwrap();
+    assert_eq!(request.state, "reserved");
+    assert_eq!(bound(), 2);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='task.profile.materialized_at_safe_boundary'
+           AND json_extract(detail_json,'$.from_settings_revision')=1
+           AND json_extract(detail_json,'$.to_settings_revision')=2
+           AND json_extract(detail_json,'$.candidate_hash')='candidate'
+           AND json_extract(detail_json,'$.phase')='code_review'
+           AND json_extract(detail_json,'$.task_version')=(SELECT version FROM tasks)",
+        1,
+    );
+    // The ready workspace policy records the new reviewer settings.
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT json_extract(profile.value,'$.settings_revision') FROM workspaces w,
+               json_each(json_extract(w.policy_json,'$.task_profiles')) profile
+             WHERE w.attempt_id='{}' AND w.state='ready' AND json_extract(profile.value,'$.role')='code_reviewer'",
+            plan.attempt_id
+        ),
+        2,
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT delivery_state || ':' || verdict FROM review_requests WHERE id='invalid-review'",
+        "finished:needs_rework".into(),
+    );
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT spent FROM review_budgets WHERE attempt_id='{}' AND review_kind='code'",
+            plan.attempt_id
+        ),
+        1,
+    );
+    seed_session(
+        &fixture,
+        &plan.attempt_id,
+        "code_reviewer",
+        "next",
+        "next-session",
+        "running",
+    );
+    assert!(reviews
+        .bind_launch_intent(&request.request_id, "next-session", "next", 1)
+        .is_err());
+    reviews
+        .bind_launch_intent(&request.request_id, "next-session", "next", 2)
+        .unwrap();
+    // Once that reviewer is live, another change waits for it to finish.
+    assert!(reviews
+        .reserve_request(
+            &plan.attempt_id,
+            "code",
+            "Review the candidate",
+            serde_json::json!({"attempt_id":plan.attempt_id}),
+        )
+        .map(|dispatch| dispatch.request_id == request.request_id)
+        .unwrap_or(true));
+}
+
+#[test]
+fn progress_counts_workflow_evidence_and_never_mere_agent_activity() {
+    let fixture = Fixture::new("task-progress");
+    seed_attempt(&fixture, "planning");
+    seed_session(
+        &fixture,
+        "a",
+        "manager",
+        "g-manager",
+        "s-manager",
+        "running",
+    );
+    seed_session(&fixture, "a", "manager", "g-old", "s-old", "exited");
+    make_effective(&fixture, "manager", "g-manager");
+    let progress = || {
+        workflow::state(&fixture.store)
+            .unwrap()
+            .tasks
+            .into_iter()
+            .find(|task| task.id == "t")
+            .unwrap()
+            .progress
+            .expect("an unfinished task reports its progress")
+    };
+    let hook = |at: &str| {
+        fixture.execute(
+            "INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,payload_json,peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+             VALUES(?1,'s-manager','g-manager','codex','PreToolUse','native','{}',42,42,'peer','managed_process_group_untrusted_payload',?2)",
+            params![uuid::Uuid::new_v4().to_string(), at],
+        );
+    };
+    // A live agent with no hooks is reported as running with no newer step,
+    // not as proven idle; no evidence exists yet.
+    let start = progress();
+    assert_eq!(start.activity, "agent_live_idle");
+    assert_eq!(start.last_meaningful_at, None);
+    assert!(!start.reason_code.is_empty() && !start.waiting_reason.is_empty());
+    // A new hook alone is activity without progress.
+    hook("2026-01-01T00:01:00Z");
+    let active = progress();
+    assert_eq!(active.activity, "agent_active_without_progress");
+    assert_eq!(active.last_meaningful_at, None);
+    assert_eq!(
+        active.last_agent_activity_at.as_deref(),
+        Some("2026-01-01T00:01:00Z")
+    );
+    // Each kind of authoritative evidence moves the last meaningful step.
+    let steps: Vec<(&str, &str)> = vec![
+        ("report_plan_ready",
+         "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+          VALUES('plan','plan','s-manager','g-manager','plan_ready','Plan','[]','{\"plan\":\"Plan\"}','2026-01-01T00:02:00Z')"),
+        ("permission_approved",
+         "INSERT INTO permission_requests(id,hook_invocation_nonce,connection_nonce,provider,project_id,task_id,attempt_id,session_id,role_generation_id,role,service_boot_id,native_session_id,cwd,policy_fingerprint,tool_name,input_digest,input_json,created_at,deadline_at,state,updated_at)
+          VALUES('permission','h','c','codex','p','t','a','s-manager','g-manager','manager','boot','native','.','policy','shell','digest','{}','2026-01-01T00:02:30Z','9999-01-01T00:00:00Z','approved','2026-01-01T00:03:00Z')"),
+        ("guidance_submitted",
+         "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at,submitted_at)
+          VALUES('answer','a','g-manager','Answer','submitted','2026-01-01T00:03:30Z','2026-01-01T00:04:00Z')"),
+        ("provider.codex_stop_idle.reconciled",
+         "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+          VALUES('boundary','boundary','service','provider.codex_stop_idle.reconciled','session','s-manager','{}','2026-01-01T00:05:00Z')"),
+        ("attempt.phase.changed",
+         "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+          VALUES('phase','phase','service','attempt.phase.changed','attempt','a','{\"phase\":\"plan_review\"}','2026-01-01T00:06:00Z')"),
+        ("recovery_resolved_quiescent",
+         "INSERT INTO recovery_records(id,attempt_id,session_id,state,detail_json,created_at,updated_at)
+          VALUES('restart','a','s-manager','resolved_quiescent','{}','2026-01-01T00:06:30Z','2026-01-01T00:07:00Z')"),
+        ("review_finished",
+         "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,prompt_hash,handoff_hash,delivery_state,verdict,created_at,updated_at)
+          VALUES('finished-review','a','plan','plan','p','h','finished','approved','2026-01-01T00:07:30Z','2026-01-01T00:08:00Z')"),
+    ];
+    for (event, sql) in &steps {
+        fixture.execute_batch(sql);
+        let current = progress();
+        assert_eq!(
+            current.last_meaningful_event.as_deref(),
+            Some(*event),
+            "{sql}"
+        );
+        assert_eq!(
+            current.activity, "agent_live_idle",
+            "{event} is newer than the last hook"
+        );
+    }
+    let settled = progress().last_meaningful_at;
+    // Bookkeeping, a stale report and a generic attempt rewrite never count.
+    fixture.execute_batch(
+        "UPDATE attempts SET updated_at='2026-01-01T00:09:00Z' WHERE id='a';
+         INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,prompt_hash,handoff_hash,delivery_state,created_at,updated_at)
+           VALUES('delivered-review','a','plan','plan','p','h','delivered','2026-01-01T00:09:10Z','2026-01-01T00:09:20Z');
+         INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+           VALUES('stale','stale','s-manager','g-manager','needs_input','Stale','[]','{}','2026-01-01T00:09:30Z');
+         INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+           VALUES('retired','retired','service','role_result.superseded','role_result','stale','{}','2026-01-01T00:09:31Z');",
+    );
+    assert_eq!(progress().last_meaningful_at, settled);
+    // A report the current phase would not consume is not progress: a plan
+    // from the current manager while the attempt is implementing, and a plan
+    // from a manager that is no longer the authority.
+    fixture.execute_batch(
+        "UPDATE attempts SET phase='implementation' WHERE id='a';
+         INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+           VALUES('wrong-phase','wrong-phase','s-manager','g-manager','plan_ready','Plan','[]','{\"plan\":\"Late plan\"}','2026-01-01T00:09:40Z');",
+    );
+    let wrong_phase = progress();
+    assert_eq!(
+        wrong_phase.last_meaningful_at, settled,
+        "a wrong-phase plan counted"
+    );
+    assert_eq!(
+        wrong_phase.last_meaningful_event.as_deref(),
+        Some("review_finished")
+    );
+    fixture.execute_batch(
+        "DELETE FROM role_results WHERE id='wrong-phase';
+         UPDATE attempts SET phase='planning' WHERE id='a';
+         INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+           VALUES('replaced','replaced','s-old','g-old','plan_ready','Plan','[]','{\"plan\":\"Old plan\"}','2026-01-01T00:09:45Z');",
+    );
+    let replaced = progress();
+    assert_eq!(
+        replaced.last_meaningful_at, settled,
+        "a replaced manager's plan counted"
+    );
+    assert_eq!(
+        replaced.last_meaningful_event.as_deref(),
+        Some("review_finished")
+    );
+    // The eligible plan from the current manager counts before it is consumed,
+    // and an accepted report keeps counting once consumed.
+    fixture.execute(
+        "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+         VALUES('eligible','eligible','s-manager','g-manager','plan_ready','Plan','[]','{\"plan\":\"Current plan\"}','2026-01-01T00:09:50Z')",
+        [],
+    );
+    let eligible = progress();
+    assert_eq!(
+        eligible.last_meaningful_at.as_deref(),
+        Some("2026-01-01T00:09:50Z")
+    );
+    assert_eq!(
+        eligible.last_meaningful_event.as_deref(),
+        Some("report_plan_ready")
+    );
+    fixture.execute_batch(
+        "UPDATE role_results SET consumed_at='2026-01-01T00:09:55Z' WHERE id IN ('eligible','replaced');
+         INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+           VALUES('retired-replaced','retired-replaced','service','role_result.superseded','role_result','replaced','{}','2026-01-01T00:09:55Z');",
+    );
+    let consumed = progress();
+    assert_eq!(
+        consumed.last_meaningful_at.as_deref(),
+        Some("2026-01-01T00:09:50Z")
+    );
+    assert_eq!(
+        consumed.last_meaningful_event.as_deref(),
+        Some("report_plan_ready")
+    );
+    // The wait age is anchored to the hold itself and stays put when other,
+    // unrelated evidence arrives later.
+    fixture.execute_batch(
+        "DELETE FROM review_requests WHERE id='delivered-review';
+         UPDATE tasks SET attention='needs_input' WHERE id='t';
+         UPDATE attempts SET status='needs_input',updated_at='2026-01-01T00:10:00Z' WHERE id='a';
+         INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+           VALUES('hold','hold','service','attempt.attention.changed','attempt','a',
+                  '{\"attention\":\"needs_input\",\"reason\":\"role_needs_input\",\"message\":\"m\"}','2026-01-01T00:10:00Z');",
+    );
+    let held = progress();
+    assert_eq!(held.waiting_since.as_deref(), Some("2026-01-01T00:10:00Z"));
+    fixture.execute(
+        "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at,submitted_at)
+         VALUES('later','a','g-manager','Later','submitted','2026-01-01T00:11:00Z','2026-01-01T00:12:00Z')",
+        [],
+    );
+    let later = progress();
+    assert_eq!(
+        later.last_meaningful_event.as_deref(),
+        Some("guidance_submitted")
+    );
+    assert_eq!(
+        later.waiting_since.as_deref(),
+        Some("2026-01-01T00:10:00Z"),
+        "unrelated evidence reset the wait age"
+    );
+    // The next step is only ever a user-facing label.
+    if let Some(next) = &later.next_operation {
+        assert!(!next.contains('_'), "raw operation shown: {next}");
+    }
+    // After the agent exits nothing is live, and a finished task has no progress.
+    fixture.execute(
+        "UPDATE sessions SET status='exited',exit_json='{\"process_group_quiescent\":true}' WHERE id='s-manager'",
+        [],
+    );
+    fixture.execute(
+        "UPDATE role_generations SET status='exited' WHERE id='g-manager'",
+        [],
+    );
+    assert_eq!(progress().activity, "no_live_agent");
+    fixture.execute("UPDATE tasks SET lifecycle='done' WHERE id='t'", []);
+    assert!(workflow::state(&fixture.store)
+        .unwrap()
+        .tasks
+        .into_iter()
+        .find(|task| task.id == "t")
+        .unwrap()
+        .progress
+        .is_none());
+}
+
+const GUIDANCE_CONFIG_REVISION: &str = "synthetic-seeded-config";
+
+/// A ready implementation attempt with an idle retained implementer. Its
+/// workspace pins README.md and docs/GUIDE.md (guidance the approved plan owns
+/// and documents), docs/UNOWNED.md (documented, not owned),
+/// docs/UNDOCUMENTED.md (owned, not documented) and a workflow configuration
+/// file. Built from baseline helpers only.
+fn guidance_fixture(name: &str) -> (Fixture, PathBuf) {
+    // The owned-paths plan shape: owned paths plus documentation keyed by path.
+    let plan = serde_json::json!({
+        "ownership":{"flow":"single writer","owned_paths":[
+            "README.md","docs/GUIDE.md","docs/UNDOCUMENTED.md","src/lib.rs"]},
+        "documentation":{"README.md":"Describe the change.","docs/GUIDE.md":"Explain it.",
+            "docs/UNOWNED.md":"Mentioned but not owned."},
+    });
+    guidance_fixture_with(
+        name,
+        &[
+            ("README.md", "# Project\n"),
+            ("docs/GUIDE.md", "Guide\n"),
+            ("docs/UNOWNED.md", "Unowned\n"),
+            ("docs/UNDOCUMENTED.md", "Undocumented\n"),
+            (".agents/trip-explorer/config.json", "{}\n"),
+        ],
+        &[
+            "README.md",
+            "docs/GUIDE.md",
+            "docs/UNOWNED.md",
+            "docs/UNDOCUMENTED.md",
+        ],
+        plan,
+    )
+}
+
+/// The same ready attempt with the given pinned files, configured guidance
+/// paths and approved structured plan.
+fn guidance_fixture_with(
+    name: &str,
+    pinned: &[(&str, &str)],
+    guidance: &[&str],
+    plan: serde_json::Value,
+) -> (Fixture, PathBuf) {
+    let fixture = Fixture::new(name);
+    seed_attempt(&fixture, "implementation");
+    seed_session(
+        &fixture,
+        "a",
+        "implementer",
+        "g-writer",
+        "s-writer",
+        "running",
+    );
+    fixture.execute(
+        "UPDATE sessions SET readiness_state='idle_candidate' WHERE id='s-writer'",
+        [],
+    );
+    let workspace = fixture.root.join("guidance-workspace");
+    let mut files = serde_json::Map::new();
+    for (relative, text) in pinned {
+        let path = workspace.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+        files.insert((*relative).into(), sha256(text.as_bytes()).into());
+    }
+    let profiles = [
+        "manager",
+        "explorer",
+        "plan_reviewer",
+        "implementer",
+        "code_reviewer",
+        "final_verifier",
+    ]
+    .map(|role| {
+        serde_json::json!({
+            "role":role,"settings_revision":1,"profile":{},"source":"project_default",
+            "profile_hash":"h","project_config_revision_id":GUIDANCE_CONFIG_REVISION,
+            "project_configuration_hash":"h","adapter":"a","adapter_hash":"h",
+            "capability_id":"c","capability_key":"k","capability_proof_hash":"p",
+        })
+    });
+    let policy = serde_json::json!({
+        "kind":"activated_project","workflow_id":agenticjira::trip::WORKFLOW_ID,
+        "upstream_source_hash":agenticjira::trip::source_hash(),
+        "overlay_hash":agenticjira::trip::overlay_hash(),
+        "manifest_hash":sha256(b"manifest"),"files":files,"task_profiles":profiles,
+        "base_project_configuration_distinct":true,
+    });
+    fixture.execute(
+        "UPDATE trip_config_revisions SET config_json=json_set(config_json,'$.guidance',json(?1))
+         WHERE id=?2",
+        params![
+            serde_json::to_string(guidance).unwrap(),
+            GUIDANCE_CONFIG_REVISION
+        ],
+    );
+    fixture.execute(
+        "INSERT INTO trip_structured_plans(id,attempt_id,plan_hash,plan_json,workflow_id,profile_revision_id,criteria_hash,verification_hash,ownership_hash,conformance_hash,approved_at,implementation_authorized_at,created_at)
+         VALUES('plan','a','plan-hash',?1,?2,?3,'c','v','o','f','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![
+            plan.to_string(),
+            agenticjira::trip::WORKFLOW_ID,
+            GUIDANCE_CONFIG_REVISION
+        ],
+    );
+    fixture.execute(
+        "UPDATE attempts SET structured_plan_id='plan',plan_hash='plan-hash',
+           plan_approved_at='2026-01-01T00:00:00Z' WHERE id='a'",
+        [],
+    );
+    fixture.execute(
+        "INSERT INTO workspaces(id,attempt_id,repository_identity,path,base_revision,worktree_head,policy_json,state,created_at,updated_at)
+         VALUES('w','a','/tmp/identity',?1,'base','base',?2,'ready','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![workspace.to_string_lossy(), policy.to_string()],
+    );
+    (fixture, workspace)
+}
+
+fn guidance_policy(fixture: &Fixture) -> String {
+    fixture.scalar("SELECT policy_json FROM workspaces WHERE id='w'")
+}
+
+fn guidance_pin(fixture: &Fixture, path: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(&guidance_policy(fixture)).unwrap()["files"][path]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn guidance_ready(fixture: &Fixture) -> Result<(), String> {
+    agenticjira::trip::require_attempt_ready(&fixture.connection(), "a", None)
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Applies the manual command through the ordinary human-command machinery.
+fn reauthorize_guidance(
+    fixture: &Fixture,
+    operation: &str,
+    expected_version: i64,
+    plan_hash: &str,
+    config_revision: &str,
+    policy_hash: &str,
+    files: &[(&str, &str, &str)],
+) -> Result<OperationResult, String> {
+    let command: HumanCommand = serde_json::from_value(serde_json::json!({
+        "kind":"reauthorize_attempt_guidance","operation_id":operation,
+        "task_id":"t","attempt_id":"a","expected_version":expected_version,
+        "plan_hash":plan_hash,"config_revision_id":config_revision,"policy_hash":policy_hash,
+        "files":files.iter().map(|(path, previous, new)| serde_json::json!({
+            "path":path,"previous_sha256":previous,"sha256":new,
+        })).collect::<Vec<_>>(),
+    }))
+    .unwrap();
+    workflow::execute(&fixture.store, &command).map_err(|error| format!("{error:#}"))
+}
+
+#[test]
+fn guidance_reauthorization_refuses_stale_bindings_unapproved_paths_and_symlinks() {
+    let (fixture, workspace) = guidance_fixture("guidance-refusals");
+    let write = |relative: &str, text: &str| {
+        let path = workspace.join(relative);
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(path, text).unwrap();
+        sha256(text.as_bytes())
+    };
+    guidance_ready(&fixture).unwrap();
+    let readme_v1 = guidance_pin(&fixture, "README.md");
+    let readme_v2 = write("README.md", "# Project\n\nApproved change.\n");
+    // The approved edit reproduces the readiness blocker.
+    assert!(guidance_ready(&fixture)
+        .unwrap_err()
+        .contains("policy file changed after verified materialization: README.md"));
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let policy = guidance_policy(&fixture);
+    let hash = sha256(policy.as_bytes());
+    let readme = ("README.md", readme_v1.as_str(), readme_v2.as_str());
+    let refuse = |name: &str, outcome: Result<OperationResult, String>, expected: &str| {
+        let error = outcome
+            .err()
+            .unwrap_or_else(|| panic!("{name} was accepted"));
+        assert!(error.contains(expected), "{name}: {error}");
+    };
+    let other = sha256(b"other");
+    refuse(
+        "stale version",
+        reauthorize_guidance(
+            &fixture,
+            "r1",
+            version - 1,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[readme],
+        ),
+        "task version is stale",
+    );
+    refuse(
+        "wrong plan",
+        reauthorize_guidance(
+            &fixture,
+            "r2",
+            version,
+            "other-plan",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[readme],
+        ),
+        "approved plan does not match",
+    );
+    refuse(
+        "wrong configuration",
+        reauthorize_guidance(
+            &fixture,
+            "r3",
+            version,
+            "plan-hash",
+            "other-config",
+            &hash,
+            &[readme],
+        ),
+        "not the project's active one",
+    );
+    refuse(
+        "wrong policy",
+        reauthorize_guidance(
+            &fixture,
+            "r4",
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &other,
+            &[readme],
+        ),
+        "workspace policy changed",
+    );
+    refuse(
+        "wrong previous hash",
+        reauthorize_guidance(
+            &fixture,
+            "r5",
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[("README.md", &other, &readme_v2)],
+        ),
+        "not pinned at the given previous hash",
+    );
+    refuse(
+        "content differs",
+        reauthorize_guidance(
+            &fixture,
+            "r6",
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[("README.md", &readme_v1, &other)],
+        ),
+        "does not have the approved new content",
+    );
+    refuse(
+        "empty",
+        reauthorize_guidance(
+            &fixture,
+            "r7",
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[],
+        ),
+        "between 1 and 32 files",
+    );
+    refuse(
+        "duplicate",
+        reauthorize_guidance(
+            &fixture,
+            "r8",
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[readme, readme],
+        ),
+        "listed more than once",
+    );
+    refuse(
+        "no-op",
+        reauthorize_guidance(
+            &fixture,
+            "r9",
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[("README.md", &readme_v1, &readme_v1)],
+        ),
+        "is unchanged",
+    );
+    refuse(
+        "escaping path",
+        reauthorize_guidance(
+            &fixture,
+            "r10",
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[("../README.md", &readme_v1, &readme_v2)],
+        ),
+        "normalized contained relative path",
+    );
+    // Workflow configuration is never guidance.
+    let config_v1 = guidance_pin(&fixture, ".agents/trip-explorer/config.json");
+    let config_v2 = write(".agents/trip-explorer/config.json", "{\"changed\":true}\n");
+    refuse(
+        "configuration file",
+        reauthorize_guidance(
+            &fixture,
+            "r11",
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[(".agents/trip-explorer/config.json", &config_v1, &config_v2)],
+        ),
+        "protected workflow artifact",
+    );
+    // Another drifted pinned file keeps the attempt held.
+    refuse(
+        "drifted configuration",
+        reauthorize_guidance(
+            &fixture,
+            "r12",
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[readme],
+        ),
+        ".agents/trip-explorer/config.json",
+    );
+    write(".agents/trip-explorer/config.json", "{}\n");
+    // Guidance the plan documents but does not own, or owns but does not document.
+    for path in ["docs/UNOWNED.md", "docs/UNDOCUMENTED.md"] {
+        let pinned = guidance_pin(&fixture, path);
+        let changed = write(path, "Changed\n");
+        refuse(
+            path,
+            reauthorize_guidance(
+                &fixture,
+                "r13",
+                version,
+                "plan-hash",
+                GUIDANCE_CONFIG_REVISION,
+                &hash,
+                &[(path, &pinned, &changed)],
+            ),
+            "does not explicitly own",
+        );
+        write(
+            path,
+            if path.ends_with("UNOWNED.md") {
+                "Unowned\n"
+            } else {
+                "Undocumented\n"
+            },
+        );
+    }
+    // An incomplete list: another approved guidance file changed too.
+    let guide_v1 = guidance_pin(&fixture, "docs/GUIDE.md");
+    write("docs/GUIDE.md", "Guide changed\n");
+    refuse(
+        "incomplete list",
+        reauthorize_guidance(
+            &fixture,
+            "r14",
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[readme],
+        ),
+        "docs/GUIDE.md",
+    );
+    write("docs/GUIDE.md", "Guide\n");
+    // A symlinked file, even to identical approved bytes, is refused.
+    let outside = fixture.root.join("outside-readme.md");
+    std::fs::write(&outside, "# Project\n\nApproved change.\n").unwrap();
+    std::fs::remove_file(workspace.join("README.md")).unwrap();
+    std::os::unix::fs::symlink(&outside, workspace.join("README.md")).unwrap();
+    let error = reauthorize_guidance(
+        &fixture,
+        "r15",
+        version,
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        &hash,
+        &[readme],
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("symlink") || error.contains("not a regular file"),
+        "symlinked file: {error}"
+    );
+    write("README.md", "# Project\n\nApproved change.\n");
+    // A symlinked directory component is refused.
+    std::fs::rename(workspace.join("docs"), workspace.join("docs-real")).unwrap();
+    std::os::unix::fs::symlink(workspace.join("docs-real"), workspace.join("docs")).unwrap();
+    let guide_v2 = sha256(b"Guide linked\n");
+    std::fs::write(workspace.join("docs-real/GUIDE.md"), "Guide linked\n").unwrap();
+    refuse(
+        "symlinked directory",
+        reauthorize_guidance(
+            &fixture,
+            "r16",
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[readme, ("docs/GUIDE.md", &guide_v1, &guide_v2)],
+        ),
+        "symlink",
+    );
+    // Nothing changed through any refusal.
+    assert_eq!(guidance_policy(&fixture), policy);
+    fixture.assert_scalar::<i64>("SELECT version FROM tasks WHERE id='t'", version);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.guidance.reauthorized'",
+        0,
+    );
+}
+
+#[test]
+fn guidance_reauthorization_waits_for_a_settled_attempt() {
+    let (fixture, workspace) = guidance_fixture("guidance-boundary");
+    // A running manager is not a writer; its own transitions still block.
+    seed_session(
+        &fixture,
+        "a",
+        "manager",
+        "g-manager",
+        "s-manager",
+        "running",
+    );
+    let readme_v1 = guidance_pin(&fixture, "README.md");
+    std::fs::write(
+        workspace.join("README.md"),
+        "# Project\n\nApproved change.\n",
+    )
+    .unwrap();
+    let readme_v2 = sha256(b"# Project\n\nApproved change.\n");
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let hash = sha256(guidance_policy(&fixture).as_bytes());
+    let readme = ("README.md", readme_v1.as_str(), readme_v2.as_str());
+    fixture.execute(
+        "INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at)
+         VALUES('snap','a','checkpoint','base','m','{}',1,'2026-01-01T00:00:00Z')",
+        [],
+    );
+    let fences: &[(&str, &str, &str)] = &[
+        ("an implementer is still working",
+         "UPDATE sessions SET readiness_state='busy' WHERE id='s-writer'",
+         "UPDATE sessions SET readiness_state='idle_candidate' WHERE id='s-writer'"),
+        ("an implementer is still working",
+         "UPDATE role_generations SET status='stopping' WHERE id='g-writer'",
+         "UPDATE role_generations SET status='running' WHERE id='g-writer'"),
+        ("starting, stopping or needs recovery",
+         "UPDATE sessions SET status='interrupt_requested' WHERE id='s-manager'",
+         "UPDATE sessions SET status='running' WHERE id='s-manager'"),
+        ("starting, stopping or needs recovery",
+         "UPDATE sessions SET status='recovery_required' WHERE id='s-manager'",
+         "UPDATE sessions SET status='running' WHERE id='s-manager'"),
+        ("keyboard control",
+         "INSERT INTO input_leases(session_id,lease_id_hash,owner_kind,owner_id,role_generation_id,process_identity_json,expires_at,created_at,updated_at) VALUES('s-writer','fence','human','viewer','g-writer','{}','9999-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+         "DELETE FROM input_leases WHERE lease_id_hash='fence'"),
+        ("permission request is pending",
+         "INSERT INTO permission_requests(id,hook_invocation_nonce,connection_nonce,provider,project_id,task_id,attempt_id,session_id,role_generation_id,role,service_boot_id,native_session_id,cwd,policy_fingerprint,tool_name,input_digest,input_json,created_at,deadline_at,state,updated_at) VALUES('fence','h','c','codex','p','t','a','s-writer','g-writer','implementer','boot','native','.','policy','shell','digest','{}','2026-01-01T00:00:00Z','9999-01-01T00:00:00Z','pending','2026-01-01T00:00:00Z')",
+         "DELETE FROM permission_requests WHERE id='fence'"),
+        ("control or proposed transition",
+         "INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at) VALUES('fence','a','pause_now','requested',1,'{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+         "DELETE FROM controls WHERE id='fence'"),
+        // A proposal that still matches the attempt's exact binding.
+        ("control or proposed transition",
+         "INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at) VALUES('fence','t','manager',1,'{}','g-manager','2026-01-01T00:00:00Z');
+          INSERT INTO controls(id,attempt_id,role_generation_id,kind,state,expected_version,payload_json,created_at,updated_at)
+            SELECT 'fence','a','g-manager','transition_proposal','proposed',version,
+              json_object('phase','code_review','evidence',json_array('e'),'source_phase','implementation',
+                'plan_hash','plan-hash','candidate_hash',NULL,'role_generation_id','g-manager','expected_task_version',version),
+              '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z' FROM tasks WHERE id='t'",
+         "DELETE FROM controls WHERE id='fence'; DELETE FROM role_settings WHERE id='fence'"),
+        ("agent switch",
+         "INSERT INTO switch_intents(id,attempt_id,role,old_generation_id,requested_settings_revision,handoff_json,state,created_at,updated_at) VALUES('fence','a','implementer','g-writer',2,'{}','stopping_old','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+         "DELETE FROM switch_intents WHERE id='fence'"),
+        ("rework",
+         "INSERT INTO rework_intents(id,operation_id,parent_attempt_id,new_attempt_id,snapshot_id,feedback,carry_plan_approval,scope_hash,configuration_hash,state,created_at,updated_at) VALUES('fence','fence','a','a','snap','f',0,'s','c','reserved','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+         "DELETE FROM rework_intents WHERE id='fence'"),
+        ("review is in flight",
+         "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,prompt_hash,handoff_hash,delivery_state,created_at,updated_at) VALUES('fence','a','code','candidate','p','h','reserved','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+         "DELETE FROM review_requests WHERE id='fence'"),
+        ("capture is in progress",
+         "INSERT INTO freeze_intents(id,attempt_id,kind,state,created_at,updated_at) VALUES('fence','a','candidate','capturing','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+         "DELETE FROM freeze_intents WHERE id='fence'"),
+        ("candidate is already frozen",
+         "UPDATE attempts SET candidate_hash='frozen' WHERE id='a'",
+         "UPDATE attempts SET candidate_hash=NULL WHERE id='a'"),
+        ("check is running",
+         "INSERT INTO check_runs(id,attempt_id,candidate_hash,executable,arguments_json,cwd,status,evidence_json,created_at) VALUES('fence','a','candidate','/usr/bin/true','[]','/tmp','launch_ambiguous','{}','2026-01-01T00:00:00Z')",
+         "DELETE FROM check_runs WHERE id='fence'"),
+        ("guidance delivery is unconfirmed",
+         "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at) VALUES('fence','a','g-writer','body','delivery_unknown','2026-01-01T00:00:00Z')",
+         "DELETE FROM guidance_messages WHERE id='fence'"),
+        ("recovery is open",
+         "INSERT INTO recovery_records(id,attempt_id,state,detail_json,created_at,updated_at) VALUES('fence','a','attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+         "DELETE FROM recovery_records WHERE id='fence'"),
+        ("restart hold",
+         "INSERT INTO restart_candidates(session_id,attempt_id,task_id,source,state,reason,result_json,created_at,updated_at) VALUES('s-writer','a','t','planned_shutdown','queued_capacity','fixture','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+         "DELETE FROM restart_candidates WHERE session_id='s-writer'"),
+        ("repository claim is uncertain",
+         "INSERT INTO claims(id,task_id,attempt_id,repository_identity,state,created_at,updated_at) VALUES('fence','t','a','/tmp/identity','unknown','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+         "DELETE FROM claims WHERE id='fence'"),
+        ("current unfinished attempt",
+         "UPDATE attempts SET status='needs_recovery' WHERE id='a'",
+         "UPDATE attempts SET status='running' WHERE id='a'"),
+    ];
+    for (index, (reason, apply, revert)) in fences.iter().enumerate() {
+        fixture.execute_batch(apply);
+        let error = reauthorize_guidance(
+            &fixture,
+            &format!("fence-{index}"),
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[readme],
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{reason} did not block"));
+        assert!(error.contains(reason), "{reason}: {error}");
+        fixture.execute_batch(revert);
+    }
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.guidance.reauthorized'",
+        0,
+    );
+    // A completed switch remains recorded as dispatched. Historical switches
+    // must not hold an otherwise settled attempt indefinitely.
+    fixture.execute_batch(
+        "INSERT INTO switch_intents(id,attempt_id,role,old_generation_id,requested_settings_revision,handoff_json,state,created_at,updated_at)
+         VALUES('completed-switch','a','implementer','g-writer',2,'{}','dispatched','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+    );
+    // An idle retained implementer at a recorded idle boundary is not a writer
+    // at work: the settled attempt accepts the approval.
+    fixture.assert_scalar::<String>(
+        "SELECT status || ':' || readiness_state FROM sessions WHERE id='s-writer'",
+        "running:idle_candidate".into(),
+    );
+    reauthorize_guidance(
+        &fixture,
+        "settled",
+        version,
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        &hash,
+        &[readme],
+    )
+    .unwrap();
+    guidance_ready(&fixture).unwrap();
+}
+
+/// A manager proposal from an earlier task version and candidate can never be
+/// applied again, so it must not hold an exact guidance approval forever. A
+/// proposal that still matches, and every other control, keeps blocking, and a
+/// later refusal restores whatever was retired.
+#[test]
+fn guidance_reauthorization_retires_only_unmatchable_transition_proposals() {
+    let plan = serde_json::json!({
+        "ownership":{"flow":"single writer","owned_paths":["README.md","docs/BUILDING.md"]},
+        "documentation":{"README.md":"Describe it.","docs/BUILDING.md":"Explain the smoke run."},
+    });
+    let (fixture, workspace) = guidance_fixture_with(
+        "guidance-stale-proposal",
+        &[
+            ("README.md", "# Project\n"),
+            ("docs/BUILDING.md", "Close with Back.\n"),
+            (".agents/trip-explorer/config.json", "{}\n"),
+        ],
+        &["README.md", "docs/BUILDING.md"],
+        plan,
+    );
+    seed_session(
+        &fixture,
+        "a",
+        "manager",
+        "g-old-manager",
+        "s-old-manager",
+        "exited",
+    );
+    seed_session(
+        &fixture,
+        "a",
+        "manager",
+        "g-manager",
+        "s-manager",
+        "running",
+    );
+    fixture.execute_batch(
+        "UPDATE tasks SET version=86 WHERE id='t';
+         INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+           VALUES('manager-setting','t','manager',1,'{}','g-manager','2026-01-01T00:00:00Z');
+         INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,spent)
+           VALUES('code-budget','a','code',2,2);
+         INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+           VALUES('report','report','s-writer','g-writer','candidate_ready','Candidate','[]','{}','2026-01-02T00:00:00Z');",
+    );
+    let proposal = |version: i64, candidate: Option<&str>, generation: &str| {
+        serde_json::json!({
+            "phase":"code_review","evidence":["candidate frozen"],"source_phase":"implementation",
+            "plan_hash":"plan-hash","candidate_hash":candidate,"role_generation_id":generation,
+            "expected_task_version":version,
+        })
+        .to_string()
+    };
+    let insert = |id: &str, version: i64, generation: &str, payload: &str| {
+        fixture.execute(
+            "INSERT INTO controls(id,attempt_id,role_generation_id,kind,state,expected_version,payload_json,created_at,updated_at)
+             VALUES(?1,'a',?2,'transition_proposal','proposed',?3,?4,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            params![id, generation, version, payload],
+        );
+    };
+    // The observed blocker: version 73, bound to a candidate since cleared.
+    let historical = proposal(73, Some("old-candidate-203de"), "g-manager");
+    insert("historical", 73, "g-manager", &historical);
+    // Current in every respect except that its manager was replaced.
+    let replaced = proposal(86, None, "g-old-manager");
+    insert("replaced-manager", 86, "g-old-manager", &replaced);
+    let building_v1 = guidance_pin(&fixture, "docs/BUILDING.md");
+    let building_text = "Close with the icon-only button.\n";
+    std::fs::write(workspace.join("docs/BUILDING.md"), building_text).unwrap();
+    let building_v2 = sha256(building_text.as_bytes());
+    let building = (
+        "docs/BUILDING.md",
+        building_v1.as_str(),
+        building_v2.as_str(),
+    );
+    let policy = guidance_policy(&fixture);
+    let hash = sha256(policy.as_bytes());
+    let untouched = || {
+        fixture.scalar::<String>(
+            "SELECT json_array(
+               (SELECT json_array(plan_hash,plan_json,approved_at,implementation_authorized_at)
+                  FROM trip_structured_plans WHERE id='plan'),
+               (SELECT json_array(plan_hash,plan_approved_at,candidate_hash,phase,status,updated_at)
+                  FROM attempts WHERE id='a'),
+               (SELECT json_group_array(json_array(review_kind,initial_allowance,extension_allowance,spent))
+                  FROM review_budgets WHERE attempt_id='a'),
+               (SELECT json_group_array(json_array(id,outcome,consumed_at)) FROM role_results))",
+        )
+    };
+    let before = untouched();
+    let control = |id: &str| {
+        fixture.scalar::<String>(&format!(
+            "SELECT state||':'||payload_json FROM controls WHERE id='{id}'"
+        ))
+    };
+    let retired = |id: &str, field: &str| {
+        fixture.scalar::<String>(&format!(
+            "SELECT COALESCE(CAST(json_extract(detail_json,'{field}') AS TEXT),'null') FROM audit_events
+             WHERE event_code='control.transition_proposal.retired' AND entity_id='{id}'"
+        ))
+    };
+    let retired_count = || {
+        fixture.scalar::<i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE event_code='control.transition_proposal.retired'",
+        )
+    };
+    let refused = |operation: &str, files: &[(&str, &str, &str)], expected: &str| {
+        let error = reauthorize_guidance(
+            &fixture,
+            operation,
+            86,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            files,
+        )
+        .unwrap_err();
+        assert!(error.contains(expected), "{operation}: {error}");
+        assert_eq!(control("historical"), format!("proposed:{historical}"));
+        assert_eq!(control("replaced-manager"), format!("proposed:{replaced}"));
+        assert_eq!(retired_count(), 0, "{operation} kept a retirement");
+        assert_eq!(guidance_policy(&fixture), policy);
+        fixture.assert_scalar::<i64>("SELECT version FROM tasks WHERE id='t'", 86);
+    };
+    // An unrelated pending control still blocks, and nothing is retired.
+    fixture.execute(
+        "INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+         VALUES('pause','a','pause_now','requested',86,'{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        [],
+    );
+    refused(
+        "with-pause",
+        &[building],
+        "a control or proposed transition is pending",
+    );
+    assert_eq!(control("pause"), "requested:{}");
+    fixture.execute("UPDATE controls SET state='finished' WHERE id='pause'", []);
+    // A proposal that still matches the exact binding keeps blocking.
+    let current = proposal(86, None, "g-manager");
+    insert("current", 86, "g-manager", &current);
+    refused(
+        "with-current",
+        &[building],
+        "a control or proposed transition is pending",
+    );
+    assert_eq!(control("current"), format!("proposed:{current}"));
+    fixture.execute("DELETE FROM controls WHERE id='current'", []);
+    // A refusal after the fences rolls the retirement back.
+    let other = sha256(b"other");
+    refused(
+        "bad-hash",
+        &[("docs/BUILDING.md", &building_v1, &other)],
+        "does not have the approved new content",
+    );
+    // The exact documentation-only approval now applies.
+    let applied = reauthorize_guidance(
+        &fixture,
+        "apply",
+        86,
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        &hash,
+        &[building],
+    )
+    .unwrap();
+    assert_eq!(applied.state, "guidance_reauthorized");
+    fixture.assert_scalar::<i64>("SELECT version FROM tasks WHERE id='t'", 87);
+    guidance_ready(&fixture).unwrap();
+    // Retired with the original payload kept and the binding audited.
+    assert_eq!(control("historical"), format!("superseded:{historical}"));
+    assert_eq!(
+        control("replaced-manager"),
+        format!("superseded:{replaced}")
+    );
+    assert_eq!(control("pause"), "finished:{}");
+    assert_eq!(retired_count(), 2);
+    assert_eq!(
+        retired("historical", "$.mismatched"),
+        r#"["task_version","candidate_hash"]"#
+    );
+    assert_eq!(retired("historical", "$.proposal.expected_version"), "73");
+    assert_eq!(retired("historical", "$.proposal.payload_json"), historical);
+    assert_eq!(retired("historical", "$.current.task_version"), "86");
+    assert_eq!(retired("historical", "$.current.candidate_hash"), "null");
+    assert_eq!(
+        retired("historical", "$.retired_for"),
+        "guidance_reauthorization"
+    );
+    assert_eq!(
+        retired("replaced-manager", "$.mismatched"),
+        r#"["manager_generation"]"#
+    );
+    // Only the approved pin moved; plan, attempt, budgets and reports did not.
+    assert_eq!(untouched(), before);
+    let mut expected: serde_json::Value = serde_json::from_str(&policy).unwrap();
+    expected["files"]["docs/BUILDING.md"] = building_v2.clone().into();
+    let mut after: serde_json::Value = serde_json::from_str(&guidance_policy(&fixture)).unwrap();
+    after
+        .as_object_mut()
+        .unwrap()
+        .remove("guidance_reauthorizations")
+        .unwrap();
+    assert_eq!(after, expected);
+}
+
+/// An ordinary code-review rejection clears the candidate, so a manager
+/// proposal bound to it is retired just as a manual verdict retires it.
+#[test]
+fn code_review_rejection_retires_proposals_bound_to_the_cleared_candidate() {
+    let fixture = Fixture::new("code-review-retires-proposal");
+    seed_attempt(&fixture, "code_review");
+    fixture.execute(
+        "UPDATE attempts SET plan_hash='plan-hash',candidate_hash='old-candidate' WHERE id='a'",
+        [],
+    );
+    seed_session(
+        &fixture,
+        "a",
+        "manager",
+        "manager-generation",
+        "manager-session",
+        "exited",
+    );
+    seed_session(
+        &fixture,
+        "a",
+        "code_reviewer",
+        "reviewer-generation",
+        "reviewer-session",
+        "exited",
+    );
+    fixture.execute_batch(
+        "UPDATE role_generations SET status='exited';
+         INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+           VALUES('manager-setting','t','manager',1,'{}','manager-generation','2026-01-01T00:00:00Z');
+         INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+           VALUES('reviewer-setting','t','code_reviewer',1,'{}','reviewer-generation','2026-01-01T00:00:00Z');
+         INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,spent)
+           VALUES('code-budget','a','code',2,1);
+         INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,prompt_hash,handoff_hash,delivery_state,session_id,created_at,updated_at)
+           VALUES('code-request','a','code','old-candidate','reviewer-generation','prompt','handoff','delivered','reviewer-session','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+         INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+           VALUES('code-result','code-report','reviewer-session','reviewer-generation','request_changes','fix the dialog','[]','{\"review_request_id\":\"code-request\",\"review_kind\":\"code\",\"candidate_hash\":\"old-candidate\"}','2026-01-01T00:00:00Z');",
+    );
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let payload = serde_json::json!({
+        "phase":"code_review","evidence":["candidate frozen"],"source_phase":"implementation",
+        "plan_hash":"plan-hash","candidate_hash":"old-candidate",
+        "role_generation_id":"manager-generation","expected_task_version":version,
+    })
+    .to_string();
+    fixture.execute(
+        "INSERT INTO controls(id,attempt_id,role_generation_id,kind,state,expected_version,payload_json,created_at,updated_at)
+         VALUES('proposal','a','manager-generation','transition_proposal','proposed',?1,?2,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![version, payload],
+    );
+    let paths = instance_paths(&fixture);
+    let app = Application::new(
+        paths.clone(),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    let applied = app.coordinator_tick().unwrap();
+    assert_eq!(applied["action"], "review_applied", "{applied}");
+    assert_eq!(applied["verdict"], "request_changes");
+    fixture.assert_scalar::<String>(
+        "SELECT phase||':'||COALESCE(candidate_hash,'cleared') FROM attempts WHERE id='a'",
+        "implementation:cleared".into(),
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT state||':'||payload_json FROM controls WHERE id='proposal'",
+        format!("superseded:{payload}"),
+    );
+    fixture.assert_scalar::<i64>("SELECT spent FROM review_budgets WHERE id='code-budget'", 1);
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+#[test]
+fn guidance_reauthorization_restores_readiness_once_and_rejects_altered_replay() {
+    let (fixture, workspace) = guidance_fixture("guidance-success");
+    // A candidate the implementer already reported must survive untouched.
+    fixture.execute(
+        "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+         VALUES('candidate','candidate','s-writer','g-writer','candidate_ready','Candidate','[]','{}','2026-01-02T00:00:00Z')",
+        [],
+    );
+    let decision = || {
+        workflow::state(&fixture.store)
+            .unwrap()
+            .decisions
+            .into_iter()
+            .find(|decision| decision.subject.attempt_id.as_deref() == Some("a"))
+            .map(|decision| decision.reason_code)
+    };
+    let preserved = || {
+        fixture.scalar::<String>(
+            "SELECT (SELECT updated_at||':'||status FROM attempts WHERE id='a')||'|'||
+                    (SELECT COALESCE(consumed_at,'unconsumed') FROM role_results WHERE id='candidate')||'|'||
+                    COALESCE((SELECT group_concat(review_kind||spent) FROM review_budgets WHERE attempt_id='a'),'')",
+        )
+    };
+    guidance_ready(&fixture).unwrap();
+    let settled_decision = decision();
+    let settled = preserved();
+    let readme_v1 = guidance_pin(&fixture, "README.md");
+    let guide_v1 = guidance_pin(&fixture, "docs/GUIDE.md");
+    std::fs::write(
+        workspace.join("README.md"),
+        "# Project\n\nApproved change.\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.join("docs/GUIDE.md"), "Guide, approved change\n").unwrap();
+    let readme_v2 = sha256(b"# Project\n\nApproved change.\n");
+    let guide_v2 = sha256(b"Guide, approved change\n");
+    assert!(guidance_ready(&fixture).is_err());
+    assert_eq!(
+        decision().as_deref(),
+        Some("workflow.attempt_readiness_stale")
+    );
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let before = guidance_policy(&fixture);
+    let hash = sha256(before.as_bytes());
+    let files = [
+        ("README.md", readme_v1.as_str(), readme_v2.as_str()),
+        ("docs/GUIDE.md", guide_v1.as_str(), guide_v2.as_str()),
+    ];
+    let applied = reauthorize_guidance(
+        &fixture,
+        "apply",
+        version,
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        &hash,
+        &files,
+    )
+    .unwrap();
+    assert_eq!(applied.state, "guidance_reauthorized");
+    assert_eq!(applied.version, Some(version + 1));
+    fixture.assert_scalar::<i64>("SELECT version FROM tasks WHERE id='t'", version + 1);
+    guidance_ready(&fixture).unwrap();
+    // Only the two approved pins moved; every other identity is unchanged.
+    let mut expected: serde_json::Value = serde_json::from_str(&before).unwrap();
+    expected["files"]["README.md"] = readme_v2.clone().into();
+    expected["files"]["docs/GUIDE.md"] = guide_v2.clone().into();
+    let mut after: serde_json::Value = serde_json::from_str(&guidance_policy(&fixture)).unwrap();
+    let history = after
+        .as_object_mut()
+        .unwrap()
+        .remove("guidance_reauthorizations")
+        .unwrap();
+    assert_eq!(after, expected);
+    assert_eq!(history[0]["previous_policy_hash"], hash.as_str());
+    assert_eq!(history[0]["files"].as_array().unwrap().len(), 2);
+    // The reported candidate, attempt anchor and review accounting are intact,
+    // and the attempt is back to the decision it had before the edit.
+    assert_eq!(preserved(), settled);
+    assert_eq!(decision(), settled_decision);
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.guidance.reauthorized'
+               AND actor_kind='human' AND entity_id='a'
+               AND json_extract(detail_json,'$.previous_policy_hash')='{hash}'
+               AND json_extract(detail_json,'$.plan_hash')='plan-hash'"
+        ),
+        1,
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='apply'",
+        1,
+    );
+    // Identical replay returns the receipt without applying twice.
+    let replay = reauthorize_guidance(
+        &fixture,
+        "apply",
+        version,
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        &hash,
+        &files,
+    )
+    .unwrap();
+    assert_eq!(replay.state, "guidance_reauthorized");
+    assert_eq!(replay.version, Some(version + 1));
+    fixture.assert_scalar::<i64>("SELECT version FROM tasks WHERE id='t'", version + 1);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.guidance.reauthorized'",
+        1,
+    );
+    // The same operation ID with an altered payload is rejected.
+    let altered = reauthorize_guidance(
+        &fixture,
+        "apply",
+        version,
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        &hash,
+        &files[..1],
+    )
+    .unwrap_err();
+    assert!(altered.contains("already used"), "{altered}");
+    // The old approval cannot be reused under a new operation.
+    assert!(reauthorize_guidance(
+        &fixture,
+        "reuse",
+        version + 1,
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        &hash,
+        &files,
+    )
+    .is_err());
+    // Ordinary readiness stays fail-closed for any later unapproved edit.
+    std::fs::write(workspace.join("README.md"), "# Unapproved later edit\n").unwrap();
+    assert!(guidance_ready(&fixture).unwrap_err().contains("README.md"));
+}
+
+#[test]
+fn guidance_reauthorization_accepts_explicit_documentation_ownership_of_the_approved_plan() {
+    // The approved plan's actual shape: ownership lists exact paths by
+    // category, documentation is keyed by labels, protected entries are
+    // narrative. docs/TESTED.md is listed only in another category and
+    // docs/PROTECTED.md is also protected; neither is approved guidance.
+    let docs = [
+        "README.md",
+        "docs/WORKFLOWS.md",
+        "docs/OPERATIONS.md",
+        "docs/PROJECT_SETUP.md",
+        "docs/BUILDING.md",
+    ];
+    let plan = serde_json::json!({
+        "ownership":{
+            "exact_paths":{
+                "dependencies":["frontend/package.json","frontend/deno.lock"],
+                "documentation":["README.md","docs/WORKFLOWS.md","docs/OPERATIONS.md",
+                    "docs/PROJECT_SETUP.md","docs/BUILDING.md","THIRD_PARTY_NOTICES.md",
+                    "docs/PROTECTED.md"],
+                "host_coordination":["src/workflow.rs","src/domain.rs"],
+                "tests":["tests/contracts.rs","docs/TESTED.md"],
+            },
+            "flow":"default_single_lane",
+            "manager":{"owns":["README and documentation content decisions"]},
+            "protected":["Application SQLite and fabricated evidence","Running control host",
+                "docs/PROTECTED.md"],
+        },
+        "documentation":{
+            "README_md":"Task focus and action labels.",
+            "WORKFLOWS_md":"Exact completion evidence.",
+            "OPERATIONS_md":"Waiting versus progress.",
+            "PROJECT_SETUP_md":"Setup receipts versus runtime proof.",
+            "BUILDING_md":"Evidence separation.",
+            "evidence_policy":"Screenshots remain ignored under .local.",
+        },
+    });
+    let mut pinned = docs
+        .iter()
+        .map(|path| (*path, "Original\n"))
+        .collect::<Vec<_>>();
+    pinned.extend([
+        ("docs/TESTED.md", "Original\n"),
+        ("docs/PROTECTED.md", "Original\n"),
+        (".agents/trip-explorer/config.json", "{}\n"),
+    ]);
+    let mut guidance = docs.to_vec();
+    guidance.extend(["docs/TESTED.md", "docs/PROTECTED.md"]);
+    let (fixture, workspace) =
+        guidance_fixture_with("guidance-exact-paths", &pinned, &guidance, plan);
+    let original = sha256(b"Original\n");
+    let changed = sha256(b"Approved change\n");
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let hash = sha256(guidance_policy(&fixture).as_bytes());
+    for path in ["docs/TESTED.md", "docs/PROTECTED.md"] {
+        std::fs::write(workspace.join(path), "Approved change\n").unwrap();
+        let error = reauthorize_guidance(
+            &fixture,
+            "refused",
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[(path, &original, &changed)],
+        )
+        .unwrap_err();
+        assert!(error.contains("does not explicitly own"), "{path}: {error}");
+        std::fs::write(workspace.join(path), "Original\n").unwrap();
+    }
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='refused'",
+        0,
+    );
+    // The five approved documentation files are re-pinned together.
+    for path in docs {
+        std::fs::write(workspace.join(path), "Approved change\n").unwrap();
+    }
+    assert!(guidance_ready(&fixture).is_err());
+    let files = docs
+        .iter()
+        .map(|path| (*path, original.as_str(), changed.as_str()))
+        .collect::<Vec<_>>();
+    let applied = reauthorize_guidance(
+        &fixture,
+        "apply-docs",
+        version,
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        &hash,
+        &files,
+    )
+    .unwrap();
+    assert_eq!(applied.state, "guidance_reauthorized");
+    guidance_ready(&fixture).unwrap();
+    for path in docs {
+        assert_eq!(guidance_pin(&fixture, path), changed);
+    }
+    for path in ["docs/TESTED.md", "docs/PROTECTED.md"] {
+        assert_eq!(guidance_pin(&fixture, path), original);
+    }
+}
+
+#[test]
+fn guidance_reauthorization_resolves_file_name_documentation_keys_to_unique_exact_owned_paths() {
+    // The continuation plan's shape: `exact_owned_paths`, documentation keyed
+    // `OPERATIONS_md`, and narrative `protected_paths_and_state`.
+    let approved = ["README.md", "docs/OPERATIONS.md", "docs/WORKFLOWS.md"];
+    let refused = [
+        "docs/UNDOCUMENTED.md",
+        "docs/NOT_OWNED.md",
+        "docs/PROTECTED.md",
+        "docs/BUILDING.md",
+        "guides/BUILDING.md",
+    ];
+    let plan = serde_json::json!({
+        "ownership":{
+            "exact_owned_paths":["README.md","docs/OPERATIONS.md","docs/WORKFLOWS.md",
+                "docs/UNDOCUMENTED.md","docs/PROTECTED.md","docs/BUILDING.md",
+                "guides/BUILDING.md","src/trip.rs"],
+            "host_semantic_integration_paths":["docs/OPERATIONS.md","docs/NOT_OWNED.md"],
+            "protected_paths_and_state":[
+                ".agents/trip-explorer and installed workflow/configuration files",
+                "docs/PROTECTED.md","Application SQLite and the running control host"],
+            "flow":"single writer",
+        },
+        "documentation":{
+            "README_md":"Task focus.","OPERATIONS_md":"Replan recovery.",
+            "WORKFLOWS_md":"Final repair.","NOT_OWNED_md":"Mentioned, not owned.",
+            "PROTECTED_md":"Owned but protected.","BUILDING_md":"Two owned files share it.",
+            "no_other_docs":"No other documentation.","owner":"Manager",
+        },
+    });
+    let all = approved.iter().chain(&refused).copied().collect::<Vec<_>>();
+    let pinned = all
+        .iter()
+        .map(|path| (*path, "Original\n"))
+        .collect::<Vec<_>>();
+    let (fixture, workspace) =
+        guidance_fixture_with("guidance-exact-owned-paths", &pinned, &all, plan);
+    let original = sha256(b"Original\n");
+    let changed = sha256(b"Approved change\n");
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let policy = guidance_policy(&fixture);
+    let hash = sha256(policy.as_bytes());
+    for path in refused {
+        std::fs::write(workspace.join(path), "Approved change\n").unwrap();
+        let error = reauthorize_guidance(
+            &fixture,
+            "refused",
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[(path, &original, &changed)],
+        )
+        .unwrap_err();
+        assert!(error.contains("does not explicitly own"), "{path}: {error}");
+        std::fs::write(workspace.join(path), "Original\n").unwrap();
+    }
+    assert_eq!(guidance_policy(&fixture), policy);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='refused'",
+        0,
+    );
+    for path in approved {
+        std::fs::write(workspace.join(path), "Approved change\n").unwrap();
+    }
+    assert!(guidance_ready(&fixture).is_err());
+    let files = approved
+        .iter()
+        .map(|path| (*path, original.as_str(), changed.as_str()))
+        .collect::<Vec<_>>();
+    let applied = reauthorize_guidance(
+        &fixture,
+        "apply-docs",
+        version,
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        &hash,
+        &files,
+    )
+    .unwrap();
+    assert_eq!(applied.state, "guidance_reauthorized");
+    guidance_ready(&fixture).unwrap();
+    for path in approved {
+        assert_eq!(guidance_pin(&fixture, path), changed, "{path}");
+    }
+    for path in refused {
+        assert_eq!(guidance_pin(&fixture, path), original, "{path}");
+    }
+}
+
+#[test]
+fn guidance_reauthorization_never_repins_protected_workflow_artifacts() {
+    // Each artifact is pinned, configured as guidance, explicitly owned as plan
+    // documentation, changed on disk and requested with the exact hashes the
+    // server computes. The host still refuses every one.
+    let protected = [
+        ".agents/trip-explorer/config.json",
+        ".agents/trip-explorer/adapters.json",
+        ".agents/trip-explorer/manifest.json",
+        ".agents/trip-explorer/base/0.9.0/workflow.md",
+        ".agents/trip-explorer/llmrelay-overlay.md",
+        ".agents/skills/trip-explorer-workflow/SKILL.md",
+        ".claude/skills/trip-explorer-workflow/SKILL.md",
+        ".codex/config.toml",
+        "AGENTS.md",
+        ".AGENTS/trip-explorer/preflight.json",
+    ];
+    let docs = ["README.md", "docs/WORKFLOWS.md"];
+    let mut owned = docs.to_vec();
+    owned.extend(protected);
+    let plan = serde_json::json!({
+        "ownership":{"exact_paths":{"documentation":owned},"flow":"default_single_lane",
+            "protected":["Running control host"]},
+        "documentation":{"README_md":"Task focus.","WORKFLOWS_md":"Workflow wording."},
+    });
+    let pinned = owned
+        .iter()
+        .map(|path| (*path, "Original\n"))
+        .collect::<Vec<_>>();
+    let (fixture, workspace) =
+        guidance_fixture_with("guidance-protected-artifacts", &pinned, &owned, plan);
+    let original = sha256(b"Original\n");
+    let changed = sha256(b"Approved change\n");
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let policy = guidance_policy(&fixture);
+    let hash = sha256(policy.as_bytes());
+    let receipts = || {
+        fixture.scalar::<i64>(
+            "SELECT COUNT(*) FROM operation_receipts WHERE operation_id LIKE 'protected-%'",
+        )
+    };
+    let audits = || {
+        fixture.scalar::<i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE event_code IN
+               ('attempt.guidance.reauthorized','human.command.applied')",
+        )
+    };
+    let audits_before = audits();
+    for (index, path) in protected.iter().enumerate() {
+        std::fs::write(workspace.join(path), "Approved change\n").unwrap();
+        // The request carries exactly the hashes the server recomputes.
+        assert_eq!(
+            sha256(&std::fs::read(workspace.join(path)).unwrap()),
+            changed
+        );
+        let error = reauthorize_guidance(
+            &fixture,
+            &format!("protected-{index}"),
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &hash,
+            &[(path, &original, &changed)],
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("protected workflow artifact"),
+            "{path}: {error}"
+        );
+        std::fs::write(workspace.join(path), "Original\n").unwrap();
+    }
+    // A mixed request is refused as a whole.
+    for path in docs {
+        std::fs::write(workspace.join(path), "Approved change\n").unwrap();
+    }
+    std::fs::write(workspace.join("AGENTS.md"), "Approved change\n").unwrap();
+    let error = reauthorize_guidance(
+        &fixture,
+        "protected-mixed",
+        version,
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        &hash,
+        &[
+            ("README.md", &original, &changed),
+            ("AGENTS.md", &original, &changed),
+        ],
+    )
+    .unwrap_err();
+    assert!(error.contains("protected workflow artifact"), "{error}");
+    std::fs::write(workspace.join("AGENTS.md"), "Original\n").unwrap();
+    assert_eq!(guidance_policy(&fixture), policy);
+    fixture.assert_scalar::<i64>("SELECT version FROM tasks WHERE id='t'", version);
+    assert_eq!(receipts(), 0);
+    assert_eq!(audits(), audits_before);
+    // Ordinary approved Markdown documentation stays eligible.
+    reauthorize_guidance(
+        &fixture,
+        "docs",
+        version,
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        &hash,
+        &[
+            ("README.md", &original, &changed),
+            ("docs/WORKFLOWS.md", &original, &changed),
+        ],
+    )
+    .unwrap();
+    guidance_ready(&fixture).unwrap();
+    for path in protected {
+        assert_eq!(guidance_pin(&fixture, path), original, "{path}");
+    }
+}
+
+/// A final-repair attempt shaped like the recovered task: ordinary approval of
+/// `approved-candidate`, one final `request_changes` on it, then an ordinary
+/// code review past the five-call cap (allowance and spent 6/6) whose
+/// `needs_rework` of `repaired-candidate` left the attempt in `needs_input` at
+/// task version 7.
+fn final_repair_recheck_fixture(name: &str) -> Fixture {
+    let fixture = Fixture::new(name);
+    seed_attempt(&fixture, "needs_input");
+    for (role, generation, session) in [
+        ("code_reviewer", "g-approver", "s-approver"),
+        ("final_verifier", "g-final", "s-final"),
+        ("code_reviewer", "g-reviewer", "s-reviewer"),
+    ] {
+        seed_session(&fixture, "a", role, generation, session, "exited");
+    }
+    fixture.execute_batch(
+        r#"UPDATE role_generations SET status='exited';
+         UPDATE attempts SET final_repair_round=1,plan_hash='plan-hash',
+           plan_approved_at='2026-01-01T00:00:00Z' WHERE id='a';
+         UPDATE tasks SET attention='needs_input',version=7 WHERE id='t';
+         INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,extension_allowance,spent)
+           VALUES('code-budget','a','code',2,4,6);
+         INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
+           VALUES('reviewer-capability','codex','fixture','code_reviewer','interactive_pty','reviewer-capability-key','supported','fixture','[]','2026-01-01T00:00:00Z','{}');
+         INSERT INTO trip_attempt_profiles(attempt_id,role,settings_revision,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at)
+           VALUES('a','code_reviewer',1,'project_default','{}','reviewer-profile','synthetic-seeded-config','h','a','h','reviewer-capability','reviewer-capability-key','p','2026-01-01T00:00:00Z');
+         INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,session_id,settings_revision,prompt_hash,handoff_hash,delivery_state,verdict,budget_spent_at,created_at,updated_at)
+           VALUES('approved-code','a','code','approved-candidate','g-approver','s-approver',1,'p','h','finished','approved','2026-01-01T00:00:01Z','2026-01-01T00:00:01Z','2026-01-01T00:00:01Z'),
+                 ('final-changes','a','final','approved-candidate','g-final','s-final',1,'p','h','finished','request_changes','2026-01-01T00:00:02Z','2026-01-01T00:00:02Z','2026-01-01T00:00:02Z'),
+                 ('sixth-code','a','code','repaired-candidate','g-reviewer','s-reviewer',1,'p','h','finished','needs_rework','2026-01-01T00:00:03Z','2026-01-01T00:00:03Z','2026-01-01T00:00:03Z');
+         INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
+           VALUES('sixth-result','sixth-report','s-reviewer','g-reviewer','needs_rework','structural','[]',
+             '{"review_request_id":"sixth-code","review_kind":"code","candidate_hash":"repaired-candidate"}',
+             '2026-01-01T00:00:03Z','2026-01-01T00:00:03Z');"#,
+    );
+    fixture
+}
+
+const FINAL_REPAIR_LEDGER: &str = "SELECT group_concat(id||':'||candidate_hash||':'||delivery_state||':'||COALESCE(verdict,'')||':'||COALESCE(budget_spent_at,''),',')
+     FROM (SELECT * FROM review_requests ORDER BY rowid)";
+const FINAL_REPAIR_CODE_BUDGET: &str = "SELECT (initial_allowance+extension_allowance)||':'||spent FROM review_budgets WHERE review_kind='code'";
+
+/// The reviewed recovery of the fixture with the given fields replaced.
+fn authorize_final_repair_recheck(
+    store: &Store,
+    paths: &InstancePaths,
+    operation: &str,
+    overrides: serde_json::Value,
+) -> Result<OperationResult, String> {
+    let mut action = serde_json::json!({
+        "action":"authorize_final_repair_recheck","task_id":"t","attempt_id":"a",
+        "expected_task_version":7,"approved_code_request_id":"approved-code",
+        "prior_candidate_hash":"approved-candidate","final_request_id":"final-changes",
+        "rejected_code_request_id":"sixth-code","reviewer_generation_id":"g-reviewer",
+    });
+    for (key, value) in overrides.as_object().unwrap() {
+        action[key] = value.clone();
+    }
+    let action: TripHumanAction = serde_json::from_value(action).unwrap();
+    agenticjira::trip::execute_human(store, paths, operation, &action)
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// The recovered fixture with `fixed-candidate` frozen for code review.
+fn recovered_final_repair_fixture(name: &str) -> (Fixture, ReviewService) {
+    let fixture = final_repair_recheck_fixture(name);
+    authorize_final_repair_recheck(
+        &fixture.store,
+        &instance_paths(&fixture),
+        "recover",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    fixture.execute_batch(
+        "INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at)
+           VALUES('fixed-snapshot','a','candidate','base','fixed-candidate','{}',1,'2026-01-02T00:00:00Z');
+         UPDATE attempts SET phase='code_review',candidate_hash='fixed-candidate' WHERE id='a';",
+    );
+    let reviews = ReviewService::new(fixture.store.clone(), fixture.root.join("artifacts"));
+    (fixture, reviews)
+}
+
+fn reserve_final_repair_recheck(
+    reviews: &ReviewService,
+) -> Result<agenticjira::review::ReviewDispatch, String> {
+    reviews
+        .reserve_request(
+            "a",
+            "code",
+            "recheck",
+            serde_json::json!({"candidate":"fixed-candidate"}),
+        )
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Delivers the recheck to a new code-reviewer generation, which must use the
+/// retained settings revision, and records its structured `verdict`, if any.
+fn deliver_final_repair_recheck(
+    fixture: &Fixture,
+    reviews: &ReviewService,
+    request: &str,
+    verdict: Option<&str>,
+) {
+    seed_session(
+        fixture,
+        "a",
+        "code_reviewer",
+        "g-recheck",
+        "s-recheck",
+        "running",
+    );
+    assert!(reviews
+        .bind_launch_intent(request, "s-recheck", "g-recheck", 2)
+        .unwrap_err()
+        .to_string()
+        .contains("retained code reviewer"));
+    reviews
+        .bind_launch_intent(request, "s-recheck", "g-recheck", 1)
+        .unwrap();
+    reviews
+        .bind_delivery(request, "s-recheck", "g-recheck", 1)
+        .unwrap();
+    fixture.execute(
+        "INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+         VALUES('recheck-settings','t','code_reviewer',1,'{}','g-recheck','2026-01-02T00:00:00Z')",
+        [],
+    );
+    let Some(verdict) = verdict else {
+        return;
+    };
+    fixture.execute(
+        "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+         VALUES('recheck-result','recheck-report','s-recheck','g-recheck',?1,'recheck','[]',?2,'2026-01-02T00:00:00Z')",
+        params![
+            verdict,
+            serde_json::json!({"review_request_id":request,"review_kind":"code","candidate_hash":"fixed-candidate"})
+                .to_string()
+        ],
+    );
+}
+
+fn final_repair_recheck_verdict(fixture: &Fixture, verdict: &str) -> OperationResult {
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::ReviewVerdict {
+            operation_id: format!("verdict-{verdict}"),
+            task_id: "t".into(),
+            attempt_id: "a".into(),
+            expected_version: fixture.scalar("SELECT version FROM tasks WHERE id='t'"),
+            review_kind: "code".into(),
+            candidate_hash: "fixed-candidate".into(),
+            verdict: verdict.into(),
+            feedback: "recheck feedback".into(),
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn final_repair_recheck_recovery_binds_the_exact_ledger_once() {
+    let fixture = final_repair_recheck_fixture("final-repair-recovery");
+    let paths = instance_paths(&fixture);
+    let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
+    let unchanged = |fixture: &Fixture, case: &str| {
+        assert_eq!(
+            fixture.scalar::<String>(FINAL_REPAIR_LEDGER),
+            ledger,
+            "{case}"
+        );
+        assert_eq!(
+            fixture.scalar::<String>(FINAL_REPAIR_CODE_BUDGET),
+            "6:6",
+            "{case}"
+        );
+    };
+    let refusals = [
+        (
+            "stale-version",
+            serde_json::json!({"expected_task_version":6}),
+            "",
+            "",
+        ),
+        (
+            "other-attempt",
+            serde_json::json!({"attempt_id":"other"}),
+            "",
+            "",
+        ),
+        (
+            "prior-candidate",
+            serde_json::json!({"prior_candidate_hash":"repaired-candidate"}),
+            "",
+            "",
+        ),
+        (
+            "final-request",
+            serde_json::json!({"final_request_id":"approved-code"}),
+            "",
+            "",
+        ),
+        (
+            "rejected-request",
+            serde_json::json!({"rejected_code_request_id":"approved-code"}),
+            "",
+            "",
+        ),
+        (
+            "reviewer",
+            serde_json::json!({"reviewer_generation_id":"g-approver"}),
+            "",
+            "",
+        ),
+        (
+            "not-repair-round",
+            serde_json::json!({}),
+            "UPDATE attempts SET final_repair_round=0",
+            "UPDATE attempts SET final_repair_round=1",
+        ),
+        (
+            "competing-hold",
+            serde_json::json!({}),
+            "UPDATE tasks SET attention='paused'",
+            "UPDATE tasks SET attention='needs_input'",
+        ),
+        (
+            "pending-control",
+            serde_json::json!({}),
+            "INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+             VALUES('pause','a','pause_now','requested',7,'{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            "DELETE FROM controls WHERE id='pause'",
+        ),
+        (
+            "profile-drift",
+            serde_json::json!({}),
+            "UPDATE trip_attempt_profiles SET settings_revision=2",
+            "UPDATE trip_attempt_profiles SET settings_revision=1",
+        ),
+        (
+            "reviewer-not-quiescent",
+            serde_json::json!({}),
+            "UPDATE role_generations SET status='running' WHERE id='g-reviewer'",
+            "UPDATE role_generations SET status='exited' WHERE id='g-reviewer'",
+        ),
+        (
+            "later-review",
+            serde_json::json!({}),
+            "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,prompt_hash,handoff_hash,delivery_state,created_at,updated_at)
+             VALUES('later','a','plan','plan-hash','p','h','abandoned','2026-01-01T00:00:04Z','2026-01-01T00:00:04Z')",
+            "DELETE FROM review_requests WHERE id='later'",
+        ),
+        (
+            "allowance-not-six",
+            serde_json::json!({}),
+            "UPDATE review_budgets SET extension_allowance=3",
+            "UPDATE review_budgets SET extension_allowance=4",
+        ),
+        (
+            "spent-not-six",
+            serde_json::json!({}),
+            "UPDATE review_budgets SET spent=5",
+            "UPDATE review_budgets SET spent=6",
+        ),
+    ];
+    for (case, overrides, setup, teardown) in refusals {
+        if !setup.is_empty() {
+            fixture.execute(setup, []);
+        }
+        let error =
+            authorize_final_repair_recheck(&fixture.store, &paths, case, overrides).unwrap_err();
+        if case.ends_with("-not-six") {
+            assert!(
+                error.contains("exactly 6 allowed and 6 spent"),
+                "{case}: {error}"
+            );
+        }
+        if !teardown.is_empty() {
+            fixture.execute(teardown, []);
+        }
+        unchanged(&fixture, case);
+        assert_eq!(
+            fixture.scalar::<String>(
+                "SELECT a.phase||':'||t.version||':'||(SELECT COUNT(*) FROM final_repair_rechecks)
+                 FROM attempts a JOIN tasks t ON t.id=a.task_id"
+            ),
+            "needs_input:7:0",
+            "{case}"
+        );
+    }
+
+    // A manager proposal bound to an earlier task version can never apply, so
+    // it is retired with an audit instead of fencing the recovery forever.
+    fixture.execute(
+        "INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+         VALUES('stale-proposal','a','transition_proposal','proposed',6,
+           '{\"phase\":\"code_review\",\"expected_task_version\":6}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        [],
+    );
+    let authorized =
+        authorize_final_repair_recheck(&fixture.store, &paths, "recover", serde_json::json!({}))
+            .unwrap();
+    assert_eq!(authorized.state, "final_repair_recheck_authorized");
+    assert_eq!(authorized.version, Some(8));
+    fixture.assert_scalar::<String>(
+        "SELECT c.state||':'||json_extract(e.detail_json,'$.retired_for')
+         FROM controls c JOIN audit_events e ON e.entity_id=c.id
+           AND e.event_code='control.transition_proposal.retired'
+         WHERE c.id='stale-proposal'",
+        "superseded:final_repair_recheck_recovery".into(),
+    );
+    let detail = &authorized.detail;
+    assert_eq!(
+        detail["prior_code_approval"],
+        serde_json::json!({"review_request_id":"approved-code","candidate_hash":"approved-candidate"})
+    );
+    assert_eq!(
+        detail["final_request_changes"]["review_request_id"],
+        "final-changes"
+    );
+    assert_eq!(
+        detail["ordinary_needs_rework"],
+        serde_json::json!({"review_request_id":"sixth-code","role_result_id":"sixth-result","candidate_hash":"repaired-candidate"})
+    );
+    assert_eq!(
+        detail["retained_code_reviewer"],
+        serde_json::json!({"role_generation_id":"g-reviewer","session_id":"s-reviewer","settings_revision":1,"profile_hash":"reviewer-profile"})
+    );
+    assert_eq!(
+        detail["ordinary_code_budget"],
+        serde_json::json!({"allowance":6,"spent":6})
+    );
+    unchanged(&fixture, "authorized");
+    fixture.assert_scalar::<String>(
+        "SELECT a.phase||':'||a.final_repair_round||':'||a.plan_hash||':'||COALESCE(a.candidate_hash,'-')
+                ||':'||t.attention||':'||t.version||':'||f.state
+         FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN final_repair_rechecks f ON f.attempt_id=a.id",
+        "implementation:1:plan-hash:-:none:8:authorized".into(),
+    );
+
+    // After restart an identical replay returns the recorded result, even when
+    // the operation receipt was never written; a second authorization fails.
+    let reopened = Store::open(&fixture.database).unwrap();
+    let recorded = serde_json::to_value(&authorized).unwrap();
+    let replay = || {
+        serde_json::to_value(
+            authorize_final_repair_recheck(&reopened, &paths, "recover", serde_json::json!({}))
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(replay(), recorded);
+    fixture.execute(
+        "DELETE FROM operation_receipts WHERE operation_id='recover'",
+        [],
+    );
+    assert_eq!(replay(), recorded);
+    assert!(authorize_final_repair_recheck(
+        &reopened,
+        &paths,
+        "recover-again",
+        serde_json::json!({"expected_task_version":8})
+    )
+    .is_err());
+    fixture.assert_scalar::<String>(
+        "SELECT (SELECT COUNT(*) FROM final_repair_rechecks)||':'||version FROM tasks",
+        "1:8".into(),
+    );
+}
+
+#[test]
+fn final_repair_recheck_spends_its_own_receipt_once_and_approval_continues() {
+    let (fixture, reviews) = recovered_final_repair_fixture("final-repair-recheck-approval");
+    let first = reserve_final_repair_recheck(&reviews).unwrap();
+    assert_eq!(first.state, "reserved");
+    fixture.assert_scalar::<String>(
+        "SELECT state||':'||candidate_hash||':'||candidate_snapshot_id||':'||review_request_id
+         FROM final_repair_rechecks",
+        format!(
+            "reserved:fixed-candidate:fixed-snapshot:{}",
+            first.request_id
+        ),
+    );
+
+    // A proven nondelivery retries the same reservation, which a later
+    // candidate cannot take over.
+    reviews
+        .mark_delivery_failure(&first.request_id, None, false, "spawn proven not delivered")
+        .unwrap();
+    fixture.execute(
+        "UPDATE attempts SET candidate_hash='later-candidate' WHERE id='a'",
+        [],
+    );
+    assert!(reserve_final_repair_recheck(&reviews)
+        .unwrap_err()
+        .contains("different candidate"));
+    fixture.execute(
+        "UPDATE attempts SET candidate_hash='fixed-candidate' WHERE id='a'",
+        [],
+    );
+    let retry = reserve_final_repair_recheck(&reviews).unwrap();
+    assert_eq!(
+        (retry.request_id.as_str(), retry.state.as_str()),
+        (first.request_id.as_str(), "nondelivered")
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM review_requests", 4);
+
+    deliver_final_repair_recheck(&fixture, &reviews, &first.request_id, Some("approved"));
+    fixture.assert_scalar::<String>(
+        "SELECT state||':'||(spent_at IS NOT NULL) FROM final_repair_rechecks",
+        "spent:1".into(),
+    );
+    fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
+
+    // Restart reloads the spent receipt: the delivered request resumes and is
+    // neither delivered nor spent again.
+    let reopened = ReviewService::new(
+        Store::open(&fixture.database).unwrap(),
+        fixture.root.join("artifacts"),
+    );
+    let resumed = reserve_final_repair_recheck(&reopened).unwrap();
+    assert_eq!(
+        (resumed.request_id.as_str(), resumed.state.as_str()),
+        (first.request_id.as_str(), "delivered")
+    );
+    assert!(reopened
+        .bind_delivery(&first.request_id, "s-recheck", "g-recheck", 1)
+        .is_err());
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM review_requests", 4);
+    fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
+
+    final_repair_recheck_verdict(&fixture, "approved");
+    fixture.assert_scalar::<String>(
+        "SELECT a.phase||':'||a.final_repair_round||':'||a.candidate_hash||':'||t.attention
+                ||':'||f.state||':'||f.verdict
+         FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN final_repair_rechecks f ON f.attempt_id=a.id",
+        "checks:1:fixed-candidate:none:approved:approved".into(),
+    );
+    fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
+}
+
+#[test]
+fn final_repair_recheck_nonapproval_or_consumed_failure_ends_incomplete() {
+    for outcome in ["request_changes", "needs_rework", "ambiguous"] {
+        let (fixture, reviews) =
+            recovered_final_repair_fixture(&format!("final-repair-recheck-{outcome}"));
+        let request = reserve_final_repair_recheck(&reviews).unwrap().request_id;
+        if outcome == "ambiguous" {
+            reviews
+                .mark_delivery_failure(&request, None, true, "delivery uncertain")
+                .unwrap();
+            fixture
+                .assert_scalar::<String>("SELECT state FROM final_repair_rechecks", "spent".into());
+            fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
+            // Recovery resolved the uncertain delivery without any verdict.
+            fixture.execute_batch(
+                "UPDATE review_requests SET delivery_state='abandoned' WHERE delivery_state='ambiguous';
+                 UPDATE attempts SET status='running' WHERE id='a';
+                 UPDATE tasks SET attention='none' WHERE id='t';",
+            );
+            assert!(reserve_final_repair_recheck(&reviews)
+                .unwrap_err()
+                .contains("ended without a verdict"));
+        } else {
+            deliver_final_repair_recheck(&fixture, &reviews, &request, Some(outcome));
+            final_repair_recheck_verdict(&fixture, outcome);
+        }
+        assert_eq!(
+            fixture.scalar::<String>(
+                "SELECT a.phase||':'||a.final_repair_round||':'||t.attention||':'||f.state
+                 FROM attempts a JOIN tasks t ON t.id=a.task_id
+                 JOIN final_repair_rechecks f ON f.attempt_id=a.id"
+            ),
+            "needs_input:1:needs_input:closed",
+            "{outcome}"
+        );
+
+        // Nothing reopens: no further reviewer call, extension or recovery.
+        let requests = fixture.scalar::<i64>("SELECT COUNT(*) FROM review_requests");
+        fixture.execute(
+            "UPDATE attempts SET phase='code_review',candidate_hash='fixed-candidate' WHERE id='a'",
+            [],
+        );
+        assert!(
+            reserve_final_repair_recheck(&reviews)
+                .unwrap_err()
+                .contains("settled"),
+            "{outcome}"
+        );
+        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM review_requests", requests);
+        fixture.execute(
+            "UPDATE attempts SET phase='needs_input',candidate_hash=NULL WHERE id='a'",
+            [],
+        );
+        let paths = instance_paths(&fixture);
+        let version = fixture.scalar::<i64>("SELECT version FROM tasks WHERE id='t'");
+        assert!(agenticjira::trip::execute_human(
+            &fixture.store,
+            &paths,
+            "extend-after-recheck",
+            &TripHumanAction::ExtendReviewBudget {
+                task_id: "t".into(),
+                attempt_id: "a".into(),
+                expected_task_version: version,
+                review_kind: "code".into(),
+                additional: 1,
+            },
+        )
+        .is_err());
+        assert!(authorize_final_repair_recheck(
+            &fixture.store,
+            &paths,
+            "recover-again",
+            serde_json::json!({"expected_task_version":version})
+        )
+        .is_err());
+        fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
+    }
+}
+
+#[test]
+fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordinator() {
+    let (fixture, reviews) = recovered_final_repair_fixture("final-repair-recheck-unanswered");
+    let request = reserve_final_repair_recheck(&reviews).unwrap().request_id;
+    deliver_final_repair_recheck(&fixture, &reviews, &request, None);
+    let reviewer = RoleContext {
+        project_id: "p".into(),
+        task_id: "t".into(),
+        attempt_id: "a".into(),
+        role_generation_id: "g-recheck".into(),
+        session_id: "s-recheck".into(),
+        credential_id: "recheck-credential".into(),
+        transcript_epoch: "e".into(),
+        role: RoleKind::CodeReviewer,
+        provider: Provider::Codex,
+        configuration_revision: 1,
+        lane_id: "default".into(),
+        permissions: vec!["report_result".into()],
+    };
+    for (operation, outcome, candidate) in [
+        ("unsupported-outcome", "blocked", "fixed-candidate"),
+        ("wrong-candidate", "approved", "repaired-candidate"),
+    ] {
+        assert!(
+            fixture
+                .store
+                .save_role_result(
+                    &reviewer,
+                    &RoleResultReport {
+                        operation_id: operation.into(),
+                        outcome: outcome.into(),
+                        summary: "recheck".into(),
+                        evidence: vec![],
+                        metadata: serde_json::json!({
+                            "review_request_id":request,"review_kind":"code","candidate_hash":candidate
+                        }),
+                    },
+                )
+                .is_err(),
+            "{operation}"
+        );
+    }
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM role_results WHERE session_id='s-recheck'",
+        0,
+    );
+    fixture.execute_batch(
+        r#"UPDATE sessions SET status='exited',exit_json='{"process_group_quiescent":true}'
+             WHERE id='s-recheck';
+           UPDATE role_generations SET status='exited' WHERE id='g-recheck';"#,
+    );
+
+    let terminal = "SELECT a.phase||':'||a.final_repair_round||':'||t.attention||':'||f.state
+            ||':'||f.closed_reason||':'||(f.spent_at IS NOT NULL)||':'||r.delivery_state
+            ||':'||(r.budget_spent_at IS NOT NULL)||':'||COALESCE(r.verdict,'-')
+            ||':'||(SELECT COUNT(*) FROM review_requests)
+            ||':'||(SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.final_repair_recheck.closed')
+         FROM attempts a JOIN tasks t ON t.id=a.task_id
+         JOIN final_repair_rechecks f ON f.attempt_id=a.id
+         JOIN review_requests r ON r.id=f.review_request_id";
+    let paths = instance_paths(&fixture);
+    let app = Application::new(
+        paths.clone(),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    let closed = app.coordinator_tick().unwrap();
+    assert_eq!(closed["action"], "final_repair_recheck_closed", "{closed}");
+    assert_eq!(closed["request_id"], request.as_str());
+    let expected =
+        "needs_input:1:needs_input:closed:reviewer_exited_without_result:1:abandoned:1:-:4:1";
+    fixture.assert_scalar::<String>(terminal, expected.into());
+    fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
+    let version = fixture.scalar::<i64>("SELECT version FROM tasks WHERE id='t'");
+    drop(app);
+
+    // After restart the closed receipt neither closes again nor admits a
+    // replacement reviewer call.
+    let reopened = Application::new(
+        paths.clone(),
+        Store::open(&fixture.database).unwrap(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        reopened.coordinator_tick().unwrap()["action"],
+        "final_repair_recheck_closed"
+    );
+    assert!(reserve_final_repair_recheck(&reviews)
+        .unwrap_err()
+        .contains("settled"));
+    fixture.assert_scalar::<String>(terminal, expected.into());
+    fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
+    fixture.assert_scalar::<i64>("SELECT version FROM tasks WHERE id='t'", version);
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+#[test]
+fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
+    let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
+    fixture.assert_scalar("PRAGMA user_version", 32_i64);
+    let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
+    fixture.execute_batch("DROP TABLE final_repair_rechecks; PRAGMA user_version=30;");
+    assert!(Store::open_current_readonly(&fixture.database).is_err());
+    let upgraded = Store::open(&fixture.database).unwrap();
+    fixture.assert_scalar("PRAGMA user_version", 32_i64);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
+    assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
+    fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
+    authorize_final_repair_recheck(
+        &upgraded,
+        &instance_paths(&fixture),
+        "recover",
+        serde_json::json!({}),
+    )
+    .unwrap();
+}
+
+const STALE_GUIDANCE_BODY: &str = "Implementation candidate is frozen. Propose phase code_review.";
+
+/// A held attempt whose exited manager session left one guidance message
+/// written but never confirmed as submitted. The session's generation anchor
+/// is absent from this boot, so its processes are provably gone.
+fn unconfirmed_guidance_fixture(name: &str) -> Fixture {
+    let fixture = Fixture::new(name);
+    seed_attempt(&fixture, "code_review");
+    fixture.execute("UPDATE attempts SET status='held' WHERE id='a'", []);
+    fixture.execute("UPDATE tasks SET attention='paused' WHERE id='t'", []);
+    fixture.execute(
+        "INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,spent)
+         VALUES('code-budget','a','code',3,2)",
+        [],
+    );
+    seed_session(&fixture, "a", "manager", "g-manager", "s-manager", "exited");
+    let boot = agenticjira::supervisor::system_boot_identity().unwrap();
+    fixture.execute(
+        "UPDATE sessions SET launch_state='finished',transcript_epoch='epoch-resumed',resume_count=1,
+           recovery_anchor_json=?1,launch_boot_identity=?2,recovery_process_group_id=2000000000
+         WHERE id='s-manager'",
+        params![
+            serde_json::json!({"pid":2000000000_u32,"process_group_id":2000000000,
+                "native_start_marker":"synthetic-absent-manager","boot_identity":boot})
+            .to_string(),
+            boot
+        ],
+    );
+    fixture.execute(
+        "UPDATE role_generations SET status='exited' WHERE id='g-manager'",
+        [],
+    );
+    fixture.execute(
+        "INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,launch_config_json,capability_key,capability_identity_json,state,created_at,updated_at)
+         VALUES('ri-manager','s-manager',1,'epoch-resumed','{}','k','{}','exited','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        [],
+    );
+    fixture.execute(
+        "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,reason,created_at,written_at,delivery_session_id,delivery_transcript_epoch,delivery_resume_invocation_id)
+         VALUES('stale-guidance','a','g-manager',?1,'written_awaiting_submit','written_through_verified_input_lease',
+                '2026-01-01T00:00:00Z','2026-01-01T00:00:01Z','s-manager','epoch-resumed','ri-manager')",
+        params![STALE_GUIDANCE_BODY],
+    );
+    fixture
+}
+
+/// Applies the exact abandonment through the ordinary human-command route,
+/// with `overrides` replacing individual fields of the correct binding.
+fn abandon_guidance(
+    fixture: &Fixture,
+    operation: &str,
+    overrides: serde_json::Value,
+) -> Result<OperationResult, String> {
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let mut command = serde_json::json!({
+        "kind":"abandon_unconfirmed_guidance","operation_id":operation,
+        "task_id":"t","expected_version":version,"attempt_id":"a",
+        "guidance_id":"stale-guidance","role_generation_id":"g-manager",
+        "delivery_session_id":"s-manager","delivery_transcript_epoch":"epoch-resumed",
+        "delivery_resume_invocation_id":"ri-manager","expected_state":"written_awaiting_submit",
+        "reason":"obsolete code-review guidance from an exited manager session",
+    });
+    for (field, value) in overrides.as_object().unwrap() {
+        command[field] = value.clone();
+    }
+    let command: HumanCommand = serde_json::from_value(command).unwrap();
+    workflow::execute(&fixture.store, &command).map_err(|error| format!("{error:#}"))
+}
+
+/// Records this test process as a live process of `s-manager`.
+fn record_live_manager_process(fixture: &Fixture) {
+    let current_pid = std::process::id();
+    let current_start = String::from_utf8(
+        Command::new("/bin/ps")
+            .args(["-o", "lstart=", "-p", &current_pid.to_string()])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    fixture.execute(
+        "INSERT INTO session_processes(session_id,pid,native_start_marker,process_group_id,last_seen_at)
+         VALUES('s-manager',?1,?2,2000000000,'2026-01-01T00:00:00Z')",
+        params![current_pid, current_start],
+    );
+}
+
+const GUIDANCE_ROW: &str = "SELECT state || ':' || reason || ':' || body || ':' || written_at || ':' ||
+    delivery_session_id || ':' || delivery_transcript_epoch || ':' || delivery_resume_invocation_id || ':' ||
+    (submitted_at IS NULL) || ':' || (acknowledged_at IS NULL)
+    FROM guidance_messages WHERE id='stale-guidance'";
+
+const GUIDANCE_HOLD_AND_REVIEWS: &str =
+    "SELECT t.lifecycle || ':' || t.attention || ':' || a.status || ':' ||
+    a.phase || ':' || b.initial_allowance || ':' || b.spent
+    FROM tasks t JOIN attempts a ON a.task_id=t.id JOIN review_budgets b ON b.attempt_id=a.id
+    WHERE t.id='t'";
+
+#[test]
+fn unconfirmed_guidance_abandonment_keeps_evidence_hold_and_review_counts() {
+    let fixture = unconfirmed_guidance_fixture("guidance-abandon-accepted");
+    fixture.execute_batch(
+        "UPDATE sessions SET transcript_epoch='epoch-current',resume_count=2 WHERE id='s-manager';
+         INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,launch_config_json,capability_key,capability_identity_json,state,created_at,updated_at)
+         VALUES('ri-manager-later','s-manager',2,'epoch-current','{}','k','{}','exited','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z');",
+    );
+    let previous = fixture.scalar::<String>(GUIDANCE_ROW);
+    let wrong_epoch = abandon_guidance(
+        &fixture,
+        "abandon-current-epoch",
+        serde_json::json!({"delivery_transcript_epoch":"epoch-current"}),
+    )
+    .unwrap_err();
+    assert!(
+        wrong_epoch.contains("delivery binding: delivery_transcript_epoch"),
+        "{wrong_epoch}"
+    );
+    fixture.assert_scalar::<String>(GUIDANCE_ROW, previous);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='abandon-current-epoch'",
+        0,
+    );
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let hold = fixture.scalar::<String>(GUIDANCE_HOLD_AND_REVIEWS);
+    assert_eq!(hold, "in_progress:paused:held:code_review:3:2");
+    let applied = abandon_guidance(&fixture, "abandon-1", serde_json::json!({})).unwrap();
+    assert_eq!(applied.state, "guidance_delivery_abandoned");
+    assert_eq!(applied.entity_id, "stale-guidance");
+    assert_eq!(applied.version, Some(version + 1));
+    assert_eq!(applied.detail["delivery_outcome"], "unconfirmed");
+    fixture.assert_scalar::<String>(
+        GUIDANCE_ROW,
+        format!("abandoned:human_abandoned_unconfirmed_delivery:{STALE_GUIDANCE_BODY}:2026-01-01T00:00:01Z:s-manager:epoch-resumed:ri-manager:1:1"),
+    );
+    // The replaced state and reason survive only in the audit record.
+    fixture.assert_scalar::<String>(
+        "SELECT json_extract(detail_json,'$.previous.state') || ':' ||
+                json_extract(detail_json,'$.previous.reason') || ':' ||
+                json_extract(detail_json,'$.human_reason') || ':' ||
+                json_extract(detail_json,'$.quiescence.verification.session_id')
+         FROM audit_events WHERE event_code='guidance.delivery.abandoned' AND operation_id='abandon-1'",
+        "written_awaiting_submit:written_through_verified_input_lease:obsolete code-review guidance from an exited manager session:s-manager".into(),
+    );
+    fixture.assert_scalar::<String>(GUIDANCE_HOLD_AND_REVIEWS, hold.clone());
+    fixture.assert_scalar::<i64>("SELECT version FROM tasks WHERE id='t'", version + 1);
+
+    let replay: HumanCommand = serde_json::from_value(serde_json::json!({
+        "kind":"abandon_unconfirmed_guidance","operation_id":"abandon-1",
+        "task_id":"t","expected_version":version,"attempt_id":"a",
+        "guidance_id":"stale-guidance","role_generation_id":"g-manager",
+        "delivery_session_id":"s-manager","delivery_transcript_epoch":"epoch-resumed",
+        "delivery_resume_invocation_id":"ri-manager","expected_state":"written_awaiting_submit",
+        "reason":"obsolete code-review guidance from an exited manager session",
+    }))
+    .unwrap();
+    // Replay is answered from the receipt even though the row is now abandoned.
+    let replayed = workflow::execute(&fixture.store, &replay).unwrap();
+    assert_eq!(replayed.state, applied.state);
+    assert_eq!(replayed.detail, applied.detail);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='guidance.delivery.abandoned'",
+        1,
+    );
+    fixture.assert_scalar::<i64>("SELECT version FROM tasks WHERE id='t'", version + 1);
+
+    let mut altered = replay.clone();
+    if let HumanCommand::AbandonUnconfirmedGuidance { delivery, .. } = &mut altered {
+        delivery.reason = "a different reason".into();
+    }
+    assert!(workflow::execute(&fixture.store, &altered)
+        .unwrap_err()
+        .to_string()
+        .contains("already used with different input"));
+    let again = abandon_guidance(&fixture, "abandon-2", serde_json::json!({})).unwrap_err();
+    assert!(
+        again.contains("does not match the supplied delivery binding: state"),
+        "{again}"
+    );
+    fixture.assert_scalar::<String>(GUIDANCE_HOLD_AND_REVIEWS, hold);
+}
+
+#[test]
+fn unconfirmed_guidance_abandonment_refuses_mismatched_bindings() {
+    let fixture = unconfirmed_guidance_fixture("guidance-abandon-mismatch");
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let cases = [
+        (
+            "stale version",
+            serde_json::json!({"expected_version":version - 1}),
+            "task version is stale",
+        ),
+        (
+            "other task",
+            serde_json::json!({"task_id":"other"}),
+            "task version is stale",
+        ),
+        (
+            "other attempt",
+            serde_json::json!({"attempt_id":"other"}),
+            "not the task's current unfinished attempt",
+        ),
+        (
+            "unknown guidance",
+            serde_json::json!({"guidance_id":"other"}),
+            "guidance other does not exist",
+        ),
+        (
+            "other generation",
+            serde_json::json!({"role_generation_id":"g-other"}),
+            "delivery binding: role_generation_id",
+        ),
+        (
+            "other session",
+            serde_json::json!({"delivery_session_id":"s-other"}),
+            "session s-other does not exist",
+        ),
+        (
+            "other epoch",
+            serde_json::json!({"delivery_transcript_epoch":"e"}),
+            "delivery binding: delivery_transcript_epoch",
+        ),
+        (
+            "missing invocation",
+            serde_json::json!({"delivery_resume_invocation_id":null}),
+            "delivery binding: delivery_resume_invocation_id",
+        ),
+        (
+            "other state",
+            serde_json::json!({"expected_state":"delivery_unknown"}),
+            "delivery binding: state",
+        ),
+        (
+            "confirmed state",
+            serde_json::json!({"expected_state":"submitted"}),
+            "expected_state must be",
+        ),
+        (
+            "blank reason",
+            serde_json::json!({"reason":"  "}),
+            "reason of at most 4096 bytes",
+        ),
+    ];
+    for (name, overrides, expected) in cases {
+        let error = abandon_guidance(&fixture, &format!("mismatch-{name}"), overrides)
+            .err()
+            .unwrap_or_else(|| panic!("{name} was accepted"));
+        assert!(error.contains(expected), "{name}: {error}");
+    }
+    fixture.execute("UPDATE attempts SET status='cancelled' WHERE id='a'", []);
+    let finished =
+        abandon_guidance(&fixture, "finished-attempt", serde_json::json!({})).unwrap_err();
+    assert!(
+        finished.contains("not the task's current unfinished attempt"),
+        "{finished}"
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM guidance_messages WHERE id='stale-guidance'",
+        "written_awaiting_submit".into(),
+    );
+    fixture.assert_scalar::<i64>("SELECT version FROM tasks WHERE id='t'", version);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_kind='human_command'",
+        0,
+    );
+}
+
+#[test]
+fn unconfirmed_guidance_abandonment_refuses_live_or_uncertain_delivery_sessions() {
+    let fixture = unconfirmed_guidance_fixture("guidance-abandon-quiescence");
+    let refuse = |name: &str, setup: &str, undo: &str, expected: &str| {
+        fixture.execute_batch(setup);
+        let error = abandon_guidance(
+            &fixture,
+            &format!("quiescence-{name}"),
+            serde_json::json!({}),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{name} was accepted"));
+        assert!(error.contains(expected), "{name}: {error}");
+        fixture.execute_batch(undo);
+    };
+    refuse(
+        "running",
+        "UPDATE sessions SET status='running' WHERE id='s-manager'",
+        "UPDATE sessions SET status='exited' WHERE id='s-manager'",
+        "is running; this action requires the session to have exited",
+    );
+    let (anchor, boot): (String, String) = fixture
+        .connection()
+        .query_row(
+            "SELECT recovery_anchor_json,launch_boot_identity FROM sessions WHERE id='s-manager'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    refuse(
+        "no process evidence",
+        "UPDATE sessions SET recovery_anchor_json=NULL,recovery_process_group_id=NULL,launch_boot_identity=NULL WHERE id='s-manager'",
+        "",
+        "quiescence is unknown",
+    );
+    fixture.execute(
+        "UPDATE sessions SET recovery_anchor_json=?1,recovery_process_group_id=2000000000,launch_boot_identity=?2 WHERE id='s-manager'",
+        params![anchor, boot],
+    );
+    refuse(
+        "resume in flight",
+        "UPDATE resume_invocations SET state='spawning' WHERE id='ri-manager'",
+        "UPDATE resume_invocations SET state='exited' WHERE id='ri-manager'",
+        "a native resume of the session is reserved or running",
+    );
+    refuse(
+        "launch outcome unknown",
+        "UPDATE sessions SET launch_state='delivery_unknown' WHERE id='s-manager'",
+        "UPDATE sessions SET launch_state='finished' WHERE id='s-manager'",
+        "launch or resume outcome is unresolved",
+    );
+    refuse(
+        "open session recovery",
+        "INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at)
+         VALUES('open-recovery','s-manager','a','attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        "DELETE FROM recovery_records WHERE id='open-recovery'",
+        "a recovery is open for the session",
+    );
+    refuse(
+        "other session recovering",
+        "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+         VALUES('g-writer','a','implementer','codex',1,1,'running','f','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+         INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+         VALUES('s-writer','g-writer','codex','recovery_required','{}','fixture','writer-epoch','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        "UPDATE sessions SET status='exited',launch_state='finished' WHERE id='s-writer'",
+        "an agent session of the attempt is starting, stopping or needs recovery",
+    );
+    refuse(
+        "uncertain claim",
+        "INSERT INTO claims(id,task_id,attempt_id,repository_identity,state,created_at,updated_at)
+         VALUES('uncertain-claim','t','a','/tmp/identity','unknown','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        "DELETE FROM claims WHERE id='uncertain-claim'",
+        "the attempt's repository claim is uncertain",
+    );
+    record_live_manager_process(&fixture);
+    let live = abandon_guidance(&fixture, "quiescence-live", serde_json::json!({})).unwrap_err();
+    assert!(live.contains("remain live"), "{live}");
+    fixture.execute(
+        "DELETE FROM session_processes WHERE session_id='s-manager'",
+        [],
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM guidance_messages WHERE id='stale-guidance'",
+        "written_awaiting_submit".into(),
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='guidance.delivery.abandoned'",
+        0,
+    );
+
+    // A later verified-quiescent recovery settles an unfinished launch outcome.
+    fixture.execute_batch(
+        "UPDATE sessions SET launch_state='delivery_unknown' WHERE id='s-manager';
+         UPDATE resume_invocations SET state='delivery_unknown' WHERE id='ri-manager';
+         INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at)
+         VALUES('settled-recovery','s-manager','a','resolved_quiescent','{}','2026-01-01T00:00:02Z','2026-01-01T00:00:02Z');",
+    );
+    let settled = abandon_guidance(&fixture, "quiescence-settled", serde_json::json!({})).unwrap();
+    assert_eq!(settled.state, "guidance_delivery_abandoned");
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM guidance_messages WHERE id='stale-guidance'",
+        "abandoned".into(),
+    );
+}
+
+const STALE_RESTART_RESULT: &str = r#"{"fresh_dispatch_release":{"native_resume_implied":false,"source":"human_continue"},"llmrelay_restart_v1":{"admission":null,"batch":null,"batch_history":[],"capacity_deferrals":0,"next_due_at":null,"replacement_failures":0,"version":1},"prior_status":"exited","role":"manager"}"#;
+
+const STALE_RESTART_REASON: &str =
+    "task is paused, input-required, terminal, or no longer parked for restoration";
+
+/// A running needs-input attempt whose exited manager session still has a
+/// skipped restart candidate from an earlier planned shutdown. The session's
+/// generation anchor is absent from this boot, so its processes are gone.
+fn stale_restart_fixture(name: &str) -> Fixture {
+    let fixture = Fixture::new(name);
+    seed_attempt(&fixture, "needs_input");
+    fixture.execute("UPDATE tasks SET attention='needs_input' WHERE id='t'", []);
+    fixture.execute(
+        "INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,spent)
+         VALUES('code-budget','a','code',3,2)",
+        [],
+    );
+    seed_session(&fixture, "a", "manager", "g-manager", "s-manager", "exited");
+    let boot = agenticjira::supervisor::system_boot_identity().unwrap();
+    fixture.execute(
+        "UPDATE sessions SET launch_state='finished',desired_running=0,transcript_epoch='epoch-resumed',
+           resume_count=1,recovery_anchor_json=?1,launch_boot_identity=?2,
+           recovery_process_group_id=2000000000
+         WHERE id='s-manager'",
+        params![
+            serde_json::json!({"pid":2000000000_u32,"process_group_id":2000000000,
+                "native_start_marker":"synthetic-absent-manager","boot_identity":boot})
+            .to_string(),
+            boot
+        ],
+    );
+    fixture.execute(
+        "UPDATE role_generations SET status='exited' WHERE id='g-manager'",
+        [],
+    );
+    fixture.execute(
+        "INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,launch_config_json,capability_key,capability_identity_json,state,created_at,updated_at)
+         VALUES('ri-manager','s-manager',1,'epoch-resumed','{}','k','{}','exited','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        [],
+    );
+    fixture.execute(
+        "INSERT INTO restart_candidates(session_id,attempt_id,task_id,source,state,reason,requested_by,result_json,created_at,updated_at)
+         VALUES('s-manager','a','t','planned_shutdown','skipped',?1,'human_continue',?2,
+                '2026-01-01T00:00:00Z','2026-01-02T00:00:00Z')",
+        params![STALE_RESTART_REASON, STALE_RESTART_RESULT],
+    );
+    fixture
+}
+
+/// Applies the exact cancellation through the ordinary human-command route,
+/// with `overrides` replacing individual fields of the correct binding.
+fn cancel_stale_restart(
+    fixture: &Fixture,
+    operation: &str,
+    overrides: serde_json::Value,
+) -> Result<OperationResult, String> {
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let mut command = serde_json::json!({
+        "kind":"cancel_stale_restart_candidate","operation_id":operation,
+        "task_id":"t","expected_version":version,"attempt_id":"a",
+        "session_id":"s-manager","role_generation_id":"g-manager",
+        "expected_state":"skipped","expected_source":"planned_shutdown",
+        "expected_requested_by":"human_continue","expected_updated_at":"2026-01-02T00:00:00Z",
+        "expected_result_sha256":sha256(STALE_RESTART_RESULT.as_bytes()),
+        "reason":"skipped candidate can never be restored; it only fences guidance reauthorization",
+    });
+    for (field, value) in overrides.as_object().unwrap() {
+        command[field] = value.clone();
+    }
+    let command: HumanCommand = serde_json::from_value(command).unwrap();
+    workflow::execute(&fixture.store, &command).map_err(|error| format!("{error:#}"))
+}
+
+// The attempt-wide restart-hold predicate every guidance reauthorization applies.
+const OPEN_RESTART_HOLD: &str =
+    "SELECT EXISTS(SELECT 1 FROM restart_candidates WHERE attempt_id='a'
+    AND state NOT IN ('resumed','released_fresh_dispatch','cancelled'))";
+
+const RESTART_HOLD_AND_REVIEWS: &str =
+    "SELECT t.lifecycle || ':' || t.attention || ':' || a.status || ':' ||
+    a.phase || ':' || b.initial_allowance || ':' || b.spent || ':' ||
+    s.status || ':' || s.desired_running || ':' ||
+    (SELECT COUNT(*) FROM resume_invocations WHERE session_id=s.id)
+    FROM tasks t JOIN attempts a ON a.task_id=t.id JOIN review_budgets b ON b.attempt_id=a.id
+    JOIN sessions s ON s.id='s-manager'
+    WHERE t.id='t'";
+
+#[test]
+fn stale_restart_candidate_cancellation_keeps_result_hold_and_review_counts() {
+    let fixture = stale_restart_fixture("restart-cancel-accepted");
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let hold = fixture.scalar::<String>(RESTART_HOLD_AND_REVIEWS);
+    assert_eq!(
+        hold,
+        "in_progress:needs_input:running:needs_input:3:2:exited:0:1"
+    );
+    fixture.assert_scalar::<bool>(OPEN_RESTART_HOLD, true);
+    let applied = cancel_stale_restart(&fixture, "cancel-1", serde_json::json!({})).unwrap();
+    assert_eq!(applied.state, "restart_candidate_cancelled");
+    assert_eq!(applied.entity_id, "s-manager");
+    assert_eq!(applied.version, Some(version + 1));
+    assert_eq!(applied.detail["native_resume_implied"], false);
+    assert_eq!(applied.detail["fresh_dispatch_implied"], false);
+    fixture.assert_scalar::<bool>(OPEN_RESTART_HOLD, false);
+    fixture.assert_scalar::<String>(
+        "SELECT state || ':' || source || ':' || requested_by || ':' || created_at || ':' ||
+                (reason LIKE 'explicit human cancellation of a stale skipped restart candidate%')
+         FROM restart_candidates WHERE session_id='s-manager'",
+        "cancelled:planned_shutdown:human_continue:2026-01-01T00:00:00Z:1".into(),
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT result_json FROM restart_candidates WHERE session_id='s-manager'",
+        STALE_RESTART_RESULT.into(),
+    );
+    // The replaced state, reason and freshness survive only in the audit record.
+    fixture.assert_scalar::<String>(
+        "SELECT json_extract(detail_json,'$.previous.state') || ':' ||
+                json_extract(detail_json,'$.previous.reason') || ':' ||
+                json_extract(detail_json,'$.previous.updated_at') || ':' ||
+                json_extract(detail_json,'$.human_reason') || ':' ||
+                json_extract(detail_json,'$.quiescence.verification.session_id')
+         FROM audit_events WHERE event_code='restart.candidate.cancelled' AND operation_id='cancel-1'",
+        format!("skipped:{STALE_RESTART_REASON}:2026-01-02T00:00:00Z:skipped candidate can never be restored; it only fences guidance reauthorization:s-manager"),
+    );
+    fixture.assert_scalar::<String>(RESTART_HOLD_AND_REVIEWS, hold.clone());
+    fixture.assert_scalar::<i64>("SELECT version FROM tasks WHERE id='t'", version + 1);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='restart.hold.released'",
+        0,
+    );
+
+    let replay: HumanCommand = serde_json::from_value(serde_json::json!({
+        "kind":"cancel_stale_restart_candidate","operation_id":"cancel-1",
+        "task_id":"t","expected_version":version,"attempt_id":"a",
+        "session_id":"s-manager","role_generation_id":"g-manager",
+        "expected_state":"skipped","expected_source":"planned_shutdown",
+        "expected_requested_by":"human_continue","expected_updated_at":"2026-01-02T00:00:00Z",
+        "expected_result_sha256":sha256(STALE_RESTART_RESULT.as_bytes()),
+        "reason":"skipped candidate can never be restored; it only fences guidance reauthorization",
+    }))
+    .unwrap();
+    // Replay is answered from the receipt even though the candidate is now cancelled.
+    let replayed = workflow::execute(&fixture.store, &replay).unwrap();
+    assert_eq!(replayed.state, applied.state);
+    assert_eq!(replayed.detail, applied.detail);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='restart.candidate.cancelled'",
+        1,
+    );
+    fixture.assert_scalar::<i64>("SELECT version FROM tasks WHERE id='t'", version + 1);
+
+    let mut altered = replay.clone();
+    if let HumanCommand::CancelStaleRestartCandidate { candidate, .. } = &mut altered {
+        candidate.reason = "a different reason".into();
+    }
+    assert!(workflow::execute(&fixture.store, &altered)
+        .unwrap_err()
+        .to_string()
+        .contains("already used with different input"));
+    let again = cancel_stale_restart(&fixture, "cancel-2", serde_json::json!({})).unwrap_err();
+    assert!(again.contains("supplied binding: state"), "{again}");
+    fixture.assert_scalar::<String>(RESTART_HOLD_AND_REVIEWS, hold);
+}
+
+#[test]
+fn stale_restart_candidate_cancellation_refuses_mismatched_or_live_candidates() {
+    let fixture = stale_restart_fixture("restart-cancel-mismatch");
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let cases = [
+        (
+            "stale version",
+            serde_json::json!({"expected_version":version - 1}),
+            "task version is stale",
+        ),
+        (
+            "other attempt",
+            serde_json::json!({"attempt_id":"other"}),
+            "not the task's current unfinished attempt",
+        ),
+        (
+            "other generation",
+            serde_json::json!({"role_generation_id":"g-other"}),
+            "supplied binding: role_generation_id",
+        ),
+        (
+            "unknown session",
+            serde_json::json!({"session_id":"s-other"}),
+            "session s-other does not exist",
+        ),
+        (
+            "other source",
+            serde_json::json!({"expected_source":"unclean_shutdown"}),
+            "supplied binding: source",
+        ),
+        (
+            "missing requester",
+            serde_json::json!({"expected_requested_by":null}),
+            "supplied binding: requested_by",
+        ),
+        (
+            "stale freshness",
+            serde_json::json!({"expected_updated_at":"2026-01-01T00:00:00Z"}),
+            "supplied binding: updated_at",
+        ),
+        (
+            "other result",
+            serde_json::json!({"expected_result_sha256":sha256(b"{}")}),
+            "supplied binding: result_sha256",
+        ),
+        (
+            "live state",
+            serde_json::json!({"expected_state":"parked"}),
+            "only a skipped restart candidate can be cancelled",
+        ),
+        (
+            "blank reason",
+            serde_json::json!({"reason":"  "}),
+            "reason of at most 4096 bytes",
+        ),
+    ];
+    for (name, overrides, expected) in cases {
+        let error = cancel_stale_restart(&fixture, &format!("mismatch-{name}"), overrides)
+            .err()
+            .unwrap_or_else(|| panic!("{name} was accepted"));
+        assert!(error.contains(expected), "{name}: {error}");
+    }
+    for live in [
+        "parked",
+        "queued_capacity",
+        "failed",
+        "blocked",
+        "pending_reconciliation",
+    ] {
+        fixture.execute(
+            "UPDATE restart_candidates SET state=?1 WHERE session_id='s-manager'",
+            params![live],
+        );
+        let error = cancel_stale_restart(&fixture, &format!("live-{live}"), serde_json::json!({}))
+            .unwrap_err();
+        assert!(error.contains("supplied binding: state"), "{live}: {error}");
+    }
+    fixture.execute(
+        "UPDATE restart_candidates SET state='skipped' WHERE session_id='s-manager'",
+        [],
+    );
+    let scheduled = STALE_RESTART_RESULT.replace(
+        r#""next_due_at":null"#,
+        r#""next_due_at":"2026-01-03T00:00:00Z""#,
+    );
+    fixture.execute(
+        "UPDATE restart_candidates SET result_json=?1 WHERE session_id='s-manager'",
+        params![scheduled],
+    );
+    let error = cancel_stale_restart(
+        &fixture,
+        "scheduled-resume",
+        serde_json::json!({"expected_result_sha256":sha256(scheduled.as_bytes())}),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("still carries admission, batch or scheduled resume authority"),
+        "{error}"
+    );
+    fixture.execute(
+        "UPDATE restart_candidates SET result_json=?1 WHERE session_id='s-manager'",
+        params![STALE_RESTART_RESULT],
+    );
+    fixture.execute("UPDATE attempts SET status='cancelled' WHERE id='a'", []);
+    let finished =
+        cancel_stale_restart(&fixture, "finished-attempt", serde_json::json!({})).unwrap_err();
+    assert!(
+        finished.contains("not the task's current unfinished attempt"),
+        "{finished}"
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM restart_candidates WHERE session_id='s-manager'",
+        "skipped".into(),
+    );
+    fixture.assert_scalar::<i64>("SELECT version FROM tasks WHERE id='t'", version);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_kind='human_command'",
+        0,
+    );
+}
+
+#[test]
+fn stale_restart_candidate_cancellation_refuses_live_sessions_and_pending_admission() {
+    let fixture = stale_restart_fixture("restart-cancel-quiescence");
+    let refuse = |name: &str, setup: &str, undo: &str, expected: &str| {
+        fixture.execute_batch(setup);
+        let error = cancel_stale_restart(
+            &fixture,
+            &format!("quiescence-{name}"),
+            serde_json::json!({}),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{name} was accepted"));
+        assert!(error.contains(expected), "{name}: {error}");
+        fixture.execute_batch(undo);
+    };
+    refuse(
+        "running",
+        "UPDATE sessions SET status='running' WHERE id='s-manager'",
+        "UPDATE sessions SET status='exited' WHERE id='s-manager'",
+        "is running; this action requires the session to have exited",
+    );
+    refuse(
+        "restored at startup",
+        "UPDATE sessions SET desired_running=1 WHERE id='s-manager'",
+        "UPDATE sessions SET desired_running=0 WHERE id='s-manager'",
+        "still marked to be restored at startup",
+    );
+    refuse(
+        "pending peer reconciliation",
+        "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+         VALUES('g-writer','a','implementer','codex',1,1,'exited','f','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+         INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+         VALUES('s-writer','g-writer','codex','exited','{}','fixture','writer-epoch','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+         INSERT INTO restart_candidates(session_id,attempt_id,task_id,source,state,reason,result_json,created_at,updated_at)
+         VALUES('s-writer','a','t','unclean_shutdown','pending_reconciliation','awaiting verification','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        "UPDATE restart_candidates SET state='cancelled' WHERE session_id='s-writer'",
+        "a restart admission or reconciliation is pending for the attempt",
+    );
+    refuse(
+        "resume in flight",
+        "UPDATE resume_invocations SET state='spawning' WHERE id='ri-manager'",
+        "UPDATE resume_invocations SET state='exited' WHERE id='ri-manager'",
+        "a native resume of the session is reserved or running",
+    );
+    refuse(
+        "open attempt recovery",
+        "INSERT INTO recovery_records(id,attempt_id,state,detail_json,created_at,updated_at)
+         VALUES('open-recovery','a','attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        "DELETE FROM recovery_records WHERE id='open-recovery'",
+        "a recovery is open for the attempt",
+    );
+    refuse(
+        "keyboard control",
+        "INSERT INTO input_leases(session_id,lease_id_hash,owner_kind,owner_id,role_generation_id,process_identity_json,expires_at,created_at,updated_at)
+         VALUES('s-manager','lease','human','browser','g-manager','{}','2999-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        "DELETE FROM input_leases WHERE session_id='s-manager'",
+        "someone has keyboard control of an agent of the attempt",
+    );
+    refuse(
+        "no process evidence",
+        "UPDATE sessions SET recovery_anchor_json=NULL,recovery_process_group_id=NULL,launch_boot_identity=NULL WHERE id='s-manager'",
+        "",
+        "quiescence is unknown",
+    );
+    // The earlier undo left the session without process evidence; restore it.
+    let boot = agenticjira::supervisor::system_boot_identity().unwrap();
+    fixture.execute(
+        "UPDATE sessions SET recovery_anchor_json=?1,recovery_process_group_id=2000000000,launch_boot_identity=?2 WHERE id='s-manager'",
+        params![
+            serde_json::json!({"pid":2000000000_u32,"process_group_id":2000000000,
+                "native_start_marker":"synthetic-absent-manager","boot_identity":boot})
+            .to_string(),
+            boot
+        ],
+    );
+    record_live_manager_process(&fixture);
+    let live =
+        cancel_stale_restart(&fixture, "quiescence-live", serde_json::json!({})).unwrap_err();
+    assert!(live.contains("remain live"), "{live}");
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM restart_candidates WHERE session_id='s-manager'",
+        "skipped".into(),
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='restart.candidate.cancelled'",
+        0,
+    );
+    fixture.execute(
+        "DELETE FROM session_processes WHERE session_id='s-manager'",
+        [],
+    );
+    let settled =
+        cancel_stale_restart(&fixture, "quiescence-settled", serde_json::json!({})).unwrap();
+    assert_eq!(settled.state, "restart_candidate_cancelled");
+}
+
+const MIGRATION_031_SQL: &str = include_str!("../migrations/031_final_repair_recheck.sql");
+
+/// Every column a schema-31 receipt has, quoted so that NULLs compare exactly.
+const SCHEMA_31_RECEIPT_ROWS: &str = "SELECT group_concat(
+    quote(attempt_id)||quote(task_id)||quote(operation_id)||quote(request_hash)
+    ||quote(authorized_task_version)||quote(plan_hash)||quote(configuration_hash)
+    ||quote(approved_code_request_id)||quote(prior_candidate_hash)||quote(final_request_id)
+    ||quote(rejected_code_request_id)||quote(rejected_code_result_id)
+    ||quote(reviewer_generation_id)||quote(reviewer_session_id)
+    ||quote(reviewer_settings_revision)||quote(reviewer_profile_hash)||quote(detail_json)
+    ||quote(state)||quote(candidate_hash)||quote(candidate_snapshot_id)
+    ||quote(review_request_id)||quote(spent_at)||quote(verdict)||quote(closed_reason)
+    ||quote(created_at)||quote(updated_at),';')
+    FROM (SELECT * FROM final_repair_rechecks ORDER BY attempt_id)";
+
+/// The historical final-repair fixture reshaped to the applied schema 31, with
+/// one receipt in each state. The authorized receipt of `a` has one consumed
+/// authenticated final result; every other receipt has its own attempt.
+fn schema_31_receipt_fixture(name: &str) -> Fixture {
+    let fixture = final_repair_recheck_fixture(name);
+    fixture.execute_batch(&format!(
+        "DROP TABLE final_repair_rechecks; {MIGRATION_031_SQL} PRAGMA user_version=31;"
+    ));
+    fixture.execute_batch(
+        r#"INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
+             VALUES('final-result','final-report','s-final','g-final','request_changes','repair','[]',
+               '{"review_request_id":"final-changes","review_kind":"final","candidate_hash":"approved-candidate"}',
+               '2026-01-01T00:00:02Z','2026-01-01T00:00:02Z');
+           INSERT INTO final_repair_rechecks(attempt_id,task_id,operation_id,request_hash,authorized_task_version,plan_hash,configuration_hash,
+               approved_code_request_id,prior_candidate_hash,final_request_id,rejected_code_request_id,rejected_code_result_id,
+               reviewer_generation_id,reviewer_session_id,reviewer_settings_revision,reviewer_profile_hash,detail_json,state,created_at,updated_at)
+             VALUES('a','t','op-authorized','h',7,'plan-hash','configuration','approved-code','approved-candidate','final-changes',
+               'sixth-code','sixth-result','g-reviewer','s-reviewer',1,'reviewer-profile','{"state":"authorized"}','authorized',
+               '2026-01-01T00:00:04Z','2026-01-01T00:00:04Z');"#,
+    );
+    for (state, verdict, closed) in [
+        ("reserved", None, None),
+        ("spent", None, None),
+        ("approved", Some("approved"), None),
+        ("closed", Some("needs_rework"), Some("nonapproval")),
+    ] {
+        fixture.execute_batch(&format!(
+            r#"INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+                 VALUES('a-{state}','t','c','needs_input','base',1,'cancelled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+               INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,prompt_hash,handoff_hash,delivery_state,verdict,created_at,updated_at)
+                 VALUES('sixth-{state}','a-{state}','code','repaired-{state}','p','h','finished','needs_rework','2026-01-01T00:00:03Z','2026-01-01T00:00:03Z'),
+                       ('recheck-{state}','a-{state}','code','fixed-{state}','p','h','delivered',NULL,'2026-01-02T00:00:00Z','2026-01-02T00:00:00Z');
+               INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
+                 VALUES('sixth-result-{state}','sixth-report-{state}','s-reviewer','g-reviewer','needs_rework','x','[]','{{}}',
+                   '2026-01-01T00:00:03Z','2026-01-01T00:00:03Z');
+               INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at)
+                 VALUES('snapshot-{state}','a-{state}','candidate','base','fixed-{state}','{{}}',1,'2026-01-02T00:00:00Z');"#
+        ));
+        fixture.execute(
+            "INSERT INTO final_repair_rechecks(attempt_id,task_id,operation_id,request_hash,authorized_task_version,plan_hash,configuration_hash,
+                 approved_code_request_id,prior_candidate_hash,final_request_id,rejected_code_request_id,rejected_code_result_id,
+                 reviewer_generation_id,reviewer_session_id,reviewer_settings_revision,reviewer_profile_hash,detail_json,state,
+                 candidate_hash,candidate_snapshot_id,review_request_id,spent_at,verdict,closed_reason,created_at,updated_at)
+             VALUES(?1,'t',?2,'h',7,'plan-hash','configuration','approved-code','approved-candidate','final-changes',?3,?4,
+                 'g-reviewer','s-reviewer',1,'reviewer-profile',?5,?6,?7,?8,?9,?10,?11,?12,
+                 '2026-01-01T00:00:04Z','2026-01-02T00:00:06Z')",
+            params![
+                format!("a-{state}"),
+                format!("op-{state}"),
+                format!("sixth-{state}"),
+                format!("sixth-result-{state}"),
+                format!(r#"{{"state":"{state}"}}"#),
+                state,
+                format!("fixed-{state}"),
+                format!("snapshot-{state}"),
+                format!("recheck-{state}"),
+                (state != "reserved").then_some("2026-01-02T00:00:05Z"),
+                verdict,
+                closed
+            ],
+        );
+    }
+    fixture
+}
+
+#[test]
+fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
+    let fixture = schema_31_receipt_fixture("normal-final-repair-migration");
+    let rows = fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS);
+    let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
+    let refused = Store::open_current_readonly(&fixture.database)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        refused.contains("unsupported database schema version 31"),
+        "{refused}"
+    );
+    fixture.assert_scalar("PRAGMA user_version", 31_i64);
+
+    let upgraded = Store::open(&fixture.database).unwrap();
+    fixture.assert_scalar("PRAGMA user_version", 32_i64);
+    assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
+    assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
+    fixture.assert_scalar::<String>(
+        "SELECT group_concat(attempt_id||':'||provenance_kind||':'||COALESCE(final_result_id,'-'),',')
+         FROM (SELECT * FROM final_repair_rechecks ORDER BY attempt_id)",
+        "a:historical_sixth_review_recovery:final-result,\
+         a-approved:historical_sixth_review_recovery:-,\
+         a-closed:historical_sixth_review_recovery:-,\
+         a-reserved:historical_sixth_review_recovery:-,\
+         a-spent:historical_sixth_review_recovery:-"
+            .into(),
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM pragma_foreign_key_check('final_repair_rechecks')",
+        0,
+    );
+    drop(upgraded);
+    assert!(Store::open_current_readonly(&fixture.database).is_ok());
+
+    // The discriminator keeps normal and historical bindings apart.
+    let connection = fixture.connection();
+    let insert = "INSERT INTO final_repair_rechecks(attempt_id,task_id,provenance_kind,operation_id,request_hash,
+            authorized_task_version,plan_hash,approved_code_request_id,prior_candidate_hash,final_request_id,
+            final_result_id,rejected_code_request_id,rejected_code_result_id,reviewer_generation_id,reviewer_session_id,
+            reviewer_settings_revision,reviewer_profile_hash,detail_json,state,candidate_hash,candidate_snapshot_id,
+            review_request_id,spent_at,verdict,closed_reason,created_at,updated_at)
+        VALUES(?1,'t',?2,?1,'h',1,'plan-hash','approved-code','approved-candidate','final-changes',?3,?4,?5,
+            'g-reviewer','s-reviewer',1,'reviewer-profile','{}',?6,?7,?8,?9,?10,?11,?12,
+            '2026-01-03T00:00:00Z','2026-01-03T00:00:00Z')";
+    for (case, provenance, final_result, rejected) in [
+        (
+            "normal with a rejected review",
+            "normal_final_request_changes",
+            Some("unused-final-result"),
+            Some("unused-rejected"),
+        ),
+        (
+            "normal without its final result",
+            "normal_final_request_changes",
+            None,
+            None,
+        ),
+        (
+            "historical without its rejected review",
+            "historical_sixth_review_recovery",
+            None,
+            None,
+        ),
+        (
+            "unknown provenance",
+            "manual_repair",
+            Some("unused-final-result"),
+            None,
+        ),
+    ] {
+        let error = connection
+            .execute(
+                insert,
+                params![
+                    "check-attempt",
+                    provenance,
+                    final_result,
+                    rejected,
+                    rejected,
+                    "authorized",
+                    None::<&str>,
+                    None::<&str>,
+                    None::<&str>,
+                    None::<&str>,
+                    None::<&str>,
+                    None::<&str>
+                ],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("CHECK constraint failed"), "{case}: {error}");
+    }
+    for (state, spent, verdict, closed) in [
+        ("authorized", None, None, None),
+        ("reserved", None, None, None),
+        ("spent", Some("2026-01-03T00:00:01Z"), None, None),
+        (
+            "approved",
+            Some("2026-01-03T00:00:01Z"),
+            Some("approved"),
+            None,
+        ),
+        (
+            "closed",
+            Some("2026-01-03T00:00:01Z"),
+            Some("needs_rework"),
+            Some("nonapproval"),
+        ),
+    ] {
+        // Each normal receipt binds its own attempt, final result and, once
+        // reserved, its recheck request and candidate snapshot.
+        connection
+            .execute_batch(&format!(
+                r#"INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+                     VALUES('normal-{state}','t','c','needs_input','base',1,'cancelled','2026-01-03T00:00:00Z','2026-01-03T00:00:00Z');
+                   INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
+                     VALUES('normal-result-{state}','normal-report-{state}','s-final','g-final','request_changes','repair','[]','{{}}',
+                       '2026-01-03T00:00:00Z','2026-01-03T00:00:00Z');"#
+            ))
+            .unwrap();
+        if state != "authorized" {
+            connection
+                .execute_batch(&format!(
+                    r#"INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,prompt_hash,handoff_hash,delivery_state,created_at,updated_at)
+                         VALUES('normal-{state}','normal-{state}','code','normal-{state}','p','h','delivered','2026-01-03T00:00:00Z','2026-01-03T00:00:00Z');
+                       INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at)
+                         VALUES('normal-{state}','normal-{state}','candidate','base','normal-{state}','{{}}',1,'2026-01-03T00:00:00Z');"#
+                ))
+                .unwrap();
+        }
+        let bound = (state != "authorized").then(|| format!("normal-{state}"));
+        connection
+            .execute(
+                insert,
+                params![
+                    format!("normal-{state}"),
+                    "normal_final_request_changes",
+                    format!("normal-result-{state}"),
+                    None::<&str>,
+                    None::<&str>,
+                    state,
+                    bound,
+                    bound,
+                    bound,
+                    spent,
+                    verdict,
+                    closed
+                ],
+            )
+            .unwrap_or_else(|error| panic!("normal {state}: {error}"));
+    }
+
+    // A receipt that breaks a foreign key or a CHECK of the rebuilt table
+    // aborts the whole migration, leaving schema 31 and every row unchanged.
+    for (name, corruption, expected) in [
+        (
+            "normal-final-repair-migration-foreign-key",
+            // Only this setup connection skips enforcement, to plant the invalid
+            // row the migration's enforcing connection must refuse.
+            "PRAGMA foreign_keys=OFF;
+             UPDATE final_repair_rechecks SET reviewer_session_id='missing-session' WHERE attempt_id='a-spent'",
+            "FOREIGN KEY constraint failed",
+        ),
+        (
+            "normal-final-repair-migration-check",
+            "PRAGMA ignore_check_constraints=ON;
+             UPDATE final_repair_rechecks SET verdict=NULL WHERE attempt_id='a-approved'",
+            "CHECK constraint failed",
+        ),
+    ] {
+        let broken = schema_31_receipt_fixture(name);
+        broken.execute_batch(corruption);
+        let rows = broken.scalar::<String>(SCHEMA_31_RECEIPT_ROWS);
+        let schema = broken.scalar::<String>(
+            "SELECT group_concat(name||':'||COALESCE(sql,''), char(10))
+             FROM (SELECT name, sql FROM sqlite_master ORDER BY name)",
+        );
+        let error = format!("{:#}", Store::open(&broken.database).err().unwrap());
+        assert!(error.contains(expected), "{name}: {error}");
+        broken.assert_scalar("PRAGMA user_version", 31_i64);
+        assert_eq!(broken.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
+        assert_eq!(
+            broken.scalar::<String>(
+                "SELECT group_concat(name||':'||COALESCE(sql,''), char(10))
+                 FROM (SELECT name, sql FROM sqlite_master ORDER BY name)"
+            ),
+            schema
+        );
+    }
+}
+
+/// An attempt at final review of `approved-candidate`, which one ordinary code
+/// review approved, whose delivered final review reported `request_changes`.
+/// The ordinary code count is `spent` of `max(2, spent)` allowed.
+fn normal_final_repair_fixture(name: &str, spent: i64) -> Fixture {
+    let fixture = Fixture::new(name);
+    seed_attempt(&fixture, "final_review");
+    for (role, generation, session) in [
+        ("manager", "g-manager", "s-manager"),
+        ("code_reviewer", "g-approver", "s-approver"),
+        ("final_verifier", "g-final", "s-final"),
+    ] {
+        seed_session(&fixture, "a", role, generation, session, "exited");
+    }
+    fixture.execute_batch(
+        r#"UPDATE role_generations SET status='exited';
+         UPDATE attempts SET plan_hash='plan-hash',plan_approved_at='2026-01-01T00:00:00Z',
+           candidate_hash='approved-candidate' WHERE id='a';
+         INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+           VALUES('manager-settings','t','manager',1,'{}','g-manager','2026-01-01T00:00:00Z'),
+                 ('reviewer-settings','t','code_reviewer',1,'{}','g-approver','2026-01-01T00:00:00Z'),
+                 ('final-settings','t','final_verifier',1,'{}','g-final','2026-01-01T00:00:00Z');
+         INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
+           VALUES('reviewer-capability','codex','fixture','code_reviewer','interactive_pty','reviewer-capability-key','supported','fixture','[]','2026-01-01T00:00:00Z','{}');
+         INSERT INTO trip_attempt_profiles(attempt_id,role,settings_revision,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at)
+           VALUES('a','code_reviewer',1,'project_default','{}','reviewer-profile','synthetic-seeded-config','h','a','h','reviewer-capability','reviewer-capability-key','p','2026-01-01T00:00:00Z');
+         INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,spent)
+           VALUES('final-budget','a','final',1,1);
+         INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,session_id,settings_revision,prompt_hash,handoff_hash,delivery_state,verdict,budget_spent_at,created_at,updated_at)
+           VALUES('approved-code','a','code','approved-candidate','g-approver','s-approver',1,'p','h','finished','approved','2026-01-01T00:00:01Z','2026-01-01T00:00:01Z','2026-01-01T00:00:01Z'),
+                 ('final-changes','a','final','approved-candidate','g-final','s-final',1,'p','h','delivered',NULL,'2026-01-01T00:00:02Z','2026-01-01T00:00:02Z','2026-01-01T00:00:02Z');
+         INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+           VALUES('final-result','final-report','s-final','g-final','request_changes','fix the dialog','[]',
+             '{"review_request_id":"final-changes","review_kind":"final","candidate_hash":"approved-candidate"}',
+             '2026-01-01T00:00:03Z');"#,
+    );
+    fixture.execute(
+        "INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,extension_allowance,spent)
+         VALUES('code-budget','a','code',2,?1,?2)",
+        params![(spent - 2).max(0), spent],
+    );
+    fixture
+}
+
+/// The attempt, final request and final result after the verdict.
+const NORMAL_REPAIR_STATE: &str = "SELECT a.phase||':'||a.final_repair_round||':'||COALESCE(a.candidate_hash,'-')
+    ||':'||r.delivery_state||':'||COALESCE(r.verdict,'-')||':'||(rr.consumed_at IS NOT NULL)||':'||t.version
+    ||':'||(SELECT COUNT(*) FROM final_repair_rechecks)
+    FROM attempts a JOIN tasks t ON t.id=a.task_id
+    JOIN review_requests r ON r.id='final-changes' JOIN role_results rr ON rr.id='final-result'
+    WHERE a.id='a'";
+
+/// Every receipt field except its timestamps.
+const NORMAL_RECEIPT: &str =
+    "SELECT provenance_kind||'|'||operation_id||'|'||request_hash||'|'||authorized_task_version
+    ||'|'||plan_hash||'|'||COALESCE(configuration_hash,'-')||'|'||approved_code_request_id
+    ||'|'||prior_candidate_hash||'|'||final_request_id||'|'||COALESCE(final_result_id,'-')
+    ||'|'||COALESCE(rejected_code_request_id,'-')||'|'||COALESCE(rejected_code_result_id,'-')
+    ||'|'||reviewer_generation_id||'|'||reviewer_session_id||'|'||reviewer_settings_revision
+    ||'|'||reviewer_profile_hash||'|'||detail_json||'|'||state||'|'||COALESCE(candidate_hash,'-')
+    ||'|'||COALESCE(candidate_snapshot_id,'-')||'|'||COALESCE(review_request_id,'-')
+    ||'|'||(spent_at IS NOT NULL)||'|'||COALESCE(verdict,'-')||'|'||COALESCE(closed_reason,'-')
+    FROM final_repair_rechecks WHERE attempt_id='a'";
+
+fn normal_final_request_changes(
+    fixture: &Fixture,
+    operation: &str,
+) -> Result<OperationResult, String> {
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::ReviewVerdict {
+            operation_id: operation.into(),
+            task_id: "t".into(),
+            attempt_id: "a".into(),
+            expected_version: fixture.scalar("SELECT version FROM tasks WHERE id='t'"),
+            review_kind: "final".into(),
+            candidate_hash: "approved-candidate".into(),
+            verdict: "request_changes".into(),
+            feedback: "fix the dialog".into(),
+        },
+    )
+    .map_err(|error| format!("{error:#}"))
+}
+
+#[test]
+fn normal_final_request_changes_opens_the_same_receipt_through_both_consumers() {
+    let coordinated = normal_final_repair_fixture("normal-final-coordinator", 1);
+    let paths = instance_paths(&coordinated);
+    let app = Application::new(
+        paths.clone(),
+        coordinated.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    let applied = app.coordinator_tick().unwrap();
+    assert_eq!(applied["action"], "review_applied", "{applied}");
+    assert_eq!(applied["verdict"], "request_changes");
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+
+    let manual = normal_final_repair_fixture("normal-final-manual", 1);
+    assert_eq!(
+        normal_final_request_changes(&manual, "final-verdict")
+            .unwrap()
+            .state,
+        "request_changes"
+    );
+    for fixture in [&coordinated, &manual] {
+        fixture.assert_scalar::<String>(
+            NORMAL_REPAIR_STATE,
+            "implementation:1:-:finished:request_changes:1:2:1".into(),
+        );
+        fixture.assert_scalar::<i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.final_repair_recheck.authorized'",
+            1,
+        );
+    }
+    assert_eq!(
+        coordinated.scalar::<String>(NORMAL_RECEIPT),
+        manual.scalar::<String>(NORMAL_RECEIPT)
+    );
+    let detail: serde_json::Value = serde_json::from_str(
+        &manual.scalar::<String>("SELECT detail_json FROM final_repair_rechecks"),
+    )
+    .unwrap();
+    assert_eq!(detail["provenance_kind"], "normal_final_request_changes");
+    assert_eq!(
+        detail["prior_code_approval"],
+        serde_json::json!({"review_request_id":"approved-code","candidate_hash":"approved-candidate"})
+    );
+    assert_eq!(
+        detail["final_request_changes"],
+        serde_json::json!({"review_request_id":"final-changes","role_result_id":"final-result","candidate_hash":"approved-candidate"})
+    );
+    assert_eq!(
+        detail["retained_code_reviewer"],
+        serde_json::json!({"role_generation_id":"g-approver","session_id":"s-approver","settings_revision":1,"profile_hash":"reviewer-profile"})
+    );
+    assert_eq!(
+        detail["ordinary_code_budget"],
+        serde_json::json!({"allowance":2,"spent":1})
+    );
+    manual.assert_scalar::<String>(
+        "SELECT provenance_kind||':'||state||':'||final_result_id||':'||COALESCE(rejected_code_request_id,'-')
+                ||':'||reviewer_generation_id||':'||plan_hash||':'||prior_candidate_hash
+         FROM final_repair_rechecks",
+        "normal_final_request_changes:authorized:final-result:-:g-approver:plan-hash:approved-candidate"
+            .into(),
+    );
+    manual.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "2:1".into());
+    // A second final change request is outside the one dedicated repair.
+    manual.execute_batch(
+        "UPDATE attempts SET phase='final_review',candidate_hash='approved-candidate' WHERE id='a';
+         UPDATE review_requests SET delivery_state='delivered',verdict=NULL WHERE id='final-changes';
+         UPDATE role_results SET consumed_at=NULL WHERE id='final-result';",
+    );
+    assert!(
+        normal_final_request_changes(&manual, "second-final-verdict")
+            .unwrap_err()
+            .contains("exceeds the one dedicated repair cycle")
+    );
+    manual.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 1);
+}
+
+#[test]
+fn normal_final_request_changes_refuses_unbound_evidence_without_side_effects() {
+    let fixture = normal_final_repair_fixture("normal-final-refusals", 1);
+    let before = fixture.scalar::<String>(NORMAL_REPAIR_STATE);
+    assert_eq!(
+        before,
+        "final_review:0:approved-candidate:delivered:-:0:1:0"
+    );
+    let cases = [
+        (
+            "no prior approval",
+            "UPDATE review_requests SET verdict='request_changes' WHERE id='approved-code'",
+            "UPDATE review_requests SET verdict='approved' WHERE id='approved-code'",
+            "lacks a finished code approval",
+        ),
+        (
+            "duplicate approval",
+            "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,session_id,settings_revision,prompt_hash,handoff_hash,delivery_state,verdict,created_at,updated_at)
+             VALUES('second-approval','a','code','approved-candidate','g-approver','s-approver',1,'p','h','finished','approved','2026-01-01T00:00:01Z','2026-01-01T00:00:01Z')",
+            "DELETE FROM review_requests WHERE id='second-approval'",
+            "more than one code approval",
+        ),
+        (
+            "approval reviewer binding",
+            "UPDATE review_requests SET session_id='s-final' WHERE id='approved-code'",
+            "UPDATE review_requests SET session_id='s-approver' WHERE id='approved-code'",
+            "do not belong to this attempt",
+        ),
+        (
+            "reviewer profile changed",
+            "UPDATE trip_attempt_profiles SET settings_revision=2 WHERE role='code_reviewer'",
+            "UPDATE trip_attempt_profiles SET settings_revision=1 WHERE role='code_reviewer'",
+            "profile changed after the approving review",
+        ),
+        (
+            "repair round used",
+            "UPDATE attempts SET final_repair_round=1 WHERE id='a'",
+            "UPDATE attempts SET final_repair_round=0 WHERE id='a'",
+            "exceeds the one dedicated repair cycle",
+        ),
+        (
+            "existing receipt",
+            "INSERT INTO final_repair_rechecks(attempt_id,task_id,provenance_kind,operation_id,request_hash,authorized_task_version,plan_hash,
+               approved_code_request_id,prior_candidate_hash,final_request_id,final_result_id,reviewer_generation_id,reviewer_session_id,
+               reviewer_settings_revision,reviewer_profile_hash,detail_json,state,created_at,updated_at)
+             VALUES('a','t','normal_final_request_changes','earlier','h',1,'plan-hash','approved-code','approved-candidate','final-changes',
+               'final-result','g-approver','s-approver',1,'reviewer-profile','{}','authorized','2026-01-01T00:00:04Z','2026-01-01T00:00:04Z')",
+            "DELETE FROM final_repair_rechecks",
+            "receipt already exists",
+        ),
+        (
+            "final result for another candidate",
+            "UPDATE role_results SET metadata_json=json_set(metadata_json,'$.candidate_hash','other') WHERE id='final-result'",
+            "UPDATE role_results SET metadata_json=json_set(metadata_json,'$.candidate_hash','approved-candidate') WHERE id='final-result'",
+            "",
+        ),
+    ];
+    for (case, setup, teardown, expected) in cases {
+        fixture.execute_batch(setup);
+        let error = normal_final_request_changes(&fixture, &format!("refused-{case}")).unwrap_err();
+        assert!(error.contains(expected), "{case}: {error}");
+        fixture.execute_batch(teardown);
+        assert_eq!(
+            fixture.scalar::<String>(NORMAL_REPAIR_STATE),
+            before,
+            "{case}"
+        );
+        fixture.assert_scalar::<i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.final_repair_recheck.authorized'",
+            0,
+        );
+    }
+
+    // The coordinator's structured result path applies the same refusal.
+    let paths = instance_paths(&fixture);
+    let app = Application::new(
+        paths.clone(),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    fixture.execute(
+        "UPDATE trip_attempt_profiles SET settings_revision=2 WHERE role='code_reviewer'",
+        [],
+    );
+    let error = format!("{:#}", app.coordinator_tick().unwrap_err());
+    assert!(
+        error.contains("profile changed after the approving review"),
+        "{error}"
+    );
+    assert_eq!(fixture.scalar::<String>(NORMAL_REPAIR_STATE), before);
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+/// Freezes the repaired candidate for its dedicated recheck.
+fn freeze_repaired_candidate(fixture: &Fixture) {
+    fixture.execute_batch(
+        "INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at)
+           VALUES('repaired-snapshot','a','candidate','base','repaired-candidate','{}',1,'2026-01-02T00:00:00Z');
+         UPDATE attempts SET phase='code_review',candidate_hash='repaired-candidate' WHERE id='a';",
+    );
+}
+
+fn reserve_repaired_recheck(
+    reviews: &ReviewService,
+) -> Result<agenticjira::review::ReviewDispatch, String> {
+    reviews
+        .reserve_request(
+            "a",
+            "code",
+            "recheck",
+            serde_json::json!({"candidate":"repaired-candidate"}),
+        )
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[test]
+fn normal_final_repair_recheck_spends_only_its_receipt_below_and_at_the_cap() {
+    for (spent, outcome) in [
+        (1, "approved"),
+        (5, "approved"),
+        (5, "ambiguous"),
+        (1, "needs_rework"),
+    ] {
+        let fixture =
+            normal_final_repair_fixture(&format!("normal-final-recheck-{spent}-{outcome}"), spent);
+        normal_final_request_changes(&fixture, "final-verdict").unwrap();
+        let ordinary = fixture.scalar::<String>(FINAL_REPAIR_CODE_BUDGET);
+        assert_eq!(ordinary, format!("{}:{spent}", spent.max(2)));
+        freeze_repaired_candidate(&fixture);
+        let reviews = ReviewService::new(fixture.store.clone(), fixture.root.join("artifacts"));
+        let request = reserve_repaired_recheck(&reviews).unwrap();
+        assert_eq!(request.state, "reserved", "{spent}/{outcome}");
+        fixture.assert_scalar::<String>(
+            "SELECT state||':'||candidate_hash||':'||candidate_snapshot_id||':'||review_request_id
+             FROM final_repair_rechecks",
+            format!(
+                "reserved:repaired-candidate:repaired-snapshot:{}",
+                request.request_id
+            ),
+        );
+        seed_session(
+            &fixture,
+            "a",
+            "code_reviewer",
+            "g-recheck",
+            "s-recheck",
+            "running",
+        );
+        reviews
+            .bind_launch_intent(&request.request_id, "s-recheck", "g-recheck", 1)
+            .unwrap();
+        if outcome == "ambiguous" {
+            reviews
+                .mark_delivery_failure(&request.request_id, None, true, "delivery uncertain")
+                .unwrap();
+            fixture
+                .assert_scalar::<String>("SELECT state FROM final_repair_rechecks", "spent".into());
+            fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, ordinary.clone());
+            continue;
+        }
+        reviews
+            .bind_delivery(&request.request_id, "s-recheck", "g-recheck", 1)
+            .unwrap();
+        fixture.assert_scalar::<String>("SELECT state FROM final_repair_rechecks", "spent".into());
+        fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, ordinary.clone());
+        // A repeated reservation resumes the delivered request; nothing is spent again.
+        let requests = fixture.scalar::<i64>("SELECT COUNT(*) FROM review_requests");
+        let resumed = reserve_repaired_recheck(&reviews).unwrap();
+        assert_eq!(
+            (resumed.request_id.as_str(), resumed.state.as_str()),
+            (request.request_id.as_str(), "delivered")
+        );
+        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM review_requests", requests);
+        fixture.execute(
+            "UPDATE role_settings SET effective_generation_id='g-recheck' WHERE id='reviewer-settings'",
+            [],
+        );
+        fixture.execute(
+            "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+             VALUES('recheck-result','recheck-report','s-recheck','g-recheck',?1,'recheck','[]',?2,'2026-01-02T00:00:00Z')",
+            params![
+                outcome,
+                serde_json::json!({"review_request_id":request.request_id,"review_kind":"code","candidate_hash":"repaired-candidate"})
+                    .to_string()
+            ],
+        );
+        workflow::execute(
+            &fixture.store,
+            &HumanCommand::ReviewVerdict {
+                operation_id: "recheck-verdict".into(),
+                task_id: "t".into(),
+                attempt_id: "a".into(),
+                expected_version: fixture.scalar("SELECT version FROM tasks WHERE id='t'"),
+                review_kind: "code".into(),
+                candidate_hash: "repaired-candidate".into(),
+                verdict: outcome.into(),
+                feedback: "recheck feedback".into(),
+            },
+        )
+        .unwrap();
+        fixture.assert_scalar::<String>(
+            "SELECT a.phase||':'||a.final_repair_round||':'||f.state||':'||f.verdict
+             FROM attempts a JOIN final_repair_rechecks f ON f.attempt_id=a.id",
+            if outcome == "approved" {
+                "checks:1:approved:approved".into()
+            } else {
+                "needs_input:1:closed:needs_rework".into()
+            },
+        );
+        fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, ordinary);
+    }
+}
+
+#[test]
+fn final_repair_round_without_its_retained_reviewer_holds_without_reserving_or_spending() {
+    let requests = "SELECT COUNT(*) FROM review_requests";
+    let held_audits =
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.final_repair_recheck.held'";
+
+    // A repair round without any receipt never falls back to the ordinary allowance.
+    let missing = Fixture::new("final-repair-round-without-receipt");
+    seed_attempt(&missing, "code_review");
+    missing.execute_batch(
+        "UPDATE attempts SET final_repair_round=1,plan_hash='plan-hash',candidate_hash='repaired-candidate' WHERE id='a';
+         INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,spent)
+           VALUES('code-budget','a','code',2,1);",
+    );
+    let reviews = ReviewService::new(missing.store.clone(), missing.root.join("artifacts"));
+    let error = reserve_repaired_recheck(&reviews).unwrap_err();
+    assert!(
+        error.contains("final-repair recheck held")
+            && error.contains("no dedicated recheck receipt"),
+        "{error}"
+    );
+    missing.assert_scalar::<i64>(requests, 0);
+    missing.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "2:1".into());
+    missing.assert_scalar::<String>(
+        "SELECT attention||':'||version FROM tasks WHERE id='t'",
+        "needs_input:2".into(),
+    );
+    missing.assert_scalar::<i64>(held_audits, 1);
+
+    // An open normal receipt keeps its retained reviewer: any conflict holds.
+    let fixture = normal_final_repair_fixture("final-repair-recheck-holds", 5);
+    normal_final_request_changes(&fixture, "final-verdict").unwrap();
+    freeze_repaired_candidate(&fixture);
+    let reviews = ReviewService::new(fixture.store.clone(), fixture.root.join("artifacts"));
+    let cases = [
+        (
+            "newer code reviewer activation",
+            "INSERT INTO role_settings(id,task_id,role,revision,config_json,created_at)
+               VALUES('reviewer-settings-2','t','code_reviewer',2,'{}','2026-01-03T00:00:00Z');
+             INSERT INTO trip_task_profile_activations(id,task_id,role,settings_id,settings_revision,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,activated_at)
+               VALUES('newer-reviewer','t','code_reviewer','reviewer-settings-2',2,'{}','newer-profile','synthetic-seeded-config','h','a','h','reviewer-capability','reviewer-capability-key','p','2026-01-03T00:00:00Z');",
+            "DELETE FROM trip_task_profile_activations WHERE id='newer-reviewer';
+             DELETE FROM role_settings WHERE id='reviewer-settings-2';",
+            "newer activated code reviewer profile",
+        ),
+        (
+            "replaced reviewer profile",
+            "UPDATE trip_attempt_profiles SET profile_hash='replaced-profile' WHERE role='code_reviewer'",
+            "UPDATE trip_attempt_profiles SET profile_hash='reviewer-profile' WHERE role='code_reviewer'",
+            "no longer the retained reviewer's",
+        ),
+        (
+            "replaced reviewer generation",
+            "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+               VALUES('g-newer','a','code_reviewer','codex',9,1,'exited','f','2026-01-03T00:00:00Z','2026-01-03T00:00:00Z')",
+            "DELETE FROM role_generations WHERE id='g-newer'",
+            "generation, session or lineage changed",
+        ),
+        (
+            "stale capability evidence",
+            "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
+               VALUES('newer-capability','codex','fixture','code_reviewer','interactive_pty','other-key','unsupported','fixture','[]','2026-01-03T00:00:00Z','{}')",
+            "DELETE FROM capabilities WHERE id='newer-capability'",
+            "capability evidence is no longer current",
+        ),
+        (
+            "receipt bound to another plan",
+            "UPDATE final_repair_rechecks SET plan_hash='other-plan'",
+            "UPDATE final_repair_rechecks SET plan_hash='plan-hash'",
+            "no longer binds",
+        ),
+    ];
+    for (case, setup, teardown, expected) in cases {
+        fixture.execute_batch(setup);
+        let receipt = fixture.scalar::<String>(NORMAL_RECEIPT);
+        let before_requests = fixture.scalar::<i64>(requests);
+        let error = reserve_repaired_recheck(&reviews).unwrap_err();
+        assert!(
+            error.contains("final-repair recheck held") && error.contains(expected),
+            "{case}: {error}"
+        );
+        assert_eq!(fixture.scalar::<String>(NORMAL_RECEIPT), receipt, "{case}");
+        fixture.assert_scalar::<i64>(requests, before_requests);
+        fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "5:5".into());
+        fixture.assert_scalar::<String>(
+            "SELECT attention FROM tasks WHERE id='t'",
+            "needs_input".into(),
+        );
+        fixture.assert_scalar::<String>(
+            "SELECT settings_revision||':'||profile_hash FROM trip_attempt_profiles WHERE role='code_reviewer'",
+            if case == "replaced reviewer profile" {
+                "1:replaced-profile".into()
+            } else {
+                "1:reviewer-profile".into()
+            },
+        );
+        fixture.execute_batch(teardown);
+        fixture.execute("UPDATE tasks SET attention='none' WHERE id='t'", []);
+    }
+    fixture.assert_scalar::<i64>(held_audits, 5);
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM final_repair_rechecks",
+        "authorized".into(),
+    );
+    // With the retained binding intact the receipt reserves its one recheck.
+    assert_eq!(
+        reserve_repaired_recheck(&reviews).unwrap().state,
+        "reserved"
+    );
+    fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "5:5".into());
+}
+
+/// A final-repair round with no receipt at all whose ordinary code request for
+/// the repaired candidate is already `state`; a delivered request also has an
+/// eligible approving result from its exited reviewer.
+fn receiptless_repair_round_fixture(name: &str, state: &str) -> Fixture {
+    let fixture = Fixture::new(name);
+    seed_attempt(&fixture, "code_review");
+    seed_session(
+        &fixture,
+        "a",
+        "code_reviewer",
+        "g-ordinary",
+        "s-ordinary",
+        "exited",
+    );
+    fixture.execute_batch(
+        "UPDATE role_generations SET status='exited';
+         UPDATE attempts SET final_repair_round=1,plan_hash='plan-hash',candidate_hash='repaired-candidate' WHERE id='a';
+         INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+           VALUES('reviewer-settings','t','code_reviewer',1,'{}','g-ordinary','2026-01-01T00:00:00Z');
+         INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,spent)
+           VALUES('code-budget','a','code',2,1);",
+    );
+    fixture.execute(
+        "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,session_id,settings_revision,prompt_hash,handoff_hash,delivery_state,created_at,updated_at)
+         VALUES('ordinary-code','a','code','repaired-candidate','g-ordinary','s-ordinary',1,?1,?2,?3,'2026-01-02T00:00:00Z','2026-01-02T00:00:00Z')",
+        params![
+            agenticjira::store::json_hash(&"recheck").unwrap(),
+            agenticjira::store::json_hash(&serde_json::json!({"candidate":"repaired-candidate"})).unwrap(),
+            state
+        ],
+    );
+    if state == "delivered" {
+        fixture.execute(
+            "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+             VALUES('ordinary-result','ordinary-report','s-ordinary','g-ordinary','approved','looks fine','[]',?1,'2026-01-02T00:00:01Z')",
+            params![serde_json::json!({"review_request_id":"ordinary-code","review_kind":"code","candidate_hash":"repaired-candidate"}).to_string()],
+        );
+    }
+    fixture
+}
+
+/// The ordinary request, its result and both counters.
+const ORDINARY_REPAIR_EVIDENCE: &str = "SELECT r.delivery_state||':'||COALESCE(r.verdict,'-')
+    ||':'||COALESCE((SELECT (consumed_at IS NOT NULL) FROM role_results WHERE id='ordinary-result'),'-')
+    ||':'||(SELECT COUNT(*) FROM review_requests)
+    ||':'||(SELECT (initial_allowance+extension_allowance)||'/'||spent FROM review_budgets WHERE review_kind='code')
+    ||':'||a.phase||':'||a.final_repair_round
+    FROM review_requests r JOIN attempts a ON a.id=r.attempt_id WHERE r.id='ordinary-code'";
+
+#[test]
+fn receiptless_repair_round_holds_every_active_ordinary_code_request() {
+    for state in ["reserved", "launching", "delivered", "ambiguous"] {
+        let fixture =
+            receiptless_repair_round_fixture(&format!("receiptless-repair-round-{state}"), state);
+        let evidence = fixture.scalar::<String>(ORDINARY_REPAIR_EVIDENCE);
+        let reviews = ReviewService::new(fixture.store.clone(), fixture.root.join("artifacts"));
+        let error = reserve_repaired_recheck(&reviews).unwrap_err();
+        assert!(
+            error.contains("final-repair recheck held")
+                && error.contains("no dedicated recheck receipt"),
+            "{state}: {error}"
+        );
+        assert_eq!(
+            fixture.scalar::<String>(ORDINARY_REPAIR_EVIDENCE),
+            evidence,
+            "{state}"
+        );
+        fixture.assert_scalar::<String>(
+            "SELECT attention FROM tasks WHERE id='t'",
+            "needs_input".into(),
+        );
+        if state != "delivered" {
+            continue;
+        }
+        // Neither authenticated consumer applies the ordinary result.
+        fixture.execute("UPDATE tasks SET attention='none' WHERE id='t'", []);
+        let manual = workflow::execute(
+            &fixture.store,
+            &HumanCommand::ReviewVerdict {
+                operation_id: "ordinary-verdict".into(),
+                task_id: "t".into(),
+                attempt_id: "a".into(),
+                expected_version: fixture.scalar("SELECT version FROM tasks WHERE id='t'"),
+                review_kind: "code".into(),
+                candidate_hash: "repaired-candidate".into(),
+                verdict: "approved".into(),
+                feedback: "looks fine".into(),
+            },
+        )
+        .map_err(|error| format!("{error:#}"))
+        .unwrap_err();
+        assert!(manual.contains("final-repair recheck held"), "{manual}");
+        assert_eq!(fixture.scalar::<String>(ORDINARY_REPAIR_EVIDENCE), evidence);
+        let paths = instance_paths(&fixture);
+        let app = Application::new(
+            paths.clone(),
+            fixture.store.clone(),
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        let held = app.coordinator_tick().unwrap();
+        assert_eq!(held["action"], "final_repair_recheck_held", "{held}");
+        assert_eq!(held["reason"], "final_repair_recheck_invalid");
+        assert_eq!(fixture.scalar::<String>(ORDINARY_REPAIR_EVIDENCE), evidence);
+        assert_eq!(evidence, "delivered:-:0:1:2/1:code_review:1");
+        fixture.assert_scalar::<String>(
+            "SELECT attention FROM tasks WHERE id='t'",
+            "needs_input".into(),
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(paths.socket_dir);
+    }
+}
+
+/// Marks the recheck reviewer exited with recorded quiescence and reports its
+/// structured `verdict` for the repaired candidate.
+fn finish_repaired_recheck(fixture: &Fixture, request: &str, verdict: &str) {
+    fixture.execute_batch(
+        r#"UPDATE sessions SET status='exited',exit_json='{"process_group_quiescent":true}' WHERE id='s-recheck';
+           UPDATE role_generations SET status='exited' WHERE id='g-recheck';"#,
+    );
+    fixture.execute(
+        "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+         VALUES('recheck-result','recheck-report','s-recheck','g-recheck',?1,'recheck','[]',?2,'2026-01-02T00:00:00Z')",
+        params![
+            verdict,
+            serde_json::json!({"review_request_id":request,"review_kind":"code","candidate_hash":"repaired-candidate"})
+                .to_string()
+        ],
+    );
+}
+
+/// The normal repair with its dedicated recheck delivered to `g-recheck`.
+fn delivered_normal_recheck(name: &str) -> (Fixture, String) {
+    let fixture = normal_final_repair_fixture(name, 5);
+    normal_final_request_changes(&fixture, "final-verdict").unwrap();
+    freeze_repaired_candidate(&fixture);
+    let reviews = ReviewService::new(fixture.store.clone(), fixture.root.join("artifacts"));
+    let request = reserve_repaired_recheck(&reviews).unwrap().request_id;
+    seed_session(
+        &fixture,
+        "a",
+        "code_reviewer",
+        "g-recheck",
+        "s-recheck",
+        "running",
+    );
+    reviews
+        .bind_launch_intent(&request, "s-recheck", "g-recheck", 1)
+        .unwrap();
+    reviews
+        .bind_delivery(&request, "s-recheck", "g-recheck", 1)
+        .unwrap();
+    (fixture, request)
+}
+
+#[test]
+fn an_ordinary_code_request_cannot_ride_on_an_unrelated_recheck_receipt() {
+    let fixture = normal_final_repair_fixture("final-repair-piggyback", 5);
+    normal_final_request_changes(&fixture, "final-verdict").unwrap();
+    freeze_repaired_candidate(&fixture);
+    seed_session(
+        &fixture,
+        "a",
+        "code_reviewer",
+        "g-ordinary",
+        "s-ordinary",
+        "exited",
+    );
+    fixture.execute(
+        "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,session_id,settings_revision,prompt_hash,handoff_hash,delivery_state,created_at,updated_at)
+         VALUES('ordinary-code','a','code','repaired-candidate','g-ordinary','s-ordinary',1,?1,?2,'delivered','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z')",
+        params![
+            agenticjira::store::json_hash(&"recheck").unwrap(),
+            agenticjira::store::json_hash(&serde_json::json!({"candidate":"repaired-candidate"})).unwrap()
+        ],
+    );
+    fixture.execute(
+        "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+         VALUES('ordinary-result','ordinary-report','s-ordinary','g-ordinary','approved','looks fine','[]',?1,'2026-01-02T00:00:01Z')",
+        params![serde_json::json!({"review_request_id":"ordinary-code","review_kind":"code","candidate_hash":"repaired-candidate"}).to_string()],
+    );
+    let receipt = fixture.scalar::<String>(NORMAL_RECEIPT);
+    let evidence = fixture.scalar::<String>(ORDINARY_REPAIR_EVIDENCE);
+    assert_eq!(evidence, "delivered:-:0:3:5/5:code_review:1");
+    let reviews = ReviewService::new(fixture.store.clone(), fixture.root.join("artifacts"));
+    let error = reserve_repaired_recheck(&reviews).unwrap_err();
+    assert!(
+        error.contains("not its receipt's dedicated recheck"),
+        "{error}"
+    );
+    fixture.execute("UPDATE tasks SET attention='none' WHERE id='t'", []);
+    let paths = instance_paths(&fixture);
+    let app = Application::new(
+        paths.clone(),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    let held = app.coordinator_tick().unwrap();
+    assert_eq!(held["action"], "final_repair_recheck_held", "{held}");
+    assert_eq!(held["reason"], "final_repair_recheck_invalid");
+    assert_eq!(fixture.scalar::<String>(ORDINARY_REPAIR_EVIDENCE), evidence);
+    assert_eq!(fixture.scalar::<String>(NORMAL_RECEIPT), receipt);
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM final_repair_rechecks",
+        "authorized".into(),
+    );
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+/// Required checks, current manager conformance and a final Explorer decision
+/// for `candidate`, with the attempt back in `checks`.
+fn seed_completed_repair_checks(fixture: &Fixture, candidate: &str) {
+    fixture.execute_batch(&format!(
+        r#"INSERT INTO trip_verification_checks(id,project_id,config_revision_id,check_key,category,
+             command_kind,executable,arguments_json,cwd,timeout_seconds,acceptance_rows_json,
+             relevant_inputs_json,invalidation_json,original_text)
+           VALUES('repair-check','p','synthetic-seeded-config','repair-check','focused','exec','/usr/bin/true',
+             '[]','.',30,'["criterion"]','[]','{{}}','repair check');
+           INSERT INTO trip_selected_checks(attempt_id,revision,check_id,required,selected_by_generation_id,created_at)
+             VALUES('a',1,'repair-check',1,'g-manager','2026-01-04T00:00:00Z');
+           INSERT INTO check_runs(id,attempt_id,candidate_hash,executable,arguments_json,cwd,status,
+             launch_state,exit_code,evidence_json,created_at,finished_at,suite_name,check_suite_version,
+             check_id,selected_check_revision,inputs_hash,acceptance_coverage_json,elapsed_millis,freshness_state)
+           VALUES('repair-check-run','a','{candidate}','/usr/bin/true','[]','.','finished','finished',0,'{{}}',
+             '2026-01-04T00:00:00Z','2026-01-04T00:00:01Z','repair-suite',1,'repair-check',1,'repair-inputs',
+             '["criterion"]',1,'current');
+           INSERT INTO trip_conformance_receipts(id,attempt_id,revision,candidate_hash,config_hash,
+             acceptance_json,ownership_json,documentation_json,test_policy_json,readability_json,
+             submitted_by_generation_id,created_at)
+           VALUES('repair-conformance','a',1,'{candidate}','h','[]','{{}}','{{}}','{{}}','{{}}','g-manager',
+             '2026-01-04T00:00:02Z');
+           INSERT INTO trip_explorer_decisions(id,attempt_id,stage,census_json,trigger,activated,
+             limits_json,candidate_hash,created_at)
+           VALUES('repair-final-explorer','a','final','{{}}','synthetic completed decision',0,'{{}}','{candidate}',
+             '2026-01-04T00:00:03Z');
+           UPDATE attempts SET phase='checks',status='running',selected_checks_revision=1,
+             manager_conformance_revision=1 WHERE id='a';
+           UPDATE tasks SET attention='none' WHERE id='t';"#
+    ));
+}
+
+/// The attempt phase, the final allowance and the task attention.
+const REPAIR_FINAL_GATE: &str =
+    "SELECT a.phase||':'||b.initial_allowance||'+'||b.extension_allowance
+    ||'/'||b.spent||':'||t.attention
+    FROM attempts a JOIN tasks t ON t.id=a.task_id
+    JOIN review_budgets b ON b.attempt_id=a.id AND b.review_kind='final' WHERE a.id='a'";
+
+#[test]
+fn second_final_review_requires_the_approved_dedicated_recheck_of_the_candidate() {
+    for case in [
+        "approved receipt",
+        "missing receipt",
+        "receipt for another candidate",
+    ] {
+        let (fixture, request) =
+            delivered_normal_recheck(&format!("final-repair-checks-{}", case.replace(' ', "-")));
+        finish_repaired_recheck(&fixture, &request, "approved");
+        let paths = instance_paths(&fixture);
+        let app = Application::new(
+            paths.clone(),
+            fixture.store.clone(),
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        // The coordinator consumes the dedicated recheck's own result.
+        let applied = app.coordinator_tick().unwrap();
+        assert_eq!(applied["action"], "review_applied", "{case}: {applied}");
+        assert_eq!(applied["request_id"], request.as_str());
+        fixture.assert_scalar::<String>(
+            "SELECT a.phase||':'||f.state||':'||f.verdict FROM attempts a JOIN final_repair_rechecks f ON f.attempt_id=a.id",
+            "checks:approved:approved".into(),
+        );
+        fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "5:5".into());
+        seed_completed_repair_checks(&fixture, "repaired-candidate");
+        match case {
+            "missing receipt" => fixture.execute("DELETE FROM final_repair_rechecks", []),
+            "receipt for another candidate" => fixture.execute(
+                "UPDATE final_repair_rechecks SET candidate_hash='other-candidate'",
+                [],
+            ),
+            _ => {}
+        }
+        fixture.assert_scalar::<String>(REPAIR_FINAL_GATE, "checks:1+0/1:none".into());
+        if case == "approved receipt" {
+            let approved = app.coordinator_tick().unwrap();
+            assert_eq!(approved["action"], "checks_approved", "{approved}");
+            fixture.assert_scalar::<String>(REPAIR_FINAL_GATE, "final_review:1+1/1:none".into());
+        } else {
+            // The ordinary approval alone never opens the second final review.
+            let error = format!("{:#}", app.coordinator_tick().unwrap_err());
+            assert!(
+                error.contains("no approved dedicated recheck of the repaired candidate"),
+                "{case}: {error}"
+            );
+            fixture.assert_scalar::<String>(REPAIR_FINAL_GATE, "checks:1+0/1:needs_input".into());
+            fixture.assert_scalar::<i64>(
+                "SELECT COUNT(*) FROM review_requests WHERE review_kind='final'",
+                1,
+            );
+            assert_ne!(app.coordinator_tick().unwrap()["action"], "checks_approved");
+            fixture.assert_scalar::<String>(REPAIR_FINAL_GATE, "checks:1+0/1:needs_input".into());
+        }
+        drop(app);
+        let _ = std::fs::remove_dir_all(paths.socket_dir);
+    }
+}
+
+#[test]
+fn ordinary_reviews_are_not_governed_by_the_final_repair_gate() {
+    for (phase, kind) in [("plan_review", "plan"), ("code_review", "code")] {
+        let fixture = Fixture::new(&format!("ordinary-review-outside-final-repair-{kind}"));
+        seed_attempt(&fixture, phase);
+        fixture.execute_batch(
+            "UPDATE attempts SET plan_hash='plan-hash',candidate_hash='candidate' WHERE id='a';
+             INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,spent)
+               VALUES('plan-budget','a','plan',2,0),('code-budget','a','code',2,1);
+             INSERT INTO role_settings(id,task_id,role,revision,config_json,created_at)
+               VALUES('reviewer-settings-2','t','code_reviewer',2,'{}','2026-01-03T00:00:00Z');
+             INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
+               VALUES('newer-reviewer-capability','codex','fixture','code_reviewer','interactive_pty','newer-reviewer-key','supported','fixture','[]','2026-01-03T00:00:00Z','{}');
+             INSERT INTO trip_task_profile_activations(id,task_id,role,settings_id,settings_revision,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,activated_at)
+               VALUES('newer-reviewer','t','code_reviewer','reviewer-settings-2',2,'{}','newer-profile','synthetic-seeded-config','h','a','h','newer-reviewer-capability','newer-reviewer-key','p','2026-01-03T00:00:00Z');",
+        );
+        let reviews = ReviewService::new(fixture.store.clone(), fixture.root.join("artifacts"));
+        let reserved = reviews
+            .reserve_request("a", kind, "review", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(reserved.state, "reserved", "{kind}");
+        fixture.assert_scalar::<String>("SELECT attention FROM tasks WHERE id='t'", "none".into());
+        fixture.assert_scalar::<i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.final_repair_recheck.held'",
+            0,
+        );
+    }
+}
+
+/// The reviewer safe-boundary refresh never rebinds a final-repair round's code
+/// reviewer: the dedicated-recheck gate decides first, and the projected
+/// decision does not wait for a profile change the recheck would never adopt.
+/// A plan review in the same attempt still adopts its newer profile.
+#[test]
+fn final_repair_gate_precedes_the_reviewer_safe_boundary_refresh() {
+    let fixture = Fixture::new("final-repair-gate-before-profile-refresh");
+    let (_, task, plan) = new_task(&fixture, "repair-refresh", "repair-refresh-task");
+    let attempt = plan.attempt_id.clone();
+    fixture.execute(
+        "UPDATE attempts SET phase='code_review',candidate_hash='candidate',final_repair_round=1 WHERE id=?1",
+        params![attempt],
+    );
+    seed_session(
+        &fixture,
+        &attempt,
+        "code_reviewer",
+        "old",
+        "old-session",
+        "exited",
+    );
+    // A prior plan reviewer too, so activation cannot rebind an unstarted role.
+    seed_session(
+        &fixture,
+        &attempt,
+        "plan_reviewer",
+        "old-plan",
+        "old-plan-session",
+        "exited",
+    );
+    fixture.execute(
+        "UPDATE role_generations SET status='exited' WHERE id IN ('old','old-plan')",
+        [],
+    );
+    let replacement = RoleOverride {
+        provider: Provider::Codex,
+        model: "replacement-model".into(),
+        effort: "high".into(),
+    };
+    let activate = |role: RoleKind, operation: &str| {
+        let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+        workflow::execute(
+            &fixture.store,
+            &HumanCommand::SetRoleSettings {
+                operation_id: format!("{operation}-settings"),
+                task_id: task.clone(),
+                role,
+                expected_version: version,
+                config: replacement.clone(),
+            },
+        )
+        .unwrap();
+        seed_supported_capabilities_for_config(&fixture, &replacement);
+        let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+        agenticjira::trip::activate_task_profile(
+            &fixture.store,
+            &capability_runtime(&fixture),
+            operation,
+            &task,
+            role,
+            2,
+            version,
+        )
+        .unwrap();
+    };
+    let bound = |role: &str| {
+        fixture.scalar::<i64>(&format!(
+            "SELECT settings_revision FROM trip_attempt_profiles WHERE attempt_id='{attempt}' AND role='{role}'"
+        ))
+    };
+    let adoptions = "SELECT COUNT(*) FROM audit_events WHERE event_code='task.profile.materialized_at_safe_boundary'";
+    let reviews = ReviewService::new(fixture.store.clone(), fixture.root.join("artifacts"));
+
+    // An eligible newer code reviewer is ready to adopt, yet the receiptless
+    // repair round holds before the refresh can rebind the reviewer.
+    activate(RoleKind::CodeReviewer, "activate-code-reviewer-2");
+    let error = reviews
+        .reserve_request(
+            &attempt,
+            "code",
+            "Review the candidate",
+            serde_json::json!({"attempt_id":attempt}),
+        )
+        .map_err(|error| format!("{error:#}"))
+        .unwrap_err();
+    assert!(error.contains("final-repair recheck held"), "{error}");
+    assert_eq!(bound("code_reviewer"), 1);
+    fixture.assert_scalar::<i64>(adoptions, 0);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM review_requests", 0);
+    fixture.assert_scalar::<String>("SELECT attention FROM tasks", "needs_input".into());
+    fixture.execute("UPDATE tasks SET attention='none'", []);
+
+    // The gate governs code review only: a plan review still adopts.
+    fixture.execute(
+        "UPDATE attempts SET phase='plan_review',plan_hash='plan-candidate' WHERE id=?1",
+        params![attempt],
+    );
+    activate(RoleKind::PlanReviewer, "activate-plan-reviewer-2");
+    assert_eq!(bound("plan_reviewer"), 1);
+    let request = reviews
+        .reserve_request(
+            &attempt,
+            "plan",
+            "Review the plan",
+            serde_json::json!({"attempt_id":attempt}),
+        )
+        .unwrap();
+    assert_eq!(request.state, "reserved");
+    assert_eq!(bound("plan_reviewer"), 2);
+    assert_eq!(bound("code_reviewer"), 1);
+    fixture.assert_scalar::<i64>(adoptions, 1);
+
+    // While the old code reviewer is still live the newer profile would wait,
+    // but the repair round never shows that wait; an ordinary round does.
+    fixture.execute(
+        "UPDATE attempts SET phase='code_review' WHERE id=?1",
+        params![attempt],
+    );
+    seed_session(
+        &fixture,
+        &attempt,
+        "code_reviewer",
+        "live",
+        "live-session",
+        "running",
+    );
+    let reasons = || {
+        workflow::state(&fixture.store)
+            .unwrap()
+            .decisions
+            .into_iter()
+            .filter(|decision| decision.subject.attempt_id.as_deref() == Some(attempt.as_str()))
+            .map(|decision| decision.reason_code)
+            .collect::<Vec<_>>()
+    };
+    let repair = reasons();
+    assert!(!repair.is_empty());
+    assert!(
+        !repair
+            .iter()
+            .any(|reason| reason == "workflow.reviewer_profile_change_pending"),
+        "{repair:?}"
+    );
+    fixture.execute(
+        "UPDATE attempts SET final_repair_round=0 WHERE id=?1",
+        params![attempt],
+    );
+    let ordinary = reasons();
+    assert!(
+        ordinary
+            .iter()
+            .any(|reason| reason == "workflow.reviewer_profile_change_pending"),
+        "{ordinary:?}"
+    );
+    assert_eq!(bound("code_reviewer"), 1);
+}
+
+/// A claimed attempt left in `needs_input` by an ordinary code `needs_rework`
+/// of a captured candidate that deleted the tracked `fixture.txt` and added
+/// untracked `untracked.txt` (0640) and `tool.sh` (0750). The manager and the
+/// reviewer exited with recorded process-group quiescence.
+fn terminal_replan_fixture(name: &str) -> (Fixture, InstancePaths, DispatchPlan, String, String) {
+    terminal_replan_fixture_with(name, &[], |_, plan| {
+        std::fs::remove_file(plan.workspace_path.join("fixture.txt")).unwrap();
+        for (file, text, mode) in [
+            ("untracked.txt", "rejected but preserved\n", 0o640),
+            ("tool.sh", "#!/bin/sh\nexit 0\n", 0o750),
+        ] {
+            let path = plan.workspace_path.join(file);
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    })
+}
+
+/// The terminal-replan fixture whose project configures `guidance` beyond
+/// `AGENTS.md` before the attempt is claimed, and whose parent workspace is
+/// shaped by `prepare` before the rejected candidate is captured.
+fn terminal_replan_fixture_with(
+    name: &str,
+    guidance: &[&str],
+    prepare: impl FnOnce(&Fixture, &DispatchPlan),
+) -> (Fixture, InstancePaths, DispatchPlan, String, String) {
+    let fixture = Fixture::new(name);
+    let paths = instance_paths(&fixture);
+    let project = add_project(&fixture, fixture.repository("repo"), "p");
+    if !guidance.is_empty() {
+        let mut configured = vec!["AGENTS.md"];
+        configured.extend_from_slice(guidance);
+        let revision: String = fixture.scalar(&format!(
+            "SELECT active_config_revision_id FROM trip_project_state WHERE project_id='{project}'"
+        ));
+        let config_json: String = fixture.scalar(&format!(
+            "SELECT config_json FROM trip_config_revisions WHERE id='{revision}'"
+        ));
+        let mut config: serde_json::Value = serde_json::from_str(&config_json).unwrap();
+        config["guidance"] = serde_json::json!(configured);
+        fixture.execute(
+            "UPDATE trip_config_revisions SET config_json=?1,configuration_hash=?2 WHERE id=?3",
+            params![
+                config.to_string(),
+                agenticjira::store::json_hash(&config).unwrap(),
+                revision
+            ],
+        );
+    }
+    let task = create_task(&fixture, &project, "task", 1);
+    let plan = claim(&fixture, paths.artifacts.clone());
+    prepare(&fixture, &plan);
+    let repository = workspace::inspect(&plan.repository_path).unwrap();
+    let (manifest, candidate_hash) = snapshot::capture(
+        &repository,
+        &plan.workspace_path,
+        &paths.artifacts.join("snapshots").join("rejected-snapshot"),
+    )
+    .unwrap();
+    fixture.execute(
+        "INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at)
+         VALUES('rejected-snapshot',?1,'candidate',?2,?3,?4,1,'2026-01-02T00:00:00Z')",
+        params![
+            plan.attempt_id,
+            manifest.snapshot_base,
+            candidate_hash,
+            serde_json::to_string(&manifest).unwrap()
+        ],
+    );
+    seed_session(
+        &fixture,
+        &plan.attempt_id,
+        "manager",
+        "g-manager",
+        "s-manager",
+        "exited",
+    );
+    seed_session(
+        &fixture,
+        &plan.attempt_id,
+        "code_reviewer",
+        "g-reviewer",
+        "s-reviewer",
+        "exited",
+    );
+    fixture.execute_batch(&format!(
+        r#"UPDATE role_generations SET status='exited' WHERE attempt_id='{parent}';
+           UPDATE attempts SET phase='needs_input',plan_hash='plan',plan_approved_at='2026-01-01T00:00:00Z',
+             candidate_hash=NULL WHERE id='{parent}';
+           UPDATE tasks SET attention='needs_input' WHERE id='{task}';
+           INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,session_id,settings_revision,prompt_hash,handoff_hash,delivery_state,verdict,budget_spent_at,created_at,updated_at)
+             VALUES('terminal-review','{parent}','code','{candidate_hash}','g-reviewer','s-reviewer',1,'p','h','finished','needs_rework',
+               '2026-01-02T00:00:01Z','2026-01-02T00:00:01Z','2026-01-02T00:00:01Z');
+           INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
+             VALUES('terminal-result','terminal-report','s-reviewer','g-reviewer','needs_rework','structural','[]',
+               '{{"review_request_id":"terminal-review","review_kind":"code","candidate_hash":"{candidate_hash}"}}',
+               '2026-01-02T00:00:02Z','2026-01-02T00:00:02Z');"#,
+        parent = plan.attempt_id,
+    ));
+    (fixture, paths, plan, task, candidate_hash)
+}
+
+fn terminal_replan_command(
+    fixture: &Fixture,
+    plan: &DispatchPlan,
+    task: &str,
+    candidate_hash: &str,
+    operation: &str,
+    overrides: serde_json::Value,
+) -> HumanCommand {
+    let mut command = serde_json::json!({
+        "kind":"replan_after_terminal_review","operation_id":operation,
+        "task_id":task,"attempt_id":plan.attempt_id,
+        "expected_version":fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+        "review_request_id":"terminal-review","role_result_id":"terminal-result",
+        "candidate_hash":candidate_hash,"snapshot_id":"rejected-snapshot",
+        "reason":"the rejected candidate needs a revised plan",
+    });
+    for (field, value) in overrides.as_object().unwrap() {
+        command[field] = value.clone();
+    }
+    serde_json::from_value(command).unwrap()
+}
+
+/// The parent's immutable evidence: requests, results, budgets, snapshots,
+/// receipt and workspace records.
+const REPLAN_PARENT_EVIDENCE: &str = "SELECT
+    COALESCE((SELECT group_concat(id||':'||review_kind||':'||candidate_hash||':'||delivery_state||':'
+      ||COALESCE(verdict,'-')||':'||COALESCE(budget_spent_at,'-')||':'||updated_at,',')
+      FROM (SELECT * FROM review_requests WHERE attempt_id=?1 ORDER BY rowid)),'none')
+    ||'|'||COALESCE((SELECT group_concat(rr.id||':'||rr.outcome||':'||COALESCE(rr.consumed_at,'-'),',')
+      FROM role_results rr JOIN role_generations g ON g.id=rr.role_generation_id WHERE g.attempt_id=?1),'none')
+    ||'|'||COALESCE((SELECT group_concat(review_kind||':'||initial_allowance||':'||extension_allowance||':'||spent,',')
+      FROM (SELECT * FROM review_budgets WHERE attempt_id=?1 ORDER BY review_kind)),'none')
+    ||'|'||COALESCE((SELECT group_concat(id||':'||kind||':'||manifest_hash||':'||complete,',')
+      FROM snapshots WHERE attempt_id=?1),'none')
+    ||'|'||COALESCE((SELECT group_concat(state||':'||COALESCE(verdict,'-')||':'||updated_at,',')
+      FROM final_repair_rechecks WHERE attempt_id=?1),'none')
+    ||'|'||COALESCE((SELECT group_concat(path||':'||state||':'||policy_json,',')
+      FROM workspaces WHERE attempt_id=?1),'none')";
+
+fn replan_parent_evidence(fixture: &Fixture, parent: &str) -> String {
+    fixture
+        .connection()
+        .query_row(REPLAN_PARENT_EVIDENCE, params![parent], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn terminal_replan_stages_a_fresh_planning_child_once_without_materializing() {
+    let (fixture, paths, plan, task, candidate_hash) =
+        terminal_replan_fixture("terminal-replan-staging");
+    let app = Application::new(
+        paths.clone(),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    let parent = plan.attempt_id.clone();
+    let evidence = replan_parent_evidence(&fixture, &parent);
+    let version: i64 = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+    let lineage = "SELECT (SELECT COUNT(*) FROM rework_intents)||':'||
+        (SELECT COUNT(*) FROM attempts WHERE parent_attempt_id IS NOT NULL)";
+    let refusals = [
+        ("stale version", serde_json::json!({"expected_version":version - 1}), "", "", "task version is stale"),
+        ("other request", serde_json::json!({"review_request_id":"other"}), "", "", "latest nonapproving code or final review"),
+        ("other result", serde_json::json!({"role_result_id":"other"}), "", "", "latest nonapproving code or final review"),
+        ("other candidate", serde_json::json!({"candidate_hash":"other"}), "", "", "latest nonapproving code or final review"),
+        ("other snapshot", serde_json::json!({"snapshot_id":"other"}), "", "", "latest nonapproving code or final review"),
+        ("missing reason", serde_json::json!({"reason":"  "}), "", "", "replan reason"),
+        (
+            "active review",
+            serde_json::json!({}),
+            "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,prompt_hash,handoff_hash,delivery_state,created_at,updated_at)
+             SELECT 'ambiguous-review',id,'final','other','p','h','ambiguous','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'
+               FROM attempts WHERE id=(SELECT attempt_id FROM review_requests WHERE id='terminal-review')",
+            "DELETE FROM review_requests WHERE id='ambiguous-review'",
+            "",
+        ),
+        (
+            "active writer",
+            serde_json::json!({}),
+            "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+             SELECT 'g-writer',attempt_id,'implementer','codex',9,1,'running','f','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'
+               FROM review_requests WHERE id='terminal-review'",
+            "DELETE FROM role_generations WHERE id='g-writer'",
+            "an implementer is still working",
+        ),
+        (
+            "unrelated hold",
+            serde_json::json!({}),
+            "UPDATE tasks SET attention='paused'",
+            "UPDATE tasks SET attention='needs_input'",
+            "task version is stale",
+        ),
+        (
+            "open recovery",
+            serde_json::json!({}),
+            "INSERT INTO recovery_records(id,attempt_id,state,detail_json,created_at,updated_at)
+             SELECT 'open-recovery',attempt_id,'attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'
+               FROM review_requests WHERE id='terminal-review'",
+            "DELETE FROM recovery_records WHERE id='open-recovery'",
+            "a recovery is open",
+        ),
+    ];
+    for (case, overrides, setup, teardown, expected) in refusals {
+        fixture.execute_batch(setup);
+        let command = terminal_replan_command(
+            &fixture,
+            &plan,
+            &task,
+            &candidate_hash,
+            &format!("refused-{case}"),
+            overrides,
+        );
+        let error = format!("{:#}", app.execute_human_command(&command).unwrap_err());
+        assert!(error.contains(expected), "{case}: {error}");
+        fixture.execute_batch(teardown);
+        fixture.assert_scalar::<String>(lineage, "0:0".into());
+        assert_eq!(
+            replan_parent_evidence(&fixture, &parent),
+            evidence,
+            "{case}"
+        );
+    }
+
+    let command = terminal_replan_command(
+        &fixture,
+        &plan,
+        &task,
+        &candidate_hash,
+        "replan",
+        serde_json::json!({}),
+    );
+    let staged = app.execute_human_command(&command).unwrap();
+    assert_eq!(staged.state, "replan_created_pending_quiescence");
+    assert_eq!(staged.version, Some(version + 1));
+    let child = staged.entity_id.clone();
+    let destination = paths.artifacts.join("worktrees").join(&child);
+    assert!(
+        !destination.exists(),
+        "staging must not create the child workspace"
+    );
+    fixture.assert_scalar::<i64>(
+        &format!("SELECT COUNT(*) FROM workspaces WHERE attempt_id='{child}'"),
+        0,
+    );
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT phase||':'||status||':'||parent_attempt_id||':'||(plan_hash IS NULL)||(plan_approved_at IS NULL)
+               ||(structured_plan_id IS NULL)||(candidate_hash IS NULL)||(accepted_snapshot_id IS NULL)
+               ||':'||final_repair_round FROM attempts WHERE id='{child}'"
+        ),
+        format!("planning:materialization_pending:{parent}:11111:0"),
+    );
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT group_concat(review_kind||':'||initial_allowance||':'||extension_allowance||':'||spent,',')
+             FROM (SELECT * FROM review_budgets WHERE attempt_id='{child}' ORDER BY review_kind)"
+        ),
+        "code:2:0:0,final:1:0:0,plan:2:0:0".into(),
+    );
+    for table in [
+        "trip_selected_checks",
+        "trip_conformance_receipts",
+        "implementation_lanes",
+        "review_requests",
+        "final_repair_rechecks",
+    ] {
+        fixture.assert_scalar::<i64>(
+            &format!("SELECT COUNT(*) FROM {table} WHERE attempt_id='{child}'"),
+            0,
+        );
+    }
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT (SELECT COUNT(*) FROM trip_attempt_profiles WHERE attempt_id='{child}')
+                   -(SELECT COUNT(*) FROM trip_attempt_profiles WHERE attempt_id='{parent}')"
+        ),
+        0,
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT snapshot_id||':'||carry_plan_approval||':'||state||':'||feedback FROM rework_intents",
+        "rejected-snapshot:0:reserved:the rejected candidate needs a revised plan".into(),
+    );
+    assert_eq!(
+        staged.detail["terminal_review"]["review_request_id"],
+        "terminal-review"
+    );
+    assert_eq!(staged.detail["accepted_authority_inherited"], false);
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT json_extract(detail_json,'$.terminal_review.role_result_id')||':'||
+                    json_extract(detail_json,'$.candidate_hash')
+             FROM audit_events WHERE event_code='rework.terminal_replan.created' AND entity_id='{child}'"
+        ),
+        format!("terminal-result:{candidate_hash}"),
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT kind FROM snapshots WHERE id='rejected-snapshot'",
+        "candidate".into(),
+    );
+    // Only lifecycle changes reach the parent; its evidence is unchanged.
+    assert_eq!(replan_parent_evidence(&fixture, &parent), evidence);
+    fixture.assert_scalar::<String>(
+        &format!("SELECT status FROM attempts WHERE id='{parent}'"),
+        "rework_staging".into(),
+    );
+
+    // The same operation returns the same child; another operation is refused.
+    let replayed = app.execute_human_command(&command).unwrap();
+    assert_eq!(replayed.entity_id, child);
+    let second = terminal_replan_command(
+        &fixture,
+        &plan,
+        &task,
+        &candidate_hash,
+        "replan-again",
+        serde_json::json!({}),
+    );
+    let error = format!("{:#}", app.execute_human_command(&second).unwrap_err());
+    assert!(
+        error.contains("task version is stale")
+            || error.contains("already has a continuation lineage"),
+        "{error}"
+    );
+    fixture.assert_scalar::<String>(lineage, "1:1".into());
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+#[test]
+fn terminal_replan_materializes_the_rejected_candidate_only_after_parent_quiescence() {
+    let (fixture, paths, plan, task, candidate_hash) =
+        terminal_replan_fixture("terminal-replan-materialize");
+    let app = Application::new(
+        paths.clone(),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    let parent = plan.attempt_id.clone();
+    let staged = app
+        .execute_human_command(&terminal_replan_command(
+            &fixture,
+            &plan,
+            &task,
+            &candidate_hash,
+            "replan",
+            serde_json::json!({}),
+        ))
+        .unwrap();
+    let child = staged.entity_id.clone();
+    let destination = paths.artifacts.join("worktrees").join(&child);
+    let evidence = replan_parent_evidence(&fixture, &parent);
+    let fences = [
+        (
+            "live manager",
+            "UPDATE role_generations SET status='running' WHERE id='g-manager'".to_owned(),
+            "UPDATE role_generations SET status='exited' WHERE id='g-manager'".to_owned(),
+        ),
+        (
+            "stopping reviewer without proven quiescence",
+            "UPDATE role_generations SET status='stopping' WHERE id='g-reviewer';
+             UPDATE sessions SET exit_json='{}' WHERE id='s-reviewer';"
+                .to_owned(),
+            r#"UPDATE role_generations SET status='exited' WHERE id='g-reviewer';
+               UPDATE sessions SET exit_json='{"process_group_quiescent":true}' WHERE id='s-reviewer';"#
+                .to_owned(),
+        ),
+        (
+            "stopping reviewer with proven session quiescence",
+            r#"UPDATE role_generations SET status='stopping' WHERE id='g-reviewer';
+               UPDATE sessions SET status='exited',exit_json='{"process_group_quiescent":true}' WHERE id='s-reviewer';"#
+                .to_owned(),
+            "UPDATE role_generations SET status='exited' WHERE id='g-reviewer'".to_owned(),
+        ),
+        (
+            "recovery-held reviewer with proven session quiescence",
+            r#"UPDATE role_generations SET status='recovery_required' WHERE id='g-reviewer';
+               UPDATE sessions SET status='exited',exit_json='{"process_group_quiescent":true}' WHERE id='s-reviewer';"#
+                .to_owned(),
+            "UPDATE role_generations SET status='exited' WHERE id='g-reviewer'".to_owned(),
+        ),
+        (
+            "ambiguous review",
+            format!(
+                "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,prompt_hash,handoff_hash,delivery_state,created_at,updated_at)
+                 VALUES('ambiguous-review','{parent}','final','other','p','h','ambiguous','2026-01-03T00:00:00Z','2026-01-03T00:00:00Z')"
+            ),
+            "DELETE FROM review_requests WHERE id='ambiguous-review'".to_owned(),
+        ),
+        (
+            "pending permission",
+            format!(
+                "INSERT INTO permission_requests(id,hook_invocation_nonce,connection_nonce,provider,project_id,task_id,attempt_id,session_id,role_generation_id,role,service_boot_id,native_session_id,cwd,policy_fingerprint,tool_name,input_digest,input_json,created_at,deadline_at,state,updated_at)
+                 SELECT 'pending-permission','nonce','connection','codex',project_id,id,'{parent}','s-manager','g-manager','manager','boot','native','/tmp','policy','Bash','digest','{{}}','2026-01-03T00:00:00Z','2999-01-01T00:00:00Z','pending','2026-01-03T00:00:00Z'
+                   FROM tasks WHERE id='{task}'"
+            ),
+            "DELETE FROM permission_requests WHERE id='pending-permission'".to_owned(),
+        ),
+        (
+            "active check",
+            format!(
+                "INSERT INTO check_runs(id,attempt_id,candidate_hash,executable,arguments_json,cwd,status,created_at)
+                 VALUES('active-check','{parent}','{candidate_hash}','/bin/true','[]','/tmp','running','2026-01-03T00:00:00Z')"
+            ),
+            "DELETE FROM check_runs WHERE id='active-check'".to_owned(),
+        ),
+        (
+            "unresolved recovery",
+            format!(
+                "INSERT INTO recovery_records(id,attempt_id,state,detail_json,created_at,updated_at)
+                 VALUES('open-recovery','{parent}','attention_required','{{}}','2026-01-03T00:00:00Z','2026-01-03T00:00:00Z')"
+            ),
+            "DELETE FROM recovery_records WHERE id='open-recovery'".to_owned(),
+        ),
+    ];
+    for (case, setup, teardown) in fences {
+        fixture.execute_batch(&setup);
+        let _ = app.coordinator_tick();
+        assert!(
+            !destination.exists(),
+            "{case} must prevent workspace creation"
+        );
+        fixture.assert_scalar::<String>(
+            "SELECT ri.state||':'||a.status FROM rework_intents ri JOIN attempts a ON a.id=ri.new_attempt_id",
+            "reserved:materialization_pending".into(),
+        );
+        fixture.assert_scalar::<i64>(
+            &format!("SELECT COUNT(*) FROM claims WHERE attempt_id='{parent}' AND state='running'"),
+            1,
+        );
+        fixture.execute_batch(&teardown);
+    }
+
+    let materialized = app.coordinator_tick().unwrap();
+    assert_eq!(
+        materialized["action"], "rework_materialized",
+        "{materialized}"
+    );
+    assert!(!destination.join("fixture.txt").exists());
+    for (file, text, mode) in [
+        ("untracked.txt", "rejected but preserved\n", 0o640),
+        ("tool.sh", "#!/bin/sh\nexit 0\n", 0o750),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(destination.join(file)).unwrap(),
+            text
+        );
+        assert_eq!(
+            std::fs::metadata(destination.join(file))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            mode
+        );
+    }
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT (SELECT status FROM attempts WHERE id='{parent}')||':'||
+                    (SELECT status||':'||(accepted_snapshot_id IS NULL) FROM attempts WHERE id='{child}')||':'||
+                    (SELECT attempt_id FROM claims WHERE state='running')||':'||
+                    (SELECT state||':'||json_extract(result_json,'$.claim_transferred') FROM rework_intents)"
+        ),
+        format!("reworked:running:1:{child}:completed:1"),
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT kind FROM snapshots WHERE id='rejected-snapshot'",
+        "candidate".into(),
+    );
+    assert_eq!(replan_parent_evidence(&fixture, &parent), evidence);
+    // The parent's original workspace keeps its rejected bytes.
+    assert_eq!(
+        std::fs::read_to_string(plan.workspace_path.join("untracked.txt")).unwrap(),
+        "rejected but preserved\n"
+    );
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+#[test]
+fn terminal_replan_source_without_exact_provenance_needs_recovery() {
+    let (fixture, paths, plan, task, candidate_hash) =
+        terminal_replan_fixture("terminal-replan-forged-source");
+    let app = Application::new(
+        paths.clone(),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    let parent = plan.attempt_id.clone();
+    let child = app
+        .execute_human_command(&terminal_replan_command(
+            &fixture,
+            &plan,
+            &task,
+            &candidate_hash,
+            "replan",
+            serde_json::json!({}),
+        ))
+        .unwrap()
+        .entity_id;
+    fixture.execute(
+        "UPDATE audit_events SET detail_json=json_set(detail_json,'$.candidate_hash','forged')
+         WHERE event_code='rework.terminal_replan.created'",
+        [],
+    );
+    let error = format!("{:#}", app.coordinator_tick().unwrap_err());
+    assert!(
+        error.contains("not the exact rejected candidate of a recorded terminal replan"),
+        "{error}"
+    );
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT (SELECT state FROM rework_intents)||':'||
+                    (SELECT status FROM attempts WHERE id='{child}')||':'||
+                    (SELECT attempt_id FROM claims WHERE state='running')||':'||
+                    (SELECT kind FROM snapshots WHERE id='rejected-snapshot')"
+        ),
+        format!("recovery_required:needs_recovery:{parent}:candidate"),
+    );
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+/// Changes `path` in the parent workspace to `content` and records what the
+/// parent's guidance approval left in its activated policy. `authorized`
+/// re-pins it with a matching reauthorization; `unapproved` records nothing;
+/// `mismatched_reauthorization` approves other bytes; `retired_configuration`
+/// binds the approval to a configuration that is not active.
+fn change_parent_guidance(
+    fixture: &Fixture,
+    plan: &DispatchPlan,
+    path: &str,
+    content: &str,
+    case: &str,
+) {
+    let target = plan.workspace_path.join(path);
+    let previous = sha256(&std::fs::read(&target).unwrap());
+    std::fs::write(&target, content).unwrap();
+    if case == "unapproved" {
+        return;
+    }
+    let changed = sha256(content.as_bytes());
+    let active: String = fixture.scalar(&format!(
+        "SELECT s.active_config_revision_id FROM trip_project_state s
+         JOIN tasks t ON t.project_id=s.project_id WHERE t.id=(SELECT task_id FROM attempts WHERE id='{}')",
+        plan.attempt_id
+    ));
+    let policy_json: String = fixture.scalar(&format!(
+        "SELECT policy_json FROM workspaces WHERE attempt_id='{}'",
+        plan.attempt_id
+    ));
+    let mut policy: serde_json::Value = serde_json::from_str(&policy_json).unwrap();
+    policy["files"][path] = serde_json::json!(changed);
+    let approved = if case == "mismatched_reauthorization" {
+        sha256(b"other approved bytes")
+    } else {
+        changed
+    };
+    let configuration = if case == "retired_configuration" {
+        "retired-configuration".to_owned()
+    } else {
+        active
+    };
+    policy["guidance_reauthorizations"] = serde_json::json!([{
+        "approved_at":"2026-01-01T12:00:00Z","config_revision_id":configuration,
+        "files":[{"path":path,"previous_sha256":previous,"sha256":approved}],
+        "plan_hash":"plan","previous_policy_hash":sha256(policy_json.as_bytes()),"task_version":1,
+    }]);
+    fixture.execute(
+        "UPDATE workspaces SET policy_json=?1 WHERE attempt_id=?2",
+        params![policy.to_string(), plan.attempt_id],
+    );
+}
+
+/// The rework child's lifecycle and ownership after materialization stopped.
+const HELD_REWORK_CHILD: &str = "SELECT ri.state||':'||child.status||':'||
+    (SELECT attempt_id FROM claims WHERE state='running')||':'||
+    (SELECT COUNT(*) FROM role_generations WHERE attempt_id=child.id)||':'||
+    (child.plan_hash IS NULL)||(child.plan_approved_at IS NULL)||(child.accepted_snapshot_id IS NULL)
+    FROM rework_intents ri JOIN attempts child ON child.id=ri.new_attempt_id";
+
+#[test]
+fn terminal_replan_keeps_the_parents_reauthorized_guidance_bytes() {
+    let authorized = "base\nauthorized guidance\n";
+    let (fixture, paths, plan, task, candidate_hash) = terminal_replan_fixture_with(
+        "terminal-replan-authorized-guidance",
+        &["fixture.txt"],
+        |fixture, plan| {
+            change_parent_guidance(fixture, plan, "fixture.txt", authorized, "authorized")
+        },
+    );
+    let app = Application::new(
+        paths.clone(),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    let parent = plan.attempt_id.clone();
+    let child = app
+        .execute_human_command(&terminal_replan_command(
+            &fixture,
+            &plan,
+            &task,
+            &candidate_hash,
+            "replan",
+            serde_json::json!({}),
+        ))
+        .unwrap()
+        .entity_id;
+    let destination = paths.artifacts.join("worktrees").join(&child);
+    let evidence = replan_parent_evidence(&fixture, &parent);
+    let materialized = app.coordinator_tick().unwrap();
+    assert_eq!(
+        materialized["action"], "rework_materialized",
+        "{materialized}"
+    );
+    // The candidate keeps its approved bytes; the project copy is not used.
+    assert_eq!(
+        std::fs::read_to_string(destination.join("fixture.txt")).unwrap(),
+        authorized
+    );
+    assert_eq!(
+        std::fs::read_to_string(plan.repository_path.join("fixture.txt")).unwrap(),
+        "base\n"
+    );
+    let policy: serde_json::Value = serde_json::from_str(&fixture.scalar::<String>(&format!(
+        "SELECT policy_json FROM workspaces WHERE attempt_id='{child}'"
+    )))
+    .unwrap();
+    assert_eq!(
+        policy["files"]["fixture.txt"],
+        sha256(authorized.as_bytes())
+    );
+    let kept = policy["rework_guidance_sources"].as_array().unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0]["path"], "fixture.txt");
+    assert_eq!(kept[0]["sha256"], sha256(authorized.as_bytes()));
+    assert_eq!(kept[0]["project_sha256"], sha256(b"base\n"));
+    assert_eq!(kept[0]["parent_attempt_id"], parent.as_str());
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT COUNT(*) FROM audit_events WHERE event_code='rework.guidance.preserved'
+             AND entity_id='{child}' AND json_extract(detail_json,'$.files[0].path')='fixture.txt'"
+        ),
+        1,
+    );
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT status||':'||(plan_hash IS NULL)||(plan_approved_at IS NULL)||(structured_plan_id IS NULL)
+               ||(accepted_snapshot_id IS NULL) FROM attempts WHERE id='{child}'"
+        ),
+        "running:1111".into(),
+    );
+    agenticjira::trip::require_attempt_ready(&fixture.connection(), &child, None).unwrap();
+    assert_eq!(replan_parent_evidence(&fixture, &parent), evidence);
+    assert_eq!(
+        std::fs::read_to_string(plan.workspace_path.join("fixture.txt")).unwrap(),
+        authorized
+    );
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+#[test]
+fn terminal_replan_refuses_unauthorized_guidance_before_claim_transfer() {
+    for (case, path, expected) in [
+        ("unapproved", "fixture.txt", "does not pin this content"),
+        (
+            "mismatched_reauthorization",
+            "fixture.txt",
+            "did not approve this content",
+        ),
+        (
+            "retired_configuration",
+            "fixture.txt",
+            "configuration that is no longer active",
+        ),
+        ("authorized", "AGENTS.md", "protected workflow artifact"),
+        (
+            "authorized",
+            ".agents/trip-explorer/config.json",
+            "policy materialization collision",
+        ),
+    ] {
+        let (fixture, paths, plan, task, candidate_hash) = terminal_replan_fixture_with(
+            &format!(
+                "terminal-replan-guidance-{case}-{}",
+                path.replace(['/', '.'], "-")
+            ),
+            &["fixture.txt"],
+            |fixture, plan| change_parent_guidance(fixture, plan, path, "changed\n", case),
+        );
+        let app = Application::new(
+            paths.clone(),
+            fixture.store.clone(),
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        app.execute_human_command(&terminal_replan_command(
+            &fixture,
+            &plan,
+            &task,
+            &candidate_hash,
+            "replan",
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        let error = format!("{:#}", app.coordinator_tick().unwrap_err());
+        assert!(error.contains(expected), "{case} {path}: {error}");
+        fixture.assert_scalar::<String>(
+            HELD_REWORK_CHILD,
+            format!("recovery_required:needs_recovery:{}:0:111", plan.attempt_id),
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(paths.socket_dir);
+    }
+}
+
+#[test]
+fn failed_guidance_materialization_retries_through_the_existing_recovery_decision() {
+    let (fixture, paths, plan, task, candidate_hash) = terminal_replan_fixture_with(
+        "terminal-replan-guidance-retry",
+        &["fixture.txt"],
+        |fixture, plan| {
+            change_parent_guidance(
+                fixture,
+                plan,
+                "fixture.txt",
+                "base\nauthorized guidance\n",
+                "retired_configuration",
+            )
+        },
+    );
+    let app = Application::new(
+        paths.clone(),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    let child = app
+        .execute_human_command(&terminal_replan_command(
+            &fixture,
+            &plan,
+            &task,
+            &candidate_hash,
+            "replan",
+            serde_json::json!({}),
+        ))
+        .unwrap()
+        .entity_id;
+    assert!(app.coordinator_tick().is_err());
+    fixture.assert_scalar::<String>(
+        HELD_REWORK_CHILD,
+        format!("recovery_required:needs_recovery:{}:0:111", plan.attempt_id),
+    );
+    // The blocker is removed; the same intent retries over its partial workspace.
+    fixture.execute(
+        "UPDATE workspaces SET policy_json=json_set(policy_json,'$.guidance_reauthorizations[0].config_revision_id',
+           (SELECT active_config_revision_id FROM trip_project_state s JOIN tasks t ON t.project_id=s.project_id
+            WHERE t.id=?2)) WHERE attempt_id=?1",
+        params![plan.attempt_id, task],
+    );
+    let intent: String = fixture.scalar("SELECT id FROM rework_intents");
+    let version: i64 = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+    let retried = app
+        .execute_human_command(&HumanCommand::ResolveRecovery {
+            operation_id: "retry-guidance-materialization".into(),
+            task_id: task.clone(),
+            attempt_id: child.clone(),
+            recovery_id: intent,
+            session_id: None,
+            expected_version: version,
+            decision: "retry_materialization".into(),
+            evidence: "parent guidance approval binding corrected".into(),
+        })
+        .unwrap();
+    assert_eq!(retried.state, "materialization_retry_reserved");
+    let materialized = app.coordinator_tick().unwrap();
+    assert_eq!(
+        materialized["action"], "rework_materialized",
+        "{materialized}"
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT ri.state||':'||child.status||':'||(SELECT attempt_id FROM claims WHERE state='running')
+         FROM rework_intents ri JOIN attempts child ON child.id=ri.new_attempt_id",
+        format!("completed:running:{child}"),
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            paths
+                .artifacts
+                .join("worktrees")
+                .join(&child)
+                .join("fixture.txt")
+        )
+        .unwrap(),
+        "base\nauthorized guidance\n"
+    );
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+/// Everything startup reconciliation must leave to the rework lifecycle.
+const UNFINISHED_REWORK_STATE: &str = "SELECT ri.state||'|'||ri.result_json||'|'||child.status
+    ||'|'||w.state||'|'||w.policy_json||'|'||(SELECT group_concat(attempt_id||'='||state) FROM claims)
+    ||'|'||t.attention||'|'||t.version
+    ||'|'||(SELECT COUNT(*) FROM recovery_records WHERE attempt_id=child.id)
+    ||'|'||(SELECT COUNT(*) FROM role_generations WHERE attempt_id=child.id)
+    FROM rework_intents ri JOIN attempts child ON child.id=ri.new_attempt_id
+    JOIN workspaces w ON w.attempt_id=child.id JOIN tasks t ON t.id=child.task_id";
+
+#[test]
+fn startup_reconciliation_leaves_an_unfinished_rework_workspace_to_its_lifecycle() {
+    let (fixture, paths, plan, task, candidate_hash) = terminal_replan_fixture_with(
+        "startup-unfinished-rework",
+        &["fixture.txt"],
+        |fixture, plan| {
+            change_parent_guidance(
+                fixture,
+                plan,
+                "fixture.txt",
+                "base\nauthorized guidance\n",
+                "retired_configuration",
+            )
+        },
+    );
+    let app = Application::new(
+        paths.clone(),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    let child = app
+        .execute_human_command(&terminal_replan_command(
+            &fixture,
+            &plan,
+            &task,
+            &candidate_hash,
+            "replan",
+            serde_json::json!({}),
+        ))
+        .unwrap()
+        .entity_id;
+    assert!(app.coordinator_tick().is_err());
+    let held = fixture.scalar::<String>(UNFINISHED_REWORK_STATE);
+    assert!(
+        held.starts_with("recovery_required|") && held.contains("|needs_recovery|reserved|"),
+        "{held}"
+    );
+    assert!(
+        held.contains(&format!("{}=running", plan.attempt_id)),
+        "{held}"
+    );
+    drop(app);
+
+    // A restarted service's ordinary reservation reconciliation does not own
+    // the child: its claim is still the parent's and its policy is lineage-only.
+    let restarted = Store::open(&fixture.database).unwrap();
+    let reconciled = Scheduler::new(restarted.clone(), paths.artifacts.clone())
+        .with_runtime(
+            test_hooks(&fixture),
+            fixture.root.join("role.sock"),
+            std::env::current_exe().unwrap(),
+        )
+        .reconcile_unknown()
+        .unwrap();
+    assert!(reconciled.is_empty(), "{reconciled:?}");
+    assert_eq!(fixture.scalar::<String>(UNFINISHED_REWORK_STATE), held);
+
+    // The rework lifecycle still owns recovery: once the blocker is removed,
+    // the existing retry materializes the same lineage.
+    fixture.execute(
+        "UPDATE workspaces SET policy_json=json_set(policy_json,'$.guidance_reauthorizations[0].config_revision_id',
+           (SELECT active_config_revision_id FROM trip_project_state s JOIN tasks t ON t.project_id=s.project_id
+            WHERE t.id=?2)) WHERE attempt_id=?1",
+        params![plan.attempt_id, task],
+    );
+    let app = Application::new(paths.clone(), restarted, std::env::current_exe().unwrap()).unwrap();
+    let intent: String = fixture.scalar("SELECT id FROM rework_intents");
+    let version: i64 = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+    let retried = app
+        .execute_human_command(&HumanCommand::ResolveRecovery {
+            operation_id: "retry-after-restart".into(),
+            task_id: task.clone(),
+            attempt_id: child.clone(),
+            recovery_id: intent,
+            session_id: None,
+            expected_version: version,
+            decision: "retry_materialization".into(),
+            evidence: "parent guidance approval binding corrected".into(),
+        })
+        .unwrap();
+    assert_eq!(retried.state, "materialization_retry_reserved");
+    let materialized = app.coordinator_tick().unwrap();
+    assert_eq!(
+        materialized["action"], "rework_materialized",
+        "{materialized}"
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT ri.state||':'||child.status||':'||w.state||':'||(SELECT attempt_id FROM claims WHERE state='running')
+         FROM rework_intents ri JOIN attempts child ON child.id=ri.new_attempt_id
+         JOIN workspaces w ON w.attempt_id=child.id",
+        format!("completed:running:ready:{child}"),
+    );
+    // A completed rework is an ordinary attempt again and needs no reconciliation.
+    assert!(scheduler(&fixture, paths.artifacts.clone())
+        .reconcile_unknown()
+        .unwrap()
+        .is_empty());
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+#[test]
+fn ordinary_policy_materialization_still_refuses_guidance_collisions() {
+    let (fixture, paths, plan, _, _) =
+        terminal_replan_fixture_with("ordinary-guidance-collision", &["fixture.txt"], |_, _| {});
+    std::fs::write(plan.workspace_path.join("fixture.txt"), "drifted\n").unwrap();
+    fixture.execute(
+        "UPDATE workspaces SET state='reserved' WHERE attempt_id=?1",
+        params![plan.attempt_id],
+    );
+    let error = format!(
+        "{:#}",
+        agenticjira::trip::materialize_project_policy(
+            &fixture.store,
+            &plan.attempt_id,
+            &plan.workspace_path
+        )
+        .unwrap_err()
+    );
+    assert!(
+        error.contains("approved guidance collides with different worktree content: fixture.txt")
+            && !error.contains("rework parent"),
+        "{error}"
+    );
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+#[test]
+fn terminal_replan_continues_after_a_closed_final_repair_recheck() {
+    let (fixture, reviews) = recovered_final_repair_fixture("terminal-replan-closed-recheck");
+    let request = reserve_final_repair_recheck(&reviews).unwrap().request_id;
+    deliver_final_repair_recheck(&fixture, &reviews, &request, Some("needs_rework"));
+    final_repair_recheck_verdict(&fixture, "needs_rework");
+    let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
+    let receipt = fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS);
+    let replan = |operation: &str, overrides: serde_json::Value| {
+        let mut command = serde_json::json!({
+            "kind":"replan_after_terminal_review","operation_id":operation,
+            "task_id":"t","attempt_id":"a",
+            "expected_version":fixture.scalar::<i64>("SELECT version FROM tasks WHERE id='t'"),
+            "review_request_id":request,"role_result_id":"recheck-result",
+            "candidate_hash":"fixed-candidate","snapshot_id":"fixed-snapshot",
+            "reason":"the closed recheck needs a revised plan",
+        });
+        for (field, value) in overrides.as_object().unwrap() {
+            command[field] = value.clone();
+        }
+        workflow::execute(&fixture.store, &serde_json::from_value(command).unwrap())
+            .map_err(|error| format!("{error:#}"))
+    };
+    // The historical ordinary rejection is not the attempt's latest review.
+    let older = replan(
+        "replan-older",
+        serde_json::json!({"review_request_id":"sixth-code","role_result_id":"sixth-result",
+            "candidate_hash":"repaired-candidate"}),
+    )
+    .unwrap_err();
+    assert!(older.contains("latest nonapproving"), "{older}");
+    let staged = replan("replan", serde_json::json!({})).unwrap();
+    assert_eq!(staged.state, "replan_created_pending_quiescence");
+    assert_eq!(
+        staged.detail["parent_final_repair_recheck"]["state"],
+        "closed"
+    );
+    assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
+    assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), receipt);
+    fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT phase||':'||(plan_hash IS NULL)||':'||(accepted_snapshot_id IS NULL)
+             FROM attempts WHERE id='{}'",
+            staged.entity_id
+        ),
+        "planning:1:1".into(),
     );
 }

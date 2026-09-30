@@ -419,8 +419,8 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
           <span className="eyebrow">{project.display_name}</span>
           <h1>Recipes</h1>
           <p>
-            Saved configurations copy into ordinary editable drafts. Make Ready
-            stays a separate human action.
+            Saved configurations copy into ordinary editable drafts. A draft
+            is queued only when you choose Make Ready.
           </p>
         </div>
       </header>

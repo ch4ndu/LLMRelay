@@ -423,6 +423,9 @@ pub async fn serve(paths: InstancePaths, requested_port: u16, open_browser: bool
         let service_started_at = chrono::Utc::now();
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut intake_error_reported = false;
+        // Unknown at startup: a deferral recorded before a restart is closed by
+        // the first tick that completes.
+        let mut tick_deferral_open = true;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -444,6 +447,12 @@ pub async fn serve(paths: InstancePaths, requested_port: u16, open_browser: bool
                             }
                             match coordinator {
                         Ok(result)=>{
+                            if tick_deferral_open {
+                                match crate::coordinator::record_tick_recovered(&coordinator_app.store){
+                                    Ok(_)=>tick_deferral_open=false,
+                                    Err(error)=>tracing::warn!(error=%error,"coordinator recovery record deferred"),
+                                }
+                            }
                             if result.get("action").and_then(|value|value.as_str())!=Some("idle"){
                                 let _=coordinator_app.diagnostics.record("info","coordinator.tick","coordinator","success",None,result);
                             }
@@ -453,7 +462,18 @@ pub async fn serve(paths: InstancePaths, requested_port: u16, open_browser: bool
                                 Err(error)=>tracing::warn!(error=%error,"drain reconciliation failed"),
                             }
                         }
-                        Err(error)=>{tracing::warn!(error=%error,"coordinator action deferred");let _=coordinator_app.diagnostics.record("warn","coordinator.tick","coordinator","deferred",None,serde_json::json!({"cause":format!("{error:#}")}));}
+                        Err(error)=>{
+                            let cause=format!("{error:#}");
+                            tick_deferral_open=true;
+                            // Diagnostics and the durable record are written once per
+                            // distinct cause, not on every retry.
+                            let subject=error.downcast_ref::<crate::coordinator::TickSubject>().map(|subject|subject.attempt_id.clone());
+                            match crate::coordinator::record_tick_deferred(&coordinator_app.store,&cause,subject.as_deref()){
+                                Ok(false)=>{},
+                                Ok(true)=>{tracing::warn!(error=%error,"coordinator action deferred");let _=coordinator_app.diagnostics.record("warn","coordinator.tick","coordinator","deferred",None,serde_json::json!({"cause":cause}));}
+                                Err(record_error)=>{tracing::warn!(error=%error,record_error=%record_error,"coordinator action deferred");let _=coordinator_app.diagnostics.record("warn","coordinator.tick","coordinator","deferred",None,serde_json::json!({"cause":cause}));}
+                            }
+                        }
                             }
                         }
                         Err(error)=>{let _=coordinator_failure.send(Some(format!("coordinator task failed: {error}")));let _=coordinator_shutdown.send(true);break}
@@ -557,6 +577,7 @@ fn web_router(web_state: WebState) -> Router {
             "/api/tasks/{task_id}/role-preparations",
             get(api_role_preparations),
         )
+        .route("/api/tasks/{task_id}/content", get(api_task_content))
         .route("/api/command", post(api_command))
         .route("/api/operation", post(api_operation))
         .route("/api/diagnostics", get(api_diagnostics))
@@ -976,6 +997,31 @@ async fn api_role_preparations(
         Err(error) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error":format!("{error:#}")})),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_task_content(
+    State(state): State<WebState>,
+    AxumPath(task_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_browser(&state, &headers) {
+        return response;
+    }
+    let store = state.app.store.clone();
+    match tokio::task::spawn_blocking(move || crate::workflow::task_content(&store, &task_id)).await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error":format!("{error:#}")})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":format!("task content read failed: {error}")})),
         )
             .into_response(),
     }

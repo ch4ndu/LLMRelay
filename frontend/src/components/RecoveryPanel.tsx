@@ -1,7 +1,7 @@
 import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import { useRef, useState } from "react";
 import { command, operationId } from "../api";
-import type { Task } from "../types";
+import { roleLabel, type Session, type Task } from "../types";
 
 const exactRecoveryKinds = [
   "workspace_reservation",
@@ -20,9 +20,10 @@ function recoveryDetail(record: Record<string, unknown>) {
 }
 
 export function RecoveryPanel(
-  { task, records, selectedRecordId, onChanged }: {
+  { task, records, sessions = [], selectedRecordId, onChanged }: {
     task: Task;
     records: Array<Record<string, unknown>>;
+    sessions?: Session[];
     /** An exact record opened from attention; no other record replaces it. */
     selectedRecordId?: string;
     onChanged: () => void;
@@ -51,6 +52,7 @@ export function RecoveryPanel(
         task={task}
         attemptId={attempt.id}
         record={record}
+        session={sessions.find((session) => session.id === record.session_id)}
         onChanged={onChanged}
       />
     );
@@ -58,21 +60,22 @@ export function RecoveryPanel(
   if (selectedRecordId === undefined) return null;
   return (
     <section className="panel recovery" role="status">
-      <h3>Recovery decision</h3>
+      <h3>Recovery</h3>
       <p>
-        The recovery record opened from the attention inbox was resolved or
-        changed, so no recovery action is offered for it. Open a current item
-        from the attention inbox, or close and reopen this task.
+        The problem you opened was resolved or changed, so there is nothing to
+        do for it here. Open a current item from Needs your attention, or close
+        and reopen this task.
       </p>
     </section>
   );
 }
 
 function RecoveryDecision(
-  { task, attemptId, record, onChanged }: {
+  { task, attemptId, record, session, onChanged }: {
     task: Task;
     attemptId: string;
     record: Record<string, unknown>;
+    session?: Session;
     onChanged: () => void;
   },
 ) {
@@ -131,30 +134,39 @@ function RecoveryDecision(
         : undefined}
       tabIndex={-1}
     >
-      <h3>Recovery decision</h3>
+      <h3>
+        {session
+          ? `Manual action needed: ${roleLabel(session.role)}`
+          : "Manual action needed"}
+      </h3>
       <p>
         {exactRecovery
           ? "Use the recovery action shown above for this task. It checks the affected session before allowing work to continue."
           : !genericResolver
           ? "This earlier request no longer has a recovery action. Refresh the task and use its current controls to submit a corrected request."
           : materialization
-          ? "Describe what happened below, then choose Retry materialization to prepare the task files again."
-          : "Describe what happened below, then choose Check recovery and continue. LLMRelay will check the recorded work before allowing you to proceed."}
+          ? "LLMRelay could not finish preparing the rework. Describe what you saw below, then choose Retry materialization to prepare the task files again."
+          : restoreEvidence
+          ? "This task was interrupted by a database restore. Describe what you know below, then choose Check recovery and continue. LLMRelay confirms the recorded state before continuing."
+          : `LLMRelay stopped automatic work because it could not confirm that ${
+            session ? `the ${roleLabel(session.role).toLowerCase()}` : "an agent"
+          } has fully stopped. Check the agent's output or terminal, describe what you saw below, then choose Check recovery and continue. LLMRelay verifies the recorded processes itself before anything continues.`}
       </p>
       <TechnicalDetails>
       <p>
         {exactRecovery
           ? "This record has an exact recovery command. Generic recovery decisions are intentionally unavailable because they cannot recheck its complete immutable binding."
           : recoveryKind === "database_restore_claim"
-          ? "This restore recorded a prelaunch claim reservation without a session or check. Human text only annotates the decision; the service confirms that the recorded prior state is eligible before reconciliation."
+          ? "This restore recorded a prelaunch claim reservation without a session or check. Your note only annotates the decision; the service confirms that the recorded prior state is eligible before reconciliation."
           : recoveryKind === "database_restore_freeze"
-          ? "This restore recorded an interrupted local freeze with no external process identity. Human text only annotates the decision; the service confirms the operation-bound record and current recovery-required freeze before reconciliation."
+          ? "This restore recorded an interrupted local freeze with no external process identity. Your note only annotates the decision; the service confirms the operation-bound record and current recovery-required freeze before reconciliation."
           : materialization
           ? "Rework materialization needs a decision for this exact intent. Retry uses its recorded intent ID; cancellation verifies the whole parent and child lineage."
           : genericResolver
-          ? "Process ownership is unresolved. Human text annotates the decision; the service still verifies every recorded PID and start identity. After reconciliation, use the exact session Resume action in role settings."
+          ? "Process ownership is unresolved. Your note annotates the decision; the service still verifies every recorded PID and start identity. After reconciliation, use the exact session Resume action in the task's agent settings."
           : "This historical control record has no exact process, check, workspace, or claim tuple. It was definitively rejected, so generic recovery would be guaranteed to fail; refresh and submit a corrected versioned control."}
       </p>
+      <p>Recovery record {String(record.id || "unknown")}{sessionId ? ` · session ${sessionId}` : ""}</p>
       </TechnicalDetails>
       {exactRecovery && (
         <p className="hint">
@@ -165,6 +177,7 @@ function RecoveryDecision(
         <>
           <textarea
             aria-label="Recovery evidence"
+            placeholder="What did you see? For example: the agent's terminal is closed."
             value={evidence}
             onChange={(e) => setEvidence(e.target.value)}
           />
@@ -197,7 +210,7 @@ function RecoveryDecision(
       {!exactRecovery && !genericResolver && (
         <div className="button-row">
           <button onClick={onChanged}>
-            Refresh and review corrected control
+            Refresh to see the current state
           </button>
         </div>
       )}

@@ -79,8 +79,25 @@ navigation, empty-title validation, unsaved draft recovery, creation, editing,
 reload persistence, filtering, archive and restore. It leaves a uniquely named
 backlog draft in the isolated database. JSON results, snapshots, screenshots and
 browser error output are saved in the artifact directory. Reruns create another
-draft. Screenshots include a 900px viewport to expose narrow-window limitations;
-the current dashboard has a 1080px minimum width.
+draft. The run also opens a task's details dialog and checks Escape closes it and
+returns focus, walks its tabs, switches the board between Active and Completed,
+and checks that the page never scrolls sideways at 1440px, 900px and 390px
+widths and at 200% text size, with Approvals reachable from the top bar. At
+390px it checks that task details open full screen and close with the same
+icon-only close button. The
+draft's description is hostile Markdown, and the run checks that its heading,
+table and task list render while the raw HTML image and the `javascript:` link
+stay inert, and that Tab and Shift+Tab never leave the open dialog.
+The layout checks use the browser's native appearance and record which theme
+was exercised. The other theme and browser page zoom remain explicitly untested:
+cmux exposes neither color-scheme emulation nor a page-zoom command. The 200%
+check enlarges root text, not browser zoom. The suite also checks configured
+agent-setting controls at 407px and 193px widths, using a draft override without
+launching an agent. Screenshots are saved per appearance, page and width.
+`smoke-results.json` lists paths the run cannot create without live agents,
+including pending approvals, recovery and output control. Separate DOM and Rust
+test evidence does not establish that those paths were exercised in the browser;
+the suite never simulates them by editing the service database.
 
 Before `run`, optionally use `observer --workspace workspace:TEST --profile
 PROFILE_ID` with the same artifact directory and browser profile. The suite then

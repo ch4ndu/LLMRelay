@@ -1,12 +1,13 @@
-import { ErrorNotice } from "./ErrorNotice";
+import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import { useMemo, useRef, useState } from "react";
 import { ApiError, command, reuseOperationIdentity } from "../api";
-import type {
-  AppState,
-  PermissionRequest,
-  PermissionScopePreview,
-  Task,
-  TripTaskVerification,
+import {
+  type AppState,
+  type PermissionRequest,
+  type PermissionScopePreview,
+  roleLabel,
+  type Task,
+  type TripTaskVerification,
 } from "../types";
 
 type Scope = "session" | "project";
@@ -28,21 +29,32 @@ export function ServiceCheckPermissionActions(
   const rerun = permission.action_state === "current_receipt";
   return (
     <div className="service-check-permission">
-      <pre>{JSON.stringify(selection.command, null, 2)}</pre>
+      <pre className="approval-command">
+        {selection.command.shell ||
+          [selection.command.executable, ...(selection.command.arguments || [])]
+            .filter(Boolean).join(" ")}
+      </pre>
       <small className="hint">
-        Source: service-owned selected check. This is distinct from native agent
-        sandbox rules; selection, candidate, inputs, worktree, freshness, and
-        build ownership remain mandatory.
+        LLMRelay runs this check itself in the task's workspace. Approving it
+        does not change what agents are allowed to do.
       </small>
-      {permission.family_preview && (
-        <details>
-          <summary>Reusable executable-family scope</summary>
-          <pre>{JSON.stringify(permission.family_preview, null, 2)}</pre>
-        </details>
-      )}
+      <TechnicalDetails>
+        <pre>{JSON.stringify(selection.command, null, 2)}</pre>
+        <p>
+          Service-owned selected check, separate from agent sandbox rules. The
+          selection, candidate, inputs, worktree, freshness and build ownership
+          are still checked before it runs.
+        </p>
+        {permission.family_preview && (
+          <>
+            <h4>Reusable executable-family scope</h4>
+            <pre>{JSON.stringify(permission.family_preview, null, 2)}</pre>
+          </>
+        )}
+      </TechnicalDetails>
       {permission.family_unavailable_reason && (
         <small className="hint">
-          Reusable family unavailable: {permission.family_unavailable_reason}
+          “Always approve” is not available: {permission.family_unavailable_reason}
         </small>
       )}
       {permission.inactive_reason && (
@@ -113,6 +125,15 @@ const shownScopeValue = (value: unknown) => {
   return JSON.stringify(value) || "Unavailable — not provided";
 };
 
+/** Pending native permission requests plus actionable service-check approvals. */
+export const pendingApprovalCount = (state: AppState) =>
+  state.permission_requests.filter((request) => request.state === "pending")
+    .length +
+  (state.trip_task_verification || []).filter((check) =>
+    check.authorization.state === "pending" &&
+    check.authorization.action_state === "actionable"
+  ).length;
+
 export function ApprovalInbox(
   { state, onSelect, onChanged }: {
     state: AppState;
@@ -124,6 +145,13 @@ export function ApprovalInbox(
     () =>
       state.permission_requests.filter((request) =>
         request.state === "pending"
+      ),
+    [state.permission_requests],
+  );
+  const decided = useMemo(
+    () =>
+      state.permission_requests.filter((request) =>
+        request.state !== "pending"
       ),
     [state.permission_requests],
   );
@@ -283,17 +311,31 @@ export function ApprovalInbox(
   };
 
   const selectedPreview = preview?.family_preview?.[scope];
+  const taskFor = (taskId: string) =>
+    state.tasks.find((item) => item.id === taskId);
+  const subject = (request: PermissionRequest) =>
+    [
+      taskFor(request.task_id)?.title,
+      state.projects.find((item) => item.id === request.project_id)
+        ?.display_name,
+    ].filter(Boolean).join(" · ");
+  const count = pending.length + pendingChecks.length;
 
   return (
-    <section className="panel approval-inbox">
+    <section
+      className="panel approval-inbox"
+      id="workspace-approvals"
+      aria-labelledby="approvals-title"
+      tabIndex={-1}
+    >
       <header>
-        <h3>Approval inbox</h3>
-        <span>{pending.length + pendingChecks.length}</span>
+        <h2 id="approvals-title">Approvals</h2>
+        <span className="count" aria-label={`${count} waiting`}>{count}</span>
       </header>
       <p className="hint">
-        Native CLI requests and service-owned selected-check decisions are shown
-        together, but their rules and authority remain separate. Codex may reuse
-        an approval already granted natively without creating a new inbox item.
+        Agents ask here before running a command or using a tool that needs
+        your permission. Nothing runs until you decide. An agent may reuse an
+        approval it already has, so not every action appears here.
       </p>
       {pendingChecks.map((selection) => {
         const task = state.tasks.find((item) =>
@@ -307,16 +349,18 @@ export function ApprovalInbox(
             key={`service:${selection.attempt_id}:${selection.check_id}`}
             className="approval-request"
           >
-            <button
-              className="approval-target"
-              onClick={() => task && onSelect(task)}
-            >
+            <div className="approval-heading">
               <strong>
-                {task?.id || selection.attempt_id} ·{" "}
-                {check?.check_key || selection.check_id}
+                Verification check waiting to run:{" "}
+                {check?.original_text || check?.check_key || "selected check"}
               </strong>
-              <small>service check · current reviewed selection</small>
-            </button>
+              <small>{task?.title || "Current task"}</small>
+            </div>
+            {task && (
+              <button className="link-button" onClick={() => onSelect(task)}>
+                Open task<span className="visually-hidden">: {task.title}</span>
+              </button>
+            )}
             <ServiceCheckPermissionActions
               selection={selection}
               busy={busy === selection.check_id}
@@ -326,187 +370,47 @@ export function ApprovalInbox(
           </article>
         );
       })}
-      {!state.permission_requests.length && (
-        <p className="empty">No native permission request has been recorded.</p>
-      )}
-      {state.permission_requests.map((request) => {
-        const project = state.projects.find((item) =>
-          item.id === request.project_id
-        );
-        const task = state.tasks.find((item) => item.id === request.task_id);
-        return (
-          <article
-            key={request.id}
-            className="approval-request"
-            data-attention-target={`permission_request:${request.id}`}
-            tabIndex={-1}
-          >
-            <button
-              className="approval-target"
-              onClick={() => task && onSelect(task, request.session_id)}
-            >
-              <strong>
-                {project?.display_name || request.project_id} ·{" "}
-                {task?.id || request.task_id}
-              </strong>
-              <small>
-                {request.role.replaceAll("_", " ")} · {request.provider} ·{" "}
-                {request.native_session_id.slice(0, 8) || "native ID unknown"}
-              </small>
-            </button>
-            <dl>
-              <div>
-                <dt>Action</dt>
-                <dd>{request.tool_name}</dd>
-              </div>
-              <div>
-                <dt>Age</dt>
-                <dd>{age(request.created_at)}</dd>
-              </div>
-              <div>
-                <dt>Status</dt>
-                <dd>
-                  {request.state.replaceAll("_", " ")} · response {request
-                    .delivery_state.replaceAll("_", " ")}
-                </dd>
-              </div>
-              <div>
-                <dt>Requested access</dt>
-                <dd>
-                  {request.requested_access == null
-                    ? "Unknown — provider supplied no access field"
-                    : JSON.stringify(request.requested_access)}
-                </dd>
-              </div>
-              {request.reason && (
-                <div>
-                  <dt>Reason</dt>
-                  <dd>{request.reason}</dd>
-                </div>
-              )}
-            </dl>
-            <pre>{shownInput(request)}</pre>
-            {request.command_display && (
-              <details>
-                <summary>Complete structured input</summary>
-                <pre>{structuredInput(request)}</pre>
-              </details>
-            )}
-            {request.state === "pending" && (
-              <div className="approval-actions">
-                <button
-                  disabled={busy === request.id}
-                  onClick={() => decide(request, "approve_once")}
-                >
-                  Approve once
-                </button>
-                <button
-                  disabled={busy === request.id ||
-                    (!request.family_preview?.project &&
-                      !request.family_preview?.session)}
-                  onClick={() => {
-                    setScope(
-                      request.family_preview?.project ? "project" : "session",
-                    );
-                    setPreview(request);
-                  }}
-                >
-                  Always approve matching actions
-                </button>
-                <button
-                  className="danger"
-                  disabled={busy === request.id}
-                  onClick={() => decide(request, "deny")}
-                >
-                  Deny
-                </button>
-              </div>
-            )}
-            {request.state === "pending" && request.family_unavailable_reason &&
-              (
-                <small className="hint">
-                  {request.family_unavailable_reason}. Approve this exact
-                  request once, deny it, or answer the faithful prompt in its
-                  native terminal.
-                </small>
-              )}
-            {request.state !== "pending" && request.decision_reason && (
-              <small className="hint">{request.decision_reason}</small>
-            )}
-            <details>
-              <summary>Permission audit</summary>
-              <dl>
-                <div>
-                  <dt>Original decision</dt>
-                  <dd>
-                    {request.decision_kind?.replaceAll("_", " ") ||
-                      "Awaiting a decision"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Decision actor</dt>
-                  <dd>{request.decision_actor || "Not decided"}</dd>
-                </div>
-                <div>
-                  <dt>Decision time</dt>
-                  <dd>
-                    {request.decided_at
-                      ? new Date(request.decided_at).toLocaleString()
-                      : "Not decided"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Matching rule</dt>
-                  <dd>{request.matching_rule_id || "None"}</dd>
-                </div>
-                <div>
-                  <dt>One-shot reservation</dt>
-                  <dd>
-                    {request.delivery_reserved_at
-                      ? `${request.reserved_behavior || "response"} reserved ${
-                        new Date(request.delivery_reserved_at).toLocaleString()
-                      }`
-                      : "Not reserved"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Local response delivery</dt>
-                  <dd>
-                    {request.delivery_state.replaceAll("_", " ")}
-                    {request.delivered_at
-                      ? ` ${new Date(request.delivered_at).toLocaleString()}`
-                      : request.delivery_unknown_at
-                      ? ` ${
-                        new Date(request.delivery_unknown_at).toLocaleString()
-                      }`
-                      : ""}
-                  </dd>
-                </div>
-                {request.delivery_reason && (
-                  <div>
-                    <dt>Delivery evidence</dt>
-                    <dd>{request.delivery_reason}</dd>
-                  </div>
-                )}
-              </dl>
-              <small className="hint">
-                A delivered response means only that bytes were written and
-                flushed to the authenticated local hook connection. It does not
-                prove the native command executed.
-              </small>
-            </details>
-          </article>
-        );
-      })}
+      {pending.map((request) => (
+        <PermissionRequestCard
+          key={request.id}
+          request={request}
+          subject={subject(request)}
+          busy={busy === request.id}
+          onOpenTask={taskFor(request.task_id)
+            ? () => onSelect(taskFor(request.task_id)!, request.session_id)
+            : undefined}
+          onDecide={(decision) => decide(request, decision)}
+          onAlways={() => {
+            setScope(request.family_preview?.project ? "project" : "session");
+            setPreview(request);
+          }}
+        />
+      ))}
+      {!count && <p className="empty">No approvals are waiting.</p>}
       {error && <ErrorNotice error={error} />}
+      {decided.length > 0 && (
+        <details className="decided-requests">
+          <summary>Recent decisions ({decided.length})</summary>
+          {decided.map((request) => (
+            <PermissionRequestCard
+              key={request.id}
+              request={request}
+              subject={subject(request)}
+              busy={false}
+              onDecide={() => {}}
+              onAlways={() => {}}
+            />
+          ))}
+        </details>
+      )}
       <details className="permission-rules">
         <summary>
-          Reusable permission rules ({state.permission_rules.length})
+          Saved approval rules ({state.permission_rules.length})
         </summary>
         <small className="hint">
-          These are LLMRelay-owned rules. Revoke affects their future request
-          decisions only; it does not revoke native Codex approvals or undo an
-          already dispatched command.
+          These rules belong to LLMRelay. Revoking one affects only future
+          requests; it does not undo a command that already ran or change the
+          agent's own approvals.
         </small>
         {state.permission_rules.map((rule) => {
           const project = state.projects.find((item) =>
@@ -516,49 +420,52 @@ export function ApprovalInbox(
             <article key={rule.id}>
               <strong>{rule.display_family}</strong>
               <small>
-                {rule.provider} · {rule.role.replaceAll("_", " ")} ·{" "}
-                {rule.lifetime} · authorized {rule.use_count} reserved responses
+                {roleLabel(rule.role)} ·{" "}
+                {rule.provider === "claude" ? "Claude" : "Codex"} ·{" "}
+                {rule.lifetime === "project" ? "whole project" : "one session"}{" "}
+                · used {rule.use_count} time{rule.use_count === 1 ? "" : "s"}
               </small>
-              <dl>
-                <div>
-                  <dt>Project</dt>
-                  <dd>
-                    {project?.display_name ||
-                      "Unavailable — registered project not present"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Project root</dt>
-                  <dd>{shownScopeValue(rule.scope.registered_root)}</dd>
-                </div>
-                {rule.lifetime === "session" && (
-                  <>
-                    <div>
-                      <dt>Native session</dt>
-                      <dd>{shownScopeValue(rule.scope.native_session)}</dd>
-                    </div>
-                    <div>
-                      <dt>Worktree</dt>
-                      <dd>{shownScopeValue(rule.scope.worktree)}</dd>
-                    </div>
-                  </>
-                )}
-                <div>
-                  <dt>Coverage</dt>
-                  <dd>{shownScopeValue(rule.scope.coverage)}</dd>
-                </div>
-                <div>
-                  <dt>Configuration binding</dt>
-                  <dd>{shownScopeValue(rule.scope.configuration_binding)}</dd>
-                </div>
-              </dl>
+              <TechnicalDetails>
+                <dl>
+                  <div>
+                    <dt>Project</dt>
+                    <dd>
+                      {project?.display_name ||
+                        "Unavailable — registered project not present"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Project root</dt>
+                    <dd>{shownScopeValue(rule.scope.registered_root)}</dd>
+                  </div>
+                  {rule.lifetime === "session" && (
+                    <>
+                      <div>
+                        <dt>Native session</dt>
+                        <dd>{shownScopeValue(rule.scope.native_session)}</dd>
+                      </div>
+                      <div>
+                        <dt>Worktree</dt>
+                        <dd>{shownScopeValue(rule.scope.worktree)}</dd>
+                      </div>
+                    </>
+                  )}
+                  <div>
+                    <dt>Coverage</dt>
+                    <dd>{shownScopeValue(rule.scope.coverage)}</dd>
+                  </div>
+                  <div>
+                    <dt>Configuration binding</dt>
+                    <dd>{shownScopeValue(rule.scope.configuration_binding)}</dd>
+                  </div>
+                </dl>
+              </TechnicalDetails>
               <small>
                 {rule.revoked_at
                   ? "Revoked " + new Date(rule.revoked_at).toLocaleString()
                   : rule.last_used_at
-                  ? "Last authorization reserved " +
-                    new Date(rule.last_used_at).toLocaleString()
-                  : "No authorization reserved after creation"}
+                  ? "Last used " + new Date(rule.last_used_at).toLocaleString()
+                  : "Not used yet"}
               </small>
               {!rule.revoked_at && (
                 <button
@@ -572,7 +479,7 @@ export function ApprovalInbox(
           );
         })}
         {!state.permission_rules.length && (
-          <p className="empty">No reusable rules have been granted.</p>
+          <p className="empty">No saved approval rules.</p>
         )}
       </details>
       {preview && selectedPreview && (
@@ -589,6 +496,182 @@ export function ApprovalInbox(
     </section>
   );
 }
+
+function PermissionRequestCard(
+  { request, subject, busy, onOpenTask, onDecide, onAlways }: {
+    request: PermissionRequest;
+    subject: string;
+    busy: boolean;
+    onOpenTask?: () => void;
+    onDecide: (decision: "approve_once" | "deny") => void;
+    onAlways: () => void;
+  },
+) {
+  const isPending = request.state === "pending";
+  return (
+    <article
+      className={`approval-request ${isPending ? "pending" : "decided"}`}
+      data-attention-target={isPending
+        ? `permission_request:${request.id}`
+        : undefined}
+      tabIndex={-1}
+    >
+      <div className="approval-heading">
+        <strong>
+          {roleLabel(request.role)} wants to use {request.tool_name}
+        </strong>
+        <small>
+          {subject || "Task not shown"} · asked {age(request.created_at)} ago
+          {!isPending && ` · ${decisionLabel(request)}`}
+        </small>
+      </div>
+      {onOpenTask && (
+        <button className="link-button" onClick={onOpenTask}>
+          Open task
+          <span className="visually-hidden">
+            : {subject.split(" · ")[0] || "for this request"}
+          </span>
+        </button>
+      )}
+      <pre className="approval-command">{shownInput(request)}</pre>
+      {request.reason && <p className="approval-reason">{request.reason}</p>}
+      {isPending && (
+        <div className="approval-actions">
+          <button className="primary" disabled={busy} onClick={() => onDecide("approve_once")}>
+            Approve once
+          </button>
+          <button
+            disabled={busy ||
+              (!request.family_preview?.project &&
+                !request.family_preview?.session)}
+            onClick={onAlways}
+          >
+            Always approve matching actions
+          </button>
+          <button
+            className="danger"
+            disabled={busy}
+            onClick={() => onDecide("deny")}
+          >
+            Deny
+          </button>
+        </div>
+      )}
+      {isPending && request.family_unavailable_reason && (
+        <small className="hint">
+          {request.family_unavailable_reason}. Approve this exact request once,
+          deny it, or answer the prompt in the agent's own terminal.
+        </small>
+      )}
+      {!isPending && request.decision_reason && (
+        <small className="hint">{request.decision_reason}</small>
+      )}
+      <details>
+        <summary>Technical details</summary>
+        {request.command_display && (
+          <>
+            <h4>Complete structured input</h4>
+            <pre>{structuredInput(request)}</pre>
+          </>
+        )}
+        <dl>
+          <div>
+            <dt>Requested access</dt>
+            <dd>
+              {request.requested_access == null
+                ? "Unknown — the agent supplied no access field"
+                : JSON.stringify(request.requested_access)}
+            </dd>
+          </div>
+          <div>
+            <dt>Status</dt>
+            <dd>
+              {request.state.replaceAll("_", " ")} · response{" "}
+              {request.delivery_state.replaceAll("_", " ")}
+            </dd>
+          </div>
+          <div>
+            <dt>Agent</dt>
+            <dd>
+              {request.provider} · session{" "}
+              {request.native_session_id.slice(0, 8) || "unknown"}
+            </dd>
+          </div>
+        </dl>
+        <h4>Permission audit</h4>
+        <dl>
+          <div>
+            <dt>Original decision</dt>
+            <dd>
+              {request.decision_kind?.replaceAll("_", " ") ||
+                "Awaiting a decision"}
+            </dd>
+          </div>
+          <div>
+            <dt>Decided by</dt>
+            <dd>{request.decision_actor || "Not decided"}</dd>
+          </div>
+          <div>
+            <dt>Decision time</dt>
+            <dd>
+              {request.decided_at
+                ? new Date(request.decided_at).toLocaleString()
+                : "Not decided"}
+            </dd>
+          </div>
+          <div>
+            <dt>Matching rule</dt>
+            <dd>{request.matching_rule_id || "None"}</dd>
+          </div>
+          <div>
+            <dt>One-shot reservation</dt>
+            <dd>
+              {request.delivery_reserved_at
+                ? `${request.reserved_behavior || "response"} reserved ${
+                  new Date(request.delivery_reserved_at).toLocaleString()
+                }`
+                : "Not reserved"}
+            </dd>
+          </div>
+          <div>
+            <dt>Local response delivery</dt>
+            <dd>
+              {request.delivery_state.replaceAll("_", " ")}
+              {request.delivered_at
+                ? ` ${new Date(request.delivered_at).toLocaleString()}`
+                : request.delivery_unknown_at
+                ? ` ${new Date(request.delivery_unknown_at).toLocaleString()}`
+                : ""}
+            </dd>
+          </div>
+          {request.delivery_reason && (
+            <div>
+              <dt>Delivery evidence</dt>
+              <dd>{request.delivery_reason}</dd>
+            </div>
+          )}
+        </dl>
+        <small className="hint">
+          A delivered response means LLMRelay sent your decision to the agent.
+          It does not prove the command ran.
+        </small>
+      </details>
+    </article>
+  );
+}
+
+const decisionLabel = (request: PermissionRequest) => {
+  switch (request.decision_kind) {
+    case "approve_once":
+      return "approved once";
+    case "always_approve":
+      return "approved by a saved rule";
+    case "deny":
+      return "denied";
+    default:
+      return request.state.replaceAll("_", " ");
+  }
+};
 
 function ScopeDialog(
   { request, scope, preview, busy, onScope, onCancel, onConfirm }: {
@@ -610,7 +693,7 @@ function ScopeDialog(
         aria-labelledby="permission-preview-title"
       >
         <header>
-          <h2 id="permission-preview-title">Always approval scope</h2>
+          <h2 id="permission-preview-title">Always approve matching actions</h2>
         </header>
         <label>
           Lifetime
@@ -675,7 +758,9 @@ function ScopeDialog(
             Confirm always approval
           </button>
         </footer>
-        <small>Request {request.id.slice(0, 8)}</small>
+        <TechnicalDetails>
+          <p>Request {request.id}</p>
+        </TechnicalDetails>
       </section>
     </div>
   );

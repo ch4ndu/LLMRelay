@@ -155,6 +155,8 @@ const MIGRATION_027: &str = include_str!("../migrations/027_cmux_task_workspace_
 const MIGRATION_028: &str = include_str!("../migrations/028_session_interrupt_deadline.sql");
 const MIGRATION_029: &str = include_str!("../migrations/029_state_revision.sql");
 const MIGRATION_030: &str = include_str!("../migrations/030_recipes.sql");
+const MIGRATION_031: &str = include_str!("../migrations/031_final_repair_recheck.sql");
+const MIGRATION_032: &str = include_str!("../migrations/032_normal_final_repair.sql");
 
 type CmuxRouteRow = (
     String,
@@ -905,10 +907,13 @@ impl Store {
         Ok(Self::from_connection(connection))
     }
 
+    /// The caller holds the instance lock. Service start is the only upgrade path
+    /// for an existing database, and only from the explicitly supported schema.
     pub(crate) fn open_service(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Self::open(path);
         }
+        upgrade_supported_service_schema(path)?;
         Self::open_current_writable(path).and_then(|store| {
             let connection = store.lock()?;
             connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -1911,7 +1916,7 @@ impl Store {
                 let mut statement = transaction.prepare(
                     "SELECT g.id,g.body
                      FROM guidance_messages g JOIN sessions s ON s.id=?2
-                     WHERE g.role_generation_id=?1 AND g.state='written_awaiting_submit'
+                     WHERE g.role_generation_id=?1 AND g.state IN ('written_awaiting_submit','delivery_unknown')
                        AND g.delivery_session_id=s.id
                        AND g.delivery_transcript_epoch=s.transcript_epoch
                        AND g.delivery_resume_invocation_id IS (
@@ -1937,7 +1942,7 @@ impl Store {
                     transaction.execute(
                         "UPDATE guidance_messages
                          SET state='submitted',reason='matched_native_user_prompt_submit',submitted_at=?1
-                         WHERE id=?2 AND role_generation_id=?3 AND state='written_awaiting_submit'
+                         WHERE id=?2 AND role_generation_id=?3 AND state IN ('written_awaiting_submit','delivery_unknown')
                            AND delivery_session_id=?4 AND delivery_transcript_epoch=(
                              SELECT transcript_epoch FROM sessions WHERE id=?4)
                            AND delivery_resume_invocation_id IS (
@@ -3755,6 +3760,17 @@ impl Store {
     ) -> Result<RoleLaunchContext> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Each exploration is a fresh read-only session, so it starts on the
+        // explorer's newest activated profile; reviewers do the same when
+        // their request is reserved.
+        if role == RoleKind::Explorer && !validation_dispatch && setup_runtime_probe.is_none() {
+            let now = Utc::now().to_rfc3339();
+            if let crate::trip::ReadOnlyProfileBoundary::Pending { message, .. } =
+                crate::trip::materialize_read_only_profile(&transaction, attempt_id, role, &now)?
+            {
+                bail!("explorer profile change pending: {message}")
+            }
+        }
         let (task_id,workspace,revision,config_json,phase,plan_approved,plan_hash,candidate_hash,attempt_status,lifecycle,attention,workflow_version,workflow_hash):(String,String,i64,String,String,Option<String>,Option<String>,Option<String>,String,String,String,String,String)=transaction.query_row(
             "SELECT a.task_id,w.path,rs.revision,rs.config_json,a.phase,a.plan_approved_at,a.plan_hash,a.candidate_hash,a.status,t.lifecycle,t.attention,a.workflow_version,a.workflow_hash FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN workspaces w ON w.attempt_id=a.id
              JOIN role_settings rs ON rs.task_id=a.task_id AND rs.role=?2
@@ -7476,7 +7492,7 @@ impl Store {
             "UPDATE sessions SET readiness_state='idle_candidate',updated_at=?1
              WHERE id=?2 AND role_generation_id=?3 AND transcript_epoch=?4
                AND native_session_id=?5 AND status='running'
-               AND readiness_state='busy_unresolved_hook_work'",
+               AND readiness_state IN ('busy_unresolved_hook_work','busy')",
             params![
                 now,
                 receipt.session_id,
@@ -7503,6 +7519,14 @@ impl Store {
                     "invocation_boundary_rowid":receipt.invocation_boundary_rowid,
                     "native_session_id":receipt.native_session_id,
                     "stop_event_rowid":receipt.stop_rowid,
+                    "scope":receipt.scope,
+                    "attempt_id":receipt.attempt_id,
+                    "task_version":receipt.task_version,
+                    "late_terminal_hooks":receipt.late_terminal_hooks,
+                    "accepted_result_id":receipt.accepted_result_id,
+                    "phase":receipt.phase,
+                    "plan_hash":receipt.plan_hash,
+                    "candidate_hash":receipt.candidate_hash,
                     "native_process_inventory_verified":true,
                     "completion_inferred":false
                 }).to_string(),
@@ -8891,7 +8915,7 @@ impl Store {
     }
 }
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 30;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 32;
 
 /// Reads the durable state cursor. It is committed state only when the
 /// connection is in autocommit mode.
@@ -8899,6 +8923,27 @@ pub(crate) fn read_state_revision(connection: &Connection) -> rusqlite::Result<i
     connection
         .prepare_cached("SELECT revision FROM state_revision WHERE singleton=1")?
         .query_row([], |row| row.get(0))
+}
+
+/// The one prior schema an existing database may be migrated from at service
+/// start. Every other non-current version is left unchanged and refused.
+const SERVICE_UPGRADABLE_SCHEMA_VERSION: i64 = 31;
+
+fn upgrade_supported_service_schema(path: &Path) -> Result<()> {
+    let mut connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open state database for upgrade {}", path.display()))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.pragma_update(None, "synchronous", "FULL")?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != SERVICE_UPGRADABLE_SCHEMA_VERSION {
+        return Ok(());
+    }
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    migrate(&mut connection)
 }
 
 pub(crate) fn require_current_schema(connection: &Connection) -> Result<()> {
@@ -9195,7 +9240,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             transaction.pragma_update(None, "user_version", 14)?;
             transaction.commit().context("commit schema migration 14")?;
         }
-        14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 => {}
+        14..=CURRENT_SCHEMA_VERSION => {}
         other => bail!("database schema {other} is newer than this LLMRelay build"),
     }
     if version <= 14 {
@@ -9324,6 +9369,30 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.pragma_update(None, "user_version", 30)?;
         transaction.commit().context("commit recipe migration")?;
     }
+    if version <= 30 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_031)?;
+        transaction.pragma_update(None, "user_version", 31)?;
+        transaction
+            .commit()
+            .context("commit final-repair recheck migration")?;
+    }
+    if version <= 31 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_032)?;
+        let violations: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check('final_repair_rechecks')",
+            [],
+            |row| row.get(0),
+        )?;
+        if violations != 0 {
+            bail!("rebuilt final-repair recheck receipts violate {violations} foreign keys")
+        }
+        transaction.pragma_update(None, "user_version", 32)?;
+        transaction
+            .commit()
+            .context("commit normal final-repair receipt migration")?;
+    }
     Ok(())
 }
 
@@ -9430,6 +9499,20 @@ pub(crate) struct CodexStopIdleReceipt {
     pub invocation_boundary_rowid: i64,
     pub native_session_id: String,
     pub stop_rowid: i64,
+    /// `setup` for a retained setup discovery or profile probe turn,
+    /// `ordinary_manager` for the task's current manager.
+    pub scope: String,
+    pub attempt_id: String,
+    pub task_version: i64,
+    /// Late tool-completion hooks received after the Stop, which match tool
+    /// starts inside the stopped turn.
+    pub late_terminal_hooks: i64,
+    /// The accepted report the stopped turn made, between its correlated
+    /// prompt and its Stop. Required for the ordinary manager.
+    pub accepted_result_id: Option<String>,
+    pub phase: String,
+    pub plan_hash: Option<String>,
+    pub candidate_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9466,6 +9549,21 @@ pub(crate) struct InterruptDeadlineReceipt {
     pub interrupt_requested_at: String,
 }
 
+/// A Codex turn whose final Stop arrived with tool bookkeeping still open.
+/// Codex does not always emit a completion hook for every started tool, so such
+/// a Stop cannot be a safe idle boundary on its own. The coordinator promotes
+/// the session to `idle_candidate` only after this exact receipt is still
+/// current and the supervisor has positively inventoried the native process
+/// and its descendants as idle; elapsed time and terminal quiet are never used.
+///
+/// Two scopes qualify. A retained setup discovery or profile probe first turn
+/// keeps its original, narrower rules. The task's current ordinary manager
+/// additionally requires its current resume invocation to be running, no
+/// untrusted hook in the invocation, and no permission, input lease, uncertain
+/// guidance delivery, control, switch, restart, recovery, freeze, or running
+/// check for the attempt. For the manager, completion hooks that arrive after
+/// the Stop and match a tool started in the stopped turn are late bookkeeping,
+/// not new work; any other later hook keeps the turn busy.
 pub(crate) fn eligible_codex_stop_idle_reconciliation(
     connection: &rusqlite::Connection,
     session_id: Option<&str>,
@@ -9474,38 +9572,63 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
         .query_row(
             "WITH current_codex AS (
                SELECT s.id AS session_id,rg.id AS generation_id,rc.id AS credential_id,
-                      s.transcript_epoch,s.native_session_id,
+                      s.transcript_epoch,s.native_session_id,a.id AS attempt_id,COALESCE(t.version,0) AS task_version,
+                      a.phase,a.plan_hash,a.candidate_hash,
+                      CASE WHEN s.setup_permit_id IS NULL THEN 'ordinary_manager' ELSE 'setup' END AS scope,
                       (SELECT ri.id FROM resume_invocations ri
                         WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
                         ORDER BY ri.resume_ordinal DESC LIMIT 1) AS resume_invocation_id,
+                      (SELECT ri.state FROM resume_invocations ri
+                        WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
+                        ORDER BY ri.resume_ordinal DESC LIMIT 1) AS resume_state,
+                      COALESCE((SELECT ri.created_at FROM resume_invocations ri
+                        WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
+                        ORDER BY ri.resume_ordinal DESC LIMIT 1),s.created_at) AS invocation_started_at,
                       COALESCE((SELECT ri.hook_event_boundary_rowid FROM resume_invocations ri
                         WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
-                        ORDER BY ri.resume_ordinal DESC LIMIT 1),s.initial_hook_event_boundary_rowid,0) AS boundary
+                        ORDER BY ri.resume_ordinal DESC LIMIT 1),s.initial_hook_event_boundary_rowid,0) AS boundary,
+                      s.readiness_state
                FROM sessions s
                JOIN role_generations rg ON rg.id=s.role_generation_id
                JOIN attempts a ON a.id=rg.attempt_id
+               LEFT JOIN tasks t ON t.id=a.task_id
                JOIN role_settings rs ON rs.task_id=a.task_id AND rs.role=rg.role
                  AND rs.effective_generation_id=rg.id
                JOIN role_credentials rc ON rc.role_generation_id=rg.id AND rc.revoked_at IS NULL
-               JOIN trip_setup_permits sp ON sp.id=s.setup_permit_id
+               LEFT JOIN trip_setup_permits sp ON sp.id=s.setup_permit_id
                WHERE (?1 IS NULL OR s.id=?1) AND s.provider='codex'
                  AND rg.status='running' AND s.status='running'
-                 AND s.readiness_state='busy_unresolved_hook_work'
-                 AND s.resume_count=0 AND rg.role!='final_verifier'
-                 AND sp.state='issued' AND sp.attempt_id=a.id AND sp.role=rg.role
-                 AND sp.purpose IN ('setup_discovery','profile_probe')
-                 AND ((sp.purpose='setup_discovery' AND s.validation_cell='trip_setup_discovery')
-                   OR (sp.purpose='profile_probe' AND s.validation_cell='trip_setup_probe'))
+                 AND rg.role!='final_verifier'
                  AND s.native_session_id IS NOT NULL AND s.native_session_id!=''
                  AND s.id=(SELECT latest.id FROM sessions latest
                    WHERE latest.role_generation_id=rg.id
                    ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)
+                 AND ((s.setup_permit_id IS NOT NULL
+                       AND s.readiness_state='busy_unresolved_hook_work'
+                       AND s.resume_count=0
+                       AND sp.state='issued' AND sp.attempt_id=a.id AND sp.role=rg.role
+                       AND sp.purpose IN ('setup_discovery','profile_probe')
+                       AND ((sp.purpose='setup_discovery' AND s.validation_cell='trip_setup_discovery')
+                         OR (sp.purpose='profile_probe' AND s.validation_cell='trip_setup_probe')))
+                   OR (s.setup_permit_id IS NULL AND rg.role='manager'
+                       AND s.readiness_state IN ('busy_unresolved_hook_work','busy')
+                       AND a.status IN ('running','needs_input')
+                       -- A pending service-owned obligation on a frozen candidate
+                       -- keeps its own one-shot service stop instead.
+                       AND (a.candidate_hash IS NULL OR t.attention!='none')
+                       AND t.lifecycle IN ('in_progress','validation','awaiting_review')
+                       AND t.archived_at IS NULL
+                       -- No second live manager authority for the attempt.
+                       AND NOT EXISTS(SELECT 1 FROM role_generations other
+                         WHERE other.attempt_id=a.id AND other.role='manager' AND other.id!=rg.id
+                           AND other.status IN ('launch_reserved','running','stopping'))))
              ), latest_stop AS (
                SELECT current_codex.*,h.rowid AS stop_rowid
                FROM current_codex JOIN hook_events h ON h.session_id=current_codex.session_id
                WHERE h.rowid=(SELECT MAX(latest.rowid) FROM hook_events latest
                  WHERE latest.session_id=current_codex.session_id
-                   AND latest.rowid>current_codex.boundary)
+                   AND latest.rowid>current_codex.boundary
+                   AND (current_codex.scope='setup' OR latest.event_name='Stop'))
                  AND h.event_name='Stop' AND h.provider='codex'
                  AND h.role_generation_id=current_codex.generation_id
                  AND h.native_session_id=current_codex.native_session_id
@@ -9521,67 +9644,156 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
                          AND submit.rowid>latest_stop.boundary
                          AND submit.rowid<latest_stop.stop_rowid) AS submit_rowid
                FROM latest_stop
+             ), bounded_turn AS (
+               SELECT stopped_turn.*,
+                      (SELECT COUNT(*) FROM hook_events late
+                       WHERE late.session_id=stopped_turn.session_id
+                         AND late.rowid>stopped_turn.stop_rowid) AS later_hooks,
+                      (SELECT COUNT(*) FROM hook_events late
+                       WHERE late.session_id=stopped_turn.session_id
+                         AND late.rowid>stopped_turn.stop_rowid
+                         AND late.event_name IN ('PostToolUse','PostToolUseFailure')
+                         AND late.role_generation_id=stopped_turn.generation_id
+                         AND late.native_session_id=stopped_turn.native_session_id
+                         AND late.provenance_state='managed_process_group_untrusted_payload'
+                         AND json_valid(late.payload_json)
+                         AND json_extract(late.payload_json,'$.tool_use_id') IN (
+                           -- Tools started in the stopped turn that had no
+                           -- completion before its Stop.
+                           SELECT json_extract(started.payload_json,'$.tool_use_id')
+                           FROM hook_events started
+                           WHERE started.session_id=stopped_turn.session_id
+                             AND started.event_name='PreToolUse'
+                             AND started.role_generation_id=stopped_turn.generation_id
+                             AND started.native_session_id=stopped_turn.native_session_id
+                             AND started.rowid BETWEEN stopped_turn.submit_rowid AND stopped_turn.stop_rowid
+                             AND json_valid(started.payload_json)
+                             AND NOT EXISTS(SELECT 1 FROM hook_events finished
+                               WHERE finished.session_id=stopped_turn.session_id
+                                 AND finished.event_name IN ('PostToolUse','PostToolUseFailure')
+                                 AND finished.rowid>started.rowid
+                                 AND finished.rowid<stopped_turn.stop_rowid
+                                 AND json_valid(finished.payload_json)
+                                 AND json_extract(finished.payload_json,'$.tool_use_id')
+                                   =json_extract(started.payload_json,'$.tool_use_id')))) AS late_terminal_hooks,
+                      (SELECT COUNT(DISTINCT json_extract(late.payload_json,'$.tool_use_id'))
+                       FROM hook_events late
+                       WHERE late.session_id=stopped_turn.session_id
+                         AND late.rowid>stopped_turn.stop_rowid
+                         AND late.event_name IN ('PostToolUse','PostToolUseFailure')
+                         AND json_valid(late.payload_json)) AS late_terminal_tools,
+                      (SELECT received_at FROM hook_events WHERE rowid=stopped_turn.submit_rowid) AS submit_at,
+                      (SELECT received_at FROM hook_events WHERE rowid=stopped_turn.stop_rowid) AS stop_at
+               FROM stopped_turn
              )
-             SELECT stopped_turn.session_id,stopped_turn.generation_id,
-                    stopped_turn.credential_id,stopped_turn.transcript_epoch,
-                    stopped_turn.resume_invocation_id,stopped_turn.boundary,
-                    stopped_turn.native_session_id,stopped_turn.stop_rowid
-             FROM stopped_turn
-             WHERE stopped_turn.submit_rowid IS NOT NULL
+             SELECT bounded_turn.session_id,bounded_turn.generation_id,
+                    bounded_turn.credential_id,bounded_turn.transcript_epoch,
+                    bounded_turn.resume_invocation_id,bounded_turn.boundary,
+                    bounded_turn.native_session_id,bounded_turn.stop_rowid,
+                    bounded_turn.scope,bounded_turn.attempt_id,bounded_turn.task_version,
+                    bounded_turn.late_terminal_hooks,
+                    (SELECT result.id FROM role_results result
+                     WHERE result.session_id=bounded_turn.session_id
+                       AND result.role_generation_id=bounded_turn.generation_id
+                       AND julianday(result.created_at)>=julianday(bounded_turn.submit_at)
+                       AND julianday(result.created_at)<=julianday(bounded_turn.stop_at)
+                       AND NOT EXISTS(SELECT 1 FROM audit_events retired
+                         WHERE retired.event_code='role_result.superseded'
+                           AND retired.entity_id=result.id)
+                     ORDER BY result.rowid DESC LIMIT 1) AS accepted_result_id,
+                    bounded_turn.phase,bounded_turn.plan_hash,bounded_turn.candidate_hash
+             FROM bounded_turn
+             WHERE bounded_turn.submit_rowid IS NOT NULL
+               AND bounded_turn.later_hooks=bounded_turn.late_terminal_hooks
+               -- Each late completion closes a different unmatched tool.
+               AND bounded_turn.late_terminal_hooks=bounded_turn.late_terminal_tools
+               -- The ordinary manager must have reported in this exact turn;
+               -- a Stop alone never makes it idle.
+               AND (bounded_turn.scope='setup' OR accepted_result_id IS NOT NULL)
+               AND (bounded_turn.readiness_state='busy_unresolved_hook_work'
+                 OR bounded_turn.late_terminal_hooks>0)
                AND EXISTS(SELECT 1 FROM hook_events start
-                 WHERE start.session_id=stopped_turn.session_id
-                   AND start.role_generation_id=stopped_turn.generation_id
+                 WHERE start.session_id=bounded_turn.session_id
+                   AND start.role_generation_id=bounded_turn.generation_id
                    AND start.event_name='SessionStart'
-                   AND start.native_session_id=stopped_turn.native_session_id
+                   AND start.native_session_id=bounded_turn.native_session_id
                    AND start.provenance_state='managed_process_group_untrusted_payload'
-                   AND start.rowid>stopped_turn.boundary
-                   AND start.rowid<stopped_turn.submit_rowid)
+                   AND start.rowid>bounded_turn.boundary
+                   AND start.rowid<bounded_turn.submit_rowid)
                AND (SELECT COUNT(*) FROM hook_events started
-                    WHERE started.session_id=stopped_turn.session_id
+                    WHERE started.session_id=bounded_turn.session_id
                       AND started.event_name='PreToolUse'
-                      AND started.role_generation_id=stopped_turn.generation_id
-                      AND started.native_session_id=stopped_turn.native_session_id
+                      AND started.role_generation_id=bounded_turn.generation_id
+                      AND started.native_session_id=bounded_turn.native_session_id
                       AND started.provenance_state='managed_process_group_untrusted_payload'
-                      AND started.rowid BETWEEN stopped_turn.submit_rowid AND stopped_turn.stop_rowid)
+                      AND started.rowid BETWEEN bounded_turn.submit_rowid AND bounded_turn.stop_rowid)
                  > (SELECT COUNT(*) FROM hook_events finished
-                    WHERE finished.session_id=stopped_turn.session_id
+                    WHERE finished.session_id=bounded_turn.session_id
                       AND finished.event_name IN ('PostToolUse','PostToolUseFailure')
-                      AND finished.role_generation_id=stopped_turn.generation_id
-                      AND finished.native_session_id=stopped_turn.native_session_id
+                      AND finished.role_generation_id=bounded_turn.generation_id
+                      AND finished.native_session_id=bounded_turn.native_session_id
                       AND finished.provenance_state='managed_process_group_untrusted_payload'
-                      AND finished.rowid BETWEEN stopped_turn.submit_rowid AND stopped_turn.stop_rowid)
+                      AND finished.rowid BETWEEN bounded_turn.submit_rowid AND bounded_turn.stop_rowid)
                AND (SELECT COUNT(*) FROM hook_events started
-                    WHERE started.session_id=stopped_turn.session_id
+                    WHERE started.session_id=bounded_turn.session_id
                       AND started.event_name='SubagentStart'
-                      AND started.role_generation_id=stopped_turn.generation_id
-                      AND started.native_session_id=stopped_turn.native_session_id
+                      AND started.role_generation_id=bounded_turn.generation_id
+                      AND started.native_session_id=bounded_turn.native_session_id
                       AND started.provenance_state='managed_process_group_untrusted_payload'
-                      AND started.rowid BETWEEN stopped_turn.submit_rowid AND stopped_turn.stop_rowid)
+                      AND started.rowid BETWEEN bounded_turn.submit_rowid AND bounded_turn.stop_rowid)
                  = (SELECT COUNT(*) FROM hook_events finished
-                    WHERE finished.session_id=stopped_turn.session_id
+                    WHERE finished.session_id=bounded_turn.session_id
                       AND finished.event_name='SubagentStop'
-                      AND finished.role_generation_id=stopped_turn.generation_id
-                      AND finished.native_session_id=stopped_turn.native_session_id
+                      AND finished.role_generation_id=bounded_turn.generation_id
+                      AND finished.native_session_id=bounded_turn.native_session_id
                       AND finished.provenance_state='managed_process_group_untrusted_payload'
-                      AND finished.rowid BETWEEN stopped_turn.submit_rowid AND stopped_turn.stop_rowid)
+                      AND finished.rowid BETWEEN bounded_turn.submit_rowid AND bounded_turn.stop_rowid)
                AND NOT EXISTS(SELECT 1 FROM permission_requests permission
-                 WHERE permission.session_id=stopped_turn.session_id
+                 WHERE permission.session_id=bounded_turn.session_id
                    AND permission.consumed_at IS NULL
                    AND permission.delivery_state NOT IN ('expired','not_delivered'))
                AND NOT EXISTS(SELECT 1 FROM input_leases lease
-                 WHERE lease.session_id=stopped_turn.session_id AND lease.revoked_at IS NULL
+                 WHERE lease.session_id=bounded_turn.session_id AND lease.revoked_at IS NULL
                    AND julianday(lease.expires_at)>julianday('now'))
                AND NOT EXISTS(SELECT 1 FROM guidance_messages guidance
-                 WHERE guidance.role_generation_id=stopped_turn.generation_id
+                 WHERE guidance.role_generation_id=bounded_turn.generation_id
                    AND guidance.state IN ('delivery_reserved','written_awaiting_submit','delivery_unknown'))
                AND NOT EXISTS(SELECT 1 FROM controls control
-                 WHERE control.attempt_id=(SELECT attempt_id FROM role_generations
-                   WHERE id=stopped_turn.generation_id)
+                 WHERE control.attempt_id=bounded_turn.attempt_id
                    AND control.state IN ('requested','draining','held','recovery_required'))
                AND NOT EXISTS(SELECT 1 FROM recovery_records recovery
-                 WHERE recovery.session_id=stopped_turn.session_id
+                 WHERE recovery.session_id=bounded_turn.session_id
                    AND recovery.state!='resolved_quiescent')
-             ORDER BY stopped_turn.stop_rowid LIMIT 1",
+               AND (bounded_turn.scope='setup' OR (
+                 bounded_turn.resume_state IS NULL OR bounded_turn.resume_state='running')
+                 AND NOT EXISTS(SELECT 1 FROM hook_events untrusted
+                   WHERE untrusted.session_id=bounded_turn.session_id
+                     AND untrusted.rowid>bounded_turn.boundary
+                     AND untrusted.event_name='UntrustedNativeEvent')
+                 AND NOT EXISTS(SELECT 1 FROM permission_requests permission
+                   WHERE permission.attempt_id=bounded_turn.attempt_id
+                     AND permission.consumed_at IS NULL
+                     AND permission.delivery_state NOT IN ('expired','not_delivered'))
+                 AND NOT EXISTS(SELECT 1 FROM controls control
+                   WHERE control.attempt_id=bounded_turn.attempt_id
+                     AND control.state NOT IN ('finished','cancelled','superseded','rejected','failed','abandoned')
+                     AND NOT (control.kind='transition_proposal' AND control.state='proposed'))
+                 AND NOT EXISTS(SELECT 1 FROM switch_intents switch
+                   WHERE switch.attempt_id=bounded_turn.attempt_id
+                     AND switch.state NOT IN ('completed','cancelled','rejected','superseded'))
+                 AND NOT EXISTS(SELECT 1 FROM restart_candidates restart
+                   WHERE restart.attempt_id=bounded_turn.attempt_id
+                     AND restart.state NOT IN ('resumed','released_fresh_dispatch','cancelled'))
+                 AND NOT EXISTS(SELECT 1 FROM recovery_records recovery
+                   WHERE recovery.attempt_id=bounded_turn.attempt_id
+                     AND recovery.state='attention_required')
+                 AND NOT EXISTS(SELECT 1 FROM freeze_intents freeze
+                   WHERE freeze.attempt_id=bounded_turn.attempt_id
+                     AND freeze.state IN ('reserved','capturing','recovery_required'))
+                 AND NOT EXISTS(SELECT 1 FROM check_runs check_run
+                   WHERE check_run.attempt_id=bounded_turn.attempt_id
+                     AND check_run.status IN ('launch_reserved','running','recovery_required','launch_ambiguous')))
+             ORDER BY bounded_turn.stop_rowid LIMIT 1",
             params![session_id],
             |row| {
                 Ok(CodexStopIdleReceipt {
@@ -9593,6 +9805,14 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
                     invocation_boundary_rowid: row.get(5)?,
                     native_session_id: row.get(6)?,
                     stop_rowid: row.get(7)?,
+                    scope: row.get(8)?,
+                    attempt_id: row.get(9)?,
+                    task_version: row.get(10)?,
+                    late_terminal_hooks: row.get(11)?,
+                    accepted_result_id: row.get(12)?,
+                    phase: row.get(13)?,
+                    plan_hash: row.get(14)?,
+                    candidate_hash: row.get(15)?,
                 })
             },
         )
@@ -10784,6 +11004,155 @@ mod interruption_tests {
         }
         drop(connection);
         drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn service_start_upgrades_only_schema_thirty_one_and_preserves_receipts() {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-service-upgrade-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("state.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let scalar = |sql: &str| -> String {
+            Connection::open(&database)
+                .unwrap()
+                .query_row(sql, [], |row| row.get::<_, rusqlite::types::Value>(0))
+                .map(|value| format!("{value:?}"))
+                .unwrap()
+        };
+        let set_version = |version: i64| {
+            Connection::open(&database)
+                .unwrap()
+                .pragma_update(None, "user_version", version)
+                .unwrap()
+        };
+        let schema = "SELECT group_concat(name||':'||COALESCE(sql,''), char(10))
+             FROM (SELECT name, sql FROM sqlite_master ORDER BY name)";
+        let version = "PRAGMA user_version";
+        let current_schema = scalar(schema);
+        // The applied schema-31 receipt table, holding one historical receipt.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(&format!(
+                "DROP TABLE final_repair_rechecks; {MIGRATION_031} PRAGMA user_version=31;"
+            ))
+            .unwrap();
+        store.lock().unwrap().execute_batch(
+            "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+               VALUES('p','p','/tmp/llmrelay-service-upgrade-fixture','service-upgrade-fixture','base','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO tasks(id,project_id,title,lifecycle,created_at,updated_at)
+               VALUES('t','p','t','in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+               VALUES('a','t','context','needs_input','base',1,'running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,extension_allowance,spent)
+               VALUES('b','a','code',2,4,6);
+             INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+               VALUES('g','a','code_reviewer','codex',1,1,'exited','f','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+               VALUES('s','g','codex','exited','{}','fixture','e','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,prompt_hash,handoff_hash,delivery_state,verdict,created_at,updated_at)
+               VALUES('approved','a','code','c1','p','h','finished','approved','2026-01-01T00:00:01Z','2026-01-01T00:00:01Z'),
+                     ('final','a','final','c1','p','h','finished','request_changes','2026-01-01T00:00:02Z','2026-01-01T00:00:02Z'),
+                     ('sixth','a','code','c2','p','h','finished','needs_rework','2026-01-01T00:00:03Z','2026-01-01T00:00:03Z');
+             INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
+               VALUES('sixth-result','sixth','s','g','needs_rework','x','[]','{}','2026-01-01T00:00:03Z','2026-01-01T00:00:03Z');
+             INSERT INTO final_repair_rechecks(attempt_id,task_id,operation_id,request_hash,authorized_task_version,plan_hash,configuration_hash,
+                 approved_code_request_id,prior_candidate_hash,final_request_id,rejected_code_request_id,rejected_code_result_id,
+                 reviewer_generation_id,reviewer_session_id,reviewer_settings_revision,reviewer_profile_hash,detail_json,state,created_at,updated_at)
+               VALUES('a','t','recover','hash',7,'plan',NULL,'approved','c1','final','sixth','sixth-result','g','s',1,'profile','{}','authorized',
+                 '2026-01-01T00:00:04Z','2026-01-01T00:00:04Z');"
+        ).unwrap();
+        drop(store);
+        let history = "SELECT (SELECT group_concat(id||':'||lifecycle) FROM tasks)
+             ||'|'||(SELECT group_concat(id||':'||phase||':'||status) FROM attempts)
+             ||'|'||(SELECT group_concat(review_kind||':'||(initial_allowance+extension_allowance)||':'||spent) FROM review_budgets)
+             ||'|'||(SELECT group_concat(id||':'||delivery_state||':'||verdict) FROM review_requests)
+             ||'|'||(SELECT group_concat(attempt_id||':'||operation_id||':'||state||':'||reviewer_session_id
+                  ||':'||rejected_code_request_id||':'||rejected_code_result_id) FROM final_repair_rechecks)
+             ||'|'||(SELECT revision FROM state_revision WHERE singleton=1)";
+        let schema_31 = scalar(schema);
+        for refused in [
+            Store::open_current_readonly(&database).err(),
+            Store::open_current_writable(&database).err(),
+        ] {
+            assert!(refused
+                .unwrap()
+                .to_string()
+                .contains("unsupported database schema version 31"));
+        }
+        assert_eq!(scalar(version), "Integer(31)");
+
+        // A receipt that fails the rebuilt table's foreign keys rolls the whole
+        // upgrade back, leaving schema 31 and every row intact.
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 UPDATE final_repair_rechecks SET reviewer_session_id='missing-session';",
+            )
+            .unwrap();
+        let broken_history = scalar(history);
+        let error = Store::open_service(&database).err().unwrap();
+        assert!(
+            format!("{error:#}").contains("FOREIGN KEY constraint failed"),
+            "{error:#}"
+        );
+        assert_eq!(scalar(version), "Integer(31)");
+        assert_eq!(scalar(history), broken_history);
+        assert_eq!(scalar(schema), schema_31);
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE final_repair_rechecks SET reviewer_session_id='s'",
+                [],
+            )
+            .unwrap();
+        let expected_history = scalar(history);
+
+        for _ in 0..2 {
+            drop(Store::open_service(&database).unwrap());
+            assert_eq!(scalar(version), "Integer(32)");
+            assert_eq!(scalar(history), expected_history);
+            assert_eq!(scalar(schema), current_schema);
+            assert_eq!(
+                scalar(
+                    "SELECT provenance_kind||':'||COALESCE(final_result_id,'none')
+                     FROM final_repair_rechecks WHERE attempt_id='a'"
+                ),
+                "Text(\"historical_sixth_review_recovery:none\")"
+            );
+        }
+        // An ordinary open of the current schema reopens it without migrating;
+        // only a newer schema is refused as unknown.
+        drop(Store::open(&database).unwrap());
+        assert_eq!(scalar(version), "Integer(32)");
+        assert_eq!(scalar(history), expected_history);
+        assert_eq!(scalar(schema), current_schema);
+        set_version(CURRENT_SCHEMA_VERSION + 1);
+        let error = Store::open(&database).err().unwrap();
+        assert!(
+            error.to_string().contains("database schema 33 is newer"),
+            "{error:#}"
+        );
+        assert_eq!(scalar(version), "Integer(33)");
+        assert_eq!(scalar(history), expected_history);
+        set_version(CURRENT_SCHEMA_VERSION);
+
+        for unsupported in [0, 14, 29, 30, 33] {
+            set_version(unsupported);
+            let error = Store::open_service(&database).err().unwrap();
+            assert!(
+                error.to_string().contains(&format!(
+                    "unsupported database schema version {unsupported}"
+                )),
+                "{error:#}"
+            );
+            assert_eq!(scalar(version), format!("Integer({unsupported})"));
+            assert_eq!(scalar(history), expected_history);
+            assert_eq!(scalar(schema), current_schema);
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

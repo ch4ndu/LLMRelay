@@ -85,7 +85,7 @@ export function ProjectSettings(
         <span
           className={project.queue_paused ? "badge waiting" : "badge supported"}
         >
-          {project.queue_paused ? "pickup paused" : "pickup active"}
+          {project.queue_paused ? "Pickup paused" : "Pickup on"}
         </span>
       </header>
       <label>
@@ -95,7 +95,7 @@ export function ProjectSettings(
             onChange={(event) => setPath(event.target.value)}
           />
           <button
-            disabled={!path || path === project.repository_path}
+            disabled={!path}
             onClick={() =>
               apply({
                 kind: "relink_project",
@@ -107,6 +107,11 @@ export function ProjectSettings(
             Validate and relink
           </button>
         </div>
+        <small className="hint">
+          Relinking checks the folder and makes new tasks start from its
+          current commit. Use it after moving the folder or committing changes.
+          It is available when no task in this project is running.
+        </small>
       </label>
       <ProjectSetup
         project={project}
@@ -116,11 +121,11 @@ export function ProjectSettings(
         onViewSession={onViewSession}
       />
       <details>
-        <summary>TRIP Verification ({tripChecks.length})</summary>
+        <summary>Verification checks ({tripChecks.length})</summary>
         <p className="hint">
-          These commands are inherited from the activated project configuration.
-          A task manager selects only the applicable matrix, and execution still
-          requires exact human authorization bound to the candidate and inputs.
+          These checks come from the project's setup. For each task the manager
+          selects the ones that apply, and each check still needs your approval
+          for the exact result it runs on.
         </p>
         <div className="check-suite-list">
           {tripChecks.map((check) => (

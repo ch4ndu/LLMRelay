@@ -78,12 +78,49 @@ pub(crate) fn read_only_decisions(connection: &Connection) -> Result<Vec<Decisio
     load_ready_tasks(connection)?
         .into_iter()
         .map(|task| {
-            Ok(
+            let task_id = task.task_id.clone();
+            let decision =
                 evaluate_ready_task(connection, None, global_active, &active_claims, task)?
-                    .decision,
-            )
+                    .decision;
+            if decision.reason_code == "scheduler.awaiting_admission" {
+                if let Some(recorded) = recorded_admission_hold(connection, &task_id)? {
+                    return Ok(recorded);
+                }
+            }
+            Ok(decision)
         })
         .collect()
+}
+
+/// The scheduler's last recorded hold for a Ready task that it has marked for
+/// attention, while the task is unchanged since. Runtime-only admission checks
+/// are explained this way instead of being reported as merely queued.
+fn recorded_admission_hold(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Option<DecisionExplanation>> {
+    let recorded: Option<(String, i64)> = connection
+        .query_row(
+            "SELECT e.detail_json,t.version FROM audit_events e JOIN tasks t ON t.id=e.entity_id
+             WHERE e.event_code='decision.explanation.changed' AND e.entity_kind='task'
+               AND e.entity_id=?1 AND t.attention NOT IN ('none','run_next_requested')
+             ORDER BY e.created_at DESC,e.rowid DESC LIMIT 1",
+            params![task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((detail, version)) = recorded else {
+        return Ok(None);
+    };
+    let explanation = serde_json::from_str::<serde_json::Value>(&detail)?
+        .get("explanation")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<DecisionExplanation>(value).ok());
+    Ok(explanation.filter(|explanation| {
+        explanation.reason_code.starts_with("scheduler.")
+            && explanation.disposition != DecisionDisposition::Ready
+            && explanation.observed_revision.task_version == Some(version)
+    }))
 }
 
 fn scheduler_capacity(connection: &Connection) -> Result<(i64, Vec<serde_json::Value>)> {
@@ -338,6 +375,52 @@ fn evaluate_ready_task(
         serde_json::json!({"project_id":task.project_id.clone()}),
         None,
     ));
+    // Checked again inside the claim transaction, where the folder's current
+    // commit is also compared, so a change after Make Ready cannot start work
+    // that workspace preparation would refuse.
+    let start_baseline =
+        crate::trip::start_baseline_problem(connection, &task.project_id, runtime.is_some())
+            .unwrap_or_else(|error| {
+                Some(format!(
+                    "LLMRelay could not check the project's workflow files: {error:#}"
+                ))
+            });
+    if let Some(problem) = start_baseline {
+        return Ok(blocked_scheduler_evaluation(
+            &task,
+            "scheduler.start_baseline_stale",
+            DecisionEvidenceState::Stale,
+            DecisionOwner::Human,
+            serde_json::json!({
+                "project_id":task.project_id.clone(),
+                "base_revision":task.base_revision.clone(),
+            }),
+            Some(problem),
+            prerequisites,
+            SchedulerMutation::NeedsInput,
+            Some(DecisionNextAction {
+                operation: "inspect_project".into(),
+                enabled: true,
+                owner: DecisionOwner::Human,
+                binding: DecisionActionBinding {
+                    project_id: Some(task.project_id.clone()),
+                    ..DecisionActionBinding::default()
+                },
+                accounting_note: None,
+            }),
+            vec!["inspect_project".into()],
+        ));
+    }
+    prerequisites.push(scheduler_prerequisite(
+        "scheduler.start_baseline_current",
+        DecisionEvidenceState::Satisfied,
+        DecisionOwner::Human,
+        serde_json::json!({
+            "project_id":task.project_id.clone(),
+            "base_revision":task.base_revision.clone(),
+        }),
+        None,
+    ));
     if let Err(error) = crate::recipes::require_binding_current(connection, &task.task_id) {
         return Ok(blocked_scheduler_evaluation(
             &task,
@@ -403,47 +486,52 @@ fn evaluate_ready_task(
         serde_json::json!({"configured":role_names.len(),"required":6}),
         None,
     ));
-    let Some(task_runtime) = task_runtime.as_ref() else {
-        return Ok(blocked_scheduler_evaluation(
-            &task,
-            "scheduler.runtime_authority_unobserved",
-            DecisionEvidenceState::Unknown,
-            DecisionOwner::Service,
-            serde_json::json!({"runtime_available":false}),
-            None,
-            prerequisites,
-            SchedulerMutation::None,
-            None,
-            Vec::new(),
-        ));
-    };
     for role in &role_names {
         role.parse::<crate::domain::RoleKind>()
             .map_err(|error| anyhow!("task {} has invalid role setting: {error}", task.task_id))?;
     }
-    if let Err(error) =
-        crate::trip::require_task_profiles_activated(connection, &task.task_id, task_runtime)
-    {
-        return Ok(blocked_scheduler_evaluation(
-            &task,
-            "scheduler.task_profile_authority_stale",
-            DecisionEvidenceState::Stale,
-            DecisionOwner::Human,
-            serde_json::json!({"task_id":task.task_id.clone()}),
-            Some(format!("{error:#}")),
-            prerequisites,
-            SchedulerMutation::BacklogNeedsInput,
-            None,
-            Vec::new(),
-        ));
-    }
-    prerequisites.push(scheduler_prerequisite(
-        "scheduler.task_profiles_current",
-        DecisionEvidenceState::Satisfied,
-        DecisionOwner::Human,
-        serde_json::json!({"task_id":task.task_id.clone()}),
-        None,
-    ));
+    // Profile authority needs the service runtime. A read-only projection
+    // cannot prove it and reports the task as queued for admission instead.
+    let profiles_checked = match task_runtime.as_ref() {
+        Some(task_runtime) => {
+            if let Err(error) = crate::trip::require_task_profiles_activated(
+                connection,
+                &task.task_id,
+                task_runtime,
+            ) {
+                return Ok(blocked_scheduler_evaluation(
+                    &task,
+                    "scheduler.task_profile_authority_stale",
+                    DecisionEvidenceState::Stale,
+                    DecisionOwner::Human,
+                    serde_json::json!({"task_id":task.task_id.clone()}),
+                    Some(format!("{error:#}")),
+                    prerequisites,
+                    SchedulerMutation::BacklogNeedsInput,
+                    None,
+                    Vec::new(),
+                ));
+            }
+            prerequisites.push(scheduler_prerequisite(
+                "scheduler.task_profiles_current",
+                DecisionEvidenceState::Satisfied,
+                DecisionOwner::Human,
+                serde_json::json!({"task_id":task.task_id.clone()}),
+                None,
+            ));
+            true
+        }
+        None => {
+            prerequisites.push(scheduler_prerequisite(
+                "scheduler.task_profiles_checked_at_admission",
+                DecisionEvidenceState::Unknown,
+                DecisionOwner::Service,
+                serde_json::json!({"runtime_available":false}),
+                Some("Agent profile verification is rechecked when the task is picked up.".into()),
+            ));
+            false
+        }
+    };
     let manager_json: String = connection.query_row(
         "SELECT config_json FROM role_settings WHERE task_id=?1 AND role='manager' ORDER BY revision DESC LIMIT 1",
         params![task.task_id],
@@ -478,6 +566,27 @@ fn evaluate_ready_task(
         serde_json::json!({"provider":manager_provider,"role":"manager"}),
         None,
     ));
+    if !profiles_checked {
+        return Ok(SchedulerEvaluation {
+            decision: scheduler_decision(
+                &task,
+                "scheduler.awaiting_admission",
+                DecisionDisposition::Waiting,
+                None,
+                prerequisites,
+                DecisionOwnership {
+                    owner: DecisionOwner::Service,
+                    state: "ready".into(),
+                    binding: scheduler_binding(&task),
+                },
+                None,
+                DecisionControlPolicy::default(),
+            ),
+            task,
+            mutation: SchedulerMutation::None,
+            eligible: false,
+        });
+    }
     Ok(SchedulerEvaluation {
         decision: scheduler_decision(
             &task,
@@ -519,6 +628,7 @@ fn blocked_scheduler_evaluation(
     next_action: Option<DecisionNextAction>,
     allowed_controls: Vec<String>,
 ) -> SchedulerEvaluation {
+    let message = message.or_else(|| crate::workflow::plain_scheduler_reason(reason_code));
     let blocker = scheduler_prerequisite(reason_code, state, owner, evidence, message);
     let disposition = if matches!(
         reason_code,
@@ -1099,13 +1209,17 @@ impl Scheduler {
 
     pub fn reconcile_unknown(&self) -> Result<Vec<String>> {
         let connection = self.store.lock()?;
+        // An unfinished rework child's workspace belongs to `prepare_rework`:
+        // its claim stays with the parent until that path transfers it.
         let mut statement = connection.prepare(
             "SELECT w.id,w.path,w.base_revision,w.repository_identity,w.attempt_id,w.policy_json
              FROM workspaces w JOIN attempts a ON a.id=w.attempt_id JOIN tasks t ON t.id=a.task_id
              WHERE (w.state IN ('reserved','unknown','recovery_required')
                     OR (w.state='ready' AND a.status='workspace_reserved'))
                AND a.status NOT IN ('cancelled','done','failed')
-               AND t.lifecycle NOT IN ('done','cancelled')",
+               AND t.lifecycle NOT IN ('done','cancelled')
+               AND NOT EXISTS(SELECT 1 FROM rework_intents ri WHERE ri.new_attempt_id=w.attempt_id
+                 AND ri.state NOT IN ('completed','cancelled'))",
         )?;
         let rows = statement
             .query_map([], |row| {

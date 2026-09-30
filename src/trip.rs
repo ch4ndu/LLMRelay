@@ -9,7 +9,7 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -1022,6 +1022,295 @@ pub(crate) fn replace_attempt_profile(
     Ok(())
 }
 
+/// Where a read-only role stands relative to its latest activated task profile.
+pub(crate) enum ReadOnlyProfileBoundary {
+    /// The attempt already uses the newest profile that applies to it.
+    Current,
+    /// A newer activation can replace the attempt binding now.
+    Ready {
+        authority: TaskProfileAuthority,
+        from_revision: i64,
+    },
+    /// A newer activation exists but must not be used yet. `needs_person` is
+    /// true when only a person can clear it (the profile needs verifying again);
+    /// otherwise it clears when the current session of the role finishes.
+    Pending {
+        /// Stable code naming the first unmet condition.
+        reason: &'static str,
+        message: String,
+        needs_person: bool,
+        /// The newer activated settings revision that is waiting.
+        settings_revision: i64,
+    },
+}
+
+/// Evaluates whether the explorer or a reviewer of this attempt should move to
+/// a newer activated task profile before its next fresh session. These roles
+/// never write, and every review or exploration starts a new session, so the
+/// boundary between sessions is safe: no live generation of the role, no review
+/// of its kind in flight, and no pending switch. Writers keep their existing
+/// explicit switch flow and are always `Current` here.
+///
+/// An activation recorded for a different project configuration does not apply
+/// to this attempt, which keeps the configuration it was reviewed with.
+pub(crate) fn read_only_profile_boundary(
+    connection: &Connection,
+    attempt_id: &str,
+    role: RoleKind,
+) -> Result<ReadOnlyProfileBoundary> {
+    let kind = match role {
+        RoleKind::Explorer => None,
+        RoleKind::PlanReviewer => Some("plan"),
+        RoleKind::CodeReviewer => Some("code"),
+        RoleKind::FinalReviewer => Some("final"),
+        RoleKind::Manager | RoleKind::Implementer => return Ok(ReadOnlyProfileBoundary::Current),
+    };
+    let role_name = role.to_string();
+    let bound: Option<(String, i64, String)> = connection
+        .query_row(
+            "SELECT a.task_id,ap.settings_revision,ap.project_config_revision_id
+             FROM trip_attempt_profiles ap JOIN attempts a ON a.id=ap.attempt_id
+             WHERE ap.attempt_id=?1 AND ap.role=?2",
+            params![attempt_id, role_name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((task_id, bound_revision, bound_configuration)) = bound else {
+        return Ok(ReadOnlyProfileBoundary::Current);
+    };
+    let latest: Option<i64> = connection.query_row(
+        "SELECT MAX(settings_revision) FROM trip_task_profile_activations
+             WHERE task_id=?1 AND role=?2 AND project_config_revision_id=?3",
+        params![task_id, role_name, bound_configuration],
+        |row| row.get(0),
+    )?;
+    let Some(revision) = latest.filter(|revision| *revision > bound_revision) else {
+        return Ok(ReadOnlyProfileBoundary::Current);
+    };
+    let label = role.label();
+    // The role's next session may start with new settings only when nothing of
+    // the old one can still act: every earlier session exited with a verified
+    // quiet process group, and no request, prompt, delivery, control, recovery,
+    // capture, check or writer could still bind the old settings.
+    let phase: String = connection.query_row(
+        "SELECT phase FROM attempts WHERE id=?1",
+        params![attempt_id],
+        |row| row.get(0),
+    )?;
+    let phase_matches = match role {
+        RoleKind::PlanReviewer => phase == "plan_review",
+        RoleKind::CodeReviewer => phase == "code_review",
+        RoleKind::FinalReviewer => phase == "final_review",
+        _ => matches!(
+            phase.as_str(),
+            "planning" | "implementation" | "code_review" | "checks" | "final_review"
+        ),
+    };
+    // Only the task's current, unfinished attempt, while it is running, can
+    // move a role to new settings.
+    let current: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
+           WHERE a.id=?1 AND a.status='running' AND t.archived_at IS NULL
+             AND t.lifecycle IN ('in_progress','validation')
+             AND a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=a.task_id
+               ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1))",
+        params![attempt_id],
+        |row| row.get(0),
+    )?;
+    if !current {
+        return Ok(ReadOnlyProfileBoundary::Pending {
+            reason: "attempt_not_current",
+            message: format!(
+                "The new {label} settings apply when this task's current attempt is running again."
+            ),
+            needs_person: false,
+            settings_revision: revision,
+        });
+    }
+    if !phase_matches {
+        return Ok(ReadOnlyProfileBoundary::Pending {
+            reason: "phase_mismatch",
+            message: format!(
+                "The new {label} settings apply when this task next reaches a {label} step."
+            ),
+            needs_person: false,
+            settings_revision: revision,
+        });
+    }
+    const FENCES: &[(&str, &str)] = &[
+        ("role_session_live",
+         "SELECT EXISTS(SELECT 1 FROM role_generations WHERE attempt_id=?1 AND role=?2
+            AND status IN ('launch_reserved','running','stopping'))"),
+        ("role_process_not_proven_quiescent",
+         "SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+            WHERE g.attempt_id=?1 AND g.role=?2
+              AND NOT (s.status='launch_failed'
+                OR (s.status='exited'
+                  AND COALESCE(CASE WHEN json_valid(s.exit_json)
+                    THEN json_extract(s.exit_json,'$.process_group_quiescent') END,0)=1)))"),
+        ("review_in_flight",
+         "SELECT EXISTS(SELECT 1 FROM review_requests WHERE attempt_id=?1 AND review_kind=?3
+            AND delivery_state IN ('launching','delivered','ambiguous'))"),
+        ("switch_pending",
+         "SELECT EXISTS(SELECT 1 FROM switch_intents WHERE attempt_id=?1 AND role=?2
+            AND state NOT IN ('completed','cancelled','rejected','superseded'))"),
+        ("permission_pending",
+         "SELECT EXISTS(SELECT 1 FROM permission_requests WHERE attempt_id=?1
+            AND consumed_at IS NULL AND delivery_state NOT IN ('expired','not_delivered'))"),
+        ("input_control",
+         "SELECT EXISTS(SELECT 1 FROM input_leases lease JOIN sessions s ON s.id=lease.session_id
+            JOIN role_generations g ON g.id=s.role_generation_id
+            WHERE g.attempt_id=?1 AND lease.revoked_at IS NULL
+              AND julianday(lease.expires_at)>julianday('now'))"),
+        ("guidance_uncertain",
+         "SELECT EXISTS(SELECT 1 FROM guidance_messages WHERE attempt_id=?1
+            AND state IN ('delivery_reserved','written_awaiting_submit','delivery_unknown'))"),
+        ("control_pending",
+         "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
+            AND state IN ('requested','draining','held','recovery_required'))"),
+        ("restart_hold",
+         "SELECT EXISTS(SELECT 1 FROM restart_candidates WHERE attempt_id=?1
+            AND state NOT IN ('resumed','released_fresh_dispatch','cancelled'))"),
+        ("recovery_open",
+         "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=?1
+            AND state='attention_required')"),
+        ("freeze_in_progress",
+         "SELECT EXISTS(SELECT 1 FROM freeze_intents WHERE attempt_id=?1
+            AND state IN ('reserved','capturing','recovery_required'))"),
+        ("check_running",
+         "SELECT EXISTS(SELECT 1 FROM check_runs WHERE attempt_id=?1
+            AND status IN ('launch_reserved','running','recovery_required','launch_ambiguous'))"),
+        ("conflicting_role_live",
+         "SELECT EXISTS(SELECT 1 FROM role_generations WHERE attempt_id=?1 AND role!=?2
+            AND role NOT IN ('manager','explorer')
+            AND status IN ('launch_reserved','running','stopping'))"),
+    ];
+    let values: [&dyn rusqlite::ToSql; 3] = [&attempt_id, &role_name, &kind];
+    for (reason, sql) in FENCES {
+        // Each fence binds the leading parameters it uses.
+        let mut statement = connection.prepare(sql)?;
+        let used = statement.parameter_count();
+        let blocked: bool = statement.query_row(&values[..used], |row| row.get(0))?;
+        if blocked {
+            return Ok(ReadOnlyProfileBoundary::Pending {
+                reason,
+                message: format!("{label} settings changed. The new settings apply once the current {label} work finishes and nothing else is waiting on it, so the next {label} session starts with them."),
+                needs_person: false,
+                settings_revision: revision,
+            });
+        }
+    }
+    let verify_again = || {
+        ReadOnlyProfileBoundary::Pending {
+        reason: "evidence_stale",
+        message: format!("The new {label} settings need their agent profile verified again before the next {label} session can start. Open the task's Agent settings and verify the profile."),
+        needs_person: true,
+        settings_revision: revision,
+    }
+    };
+    // The same current-capability rule that ordinary task-profile authority
+    // uses: the activation's capability must still be the newest supported
+    // observation for that executable and role.
+    let activation: Option<(String, String, String, String, String, String)> = connection
+        .query_row(
+            "SELECT a.id,a.profile_hash,a.adapter_hash,a.capability_id,a.capability_key,a.capability_proof_hash
+             FROM trip_task_profile_activations a JOIN capabilities c ON c.id=a.capability_id
+             WHERE a.task_id=?1 AND a.role=?2 AND a.settings_revision=?3 AND a.project_config_revision_id=?4
+               AND c.rowid=(SELECT latest_capability.rowid FROM capabilities latest_capability
+                 WHERE latest_capability.provider=c.provider AND latest_capability.executable_version=c.executable_version
+                   AND latest_capability.role=c.role AND latest_capability.mode=c.mode
+                 ORDER BY latest_capability.checked_at DESC,latest_capability.rowid DESC LIMIT 1)
+               AND c.status='supported' AND c.config_hash=a.capability_key AND c.proof_json!='{}'
+             ORDER BY a.activated_at DESC,a.rowid DESC LIMIT 1",
+            params![task_id, role_name, revision, bound_configuration],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
+        .optional()?;
+    let Some((activation_id, profile_hash, adapter_hash, capability_id, capability_key, proof)) =
+        activation
+    else {
+        return Ok(verify_again());
+    };
+    let Ok((mut authority, _)) =
+        task_profile_descriptor(connection, &task_id, &role_name, revision)
+    else {
+        return Ok(verify_again());
+    };
+    if authority.profile_hash != profile_hash
+        || authority.adapter_hash != adapter_hash
+        || authority.project_config_revision_id != bound_configuration
+    {
+        return Ok(verify_again());
+    }
+    authority.activation_id = Some(activation_id);
+    authority.capability_id = capability_id;
+    authority.capability_key = capability_key;
+    authority.capability_proof_hash = proof;
+    Ok(ReadOnlyProfileBoundary::Ready {
+        authority,
+        from_revision: bound_revision,
+    })
+}
+
+/// Applies a `Ready` boundary inside the caller's transaction and records the
+/// replacement. Other outcomes are returned unchanged, so callers decide
+/// whether to wait.
+pub(crate) fn materialize_read_only_profile(
+    connection: &Connection,
+    attempt_id: &str,
+    role: RoleKind,
+    now: &str,
+) -> Result<ReadOnlyProfileBoundary> {
+    let boundary = read_only_profile_boundary(connection, attempt_id, role)?;
+    if let ReadOnlyProfileBoundary::Ready {
+        authority,
+        from_revision,
+    } = &boundary
+    {
+        // The ready workspace's reviewed policy and materialized files must be
+        // intact before its profile projection is rewritten, and still intact
+        // afterwards; any drift aborts the whole transaction.
+        let ready_workspace: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspaces WHERE attempt_id=?1 AND state='ready')",
+            params![attempt_id],
+            |row| row.get(0),
+        )?;
+        if ready_workspace {
+            require_attempt_ready(connection, attempt_id, None)?;
+        }
+        replace_attempt_profile(connection, attempt_id, authority, now)?;
+        if ready_workspace {
+            require_attempt_ready(connection, attempt_id, None)?;
+            let projected: Option<i64> = connection.query_row(
+                "SELECT (SELECT json_extract(profile.value,'$.settings_revision')
+                         FROM json_each(json_extract(w.policy_json,'$.task_profiles')) profile
+                         WHERE json_extract(profile.value,'$.role')=?2)
+                 FROM workspaces w WHERE w.attempt_id=?1 AND w.state='ready'",
+                params![attempt_id, role.to_string()],
+                |row| row.get(0),
+            )?;
+            if projected != Some(authority.settings_revision) {
+                bail!("workspace policy did not record the new {role} settings")
+            }
+        }
+        // The receipt names the exact task version and frozen work the new
+        // settings were adopted for, in the same transaction as the request.
+        let (task_version, phase, plan_hash, candidate_hash): (
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = connection.query_row(
+            "SELECT t.version,a.phase,a.plan_hash,a.candidate_hash
+             FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1",
+            params![attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        connection.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'service','task.profile.materialized_at_safe_boundary','attempt',?3,?4,?5)",params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),attempt_id,serde_json::json!({"role":role,"from_settings_revision":from_revision,"to_settings_revision":authority.settings_revision,"activation_id":authority.activation_id,"task_version":task_version,"phase":phase,"plan_hash":plan_hash,"candidate_hash":candidate_hash}).to_string(),now])?;
+    }
+    Ok(boundary)
+}
+
 pub fn activate_task_profile(
     store: &Store,
     runtime: &CapabilityRuntime,
@@ -1204,6 +1493,476 @@ fn verify_ready_workspace_policy(connection: &Connection, attempt_id: &str) -> R
     let policy = validate_materialized_policy(&policy_json)?;
     verified_policy_paths(&root, &policy)?;
     Ok(())
+}
+
+/// Documentation paths the approved structured plan explicitly owns. Two plan
+/// shapes name them exactly:
+///
+/// - `ownership.exact_paths.documentation`, an explicit path array; paths in
+///   the other `exact_paths` categories (code, tests, dependencies) are not
+///   documentation ownership, and `documentation` keys are labels;
+/// - `ownership.owned_paths` (or each lane's `owned_paths`) intersected with
+///   `documentation` keys that are literal paths.
+///
+/// Only exact array entries and keys count, never narrative text, and any path
+/// also listed in `ownership.protected` is excluded.
+/// Workflow authority artifacts that no guidance approval may re-pin, whatever
+/// the project configuration or approved plan lists. These are the paths setup
+/// installs or owns: the TRIP package under `.agents/` (skills, base package,
+/// bin, overlay, `config.json` with its profiles, `adapters.json`,
+/// `preflight.json`, `manifest.json`), the alternate `.claude/` skill root and
+/// provider settings under `.claude/` and `.codex/`, the setup-owned root
+/// `AGENTS.md`, and Git metadata. Comparison ignores ASCII case because a
+/// case-insensitive filesystem resolves `.AGENTS/...` to `.agents/...`.
+/// Ordinary project documentation such as `README.md` or `docs/WORKFLOWS.md`
+/// is not protected.
+fn is_protected_workflow_artifact(relative: &str) -> bool {
+    const PROTECTED_ROOTS: &[&str] = &[".agents", ".claude", ".codex", ".git"];
+    const PROTECTED_FILES: &[&str] = &["AGENTS.md"];
+    let first = relative.split('/').next().unwrap_or(relative);
+    PROTECTED_ROOTS
+        .iter()
+        .any(|root| first.eq_ignore_ascii_case(root))
+        || PROTECTED_FILES
+            .iter()
+            .any(|file| relative.eq_ignore_ascii_case(file))
+}
+
+fn approved_documentation_paths(plan: &serde_json::Value) -> BTreeSet<String> {
+    let strings = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let ownership = plan.get("ownership");
+    let mut documented = strings(
+        ownership
+            .and_then(|value| value.get("exact_paths"))
+            .and_then(|value| value.get("documentation")),
+    )
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let mut owned = ["owned_paths", "exact_owned_paths"]
+        .into_iter()
+        .flat_map(|key| strings(ownership.and_then(|value| value.get(key))))
+        .collect::<BTreeSet<_>>();
+    for lane in ownership
+        .and_then(|value| value.get("lanes"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        owned.extend(strings(lane.get("owned_paths")));
+    }
+    // A key names an owned path literally or as its file name with `.` as `_`
+    // (`OPERATIONS_md`); only a single match counts, so collisions are refused.
+    let owned_match = |key: &str| {
+        let mut matches = owned.iter().filter(|path| {
+            *path == key
+                || path
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.contains('.') && name.replace('.', "_") == key)
+        });
+        match (matches.next(), matches.next()) {
+            (Some(path), None) => Some(path.clone()),
+            _ => None,
+        }
+    };
+    documented.extend(
+        plan.get("documentation")
+            .and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter_map(|(key, _)| owned_match(key)),
+    );
+    let protected = ["protected", "protected_paths_and_state"]
+        .into_iter()
+        .flat_map(|key| strings(ownership.and_then(|value| value.get(key))))
+        .collect::<BTreeSet<_>>();
+    documented
+        .into_iter()
+        .filter(|path| !protected.contains(path))
+        .collect()
+}
+
+/// Everything that must be settled before an attempt's pinned guidance may
+/// change: no writer doing work (an implementer is idle only at a recorded
+/// `idle_candidate` boundary or after it exits), no session mid-transition,
+/// keyboard control, pending permission, control or proposal, switch, rework,
+/// review, capture, frozen candidate, check, uncertain guidance, recovery,
+/// restart hold or uncertain claim. `?1` is the attempt.
+const GUIDANCE_REAUTHORIZATION_FENCES: &[(&str, &str)] = &[
+    ("an implementer is still working",
+     "SELECT EXISTS(SELECT 1 FROM role_generations g WHERE g.attempt_id=?1 AND g.role='implementer'
+        AND (g.status IN ('launch_reserved','stopping')
+          OR (g.status='running' AND NOT EXISTS(SELECT 1 FROM sessions s
+            WHERE s.id=(SELECT latest.id FROM sessions latest WHERE latest.role_generation_id=g.id
+                        ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)
+              AND s.status='running' AND s.readiness_state='idle_candidate'))))"),
+    ("an agent session is starting, stopping or needs recovery",
+     "SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+        WHERE g.attempt_id=?1
+          AND s.status IN ('launch_reserved','interrupt_requested','recovery_required'))"),
+    ("someone has keyboard control of an agent",
+     "SELECT EXISTS(SELECT 1 FROM input_leases lease JOIN sessions s ON s.id=lease.session_id
+        JOIN role_generations g ON g.id=s.role_generation_id
+        WHERE g.attempt_id=?1 AND lease.revoked_at IS NULL
+          AND julianday(lease.expires_at)>julianday('now'))"),
+    ("a permission request is pending",
+     "SELECT EXISTS(SELECT 1 FROM permission_requests WHERE attempt_id=?1
+        AND consumed_at IS NULL AND delivery_state NOT IN ('expired','not_delivered'))"),
+    ("a control or proposed transition is pending",
+     "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
+        AND state NOT IN ('finished','cancelled','superseded','rejected','failed','abandoned'))"),
+    ("an agent switch is pending",
+     "SELECT EXISTS(SELECT 1 FROM switch_intents WHERE attempt_id=?1
+        AND state NOT IN ('dispatched','completed','cancelled','rejected','superseded'))"),
+    ("a rework is in progress",
+     "SELECT EXISTS(SELECT 1 FROM rework_intents WHERE new_attempt_id=?1
+        AND state NOT IN ('completed','cancelled'))"),
+    ("a review is in flight",
+     "SELECT EXISTS(SELECT 1 FROM review_requests WHERE attempt_id=?1
+        AND delivery_state IN ('reserved','launching','delivered','ambiguous'))"),
+    ("a capture is in progress",
+     "SELECT EXISTS(SELECT 1 FROM freeze_intents WHERE attempt_id=?1
+        AND state IN ('reserved','capturing','recovery_required'))"),
+    ("the candidate is already frozen",
+     "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1 AND candidate_hash IS NOT NULL)"),
+    ("a check is running",
+     "SELECT EXISTS(SELECT 1 FROM check_runs WHERE attempt_id=?1
+        AND status IN ('launch_reserved','running','recovery_required','launch_ambiguous'))"),
+    ("guidance delivery is unconfirmed",
+     "SELECT EXISTS(SELECT 1 FROM guidance_messages WHERE attempt_id=?1
+        AND state IN ('delivery_reserved','written_awaiting_submit','delivery_unknown'))"),
+    ("a recovery is open",
+     "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=?1
+        AND state='attention_required')"),
+    ("a restart hold is open",
+     "SELECT EXISTS(SELECT 1 FROM restart_candidates WHERE attempt_id=?1
+        AND state NOT IN ('resumed','released_fresh_dispatch','cancelled'))"),
+    ("the attempt's repository claim is uncertain",
+     "SELECT EXISTS(SELECT 1 FROM claims WHERE attempt_id=?1 AND state='unknown')"),
+];
+
+/// Supersedes the attempt's proposed transitions that can never be applied
+/// again. A proposal is bound to the task version, source phase, plan,
+/// candidate and effective manager generation current when it was made, and
+/// the task version only grows, so a proposal that differs in any of them is
+/// permanently refused by `ApplyTransition`. A proposal that still matches all
+/// of them stays pending and keeps blocking. Payloads are kept; each retirement
+/// is audited with the proposal's binding, the current one and what differs.
+pub(crate) fn retire_unmatchable_transition_proposals(
+    connection: &Connection,
+    attempt_id: &str,
+    retired_for: &str,
+    now: &str,
+) -> Result<usize> {
+    let (task_version, phase, plan_hash, candidate_hash): (
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = connection.query_row(
+        "SELECT t.version,a.phase,a.plan_hash,a.candidate_hash
+         FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1",
+        params![attempt_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let effective_managers = connection
+        .prepare(
+            "SELECT DISTINCT rg.id FROM role_generations rg
+             JOIN role_settings rs ON rs.effective_generation_id=rg.id AND rs.role='manager'
+             WHERE rg.attempt_id=?1 AND rg.role='manager' ORDER BY rg.id",
+        )?
+        .query_map(params![attempt_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let proposals = connection
+        .prepare(
+            "SELECT id,expected_version,role_generation_id,payload_json FROM controls
+             WHERE attempt_id=?1 AND kind='transition_proposal' AND state='proposed'
+             ORDER BY created_at,rowid",
+        )?
+        .query_map(params![attempt_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let current = serde_json::json!({
+        "task_version":task_version,"source_phase":phase,"plan_hash":plan_hash,
+        "candidate_hash":candidate_hash,"effective_manager_generation_ids":effective_managers,
+    });
+    let mut retired = 0;
+    for (id, expected_version, generation, payload_json) in proposals {
+        // A payload that cannot be read can never be applied either.
+        let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap_or_default();
+        let text = |field: &str| payload.get(field).and_then(serde_json::Value::as_str);
+        let mut differs = Vec::new();
+        if expected_version != Some(task_version)
+            || payload
+                .get("expected_task_version")
+                .and_then(serde_json::Value::as_i64)
+                != Some(task_version)
+        {
+            differs.push("task_version");
+        }
+        if text("source_phase") != Some(phase.as_str()) {
+            differs.push("source_phase");
+        }
+        if text("plan_hash") != plan_hash.as_deref() {
+            differs.push("plan_hash");
+        }
+        if text("candidate_hash") != candidate_hash.as_deref() {
+            differs.push("candidate_hash");
+        }
+        if generation.as_deref().is_none_or(|generation| {
+            text("role_generation_id") != Some(generation)
+                || !effective_managers
+                    .iter()
+                    .any(|manager| manager == generation)
+        }) {
+            differs.push("manager_generation");
+        }
+        if differs.is_empty() {
+            continue;
+        }
+        if connection.execute(
+            "UPDATE controls SET state='superseded',updated_at=?1 WHERE id=?2 AND state='proposed'",
+            params![now, id],
+        )? != 1
+        {
+            bail!("a proposed transition changed while it was being retired")
+        }
+        let detail = serde_json::json!({
+            "attempt_id":attempt_id,"reason":"binding_no_longer_current","retired_for":retired_for,
+            "mismatched":differs,"current":current,
+            "proposal":{"expected_version":expected_version,"role_generation_id":generation,
+                        "payload_json":payload_json},
+        });
+        connection.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES(?1,?2,'service','control.transition_proposal.retired','control',?3,?4,?5)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+                id,
+                detail.to_string(),
+                now
+            ],
+        )?;
+        retired += 1;
+    }
+    Ok(retired)
+}
+
+/// Applies your explicit approval that listed guidance files in the active
+/// attempt's ready workspace may keep their new content. Guidance files are
+/// pinned when the workspace is prepared, so an approved documentation change
+/// made during the attempt otherwise leaves the attempt permanently not ready.
+///
+/// Nothing is inferred: the task version, the attempt as the task's current
+/// unfinished attempt, its approved and implementation-authorized plan hash,
+/// the active project configuration revision (which every task profile of the
+/// attempt must use), and the hash of the exact policy being amended must all
+/// match, and the attempt must be at a settled boundary (see
+/// `GUIDANCE_REAUTHORIZATION_FENCES`). Each file must be a configured guidance
+/// path the approved plan both owns and documents, pinned at
+/// `previous_sha256`, and a contained regular file whose recomputed hash is
+/// `sha256`. Workflow, skill, manifest and configuration files can never be
+/// changed this way, and every other pinned file, including any other changed
+/// guidance not listed, must still match. Returns the audit detail.
+pub(crate) fn reauthorize_attempt_guidance(
+    connection: &Connection,
+    task_id: &str,
+    attempt_id: &str,
+    expected_version: i64,
+    plan_hash: &str,
+    config_revision_id: &str,
+    policy_hash: &str,
+    files: &[crate::domain::GuidanceReauthorization],
+    now: &str,
+) -> Result<serde_json::Value> {
+    if files.is_empty() || files.len() > 32 {
+        bail!("guidance reauthorization needs between 1 and 32 files")
+    }
+    let current: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tasks t JOIN attempts a ON a.task_id=t.id
+           WHERE t.id=?1 AND a.id=?2 AND t.version=?3 AND t.archived_at IS NULL
+             AND t.lifecycle IN ('in_progress','validation')
+             AND a.status IN ('running','needs_input','held')
+             AND a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=t.id
+               ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1))",
+        params![task_id, attempt_id, expected_version],
+        |row| row.get(0),
+    )?;
+    if !current {
+        bail!("task version is stale, or the attempt is not the task's current unfinished attempt")
+    }
+    // Runs in the caller's transaction, so any later refusal restores them.
+    retire_unmatchable_transition_proposals(
+        connection,
+        attempt_id,
+        "guidance_reauthorization",
+        now,
+    )?;
+    for (reason, sql) in GUIDANCE_REAUTHORIZATION_FENCES {
+        let blocked: bool = connection.query_row(sql, params![attempt_id], |row| row.get(0))?;
+        if blocked {
+            bail!("guidance cannot be reauthorized while {reason}")
+        }
+    }
+    let plan_json: String = connection
+        .query_row(
+            "SELECT p.plan_json FROM attempts a JOIN trip_structured_plans p ON p.id=a.structured_plan_id
+             WHERE a.id=?1 AND a.plan_hash=?2 AND p.plan_hash=?2
+               AND a.plan_approved_at IS NOT NULL AND p.approved_at IS NOT NULL
+               AND p.implementation_authorized_at IS NOT NULL",
+            params![attempt_id, plan_hash],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("the attempt's approved plan does not match the given plan hash"))?;
+    let (guidance_json, profiles_match): (String, bool) = connection
+        .query_row(
+            "SELECT json_extract(r.config_json,'$.guidance'),
+                    NOT EXISTS(SELECT 1 FROM trip_attempt_profiles ap
+                      WHERE ap.attempt_id=a.id AND ap.project_config_revision_id!=r.id)
+             FROM attempts a JOIN tasks t ON t.id=a.task_id
+             JOIN trip_project_state s ON s.project_id=t.project_id
+             JOIN trip_config_revisions r ON r.id=s.active_config_revision_id
+             WHERE a.id=?1 AND r.id=?2",
+            params![attempt_id, config_revision_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            anyhow!("the given configuration revision is not the project's active one")
+        })?;
+    if !profiles_match {
+        bail!("the attempt's task profiles use a different configuration revision")
+    }
+    let guidance: BTreeSet<String> = serde_json::from_str(&guidance_json)?;
+    let (root, policy_json): (String, String) = connection
+        .query_row(
+            "SELECT path,policy_json FROM workspaces WHERE attempt_id=?1 AND state='ready'",
+            params![attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("the attempt has no ready workspace"))?;
+    if sha256(policy_json.as_bytes()) != policy_hash {
+        bail!("the workspace policy changed since it was reviewed for this approval")
+    }
+    let mut policy = validate_materialized_policy(&policy_json)?;
+    if policy.get("kind").and_then(serde_json::Value::as_str) != Some("activated_project") {
+        bail!("only an activated-project workspace policy carries approved guidance")
+    }
+    let root = PathBuf::from(root).canonicalize()?;
+    let named = approved_documentation_paths(&serde_json::from_str(&plan_json)?);
+    let mut seen = BTreeSet::new();
+    let mut changes = Vec::new();
+    for file in files {
+        validate_relative(&file.path)?;
+        if !seen.insert(file.path.as_str()) {
+            bail!("{} is listed more than once", file.path)
+        }
+        if !valid_sha256(&file.previous_sha256) || !valid_sha256(&file.sha256) {
+            bail!("{} needs valid previous and new SHA-256 hashes", file.path)
+        }
+        if file.previous_sha256 == file.sha256 {
+            bail!("{} is unchanged", file.path)
+        }
+        // Decided by the host alone, before configuration or plan are read.
+        if is_protected_workflow_artifact(&file.path) {
+            bail!(
+                "{} is a protected workflow artifact and can never be reauthorized as guidance",
+                file.path
+            )
+        }
+        if !guidance.contains(&file.path) {
+            bail!("{} is not a configured guidance file", file.path)
+        }
+        if !named.contains(&file.path) {
+            bail!(
+                "the approved plan does not explicitly own {} as documentation",
+                file.path
+            )
+        }
+        let pinned = policy
+            .pointer("/files")
+            .and_then(|files| files.get(&file.path))
+            .and_then(serde_json::Value::as_str);
+        if pinned != Some(file.previous_sha256.as_str()) {
+            bail!("{} is not pinned at the given previous hash", file.path)
+        }
+        let path = root.join(&file.path);
+        ensure_no_symlink_ancestry(&root, &path)?;
+        if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            bail!("{} is not a regular file in the workspace", file.path)
+        }
+        if hash_file(&path)?.as_deref() != Some(file.sha256.as_str()) {
+            bail!(
+                "{} in the workspace does not have the approved new content",
+                file.path
+            )
+        }
+        changes.push(serde_json::json!({
+            "path":file.path,"previous_sha256":file.previous_sha256,"sha256":file.sha256,
+        }));
+    }
+    let pinned = policy
+        .get_mut("files")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| anyhow!("ready workspace policy lacks its file map"))?;
+    for file in files {
+        pinned.insert(
+            file.path.clone(),
+            serde_json::Value::String(file.sha256.clone()),
+        );
+    }
+    let record = serde_json::json!({
+        "task_version":expected_version,"plan_hash":plan_hash,
+        "config_revision_id":config_revision_id,"previous_policy_hash":policy_hash,
+        "files":changes,"approved_at":now,
+    });
+    let history = policy
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("workspace policy must be an object"))?
+        .entry("guidance_reauthorizations")
+        .or_insert_with(|| serde_json::json!([]));
+    history
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("workspace guidance reauthorization history is malformed"))?
+        .push(record.clone());
+    let updated = policy.to_string();
+    validate_materialized_policy(&updated)?;
+    // Every other pinned file must still match; only the listed files move.
+    verified_policy_paths(&root, &policy)?;
+    let changed = connection.execute(
+        "UPDATE workspaces SET policy_json=?1,updated_at=?2
+         WHERE attempt_id=?3 AND state='ready' AND policy_json=?4",
+        params![updated, now, attempt_id, policy_json],
+    )?;
+    if changed != 1 {
+        bail!("the workspace policy changed while applying the approval")
+    }
+    let mut detail = record;
+    detail["attempt_id"] = serde_json::json!(attempt_id);
+    detail["policy_hash"] = serde_json::json!(sha256(updated.as_bytes()));
+    connection.execute(
+        "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+         VALUES(?1,?2,'human','attempt.guidance.reauthorized','attempt',?3,?4,?5)",
+        params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),attempt_id,detail.to_string(),now],
+    )?;
+    Ok(detail)
 }
 
 pub(crate) fn validate_materialized_policy(policy_json: &str) -> Result<serde_json::Value> {
@@ -1687,6 +2446,30 @@ pub fn execute_human_with_runtime(
             *expected_task_version,
             stage,
             justification,
+        )?,
+        TripHumanAction::AuthorizeFinalRepairRecheck {
+            task_id,
+            attempt_id,
+            expected_task_version,
+            approved_code_request_id,
+            prior_candidate_hash,
+            final_request_id,
+            rejected_code_request_id,
+            reviewer_generation_id,
+        } => authorize_final_repair_recheck(
+            store,
+            operation_id,
+            &request_hash,
+            task_id,
+            attempt_id,
+            *expected_task_version,
+            &FinalRepairLedger {
+                approved_code_request_id,
+                prior_candidate_hash,
+                final_request_id,
+                rejected_code_request_id,
+                reviewer_generation_id,
+            },
         )?,
     };
     persist_trip_receipt(store, operation_id, &request_hash, &result)?;
@@ -5002,6 +5785,8 @@ fn extend_review_budget(
          JOIN tasks t ON t.id=a.task_id WHERE b.attempt_id=?1 AND b.review_kind=?2 AND t.id=?3 AND t.version=?4",
         params![attempt_id,kind,task_id,expected_version], |row| Ok((row.get(0)?,row.get(1)?))
     )?;
+    // The final-repair recheck is a separate one-shot lane
+    // (`authorize_final_repair_recheck`), never an ordinary extension.
     if initial + extension + additional > 5 {
         bail!("ordinary review allowance cannot exceed five total calls")
     }
@@ -5120,6 +5905,284 @@ fn authorize_additional_explorer(
         Some(expected_version + 1),
         "additional_explorer_authorized",
         serde_json::json!({"attempt_id":attempt_id,"stage":"rescue","allowance":1}),
+    ))
+}
+
+struct FinalRepairLedger<'a> {
+    approved_code_request_id: &'a str,
+    prior_candidate_hash: &'a str,
+    final_request_id: &'a str,
+    rejected_code_request_id: &'a str,
+    reviewer_generation_id: &'a str,
+}
+
+/// Bindings are derived from the ledger and only compared with the caller's
+/// reviewed values. Historical ordinary requests, results, verdicts and budget
+/// are never relabeled or refunded: the receipt is a separate one-shot lane.
+fn authorize_final_repair_recheck(
+    store: &Store,
+    operation_id: &str,
+    request_hash: &str,
+    task_id: &str,
+    attempt_id: &str,
+    expected_version: i64,
+    reviewed: &FinalRepairLedger<'_>,
+) -> Result<OperationResult> {
+    let now = Utc::now().to_rfc3339();
+    let mut connection = store.lock()?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let recorded: Option<(String, String, i64, String)> = tx
+        .query_row(
+            "SELECT operation_id,request_hash,authorized_task_version,detail_json
+             FROM final_repair_rechecks WHERE attempt_id=?1",
+            params![attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    if let Some((operation, hash, version, detail)) = recorded {
+        if operation != operation_id || hash != request_hash {
+            bail!("a final-repair recheck was already authorized for this attempt")
+        }
+        return Ok(operation_result(
+            operation_id,
+            "attempt",
+            attempt_id,
+            Some(version + 1),
+            "final_repair_recheck_authorized",
+            serde_json::from_str(&detail)?,
+        ));
+    }
+    require_attempt_ready(&tx, attempt_id, None)?;
+    let current: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT a.plan_hash,a.configuration_hash
+             FROM tasks t JOIN attempts a ON a.task_id=t.id
+             WHERE t.id=?1 AND a.id=?2 AND t.version=?3 AND t.archived_at IS NULL
+               AND t.lifecycle IN ('in_progress','validation') AND t.attention='needs_input'
+               AND a.status='running' AND a.phase='needs_input' AND a.final_repair_round=1
+               AND a.candidate_hash IS NULL AND a.plan_hash IS NOT NULL
+               AND a.plan_approved_at IS NOT NULL
+               AND a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=t.id
+                 ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)",
+            params![task_id, attempt_id, expected_version],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((plan_hash, configuration_hash)) = current else {
+        bail!("final-repair recheck recovery requires the task's current attempt at the given version, in its final repair round and held in needs_input")
+    };
+    retire_unmatchable_transition_proposals(
+        &tx,
+        attempt_id,
+        "final_repair_recheck_recovery",
+        &now,
+    )?;
+    for (reason, sql) in GUIDANCE_REAUTHORIZATION_FENCES {
+        let blocked: bool = tx.query_row(sql, params![attempt_id], |row| row.get(0))?;
+        if blocked {
+            bail!("final-repair recheck recovery cannot proceed while {reason}")
+        }
+    }
+    type Derived = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+    );
+    let derived: Option<Derived> = tx
+        .query_row(
+            "SELECT approved.id,final_changes.id,final_changes.candidate_hash,rejected.id,
+                    result.id,reviewer.id,session.id,rejected.candidate_hash,
+                    rejected.settings_revision,profile.profile_hash
+             FROM review_requests final_changes
+             JOIN review_requests approved ON approved.id=(
+               SELECT code.id FROM review_requests code
+               WHERE code.attempt_id=final_changes.attempt_id AND code.review_kind='code'
+                 AND code.delivery_state='finished' AND code.verdict='approved'
+                 AND code.candidate_hash=final_changes.candidate_hash
+                 AND code.rowid<final_changes.rowid
+               ORDER BY code.rowid DESC LIMIT 1)
+             JOIN review_requests rejected ON rejected.id=(
+               SELECT latest.id FROM review_requests latest
+               WHERE latest.attempt_id=final_changes.attempt_id ORDER BY latest.rowid DESC LIMIT 1)
+             JOIN role_results result ON result.role_generation_id=rejected.role_generation_id
+               AND result.session_id=rejected.session_id AND result.outcome='needs_rework'
+               AND result.consumed_at IS NOT NULL
+               AND json_extract(result.metadata_json,'$.review_request_id')=rejected.id
+               AND json_extract(result.metadata_json,'$.review_kind')='code'
+               AND json_extract(result.metadata_json,'$.candidate_hash')=rejected.candidate_hash
+             JOIN role_generations reviewer ON reviewer.id=rejected.role_generation_id
+               AND reviewer.attempt_id=final_changes.attempt_id AND reviewer.role='code_reviewer'
+               AND reviewer.status NOT IN ('launch_reserved','running','stopping')
+             JOIN sessions session ON session.id=rejected.session_id
+               AND session.role_generation_id=reviewer.id AND session.status='exited'
+             JOIN trip_attempt_profiles profile ON profile.attempt_id=final_changes.attempt_id
+               AND profile.role='code_reviewer'
+               AND profile.settings_revision=rejected.settings_revision
+             WHERE final_changes.attempt_id=?1 AND final_changes.review_kind='final'
+               AND final_changes.delivery_state='finished'
+               AND final_changes.verdict='request_changes'
+               AND (SELECT COUNT(*) FROM review_requests other
+                 WHERE other.attempt_id=final_changes.attempt_id
+                   AND other.review_kind='final' AND other.verdict='request_changes')=1
+               AND rejected.review_kind='code' AND rejected.delivery_state='finished'
+               AND rejected.verdict='needs_rework' AND rejected.budget_spent_at IS NOT NULL
+               AND rejected.rowid>final_changes.rowid
+               AND rejected.candidate_hash!=final_changes.candidate_hash
+               AND NOT EXISTS(SELECT 1 FROM role_results duplicate
+                 WHERE json_extract(duplicate.metadata_json,'$.review_request_id')=rejected.id
+                   AND duplicate.id!=result.id)
+               AND NOT EXISTS(SELECT 1 FROM role_generations newer
+                 WHERE newer.attempt_id=reviewer.attempt_id AND newer.role=reviewer.role
+                   AND newer.lane_id=reviewer.lane_id AND newer.generation>reviewer.generation)",
+            params![attempt_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        approved,
+        final_request,
+        prior_candidate,
+        rejected,
+        result,
+        reviewer,
+        session,
+        repaired_candidate,
+        settings_revision,
+        profile_hash,
+    )) = derived
+    else {
+        bail!("the ledger lacks an exact final-repair history: ordinary code approval, one final request_changes on that candidate, and a latest ordinary needs_rework of a repaired candidate with one consumed result from a quiescent, latest code reviewer under the pinned profile")
+    };
+    let (allowance, spent): (i64, i64) = tx.query_row(
+        "SELECT initial_allowance+extension_allowance,spent FROM review_budgets
+         WHERE attempt_id=?1 AND review_kind='code'",
+        params![attempt_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let detail = serde_json::json!({
+        "attempt_id":attempt_id,"task_version":expected_version,"plan_hash":plan_hash,
+        "configuration_hash":configuration_hash,
+        "prior_code_approval":{"review_request_id":approved,"candidate_hash":prior_candidate},
+        "final_request_changes":{"review_request_id":final_request,
+            "candidate_hash":prior_candidate},
+        "ordinary_needs_rework":{"review_request_id":rejected,"role_result_id":result,
+            "candidate_hash":repaired_candidate},
+        "retained_code_reviewer":{"role_generation_id":reviewer,"session_id":session,
+            "settings_revision":settings_revision,"profile_hash":profile_hash},
+        "ordinary_code_budget":{"allowance":allowance,"spent":spent},
+        "final_repair_recheck":{"allowance":1,"spent":0},
+    });
+    // The removed ordinary exception admitted exactly one call past the
+    // five-call maximum, which the rejected review spent. Any other shape is
+    // not that historical error and receives no receipt.
+    if allowance != 6 || spent != 6 {
+        bail!("final-repair recheck recovery requires the historical ordinary code budget of exactly 6 allowed and 6 spent: {detail}")
+    }
+    if approved != reviewed.approved_code_request_id
+        || prior_candidate != reviewed.prior_candidate_hash
+        || final_request != reviewed.final_request_id
+        || rejected != reviewed.rejected_code_request_id
+        || reviewer != reviewed.reviewer_generation_id
+    {
+        bail!("the reviewed final-repair bindings differ from the ledger: {detail}")
+    }
+    // The final result is recorded only when exactly one authenticated
+    // matching result exists, as migration 032 derived it for older receipts.
+    let final_result: Option<String> = tx.query_row(
+        "SELECT CASE WHEN COUNT(*)=1 THEN MIN(result.id) END
+         FROM review_requests final
+         JOIN role_results result ON result.role_generation_id=final.role_generation_id
+           AND result.session_id=final.session_id
+         JOIN role_generations verifier ON verifier.id=result.role_generation_id
+           AND verifier.attempt_id=final.attempt_id AND verifier.role='final_verifier'
+         WHERE final.id=?1 AND final.review_kind='final'
+           AND result.outcome='request_changes' AND result.consumed_at IS NOT NULL
+           AND json_extract(result.metadata_json,'$.review_request_id')=final.id
+           AND json_extract(result.metadata_json,'$.review_kind')='final'
+           AND json_extract(result.metadata_json,'$.candidate_hash')=final.candidate_hash",
+        params![final_request],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO final_repair_rechecks(attempt_id,task_id,operation_id,request_hash,
+           authorized_task_version,plan_hash,configuration_hash,approved_code_request_id,
+           prior_candidate_hash,final_request_id,rejected_code_request_id,rejected_code_result_id,
+           reviewer_generation_id,reviewer_session_id,reviewer_settings_revision,
+           reviewer_profile_hash,detail_json,state,created_at,updated_at,
+           provenance_kind,final_result_id)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,'authorized',?18,?18,
+           'historical_sixth_review_recovery',?19)",
+        params![
+            attempt_id,
+            task_id,
+            operation_id,
+            request_hash,
+            expected_version,
+            plan_hash,
+            configuration_hash,
+            approved,
+            prior_candidate,
+            final_request,
+            rejected,
+            result,
+            reviewer,
+            session,
+            settings_revision,
+            profile_hash,
+            detail.to_string(),
+            now,
+            final_result
+        ],
+    )?;
+    if tx.execute(
+        "UPDATE attempts SET phase='implementation',updated_at=?1
+         WHERE id=?2 AND phase='needs_input' AND final_repair_round=1 AND candidate_hash IS NULL",
+        params![now, attempt_id],
+    )? != 1
+    {
+        bail!("the attempt changed while the final-repair recheck was being authorized")
+    }
+    if tx.execute(
+        "UPDATE tasks SET attention='none',version=version+1,updated_at=?1
+         WHERE id=?2 AND version=?3 AND attention='needs_input'",
+        params![now, task_id, expected_version],
+    )? != 1
+    {
+        bail!("task version is stale")
+    }
+    tx.execute(
+        "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+         VALUES(?1,?2,'human','attempt.final_repair_recheck.authorized','attempt',?3,?4,?5)",
+        params![uuid::Uuid::new_v4().to_string(), operation_id, attempt_id, detail.to_string(), now],
+    )?;
+    tx.commit()?;
+    Ok(operation_result(
+        operation_id,
+        "attempt",
+        attempt_id,
+        Some(expected_version + 1),
+        "final_repair_recheck_authorized",
+        detail,
     ))
 }
 
@@ -10581,21 +11644,202 @@ fn materialize_setup_package(store: &Store, attempt_id: &str, workspace: &Path) 
     Ok(())
 }
 
+/// Guidance a rework child may keep from its exact source snapshot although it
+/// differs from the project repository: content its parent's activated policy
+/// pinned after an explicit guidance reauthorization.
+struct ReworkGuidanceSource {
+    intent_id: String,
+    parent_attempt_id: String,
+    snapshot_id: String,
+    parent_policy_hash: String,
+    parent_files: serde_json::Map<String, serde_json::Value>,
+    reauthorizations: Vec<serde_json::Value>,
+    snapshot_files: BTreeMap<String, String>,
+}
+
+impl ReworkGuidanceSource {
+    /// Returns the provenance of `relative` kept at `observed`, or why it may
+    /// not be kept. Only a configured guidance path reaches this.
+    fn authorize(
+        &self,
+        relative: &str,
+        observed: &str,
+        project_hash: &str,
+    ) -> std::result::Result<serde_json::Value, String> {
+        if is_protected_workflow_artifact(relative) {
+            return Err("it is a protected workflow artifact".into());
+        }
+        if self.snapshot_files.get(relative).map(String::as_str) != Some(observed) {
+            return Err("the worktree content is not the rework source snapshot's".into());
+        }
+        if self
+            .parent_files
+            .get(relative)
+            .and_then(serde_json::Value::as_str)
+            != Some(observed)
+        {
+            return Err("the parent's activated policy does not pin this content".into());
+        }
+        let approval = self
+            .reauthorizations
+            .iter()
+            .filter_map(|approval| {
+                approval
+                    .get("files")
+                    .and_then(serde_json::Value::as_array)?
+                    .iter()
+                    .rev()
+                    .find(|file| {
+                        file.get("path").and_then(serde_json::Value::as_str) == Some(relative)
+                    })
+                    .map(|file| (approval, file))
+            })
+            .last()
+            .filter(|(_, file)| {
+                file.get("sha256").and_then(serde_json::Value::as_str) == Some(observed)
+            })
+            .ok_or_else(|| {
+                "the parent's latest guidance reauthorization did not approve this content"
+                    .to_owned()
+            })?;
+        Ok(serde_json::json!({
+            "path":relative,"sha256":observed,"project_sha256":project_hash,
+            "parent_attempt_id":self.parent_attempt_id,"rework_intent_id":self.intent_id,
+            "snapshot_id":self.snapshot_id,"parent_policy_hash":self.parent_policy_hash,
+            "previous_sha256":approval.1.get("previous_sha256"),
+            "reauthorized_at":approval.0.get("approved_at"),
+        }))
+    }
+}
+
+/// The authorized parent guidance of the rework child being materialized, if
+/// `attempt_id` is one. `Some(Err)` names why its parent's activated policy
+/// cannot vouch for any guidance: the policy, workflow, manifest and active
+/// configuration it was bound to must all still be current.
+fn rework_guidance_source(
+    connection: &Connection,
+    attempt_id: &str,
+    manifest_hash: &str,
+    active_configuration: &str,
+) -> Result<Option<std::result::Result<ReworkGuidanceSource, String>>> {
+    let source: Option<(String, String, String, Option<String>, Option<String>)> = connection
+        .query_row(
+            "SELECT ri.id,ri.parent_attempt_id,ri.snapshot_id,
+                    (SELECT s.manifest_json FROM snapshots s WHERE s.id=ri.snapshot_id
+                       AND s.attempt_id=ri.parent_attempt_id AND s.complete=1
+                       AND s.kind IN ('accepted','candidate')),
+                    (SELECT w.policy_json FROM workspaces w WHERE w.attempt_id=ri.parent_attempt_id)
+             FROM rework_intents ri JOIN attempts child ON child.id=ri.new_attempt_id
+             WHERE ri.new_attempt_id=?1 AND ri.state='materializing'
+               AND child.parent_attempt_id=ri.parent_attempt_id",
+            params![attempt_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((intent_id, parent_attempt_id, snapshot_id, manifest_json, policy_json)) = source
+    else {
+        return Ok(None);
+    };
+    let refuse = |reason: &str| Ok(Some(Err(reason.to_owned())));
+    let Some(manifest_json) = manifest_json else {
+        return refuse("the rework source is not a complete snapshot of the parent");
+    };
+    let Some(policy_json) = policy_json else {
+        return refuse("the parent has no workspace policy");
+    };
+    let Ok(policy) = validate_materialized_policy(&policy_json) else {
+        return refuse("the parent's workspace policy is not a valid pinned TRIP policy");
+    };
+    if policy.get("kind").and_then(serde_json::Value::as_str) != Some("activated_project")
+        || policy
+            .get("manifest_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(manifest_hash)
+    {
+        return refuse("the parent's policy is not bound to the current activated manifest");
+    }
+    let bound_configurations = policy
+        .get("task_profiles")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|profile| profile.get("project_config_revision_id"))
+        .chain(
+            policy
+                .get("guidance_reauthorizations")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|approval| approval.get("config_revision_id")),
+        )
+        .collect::<Vec<_>>();
+    if bound_configurations
+        .iter()
+        .any(|revision| revision.and_then(serde_json::Value::as_str) != Some(active_configuration))
+    {
+        return refuse("the parent's policy was bound to a configuration that is no longer active");
+    }
+    let manifest: crate::snapshot::SnapshotManifest = serde_json::from_str(&manifest_json)?;
+    let snapshot_files = manifest
+        .entries
+        .into_iter()
+        .filter(|entry| !entry.deleted && entry.kind == "file")
+        .filter_map(|entry| entry.hash.map(|hash| (entry.path, hash)))
+        .collect();
+    Ok(Some(Ok(ReworkGuidanceSource {
+        intent_id,
+        parent_attempt_id,
+        snapshot_id,
+        parent_policy_hash: sha256(policy_json.as_bytes()),
+        parent_files: policy
+            .get("files")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default(),
+        reauthorizations: policy
+            .get("guidance_reauthorizations")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        snapshot_files,
+    })))
+}
+
 pub fn materialize_project_policy(
     store: &Store,
     attempt_id: &str,
     workspace: &Path,
 ) -> Result<serde_json::Value> {
-    let (root, manifest_hash, guidance): (String, String, String) = {
+    let (root, manifest_hash, guidance, rework_source): (
+        String,
+        String,
+        String,
+        Option<std::result::Result<ReworkGuidanceSource, String>>,
+    ) = {
         let connection = store.lock()?;
         require_attempt_ready(&connection, attempt_id, None)?;
-        connection.query_row(
-            "SELECT p.repository_path,s.manifest_hash,json_extract(r.config_json,'$.guidance')
+        let (root, manifest_hash, guidance, active_configuration): (String, String, String, String) = connection.query_row(
+            "SELECT p.repository_path,s.manifest_hash,json_extract(r.config_json,'$.guidance'),r.id
              FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
              JOIN trip_project_state s ON s.project_id=p.id JOIN trip_config_revisions r ON r.id=s.active_config_revision_id
              WHERE a.id=?1 AND s.readiness='ready'",
-            params![attempt_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))
-        )?
+            params![attempt_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))
+        )?;
+        let rework_source = rework_guidance_source(
+            &connection,
+            attempt_id,
+            &manifest_hash,
+            &active_configuration,
+        )?;
+        (root, manifest_hash, guidance, rework_source)
     };
     let root = PathBuf::from(root).canonicalize()?;
     let manifest_path = root.join(".agents/trip-explorer/manifest.json");
@@ -10729,6 +11973,7 @@ pub fn materialize_project_policy(
         serde_json::Value::String(manifest_hash.clone()),
     );
     let guidance: Vec<String> = serde_json::from_str(&guidance)?;
+    let mut preserved_guidance = Vec::new();
     for relative in guidance {
         validate_relative(&relative)?;
         let source = contained_path(&root, &relative, true)?;
@@ -10738,7 +11983,27 @@ pub fn materialize_project_policy(
         if destination.exists() {
             let observed = hash_file(&destination)?;
             if observed.as_deref() != Some(expected.as_str()) {
-                bail!("approved guidance collides with different worktree content: {relative}")
+                // A rework child keeps its source's guidance only where the
+                // parent's policy pinned exactly that reauthorized content.
+                let kept = match (&rework_source, observed.as_deref()) {
+                    (None, _) => bail!(
+                        "approved guidance collides with different worktree content: {relative}"
+                    ),
+                    (Some(Err(reason)), _) => Err(reason.clone()),
+                    (Some(Ok(_)), None) => {
+                        Err("the worktree path is not a regular file".to_owned())
+                    }
+                    (Some(Ok(source)), Some(observed)) => {
+                        ensure_no_symlink_ancestry(workspace, &destination)?;
+                        source.authorize(&relative, observed, &expected)
+                    }
+                };
+                let provenance = kept.map_err(|reason| {
+                    anyhow!("approved guidance collides with different worktree content: {relative}; the rework parent's authorized guidance cannot keep it: {reason}")
+                })?;
+                copied.insert(relative, provenance["sha256"].clone());
+                preserved_guidance.push(provenance);
+                continue;
             }
         } else {
             write_activated_policy_file(
@@ -10765,16 +12030,264 @@ pub fn materialize_project_policy(
     if task_profiles.len() != 6 {
         bail!("attempt policy materialization requires six frozen effective task profiles")
     }
-    let policy = serde_json::json!({"kind":"activated_project","workflow_id":WORKFLOW_ID,"upstream_source_hash":source_hash(),"overlay_hash":overlay_hash(),"manifest_hash":manifest_hash,"files":copied,"allowed_prefixes":allowed_prefixes,"base_project_configuration_distinct":true,"task_profiles":task_profiles,"uncommitted_guidance":"approved overlay; not asserted present in base Git revision"});
+    let mut policy = serde_json::json!({"kind":"activated_project","workflow_id":WORKFLOW_ID,"upstream_source_hash":source_hash(),"overlay_hash":overlay_hash(),"manifest_hash":manifest_hash,"files":copied,"allowed_prefixes":allowed_prefixes,"base_project_configuration_distinct":true,"task_profiles":task_profiles,"uncommitted_guidance":"approved overlay; not asserted present in base Git revision"});
+    if !preserved_guidance.is_empty() {
+        // Pins kept from the parent carry their provenance; no plan approval,
+        // accepted snapshot or review outcome is inherited with them.
+        policy["rework_guidance_sources"] = serde_json::Value::Array(preserved_guidance.clone());
+    }
     validate_materialized_policy(&policy.to_string())?;
+    let now = Utc::now().to_rfc3339();
     let changed = connection.execute(
         "UPDATE workspaces SET policy_json=?1,updated_at=?2 WHERE attempt_id=?3 AND state IN ('reserved','unknown','recovery_required')",
-        params![policy.to_string(),Utc::now().to_rfc3339(),attempt_id],
+        params![policy.to_string(),now,attempt_id],
     )?;
     if changed != 1 {
         bail!("workspace reservation changed before policy persistence")
     }
+    if !preserved_guidance.is_empty() {
+        connection.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES(?1,?2,'service','rework.guidance.preserved','attempt',?3,?4,?5)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+                attempt_id,
+                serde_json::json!({"files":preserved_guidance}).to_string(),
+                now
+            ],
+        )?;
+    }
     Ok(policy)
+}
+
+/// Blob hashes already read from immutable commits, keyed by repository root,
+/// revision and path.
+fn committed_hash_cache() -> &'static std::sync::Mutex<HashMap<String, Option<String>>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<String>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn committed_hashes(root: &Path, revision: &str, paths: &[&str]) -> Result<Vec<Option<String>>> {
+    let key = |path: &str| format!("{}\0{revision}\0{path}", root.display());
+    let mut cache = committed_hash_cache()
+        .lock()
+        .map_err(|_| anyhow!("committed file cache poisoned"))?;
+    let missing = paths
+        .iter()
+        .copied()
+        .filter(|path| !cache.contains_key(&key(path)))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        if cache.len() > 50_000 {
+            cache.clear();
+        }
+        let files = crate::workspace::committed_files(root, revision, &missing)?;
+        for (path, bytes) in missing.iter().zip(files) {
+            cache.insert(key(path), bytes.as_deref().map(sha256));
+        }
+    }
+    Ok(paths
+        .iter()
+        .map(|path| cache.get(&key(path)).cloned().flatten())
+        .collect())
+}
+
+/// Explains why a new task in this project would fail to get its workflow
+/// files, before the task is made Ready or started. A task workspace starts
+/// from the project's registered commit, so an activated file whose committed
+/// copy matches neither the activated bytes nor the approved original would be
+/// refused rather than overwritten; repeated uncommitted setup changes produce
+/// exactly that. Returns `None` only when the project is not ready, so the
+/// check does not apply; a ready project whose folder, commit or workflow
+/// files cannot be read is a problem, because nothing then proves a new task
+/// could start. `check_head` also requires the folder to still be at the
+/// registered commit.
+pub fn start_baseline_problem(
+    connection: &Connection,
+    project_id: &str,
+    check_head: bool,
+) -> Result<Option<String>> {
+    let row: Option<(String, String, String, Option<String>, Option<String>)> = connection
+        .query_row(
+            "SELECT p.repository_path,p.base_revision,s.manifest_hash,
+                    json_extract(r.config_json,'$.guidance'),s.setup_operation_id
+             FROM projects p JOIN trip_project_state s ON s.project_id=p.id
+             JOIN trip_config_revisions r ON r.id=s.active_config_revision_id
+             WHERE p.id=?1 AND s.readiness='ready' AND s.manifest_hash IS NOT NULL",
+            params![project_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((root, base, manifest_hash, guidance, setup_operation_id)) = row else {
+        return Ok(None);
+    };
+    let registered = PathBuf::from(root);
+    let Ok(root) = registered.canonicalize() else {
+        return Ok(Some(format!(
+            "LLMRelay cannot open the project folder {}. Restore the folder, or if the repository moved, enter its new path in Project settings and choose Validate and relink.",
+            registered.display()
+        )));
+    };
+    let short = |revision: &str| revision.chars().take(10).collect::<String>();
+    if check_head {
+        let Ok(head) = crate::workspace::head(&root) else {
+            return Ok(Some(format!(
+                "LLMRelay cannot read the current commit of the project folder {}. Check that the folder is still the project's Git repository, then choose Validate and relink in Project settings.",
+                root.display()
+            )));
+        };
+        if head != base {
+            return Ok(Some(format!(
+                "The project folder is now at commit {}, but LLMRelay starts new tasks from commit {}. Choose Validate and relink in Project settings to start new tasks from the current commit. Relinking is available when no task in this project is running.",
+                short(&head),
+                short(&base)
+            )));
+        }
+    }
+    // A missing commit would otherwise read as a commit without any of the
+    // files below, which never conflicts.
+    let base_readable = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["cat-file", "-e", &format!("{base}^{{commit}}")])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !base_readable {
+        return Ok(Some(format!(
+            "LLMRelay cannot read commit {}, which new tasks in this project start from, in the project folder {}. Check that the folder is still the project's Git repository, then choose Validate and relink in Project settings so new tasks start from its current commit.",
+            short(&base),
+            root.display()
+        )));
+    }
+    let manifest_path = root.join(".agents/trip-explorer/manifest.json");
+    let Some(observed_manifest) = hash_file(&manifest_path)? else {
+        return Ok(Some(
+            "The activated workflow files are missing from the project folder (.agents/trip-explorer/manifest.json). Restore them, or open Project setup to set up the project again.".into(),
+        ));
+    };
+    if observed_manifest != manifest_hash {
+        return Ok(Some(
+            "The activated workflow files in the project folder changed after setup (.agents/trip-explorer/manifest.json). Open Project setup to review the change. LLMRelay will not overwrite it.".into(),
+        ));
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    // Mirrors the destinations `materialize_project_policy` writes.
+    let mut expected: Vec<(String, String, bool)> = Vec::new();
+    for (relative, hash) in manifest
+        .get("base")
+        .and_then(|value| value.as_object())
+        .into_iter()
+        .flatten()
+    {
+        validate_relative(relative)?;
+        let hash = hash.as_str().unwrap_or_default().to_owned();
+        expected.push((
+            format!(".agents/trip-explorer/base/{PACKAGE_VERSION}/{relative}"),
+            hash.clone(),
+            false,
+        ));
+        if let Some(rest) = relative.strip_prefix("skills/") {
+            expected.push((format!(".agents/skills/{rest}"), hash, false));
+        }
+    }
+    for (relative, hash) in manifest
+        .get("bin")
+        .and_then(|value| value.as_object())
+        .into_iter()
+        .flatten()
+    {
+        validate_relative(relative)?;
+        expected.push((
+            format!(".agents/trip-explorer/bin/{relative}"),
+            hash.as_str().unwrap_or_default().to_owned(),
+            false,
+        ));
+    }
+    for (relative, hash_key) in [
+        (".agents/trip-explorer/config.json", "config_sha256"),
+        (".agents/trip-explorer/adapters.json", "adapters_sha256"),
+        (".agents/trip-explorer/preflight.json", "preflight_sha256"),
+    ] {
+        if let Some(hash) = manifest.get(hash_key).and_then(|value| value.as_str()) {
+            expected.push((relative.into(), hash.into(), false));
+        }
+    }
+    expected.push((
+        ".agents/trip-explorer/manifest.json".into(),
+        manifest_hash.clone(),
+        false,
+    ));
+    let guidance: Vec<String> = guidance
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()?
+        .unwrap_or_default();
+    for relative in guidance {
+        validate_relative(&relative)?;
+        if let Some(hash) = hash_file(&root.join(&relative))? {
+            expected.push((relative, hash, true));
+        }
+    }
+    let paths = expected
+        .iter()
+        .map(|(path, _, _)| path.as_str())
+        .collect::<Vec<_>>();
+    let Ok(committed) = committed_hashes(&root, &base, &paths) else {
+        return Ok(Some(format!(
+            "LLMRelay could not read the workflow files in commit {} of the project folder, so it cannot confirm that new tasks can start. Check that the folder's Git repository is readable, then try again.",
+            short(&base)
+        )));
+    };
+    let mut conflicts = Vec::new();
+    for ((relative, expected, guidance), committed) in expected.iter().zip(committed) {
+        let Some(committed) = committed else {
+            continue;
+        };
+        if &committed == expected {
+            continue;
+        }
+        // The activated installation may replace exactly its approved original.
+        let approved = !guidance
+            && connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM trip_frozen_install_files f
+                   JOIN trip_setup_operations so ON so.id=f.setup_operation_id
+                   WHERE so.id=?1 AND so.state='activated' AND so.install_authorized_at IS NOT NULL
+                     AND so.approved_source_set_hash=so.final_source_set_hash
+                     AND so.approved_preimages_hash IS NOT NULL
+                     AND f.relative_path=?2 AND f.source_hash=?3 AND f.preimage_hash=?4)",
+                params![setup_operation_id, relative, expected, committed],
+                |row| row.get::<_, bool>(0),
+            )?;
+        if !approved {
+            conflicts.push(relative.as_str());
+        }
+    }
+    if conflicts.is_empty() {
+        return Ok(None);
+    }
+    let listed = conflicts
+        .iter()
+        .take(5)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = conflicts.len().saturating_sub(5);
+    Ok(Some(format!(
+        "Files that new tasks need were changed after commit {} and are not committed: {listed}{}. New tasks start from that commit, so LLMRelay will not start them or overwrite these files. Commit or restore the changes, then choose Validate and relink in Project settings so new tasks start from the current commit.",
+        short(&base),
+        if more > 0 { format!(", and {more} more") } else { String::new() }
+    )))
 }
 
 fn activate_configuration(
@@ -12008,4 +13521,391 @@ fn git_exclude_journal_if_needed(
         bail!("repository-local TRIP ledger is not ignored and the exact local exclude addition is not approved")
     }
     Ok(Some(git_exclude_journal(root)?))
+}
+
+#[cfg(test)]
+mod read_only_profile_boundary_tests {
+    use super::*;
+
+    const NOW: &str = "2026-01-01T00:00:00Z";
+
+    fn role_json(effort: &str) -> String {
+        serde_json::to_string(&RoleOverride {
+            provider: Provider::Codex,
+            model: "gpt-5.6-sol".into(),
+            effort: effort.into(),
+        })
+        .unwrap()
+    }
+
+    /// One code-review attempt bound to reviewer settings revision 1, with
+    /// revision 2 activated afterwards against the same project configuration.
+    fn fixture() -> (Store, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "agenticjira-read-only-profile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&root.join("state.sqlite3")).unwrap();
+        let connection = store.lock().unwrap();
+        let base: serde_json::Value = serde_json::from_str(&role_json("high")).unwrap();
+        let settings =
+            serde_json::json!({"roles":{"code_reviewer":base},"trip_config_revision_id":"config"});
+        connection.execute(
+            "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,queue_paused,settings_json,created_at,updated_at)
+             VALUES('p','Project','/tmp/project','/tmp/identity','base',0,?1,?2,?2)",
+            params![settings.to_string(), NOW],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO trip_project_state(project_id,readiness,reason,detected_installation,detected_json,active_config_revision_id,workflow_id,package_version,upstream_source_hash,overlay_hash,manifest_hash,activated_at,updated_at)
+             VALUES('p','ready','fixture','compatible','{}','config',?1,?2,?3,?4,'manifest',?5,?5)",
+            params![WORKFLOW_ID, PACKAGE_VERSION, source_hash(), overlay_hash(), NOW],
+        ).unwrap();
+        let config = serde_json::json!({"roles":{"code_reviewer":{"profile":"review"}},"profiles":{"review":{"adapter":"codex-cli"}}});
+        let adapters = serde_json::json!({"adapters":{"codex-cli":{"provider":"codex","kind":"builtin-cli","capabilities":{"read_only":true,"resume":true}}}});
+        connection.execute(
+            "INSERT INTO trip_config_revisions(id,project_id,revision,state,config_json,adapters_json,preflight_json,verification_json,source_hash,overlay_hash,configuration_hash,created_at,activated_at)
+             VALUES('config','p',1,'activated',?1,?2,'[]','{}',?3,?4,'configuration',?5,?5)",
+            params![config.to_string(), adapters.to_string(), source_hash(), overlay_hash(), NOW],
+        ).unwrap();
+        connection.execute(
+            r#"INSERT INTO tasks(id,project_id,title,description,acceptance_criteria_json,lifecycle,created_at,updated_at)
+               VALUES('t','p','Task','Description','["criterion"]','in_progress',?1,?1)"#,
+            params![NOW],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,scope_hash,configuration_hash,workflow_version,workflow_hash,upstream_source_hash,overlay_hash,legacy_migration_required,created_at,updated_at,candidate_hash)
+             VALUES('a','t','context','code_review','base',1,'running','scope','configuration','v','h','u','o',0,?1,?1,'candidate')",
+            params![NOW],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance) VALUES('budget','a','code',3)",
+            [],
+        ).unwrap();
+        for (revision, effort) in [(1, "high"), (2, "medium")] {
+            connection.execute(
+                "INSERT INTO role_settings(id,task_id,role,revision,config_json,created_at) VALUES(?1,'t','code_reviewer',?2,?3,?4)",
+                params![format!("setting-{revision}"), revision, role_json(effort), NOW],
+            ).unwrap();
+        }
+        connection.execute(
+            "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,checked_at,proof_json)
+             VALUES('capability','codex','1.0','code_reviewer','read_only','key','supported',?1,'{\"proof\":1}')",
+            params![NOW],
+        ).unwrap();
+        let bound = task_profile_descriptor(&connection, "t", "code_reviewer", 1)
+            .unwrap()
+            .0;
+        connection.execute("INSERT INTO trip_attempt_profiles(attempt_id,role,settings_revision,activation_id,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at) VALUES('a','code_reviewer',1,NULL,?1,?2,?3,'config','configuration',?4,?5,'capability','key','proof',?6)",params![bound.source,bound.profile_json.to_string(),bound.profile_hash,bound.adapter_name,bound.adapter_hash,NOW]).unwrap();
+        let next = task_profile_descriptor(&connection, "t", "code_reviewer", 2)
+            .unwrap()
+            .0;
+        connection.execute("INSERT INTO trip_task_profile_activations(id,task_id,role,settings_id,settings_revision,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,activated_at) VALUES('activation-2','t','code_reviewer','setting-2',2,?1,?2,'config','configuration',?3,?4,'capability','key','proof-2',?5)",params![next.profile_json.to_string(),next.profile_hash,next.adapter_name,next.adapter_hash,NOW]).unwrap();
+        drop(connection);
+        (store, root)
+    }
+
+    fn bound_revision(store: &Store) -> (i64, Option<String>) {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT settings_revision,activation_id FROM trip_attempt_profiles WHERE attempt_id='a' AND role='code_reviewer'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    /// A previous reviewer generation and its session. An `exited` reviewer
+    /// has an exited session with a verified quiet process group unless
+    /// `quiescent` is false.
+    fn seed_reviewer_with(store: &Store, status: &str, quiescent: bool) {
+        let connection = store.lock().unwrap();
+        connection.execute(
+            "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+             VALUES('reviewer','a','code_reviewer','codex',1,1,?1,'f',?2,?2)",
+            params![status, NOW],
+        ).unwrap();
+        let exit = (status == "exited").then(|| {
+            if quiescent {
+                r#"{"process_group_quiescent":true}"#
+            } else {
+                r#"{"process_group_quiescent":false}"#
+            }
+        });
+        connection.execute(
+            "INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,exit_json,created_at,updated_at)
+             VALUES('reviewer-session','reviewer','codex',?1,'{}','fixture','e',?2,?3,?3)",
+            params![status, exit, NOW],
+        ).unwrap();
+    }
+
+    fn seed_reviewer(store: &Store, status: &str) {
+        seed_reviewer_with(store, status, true)
+    }
+
+    fn pending_reason(store: &Store) -> Option<&'static str> {
+        match read_only_profile_boundary(&store.lock().unwrap(), "a", RoleKind::CodeReviewer)
+            .unwrap()
+        {
+            ReadOnlyProfileBoundary::Pending { reason, .. } => Some(reason),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn every_unfinished_fact_keeps_the_old_reviewer_settings() {
+        let (store, _root) = fixture();
+        seed_reviewer_with(&store, "exited", false);
+        assert_eq!(
+            pending_reason(&store),
+            Some("role_process_not_proven_quiescent"),
+            "an exit without a verified quiet process group is not a boundary"
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET exit_json='{\"process_group_quiescent\":true}'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(pending_reason(&store), None);
+        let fences: &[(&str, &str, &str)] = &[
+            ("review_in_flight",
+             "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,prompt_hash,handoff_hash,delivery_state,created_at,updated_at) VALUES('fence','a','code','candidate','p','h','ambiguous','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+             "DELETE FROM review_requests WHERE id='fence'"),
+            ("switch_pending",
+             "INSERT INTO switch_intents(id,attempt_id,role,old_generation_id,requested_settings_revision,handoff_json,state,created_at,updated_at) VALUES('fence','a','code_reviewer','reviewer',2,'{}','stopping_old','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+             "DELETE FROM switch_intents WHERE id='fence'"),
+            ("permission_pending",
+             "INSERT INTO permission_requests(id,hook_invocation_nonce,connection_nonce,provider,project_id,task_id,attempt_id,session_id,role_generation_id,role,service_boot_id,native_session_id,cwd,policy_fingerprint,tool_name,input_digest,input_json,created_at,deadline_at,state,updated_at) VALUES('fence','h','c','codex','p','t','a','reviewer-session','reviewer','code_reviewer','boot','native','.','policy','shell','digest','{}','2026-01-01T00:00:00Z','9999-01-01T00:00:00Z','pending','2026-01-01T00:00:00Z')",
+             "DELETE FROM permission_requests WHERE id='fence'"),
+            ("input_control",
+             "INSERT INTO input_leases(session_id,lease_id_hash,owner_kind,owner_id,role_generation_id,process_identity_json,expires_at,created_at,updated_at) VALUES('reviewer-session','fence','human','viewer','reviewer','{}','9999-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+             "DELETE FROM input_leases WHERE lease_id_hash='fence'"),
+            ("control_pending",
+             "INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at) VALUES('fence','a','pause_now','requested',1,'{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+             "DELETE FROM controls WHERE id='fence'"),
+            ("restart_hold",
+             "INSERT INTO restart_candidates(session_id,attempt_id,task_id,source,state,reason,result_json,created_at,updated_at) VALUES('reviewer-session','a','t','planned_shutdown','queued_capacity','fixture','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+             "DELETE FROM restart_candidates WHERE session_id='reviewer-session'"),
+            ("recovery_open",
+             "INSERT INTO recovery_records(id,attempt_id,state,detail_json,created_at,updated_at) VALUES('fence','a','attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+             "DELETE FROM recovery_records WHERE id='fence'"),
+            ("conflicting_role_live",
+             "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at) VALUES('writer','a','implementer','claude',1,1,'running','f','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+             "DELETE FROM role_generations WHERE id='writer'"),
+            // Missing or malformed exit proof is never read as quiet.
+            ("role_process_not_proven_quiescent",
+             "UPDATE sessions SET exit_json=NULL WHERE id='reviewer-session'",
+             "UPDATE sessions SET exit_json='{\"process_group_quiescent\":true}' WHERE id='reviewer-session'"),
+            ("role_process_not_proven_quiescent",
+             "UPDATE sessions SET exit_json='{}' WHERE id='reviewer-session'",
+             "UPDATE sessions SET exit_json='{\"process_group_quiescent\":true}' WHERE id='reviewer-session'"),
+            ("role_process_not_proven_quiescent",
+             "UPDATE sessions SET exit_json='not json' WHERE id='reviewer-session'",
+             "UPDATE sessions SET exit_json='{\"process_group_quiescent\":true}' WHERE id='reviewer-session'"),
+            // Uncertain guidance stays a fence after its generation exited.
+            ("guidance_uncertain",
+             "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at) VALUES('fence','a','reviewer','body','delivery_unknown','2026-01-01T00:00:00Z')",
+             "DELETE FROM guidance_messages WHERE id='fence'"),
+            ("freeze_in_progress",
+             "INSERT INTO freeze_intents(id,attempt_id,kind,state,created_at,updated_at) VALUES('fence','a','candidate','capturing','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+             "DELETE FROM freeze_intents WHERE id='fence'"),
+            ("check_running",
+             "INSERT INTO check_runs(id,attempt_id,candidate_hash,executable,arguments_json,cwd,status,evidence_json,created_at) VALUES('fence','a','candidate','/usr/bin/true','[]','/tmp','running','{}','2026-01-01T00:00:00Z')",
+             "DELETE FROM check_runs WHERE id='fence'"),
+            ("check_running",
+             "INSERT INTO check_runs(id,attempt_id,candidate_hash,executable,arguments_json,cwd,status,evidence_json,created_at) VALUES('fence','a','candidate','/usr/bin/true','[]','/tmp','launch_ambiguous','{}','2026-01-01T00:00:00Z')",
+             "DELETE FROM check_runs WHERE id='fence'"),
+            ("attempt_not_current",
+             "UPDATE attempts SET status='needs_input' WHERE id='a'",
+             "UPDATE attempts SET status='running' WHERE id='a'"),
+            ("attempt_not_current",
+             "INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,scope_hash,configuration_hash,workflow_version,workflow_hash,upstream_source_hash,overlay_hash,legacy_migration_required,created_at,updated_at) VALUES('newer','t','context-newer','planning','base',1,'running','scope','configuration','v','h','u','o',0,'2026-02-01T00:00:00Z','2026-02-01T00:00:00Z')",
+             "DELETE FROM attempts WHERE id='newer'"),
+            ("attempt_not_current",
+             "UPDATE tasks SET lifecycle='done' WHERE id='t'",
+             "UPDATE tasks SET lifecycle='in_progress' WHERE id='t'"),
+        ];
+        for (reason, apply, revert) in fences {
+            store.lock().unwrap().execute_batch(apply).unwrap();
+            assert_eq!(pending_reason(&store), Some(*reason));
+            store.lock().unwrap().execute_batch(revert).unwrap();
+            assert_eq!(pending_reason(&store), None, "{reason} was not reverted");
+        }
+        // Only a review step moves the code reviewer.
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE attempts SET phase='implementation'", [])
+            .unwrap();
+        assert_eq!(pending_reason(&store), Some("phase_mismatch"));
+    }
+
+    #[test]
+    fn a_running_reviewer_keeps_its_settings_and_no_request_is_created() {
+        let (store, root) = fixture();
+        seed_reviewer(&store, "running");
+        let boundary =
+            read_only_profile_boundary(&store.lock().unwrap(), "a", RoleKind::CodeReviewer)
+                .unwrap();
+        assert!(matches!(
+            boundary,
+            ReadOnlyProfileBoundary::Pending {
+                needs_person: false,
+                ..
+            }
+        ));
+        let waiting = crate::coordinator::review_decision_for_tests(&store.lock().unwrap(), "a");
+        assert_eq!(
+            waiting.reason_code,
+            "workflow.reviewer_profile_change_pending"
+        );
+        assert!(waiting
+            .primary_blocker
+            .as_ref()
+            .and_then(|blocker| blocker.message.as_deref())
+            .is_some_and(|message| message.contains("Code reviewer settings changed")));
+        let reviews = crate::review::ReviewService::new(store.clone(), root.join("artifacts"));
+        let error = reviews
+            .reserve_request(
+                "a",
+                "code",
+                "Review it",
+                serde_json::json!({"attempt_id":"a"}),
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reviewer profile change pending"),
+            "{error:#}"
+        );
+        let requests: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM review_requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(requests, 0);
+        assert_eq!(bound_revision(&store), (1, None));
+    }
+
+    #[test]
+    fn the_next_review_moves_to_the_newest_activation_exactly_once() {
+        let (store, root) = fixture();
+        seed_reviewer(&store, "exited");
+        let reviews = crate::review::ReviewService::new(store.clone(), root.join("artifacts"));
+        let request = reviews
+            .reserve_request(
+                "a",
+                "code",
+                "Review it",
+                serde_json::json!({"attempt_id":"a"}),
+            )
+            .unwrap();
+        assert_eq!(request.state, "reserved");
+        assert_eq!(bound_revision(&store), (2, Some("activation-2".into())));
+        let connection = store.lock().unwrap();
+        let recorded: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE event_code='task.profile.materialized_at_safe_boundary'
+               AND json_extract(detail_json,'$.from_settings_revision')=1 AND json_extract(detail_json,'$.to_settings_revision')=2",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(recorded, 1);
+        assert!(matches!(
+            read_only_profile_boundary(&connection, "a", RoleKind::CodeReviewer).unwrap(),
+            ReadOnlyProfileBoundary::Current
+        ));
+        drop(connection);
+        // Reserving the same request again reuses it without another change.
+        let again = reviews
+            .reserve_request(
+                "a",
+                "code",
+                "Review it",
+                serde_json::json!({"attempt_id":"a"}),
+            )
+            .unwrap();
+        assert_eq!(again.request_id, request.request_id);
+        let connection = store.lock().unwrap();
+        let recorded: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE event_code='task.profile.materialized_at_safe_boundary'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(recorded, 1);
+        connection.execute(
+            "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+             VALUES('next','a','code_reviewer','codex',2,2,'launch_reserved','f',?1,?1)",
+            params![NOW],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+             VALUES('next-session','next','codex','launch_reserved','{}','fixture','e',?1,?1)",
+            params![NOW],
+        ).unwrap();
+        drop(connection);
+        // The lineage guard refuses a launch bound to the replaced revision.
+        assert!(reviews
+            .bind_launch_intent(&request.request_id, "next-session", "next", 1)
+            .is_err());
+        reviews
+            .bind_launch_intent(&request.request_id, "next-session", "next", 2)
+            .unwrap();
+    }
+
+    #[test]
+    fn stale_evidence_for_the_new_settings_needs_a_person() {
+        let (store, _root) = fixture();
+        let connection = store.lock().unwrap();
+        connection.execute(
+            "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,checked_at,proof_json)
+             VALUES('newer','codex','1.0','code_reviewer','read_only','other-key','supported','2026-01-02T00:00:00Z','{\"proof\":2}')",
+            [],
+        ).unwrap();
+        assert!(matches!(
+            read_only_profile_boundary(&connection, "a", RoleKind::CodeReviewer).unwrap(),
+            ReadOnlyProfileBoundary::Pending {
+                needs_person: true,
+                ..
+            }
+        ));
+        let decision = crate::coordinator::review_decision_for_tests(&connection, "a");
+        assert_eq!(
+            decision.reason_code,
+            "workflow.reviewer_profile_change_pending"
+        );
+        let next = decision
+            .next_action
+            .expect("a person gets an exact destination");
+        assert_eq!(next.operation, "verify_task_profile");
+        assert_eq!(next.binding.role, Some(RoleKind::CodeReviewer));
+        assert_eq!(next.binding.settings_revision, Some(2));
+        assert_eq!(next.binding.task_id.as_deref(), Some("t"));
+        // Writers keep the explicit switch flow.
+        assert!(matches!(
+            read_only_profile_boundary(&connection, "a", RoleKind::Implementer).unwrap(),
+            ReadOnlyProfileBoundary::Current
+        ));
+        // An activation made for another project configuration does not apply;
+        // the attempt keeps the configuration it was reviewed with.
+        connection.execute(
+            "INSERT INTO trip_config_revisions(id,project_id,revision,state,config_json,adapters_json,preflight_json,verification_json,source_hash,overlay_hash,configuration_hash,created_at)
+             SELECT 'other',project_id,2,'proposed',config_json,adapters_json,preflight_json,verification_json,source_hash,overlay_hash,'other-configuration',created_at
+             FROM trip_config_revisions WHERE id='config'",
+            [],
+        ).unwrap();
+        connection
+            .execute(
+                "UPDATE trip_task_profile_activations SET project_config_revision_id='other'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            read_only_profile_boundary(&connection, "a", RoleKind::CodeReviewer).unwrap(),
+            ReadOnlyProfileBoundary::Current
+        ));
+    }
 }

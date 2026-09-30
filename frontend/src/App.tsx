@@ -28,6 +28,7 @@ import type {
   CmuxSessionSurface,
   Project,
   Task,
+  TaskAction,
   TripSetupState,
 } from "./types";
 import {
@@ -38,13 +39,22 @@ import { ProjectPicker } from "./components/ProjectPicker";
 import { ProjectSettings } from "./components/ProjectSettings";
 import { TaskBoard } from "./components/TaskBoard";
 import { TaskForm } from "./components/TaskForm";
-import { TaskDetail } from "./components/TaskDetail";
+import { TaskDetail, type TaskTab } from "./components/TaskDetail";
+import { pendingApprovalCount } from "./components/ApprovalInbox";
 import { Workspace } from "./components/Workspace";
 import { History } from "./components/History";
 import { Recipes } from "./components/Recipes";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { CompatibilityDetails, RoleSettings } from "./components/RoleSettings";
 type Page = "workspace" | "board" | "recipes" | "roles" | "history" | "diagnostics";
+const pages: Array<{ id: Page; label: string; icon: string }> = [
+  { id: "workspace", label: "Workspace", icon: "◫" },
+  { id: "board", label: "Board", icon: "▦" },
+  { id: "recipes", label: "Recipes", icon: "▤" },
+  { id: "roles", label: "Projects", icon: "▣" },
+  { id: "history", label: "History", icon: "◴" },
+  { id: "diagnostics", label: "Diagnostics", icon: "⚙" },
+];
 const stateLabel = (value: string) => {
   const words = value.replaceAll("_", " ");
   return words[0].toUpperCase() + words.slice(1);
@@ -148,6 +158,10 @@ export function App() {
   const [lastSuccessfulAt, setLastSuccessfulAt] = useState("");
   const [attentionFocus, setAttentionFocus] = useState<AttentionTarget>();
   const [navigationNotice, setNavigationNotice] = useState("");
+  const [menuOpen, setMenuOpen] = useState(false);
+  // Each task keeps the tab it was last shown with while the app is open.
+  const [taskTabs, setTaskTabs] = useState<Record<string, TaskTab>>({});
+  const pendingSection = useRef<string | undefined>(undefined);
   const pendingFocus = useRef<
     { title: string; target: AttentionTarget } | undefined
   >(undefined);
@@ -247,6 +261,14 @@ export function App() {
     void refresh();
   });
   useEffect(() => {
+    const section = pendingSection.current;
+    if (!section) return;
+    pendingSection.current = undefined;
+    const element = document.getElementById(section);
+    element?.scrollIntoView({ block: "start" });
+    element?.focus({ preventScroll: true });
+  });
+  useEffect(() => {
     localStorage.setItem("agenticjira.page", page);
   }, [page]);
   useEffect(() => {
@@ -285,9 +307,22 @@ export function App() {
   );
   const nav = (value: Page) => {
     setPage(value);
+    setMenuOpen(false);
     if (value === "recipes") {
       setSelectedId(undefined);
       setForm(undefined);
+    }
+  };
+  // Approvals and attention are reachable from every page without scrolling.
+  const openWorkspaceSection = (section: string) => {
+    setPage("workspace");
+    setMenuOpen(false);
+    pendingSection.current = section;
+    if (page === "workspace") {
+      const element = document.getElementById(section);
+      element?.scrollIntoView({ block: "start" });
+      element?.focus({ preventScroll: true });
+      pendingSection.current = undefined;
     }
   };
   const openSetup = (projectId: string) => {
@@ -318,6 +353,7 @@ export function App() {
       return `${item.title} changed before it could open: ${problem} The latest state was requested; nothing was executed.`;
     }
     if (
+      "project_id" in target &&
       latest.projects.some((candidate) => candidate.id === target.project_id)
     ) {
       setProject(target.project_id);
@@ -332,13 +368,42 @@ export function App() {
         setPage("workspace");
         setSelectedId(undefined);
         break;
+      case "diagnostics":
+        setPage("diagnostics");
+        setSelectedId(undefined);
+        break;
       default:
+        // Live output and Agent settings are on the Activity tab; every
+        // other exact destination is on Overview.
+        setTaskTabs((current) => ({
+          ...current,
+          [target.task_id]: item.action?.kind === "open_agent_output" ||
+              target.kind === "role_settings"
+            ? "activity"
+            : "overview",
+        }));
         setSelectedId(target.task_id);
     }
     // A fresh object re-renders, and so re-focuses, a repeated click.
     setAttentionFocus({ ...target });
     pendingFocus.current = { title: item.title, target };
     return undefined;
+  };
+  // A card or header action opens the same exact item the inbox would.
+  const openTaskAction = (action: TaskAction, itemId = action.item_id) => {
+    const latest = live.current?.latest() ?? state;
+    const item = action.item_ids.includes(itemId)
+      ? latest.attention.find((candidate) => candidate.id === itemId)
+      : undefined;
+    if (!item?.target) {
+      void refresh();
+      setNavigationNotice(
+        "That task's next step changed before it could open. The latest state was requested; nothing was executed.",
+      );
+      return;
+    }
+    const problem = navigateAttention(item, item.target);
+    if (problem) setNavigationNotice(problem);
   };
   const queue = async () => {
     const current = state.projects.find((v) => v.id === project);
@@ -364,93 +429,121 @@ export function App() {
       </main>
     );
   }
+  const projectTasks = project
+    ? state.tasks.filter((task) => task.project_id === project)
+    : state.tasks;
+  const attentionCount = state.attention.filter((item) =>
+    !item.target || !project || !("project_id" in item.target) ||
+    item.target.project_id === project
+  ).length;
+  const approvalCount = pendingApprovalCount(state);
+  const dialogOpen = !!selected;
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
+    <div className={`app-shell${menuOpen ? " menu-open" : ""}`}>
+      <aside className="sidebar" inert={dialogOpen}>
         <div className="brand">
-          <span className="logo">LR</span>
+          <span className="logo" aria-hidden="true">LR</span>
           <div>
             <strong>LLMRelay</strong>
             <small>Local workspace</small>
           </div>
+          <button
+            className="menu-toggle"
+            aria-expanded={menuOpen}
+            aria-controls="sidebar-menu"
+            onClick={() => setMenuOpen((open) => !open)}
+          >
+            {menuOpen ? "Close menu" : "Menu"}
+          </button>
         </div>
-        <nav aria-label="Main navigation">
-          {(["workspace", "board", "recipes", "roles", "history", "diagnostics"] as Page[])
-            .map((item) => (
+        <div className="sidebar-menu" id="sidebar-menu">
+          <nav aria-label="Main navigation">
+            {pages.map((item) => (
               <button
-                key={item}
-                className={page === item ? "active" : ""}
-                onClick={() => nav(item)}
+                key={item.id}
+                className={page === item.id ? "active" : ""}
+                aria-current={page === item.id ? "page" : undefined}
+                onClick={() => nav(item.id)}
               >
-                <span>
-                  {item === "workspace"
-                    ? "◫"
-                    : item === "board"
-                    ? "▦"
-                    : item === "recipes"
-                    ? "▤"
-                    : item === "roles"
-                    ? "▣"
-                    : item === "history"
-                    ? "◴"
-                    : "⚙"}
-                </span>
-                {item === "roles"
-                  ? "Projects"
-                  : item[0].toUpperCase() + item.slice(1)}
+                <span aria-hidden="true">{item.icon}</span>
+                {item.label}
+                {item.id === "workspace" && attentionCount + approvalCount > 0 && (
+                  <span
+                    className="nav-badge"
+                    aria-label={`${attentionCount + approvalCount} waiting for you`}
+                  >
+                    {attentionCount + approvalCount}
+                  </span>
+                )}
               </button>
             ))}
-        </nav>
-        <ProjectPicker
-          projects={state.projects}
-          selected={project}
-          onSelect={setProject}
-          onChanged={refresh}
-          onAdded={openSetup}
-        />
-        <footer
-          title={lastSuccessfulAt || state.generated_at
-            ? `Last successful update: ${
-              new Date(lastSuccessfulAt || state.generated_at).toLocaleString()
-            }`
-            : undefined}
-        >
-          <span
-            className={`status ${connection.online ? "observed" : "offline"}`}
+          </nav>
+          <ProjectPicker
+            projects={state.projects}
+            selected={project}
+            onSelect={setProject}
+            onChanged={refresh}
+            onAdded={openSetup}
           />
-          {connection.online ? "Local service" : "Service offline"}
-          <br />
-          <small>
-            {connection.online
-              ? "Connected"
-              : lastSuccessfulAt || state.generated_at
-              ? "Showing last successful state"
-              : "State unavailable"}
-          </small>
-          {!connection.online && (
-            <button
-              className="link-button"
-              disabled={connection.refreshing}
-              onClick={() => void refresh()}
-            >
-              {connection.refreshing ? "Reconnecting…" : "Retry connection"}
-            </button>
-          )}
-        </footer>
+          <footer
+            title={lastSuccessfulAt || state.generated_at
+              ? `Last successful update: ${
+                new Date(lastSuccessfulAt || state.generated_at).toLocaleString()
+              }`
+              : undefined}
+          >
+            <span
+              aria-hidden="true"
+              className={`status ${connection.online ? "observed" : "offline"}`}
+            />
+            {connection.online ? "Local service" : "Service offline"}
+            <br />
+            <small>
+              {connection.online
+                ? "Connected"
+                : lastSuccessfulAt || state.generated_at
+                ? "Showing last successful state"
+                : "State unavailable"}
+            </small>
+            {!connection.online && (
+              <button
+                className="link-button"
+                disabled={connection.refreshing}
+                onClick={() => void refresh()}
+              >
+                {connection.refreshing ? "Reconnecting…" : "Retry connection"}
+              </button>
+            )}
+          </footer>
+        </div>
       </aside>
-      <main className="content">
+      <main className="content" inert={dialogOpen}>
         <header className="topbar">
-          <div>
+          <div className="topbar-title">
             {state.projects.find((v) => v.id === project)?.display_name ||
               "All projects"}
             <small>
-              {tasks.filter((t) => t.lifecycle === "in_progress").length}{" "}
-              in progress · {state.attention.filter((item) =>
-                !item.target || !project || item.target.project_id === project
-              ).length} need attention
+              {projectTasks.filter((t) =>
+                !t.archived && !["done", "cancelled"].includes(t.lifecycle)
+              ).length} active tasks
             </small>
           </div>
-          <div className="button-row">
+          <div className="waiting-links" aria-label="Waiting for you">
+            <button
+              className={attentionCount ? "waiting-link has-items" : "waiting-link"}
+              onClick={() => openWorkspaceSection("workspace-attention")}
+            >
+              Needs your attention
+              <span className="count">{attentionCount}</span>
+            </button>
+            <button
+              className={approvalCount ? "waiting-link has-items" : "waiting-link"}
+              onClick={() => openWorkspaceSection("workspace-approvals")}
+            >
+              Approvals<span className="count">{approvalCount}</span>
+            </button>
+          </div>
+          <div className="button-row topbar-actions">
             <button onClick={queue} disabled={!project}>
               {state.projects.find((v) => v.id === project)?.queue_paused
                 ? "Resume pickup"
@@ -500,6 +593,7 @@ export function App() {
             onChanged={refresh}
             onOpenSetup={openSetup}
             onNavigateAttention={navigateAttention}
+            onTaskAction={openTaskAction}
             onViewCmuxSession={viewCmuxSession}
             onSetCmuxKeyboardControl={setCmuxSessionKeyboardControl}
             onDiscardCmuxSurface={discardCmuxSessionSurface}
@@ -508,17 +602,20 @@ export function App() {
           <>
             <header className="page-heading">
               <div>
-                <span className="eyebrow">Task-only workflow</span>
-                <h1>Task board</h1>
+                <span className="eyebrow">Board</span>
+                <h1>Tasks</h1>
                 <p>
-                  Draft, queue, execute, review, accept, and retain each task’s
-                  evidence.
+                  Drafts, queued and running work, and tasks waiting for your
+                  review. Completed tasks are kept separately.
                 </p>
               </div>
             </header>
             <TaskBoard
               tasks={tasks}
               projects={state.projects}
+              sessions={state.active_sessions}
+              taskActions={state.task_actions}
+              onTaskAction={openTaskAction}
               onOpen={openTask}
               onEdit={(task) => {
                 setEditing(task);
@@ -559,10 +656,11 @@ export function App() {
             <header className="page-heading">
               <div>
                 <span className="eyebrow">Projects and agents</span>
-                <h1>Project control center</h1>
+                <h1>Projects</h1>
                 <p>
-                  Requested revisions stay distinct from effective and running
-                  generations.
+                  Project setup, verification checks and each task's agent
+                  settings. A requested change takes effect only after it is
+                  verified and applied.
                 </p>
               </div>
             </header>
@@ -611,25 +709,31 @@ export function App() {
             ))}
             {!tasks.length && (
               <p className="empty">
-                Create a task to inspect its host manager and five delegated
-                roles.
+                Create a task to see and change its six agent roles.
               </p>
             )}
             <section className="panel capabilities">
-              <h3>Capability evidence</h3>
+              <h3>Agent verification records</h3>
               {state.capabilities.map((item, index) => (
                 <div key={index}>
-                  <strong>{String(item.provider)} · {String(item.role)}</strong>
+                  <strong>
+                    {item.provider === "claude" ? "Claude" : "Codex"} ·{" "}
+                    {stateLabel(String(item.role))}
+                  </strong>
                   <span className={`badge ${item.status}`}>
-                    Production {stateLabel(item.status)}
+                    {item.status === "supported"
+                      ? "Verified"
+                      : stateLabel(item.status)}
                   </span>
                   <small>
-                    Validation observation: {stateLabel(item.mode)}
+                    {stateLabel(item.mode)}
                     {item.version ? ` · ${item.version}` : ""} ·{" "}
-                    {item.checked_at || "never checked"}
+                    {item.checked_at
+                      ? `checked ${new Date(item.checked_at).toLocaleString()}`
+                      : "never checked"}
                   </small>
                   {item.gaps.length > 0 && (
-                    <small>Evidence gaps: {item.gaps.join(" · ")}</small>
+                    <small>Missing evidence: {item.gaps.join(" · ")}</small>
                   )}
                   <CompatibilityDetails compatibility={item.compatibility} />
                 </div>
@@ -644,22 +748,45 @@ export function App() {
             onOpen={openTask}
             onChanged={refresh}
           />
-        )} {page === "diagnostics" && <DiagnosticsPanel capabilities={state.capabilities} setups={state.trip_setups || []} />}
+        )} {page === "diagnostics" && (
+          <div data-attention-target="diagnostics" tabIndex={-1}>
+            <DiagnosticsPanel
+              capabilities={state.capabilities}
+              setups={state.trip_setups || []}
+              attention={state.attention}
+            />
+          </div>
+        )}
       </main>
       {selected && (
         <TaskDetail
+          key={selected.id}
           task={selected}
           state={state}
           selectedRecoveryId={attentionFocus?.kind === "recovery_record" &&
               attentionFocus.task_id === selected.id
             ? attentionFocus.recovery_id
             : undefined}
+          settingsFocus={attentionFocus?.kind === "role_settings" &&
+              attentionFocus.task_id === selected.id
+            ? attentionFocus
+            : undefined}
+          tab={taskTabs[selected.id] || "overview"}
+          onTabChange={(tab) =>
+            setTaskTabs((current) => ({ ...current, [selected.id]: tab }))}
           onClose={() => {
             setSelectedId(undefined);
             setAttentionFocus(undefined);
           }}
           onChanged={refresh}
-          onOpenSetup={openSetup}
+          onOpenSetup={(projectId) => {
+            setSelectedId(undefined);
+            openSetup(projectId);
+          }}
+          onTaskAction={openTaskAction}
+          onViewCmuxSession={viewCmuxSession}
+          onSetCmuxKeyboardControl={setCmuxSessionKeyboardControl}
+          onDiscardCmuxSurface={discardCmuxSessionSurface}
         />
       )} {form && (
         <TaskForm

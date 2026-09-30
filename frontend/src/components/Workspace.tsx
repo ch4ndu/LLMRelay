@@ -1,42 +1,35 @@
-import { terminalGuidance } from "../cmuxRouting";
 import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
-import {
-  type CSSProperties,
-  type PointerEvent as ReactPointerEvent,
-  useEffect,
-  useRef,
-  useState,
-} from "react";
+import { useRef, useState } from "react";
 import { command, getRestartPreview, operation, operationId } from "../api";
 import {
-  cmuxNewestSurface,
-  cmuxOutcomeWithDurableSurface,
-  cmuxRouteLabel,
-  cmuxSurfacePresentation,
-  cmuxViewOutcomeFromSurface,
-  recordedOutputText,
-} from "../cmuxRouting";
-import type {
-  AppState,
-  AttentionItem,
-  AttentionTarget,
-  CmuxKeyboardControlAction,
-  CmuxKeyboardControlOutcome,
-  CmuxSessionSurface,
-  CmuxViewOutcome,
-  RestartPreview,
-  RestartResumeResult,
-  Task,
+  type AppState,
+  type AttentionItem,
+  type AttentionTarget,
+  type CmuxKeyboardControlAction,
+  type CmuxKeyboardControlOutcome,
+  type CmuxSessionSurface,
+  type CmuxViewOutcome,
+  type ContinuationActionKind,
+  type RestartPreview,
+  type RestartResumeResult,
+  roleLabel,
+  type Task,
+  type TaskAction,
 } from "../types";
 import { ActivityTimeline } from "./ActivityTimeline";
-import { ApprovalInbox } from "./ApprovalInbox";
+import { ApprovalInbox, pendingApprovalCount } from "./ApprovalInbox";
 import { AttentionInbox } from "./AttentionInbox";
 import { ResourceStatus } from "./ResourceStatus";
-import { SessionTree } from "./SessionTree";
+import { SessionTree, useSessionAccess } from "./SessionTree";
+import { TaskSections } from "./TaskBoard";
 
-const savedSideWidth = () => {
-  const value = Number(localStorage.getItem("agenticjira.workspace.sideWidth"));
-  return Number.isFinite(value) ? Math.min(520, Math.max(260, value)) : 330;
+const settledRestartStates = ["resumed", "released_fresh_dispatch", "cancelled"];
+
+/** The restart steps you can take, named by what the service projects. */
+const restartStepLabels: Partial<Record<ContinuationActionKind, string>> = {
+  exact_resume: "Can resume the same conversation",
+  continue_fresh_dispatch: "Can continue with a new session",
+  recover_ownership: "Needs a recovery check before it can continue",
 };
 
 export function Workspace(
@@ -46,6 +39,7 @@ export function Workspace(
     onChanged,
     onOpenSetup = () => {},
     onNavigateAttention = () => undefined,
+    onTaskAction,
     onViewCmuxSession = async () => {
       throw new Error("persistent cmux presentation is not available");
     },
@@ -64,6 +58,7 @@ export function Workspace(
       item: AttentionItem,
       target: AttentionTarget,
     ) => string | undefined;
+    onTaskAction?: (action: TaskAction) => void;
     onViewCmuxSession?: (sessionId: string) => Promise<CmuxViewOutcome>;
     onSetCmuxKeyboardControl?: (
       sessionId: string,
@@ -77,7 +72,6 @@ export function Workspace(
     ) => Promise<CmuxViewOutcome>;
   },
 ) {
-  const [sideWidth, setSideWidth] = useState(savedSideWidth);
   const [restoreBusy, setRestoreBusy] = useState(false);
   const [autoResumeError, setAutoResumeError] = useState("");
   const [preview, setPreview] = useState<RestartPreview>();
@@ -87,52 +81,20 @@ export function Workspace(
   const [resumeBusy, setResumeBusy] = useState(false);
   const [resumeError, setResumeError] = useState("");
   const resumeOperation = useRef<string | undefined>(undefined);
-  const [routes, setRoutes] = useState<Record<string, CmuxViewOutcome>>({});
-  const [discardingRoutes, setDiscardingRoutes] = useState<
-    Record<string, boolean>
-  >({});
-  const discardOperations = useRef<
-    Record<
-      string,
-      { surfaceRouteId: string; sessionId: string; operationId: string }
-    >
-  >({});
-  const durableSurfaces = useRef<Record<string, CmuxSessionSurface>>({});
-  for (const session of state.active_sessions) {
-    if (!session.cmux_surface) continue;
-    const latest = cmuxNewestSurface(
-      durableSurfaces.current[session.id],
-      session.cmux_surface,
-    );
-    if (latest) durableSurfaces.current[session.id] = latest;
-  }
-  const durableSurfaceForSession = (sessionId: string) =>
-    durableSurfaces.current[sessionId] ||
-    state.active_sessions.find((session) => session.id === sessionId)
-      ?.cmux_surface;
-  const commitRoute = (sessionId: string, outcome: CmuxViewOutcome) => {
-    const committed = cmuxOutcomeWithDurableSurface(
-      outcome,
-      durableSurfaceForSession(sessionId),
-    ) || outcome;
-    setRoutes((current) => ({ ...current, [sessionId]: committed }));
-    return committed;
-  };
-
-  useEffect(() => {
-    const keys = Array.from(
-      { length: localStorage.length },
-      (_, index) => localStorage.key(index),
-    );
-    for (const key of keys) {
-      if (typeof key === "string" && key.startsWith("agenticjira.terminal.")) {
-        localStorage.removeItem(key);
-      }
-    }
-  }, []);
-  useEffect(() => {
-    localStorage.setItem("agenticjira.workspace.sideWidth", String(sideWidth));
-  }, [sideWidth]);
+  const access = useSessionAccess(state.active_sessions, {
+    onView: onViewCmuxSession,
+    onSetKeyboardControl: onSetCmuxKeyboardControl,
+    onDiscard: onDiscardCmuxSurface,
+    onChanged,
+  });
+  const taskById = (taskId: string) =>
+    state.tasks.find((task) => task.id === taskId);
+  const liveSessions = state.active_sessions.filter((session) =>
+    !["exited", "launch_failed"].includes(session.status)
+  );
+  const pastSessions = state.active_sessions.filter((session) =>
+    ["exited", "launch_failed"].includes(session.status)
+  );
 
   const restartCandidateRows = state.restart_candidates.map((candidate) => {
     const action = state.continuation_actions.find((candidateAction) =>
@@ -144,174 +106,25 @@ export function Workspace(
       candidateTask.id === candidate.task_id &&
       candidateTask.active_attempt?.id === candidate.attempt_id
     );
-    return { action, candidate, task };
+    const session = state.active_sessions.find((item) =>
+      item.id === candidate.session_id
+    );
+    return { action, candidate, task, session };
   });
-  const adjustSide = (value: number) =>
-    setSideWidth(Math.min(520, Math.max(260, value)));
-  const startResize = (event: ReactPointerEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    const startX = event.clientX;
-    const startWidth = sideWidth;
-    const move = (next: PointerEvent) =>
-      adjustSide(startWidth + startX - next.clientX);
-    const stop = () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", stop);
-      window.removeEventListener("pointercancel", stop);
-    };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", stop);
-    window.addEventListener("pointercancel", stop);
-  };
-
-  const openCmuxSession = async (sessionId: string) => {
-    const key = sessionId;
-    setRoutes((current) => ({
-      ...current,
-      [key]: {
-        state: "pending",
-        message: "Reserving the exact persistent cmux presentation…",
-        retry_available: false,
-      },
-    }));
-    try {
-      const result = commitRoute(
-        key,
-        cmuxViewOutcomeFromSurface(
-          await onViewCmuxSession(sessionId),
-        ),
-      );
-      onChanged();
-      return result;
-    } catch (cause) {
-      const result: CmuxViewOutcome = {
-        state: "failed",
-        message: cause instanceof Error ? cause.message : String(cause),
-        retry_available: true,
-      };
-      return commitRoute(key, result);
-    }
-  };
-
-  const routeSurface = (sessionId: string) =>
-    cmuxOutcomeWithDurableSurface(
-      routes[sessionId],
-      durableSurfaceForSession(sessionId),
-    )?.surface || durableSurfaceForSession(sessionId);
-
-  const setKeyboardControl = async (
-    sessionId: string,
-    surface: CmuxSessionSurface,
-    action: CmuxKeyboardControlAction,
-  ) => {
-    const currentSurface = cmuxNewestSurface(
-      durableSurfaceForSession(sessionId),
-      surface,
-    ) || surface;
-    const presentation = cmuxSurfacePresentation(currentSurface);
-    if (
-      action === "acquire"
-        ? !presentation.takeAvailable
-        : !presentation.releaseAvailable
-    ) return;
-    setRoutes((current) => ({
-      ...current,
-      [sessionId]: {
-        state: "pending",
-        message: action === "acquire"
-          ? "Keyboard control is pending on the existing authenticated cmux attachment…"
-          : "Keyboard-control release is pending on the existing authenticated cmux attachment…",
-        retry_available: false,
-        surface: currentSurface,
-      },
-    }));
-    try {
-      const result = await onSetCmuxKeyboardControl(
-        sessionId,
-        currentSurface,
-        action,
-      );
-      const outcome = commitRoute(
-        sessionId,
-        cmuxViewOutcomeFromSurface({
-          state: result.state === "retired" ? "failed" : result.state,
-          message: result.message,
-          retry_available: result.state !== "retired",
-          surface: result.surface,
-        }),
-      );
-      onChanged();
-      return outcome;
-    } catch (cause) {
-      const outcome = commitRoute(
-        sessionId,
-        cmuxViewOutcomeFromSurface({
-          state: "failed",
-          message: cause instanceof Error ? cause.message : String(cause),
-          retry_available: true,
-          surface: currentSurface,
-        }),
-      );
-      return outcome;
-    }
-  };
-
-  const takeKeyboardControl = async (sessionId: string) => {
-    const viewed = await openCmuxSession(sessionId);
-    const surface = viewed.surface || routeSurface(sessionId);
-    if (!surface || !cmuxSurfacePresentation(surface).takeAvailable) return;
-    await setKeyboardControl(sessionId, surface, "acquire");
-  };
-
-  const releaseKeyboardControl = async (sessionId: string) => {
-    const surface = routeSurface(sessionId);
-    if (!surface) return;
-    await setKeyboardControl(sessionId, surface, "release");
-  };
-
-  const discardUnknownRoute = async (
-    key: string,
-    sessionId: string,
-    route: CmuxViewOutcome,
-  ) => {
-    const currentRoute = cmuxOutcomeWithDurableSurface(
-      route,
-      durableSurfaceForSession(sessionId),
-    ) || route;
-    if (
-      !currentRoute.surface ||
-      !cmuxSurfacePresentation(currentRoute.surface).discardAvailable
-    ) return;
-    const prior = discardOperations.current[key];
-    const retry = prior?.surfaceRouteId === currentRoute.surface.id &&
-        prior.sessionId === sessionId
-      ? prior
-      : {
-        surfaceRouteId: currentRoute.surface.id,
-        sessionId,
-        operationId: operationId(),
-      };
-    discardOperations.current[key] = retry;
-    setDiscardingRoutes((current) => ({ ...current, [key]: true }));
-    try {
-      const result = await onDiscardCmuxSurface(
-        sessionId,
-        retry.surfaceRouteId,
-        retry.operationId,
-      );
-      delete discardOperations.current[key];
-      commitRoute(key, cmuxViewOutcomeFromSurface(result));
-      onChanged();
-    } catch (cause) {
-      commitRoute(key, {
-        ...currentRoute,
-        message: cause instanceof Error ? cause.message : String(cause),
-      });
-    } finally {
-      setDiscardingRoutes((current) => ({ ...current, [key]: false }));
-    }
-  };
+  // Urgent only when the row still belongs to an unfinished task's current
+  // attempt and the service offers an enabled step you can take for exactly
+  // that session; waits, reconciliation and terminal rows are history.
+  const currentRestarts = restartCandidateRows.filter(({ action, candidate, task }) =>
+    !settledRestartStates.includes(candidate.state) && !!task && !task.archived &&
+    !["done", "cancelled"].includes(task.lifecycle) &&
+    !!action?.enabled && action.kind in restartStepLabels
+  );
+  const earlierRestarts = restartCandidateRows.filter((row) =>
+    !currentRestarts.includes(row)
+  );
+  const bulkResumable = currentRestarts.some(({ action }) =>
+    action?.kind === "exact_resume" && action.operation === "restart_resume"
+  );
 
   const setAutoResume = async (enabled: boolean) => {
     setRestoreBusy(true);
@@ -374,270 +187,256 @@ export function Workspace(
       setResumeBusy(false);
     }
   };
+  const sessionLabel = (sessionId: string) => {
+    const session = state.active_sessions.find((item) => item.id === sessionId);
+    const task = session && taskById(session.task_id);
+    return session
+      ? `${roleLabel(session.role)}${task ? ` · ${task.title}` : ""}`
+      : "Earlier session";
+  };
+  const restartRow = (
+    { action, candidate, task, session }: typeof restartCandidateRows[number],
+    current: boolean,
+  ) => (
+    <article className="restart-candidate" key={candidate.session_id}>
+      <div>
+        <strong>
+          {session ? roleLabel(session.role) : "Agent"} ·{" "}
+          {task?.title || taskById(candidate.task_id)?.title || "Earlier task"}
+        </strong>
+        {current && action && (
+          <span className="restart-step">{restartStepLabels[action.kind]}</span>
+        )}
+        <small>
+          {current
+            ? action?.reason
+            : "No step is offered for this session now. It is kept here for reference."}
+        </small>
+        <TechnicalDetails>
+          <p>
+            Session {candidate.session_id} · {candidate.state} ·{" "}
+            {candidate.reason}
+          </p>
+        </TechnicalDetails>
+      </div>
+      {task && (
+        <button onClick={() => onSelect(task)}>
+          Open task<span className="visually-hidden">: {task.title}</span>
+        </button>
+      )}
+    </article>
+  );
+  const approvalCount = pendingApprovalCount(state);
 
   return (
-    <div
-      className="workspace"
-      style={{ "--workspace-side-width": `${sideWidth}px` } as CSSProperties}
-    >
-      <div className="workspace-main">
-        <div className="workspace-toolbar">
-          <div>
-            <span className="eyebrow">Live workspace</span>
-            <h1>Roles and session access</h1>
-            <p className="muted">
-              View live output in cmux, and take keyboard control only when you
-              explicitly need to answer a native prompt. Session lifecycle and
-              workflow approvals remain in LLMRelay.
-            </p>
-            <details className="workspace-instructions">
-              <summary>How session access works</summary>
-              <p className="muted">
-                View output reserves or focuses one mode-neutral task surface
-                and never changes an existing lease. Take and Release are
-                separate revision-bound human actions applied by that same
-                authenticated attachment. Ctrl-] detaches and releases control,
-                if held, without stopping the service-owned provider. Reopening
-                a presentation never starts the host, resumes a provider, or
-                bypasses dashboard permissions and workflow approvals.
-              </p>
-            </details>
-          </div>
-          <fieldset className="restore-controls">
-            <legend>Restart restoration</legend>
-            <label>
-              <input
-                type="checkbox"
-                checked={state.instance_settings.auto_resume_eligible}
-                disabled={restoreBusy}
-                onChange={(event) => void setAutoResume(event.target.checked)}
-              />
-              Auto-resume eligible work
-            </label>
-            <small>
-              Open each restart candidate below for its exact current recovery
-              action. Automatic restoration still rechecks the same frozen
-              identity and current authority before any resume.
-            </small>
-            <button
-              disabled={previewBusy}
-              onClick={() => void requestPreview()}
-            >
-              {previewBusy ? "Checking restart preview…" : "Preview restart"}
-            </button>
-            <button
-              disabled={resumeBusy || state.restart_candidates.length === 0}
-              onClick={() => void resumeEligible()}
-            >
-              {resumeBusy ? "Submitting resume…" : "Resume eligible"}
-            </button>
-            {resumeError && <ErrorNotice error={resumeError} />}
-            {previewError && (
-              <ErrorNotice error={previewError} />
-            )}
-            {autoResumeError && <ErrorNotice error={autoResumeError} />}
-          </fieldset>
+    <div className="workspace">
+      <header className="page-heading workspace-heading">
+        <div>
+          <span className="eyebrow">Workspace</span>
+          <h1>What's happening</h1>
+          <p>
+            What is waiting for you comes first, then active work and the
+            agents running it.
+          </p>
         </div>
+        <nav className="waiting-summary" aria-label="Waiting for you">
+          <a href="#workspace-attention" className={state.attention.length ? "has-items" : ""}>
+            Needs your attention
+            <span className="count">{state.attention.length}</span>
+          </a>
+          <a href="#workspace-approvals" className={approvalCount ? "has-items" : ""}>
+            Approvals<span className="count">{approvalCount}</span>
+          </a>
+          <a href="#workspace-tasks">
+            Active tasks
+            <span className="count">
+              {state.tasks.filter((task) =>
+                !task.archived && !["done", "cancelled"].includes(task.lifecycle)
+              ).length}
+            </span>
+          </a>
+        </nav>
+      </header>
+      <div className="workspace-inboxes">
+        <AttentionInbox
+          state={state}
+          onNavigate={onNavigateAttention}
+          onChanged={onChanged}
+        />
+        <ApprovalInbox
+          state={state}
+          onSelect={(task) => onSelect(task)}
+          onChanged={onChanged}
+        />
+      </div>
+      {currentRestarts.length > 0 && (
+        <section
+          className="panel restart-candidates"
+          aria-label="Restart recovery"
+        >
+          <header>
+            <h2>Waiting after restart</h2>
+            <span className="count">{currentRestarts.length}</span>
+          </header>
+          <p className="hint">
+            These sessions were running when LLMRelay stopped. Each shows the
+            next step LLMRelay offers for it; open its task to take that step.
+          </p>
+          {currentRestarts.slice(0, 20).map((row) => restartRow(row, true))}
+        </section>
+      )}
+      <TaskSections
+        tasks={state.tasks}
+        projects={state.projects}
+        sessions={state.active_sessions}
+        taskActions={state.task_actions}
+        onOpen={onSelect}
+        onTaskAction={onTaskAction}
+      />
+      <section className="panel workspace-sessions" aria-labelledby="workspace-sessions-title">
+        <header>
+          <h2 id="workspace-sessions-title">Agents</h2>
+        </header>
         <SessionTree
-          sessions={state.active_sessions}
-          routes={routes}
-          onView={(sessionId) => void openCmuxSession(sessionId)}
-          onTake={(sessionId) => void takeKeyboardControl(sessionId)}
-          onRelease={(sessionId) => void releaseKeyboardControl(sessionId)}
+          title="Running now"
+          empty="No agent is running right now."
+          sessions={liveSessions}
+          access={access}
+          taskTitle={(session) => taskById(session.task_id)?.title}
           setupProjectId={(session) =>
             state.trip_setups?.find((setup) =>
               setup.setup_operation_id === session.setup_operation_id
             )?.project_id ||
-            state.tasks.find((task) => task.id === session.task_id)?.project_id}
+            taskById(session.task_id)?.project_id}
           onOpenSetup={onOpenSetup}
         />
-        {Object.entries(routes).map(([key, localRoute]) => {
-          const sessionId = key;
-          const route = cmuxOutcomeWithDurableSurface(
-            localRoute,
-            durableSurfaceForSession(sessionId),
-          ) || localRoute;
-          const output = recordedOutputText(route);
-          const presentation = cmuxSurfacePresentation(
-            route.surface,
-            route.state === "pending",
-          );
-          const retryAvailable = route.surface
-            ? presentation.retryAvailable
-            : route.retry_available;
-          return (
-            <section
-              className={`panel cmux-route ${route.state}`}
-              aria-live="polite"
-              key={key}
+        {pastSessions.length > 0 && (
+          <details className="past-sessions">
+            <summary>Earlier sessions ({pastSessions.length})</summary>
+            <SessionTree
+              title="Earlier sessions"
+              sessions={pastSessions}
+              access={access}
+              taskTitle={(session) => taskById(session.task_id)?.title}
+              setupProjectId={(session) =>
+                state.trip_setups?.find((setup) =>
+                  setup.setup_operation_id === session.setup_operation_id
+                )?.project_id ||
+                taskById(session.task_id)?.project_id}
+              onOpenSetup={onOpenSetup}
+            />
+          </details>
+        )}
+      </section>
+      <details className="panel restart-tools">
+        <summary>Restart and recovery tools</summary>
+        <fieldset className="restore-controls">
+          <legend>After LLMRelay restarts</legend>
+          <label>
+            <input
+              type="checkbox"
+              checked={state.instance_settings.auto_resume_eligible}
+              disabled={restoreBusy}
+              onChange={(event) => void setAutoResume(event.target.checked)}
+            />
+            Resume eligible work automatically
+          </label>
+          <small>
+            Automatic resume still rechecks each session before continuing it.
+            Open a task above to handle its session yourself.
+          </small>
+          <div className="button-row">
+            <button
+              disabled={previewBusy}
+              onClick={() => void requestPreview()}
             >
-              <header>
-                <h3>Task terminal</h3>
-                <span>{cmuxRouteLabel(route.state)}</span>
-              </header>
-              <p>{terminalGuidance(route)}</p>
-              <TechnicalDetails>
-        <p>{route.message}</p>
-        {route.surface && <p>
-          route revision {route.surface.binding_revision} · surface {route.surface.surface_state} · attachment {route.surface.attachment_state} · desired {route.surface.desired_input_state} · actual {route.surface.actual_input_state} · control revision {route.surface.applied_revision}/{route.surface.control_revision}
-        </p>}
-        {presentation.diagnostic && <p>{presentation.diagnostic}</p>}
-      </TechnicalDetails>
-      {output && <pre className="recorded-output">{output}</pre>}
-      {route.surface && presentation.discardAvailable && (
-                <button
-                  disabled={discardingRoutes[key]}
-                  onClick={() =>
-                    void discardUnknownRoute(key, sessionId, route)}
-                >
-                  {discardingRoutes[key]
-                    ? "Discarding unknown reservation…"
-                    : "Discard unknown reservation"}
-                </button>
-              )}
-              {retryAvailable && (
-                <button
-                  onClick={() => void openCmuxSession(sessionId)}
-                >
-                  {route.surface ? presentation.viewLabel : "View output again"}
-                </button>
-              )}
-            </section>
-          );
-        })}
-        {state.restart_candidates.length > 0 && (
-          <section
-            className="panel restart-candidates"
-            aria-label="Restart candidates"
-          >
-            <header>
-              <h3>Restart candidates</h3>
-              <span>{state.restart_candidates.length}</span>
-            </header>
-            <p className="muted">
-              Resume restores the exact native session. Continue releases a
-              restart hold only after all prior processes are confirmed stopped,
-              allowing the normal workflow to proceed.
-            </p>
-            {restartCandidateRows.slice(0, 20).map(({
-              action,
-              candidate,
-              task,
-            }) => (
-              <article className="restart-candidate" key={candidate.session_id}>
-                <span>
-                  <strong>{candidate.session_id}</strong> · {candidate.state} ·
-                  {" "}
-                  {candidate.reason}
-                </span>
-                <small>
-                  {action?.reason ||
-                    "No current continuation action is projected for this candidate; refresh state before taking action."}
-                </small>
-                {task && (
-                  <button onClick={() => onSelect(task)}>
-                    Open task recovery
-                  </button>
-                )}
-              </article>
-            ))}
-          </section>
+              {previewBusy ? "Checking…" : "Preview restart"}
+            </button>
+            <button
+              disabled={resumeBusy || !bulkResumable}
+              onClick={() => void resumeEligible()}
+            >
+              {resumeBusy ? "Submitting resume…" : "Resume eligible sessions"}
+            </button>
+          </div>
+          {resumeError && <ErrorNotice error={resumeError} />}
+          {previewError && <ErrorNotice error={previewError} />}
+          {autoResumeError && <ErrorNotice error={autoResumeError} />}
+        </fieldset>
+        {earlierRestarts.length > 0 && (
+          <details className="restart-history">
+            <summary>Earlier restart sessions ({earlierRestarts.length})</summary>
+            {earlierRestarts.slice(0, 20).map((row) => restartRow(row, false))}
+          </details>
         )}
         {preview && (
-          <section
-            className="panel restart-preview"
-            aria-label="Restart preview"
-          >
+          <section className="restart-preview" aria-label="Restart preview">
             <h3>Restart preview</h3>
             <p>{preview.snapshot.notice}</p>
-            <small>
-              Observed {preview.snapshot.captured_at} · process inventory{" "}
-              {preview.snapshot.process_inventory} · boot identity{" "}
-              {preview.snapshot.boot_identity}. This preview grants no resume
-              authority.
-            </small>
+            <small>This preview does not resume anything.</small>
             {preview.sessions.map((session, index) => (
               <article
                 className="restart-candidate"
                 key={`${session.decision.subject.session_id || index}`}
               >
                 <strong>
-                  {session.decision.subject.session_id || "Unknown session"} ·
-                  {" "}
-                  {session.classification.replaceAll("_", " ")}
+                  {session.decision.subject.session_id
+                    ? sessionLabel(session.decision.subject.session_id)
+                    : "Unknown session"}
                 </strong>
                 <small>
-                  {session.decision.primary_blocker?.message ||
-                    session.decision.reason_code}
-                </small>
-                <small>
                   {session.can_resume_now
-                    ? "Admission may be available after current revalidation"
+                    ? "Can resume after LLMRelay rechecks it"
                     : session.could_resume_after_confirmed_shutdown
-                    ? "Needs verified quiescence before eligibility"
-                    : "No current resume route"}
+                    ? "Can resume once its earlier process is confirmed stopped"
+                    : "Cannot be resumed"}
+                  {session.decision.primary_blocker?.message
+                    ? ` · ${session.decision.primary_blocker.message}`
+                    : ""}
                 </small>
+                <TechnicalDetails>
+                  <p>
+                    {session.classification.replaceAll("_", " ")} ·{" "}
+                    {session.decision.reason_code} · observed{" "}
+                    {preview.snapshot.captured_at} · process inventory{" "}
+                    {preview.snapshot.process_inventory} · boot identity{" "}
+                    {preview.snapshot.boot_identity}
+                  </p>
+                </TechnicalDetails>
               </article>
             ))}
           </section>
         )}
         {resumeResult && (
           <section
-            className="panel restart-resume-result"
+            className="restart-resume-result"
             aria-label="Restart resume result"
           >
-            <h3>Restart resume · {resumeResult.state}</h3>
+            <h3>Resume result</h3>
             <p>
-              Queued {resumeResult.queued_ids.length}:{" "}
-              {resumeResult.queued_ids.join(", ") || "none"}. Omitted{" "}
-              {resumeResult.omitted_count}:{" "}
-              {resumeResult.omitted_ids.join(", ") || "none"}.
+              {resumeResult.queued_ids.length} session(s) queued to resume;{" "}
+              {resumeResult.omitted_count} not resumed.
             </p>
             {resumeResult.outcomes.map((outcome, index) => (
               <small key={`${outcome.session_id}:${index}`}>
-                {outcome.session_id}: {outcome.state}
+                {sessionLabel(outcome.session_id)}:{" "}
+                {outcome.state.replaceAll("_", " ")}
                 {outcome.reason ? ` · ${outcome.reason}` : ""}
                 {outcome.next_due_at
-                  ? ` · retry after ${outcome.next_due_at}`
+                  ? ` · tries again after ${
+                    new Date(outcome.next_due_at).toLocaleString()
+                  }`
                   : ""}
               </small>
             ))}
           </section>
         )}
-        <ActivityTimeline events={state.history} />
-      </div>
-      <div
-        className="workspace-divider"
-        role="separator"
-        aria-label="Resize workspace details"
-        aria-orientation="vertical"
-        aria-valuemin={260}
-        aria-valuemax={520}
-        aria-valuenow={sideWidth}
-        tabIndex={0}
-        onPointerDown={startResize}
-        onKeyDown={(event) => {
-          if (event.key === "ArrowLeft") adjustSide(sideWidth + 16);
-          else if (event.key === "ArrowRight") adjustSide(sideWidth - 16);
-          else if (event.key === "Home") adjustSide(260);
-          else if (event.key === "End") adjustSide(520);
-          else return;
-          event.preventDefault();
-        }}
-      />
-      <aside className="workspace-side">
-        <ApprovalInbox
-          state={state}
-          onSelect={(task) => onSelect(task)}
-          onChanged={onChanged}
-        />
-        <AttentionInbox
-          state={state}
-          onNavigate={onNavigateAttention}
-          onChanged={onChanged}
-        />
+      </details>
+      <details className="panel workspace-activity">
+        <summary>Recent activity and resources</summary>
+        <ActivityTimeline events={state.history} tasks={state.tasks} />
         <ResourceStatus resources={state.resources} />
-      </aside>
+      </details>
     </div>
   );
 }

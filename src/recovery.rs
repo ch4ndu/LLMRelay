@@ -809,6 +809,51 @@ pub fn reconcile_prior_boot(store: &Store) -> Result<Vec<serde_json::Value>> {
         "service restarted before launch permit was consumed",
     )?;
     let mut connection = store.lock()?;
+    // Guidance that was being written when the service stopped may or may not
+    // have reached the agent. It becomes uncertain, never replayable; only an
+    // exact native submit of the same body for the same invocation can later
+    // prove delivery. Queued, submitted and acknowledged guidance is unchanged.
+    // Selection, each compare-and-set and its audit record commit together, and
+    // results are published only after that commit.
+    {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = Utc::now().to_rfc3339();
+        let in_flight = {
+            let mut statement = transaction.prepare(
+                "SELECT id,state,attempt_id FROM guidance_messages
+                 WHERE state IN ('delivery_reserved','written_awaiting_submit') ORDER BY rowid",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut uncertain = Vec::new();
+        for (id, state, attempt) in in_flight {
+            let changed = transaction.execute(
+                "UPDATE guidance_messages SET state='delivery_unknown',
+                        reason='service restarted before delivery was confirmed'
+                 WHERE id=?1 AND state=?2",
+                params![id, state],
+            )?;
+            if changed == 1 {
+                transaction.execute(
+                    "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+                     VALUES(?1,?2,'service','guidance.delivery.unknown_after_restart','guidance',?3,?4,?5)",
+                    params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),id,serde_json::json!({"attempt_id":attempt,"prior_state":state,"replayable":false}).to_string(),now],
+                )?;
+                uncertain.push(serde_json::json!({"guidance_id":id,"attempt_id":attempt,"state":"delivery_unknown","prior_state":state,"replayable":false}));
+            }
+        }
+        transaction.commit()?;
+        results.extend(uncertain);
+    }
     let mut statement=connection.prepare("SELECT id,process_identity_json,launch_state FROM sessions WHERE status IN ('launch_reserved','running')")?;
     let sessions = statement
         .query_map([], |row| {

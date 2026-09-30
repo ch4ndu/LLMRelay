@@ -1682,6 +1682,20 @@ impl Application {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
+        let final_repair_recheck: Option<String> = connection
+            .query_row(
+                "SELECT json_object('accounting_lane','final_repair_recheck','allowance',1,
+                   'provenance_kind',provenance_kind,
+                   'spent',CASE WHEN spent_at IS NULL THEN 0 ELSE 1 END,'state',state,
+                   'candidate_hash',candidate_hash,'review_request_id',review_request_id,
+                   'verdict',verdict,'closed_reason',closed_reason,
+                   'invalid_ordinary_review_request_id',rejected_code_request_id,
+                   'ordinary_review_budget','separate and never spent by this lane')
+                 FROM final_repair_rechecks WHERE attempt_id=?1",
+                params![context.attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?;
         let guidance = if context.role == crate::domain::RoleKind::Manager {
             let mut statement=connection.prepare("SELECT json_object(
                 'id',g.id,'body',g.body,'state',g.state,'reason',g.reason,
@@ -2187,6 +2201,9 @@ impl Application {
         let mut value = serde_json::json!({"identity":context,"task":serde_json::from_str::<serde_json::Value>(&task)?,"attempt":serde_json::from_str::<serde_json::Value>(&attempt)?,"task_profiles":task_profiles.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"project_policy":project_policy,"verification_catalog":verification_catalog,"selected_checks":selected_checks,"explorer_decisions":explorer_decisions,"approved_plan":plan,"active_review":current_review.map(|value|serde_json::from_str::<serde_json::Value>(&value.5)).transpose()?,"completed_final_review":completed_final_review.map(|value|serde_json::from_str::<serde_json::Value>(&value)).transpose()?,"review_feedback":feedback.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"review_budgets":budgets.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"check_results":checks.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"guidance":guidance,"guidance_contract":guidance_contract,"setup_contract":setup_contract,"commands":commands});
         if let Some(evidence) = ordinary_review_evidence {
             value["ordinary_review_evidence"] = evidence;
+        }
+        if let Some(recheck) = final_repair_recheck {
+            value["final_repair_recheck"] = serde_json::from_str(&recheck)?;
         }
         if let Some(feedback) = manager_feedback {
             value["manager_feedback"] = serde_json::json!({
@@ -4449,6 +4466,11 @@ impl Application {
             let mut connection = self.store.lock()?;
             let transaction =
                 connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            // Nothing is created on disk and no claim moves until every parent
+            // role is proven quiescent; until then the lineage stays reserved.
+            if rework_parent_blocker(&transaction, &parent)?.is_some() {
+                return Ok(false);
+            }
             let reserved = transaction.execute(
                 "UPDATE rework_intents SET state='materializing',updated_at=?1
                  WHERE id=?2 AND state IN ('reserved','materializing')
@@ -4470,11 +4492,11 @@ impl Application {
             transaction.commit()?;
         }
         let materialized = if destination.exists() {
-            self.reviews.verify_materialized(&snapshot, &destination)
+            self.reviews.verify_rework_source(&intent, &destination)
         } else {
             self.reviews
                 .materialize_rework(&snapshot, &destination)
-                .and_then(|_| self.reviews.verify_materialized(&snapshot, &destination))
+                .and_then(|_| self.reviews.verify_rework_source(&intent, &destination))
         };
         if !matches!(&materialized, Ok(true)) {
             let reason = materialized
@@ -4563,6 +4585,23 @@ impl Application {
         if !eligible {
             return Ok(false);
         }
+        if let Some(blocker) = rework_parent_blocker(&transaction, &parent)? {
+            let reason = format!("parent ownership changed during materialization: {blocker}");
+            transaction.execute(
+                "UPDATE rework_intents SET state='recovery_required',result_json=?1,updated_at=?2 WHERE id=?3 AND state='materializing'",
+                params![serde_json::json!({"reason":reason,"claim_retained":true}).to_string(),finished,intent],
+            )?;
+            transaction.execute(
+                "UPDATE attempts SET status='needs_recovery',updated_at=?1 WHERE id=?2 AND status='materialization_pending'",
+                params![finished, attempt_id],
+            )?;
+            transaction.execute(
+                "UPDATE tasks SET attention='needs_recovery',updated_at=?1 WHERE id=?2 AND lifecycle='in_progress' AND attention='none'",
+                params![finished, task],
+            )?;
+            transaction.commit()?;
+            bail!("{reason}")
+        }
         let policy_json: String = transaction.query_row(
             "SELECT policy_json FROM workspaces WHERE attempt_id=?1 AND state='reserved'",
             params![attempt_id],
@@ -4617,6 +4656,78 @@ impl Application {
         transaction.commit()?;
         Ok(true)
     }
+}
+
+/// Parent state that must be settled before a rework child's workspace is
+/// created or the repository claim moves. `?1` is the parent attempt. A
+/// generation must be terminal and its sessions must have recorded process-group
+/// quiescence; an exited session alone cannot release role capacity.
+const REWORK_PARENT_FENCES: &[(&str, &str)] = &[
+    ("a parent role is still live",
+     "SELECT EXISTS(SELECT 1 FROM role_generations WHERE attempt_id=?1
+        AND status NOT IN ('exited','launch_failed','replaced','revoked'))"),
+    ("a parent session has not exited with proven process-group quiescence",
+     "SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+        WHERE g.attempt_id=?1
+          AND NOT (s.status='launch_failed'
+            OR (s.status='exited'
+              AND COALESCE(CASE WHEN json_valid(s.exit_json)
+                THEN json_extract(s.exit_json,'$.process_group_quiescent') END,0)=1)))"),
+    ("a parent review is in flight or its delivery is uncertain",
+     "SELECT EXISTS(SELECT 1 FROM review_requests WHERE attempt_id=?1
+        AND delivery_state IN ('launching','delivered','ambiguous'))"),
+    ("a parent check is running or needs recovery",
+     "SELECT EXISTS(SELECT 1 FROM check_runs WHERE attempt_id=?1
+        AND status IN ('launch_reserved','running','recovery_required','launch_ambiguous'))"),
+    ("a parent capture is in progress",
+     "SELECT EXISTS(SELECT 1 FROM freeze_intents WHERE attempt_id=?1
+        AND state IN ('reserved','capturing','recovery_required'))"),
+    ("a parent permission request is pending",
+     "SELECT EXISTS(SELECT 1 FROM permission_requests WHERE attempt_id=?1
+        AND consumed_at IS NULL AND delivery_state NOT IN ('expired','not_delivered'))"),
+    ("someone has keyboard control of a parent agent",
+     "SELECT EXISTS(SELECT 1 FROM input_leases lease JOIN sessions s ON s.id=lease.session_id
+        JOIN role_generations g ON g.id=s.role_generation_id
+        WHERE g.attempt_id=?1 AND lease.revoked_at IS NULL
+          AND julianday(lease.expires_at)>julianday('now'))"),
+    ("parent guidance is submitted or its delivery is unconfirmed",
+     "SELECT EXISTS(SELECT 1 FROM guidance_messages WHERE attempt_id=?1
+        AND state IN ('delivery_reserved','written_awaiting_submit','delivery_unknown','submitted'))"),
+    ("a parent recovery is open",
+     "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=?1
+        AND state='attention_required')"),
+    ("a parent restart hold is open",
+     "SELECT EXISTS(SELECT 1 FROM restart_candidates WHERE attempt_id=?1
+        AND state NOT IN ('resumed','released_fresh_dispatch','cancelled'))"),
+    ("a parent agent switch is pending",
+     "SELECT EXISTS(SELECT 1 FROM switch_intents WHERE attempt_id=?1
+        AND state NOT IN ('dispatched','completed','cancelled','rejected','superseded'))"),
+    ("a parent manager stop or change is unresolved",
+     "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
+        AND kind IN ('manager_stop','manager_change')
+        AND state NOT IN ('finished','cancelled','superseded','rejected'))"),
+    ("a parent control is pending",
+     "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
+        AND kind NOT IN ('transition_proposal','manager_stop','manager_change')
+        AND state IN ('requested','draining','held','recovery_required'))"),
+    ("the parent repository claim is not exactly one running claim",
+     "SELECT NOT ((SELECT COUNT(*) FROM claims WHERE attempt_id=?1 AND state='running')=1
+        AND NOT EXISTS(SELECT 1 FROM claims WHERE attempt_id=?1
+          AND state IN ('reserved','launching','unknown','stopping')))"),
+];
+
+fn rework_parent_blocker(
+    connection: &rusqlite::Connection,
+    parent: &str,
+) -> Result<Option<&'static str>> {
+    for (blocker, sql) in REWORK_PARENT_FENCES {
+        let blocked: bool =
+            connection.query_row(sql, rusqlite::params![parent], |row| row.get(0))?;
+        if blocked {
+            return Ok(Some(*blocker));
+        }
+    }
+    Ok(None)
 }
 
 fn restart_due(next_due_at: &Option<String>, now: &chrono::DateTime<Utc>) -> Result<bool> {

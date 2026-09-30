@@ -7,15 +7,80 @@ import {
   operationIntent,
   reuseOperationIdentity,
 } from "../api";
-import type {
-  ContinuationAction,
-  DecisionExplanation,
-  Project,
-  Session,
-  SwitchIntent,
-  Task,
-  WorkflowControl,
+import { TechnicalDetails } from "./ErrorNotice";
+import {
+  type ContinuationAction,
+  type ContinuationActionKind,
+  type DecisionExplanation,
+  type DecisionOwner,
+  type Project,
+  roleLabel,
+  type Session,
+  type SwitchIntent,
+  type Task,
+  type WorkflowControl,
 } from "../types";
+
+/** Who is expected to act, in plain words. */
+export const ownerLabel = (owner: DecisionOwner | string) =>
+  owner === "human"
+    ? "You"
+    : owner === "service"
+    ? "LLMRelay"
+    : owner === "provider"
+    ? "The agent"
+    : "Outside LLMRelay";
+
+/** Blocker codes meaning the project's workflow setup must be finished or
+ * reviewed first. Their backend message is a diagnostic, so it belongs under
+ * Technical details rather than as the explanation. */
+const PROJECT_SETUP_BLOCKERS = new Set([
+  "task.project_ready",
+  "scheduler.project_readiness_stale",
+  "workflow.project_readiness_stale",
+]);
+
+/** A plain explanation when `code` is a project-setup blocker, otherwise
+ * undefined so the caller keeps its own message. */
+export const projectSetupProblem = (
+  project: Project | undefined,
+  code: string | undefined,
+) => {
+  if (!code || !PROJECT_SETUP_BLOCKERS.has(code)) return undefined;
+  switch (project?.trip?.readiness ?? "not_initialized") {
+    case "not_initialized":
+      return "This project has not been set up yet, so this task cannot start. Open project setup to set it up; the task is kept.";
+    case "setup_in_progress":
+      return "Project setup has not been finished yet, so this task cannot start. Open project setup to finish it; the task is kept.";
+    case "needs_upgrade_review":
+      return "The project's workflow setup changed and needs your review before this task can start. Open project setup to review it; the task is kept.";
+    default:
+      return "The project's workflow setup needs attention before this task can start. Open project setup to see what to fix; the task is kept.";
+  }
+};
+
+const actionTitles: Record<ContinuationActionKind, string> = {
+  exact_resume: "Session stopped before finishing",
+  fresh_accounted_retry: "Needs a fresh session",
+  replace_stale_authority: "Needs updated agent settings",
+  wait_for_exit: "Waiting for the agent to stop",
+  wait_for_capacity: "Waiting for a free agent slot",
+  wait_for_service: "Waiting for LLMRelay to be ready",
+  recover_ownership: "Confirm the agent has stopped",
+  retry_graceful_stop: "Agent did not stop in time",
+  force_stop_exact_process: "Force stop is available",
+  prepare_corrected_runtime: "Profile needs a new verification",
+  authorize_implementation: "Approved plan is waiting to start",
+  migrate_attempt: "Move to the current workflow",
+  authorize_additional_explorer: "Extra Explorer call needs your approval",
+  recover_setup_apply: "Setup installation needs recovery",
+  recover_workspace_reservation: "Workspace could not be prepared",
+  continue_fresh_dispatch: "Can continue with a new session",
+  start_managed_legacy_attempt: "Imported task needs a fresh start",
+  refresh_and_reconcile: "A request was rejected",
+  authorization_required: "Needs a new approval",
+  terminal_incomplete: "Cannot continue automatically",
+};
 
 export function WorkflowControls(
   {
@@ -42,6 +107,10 @@ export function WorkflowControls(
 ) {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const setupProblem = projectSetupProblem(
+    project,
+    decision?.primary_blocker?.code,
+  );
   const operationStorageKey = `llmrelay.workflow.operations.${task.id}`;
   const commandIdentities = useRef(
     new Map<string, { body: string; id: string }>(
@@ -222,6 +291,12 @@ export function WorkflowControls(
       ? value as Record<string, unknown>
       : undefined;
   };
+  const actionRole = (action: ContinuationAction) => {
+    const role = actionValue(action, "role") ||
+      sessions.find((session) => session.id === actionValue(action, "session_id"))
+        ?.role;
+    return role ? roleLabel(role as Session["role"]) : undefined;
+  };
   const actionButton = (action: ContinuationAction) => {
     const attemptId = actionValue(action, "attempt_id");
     const workspaceId = actionValue(action, "workspace_id");
@@ -236,7 +311,7 @@ export function WorkflowControls(
         const restartResume = action.operation === "restart_resume";
         return (
           <button
-            className="primary"
+            className="primary compact"
             disabled={!action.enabled || !sessionId ||
               (!restartResume && action.operation === "runtime_probe_resume" &&
                 (!runtimeAdmissionId || !role)) ||
@@ -256,10 +331,10 @@ export function WorkflowControls(
               )}
           >
             {restartResume
-              ? "Resume retained restart session"
+              ? "Resume after restart"
               : action.operation === "runtime_probe_resume"
-              ? "Resume retained runtime probe"
-              : "Resume retained session"}
+              ? "Resume the verification"
+              : "Resume the stopped session"}
           </button>
         );
       case "recover_workspace_reservation":
@@ -306,8 +381,8 @@ export function WorkflowControls(
               })}
           >
             {action.kind === "retry_graceful_stop"
-              ? "Retry graceful stop"
-              : "Force stop exact managed process"}
+              ? "Ask it to stop again"
+              : "Force stop this process"}
           </button>
         );
       case "continue_fresh_dispatch":
@@ -316,13 +391,13 @@ export function WorkflowControls(
             disabled={!action.enabled || !!busy}
             onClick={() => void control("continue")}
           >
-            Continue with fresh dispatch
+            Continue with a new session
           </button>
         );
       case "fresh_accounted_retry":
         return (
           <button
-            className="primary"
+            className="primary compact"
             disabled={!action.enabled || !!busy ||
               (action.operation === "trip_setup_dispatch" &&
                 (!attemptId || !role))}
@@ -338,14 +413,14 @@ export function WorkflowControls(
               )}
           >
             {action.operation === "trip_setup_dispatch"
-              ? "Start fresh accounted setup session"
-              : "Start fresh accounted session"}
+              ? "Start a fresh setup session"
+              : "Start a fresh session"}
           </button>
         );
       case "replace_stale_authority":
         return (
           <button onClick={() => onOpenSetup(task.project_id)}>
-            Review current role authority
+            Review agent settings
           </button>
         );
       case "prepare_corrected_runtime":
@@ -354,17 +429,17 @@ export function WorkflowControls(
             disabled={!action.enabled}
             onClick={() => onOpenSetup(task.project_id)}
           >
-            Prepare corrected runtime verification
+            Prepare a new verification
           </button>
         );
       case "start_managed_legacy_attempt":
         return (
           <button
-            className="primary"
+            className="primary compact"
             disabled={!action.enabled || !!busy}
             onClick={() => void send("normalize_legacy_task")}
           >
-            Start a fresh managed attempt
+            Start a fresh attempt
           </button>
         );
       case "refresh_and_reconcile":
@@ -373,7 +448,7 @@ export function WorkflowControls(
             disabled={!action.enabled || !!busy}
             onClick={onChanged}
           >
-            Refresh and review corrected control
+            Refresh to see the current state
           </button>
         );
       default:
@@ -388,24 +463,37 @@ export function WorkflowControls(
       tabIndex={-1}
     >
       <header>
-        <h3>Workflow controls</h3>
-        <span>
-          {task.active_attempt?.phase?.replaceAll("_", " ") || task.lifecycle}
-        </span>
+        <h3>Controls</h3>
       </header>
-      {decision && (
-        <p className="hint">
-          {decision.primary_blocker?.message ||
-            decision.reason_code.replaceAll("_", " ")}. Owner:{" "}
-          {decision.ownership.owner}. {decision.next_action
-            ? `Next: ${decision.next_action.operation.replaceAll("_", " ")}.`
-            : "No current action is offered."}
+      {decision && decision.primary_blocker?.message && (
+        <p className="hint decision-summary">
+          {setupProblem || decision.primary_blocker.message}{" "}
+          <span className="owner">
+            Waiting on: {ownerLabel(decision.primary_blocker.owner)}.
+          </span>
         </p>
+      )}
+      {decision && (
+        <TechnicalDetails>
+          <p>
+            {decision.reason_code} · {decision.disposition} · owner{" "}
+            {decision.ownership.owner} ·{" "}
+            {decision.next_action
+              ? `next ${decision.next_action.operation}`
+              : "no current action"}
+          </p>
+          {setupProblem && (
+            <p>
+              {decision.primary_blocker?.message} · project readiness{" "}
+              {project?.trip?.readiness ?? "not reported"}
+            </p>
+          )}
+        </TechnicalDetails>
       )}
       {terminal
         ? (
           <p className="hint">
-            This task is terminal; its workflow history is read-only.
+            This task is finished; its history is read-only.
           </p>
         )
         : task.lifecycle === "backlog"
@@ -415,10 +503,10 @@ export function WorkflowControls(
               className="primary"
               disabled={!!busy || !allows("make_ready")}
               title={decision?.control_policy.disabled_reason_code
-                ? decision.primary_blocker?.message ||
+                ? setupProblem || decision.primary_blocker?.message ||
                   decision.control_policy.disabled_reason_code
                 : project?.trip?.readiness !== "ready"
-                ? project?.trip?.reason
+                ? projectSetupProblem(project, "task.project_ready")
                 : undefined}
               onClick={() => send("make_ready")}
             >
@@ -456,7 +544,7 @@ export function WorkflowControls(
               disabled={!!busy || !allows("pause_after_role")}
               onClick={() => control("pause_after_role")}
             >
-              Pause after role
+              Pause after this step
             </button>
             <button
               disabled={!!busy || !allows("pause_now")}
@@ -481,23 +569,31 @@ export function WorkflowControls(
         )}
       {!terminal && task.lifecycle !== "backlog" && (
         <div className="inline-form">
-          <strong>Manager authority</strong>
+          <strong>Manager</strong>
           <small>
-            requested {requestedManager
-              ? `${requestedManager.config.provider} · ${requestedManager.config.model} · ${requestedManager.config.effort} (rev ${requestedManager.revision})`
-              : "not configured"}
-            {" · "}effective {effectiveManager
-              ? `${effectiveManager.config.provider} · ${effectiveManager.config.model} · ${effectiveManager.config.effort} (rev ${effectiveManager.revision})`
-              : "not active"}
-            {managerSession ? ` · ${managerSession.status}` : ""}
+            {effectiveManager
+              ? `Active: ${effectiveManager.config.provider} · ${effectiveManager.config.model} · ${effectiveManager.config.effort}`
+              : "No manager is active yet"}
+            {pendingManagerChange && requestedManager
+              ? ` · Requested change (not active yet): ${requestedManager.config.provider} · ${requestedManager.config.model} · ${requestedManager.config.effort}`
+              : ""}
           </small>
+          <TechnicalDetails>
+            <p>
+              requested revision {requestedManager?.revision ?? "none"} ·
+              effective revision {effectiveManager?.revision ?? "none"}
+              {managerSession ? ` · session ${managerSession.status}` : ""}
+            </p>
+          </TechnicalDetails>
           {managerControl && (
             <small
               className={managerControl.state === "failed"
                 ? "error"
                 : "badge waiting"}
             >
-              {managerControl.kind.replaceAll("_", " ")} ·{" "}
+              {managerControl.kind === "manager_stop"
+                ? "Manager stop"
+                : "Manager change"} ·{" "}
               {managerControl.state.replaceAll("_", " ")}
               {typeof managerControl.payload.next_action === "string"
                 ? ` · ${managerControl.payload.next_action}`
@@ -506,14 +602,14 @@ export function WorkflowControls(
           )}
           {managerSwitch && (
             <small className="badge waiting">
-              Replacement switch {managerSwitch.state.replaceAll("_", " ")}.
+              Manager replacement: {managerSwitch.state.replaceAll("_", " ")}.
             </small>
           )}
           {task.lifecycle === "awaiting_review" && (
             <small className="badge waiting">
-              Human review is still authoritative. The requested manager profile
-              is future configuration only; it cannot dispatch, resume, replace
-              the manager, or rerun final review here.
+              Your review decides this result. A requested manager change
+              applies only to future work; it cannot restart or replace the
+              manager, or rerun final review from here.
             </small>
           )}
           <div className="button-row">
@@ -568,7 +664,7 @@ export function WorkflowControls(
           className="continuation-actions"
           aria-label="Current recovery actions"
         >
-          <h4>Current recovery and continuation</h4>
+          <h4>What can happen next</h4>
           {projected.map((action, index) => (
             <article
               className="review-row"
@@ -579,35 +675,45 @@ export function WorkflowControls(
                 : undefined}
               tabIndex={-1}
             >
-              <strong>{action.kind.replaceAll("_", " ")}</strong>
-              <span>{action.reason}</span>
-              {action.waiting_for && (
-                <small>Waiting for: {action.waiting_for}</small>
-              )}
-              {action.deadline_at && (
-                <small>
-                  Deadline: {new Date(action.deadline_at).toLocaleString()}
-                </small>
-              )}
-              {action.accounting_note && (
-                <small>{action.accounting_note}</small>
-              )}
-              {actionButton(action)}
+              <div className="continuation-copy">
+                <strong>
+                  {actionTitles[action.kind] || "Next step"}
+                  {actionRole(action) ? ` · ${actionRole(action)}` : ""}
+                </strong>
+                <span>{action.reason}</span>
+                {action.waiting_for && (
+                  <small>Waiting for {action.waiting_for}.</small>
+                )}
+                {action.deadline_at && (
+                  <small>
+                    Stops being retried automatically at{" "}
+                    {new Date(action.deadline_at).toLocaleString()}.
+                  </small>
+                )}
+                {action.accounting_note && (
+                  <small>{action.accounting_note}</small>
+                )}
+                {!action.enabled && action.owner !== "service" && (
+                  <small>
+                    Not available right now. Waiting on:{" "}
+                    {ownerLabel(action.owner)}.
+                  </small>
+                )}
+              </div>
+              <div className="continuation-action">{actionButton(action)}</div>
             </article>
           ))}
         </section>
       )}
       {error && <ErrorNotice error={error} />}
-      <small>
+      <small className="hint">
         {terminal
-          ? "Accepted and cancelled work cannot be resumed or changed from terminal history."
+          ? "Completed and cancelled tasks cannot be resumed or changed."
           : task.lifecycle === "backlog"
           ? project?.trip?.readiness === "ready"
-            ? "Ready validates the task and the host manager plus five delegated role settings before queue pickup."
-            : `Ready is blocked: ${
-              project?.trip?.reason || "the project is not initialized"
-            }. The draft remains available.`
-          : "Control requests are versioned and may remain draining until every owned process is reconciled."}
+            ? "Make Ready checks the task and all six agent roles, then queues it. Queued tasks start automatically when an agent slot is free."
+            : projectSetupProblem(project, "task.project_ready")
+          : "Continue resumes automatic work. Pause after this step lets the current agent finish first. Cancel stops the task. Controls may take a moment while LLMRelay confirms each agent has stopped."}
       </small>
     </section>
   );

@@ -15,14 +15,23 @@ After a service restart, the dashboard resets its cursor to the new service
 identity; if its browser session is no longer valid, use the current startup
 authentication flow below.
 
-The grouped Attention inbox includes items across projects. Selecting an item
-opens its exact task, attempt, session, permission, recovery record or project
-setup when that binding is still current. If it changed or its panel is absent,
-the dashboard explains the failure and refreshes once; opening an item never
-executes its action. A selected recovery record that resolves stays non-actionable
-instead of silently selecting another record. Open the task normally from the
-board, history or **Open task recovery** to return to its current recovery view.
+**Needs your attention** and **Approvals** include items across projects; their
+counts stay visible in the top bar. Selecting an item opens its exact task,
+attempt, session, permission, recovery record or project setup when that
+binding is still current, on the task tab that holds it (live output opens the
+**Activity** tab). If it changed or its panel is absent, the dashboard explains
+the failure and refreshes once; opening an item never executes its action. A
+selected recovery record that resolves stays non-actionable instead of silently
+selecting another record. Open the task normally from the board, history or the
+restart row's **Open task** button to return to its current recovery view.
 Recovery drafts stay with their record and are not transferred to another record.
+
+Recovery offers resume only when it can still apply. A stopped session of a
+current, unfinished task offers **Resume the stopped session** only while its
+exact binding is eligible. Sessions that reported their result and were stopped
+after their turn, sessions replaced by a newer generation, and sessions of
+completed or cancelled tasks are history: they appear under **Earlier sessions**
+and in the task's **Activity** tab, never as urgent recovery.
 
 Native OS notifications are deferred; the dashboard attention rail is the
 implemented notification surface for this milestone.
@@ -71,9 +80,11 @@ Attaching does not launch another agent or resume an ended conversation. It stay
 
 ## Restart and restore
 
-LLMRelay restores the browser workspace independently from execution. The selected project, task detail, page, and details-column width persist locally. Live output belongs to cmux; old embedded-terminal layout and scrollback settings are no longer used. Reopening an ended session shows recorded history and never launches a provider. LLMRelay does not register its short-lived attachment command as cmux resume metadata: the command contains an exact process binding and route token which must not be restored after that binding changes. After a service restart, recover or resume eligible work in LLMRelay and open its current attachment; LLMRelay creates terminal access from the new current binding.
+LLMRelay restores the browser workspace independently from execution. The selected project, open task, page, board and Workspace Active/Completed section persist locally, and an open task keeps its tab while the dashboard stays open. Live output belongs to cmux; old embedded-terminal layout and scrollback settings are no longer used. Reopening an ended session shows recorded history and never launches a provider. LLMRelay does not register its short-lived attachment command as cmux resume metadata: the command contains an exact process binding and route token which must not be restored after that binding changes. After a service restart, recover or resume eligible work in LLMRelay and open its current attachment; LLMRelay creates terminal access from the new current binding.
 
-Automatic work resumption is off by default and remains off across service restarts until a human enables **Auto-resume eligible work** in the Workspace page’s **Restart restoration** group. During a deliberate restart, stop with drain so the service records the exact running native bindings before it interrupts them:
+Guidance that was being delivered when the service stopped is marked as uncertain at the next startup and is never sent again automatically. It becomes submitted only if the agent's own prompt-submit event for the same session and invocation later carries exactly its text; otherwise it stays uncertain and is shown as such. Queued guidance that had not started delivery stays queued for the next safe boundary. A session whose launch never began is recorded as proven nondelivery and may be replaced; a session that had started but whose process ownership is unknown needs recovery before anything is delivered to it.
+
+Automatic work resumption is off by default and remains off across service restarts until you enable **Resume eligible work automatically** under the Workspace page's **Restart and recovery tools**. During a deliberate restart, stop with drain so the service records the exact running native bindings before it interrupts them:
 
 ```sh
 llmrelay stop --drain \
@@ -82,7 +93,7 @@ llmrelay serve \
   --data-dir "$PWD/.local/my-agenticjira" --port 0
 ```
 
-Use the authenticated dashboard automatically opened by `serve`, or the current one-use login link when running with `--no-open`. The service holds all captured previously running work, including blocked or skipped native-resume candidates. Missing native history or matching current Supported capability evidence cannot silently trigger a fresh session. Legacy Codex Implementer Supported rows remain demoted because they predate the service-recorded native-policy identity checks. Migration 017 also demotes old Codex Manager/Reviewer Supported rows that lack the denied-read-floor marker to Unverified while preserving their proofs, evidence references, timestamps, and prior gaps. Those historical rows cannot authorize a launch or resume under the new key. An explicit Continue or recovery action can release the hold for normal workflow dispatch only after positive process-quiescence checks; it does not itself perform a native resume. In the Workspace page, choose **Open task recovery** on the relevant restart candidate. Its task exposes **Resume retained restart session** only when the exact binding is eligible. Use **Continue with fresh dispatch** only when its separately checked recovery prerequisites are satisfied. The equivalent non-browser commands are:
+Use the authenticated dashboard automatically opened by `serve`, or the current one-use login link when running with `--no-open`. The service holds all captured previously running work, including blocked or skipped native-resume candidates. Missing native history or matching current Supported capability evidence cannot silently trigger a fresh session. Legacy Codex Implementer Supported rows remain demoted because they predate the service-recorded native-policy identity checks. Migration 017 also demotes old Codex Manager/Reviewer Supported rows that lack the denied-read-floor marker to Unverified while preserving their proofs, evidence references, timestamps, and prior gaps. Those historical rows cannot authorize a launch or resume under the new key. An explicit Continue or recovery action can release the hold for normal workflow dispatch only after positive process-quiescence checks; it does not itself perform a native resume. In the Workspace page, choose **Open task** on the relevant row under **Waiting after restart**. Its task exposes **Resume after restart** only when the exact binding is eligible. Use **Continue with a new session** only when its separately checked recovery prerequisites are satisfied. The equivalent non-browser commands are:
 
 ```sh
 llmrelay resume-work \
@@ -110,7 +121,7 @@ llmrelay import --data-dir <INSTANCE> apply --project <PROJECT_ID> \
 
 ### Preview and bounded restoration
 
-Use **Restart preview** in Workspace, or run
+Use **Preview restart** under **Restart and recovery tools** in Workspace, or run
 `llmrelay restart-preview --data-dir <INSTANCE>` against the running service, to
 inspect recorded sessions before stopping work. Preview runs only when requested.
 It does not drain, signal, reconcile, reserve a launch, or change saved state.
@@ -173,7 +184,7 @@ If the dashboard reports **browser session required**, use the authenticated bro
 
 ## Recovery actions and bounded waits
 
-The Attention inbox and owning task/setup screen explain who can advance a
+Needs your attention and the owning task/setup screen explain who can advance a
 blocked operation, what it is waiting for, and the available action. A visible
 action is guidance: the service rechecks its current task version, session,
 generation, policy and process ownership when submitted. A stale screen cannot
@@ -181,12 +192,13 @@ authorize a replacement or bypass an approval.
 
 | Situation | Next action and boundary |
 | --- | --- |
-| Exact native resume rejected after runtime identity changes | Review the reason. **Start fresh accounted session** is available only if the same role profile and current authority still qualify. It consumes a fresh call; it is not native resume. |
+| Exact native resume rejected after runtime identity changes | Review the reason. **Start a fresh session** is available only if the same role profile and current authority still qualify. It consumes a fresh call; it is not native resume. |
 | Role, candidate, configuration, hook trust, native history or invocation provenance changed | Review the current role authority or prepare corrected verification. Old approval evidence cannot be reused as replacement authority. |
 | Resume or review authority already spent | New explicit authorization is required; the dashboard cannot reset the allowance. Unknown permanent rejections remain terminal with their reason. |
 | Interrupted installation or uncertain workspace creation | Open project/task recovery and follow its journal or reservation action; see [project recovery](PROJECT_SETUP.md#interrupted-setup-and-workspace-recovery). |
+| Workspace preparation refused to overwrite changed workflow or guidance files | The task explains which case applies. A guidance file that differs from the commit can be restored and the reservation retried. Workflow files changed again after setup cannot be fixed by retrying, because the workspace always starts from the recorded commit: choose **Verify and cancel reservation** (this cancels the task), commit the changes, choose **Validate and relink**, then create the task again. The failed reservation stays recorded. |
 | Service cannot prove process exit | Resolve exact process ownership before resuming or replacing work. A quiet terminal is not proof of exit. |
-| Graceful stop exceeds 30 seconds | The service records recovery for the exact managed process. Choose **Retry graceful stop** or explicitly **Force stop exact managed process** when offered. |
+| Graceful stop exceeds 30 seconds | The service records recovery for the exact managed process. Choose **Ask it to stop again** or explicitly **Force stop this process** when offered. |
 | Browser request times out | Refresh and reconcile. The operation may have succeeded; retain its operation ID until a definitive result rather than submit a new operation blindly. |
 
 Only frozen-runtime identity drift becomes stale when the original frozen
@@ -234,6 +246,67 @@ Continue requests are idempotent by operation ID. While a Continue is pending, a
 different operation ID is refused. A queued Continue that has become ineligible
 is rejected with a recorded reason instead of advancing the task again.
 
+Guidance whose delivery was never confirmed (`delivery_reserved`,
+`written_awaiting_submit` or `delivery_unknown`) fences guidance
+reauthorization. When its delivery session has exited and the guidance is
+obsolete, abandon that exact message with an authenticated command:
+
+```sh
+llmrelay apply --data-dir "$PWD/.local/my-agenticjira" --file abandon.json
+```
+
+```json
+{"kind":"abandon_unconfirmed_guidance","operation_id":"<new id>",
+ "task_id":"<task>","expected_version":7,"attempt_id":"<attempt>",
+ "guidance_id":"<guidance>","role_generation_id":"<generation>",
+ "delivery_session_id":"<session>","delivery_transcript_epoch":"<epoch>",
+ "delivery_resume_invocation_id":"<invocation or null>",
+ "expected_state":"written_awaiting_submit","reason":"<why it is obsolete>"}
+```
+
+`delivery_transcript_epoch` and `delivery_resume_invocation_id` identify the
+guidance row's historical delivery. That epoch may differ from the session's
+latest transcript epoch; use the stored message binding, not the latest session
+values. Every field must equal the recorded binding, the attempt must be the task's
+current unfinished attempt, and the session must have exited with its recorded
+processes proven absent. An unfinished launch or resume outcome needs a later
+verified-quiescent recovery first. Open recoveries, keyboard control, starting or
+recovering sessions and uncertain claims refuse. The message becomes `abandoned`
+with reason `human_abandoned_unconfirmed_delivery`; its body and delivery
+identity stay, and the audit event keeps the previous state, reason and your
+reason. The delivery outcome remains unknown: nothing is marked submitted,
+replayed or resumed, and task holds, attention and review counts are unchanged.
+Repeating the same operation ID with identical input returns the stored result.
+
+A `skipped` restart candidate can never be restored, but until it reaches a
+terminal disposition it still counts as an open restart hold, for example in
+guidance reauthorization. When its session has exited, cancel that exact
+candidate with the same `llmrelay apply` route:
+
+```json
+{"kind":"cancel_stale_restart_candidate","operation_id":"<new id>",
+ "task_id":"<task>","expected_version":7,"attempt_id":"<attempt>",
+ "session_id":"<session>","role_generation_id":"<session generation>",
+ "expected_state":"skipped","expected_source":"<source>",
+ "expected_requested_by":"<requested_by or null>",
+ "expected_updated_at":"<updated_at>",
+ "expected_result_sha256":"<SHA-256 of the stored result_json text>",
+ "reason":"<why it is stale>"}
+```
+
+Only `skipped` is accepted; parked, queued, admitting, failed, blocked and
+pending-reconciliation candidates keep their own recovery routes. Every field
+must equal the stored candidate, the attempt must be the task's current
+unfinished attempt, and the result may carry no admission, active batch or
+scheduled resume. The session must have exited with its recorded processes
+proven absent and must not be marked for restoration at startup. The same
+session and attempt fences as guidance abandonment apply, and a pending admission
+or reconciliation anywhere in the attempt refuses. The candidate becomes
+`cancelled` with an explicit human-cancellation reason; `result_json`, `source`
+and `requested_by` stay, and the audit event keeps the previous row and your
+reason. Nothing is resumed, released or dispatched, and task holds, attention
+and review counts are unchanged. Identical replay returns the stored result.
+
 Browser reads have an eight-second response deadline and mutations have a
 15-second response deadline. These bound browser waiting, not the lifetime of an
 accepted operation. Selected checks return after reservation and spawn are
@@ -253,6 +326,65 @@ identity separately from the old session. Fresh recovery requires the latest
 applicable evidence itself to be Supported for that identity and role profile.
 A newer unverified or unsupported result blocks a stale dashboard action, and the
 service rechecks the evidence at final dispatch before reserving provider work.
+
+### Replan after a terminal review
+
+An attempt left incomplete by a terminal review can continue in a new planning
+attempt. The review is either an ordinary code or final `needs_rework`, or the
+nonapproving verdict that closed a final-repair recheck. Request it explicitly
+with the same `llmrelay apply` route:
+
+```json
+{"kind":"replan_after_terminal_review","operation_id":"<new id>",
+ "task_id":"<task>","attempt_id":"<attempt>","expected_version":7,
+ "review_request_id":"<terminal review request>",
+ "role_result_id":"<its consumed structured result>",
+ "candidate_hash":"<rejected candidate hash>",
+ "snapshot_id":"<complete candidate snapshot with that hash>",
+ "reason":"<why a new plan is needed>"}
+```
+
+The attempt must be the task's current attempt in `needs_input` without a
+frozen candidate, at the given version, and not already replanned. The review
+must be its latest review request, finished with that verdict and exactly one
+consumed result, and the snapshot must be that candidate's complete snapshot. A
+recheck receipt must be closed on that review. Active, uncertain or unconsumed
+reviews, a working implementer, open recovery, restart holds, pending controls,
+manager stops or switches refuse the request.
+
+The result state is `replan_created_pending_quiescence`. The new attempt waits
+in `materialization_pending` while the old attempt's roles are stopped. Its
+workspace is created only after every old role has exited with recorded
+process-group quiescence. Checks, captures, permission requests, keyboard
+control, submitted or unconfirmed guidance, recovery, restart, switch and
+control state must also be settled, and the repository claim must be one
+running claim. Until then nothing is copied and the claim stays with the old
+attempt. The workspace must match the rejected snapshot exactly, including
+untracked files, deletions and modes. If the old attempt's state changes during
+copying, the new attempt needs recovery and keeps its reserved lineage. The
+old attempt's workspace is left in place. Identical replay returns the same new
+attempt; another operation for the same old attempt is refused.
+
+Configured guidance normally comes from the project repository, and a
+different file already in a new workspace is refused. A rework or replan
+workspace may keep a guidance file whose content differs from the repository
+only if the old attempt's activated policy pinned exactly that content through
+its latest guidance approval. That policy must also still match the current
+workflow, manifest and active configuration, and the bytes must be the source
+snapshot's. Protected workflow files (`.agents/`, `.claude/`, `.codex/`,
+`AGENTS.md`) and package or configuration files are never kept this way. Each
+kept file is listed with its provenance in the new workspace policy under
+`rework_guidance_sources` and in a `rework.guidance.preserved` audit event; no
+plan approval, accepted snapshot or review outcome comes with it. If
+materialization stopped with a recovery, fix the cause and retry the same
+lineage with `resolve_recovery`, using the rework intent id as `recovery_id`,
+no `session_id`, and `decision` `retry_materialization`. The retry re-verifies
+the workspace against the exact source snapshot before continuing.
+
+Service startup leaves an unfinished rework or replan workspace alone. Until its
+lineage completes or is cancelled, only that lineage's own materialization and
+the recovery retry above can promote the workspace or move the claim; ordinary
+startup reconciliation neither promotes nor recovers it, and never retries it.
 
 ## Bundled workflow identity changes
 
@@ -277,7 +409,13 @@ reuse old qualification evidence to bypass these checks.
 
 The database commands operate on the instance selected by `--data-dir`. Current
 schema only is supported: they do not upgrade an earlier installation. Fresh
-service initialization still creates the current schema.
+service initialization still creates the current schema. Service start, under
+the instance lock, upgrades an existing schema 31 database to schema 32 in one
+migration transaction. It refuses every other older or newer schema, including
+schema 30, without changing it, and a failed upgrade leaves the database at
+schema 31. Schema 32 records whether each final-repair recheck receipt came from
+a normal final change request or the historical sixth-review recovery; existing
+receipts keep every recorded value.
 
 ```sh
 llmrelay database --data-dir <ABSOLUTE_INSTANCE_PATH> inspect

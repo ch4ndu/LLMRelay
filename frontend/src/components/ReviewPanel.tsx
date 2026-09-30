@@ -1,4 +1,5 @@
-import { ErrorNotice } from "./ErrorNotice";
+import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
+import { MarkdownContent } from "./MarkdownContent";
 import { useRef, useState } from "react";
 import {
   ApiError,
@@ -144,41 +145,49 @@ export function ReviewPanel(
       <span className="eyebrow">Your decision</span>
       <h3>
         {implementation
-          ? "Authorize implementation of this exact plan"
+          ? "Allow implementation of this plan"
           : plan
           ? "Approve the reviewed plan"
           : "Accept the reviewed result"}
       </h3>
       <p>
         {implementation
-          ? "Plan approval and implementation authorization are separate human decisions. This authorizes only the current reviewed plan."
+          ? "Approving the plan and allowing implementation are separate decisions. This allows implementation of this exact plan only."
           : plan
-          ? `Plan ${
-            attempt.plan_hash?.slice(0, 12)
-          } passed independent review. Read the exact persisted plan before approval.`
-          : `Candidate ${
-            attempt.candidate_hash?.slice(0, 12)
-          } passed configured checks and final review.`}
+          ? "The plan passed its independent review. Read it before approving."
+          : "The result passed its selected checks and final review."}
       </p>
       {!plan && !implementation && (
         <p className="hint">
-          Verification evidence: {verification.filter((item) =>
+          {verification.filter((item) =>
             item.latest_run?.freshness_state === "current" &&
             item.latest_run.exit_code === 0
-          ).length}/{verification.length}{" "}
-          selected checks current. Manager conformance revision{" "}
-          {attempt.manager_conformance_revision}; human acceptance remains a
-          separate decision.
+          ).length} of {verification.length}{" "}
+          selected checks passed on this result. Accepting it is your decision.
         </p>
       )}
       {(plan || implementation) && (
-        <pre className="plan-content">{attempt.plan || "The persisted plan text is unavailable; approval is disabled."}</pre>
+        attempt.plan
+          ? <MarkdownContent className="plan-content" text={attempt.plan} />
+          : (
+            <p className="warning">
+              The plan text is not available, so it cannot be approved. Refresh
+              the dashboard; if it stays missing, check Technical details.
+            </p>
+          )
       )}
+      <TechnicalDetails>
+        <p>
+          {plan || implementation
+            ? `Plan ${attempt.plan_hash || "unavailable"}`
+            : `Candidate ${attempt.candidate_hash || "unavailable"} · manager conformance revision ${attempt.manager_conformance_revision ?? "none"}`}
+        </p>
+      </TechnicalDetails>
       {!plan && (
         <>
           <textarea
             aria-label="Review or rework feedback"
-            placeholder="Required context for requested rework"
+            placeholder="Describe what should change (required to request rework)"
             value={feedback}
             onChange={(event) => setFeedback(event.target.value)}
           />
@@ -187,8 +196,8 @@ export function ReviewPanel(
               type="checkbox"
               checked={carryApproval}
               onChange={(event) => setCarryApproval(event.target.checked)}
-            />Carry plan approval only if scope and role configuration still
-            match
+            />Keep the approved plan for the rework (only when the task scope
+            and agent settings are unchanged)
           </label>
         </>
       )}
@@ -220,7 +229,7 @@ export function ReviewPanel(
                   ),
                 })}
             >
-              Authorize implementation
+              Allow implementation
             </button>
           )
           : (
@@ -235,7 +244,7 @@ export function ReviewPanel(
       </div>
       {migration && (
         <section className="review-row">
-          <strong>Migrate this active attempt to the current workflow</strong>
+          <strong>Move this task to the current workflow</strong>
           <span>{migration.reason}</span>
           <button
             disabled={!migration.enabled ||
@@ -255,20 +264,20 @@ export function ReviewPanel(
                 ),
               })}
           >
-            Migrate current attempt
+            Move to current workflow
           </button>
         </section>
       )}
       {additionalExplorer && (
         <section className="review-row">
-          <strong>Authorize one additional Explorer call</strong>
+          <strong>Approve one more Explorer call</strong>
           <span>{additionalExplorer.reason}</span>
           <textarea
             aria-label="Additional Explorer justification"
             maxLength={400}
             value={additionalJustification}
             onChange={(event) => setAdditionalJustification(event.target.value)}
-            placeholder="Bounded justification for one rescue Explorer call"
+            placeholder="Why one more Explorer call is needed"
           />
           <button
             disabled={!additionalExplorer.enabled ||
@@ -284,7 +293,7 @@ export function ReviewPanel(
                 justification: additionalJustification.trim(),
               })}
           >
-            Authorize one rescue Explorer
+            Approve one more Explorer call
           </button>
         </section>
       )}

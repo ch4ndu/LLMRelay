@@ -31,16 +31,20 @@ export function History(
     }
   };
   const rows = tasks.filter((t) =>
-    (t.lifecycle === "done" && (showArchived || !t.archived)) ||
+    (["done", "cancelled"].includes(t.lifecycle) &&
+      (showArchived || !t.archived)) ||
     (t.lifecycle === "backlog" && t.archived)
   );
   return (
     <section className="history">
       <header className="page-heading">
         <div>
-          <span className="eyebrow">Completed tasks and archived drafts</span>
-          <h1>History and archive</h1>
-          <p>Accepted results and evidence stay available when hidden.</p>
+          <span className="eyebrow">History</span>
+          <h1>Completed and archived tasks</h1>
+          <p>
+            Accepted, cancelled and archived tasks. Their results and evidence
+            stay available here.
+          </p>
         </div>
         <label className="toggle">
           <input
@@ -52,17 +56,25 @@ export function History(
       </header>
       {error && <ErrorNotice error={error} />}
       <div className="history-list">
+        {!rows.length && (
+          <p className="empty">No completed or archived tasks yet.</p>
+        )}
         {rows.map((task) => (
           <article key={task.id}>
             <button onClick={() => onOpen(task)}>
-              <strong>{task.id} · {task.title}</strong>
+              <strong>{task.title}</strong>
               <small>
-                {projects.find((p) => p.id === task.project_id)?.display_name} ·
-                {" "}
-                {task.active_attempt?.candidate_hash?.slice(0, 12)}
+                {projects.find((p) => p.id === task.project_id)?.display_name}
+                {" · "}
+                {task.lifecycle === "done"
+                  ? "Completed"
+                  : task.lifecycle === "cancelled"
+                  ? "Cancelled"
+                  : "Draft"}
               </small>
+              <small className="task-key">{task.id}</small>
             </button>
-            <span>{task.archived ? "Archived" : "Visible"}</span>
+            <span>{task.archived ? "Archived" : "Shown in Completed"}</span>
             <button disabled={!task.archived && !task.can_archive} onClick={() => toggle(task)}>
               {task.archived ? "Restore" : "Archive"}
             </button>

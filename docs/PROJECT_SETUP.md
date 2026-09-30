@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-In the dashboard, choose **Add project**, enter a project name and the absolute path to an existing local Git repository, and submit the form. Field labels and validation explain missing values before submission; the service then validates the physical repository identity and current revision. A relink is accepted only for another path to the same physical repository and only while no attempt is active.
+In the dashboard, choose **Add project**, enter a project name and the absolute path to an existing local Git repository, and submit the form. Field labels and validation explain missing values before submission; the service then validates the physical repository identity and current revision. A relink is accepted only for another path to the same physical repository and only while no attempt is active. **Validate and relink** also accepts the current path: use it after committing changes so new tasks start from the folder's current commit.
 
 Continue through project setup before running tasks. The five stages organize the existing approvals:
 
@@ -60,7 +60,9 @@ See [provider compatibility and permissions](SECURITY.md) for supported Codex ac
 
 Provider profiles remain `Unverified` until matching local preflight succeeds. An imported upstream preflight document is validated as installation data, but cannot by itself prove the local executable and application sandbox behavior. Changing a profile creates a pending configuration revision and requires matching evidence before that profile can run. Failed or declined probes preserve the setup draft and do not activate the project.
 
-During supported Implementer sessions, the Workspace **Approval inbox** handles native action requests the CLI actually emits with **Approve once**, **Always approve matching actions**, and **Deny**. Codex honors approvals already granted through its native policy, so a natively allowed or sandbox-allowed action may run without a new inbox item. LLMRelay does not enumerate, create, edit, or revoke native Codex approvals; dashboard **Revoke** affects only LLMRelay-owned reusable rules. Workflow approvals, review-budget changes, role switching, and final acceptance remain separate human dashboard actions. Trusting a folder does not grant those actions to an agent.
+An activated setup keeps showing its recorded results. When a selected profile's settings changed after verification, its last verification failed, or newer agent evidence replaced it, the setup page says **Setup activated** and names each profile that must be verified again, instead of reporting an unknown agent version. A version is reported as unsupported only when an agent actually reported that version, or when this LLMRelay release has no support for that provider at all.
+
+During supported Implementer sessions, the Workspace **Approvals** list handles native action requests the CLI actually emits with **Approve once**, **Always approve matching actions**, and **Deny**. Codex honors approvals already granted through its native policy, so a natively allowed or sandbox-allowed action may run without a new inbox item. LLMRelay does not enumerate, create, edit, or revoke native Codex approvals; dashboard **Revoke** affects only LLMRelay-owned reusable rules. Workflow approvals, review-budget changes, role switching, and final acceptance remain separate decisions you make in the dashboard. Trusting a folder does not grant those actions to an agent.
 
 
 
@@ -72,11 +74,11 @@ The setup page lists detected workflow locations and asks how to preserve the or
 
 Normal onboarding uses project setup's explicitly approved profile probes. Each probe is bound to its setup operation, selected profile, fixture, generation, executable, and sandbox policy. It runs in the app-owned empty fixture and cannot activate ordinary task authority in an uninitialized project. Setup discovery and the subsequently selected-profile probe attempt have separate immutable configurations. Live calls use the installed CLI accounts and their normal allowance; a failed probe remains unverified and is not silently retried.
 
-Retained setup discovery and profile probes use exactly two turns. After the first turn reaches a strict native `Stop` boundary, the service verifies the exact managed session and process inventory before marking it idle. It then stops that completed first invocation without creating a replacement-manager control or spending the retained resume. The session must exit with verified process-group quiescence before **Resume retained session** becomes available; the human starts that second and final turn explicitly. The service-owned stop receipt authorizes a new invocation credential only for that one exact resume. At the bounded stop deadline, an attached child is reconciled first and an unattached generation is checked against fresh operating-system PID, start, process-group, and boot evidence. A verified exit wins the race; a proven-live or unverifiable generation enters explicit recovery without another signal. **Stop discovery manager** remains the separate replacement action and does not stand in for this service-owned first-turn completion.
+Retained setup discovery and profile probes use exactly two turns. After the first turn reaches a strict native `Stop` boundary, the service verifies the exact managed session and process inventory before marking it idle. It then stops that completed first invocation without creating a replacement-manager control or spending the retained resume. The session must exit with verified process-group quiescence before **Resume the stopped session** becomes available; you start that second and final turn explicitly. The service-owned stop receipt authorizes a new invocation credential only for that one exact resume. At the bounded stop deadline, an attached child is reconciled first and an unattached generation is checked against fresh operating-system PID, start, process-group, and boot evidence. A verified exit wins the race; a proven-live or unverifiable generation enters explicit recovery without another signal. **Stop discovery manager** remains the separate replacement action and does not stand in for this service-owned first-turn completion.
 
 On a first Codex launch, open the session output to review the native folder and hook trust prompts. Trust applies to the displayed fixture and configured hooks; it does not approve arbitrary agent commands. If the initial session-start hook ran before hook trust was established, LLMRelay cannot safely identify that conversation for resume. Stop that session, wait for it to exit, then explicitly choose **Launch exact-profile retry** after reviewing the hooks. This starts another CLI session and uses its normal allowance; LLMRelay retains the first session's history and does not manufacture a session identity or retry automatically.
 
-If a setup or runtime probe reports unresolved process ownership, its project setup view provides **Verify quiescence and reconcile**. Enter a short recovery note and let the service check the recorded operating-system process identities. The note cannot override a live or unknown process. Successful reconciliation refreshes the view and leaves the old credential revoked; a separate eligible resume receives a new credential bound to that exact invocation and its current setup or runtime authority. Use **Resume retained session** for setup or **Resume same native session** for runtime verification. A stale profile, consumed permission, superseded admission, or fresh-only final verifier cannot be resumed through recovery.
+If a setup or runtime probe reports unresolved process ownership, its project setup view provides **Verify quiescence and reconcile**. Enter a short recovery note and let the service check the recorded operating-system process identities. The note cannot override a live or unknown process. Successful reconciliation refreshes the view and leaves the old credential revoked; a separate eligible resume receives a new credential bound to that exact invocation and its current setup or runtime authority. Use **Resume the stopped session** for setup or **Resume the verification** for runtime verification. A stale profile, consumed permission, superseded admission, or fresh-only final verifier cannot be resumed through recovery.
 
 After installation, ordinary runtime checks establish evidence for the policy used by task roles. Preparing the scope or editing a setting launches no agent. Human authorization, launching a check, and publishing its evidence are separate actions. Publication is bound to the exact current profile, configuration, adapter, native session, and observed policy. Only selected installed providers are required. A changed executable or proof may require fresh evidence and explicit task-profile reactivation; historical evidence stays available for diagnosis.
 
@@ -137,9 +139,30 @@ current authority. A mismatched path stays in recovery.
 Recovery evidence identifies the failed stage: `repository_inspection` retains
 the inspection error; `repository_identity` retains the expected and observed
 repository identities and observed base revision. `policy_materialization` is
-reserved for failures while materializing the workspace policy. Successful retry
-or cancellation resolves the reservation record and removes its old recovery
-actions from the refreshed task.
+recorded when preparing the workspace would overwrite a workflow or guidance
+file that differs from the reviewed bytes. Successful retry or cancellation
+resolves the reservation record and removes its old recovery actions from the
+refreshed task; a failed reservation stays in the task's history.
+
+### Uncommitted setup changes
+
+A task workspace always starts from the project's registered commit, then
+receives the activated workflow files and approved guidance from the project
+folder. If setup ran again, or a guidance file was edited, without the change
+being committed, the committed copy can match neither the activated bytes nor
+the original that the installation approved for replacement. LLMRelay checks
+for this before **Make Ready**, when a task is created as Ready, and again when
+a Ready task is picked up. The check names the affected files and stops there;
+it never overwrites them. To continue, commit or restore the listed changes,
+then choose **Validate and relink** in Project settings. The same check reports
+a project folder that has moved past the registered commit.
+
+A reservation that already failed this way is kept as recorded history. When
+only a guidance file differs, restoring it to the committed version lets
+**Inspect and retry workspace reservation** succeed. Changed workflow files
+cannot be fixed by retrying, because the recorded commit cannot change: choose
+**Verify and cancel reservation**, commit the changes, relink, and create the
+task again.
 
 **Verify and cancel reservation** checks ownership, abandons the reservation,
 releases its exact claim and cancels the attempt/task without deleting worktree
@@ -147,16 +170,16 @@ contents. Any surviving path is reported for separate cleanup. Startup cannot
 reactivate a cancelled attempt's workspace claim. Generic Cancel is not a
 substitute for this reservation-specific recovery action.
 
-If **Resume retained session** is rejected because the executable or another
+If **Resume the stopped session** is rejected because the executable or another
 frozen runtime binding changed, the refreshed setup card explains the rejection.
-**Start fresh accounted setup session** appears only while the same selected
+**Start a fresh setup session** appears only while the same selected
 profile, current setup permit and remaining authority allow it. Changed profile
 or setup authority requires its own replacement/verification flow. Runtime
-probes instead use **Prepare corrected runtime verification**; final-verifier
+probes instead use **Prepare a new verification**; final-verifier
 invocations remain fresh-only.
 
 An adapter update alone does not qualify existing profiles. After a CLI upgrade,
 complete the current setup/runtime verification for each exact role identity you
 intend to activate. Historical Supported rows remain evidence for their original
 identity and cannot substitute for current proof. A failed retained runtime probe
-uses **Prepare corrected runtime verification** rather than silently restarting.
+uses **Prepare a new verification** rather than silently restarting.

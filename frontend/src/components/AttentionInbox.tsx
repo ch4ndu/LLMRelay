@@ -1,4 +1,4 @@
-import { ErrorNotice } from "./ErrorNotice";
+import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import { useMemo, useState } from "react";
 import { command, operationId } from "../api";
 import type {
@@ -9,12 +9,12 @@ import type {
 } from "../types";
 
 const attentionGroups: Array<{ category: AttentionCategory; label: string }> = [
-  { category: "permission", label: "Permissions" },
-  { category: "decision", label: "Decisions" },
-  { category: "recovery", label: "Recovery" },
-  { category: "compatibility", label: "Compatibility" },
-  { category: "blocked", label: "Blocked" },
-  { category: "awaiting_acceptance", label: "Completed · awaiting acceptance" },
+  { category: "permission", label: "Waiting for your approval" },
+  { category: "decision", label: "Waiting for your decision" },
+  { category: "recovery", label: "Manual action needed" },
+  { category: "compatibility", label: "Setup needs attention" },
+  { category: "blocked", label: "Can't continue yet" },
+  { category: "awaiting_acceptance", label: "Ready for your review" },
 ];
 
 const sameTarget = (left: AttentionTarget, right: AttentionTarget) => {
@@ -36,6 +36,7 @@ function unresolvedTarget(
       ? undefined
       : "the permission request was already decided or changed.";
   }
+  if (target.kind === "diagnostics") return undefined;
   if (target.kind === "project_setup") {
     const project = state.projects.find((candidate) =>
       candidate.id === target.project_id
@@ -83,6 +84,13 @@ function unresolvedTarget(
           )
         ? undefined
         : "the recovery record was resolved or its attempt was superseded.";
+    case "role_settings":
+      return task.role_settings.some((setting) =>
+          setting.role === target.role &&
+          setting.revision === target.settings_revision
+        )
+        ? undefined
+        : "the agent settings changed.";
   }
 }
 
@@ -127,16 +135,25 @@ const attentionMarker = (target: AttentionTarget) => {
       return `recovery_record:${target.recovery_id}`;
     case "project_setup":
       return `project_setup:${target.project_id}`;
+    case "role_settings":
+      return `role_settings:${target.task_id}:${target.role}`;
+    case "diagnostics":
+      return "diagnostics";
   }
 };
 
-/** The rendered element marked for exactly `target`; no other panel stands in. */
+/**
+ * The rendered element marked for exactly `target`; no other panel stands in.
+ * Content behind an open dialog is inert and never receives the focus.
+ */
 export function attentionFocusElement(
   target: AttentionTarget,
 ): HTMLElement | undefined {
   const marker = attentionMarker(target);
   return [...document.querySelectorAll<HTMLElement>("[data-attention-target]")]
-    .find((element) => element.dataset.attentionTarget === marker);
+    .find((element) =>
+      element.dataset.attentionTarget === marker && !element.closest("[inert]")
+    );
 }
 
 export function AttentionInbox(
@@ -200,10 +217,17 @@ export function AttentionInbox(
   };
 
   return (
-    <section className="panel inbox" aria-label="Attention inbox">
+    <section
+      className="panel inbox"
+      id="workspace-attention"
+      aria-labelledby="attention-title"
+      tabIndex={-1}
+    >
       <header>
-        <h3>Attention inbox</h3>
-        <span>{state.attention.length}</span>
+        <h2 id="attention-title">Needs your attention</h2>
+        <span className="count" aria-label={`${state.attention.length} waiting`}>
+          {state.attention.length}
+        </span>
       </header>
       {notice && (
         <p className="attention-notice" role="status">
@@ -216,6 +240,11 @@ export function AttentionInbox(
           item.category === category
         );
         if (!items.length) return null;
+        // One explanation shared by every item is shown once for the group.
+        const sharedReason = items.length > 1 &&
+            items.every((item) => item.reason === items[0].reason)
+          ? items[0].reason
+          : undefined;
         return (
           <div
             key={category}
@@ -223,98 +252,151 @@ export function AttentionInbox(
             role="group"
             aria-label={`${label} (${items.length})`}
           >
-            <h4>
-              {label} <span>{items.length}</span>
-            </h4>
+            <h3>
+              {label} <span className="count">{items.length}</span>
+            </h3>
+            {sharedReason && <p className="hint">{sharedReason}</p>}
             {items.map((item) => {
               const { target: destination } = item;
-              const project = destination &&
-                projectName(destination.project_id);
-              return destination
-                ? (
-                  <button
-                    key={item.id}
-                    type="button"
-                    className="attention-item"
-                    data-attention-id={item.id}
-                    onClick={() => open(item, destination)}
-                  >
+              const project = destination && "project_id" in destination
+                ? projectName(destination.project_id)
+                : undefined;
+              const subject = [item.task_title, project].filter(Boolean).join(
+                " · ",
+              );
+              return (
+                <article
+                  key={item.id}
+                  className="attention-item"
+                  data-attention-id={item.id}
+                >
+                  <div className="attention-copy">
                     <strong>{item.title}</strong>
-                    <small>{item.reason}</small>
-                    {project && <em>{project}</em>}
-                  </button>
-                )
-                : (
-                  <div
-                    key={item.id}
-                    className="attention-item restore-hold-item"
-                    data-attention-id={item.id}
-                  >
-                    <strong>{item.title}</strong>
-                    <small>{item.reason}</small>
-                    {item.held_tasks.map((held) => (
-                      <button
-                        key={held.task_id}
-                        type="button"
-                        onClick={() => open(item, { kind: "task", ...held })}
-                      >
-                        {held.task_id} · {taskTitle(held.task_id)}
-                      </button>
-                    ))}
+                    {subject && <small className="attention-subject">{subject}</small>}
+                    {!sharedReason && item.reason && <p>{item.reason}</p>}
+                    {item.details && (
+                      <TechnicalDetails>
+                        <pre>{item.details}</pre>
+                      </TechnicalDetails>
+                    )}
                   </div>
-                );
+                  {destination
+                    ? (
+                      <button
+                        type="button"
+                        className="attention-open"
+                        onClick={() => open(item, destination)}
+                      >
+                        {item.action?.label || "Open"}
+                        <span className="visually-hidden">: {item.title}</span>
+                      </button>
+                    )
+                    : item.held_tasks.length > 0
+                    ? (
+                      <div className="held-tasks">
+                        {item.held_tasks.map((held) => (
+                          <button
+                            key={held.task_id}
+                            type="button"
+                            onClick={() => open(item, { kind: "task", ...held })}
+                          >
+                            Open {taskTitle(held.task_id) || "task"}
+                          </button>
+                        ))}
+                      </div>
+                    )
+                    : (
+                      // No current page can act on this item, so the only
+                      // honest action is to fetch the latest state.
+                      <div className="attention-refresh">
+                        <small className="hint">
+                          Nothing here can be opened directly. Refresh to see
+                          whether it has been resolved.
+                        </small>
+                        <button type="button" onClick={onChanged}>
+                          Refresh
+                          <span className="visually-hidden">: {item.title}</span>
+                        </button>
+                      </div>
+                    )}
+                </article>
+              );
             })}
           </div>
         );
       })}
       {!state.attention.length && (
-        <p className="empty">
-          No task needs a human decision.
-        </p>
+        <p className="empty">Nothing is waiting for you.</p>
       )}
-      <div className="guidance">
-        <h4>Manager guidance</h4>
-        <select
-          aria-label="Guidance target"
-          value={target}
-          onChange={(event) => setTarget(event.target.value)}
-        >
-          <option value="">Choose running manager</option>
-          {targets.map(({ task, session }) => (
-            <option
-              key={session.role_generation_id}
-              value={session.role_generation_id}
-            >
-              {task.id} · {session.provider} ·{" "}
-              {session.role_generation_id.slice(0, 8)}
-            </option>
-          ))}
-        </select>
+      <details className="guidance">
+        <summary>Send guidance to a running manager</summary>
+        <label>
+          Manager
+          <select
+            aria-label="Guidance target"
+            value={target}
+            onChange={(event) => setTarget(event.target.value)}
+          >
+            <option value="">Choose a running manager</option>
+            {targets.map(({ task, session }) => (
+              <option
+                key={session.role_generation_id}
+                value={session.role_generation_id}
+              >
+                {task.title} · {session.provider === "claude" ? "Claude" : "Codex"}
+              </option>
+            ))}
+          </select>
+        </label>
         {!targets.length && (
           <small className="hint">
-            Guidance becomes available while a task-bound manager session is
-            active.
+            Guidance can be sent while a task's manager is running.
           </small>
         )}
         <textarea
           aria-label="Guidance message"
           value={message}
           onChange={(event) => setMessage(event.target.value)}
-          placeholder="Submit once; delivery waits for a proven safe idle boundary."
+          placeholder="The manager receives this when it next pauses between steps."
         />
         <button disabled={!target || !message.trim()} onClick={send}>
           Queue guidance
         </button>
         {error && <ErrorNotice error={error} />}
-        <ul>
-          {state.guidance.slice(0, 8).map((item) => (
-            <li key={String(item.id)}>
-              <span>{String(item.body)}</span>
-              <em>{String(item.state).replaceAll("_", " ")}</em>
-            </li>
-          ))}
-        </ul>
-      </div>
+        {state.guidance.length > 0 && (
+          <ul>
+            {state.guidance.slice(0, 8).map((item) => (
+              <li key={String(item.id)}>
+                <span>{String(item.body)}</span>
+                <em>{guidanceState(String(item.state))}</em>
+              </li>
+            ))}
+          </ul>
+        )}
+        <TechnicalDetails>
+          <p>
+            Guidance waits for a safe pause between the manager's steps. If
+            delivery cannot be confirmed it is not sent again automatically.
+          </p>
+        </TechnicalDetails>
+      </details>
     </section>
   );
+}
+
+export function guidanceState(state: string): string {
+  switch (state) {
+    case "queued":
+    case "delivery_reserved":
+      return "Waiting for the manager to pause";
+    case "written_awaiting_submit":
+    case "submitted":
+      return "Sent to the manager";
+    case "acknowledged":
+      return "Received by the manager";
+    case "delivery_unknown":
+      return "Delivery not confirmed — check the manager's output before sending again";
+    default:
+      return state.replaceAll("_", " ");
+  }
 }

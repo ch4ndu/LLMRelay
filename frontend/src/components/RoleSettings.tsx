@@ -50,7 +50,11 @@ export function CompatibilityDetails({
           : compatibility.status === "contract_changed"
           ? "The agent connection settings have changed since the last verification."
           : compatibility.status === "evidence_stale"
-          ? "Verification for these agent settings is missing or out of date."
+          ? compatibility.missing_evidence.includes(
+              "exact_selected_profile_observation",
+            )
+            ? compatibility.message
+            : "Verification for these agent settings is missing or out of date."
           : candidate
           ? "Version recognition alone does not mean this profile is ready to run. Check its verification status."
           : "LLMRelay's agent support information could not be validated."}
@@ -405,8 +409,8 @@ export function RoleSettings(
   return (
     <section className="panel role-settings">
       <header>
-        <h3>Host manager + five delegated roles</h3>
-        <span>Requested · effective · running</span>
+        <h3>Agent roles</h3>
+        <span>The manager plus five delegated roles</span>
       </header>
       <div className="role-list">
         {ROLES.map((role) => {
@@ -544,17 +548,21 @@ export function RoleSettings(
             item.old_generation_id === effective?.effective_generation_id
           );
           return (
-            <article key={role}>
+            <article
+              key={role}
+              data-attention-target={`role_settings:${task.id}:${role}`}
+              tabIndex={-1}
+            >
               <div>
                 <strong>{roleLabel(role)}</strong>
                 <small>
                   {running
-                    ? `${running.provider} running`
+                    ? "Running now"
                     : session
-                    ? `${session.status}, ${session.readiness}`
+                    ? session.status === "exited" ? "Not running" : session.status.replaceAll("_", " ")
                     : effective
-                    ? "effective, no attached process"
-                    : "requested"}
+                    ? "Active, not running"
+                    : "Not started yet"}
                 </small>
                 {role === "implementer" &&
                   lanes.filter((lane) =>
@@ -571,18 +579,21 @@ export function RoleSettings(
               </div>
               {!terminal && editing === role && value
                 ? (
-                  <div className="compact-fields">
-                    <select
-                      value={value.provider}
-                      onChange={(event) =>
-                        setConfig({
-                          ...value,
-                          provider: event.target.value as "codex" | "claude",
-                        })}
-                    >
-                      <option value="codex">Codex</option>
-                      <option value="claude">Claude</option>
-                    </select>
+                  <div className="compact-fields role-edit-fields">
+                    <label>
+                      Provider
+                      <select
+                        value={value.provider}
+                        onChange={(event) =>
+                          setConfig({
+                            ...value,
+                            provider: event.target.value as "codex" | "claude",
+                          })}
+                      >
+                        <option value="codex">Codex</option>
+                        <option value="claude">Claude</option>
+                      </select>
+                    </label>
                     <ModelSelector
                       provider={value.provider}
                       value={value.model}
@@ -590,38 +601,51 @@ export function RoleSettings(
                       label={`${roleLabel(role)} exact model`}
                       knownExactModels={knownExactModels(value.provider)}
                     />
-                    <select
-                      value={value.effort}
-                      onChange={(event) =>
-                        setConfig({ ...value, effort: event.target.value })}
-                    >
-                      {!["low", "medium", "high", "xhigh", "max", "ultra"]
-                        .includes(value.effort) && (
-                        <option value={value.effort}>{value.effort}</option>
-                      )}
-                      <option>low</option>
-                      <option>medium</option>
-                      <option>high</option>
-                      <option>xhigh</option>
-                      <option>max</option>
-                      <option>ultra</option>
-                    </select>
-                    <button onClick={() => save(role)}>Save request</button>
+                    <label>
+                      Effort
+                      <select
+                        value={value.effort}
+                        onChange={(event) =>
+                          setConfig({ ...value, effort: event.target.value })}
+                      >
+                        {!["low", "medium", "high", "xhigh", "max", "ultra"]
+                          .includes(value.effort) && (
+                          <option value={value.effort}>{value.effort}</option>
+                        )}
+                        <option>low</option>
+                        <option>medium</option>
+                        <option>high</option>
+                        <option>xhigh</option>
+                        <option>max</option>
+                        <option>ultra</option>
+                      </select>
+                    </label>
+                    <div className="button-row role-edit-actions">
+                      <button className="primary" onClick={() => save(role)}>
+                        Save request
+                      </button>
+                      <button onClick={() => setEditing(undefined)}>
+                        Cancel
+                      </button>
+                    </div>
                   </div>
                 )
                 : (
                   <>
-                    <span>
-                      requested rev {requested?.revision ?? "draft"}: {value
-                        ? `${value.provider} · ${value.model} · ${value.effort}`
+                    <span className="role-profile">
+                      {value
+                        ? `${value.provider === "claude" ? "Claude" : "Codex"} · ${value.model} · ${value.effort}`
                         : "Not configured"}
-                      <br />
-                      <small>
-                        effective rev {effective?.revision ?? "—"}
-                        {session
-                          ? ` · ${session.id.slice(0, 8)} · ${session.status}`
-                          : ""}
-                      </small>
+                      {pendingReplacement && (
+                        <small> · requested change, not active yet</small>
+                      )}
+                      <TechnicalDetails>
+                        <p>
+                          requested revision {requested?.revision ?? "draft"} ·
+                          effective revision {effective?.revision ?? "none"}
+                          {session ? ` · session ${session.id} · ${session.status}` : ""}
+                        </p>
+                      </TechnicalDetails>
                     </span>
                     {!terminal && value && (
                       <button
@@ -635,8 +659,8 @@ export function RoleSettings(
                     )}
                     {!terminal && !value && (
                       <small>
-                        Activate project profiles or save an explicit task
-                        override before editing this role.
+                        Finish project setup or save settings for this task
+                        before editing this role.
                       </small>
                     )}
                     {!task.archived &&
@@ -645,29 +669,26 @@ export function RoleSettings(
                       !contractUnavailable &&
                       exactResume.operation !== "runtime_probe_resume" && (
                       <button onClick={() => resume(session, exactResume)}>
-                        Resume exact native session
+                        Resume the stopped session
                       </button>
                     )}
                   </>
                 )}
               {intent && (
                 <small className="badge waiting">
-                  Switch {String(intent.state).replaceAll("_", " ")} · lane{" "}
-                  {intent.lane_id === "default"
-                    ? "default"
-                    : intent.lane_id.slice(0, 8)} · checkpoint{" "}
-                  {String(intent.checkpoint_snapshot_id).slice(0, 8)}
+                  Role change: {String(intent.state).replaceAll("_", " ")}
                 </small>
               )}
               {productionRestriction && (
                 <div className="hint">
                   <span className={`badge ${productionRestriction.status}`}>
-                    Production {productionRestriction.status[0].toUpperCase() +
-                      productionRestriction.status.slice(1)}
+                    {productionRestriction.status === "unverified"
+                      ? "Needs verification"
+                      : "Not supported"}
                   </span>{" "}
                   {productionRestriction.status === "unverified"
-                    ? "Validation required: "
-                    : "Launch blocked: "}
+                    ? "Verification required: "
+                    : "Cannot start: "}
                   {productionRestriction.status === "unverified"
                     ? "Run verification for this agent profile in Project setup or Agent settings before starting work."
                     : "This agent cannot run with the current settings. Review Technical details and choose a supported configuration."}
@@ -677,11 +698,10 @@ export function RoleSettings(
               <CompatibilityDetails compatibility={compatibility} />
               {requested && preparation?.task_profile_source && (
                 <small>
-                  Authority source: {preparation.task_profile_source ===
-                      "project_default"
-                    ? "project default"
-                    : "task override"} · adapter {preparation.adapter ||
-                    "unavailable"}
+                  Settings from{" "}
+                  {preparation.task_profile_source === "project_default"
+                    ? "the project"
+                    : "this task"}
                 </small>
               )}
               {!terminal && requested && preparation?.status === "unverified" &&
@@ -700,11 +720,11 @@ export function RoleSettings(
                         />
                       </label>
                       <small>
-                        Enter the exact human-confirmed live endpoint before
-                        preparing the fresh runtime proof. The bounded native
-                        check makes no cmux control request and preserves its
-                        native exit and stderr; an absent or refused socket
-                        cannot count as a sandbox denial.
+                        Enter the socket path of the cmux you are running now
+                        before preparing the verification. The check does not
+                        control cmux; if the socket is missing or refused the
+                        verification fails instead of being treated as a
+                        sandbox limit.
                       </small>
                     </>
                   )}
@@ -714,16 +734,16 @@ export function RoleSettings(
                       onClick={() =>
                         void prepareRuntime(role, requested.revision)}
                     >
-                      Prepare exact runtime proof
+                      Prepare verification
                     </button>
                   )}
                   {runtimeAdmission?.state === "pending_approval" && (
                     <>
                       <small>
-                        Scope <code>{runtimeAdmission.scope_hash}</code>{" "}
-                        · fresh calls:{" "}
-                        {runtimeAdmission.fresh_call_count}. No call has
-                        started.
+                        This verification makes{" "}
+                        {runtimeAdmission.fresh_call_count} new agent call
+                        {runtimeAdmission.fresh_call_count === 1 ? "" : "s"}.
+                        Nothing has started yet.
                       </small>
                       <button
                         onClick={() =>
@@ -732,7 +752,7 @@ export function RoleSettings(
                             runtimeAdmission.scope_hash,
                           )}
                       >
-                        Approve scoped runtime call
+                        Approve verification call
                       </button>
                     </>
                   )}
@@ -741,7 +761,7 @@ export function RoleSettings(
                       onClick={() =>
                         void runRuntime(runtimeAdmission.id, role, "launch")}
                     >
-                      Launch bounded runtime probe
+                      Start verification
                     </button>
                   )}
                   {runtimeAdmission &&
@@ -753,17 +773,15 @@ export function RoleSettings(
                       onClick={() =>
                         void prepareRuntime(role, requested.revision)}
                     >
-                      Prepare corrected runtime verification
+                      Prepare a new verification
                     </button>
                   )}
                   {runtimeAdmission?.probe_state === "running" && (
                     <small>
-                      Probe {runtimeAdmission.session_status || "reserved"}{" "}
-                      · trust {runtimeAdmission.hook_trust || "pending"}{" "}
-                      · session{" "}
-                      <code>{runtimeAdmission.session_id}</code>. Use the
-                      existing Workspace terminal and permission inbox for
-                      observable output and human decisions.
+                      Verification is{" "}
+                      {(runtimeAdmission.session_status || "starting").replaceAll("_", " ")}.
+                      Watch its output in the Workspace and answer any
+                      approvals it asks for there.
                     </small>
                   )}
                   {runtimeExactResume && runtimeSession && (
@@ -771,7 +789,7 @@ export function RoleSettings(
                       onClick={() =>
                         void resume(runtimeSession, runtimeExactResume)}
                     >
-                      Resume same native probe
+                      Resume the verification
                     </button>
                   )}
                   {runtimeAdmission?.probe_state === "evidence_recorded" && (
@@ -779,29 +797,29 @@ export function RoleSettings(
                       onClick={() =>
                         void runRuntime(runtimeAdmission.id, role, "publish")}
                     >
-                      Publish exact ordinary proof
+                      Save verification result
                     </button>
                   )}
                   {runtimeAdmission?.failure_reason && (
                     <ErrorNotice error={runtimeAdmission.failure_reason} />
                   )}
                   <small>
-                    Setup receipts do not grant this authority. Profile choice
-                    never launches paid work or approves installation,
-                    implementation, acceptance, retry, or blanket permissions.
+                    Choosing a profile starts no paid work and approves nothing
+                    else: not installation, implementation, acceptance, retries
+                    or blanket permissions.
                   </small>
                 </div>
               )}
               {!terminal && pendingReplacement && !replacementEligible && (
                 <small className="badge waiting">
-                  Replacement blocked before authority transfer:{" "}
+                  The requested change is not active yet:{" "}
                   {matchesActivated || taskActivated
-                    ? "the exact current capability proof is missing or stale."
-                    : "validate the exact ordinary capability, then explicitly activate this task-only profile."}
+                    ? "its verification is missing or out of date."
+                    : "verify this profile, then activate it for this task."}
                   {" "}
-                  The current role remains effective.
+                  The current settings stay in use until then.
                   {role === "manager"
-                    ? " Complete the exact proof and task-profile activation above, then use Change manager at safe boundary or Interrupt and change manager in Workflow controls."
+                    ? " After that, use Change manager at safe boundary or Interrupt and change manager in the task's Controls."
                     : ""}
                 </small>
               )}
@@ -817,15 +835,15 @@ export function RoleSettings(
                     )
                     : (
                       <small>
-                        Pending activation. Complete the existing capability
-                        workflow validation for this exact prepared tuple; setup
-                        probes do not grant ordinary task authority.
+                        Not active yet. Verify this exact profile before it can
+                        be used for this task; project setup checks alone are
+                        not enough.
                       </small>
                     )
                 )}
               {!terminal && requested && taskActivated && !matchesActivated && (
                 <small className="badge supported">
-                  Task-only profile activated · {requested.activation?.adapter}
+                  Active for this task only
                 </small>
               )}
               {!terminal && switchable && requested && effective &&
@@ -844,15 +862,14 @@ export function RoleSettings(
               {!terminal && role === "explorer" && requested && effective &&
                 pendingReplacement && (
                 <small className="badge waiting">
-                  Pending Explorer profile change waits for a service-verified
-                  workflow boundary; Explorer evidence cannot authorize its own
-                  switch.
+                  The Explorer change applies at the next safe point between
+                  workflow steps.
                 </small>
               )}
               {role === "final_verifier" && session?.status === "exited" && (
                 <small>
-                  Final verification is fresh-only. An interrupted or incomplete
-                  final invocation cannot be resumed.
+                  Final verification always runs as a new session, so a stopped
+                  one cannot be resumed.
                 </small>
               )}
             </article>
@@ -861,12 +878,10 @@ export function RoleSettings(
       </div>
       {error && <ErrorNotice error={error} />}
       <p className="hint">
-        An active change stays requested until a verified immutable checkpoint
-        and typed handoff are available. Resume reuses only the exact persisted
-        native session, role generation, configuration, and invocation. Codex
-        native approvals are honored and may avoid a new inbox item; the inbox
-        handles requests the CLI actually emits, and Revoke affects only
-        LLMRelay-owned rules.
+        A change to a running role stays requested until the role reaches a
+        safe checkpoint. Resume continues the same agent conversation with the
+        same settings. Approvals the agent already granted itself are honored;
+        Approvals shows the requests it sends to LLMRelay.
       </p>
     </section>
   );

@@ -1326,6 +1326,11 @@ export function ProjectSetup({
         proposalProblem.includes("existing-installation")
     ? "review"
     : "project-settings";
+  // Recorded setup results stay visible; this names which of them are stale.
+  const staleSelections = (setup?.selected_profiles || []).filter((selection) =>
+    selection.selection_state === "selected" && selection.compatibility &&
+    selection.compatibility.status !== "matched"
+  );
   return (
     <section
       className="trip-setup"
@@ -1344,21 +1349,46 @@ export function ProjectSetup({
             trip.readiness === "ready" ? "supported" : "waiting"
           }`}
         >
-          {trip.readiness.replaceAll("_", " ")}
+          {trip.readiness === "ready"
+            ? "Setup activated"
+            : trip.readiness.replaceAll("_", " ")}
         </span>
       </header>
+      {staleSelections.length > 0 && (
+        <p className="warning" role="status">
+          {trip.readiness === "ready"
+            ? "Setup is activated, but"
+            : "In the current setup draft,"}{" "}
+          {staleSelections.length === 1
+            ? "one agent profile needs"
+            : `${staleSelections.length} agent profiles need`}{" "}
+          verification again before tasks can use{" "}
+          {staleSelections.length === 1 ? "it" : "them"}:{" "}
+          {staleSelections.map((selection) => roleName(selection.role)).join(
+            ", ",
+          )}. The recorded setup results are kept; see Agent verification
+          below for what changed.
+        </p>
+      )}
       {setup?.selected_profiles.some((selection) => selection.selection_state === "selected") && (
-        <section className="panel" aria-label="Selected profile compatibility">
-          <h5>Selected profile compatibility</h5>
+        <section className="panel" aria-label="Agent verification">
+          <h5>Agent verification</h5>
           {setup.selected_profiles.filter((selection) => selection.selection_state === "selected")
             .map((selection) => {
               const profile = selection.profile;
               return (
                 <div key={selection.role}>
-                  <strong>{selection.role} · {profile?.provider || "unselected"}</strong>
+                  <strong>
+                    {roleName(selection.role)} ·{" "}
+                    {profile?.provider === "claude"
+                      ? "Claude"
+                      : profile?.provider === "codex"
+                      ? "Codex"
+                      : "not selected"}
+                  </strong>
                   {selection.compatibility
                     ? <CompatibilityDetails compatibility={selection.compatibility} />
-                    : <p className="hint">No current compatibility observation is recorded for this profile.</p>}
+                    : <p className="hint">No verification is recorded for this profile yet.</p>}
                 </div>
               );
             })}
@@ -2061,8 +2091,8 @@ export function ProjectSetup({
                       Each line is an exact <code>/bin/sh -lc</code>{" "}
                       command. A task manager selects the applicable matrix;
                       structured argv contracts must name an absolute
-                      executable, and every command still requires exact human
-                      authorization before execution.
+                      executable, and every command still needs your approval
+                      before it runs.
                     </p>
                     <label>
                       Exact approved AGENTS.md content<textarea
@@ -2591,8 +2621,8 @@ export function ProjectSetup({
             />
           </label>
           <p className="hint">
-            Required when this admission includes Claude. Enter the exact
-            human-confirmed live socket path before preparing it. The frozen
+            Required when this admission includes Claude. Enter the socket path
+            of the cmux you are running now before preparing it. The frozen
             probe is a zero-I/O connection attempt only: it never sends a cmux
             control request or changes cmux, and preserves its native exit and
             stderr. A missing or refused path is not evidence of sandbox denial.
@@ -2954,13 +2984,13 @@ function SetupInvocation(
               disabled={!presentationActionability.takeAvailable}
               onClick={() => void takeKeyboardControl()}
             >
-              Take keyboard control
+              Take control
             </button>
           )}
           {session.status === "running" &&
             presentationActionability.releaseAvailable && (
             <button onClick={() => void setKeyboardControl("release")}>
-              Release keyboard control
+              Release control
             </button>
           )}
         </>
@@ -3006,7 +3036,7 @@ function SetupInvocation(
             disabled={!!busy}
             onClick={() => onDispatch(attemptId, role, session.id)}
           >
-            Resume retained session
+            Resume the stopped session
           </button>
         </>
       )}
@@ -3355,7 +3385,7 @@ function RuntimeAdmission(
                       onClick={() =>
                         void takeKeyboardControl(probe.session_id!)}
                     >
-                      Take keyboard control
+                      Take control
                     </button>
                   )}
                   {probe.session_status === "running" &&
@@ -3368,7 +3398,7 @@ function RuntimeAdmission(
                           "release",
                         )}
                     >
-                      Release keyboard control
+                      Release control
                     </button>
                   )}
                 </>
@@ -3415,7 +3445,7 @@ function RuntimeAdmission(
                   disabled={!!busy}
                   onClick={() => onCorrect(probe.role)}
                 >
-                  Prepare corrected runtime verification
+                  Prepare a new verification
                 </button>
               )}
               {probe.role === "final_verifier" && probe.session_id &&

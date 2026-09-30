@@ -13,6 +13,7 @@ import type {
   RolePreparation,
   StateCursor,
   StateWaitResult,
+  TaskContent,
 } from "./types";
 
 export class ApiError extends Error {
@@ -341,6 +342,11 @@ const attentionTargetIsCurrent = (value: unknown): boolean => {
     case "project_setup":
       return hasStrings(value, ["project_id"]) &&
         hasNullableString(value, "setup_operation_id");
+    case "role_settings":
+      return hasStrings(value, ["project_id", "task_id", "role"]) &&
+        Number.isInteger(field(value, "settings_revision"));
+    case "diagnostics":
+      return true;
     default:
       return false;
   }
@@ -378,13 +384,58 @@ const compatibilityIsCurrent = (value: unknown) => {
     typeof field(value, "message") === "string" &&
     Array.isArray(missing) && missing.every((item) => typeof item === "string");
 };
+const attentionActionIsCurrent = (value: unknown) =>
+  value === undefined || value === null ||
+  (hasStrings(value, ["kind", "label"]) &&
+    [
+      "review_plan",
+      "review_request",
+      "review_result",
+      "answer_question",
+      "open_agent_output",
+      "open_project_setup",
+      "open_agent_settings",
+      "open_diagnostics",
+      "resolve_issue",
+    ].includes(String(field(value, "kind"))));
 const attentionItemIsCurrent = (value: unknown) => {
   const target = field(value, "target");
   const held = field(value, "held_tasks");
+  const details = field(value, "details");
   return hasStrings(value, ["id", "title", "reason"]) &&
+    (details === undefined || details === null || typeof details === "string") &&
+    attentionActionIsCurrent(field(value, "action")) &&
     attentionCategories.includes(String(field(value, "category"))) &&
     (target === null || attentionTargetIsCurrent(target)) &&
     Array.isArray(held) && held.every(taskTargetIsCurrent);
+};
+// A task action must name one of the snapshot's attention items for its task,
+// so a card or header can never route anywhere the inbox would not.
+const taskActionsAreCurrent = (state: AppState) => {
+  const actions: unknown = state.task_actions;
+  if (actions === undefined) return true;
+  return Array.isArray(actions) && actions.every((value) => {
+    const ids = field(value, "item_ids");
+    const primary = state.attention.find((item) =>
+      item.id === field(value, "item_id")
+    );
+    return hasStrings(value, ["task_id", "item_id"]) &&
+      attentionActionIsCurrent(field(value, "action")) &&
+      field(value, "action") != null &&
+      Array.isArray(ids) && ids.length > 0 &&
+      ids.every((id) => typeof id === "string") &&
+      ids[0] === field(value, "item_id") &&
+      primary !== undefined &&
+      primary.target !== null &&
+      "task_id" in primary.target &&
+      primary.target.task_id === field(value, "task_id") &&
+      ids.every((id) =>
+        state.attention.some((item) =>
+          item.id === id && item.target !== null && "task_id" in item.target &&
+          item.target.task_id === field(value, "task_id")
+        )
+      );
+  });
 };
 const currentSnapshot = (state: AppState): AppState => {
   const recipeArray = (value: unknown, keys: string[]) =>
@@ -455,7 +506,8 @@ const currentSnapshot = (state: AppState): AppState => {
   }
   if (
     !Array.isArray(state.attention) ||
-    !state.attention.every(attentionItemIsCurrent)
+    !state.attention.every(attentionItemIsCurrent) ||
+    !taskActionsAreCurrent(state)
   ) {
     throw new Error(
       "The service returned an unsupported attention schema. Refresh after updating the service; no attention navigation was applied.",
@@ -588,6 +640,34 @@ export const getRolePreparations = async (taskId: string) => {
     );
   }
   return preparations;
+};
+const taskContentRecordIsCurrent = (value: unknown) =>
+  ["report", "rework_request"].includes(String(field(value, "kind"))) &&
+  hasStrings(value, ["id", "created_at", "summary"]) &&
+  ["plan", "role", "outcome", "review_kind"].every((name) => {
+    const item = field(value, name);
+    return item === undefined || item === null || typeof item === "string";
+  });
+/** Plans, reports and feedback for the task's current attempt. */
+export const getTaskContent = async (taskId: string, signal?: AbortSignal) => {
+  const content = await json<TaskContent>(
+    `/api/tasks/${encodeURIComponent(taskId)}/content`,
+    signal && { signal },
+    transportTimeouts.read,
+  );
+  if (
+    content.task_id !== taskId ||
+    !(content.attempt_id === null || typeof content.attempt_id === "string") ||
+    typeof content.content_revision !== "string" ||
+    typeof content.truncated !== "boolean" ||
+    !Array.isArray(content.records) ||
+    !content.records.every(taskContentRecordIsCurrent)
+  ) {
+    throw new Error(
+      "The service returned unsupported task content. Refresh after updating the service.",
+    );
+  }
+  return content;
 };
 export const getModelCatalog = (provider: Provider) =>
   json<ModelCatalog>(

@@ -1,12 +1,63 @@
-import { ErrorNotice } from "./ErrorNotice";
+import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import { useEffect, useState } from "react";
 import { diagnostics } from "../api";
-import type { CapabilityEvidence, TripSetupState } from "../types";
+import type {
+  AttentionItem,
+  CapabilityEvidence,
+  TripSetupState,
+} from "../types";
+import { roleLabel } from "../types";
 import { CompatibilityDetails } from "./RoleSettings";
-export function DiagnosticsPanel({ capabilities = [], setups = [] }: {
-  capabilities?: CapabilityEvidence[];
-  setups?: TripSetupState[];
-}) {
+
+const providerName = (provider?: string) =>
+  provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : provider || "Agent";
+
+const verificationLabel = (status: string) =>
+  status === "supported"
+    ? "Verified"
+    : status === "unsupported"
+    ? "Not supported"
+    : "Not verified yet";
+
+/** Plain wording for recorded service events; anything else stays generic. */
+function eventSummary(event: Record<string, unknown>) {
+  const code = String(event.event_code || event.code || "");
+  const outcome = String(event.outcome || "");
+  if (code === "coordinator.tick" && outcome === "deferred") {
+    return {
+      title: "A workflow step failed and is being retried",
+      impact: "Waiting work does not advance until the step succeeds.",
+    };
+  }
+  if (code === "coordinator.tick") {
+    return { title: "A workflow step completed", impact: "" };
+  }
+  if (code === "recipe.intake" && outcome === "deferred") {
+    return {
+      title: "A scheduled recipe could not create its draft yet",
+      impact: "LLMRelay tries again at the next check.",
+    };
+  }
+  return {
+    title: outcome ? `Service event: ${outcome.replaceAll("_", " ")}` : "Service event",
+    impact: "",
+  };
+}
+
+export function DiagnosticsPanel(
+  { capabilities = [], setups = [], attention = [] }: {
+    capabilities?: CapabilityEvidence[];
+    setups?: TripSetupState[];
+    /** The current attention list; its paused-service items are shown here. */
+    attention?: AttentionItem[];
+  },
+) {
+  // Taken from the service's current state, so a paused step is shown even
+  // when its best-effort diagnostic log entry could not be written.
+  const paused = attention.filter((item) =>
+    item.id === "coordinator_deferred" ||
+    item.id.startsWith("coordinator_deferred:")
+  );
   const [events, setEvents] = useState<Array<Record<string, unknown>>>([]);
   const [error, setError] = useState("");
   useEffect(() => {
@@ -20,24 +71,57 @@ export function DiagnosticsPanel({ capabilities = [], setups = [] }: {
         <div>
           <span className="eyebrow">Local service</span>
           <h1>Diagnostics and setup</h1>
-          <p>Sanitized local events, capability state, and recovery signals.</p>
+          <p>
+            Recent service events, agent verification status and anything that
+            is stopping work from advancing.
+          </p>
         </div>
       </header>
       {error && <ErrorNotice error={error} />}
+      <section className="panel diagnostics-current" aria-labelledby="diagnostics-current-title">
+        <h3 id="diagnostics-current-title">Right now</h3>
+        {paused.length
+          ? paused.map((item) => (
+            <article key={item.id} data-diagnostic-id={item.id}>
+              <strong>{item.title}</strong>
+              {item.task_title && <small>{item.task_title}</small>}
+              <p>{item.reason}</p>
+              {item.details && (
+                <TechnicalDetails>
+                  <pre>{item.details}</pre>
+                </TechnicalDetails>
+              )}
+            </article>
+          ))
+          : <p className="empty">No workflow step is failing right now.</p>}
+      </section>
       <div className="diagnostic-list">
-        {events.map((event, index) => (
-          <article key={index}>
-            <time>{String(event.timestamp || event.created_at || "")}</time>
-            <strong>{String(event.event_code || event.code || "event")}</strong>
-            <pre>{JSON.stringify(event.detail||event,null,2)}</pre>
-          </article>
-        ))}
+        {events.map((event, index) => {
+          const summary = eventSummary(event);
+          return (
+            <article key={index}>
+              <time>{String(event.timestamp || event.created_at || "")}</time>
+              <strong>{summary.title}</strong>
+              {summary.impact && <p>{summary.impact}</p>}
+              <TechnicalDetails>
+                <pre>
+                  {String(event.event_code || event.code || "event")}
+                  {"\n"}
+                  {JSON.stringify(event.detail || event, null, 2)}
+                </pre>
+              </TechnicalDetails>
+            </article>
+          );
+        })}
       </div>
       <section className="panel">
-        <h3>Runtime capability validation</h3>
+        <h3>Agent verification</h3>
         {capabilities.filter((item) => item.compatibility).map((item, index) => (
           <div key={`${item.provider}-${item.role}-${index}`}>
-            <strong>{item.provider} · {item.role} · Production {item.status}</strong>
+            <strong>
+              {providerName(item.provider)} · {roleLabel(item.role)} ·{" "}
+              {verificationLabel(item.status)}
+            </strong>
             <CompatibilityDetails compatibility={item.compatibility} />
           </div>
         ))}
@@ -50,24 +134,25 @@ export function DiagnosticsPanel({ capabilities = [], setups = [] }: {
               item.provider === selection.profile?.provider && item.role === selection.role))
           .map((selection) => (
             <div key={`${setup.setup_operation_id}-${selection.role}`}>
-              <strong>{selection.profile?.provider} · {selection.role} · Production unverified</strong>
+              <strong>
+                {providerName(selection.profile?.provider)} · {roleLabel(selection.role)} ·{" "}
+                Not verified yet
+              </strong>
               <CompatibilityDetails compatibility={selection.compatibility} />
             </div>
           )))}
         <p>
-          Project Setup and task Role Settings prepare an exact scoped runtime
-          admission, display the fresh-call count, and require separate human
-          authorization before launching app-owned disposable-worktree probes.
-          Progress stays visible in the Workspace terminal and permission inbox;
-          proof publication is a second explicit action after structured
-          evidence and quiescence. Installation receipts remain historical and
-          never become ordinary task authority.
+          To verify an agent, use Project setup or the task's Agent settings.
+          They show how many agent calls the check will make and wait for your
+          approval before starting it in a separate throwaway workspace. You
+          can follow it in Workspace and the approvals list. After it passes
+          and the agent has stopped, you choose whether to use the result.
+          Setup results are kept as history and do not approve task work.
         </p>
         <p className="hint">
-          Advanced capability CLI commands remain diagnostic interfaces. New
-          installations and task profile changes use the dashboard runtime
-          action so fixture, role, profile, generation, and proof identity stay
-          service-bound.
+          The command-line verification commands are for troubleshooting. Use
+          the dashboard for new setups and task agent changes so each check
+          stays tied to the exact project, task and agent it verifies.
         </p>
       </section>
     </section>

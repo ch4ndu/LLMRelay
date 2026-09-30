@@ -1,16 +1,18 @@
 use crate::domain::{
-    AppStateDto, AttentionCategory, AttentionItem, AttentionTarget, ContinuationAction,
-    ContinuationActionKind, DecisionActionBinding, DecisionControlPolicy, DecisionDisposition,
-    DecisionEvidenceState, DecisionExplanation, DecisionNextAction, DecisionObservedRevision,
-    DecisionOwner, DecisionOwnership, DecisionPrerequisite, DecisionSubject, HumanCommand,
-    OperationResult, PermissionRequestDto, ProjectDto, RestartCandidateResult, TaskAttentionTarget,
-    TaskDto,
+    AppStateDto, AttentionActionKind, AttentionCategory, AttentionItem, AttentionTarget,
+    ContinuationAction, ContinuationActionKind, DecisionActionBinding, DecisionControlPolicy,
+    DecisionDisposition, DecisionEvidenceState, DecisionExplanation, DecisionNextAction,
+    DecisionObservedRevision, DecisionOwner, DecisionOwnership, DecisionPrerequisite,
+    DecisionSubject, HumanCommand, OperationResult, PermissionRequestDto, ProjectDto,
+    RestartCandidateResult, RoleKind, StaleRestartCandidateCancellation, TaskAttentionTarget,
+    TaskDto, UnconfirmedGuidanceAbandonment,
 };
 use crate::store::{json_hash, Store};
 use crate::supervisor::GRACEFUL_STOP_SECONDS;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 // A reserved route keeps its captured authority but has already moved reviewer and Explorer ownership.
@@ -850,6 +852,466 @@ fn revalidate_admission_proofs(
     Ok(())
 }
 
+const UNCONFIRMED_GUIDANCE_STATES: [&str; 3] = [
+    "delivery_reserved",
+    "written_awaiting_submit",
+    "delivery_unknown",
+];
+
+/// Facts that must be settled before a human retires state bound to an exited
+/// session. `?1` is the session.
+const EXITED_SESSION_FENCES: &[(&str, &str)] = &[
+    (
+        "the session has not exited",
+        "SELECT NOT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND status='exited')",
+    ),
+    (
+        "a native resume of the session is reserved or running",
+        "SELECT EXISTS(SELECT 1 FROM resume_invocations WHERE session_id=?1
+        AND state IN ('reserved','spawning','running'))",
+    ),
+    // An unfinished launch or resume outcome is settled only by a later verified-quiescent recovery.
+    (
+        "the session's launch or resume outcome is unresolved",
+        "SELECT EXISTS(SELECT 1 FROM sessions s WHERE s.id=?1
+        AND NOT (s.launch_state='finished' AND NOT EXISTS(SELECT 1 FROM resume_invocations ri
+          WHERE ri.session_id=s.id AND ri.state NOT IN ('exited','proven_nondelivery')))
+        AND COALESCE((SELECT r.state FROM recovery_records r WHERE r.session_id=s.id
+          ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1),'')!='resolved_quiescent')",
+    ),
+    (
+        "a recovery is open for the session",
+        "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE session_id=?1
+        AND state='attention_required')",
+    ),
+];
+
+/// The attempt-wide subset of the guidance reauthorization fences that bears
+/// on process ownership. `?1` is the attempt.
+const ATTEMPT_PROCESS_OWNERSHIP_FENCES: &[(&str, &str)] = &[
+    ("an agent session of the attempt is starting, stopping or needs recovery",
+     "SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+        WHERE g.attempt_id=?1
+          AND s.status IN ('launch_reserved','interrupt_requested','recovery_required'))"),
+    ("someone has keyboard control of an agent of the attempt",
+     "SELECT EXISTS(SELECT 1 FROM input_leases lease JOIN sessions s ON s.id=lease.session_id
+        JOIN role_generations g ON g.id=s.role_generation_id
+        WHERE g.attempt_id=?1 AND lease.revoked_at IS NULL
+          AND julianday(lease.expires_at)>julianday('now'))"),
+    ("a recovery is open for the attempt",
+     "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=?1
+        AND state='attention_required')"),
+    ("the attempt's repository claim is uncertain",
+     "SELECT EXISTS(SELECT 1 FROM claims WHERE attempt_id=?1 AND state='unknown')"),
+];
+
+/// Every session fact the process verification relied on, so a change before
+/// the write transaction is detected. Returns the status and fingerprint.
+fn session_fingerprint(connection: &Connection, session: &str) -> Result<Option<(String, String)>> {
+    Ok(connection
+        .query_row(
+            "SELECT s.status,json_object('status',s.status,'launch_state',s.launch_state,
+                'desired_running',s.desired_running,
+                'transcript_epoch',s.transcript_epoch,'resume_count',s.resume_count,
+                'process_identity_json',s.process_identity_json,
+                'recovery_anchor_json',s.recovery_anchor_json,'recovery_root_pid',s.recovery_root_pid,
+                'recovery_process_group_id',s.recovery_process_group_id,
+                'launch_boot_identity',s.launch_boot_identity,'updated_at',s.updated_at,
+                'processes',(SELECT group_concat(pid || ':' || native_start_marker || ':' || process_group_id, ',')
+                  FROM (SELECT pid,native_start_marker,process_group_id FROM session_processes
+                        WHERE session_id=?1 ORDER BY pid,native_start_marker)),
+                'resume_invocations',(SELECT group_concat(id || ':' || state, ',')
+                  FROM (SELECT id,state FROM resume_invocations WHERE session_id=?1
+                        ORDER BY resume_ordinal)))
+             FROM sessions s WHERE s.id=?1",
+            params![session],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// Proves outside the write transaction that the session exited and none of
+/// its recorded processes remain. Returns `None` once the operation has a
+/// receipt, so an identical replay returns its stored result unchanged.
+fn verify_exited_session_quiescent(
+    store: &Store,
+    operation_id: &str,
+    session: &str,
+) -> Result<Option<serde_json::Value>> {
+    let fingerprint = {
+        let connection = store.lock()?;
+        let replay: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operation_receipts WHERE operation_id=?1
+               AND actor_key='human_control' AND operation_kind='human_command')",
+            params![operation_id],
+            |row| row.get(0),
+        )?;
+        if replay {
+            return Ok(None);
+        }
+        let (status, fingerprint) = session_fingerprint(&connection, session)?
+            .ok_or_else(|| anyhow!("session {session} does not exist"))?;
+        if status != "exited" {
+            bail!("session {session} is {status}; this action requires the session to have exited")
+        }
+        fingerprint
+    };
+    let verification = crate::recovery::verify_session_quiescent(store, session)
+        .context("session quiescence could not be proven")?;
+    Ok(Some(serde_json::json!({
+        "session_fingerprint":fingerprint,"verification":verification,
+    })))
+}
+
+fn require_current_unfinished_attempt(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    attempt_id: &str,
+    expected_version: i64,
+) -> Result<()> {
+    let current: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tasks t JOIN attempts a ON a.task_id=t.id
+           WHERE t.id=?1 AND a.id=?2 AND t.version=?3 AND t.archived_at IS NULL
+             AND t.lifecycle IN ('in_progress','validation')
+             AND a.status IN ('running','needs_input','held')
+             AND a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=t.id
+               ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1))",
+        params![task_id, attempt_id, expected_version],
+        |row| row.get(0),
+    )?;
+    if !current {
+        bail!("task version is stale, or the attempt is not the task's current unfinished attempt")
+    }
+    Ok(())
+}
+
+/// Rechecks inside the write transaction that the verified session is
+/// unchanged and that it and its attempt are at a settled boundary.
+fn require_quiescent_session_boundary(
+    transaction: &Transaction<'_>,
+    session: &str,
+    attempt: &str,
+    quiescence: &serde_json::Value,
+    refusal: &str,
+) -> Result<()> {
+    let fingerprint =
+        session_fingerprint(transaction, session)?.map(|(_, fingerprint)| fingerprint);
+    if fingerprint.as_deref() != quiescence["session_fingerprint"].as_str() {
+        bail!("the session changed while its quiescence was being verified")
+    }
+    for (blocker, sql) in EXITED_SESSION_FENCES {
+        let blocked: bool = transaction.query_row(sql, params![session], |row| row.get(0))?;
+        if blocked {
+            bail!("{refusal} while {blocker}")
+        }
+    }
+    for (blocker, sql) in ATTEMPT_PROCESS_OWNERSHIP_FENCES {
+        let blocked: bool = transaction.query_row(sql, params![attempt], |row| row.get(0))?;
+        if blocked {
+            bail!("{refusal} while {blocker}")
+        }
+    }
+    Ok(())
+}
+
+/// Marks one unconfirmed guidance delivery abandoned after re-deriving every
+/// supplied binding from stored state. Body, delivery identity and timestamps
+/// are kept; the replaced state and reason are preserved in the audit detail.
+/// Task hold, attention and review accounting are untouched.
+fn abandon_unconfirmed_guidance(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+    delivery: &UnconfirmedGuidanceAbandonment,
+    quiescence: &serde_json::Value,
+    now: &str,
+) -> Result<serde_json::Value> {
+    const ABANDONED_REASON: &str = "human_abandoned_unconfirmed_delivery";
+    if !UNCONFIRMED_GUIDANCE_STATES.contains(&delivery.expected_state.as_str()) {
+        bail!(
+            "expected_state must be delivery_reserved, written_awaiting_submit or delivery_unknown"
+        )
+    }
+    let reason = delivery.reason.trim();
+    if reason.is_empty() || reason.len() > 4096 {
+        bail!("a reason of at most 4096 bytes is required to abandon guidance")
+    }
+    require_current_unfinished_attempt(
+        transaction,
+        &delivery.task_id,
+        &delivery.attempt_id,
+        delivery.expected_version,
+    )?;
+    let previous: String = transaction
+        .query_row(
+            "SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,
+                'body',body,'state',state,'reason',reason,'created_at',created_at,
+                'written_at',written_at,'submitted_at',submitted_at,'acknowledged_at',acknowledged_at,
+                'delivery_session_id',delivery_session_id,
+                'delivery_transcript_epoch',delivery_transcript_epoch,
+                'delivery_resume_invocation_id',delivery_resume_invocation_id)
+             FROM guidance_messages WHERE id=?1",
+            params![delivery.guidance_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("guidance {} does not exist", delivery.guidance_id))?;
+    let previous: serde_json::Value = serde_json::from_str(&previous)?;
+    let mismatched = [
+        ("attempt_id", Some(delivery.attempt_id.as_str())),
+        (
+            "role_generation_id",
+            Some(delivery.role_generation_id.as_str()),
+        ),
+        (
+            "delivery_session_id",
+            Some(delivery.delivery_session_id.as_str()),
+        ),
+        (
+            "delivery_transcript_epoch",
+            Some(delivery.delivery_transcript_epoch.as_str()),
+        ),
+        (
+            "delivery_resume_invocation_id",
+            delivery.delivery_resume_invocation_id.as_deref(),
+        ),
+        ("state", Some(delivery.expected_state.as_str())),
+    ]
+    .into_iter()
+    .filter(|(field, supplied)| previous[*field].as_str() != *supplied)
+    .map(|(field, _)| field)
+    .collect::<Vec<_>>();
+    if !mismatched.is_empty() {
+        bail!(
+            "guidance {} does not match the supplied delivery binding: {}",
+            delivery.guidance_id,
+            mismatched.join(", ")
+        )
+    }
+    let (generation_bound, session_bound, invocation_bound): (bool, bool, bool) = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM role_generations WHERE id=?1 AND attempt_id=?2),
+                    EXISTS(SELECT 1 FROM sessions WHERE id=?3 AND role_generation_id=?1),
+                    ?5 IS NULL OR EXISTS(SELECT 1 FROM resume_invocations
+                      WHERE id=?5 AND session_id=?3 AND transcript_epoch=?4)",
+            params![
+                delivery.role_generation_id,
+                delivery.attempt_id,
+                delivery.delivery_session_id,
+                delivery.delivery_transcript_epoch,
+                delivery.delivery_resume_invocation_id
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    if !generation_bound {
+        bail!("the guidance role generation does not belong to the attempt")
+    }
+    if !session_bound {
+        bail!("the delivery session does not belong to the guidance role generation")
+    }
+    if !invocation_bound {
+        bail!("the delivery resume invocation does not belong to the delivery session and transcript epoch")
+    }
+    require_quiescent_session_boundary(
+        transaction,
+        &delivery.delivery_session_id,
+        &delivery.attempt_id,
+        quiescence,
+        "guidance cannot be abandoned",
+    )?;
+    let changed = transaction.execute(
+        "UPDATE guidance_messages SET state='abandoned',reason=?1
+         WHERE id=?2 AND state=?3 AND attempt_id=?4 AND role_generation_id=?5
+           AND delivery_session_id=?6 AND delivery_transcript_epoch=?7
+           AND delivery_resume_invocation_id IS ?8",
+        params![
+            ABANDONED_REASON,
+            delivery.guidance_id,
+            delivery.expected_state,
+            delivery.attempt_id,
+            delivery.role_generation_id,
+            delivery.delivery_session_id,
+            delivery.delivery_transcript_epoch,
+            delivery.delivery_resume_invocation_id
+        ],
+    )?;
+    if changed != 1 {
+        bail!(
+            "guidance {} changed before it could be abandoned",
+            delivery.guidance_id
+        )
+    }
+    let detail = serde_json::json!({
+        "guidance_id":delivery.guidance_id,"task_id":delivery.task_id,
+        "attempt_id":delivery.attempt_id,"state":"abandoned","reason":ABANDONED_REASON,
+        "human_reason":reason,"delivery_outcome":"unconfirmed","previous":previous,
+        "quiescence":quiescence,
+    });
+    transaction.execute(
+        "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,old_version,new_version,detail_json,created_at)
+         VALUES(?1,?2,'human','guidance.delivery.abandoned','guidance_message',?3,?4,?5,?6,?7)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            operation_id,
+            delivery.guidance_id,
+            delivery.expected_version,
+            delivery.expected_version + 1,
+            detail.to_string(),
+            now
+        ],
+    )?;
+    Ok(detail)
+}
+
+/// Moves one exactly identified skipped restart candidate to the existing
+/// terminal `cancelled` disposition. `result_json`, `source` and `requested_by`
+/// are kept; the replaced state, reason and timestamp are preserved in the
+/// audit detail. Task hold, attention and review accounting are untouched.
+fn cancel_stale_restart_candidate(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+    candidate: &StaleRestartCandidateCancellation,
+    quiescence: &serde_json::Value,
+    now: &str,
+) -> Result<serde_json::Value> {
+    const CANCELLED_REASON: &str = "explicit human cancellation of a stale skipped restart candidate; no native resume or fresh dispatch was implied";
+    // Queued, admitting, parked and failed candidates still carry restart
+    // authority and keep their own recovery routes.
+    if candidate.expected_state != "skipped" {
+        bail!("only a skipped restart candidate can be cancelled; expected_state must be skipped")
+    }
+    let reason = candidate.reason.trim();
+    if reason.is_empty() || reason.len() > 4096 {
+        bail!("a reason of at most 4096 bytes is required to cancel a restart candidate")
+    }
+    require_current_unfinished_attempt(
+        transaction,
+        &candidate.task_id,
+        &candidate.attempt_id,
+        candidate.expected_version,
+    )?;
+    let (previous, result_json): (String, String) = transaction
+        .query_row(
+            "SELECT json_object('session_id',rc.session_id,'attempt_id',rc.attempt_id,
+                'task_id',rc.task_id,'source',rc.source,'state',rc.state,'reason',rc.reason,
+                'requested_by',rc.requested_by,'result_json',rc.result_json,
+                'created_at',rc.created_at,'updated_at',rc.updated_at,
+                'role_generation_id',s.role_generation_id,
+                'generation_attempt_id',rg.attempt_id),rc.result_json
+             FROM restart_candidates rc JOIN sessions s ON s.id=rc.session_id
+             JOIN role_generations rg ON rg.id=s.role_generation_id
+             WHERE rc.session_id=?1",
+            params![candidate.session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            anyhow!(
+                "no restart candidate exists for session {}",
+                candidate.session_id
+            )
+        })?;
+    let previous: serde_json::Value = serde_json::from_str(&previous)?;
+    let result_sha256 = hex::encode(Sha256::digest(result_json.as_bytes()));
+    let mut mismatched = [
+        ("attempt_id", Some(candidate.attempt_id.as_str())),
+        ("generation_attempt_id", Some(candidate.attempt_id.as_str())),
+        ("task_id", Some(candidate.task_id.as_str())),
+        (
+            "role_generation_id",
+            Some(candidate.role_generation_id.as_str()),
+        ),
+        ("state", Some(candidate.expected_state.as_str())),
+        ("source", Some(candidate.expected_source.as_str())),
+        ("requested_by", candidate.expected_requested_by.as_deref()),
+        ("updated_at", Some(candidate.expected_updated_at.as_str())),
+    ]
+    .into_iter()
+    .filter(|(field, supplied)| previous[*field].as_str() != *supplied)
+    .map(|(field, _)| field)
+    .collect::<Vec<_>>();
+    if result_sha256 != candidate.expected_result_sha256 {
+        mismatched.push("result_sha256");
+    }
+    if !mismatched.is_empty() {
+        bail!(
+            "restart candidate for session {} does not match the supplied binding: {}",
+            candidate.session_id,
+            mismatched.join(", ")
+        )
+    }
+    let result = RestartCandidateResult::parse(&result_json)?;
+    result.validate_candidate_state("skipped", &candidate.session_id)?;
+    if result.restart.admission.is_some()
+        || result.restart.active_batch().is_some()
+        || result.restart.next_due_at.is_some()
+    {
+        bail!("the restart candidate still carries admission, batch or scheduled resume authority")
+    }
+    let (desired_running, attempt_admission): (bool, bool) = transaction.query_row(
+        "SELECT (SELECT desired_running FROM sessions WHERE id=?1),
+                EXISTS(SELECT 1 FROM restart_candidates WHERE attempt_id=?2
+                  AND state IN ('admitting','pending_reconciliation'))",
+        params![candidate.session_id, candidate.attempt_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    // Startup re-prepares desired-running sessions and would overwrite the cancellation.
+    if desired_running {
+        bail!("the restart candidate cannot be cancelled while its session is still marked to be restored at startup")
+    }
+    if attempt_admission {
+        bail!("the restart candidate cannot be cancelled while a restart admission or reconciliation is pending for the attempt")
+    }
+    require_quiescent_session_boundary(
+        transaction,
+        &candidate.session_id,
+        &candidate.attempt_id,
+        quiescence,
+        "the restart candidate cannot be cancelled",
+    )?;
+    let changed = transaction.execute(
+        "UPDATE restart_candidates SET state='cancelled',reason=?1,updated_at=?2
+         WHERE session_id=?3 AND state='skipped' AND attempt_id=?4 AND task_id=?5
+           AND source=?6 AND requested_by IS ?7 AND updated_at=?8 AND result_json=?9",
+        params![
+            CANCELLED_REASON,
+            now,
+            candidate.session_id,
+            candidate.attempt_id,
+            candidate.task_id,
+            candidate.expected_source,
+            candidate.expected_requested_by,
+            candidate.expected_updated_at,
+            result_json
+        ],
+    )?;
+    if changed != 1 {
+        bail!(
+            "restart candidate for session {} changed before it could be cancelled",
+            candidate.session_id
+        )
+    }
+    let detail = serde_json::json!({
+        "session_id":candidate.session_id,"task_id":candidate.task_id,
+        "attempt_id":candidate.attempt_id,"state":"cancelled","reason":CANCELLED_REASON,
+        "human_reason":reason,"native_resume_implied":false,"fresh_dispatch_implied":false,
+        "previous":previous,"quiescence":quiescence,
+    });
+    transaction.execute(
+        "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,old_version,new_version,detail_json,created_at)
+         VALUES(?1,?2,'human','restart.candidate.cancelled','session',?3,?4,?5,?6,?7)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            operation_id,
+            candidate.session_id,
+            candidate.expected_version,
+            candidate.expected_version + 1,
+            detail.to_string(),
+            now
+        ],
+    )?;
+    Ok(detail)
+}
+
 fn park_resolved_admission(
     transaction: &rusqlite::Transaction<'_>,
     session: &str,
@@ -1021,10 +1483,22 @@ pub fn execute_with_runtime(
     } else {
         None
     };
+    let session_quiescence = match command {
+        HumanCommand::AbandonUnconfirmedGuidance { delivery, .. } => {
+            verify_exited_session_quiescent(store, operation_id, &delivery.delivery_session_id)?
+        }
+        HumanCommand::CancelStaleRestartCandidate { candidate, .. } => {
+            verify_exited_session_quiescent(store, operation_id, &candidate.session_id)?
+        }
+        _ => None,
+    };
     let mut connection = store.lock()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some(verified) = recovery_evidence.as_ref() {
         revalidate_admission_proofs(&transaction, verified)?;
+    }
+    if let Some(verified) = session_quiescence.as_ref() {
+        revalidate_admission_proofs(&transaction, &verified["verification"])?;
     }
     if let Some((stored_hash, result)) = transaction
         .query_row(
@@ -1136,7 +1610,17 @@ pub fn execute_with_runtime(
                 *ready,
                 &now,
             )?;
-            let state = if *ready {
+            // A task that could not start from the project's registered commit
+            // is kept as a draft whose Ready decision explains why.
+            let baseline_problem = *ready
+                && crate::trip::start_baseline_problem(&transaction, project_id, true)?.is_some();
+            let state = if baseline_problem {
+                transaction.execute(
+                    "UPDATE tasks SET lifecycle='backlog',attention='needs_input',ready_at=NULL WHERE id=?1",
+                    params![id],
+                )?;
+                "start_baseline_stale"
+            } else if *ready {
                 match runtime
                     .ok_or_else(|| {
                         anyhow!("Ready admission requires the service capability runtime")
@@ -1262,6 +1746,11 @@ pub fn execute_with_runtime(
                 |row| row.get(0),
             )?;
             crate::trip::require_project_ready(&transaction, &project_id)?;
+            if let Some(problem) =
+                crate::trip::start_baseline_problem(&transaction, &project_id, true)?
+            {
+                bail!("{problem}")
+            }
             crate::recipes::require_binding_current(&transaction, task_id)?;
             let (title, criteria, configured): (String, String, i64) = transaction.query_row(
                 "SELECT title,acceptance_criteria_json,
@@ -2102,27 +2591,47 @@ pub fn execute_with_runtime(
                 params![generation,attempt_id,expected_role,session,verdict,candidate_hash,review_kind,request_id],
                 |row| row.get(0),
             ).optional()?.ok_or_else(||anyhow!("review transition requires the current request's authenticated structured role result"))?;
-            if review_kind == "final" && verdict == "request_changes" {
-                let repair_allowed:bool=transaction.query_row(
-                    "SELECT a.final_repair_round=0 AND EXISTS(SELECT 1 FROM review_requests code
-                       WHERE code.attempt_id=a.id AND code.review_kind='code' AND code.candidate_hash=a.candidate_hash
-                         AND code.verdict='approved' AND code.delivery_state='finished')
-                     FROM attempts a WHERE a.id=?1",
-                    params![attempt_id],|row|row.get(0)
-                )?;
-                if !repair_allowed {
-                    bail!("final request_changes exceeds the one dedicated repair cycle or lacks retained code approval")
+            // Same rule as the coordinator: in the final repair round only the
+            // receipt's dedicated recheck result can be applied.
+            if review_kind == "code" {
+                if let crate::review::RecheckBinding::Held(reason) =
+                    crate::review::final_repair_code_review_binding(
+                        &transaction,
+                        attempt_id,
+                        Some((request_id.as_str(), true)),
+                    )?
+                {
+                    bail!("final-repair recheck held: {reason}")
                 }
-                transaction.execute(
-                    "UPDATE attempts SET final_repair_round=1 WHERE id=?1 AND final_repair_round=0",
-                    params![attempt_id],
+            }
+            if review_kind == "final" && verdict == "request_changes" {
+                crate::review::begin_normal_final_repair(
+                    &transaction,
+                    attempt_id,
+                    &request_id,
+                    &result_id,
+                    &now,
                 )?;
             }
+            let recheck = review_kind == "code"
+                && crate::review::settle_final_repair_recheck(
+                    &transaction,
+                    &request_id,
+                    verdict,
+                    &now,
+                )?;
             if transaction.execute("UPDATE review_requests SET delivery_state='finished',verdict=?1,feedback=?2,updated_at=?3 WHERE id=?4 AND delivery_state='delivered'",
                 params![verdict,feedback,now,request_id])? != 1 {
                 bail!("current delivered review request changed before its verdict was applied")
             }
-            apply_review_transition(&transaction, attempt_id, review_kind, verdict, &now)?;
+            apply_review_transition(
+                &transaction,
+                attempt_id,
+                review_kind,
+                verdict,
+                recheck,
+                &now,
+            )?;
             if review_kind == "plan" && verdict == "approved" {
                 transaction.execute(
                     "UPDATE trip_structured_plans SET review_request_id=?1,reviewed_at=?2
@@ -2151,12 +2660,17 @@ pub fn execute_with_runtime(
             if transaction.execute(
                 "UPDATE tasks SET version=version+1,
                  attention=CASE
-                   WHEN ?1!='needs_rework' THEN attention
+                   WHEN NOT ?1 THEN attention
                    WHEN attention IN ('paused','pause_requested','needs_recovery') THEN attention
                    ELSE 'needs_input'
                  END,
                  updated_at=?2 WHERE id=?3 AND version=?4",
-                params![verdict, now, task_id, expected_version],
+                params![
+                    verdict == "needs_rework" || (recheck && verdict != "approved"),
+                    now,
+                    task_id,
+                    expected_version
+                ],
             )? != 1
             {
                 bail!("task version is stale")
@@ -2300,66 +2814,32 @@ pub fn execute_with_runtime(
                     let snapshot = snapshot.ok_or_else(|| {
                         anyhow!("rework requires the exact reviewed accepted snapshot")
                     })?;
-                    let task_scope: (String, String, String) = transaction.query_row(
-                        "SELECT title,description,acceptance_criteria_json FROM tasks WHERE id=?1",
-                        params![task_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )?;
-                    let current_scope = json_hash(
-                        &serde_json::json!({"title":task_scope.0,"description":task_scope.1,"acceptance_criteria":serde_json::from_str::<serde_json::Value>(&task_scope.2)?,"base_revision":base}),
-                    )?;
-                    let configurations = {
-                        let mut statement=transaction.prepare("SELECT role,revision,config_json FROM role_settings r WHERE task_id=?1 AND revision=(SELECT MAX(revision) FROM role_settings WHERE task_id=r.task_id AND role=r.role) ORDER BY role")?;
-                        let rows = statement
-                            .query_map(params![task_id], |row| {
-                                Ok((
-                                    row.get::<_, String>(0)?,
-                                    row.get::<_, i64>(1)?,
-                                    row.get::<_, String>(2)?,
-                                ))
-                            })?
-                            .collect::<rusqlite::Result<Vec<_>>>()?;
-                        rows
-                    };
-                    let current_configuration = json_hash(&configurations)?;
-                    let current_configuration_revision = configurations
-                        .iter()
-                        .map(|(_, revision, _)| *revision)
-                        .max()
-                        .unwrap_or(config);
+                    let scope = current_lineage_scope(&transaction, task_id, &base, config)?;
                     let carry = *carry_plan_approval
                         && plan_hash.is_some()
                         && plan_approved.is_some()
-                        && scope_hash == current_scope
-                        && configuration_hash == current_configuration;
+                        && scope_hash == scope.scope_hash
+                        && configuration_hash == scope.configuration_hash;
                     if *carry_plan_approval && !carry {
                         bail!("plan approval cannot carry because task scope or role configuration changed")
                     }
-                    let new_attempt = uuid::Uuid::new_v4().to_string();
-                    let phase = if carry { "implementation" } else { "planning" };
-                    let carried_plan_hash = if carry { plan_hash.as_deref() } else { None };
-                    transaction.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at,parent_attempt_id,plan_hash,plan_approved_at,accepted_snapshot_id,scope_hash,configuration_hash,workflow_version,workflow_hash,upstream_source_hash,overlay_hash,legacy_migration_required)
-                        VALUES(?1,?2,?3,?4,?5,?6,'materialization_pending',?7,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,0)",
-                        params![new_attempt, task_id, uuid::Uuid::new_v4().to_string(), phase, base, current_configuration_revision, now, attempt_id,
-                            carried_plan_hash, carry.then_some(now.as_str()), snapshot,current_scope,current_configuration,crate::workflow_resources::WORKFLOW_VERSION,crate::workflow_resources::workflow_hash(),crate::trip::source_hash(),crate::trip::overlay_hash()])?;
-                    transaction.execute("INSERT INTO trip_attempt_profiles(attempt_id,role,settings_revision,activation_id,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at)
-                        SELECT ?1,role,settings_revision,activation_id,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,?2 FROM trip_attempt_profiles WHERE attempt_id=?3",
-                        params![new_attempt,now,attempt_id])?;
-                    for (kind, allowance) in [("plan", 2), ("code", 2), ("final", 1)] {
-                        transaction.execute("INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance) VALUES(?1,?2,?3,?4)",
-                            params![uuid::Uuid::new_v4().to_string(), new_attempt, kind, allowance])?;
-                    }
-                    transaction.execute("UPDATE tasks SET lifecycle='in_progress',attention='none',version=version+1,description=description,updated_at=?1 WHERE id=?2", params![now, task_id])?;
-                    transaction.execute(
-                        "UPDATE attempts SET status='rework_staging',updated_at=?1 WHERE id=?2",
-                        params![now, attempt_id],
+                    let (new_attempt, _) = stage_rework_lineage(
+                        &transaction,
+                        &LineageChild {
+                            task_id,
+                            parent_attempt_id: attempt_id,
+                            operation_id,
+                            phase: if carry { "implementation" } else { "planning" },
+                            base_revision: &base,
+                            scope: &scope,
+                            carried_plan_hash: if carry { plan_hash.as_deref() } else { None },
+                            carry_plan_approval: carry,
+                            accepted_snapshot_id: Some(&snapshot),
+                            source_snapshot_id: &snapshot,
+                            feedback,
+                        },
+                        &now,
                     )?;
-                    transaction.execute("UPDATE role_credentials SET revoked_at=?1 WHERE role_generation_id IN (SELECT id FROM role_generations WHERE attempt_id=?2) AND revoked_at IS NULL",params![now,attempt_id])?;
-                    transaction.execute("UPDATE role_generations SET status='stopping',updated_at=?1 WHERE attempt_id=?2 AND status IN ('launch_reserved','running')",params![now,attempt_id])?;
-                    transaction.execute("INSERT INTO rework_intents(id,operation_id,parent_attempt_id,new_attempt_id,snapshot_id,feedback,carry_plan_approval,scope_hash,configuration_hash,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'reserved',?10,?10)",params![uuid::Uuid::new_v4().to_string(),operation_id,attempt_id,new_attempt,snapshot,feedback,carry,current_scope,current_configuration,now])?;
-                    transaction.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
-                        VALUES(?1,?2,'human','rework.lineage.created','attempt',?3,?4,?5)", params![uuid::Uuid::new_v4().to_string(), operation_id, new_attempt,
-                            serde_json::json!({"parent_attempt_id":attempt_id,"feedback":feedback,"carry_plan_approval":carry}).to_string(), now])?;
                     result(
                         operation_id,
                         "attempt",
@@ -2370,6 +2850,44 @@ pub fn execute_with_runtime(
                 }
                 _ => bail!("human review decision must be accept or request_changes"),
             }
+        }
+        HumanCommand::ReplanAfterTerminalReview {
+            task_id,
+            attempt_id,
+            expected_version,
+            review_request_id,
+            role_result_id,
+            candidate_hash,
+            snapshot_id,
+            reason,
+            ..
+        } => {
+            let (child, detail) = stage_terminal_replan(
+                &transaction,
+                operation_id,
+                &TerminalReplan {
+                    task_id,
+                    attempt_id,
+                    expected_version: *expected_version,
+                    review_request_id,
+                    role_result_id,
+                    candidate_hash,
+                    snapshot_id,
+                    reason,
+                },
+                &now,
+            )?;
+            // Deliberately not `rework_created`: materialization waits for the
+            // coordinator to prove the parent quiescent.
+            let mut staged = result(
+                operation_id,
+                "attempt",
+                child,
+                Some(expected_version + 1),
+                "replan_created_pending_quiescence",
+            );
+            staged.detail = detail;
+            staged
         }
         HumanCommand::Guidance {
             task_id,
@@ -2856,6 +3374,98 @@ pub fn execute_with_runtime(
                 "legacy_task_normalized",
             )
         }
+        HumanCommand::ReauthorizeAttemptGuidance {
+            task_id,
+            attempt_id,
+            expected_version,
+            plan_hash,
+            config_revision_id,
+            policy_hash,
+            files,
+            ..
+        } => {
+            let detail = crate::trip::reauthorize_attempt_guidance(
+                &transaction,
+                task_id,
+                attempt_id,
+                *expected_version,
+                plan_hash,
+                config_revision_id,
+                policy_hash,
+                files,
+                &now,
+            )?;
+            let changed = transaction.execute(
+                "UPDATE tasks SET version=version+1,updated_at=?1 WHERE id=?2 AND version=?3",
+                params![now, task_id, expected_version],
+            )?;
+            if changed != 1 {
+                bail!("task version changed while applying the guidance approval")
+            }
+            let mut applied = result(
+                operation_id,
+                "attempt",
+                attempt_id.clone(),
+                Some(expected_version + 1),
+                "guidance_reauthorized",
+            );
+            applied.detail = detail;
+            applied
+        }
+        HumanCommand::AbandonUnconfirmedGuidance { delivery, .. } => {
+            let quiescence = session_quiescence.as_ref().ok_or_else(|| {
+                anyhow!("guidance abandonment requires verified delivery session quiescence")
+            })?;
+            let detail = abandon_unconfirmed_guidance(
+                &transaction,
+                operation_id,
+                delivery,
+                quiescence,
+                &now,
+            )?;
+            bump_task(
+                &transaction,
+                &delivery.task_id,
+                delivery.expected_version,
+                &now,
+            )?;
+            let mut applied = result(
+                operation_id,
+                "guidance_message",
+                delivery.guidance_id.clone(),
+                Some(delivery.expected_version + 1),
+                "guidance_delivery_abandoned",
+            );
+            applied.detail = detail;
+            applied
+        }
+        HumanCommand::CancelStaleRestartCandidate { candidate, .. } => {
+            let quiescence = session_quiescence.as_ref().ok_or_else(|| {
+                anyhow!("restart candidate cancellation requires verified session quiescence")
+            })?;
+            let detail = cancel_stale_restart_candidate(
+                &transaction,
+                operation_id,
+                candidate,
+                quiescence,
+                &now,
+            )?;
+            bump_task(
+                &transaction,
+                &candidate.task_id,
+                candidate.expected_version,
+                &now,
+            )?;
+            let mut applied = result(
+                operation_id,
+                "restart_candidate",
+                candidate.session_id.clone(),
+                Some(candidate.expected_version + 1),
+                "restart_candidate_cancelled",
+            );
+            applied.detail = detail;
+            applied
+        }
         HumanCommand::RetryWorkspaceReservation { .. }
         | HumanCommand::CancelWorkspaceReservation { .. }
         | HumanCommand::RetryGracefulStop { .. }
@@ -3159,6 +3769,38 @@ pub fn role_preparations(
     Ok(preparations)
 }
 
+/// Why a selected setup profile has no current compatibility observation.
+fn missing_selection_observation(
+    selection: &serde_json::Value,
+    receipts: &[serde_json::Value],
+) -> &'static str {
+    let same_role = |receipt: &&serde_json::Value| {
+        receipt.get("role") == selection.get("role")
+            && receipt.get("provider") == selection.pointer("/profile/provider")
+    };
+    let exact = receipts
+        .iter()
+        .filter(same_role)
+        .filter(|receipt| receipt.get("profile_hash") == selection.get("profile_hash"))
+        .max_by_key(|receipt| {
+            receipt
+                .get("created_at")
+                .and_then(serde_json::Value::as_str)
+        });
+    match exact {
+        None if receipts.iter().any(|receipt| same_role(&receipt)) => {
+            "These agent settings changed after they were last verified. Verify this profile again before starting work."
+        }
+        None => "This profile has not been verified yet. Verify it before starting work.",
+        Some(receipt) if json_text(receipt, "result") != Some("success") => {
+            "The last verification of this profile did not succeed. Verify it again before starting work."
+        }
+        Some(_) => {
+            "Newer agent evidence replaced the verification recorded for this profile, so it must be verified again before starting work."
+        }
+    }
+}
+
 fn selected_setup_capability<'a>(
     selection: &serde_json::Value,
     receipts: &[serde_json::Value],
@@ -3213,10 +3855,66 @@ fn selected_setup_capability<'a>(
 #[cfg(test)]
 mod m7_setup_projection_tests {
     use super::{
-        continuation_actions, permanent_resume_rejection_is_current, selected_setup_capability,
+        continuation_actions, missing_selection_observation, permanent_resume_rejection_is_current,
+        selected_setup_capability, workspace_recovery_reason,
     };
     use crate::domain::TaskDto;
     use serde_json::{json, Value};
+
+    #[test]
+    fn missing_profile_observation_names_the_stale_fact_instead_of_an_unknown_version() {
+        let selection = json!({
+            "role":"explorer","profile":{"provider":"claude"},"profile_hash":"current"
+        });
+        let receipt = |hash: &str, result: &str| {
+            json!({"role":"explorer","provider":"claude","profile_hash":hash,"result":result,
+                   "created_at":"2026-01-01T00:00:00Z"})
+        };
+        assert!(missing_selection_observation(&selection, &[]).contains("not been verified yet"));
+        assert!(
+            missing_selection_observation(&selection, &[receipt("older", "success")])
+                .contains("changed after they were last verified")
+        );
+        assert!(
+            missing_selection_observation(&selection, &[receipt("current", "failure")])
+                .contains("did not succeed")
+        );
+        assert!(
+            missing_selection_observation(&selection, &[receipt("current", "success")])
+                .contains("Newer agent evidence replaced")
+        );
+        for message in [
+            missing_selection_observation(&selection, &[]),
+            missing_selection_observation(&selection, &[receipt("older", "success")]),
+        ] {
+            assert!(!message.contains("version"), "{message}");
+        }
+    }
+
+    #[test]
+    fn workspace_recovery_explains_whether_retrying_can_succeed() {
+        let guidance = workspace_recovery_reason(&json!({
+            "reason":"TRIP policy materialization requires recovery: approved guidance collides with different worktree content: AGENTS.md",
+        }));
+        assert!(
+            guidance.contains("AGENTS.md") && guidance.contains("Inspect and retry"),
+            "{guidance}"
+        );
+        let collision = workspace_recovery_reason(&json!({
+            "reason":"TRIP policy materialization requires recovery: policy materialization collision: /w/.agents/trip-explorer/config.json",
+            "observed_filesystem":{"stage":"policy_materialization"}
+        }));
+        assert!(
+            collision.contains("retrying cannot fix")
+                && collision.contains("Validate and relink")
+                && collision.contains("cancels the task"),
+            "{collision}"
+        );
+        assert!(
+            workspace_recovery_reason(&json!({"reason":"worktree creation failed"}))
+                .contains("Inspect and retry workspace reservation")
+        );
+    }
 
     #[test]
     fn exact_selected_profile_ignores_unrelated_and_newer_failed_evidence() {
@@ -3282,6 +3980,7 @@ mod m7_setup_projection_tests {
             snapshots: vec![],
             review_budgets: vec![],
             legacy: json!({}),
+            progress: None,
         };
         let session = json!({"id":"session","task_id":"task","attempt_id":"attempt","role":"manager","role_generation_id":"generation","generation_status":"exited","config_revision":1,"provider":"codex","status":"exited","resume_count":0,"transcript_epoch":"epoch","capability_current":false});
         let rejection = json!({"category":"provider_compatibility_invalid_manifest"});
@@ -3401,13 +4100,15 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
     let mut tasks = Vec::new();
     for id in task_ids {
         let mut task = connection.query_row("SELECT id,project_id,title,description,acceptance_criteria_json,priority,manual_order,lifecycle,attention,version,archived_at,role_overrides_json,legacy_json,EXISTS(SELECT 1 FROM permission_requests pr WHERE pr.task_id=tasks.id AND pr.state='pending'),(archived_at IS NULL AND (lifecycle='done' OR (lifecycle='backlog' AND ready_at IS NULL AND NOT EXISTS(SELECT 1 FROM attempts WHERE task_id=tasks.id)))) FROM tasks WHERE id=?1",
-            params![id], |row| Ok(TaskDto { id:row.get(0)?,project_id:row.get(1)?,title:row.get(2)?,description:row.get(3)?,acceptance_criteria:serde_json::from_str(&row.get::<_,String>(4)?).unwrap_or_default(),priority:row.get(5)?,manual_order:row.get(6)?,lifecycle:row.get(7)?,attention:row.get(8)?,version:row.get(9)?,archived:row.get::<_,Option<String>>(10)?.is_some(),can_archive:row.get(14)?,recipe_provenance:None,role_overrides:parse(row.get(11)?),legacy:parse(row.get(12)?),permission_waiting:row.get(13)?,dependencies:vec![],active_attempt:None,role_settings:vec![],reviews:vec![],snapshots:vec![],review_budgets:vec![] }))?;
+            params![id], |row| Ok(TaskDto { id:row.get(0)?,project_id:row.get(1)?,title:row.get(2)?,description:row.get(3)?,acceptance_criteria:serde_json::from_str(&row.get::<_,String>(4)?).unwrap_or_default(),priority:row.get(5)?,manual_order:row.get(6)?,lifecycle:row.get(7)?,attention:row.get(8)?,version:row.get(9)?,archived:row.get::<_,Option<String>>(10)?.is_some(),can_archive:row.get(14)?,recipe_provenance:None,role_overrides:parse(row.get(11)?),legacy:parse(row.get(12)?),permission_waiting:row.get(13)?,dependencies:vec![],active_attempt:None,role_settings:vec![],reviews:vec![],snapshots:vec![],review_budgets:vec![],progress:None }))?;
         task.recipe_provenance = crate::recipes::task_provenance(&connection, &id)?;
         task.dependencies = json_rows(&connection, "SELECT json_object('task_id',depends_on_task_id,'integration_ref',integration_ref,'verified_at',verified_at) FROM task_dependencies WHERE task_id=?1", &id)?;
         task.active_attempt = connection
             .query_row(
-                "SELECT json_object(
+                &format!(
+                    "SELECT json_object(
             'id',a.id,'phase',a.phase,'status',a.status,'base_revision',a.base_revision,
+            'content_revision',{TASK_CONTENT_REVISION_SQL},
             'plan_hash',a.plan_hash,'plan',(
                 SELECT json_extract(rr.metadata_json,'$.plan') FROM snapshots s
                 JOIN role_results rr ON rr.id=json_extract(s.manifest_json,'$.role_result_id')
@@ -3426,7 +4127,8 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             'legacy_migration_required',a.legacy_migration_required,
             'human_acceptance_at',a.human_acceptance_at
         ) FROM attempts a JOIN tasks t ON t.id=a.task_id
-          WHERE a.task_id=?1 ORDER BY a.created_at DESC LIMIT 1",
+          WHERE a.task_id=?1 ORDER BY a.created_at DESC LIMIT 1"
+                ),
                 params![id],
                 |row| row.get::<_, String>(0),
             )
@@ -3548,6 +4250,12 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             'capture_state',s.capture_state,'updated_at',s.updated_at,
             'interrupt_requested_at',s.interrupt_requested_at,
             'transcript_epoch',s.transcript_epoch,'resume_count',s.resume_count,
+            'reported_in_latest_invocation',EXISTS(
+                SELECT 1 FROM role_results result
+                 WHERE result.session_id=s.id AND result.role_generation_id=s.role_generation_id
+                   AND result.created_at>=COALESCE((SELECT MAX(invocation.created_at)
+                     FROM resume_invocations invocation WHERE invocation.session_id=s.id),
+                     s.created_at)),
             'process_identity',json(s.process_identity_json),'task_id',t.id,
             'attempt_id',a.id,'role',rg.role,'generation',rg.generation,
             'config_revision',rg.config_revision,'lane_id',rg.lane_id,
@@ -3710,6 +4418,8 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         crate::trip::state_rows(&connection)?;
     let mut decisions = crate::coordinator::read_only_decisions(&connection)?;
     decisions.extend(crate::scheduler::read_only_decisions(&connection)?);
+    let mut start_baselines: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
     for task in &tasks {
         if decisions
             .iter()
@@ -3718,7 +4428,24 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             continue;
         }
         if task.lifecycle == "backlog" {
-            decisions.push(backlog_readiness_decision(&connection, task)?);
+            if !start_baselines.contains_key(&task.project_id) {
+                let problem =
+                    crate::trip::start_baseline_problem(&connection, &task.project_id, false)
+                        .unwrap_or_else(|error| {
+                            Some(format!(
+                                "LLMRelay could not check the project's workflow files: {error:#}"
+                            ))
+                        });
+                start_baselines.insert(task.project_id.clone(), problem);
+            }
+            let start_baseline = start_baselines
+                .get(&task.project_id)
+                .and_then(Option::as_deref);
+            decisions.push(backlog_readiness_decision(
+                &connection,
+                task,
+                start_baseline,
+            )?);
             continue;
         }
         let terminal = matches!(task.lifecycle.as_str(), "done" | "cancelled");
@@ -3870,28 +4597,40 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
                     continue;
                 };
                 let observed = selected_setup_capability(selection, &setup_receipts, &capabilities);
+                // Without an observation the installed version is unknown, so
+                // only a release with no support for the provider at all may be
+                // reported as unsupported; otherwise the evidence is missing.
+                let release_unsupported = store
+                    .compatibility_bundles
+                    .resolve(provider, "", role)
+                    .err()
+                    .filter(|error| {
+                        error.explanation().action
+                            == crate::provider_compatibility::SafeAction::UpdateLlmrelayRelease
+                    });
                 let explanation = if let Some(observed) = observed {
                     observed.get("compatibility").cloned()
-                } else if provider == crate::domain::Provider::Claude {
-                    store
-                        .compatibility_bundles
-                        .resolve(provider, "", role)
-                        .err()
-                        .and_then(|error| serde_json::to_value(error.explanation()).ok())
+                } else if let Some(error) = release_unsupported {
+                    serde_json::to_value(error.explanation()).ok()
                 } else {
-                    Some(serde_json::to_value(crate::provider_compatibility::CompatibilityExplanation {
-                        status: crate::provider_compatibility::CompatibilityStatus::EvidenceStale,
-                        observed_version: None,
-                        pack_id: None,
-                        pack_revision: None,
-                        contract_id: None,
-                        contract_revision: None,
-                        short_hash: None,
-                        predicate_id: None,
-                        missing_evidence: vec!["exact_selected_profile_observation".into()],
-                        action: crate::provider_compatibility::SafeAction::RequalifyExactProfile,
-                        message: "No exact compatibility observation is recorded for this selected profile.".into(),
-                    })?)
+                    Some(serde_json::to_value(
+                        crate::provider_compatibility::CompatibilityExplanation {
+                            status:
+                                crate::provider_compatibility::CompatibilityStatus::EvidenceStale,
+                            observed_version: None,
+                            pack_id: None,
+                            pack_revision: None,
+                            contract_id: None,
+                            contract_revision: None,
+                            short_hash: None,
+                            predicate_id: None,
+                            missing_evidence: vec!["exact_selected_profile_observation".into()],
+                            action:
+                                crate::provider_compatibility::SafeAction::RequalifyExactProfile,
+                            message: missing_selection_observation(selection, &setup_receipts)
+                                .into(),
+                        },
+                    )?)
                 };
                 let explanation = explanation.map(|mut value| {
                     if value["status"] == "matched" {
@@ -3941,8 +4680,13 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         trip_setups: &trip_setups,
         decisions: &decisions,
         continuation_actions: &continuation_actions,
+        coordinator_deferral: crate::coordinator::open_tick_deferral(&connection)?,
     }
     .items();
+    let task_actions = crate::domain::task_actions(&attention);
+    for task in &mut tasks {
+        task.progress = task_progress(&connection, task, &decisions, &task_actions, &attention)?;
+    }
     let resources = serde_json::json!({
         "active_sessions":active_sessions.iter().filter(|value|!matches!(value.get("status").and_then(|state|state.as_str()),Some("exited"|"launch_failed"))).count(),
         "active_controls":controls.len(),
@@ -3984,6 +4728,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         trip_task_verification,
         decisions,
         continuation_actions,
+        task_actions,
         attention,
     })
 }
@@ -3991,6 +4736,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
 fn backlog_readiness_decision(
     connection: &Connection,
     task: &TaskDto,
+    start_baseline: Option<&str>,
 ) -> Result<DecisionExplanation> {
     let project = crate::trip::require_project_ready(connection, &task.project_id);
     let scope = validate_task(&task.title, &task.acceptance_criteria);
@@ -4012,13 +4758,19 @@ fn backlog_readiness_decision(
         };
     let prerequisites = vec![
         prerequisite("task.project_ready", if project.is_ok() { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Missing }, project.as_ref().err().map(|error| format!("{error:#}"))),
+        prerequisite("task.start_baseline_current", if start_baseline.is_none() { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Stale }, start_baseline.map(str::to_owned)),
         prerequisite("task.valid_scope", if scope.is_ok() { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Missing }, scope.as_ref().err().map(|error| format!("{error:#}"))),
         prerequisite("task.six_role_settings", if configured == 6 { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Missing }, (configured != 6).then(|| format!("{configured} of six app roles have current settings"))),
         prerequisite("task.profile_activation_and_runtime", DecisionEvidenceState::Unknown, Some("Exact project-default or task-override activation and current runtime capability are checked by Make Ready".into())),
     ];
     let blocker = prerequisites
         .iter()
-        .find(|item| item.state == DecisionEvidenceState::Missing)
+        .find(|item| {
+            matches!(
+                item.state,
+                DecisionEvidenceState::Missing | DecisionEvidenceState::Stale
+            )
+        })
         .cloned();
     let enabled = blocker.is_none();
     let binding = DecisionActionBinding {
@@ -4480,21 +5232,21 @@ fn permanent_resume_rejection_route(
     match category {
         "provider_compatibility_invalid_manifest" => (
             ContinuationActionKind::TerminalIncomplete, false,
-            "The embedded provider compatibility contract is invalid; update LLMRelay.",
+            "LLMRelay's built-in agent support information is invalid. Update LLMRelay.",
             "external", "terminal_incomplete", Some("No retry is available from this release."),
         ),
         "provider_compatibility_unsupported" | "provider_compatibility_contract_changed" => (
             ContinuationActionKind::ReplaceStaleAuthority, false,
-            "The provider compatibility contract needs a reviewed exact version and fresh proof.",
-            "human", "replace_stale_authority", Some("Fresh dispatch requires a current matching contract and proof."),
+            "This agent version is not verified for this LLMRelay release. Install a supported agent version or update LLMRelay, then verify the profile again.",
+            "human", "replace_stale_authority", Some("A new session can start only after the profile is verified."),
         ),
         "resume_spent" | "authority_consumed" => (
             ContinuationActionKind::AuthorizationRequired,
             false,
-            "This retained session's authority is spent and cannot be resumed or silently replaced.",
+            "This session's approval has already been used, so it cannot be resumed. A new approval is needed before the role can continue.",
             "external",
             "authorization_required",
-            Some("A new authorization is required; this action never reuses spent retained-session authority."),
+            Some("LLMRelay never reuses an approval that was already used."),
         ),
         "profile_authority_changed"
         | "native_history_unavailable"
@@ -4504,20 +5256,147 @@ fn permanent_resume_rejection_route(
         | "stale_review_or_scope" => (
             ContinuationActionKind::ReplaceStaleAuthority,
             true,
-            "The retained session is permanently ineligible for exact resume; review and authorize a corrected replacement.",
+            "This session can't be resumed. Review the role's current settings and approve a replacement session.",
             "human",
             "replace_stale_authority",
-            Some("Replacement authority is separately reviewed and never converts this rejected exact resume into a fresh launch."),
+            Some("A replacement is a new session that you approve separately."),
         ),
         _ => (
             ContinuationActionKind::TerminalIncomplete,
             false,
-            "The retained session has an unrecognized permanent rejection category and cannot resume automatically.",
+            "This session can't be resumed for a reason this version of LLMRelay doesn't recognize.",
             "external",
             "terminal_incomplete",
-            Some("Preserve the durable rejection record and obtain an explicit disposition before replacing this session."),
+            Some("Keep the record and ask the person who manages this installation before replacing the session."),
         ),
     }
+}
+
+const TASK_CONTENT_RECORD_LIMIT: usize = 50;
+const TASK_CONTENT_BYTE_LIMIT: usize = 512 * 1024;
+
+/// Changes whenever the current attempt gains a report, its review state
+/// changes or rework feedback is recorded; the dashboard refetches the task
+/// content when it differs.
+const TASK_CONTENT_REVISION_SQL: &str = "(SELECT COUNT(*)||':'||COALESCE(MAX(rr.created_at),'')
+      FROM role_results rr JOIN role_generations rg ON rg.id=rr.role_generation_id
+      WHERE rg.attempt_id=a.id)
+    ||'|'||(SELECT COUNT(*)||':'||COALESCE(MAX(r.updated_at),'') FROM review_requests r WHERE r.attempt_id=a.id)
+    ||'|'||(SELECT COUNT(*) FROM rework_intents ri WHERE ri.new_attempt_id=a.id)";
+
+/// Readable plans, agent reports and rework feedback for a task's current
+/// attempt, oldest first. Only presentation text is returned: no metadata
+/// beyond the plan, no transcripts, permission details or other attempts. The
+/// newest records are kept when the record or byte bound is reached.
+pub fn task_content(store: &Store, task_id: &str) -> Result<serde_json::Value> {
+    let connection = store.lock()?;
+    let current: Option<(String, String)> = connection
+        .query_row(
+            &format!(
+                "SELECT a.id,{TASK_CONTENT_REVISION_SQL} FROM attempts a
+                 WHERE a.task_id=?1 ORDER BY a.created_at DESC LIMIT 1"
+            ),
+            params![task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((attempt_id, content_revision)) = current else {
+        return Ok(serde_json::json!({
+            "task_id":task_id,"attempt_id":null,"content_revision":"",
+            "records":[],"truncated":false,
+        }));
+    };
+    let mut records = Vec::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT rr.id,rr.created_at,rg.role,rr.outcome,rr.summary,
+                    CASE WHEN json_type(rr.metadata_json,'$.plan')='text'
+                         THEN json_extract(rr.metadata_json,'$.plan') END,
+                    json_extract(rr.metadata_json,'$.review_kind')
+             FROM role_results rr JOIN role_generations rg ON rg.id=rr.role_generation_id
+             WHERE rg.attempt_id=?1 ORDER BY rr.created_at,rr.id",
+        )?;
+        let rows = statement.query_map(params![attempt_id], |row| {
+            Ok(serde_json::json!({
+                "kind":"report",
+                "id":row.get::<_, String>(0)?,
+                "created_at":row.get::<_, String>(1)?,
+                "role":row.get::<_, String>(2)?,
+                "outcome":row.get::<_, String>(3)?,
+                "summary":row.get::<_, String>(4)?,
+                "plan":row.get::<_, Option<String>>(5)?,
+                "review_kind":row.get::<_, Option<String>>(6)?,
+            }))
+        })?;
+        for row in rows {
+            records.push(row?);
+        }
+    }
+    let rework: Option<(String, String, String)> = connection
+        .query_row(
+            "SELECT id,created_at,feedback FROM rework_intents WHERE new_attempt_id=?1",
+            params![attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((id, created_at, feedback)) = rework {
+        records.push(serde_json::json!({
+            "kind":"rework_request","id":id,"created_at":created_at,"summary":feedback,
+        }));
+        records.sort_by(|left, right| {
+            json_text(left, "created_at").cmp(&json_text(right, "created_at"))
+        });
+    }
+    let mut truncated = records.len() > TASK_CONTENT_RECORD_LIMIT;
+    let mut kept = Vec::new();
+    let mut bytes = 0;
+    for record in records.into_iter().rev().take(TASK_CONTENT_RECORD_LIMIT) {
+        let size = record.to_string().len();
+        if bytes + size > TASK_CONTENT_BYTE_LIMIT {
+            truncated = true;
+            break;
+        }
+        bytes += size;
+        kept.push(record);
+    }
+    kept.reverse();
+    Ok(serde_json::json!({
+        "task_id":task_id,
+        "attempt_id":attempt_id,
+        "content_revision":content_revision,
+        "records":kept,
+        "truncated":truncated,
+    }))
+}
+
+/// Plain next step for an uncertain workspace reservation. A workspace always
+/// starts from the reservation's recorded commit, so the guidance depends on
+/// whether retrying can ever succeed for the recorded failure.
+fn workspace_recovery_reason(detail: &serde_json::Value) -> String {
+    let failure = [
+        json_text(detail, "reason"),
+        detail
+            .get("observed_filesystem")
+            .and_then(|observed| json_text(observed, "error")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    if let Some(path) = failure
+        .split("approved guidance collides with different worktree content: ")
+        .nth(1)
+    {
+        let path = path.split_whitespace().next().unwrap_or(path);
+        return format!("The guidance file {path} has uncommitted changes, so the task's workspace, which starts from the last commit, does not match it. LLMRelay did not overwrite anything. Restore {path} to its committed version and choose Inspect and retry workspace reservation, or choose Verify and cancel reservation, which cancels this task.");
+    }
+    if failure.contains("policy materialization collision")
+        || failure.contains("activated manifest drifted")
+        || failure.contains("activated package file drifted")
+    {
+        return "The project's workflow files were changed again after setup without being committed, so this task's workspace, which starts from the last commit, cannot be prepared without overwriting them. LLMRelay did not overwrite anything, and retrying cannot fix this reservation. Choose Verify and cancel reservation (this cancels the task), commit the workflow changes, choose Validate and relink in Project settings, then create the task again.".into();
+    }
+    "LLMRelay could not confirm that this task's workspace was set up correctly. Check the folder shown in Technical details, then choose Inspect and retry workspace reservation, or Verify and cancel reservation, which cancels this task.".into()
 }
 
 fn continuation_actions(
@@ -4545,14 +5424,14 @@ fn continuation_actions(
                 actions.push(continuation(
                     ContinuationActionKind::AuthorizeImplementation,
                     attempt_id.is_some() && attempt.get("plan_hash").and_then(serde_json::Value::as_str).is_some(),
-                    "The approved plan needs a distinct implementation authorization.",
+                    "The approved plan is waiting for you to allow implementation to start.",
                     "human",
                     None,
                     None,
                     None,
                     "authorize_implementation",
                     serde_json::json!({"task_id":task.id,"attempt_id":attempt_id,"expected_task_version":task.version,"plan_hash":attempt.get("plan_hash"),"config_revision_id":attempt.get("config_revision_id")}),
-                    Some("Does not consume a provider call; it authorizes implementation of this exact plan."),
+                    Some("Allowing implementation starts no agent call by itself; it applies only to this exact plan."),
                 ));
             }
             if attempt
@@ -4563,14 +5442,14 @@ fn continuation_actions(
                 actions.push(continuation(
                     ContinuationActionKind::MigrateAttempt,
                     attempt_id.is_some(),
-                    "This active attempt requires explicit migration before ordinary controls can continue.",
+                    "This task was started with an older workflow version. Move it to the current workflow before it can continue.",
                     "human",
                     None,
                     None,
                     None,
                     "migrate_attempt",
                     serde_json::json!({"task_id":task.id,"attempt_id":attempt_id,"expected_task_version":task.version,"plan_hash":attempt.get("plan_hash"),"config_revision_id":attempt.get("config_revision_id")}),
-                    Some("Migration rechecks quiescence and current workflow configuration."),
+                    Some("Moving it first checks that no agent is still running and that the current workflow settings apply."),
                 ));
             }
         }
@@ -4598,14 +5477,14 @@ fn continuation_actions(
             actions.push(continuation(
                 ContinuationActionKind::StartManagedLegacyAttempt,
                 true,
-                "Imported legacy work has no LLMRelay attempt lineage and must begin through normal current admission.",
+                "This imported task has no LLMRelay history yet. Start a fresh attempt to run it through the normal workflow.",
                 "human",
                 None,
                 None,
                 None,
                 "normalize_legacy_task",
                 serde_json::json!({"task_id":task.id,"expected_task_version":task.version,"source_status":source_status}),
-                Some("Starts no provider work itself; normal Ready and admission checks remain required."),
+                Some("Starting a fresh attempt runs no agent by itself; the normal Ready checks still apply."),
             ));
         }
     }
@@ -4615,14 +5494,14 @@ fn continuation_actions(
             actions.push(continuation(
                 ContinuationActionKind::RecoverSetupApply,
                 state == Some("recovery_required"),
-                "The authorized installation journal requires byte-for-byte recovery before it can proceed.",
+                "Setup was interrupted while installing workflow files. Recover the installation so LLMRelay can check every file before continuing.",
                 "human",
                 (state == Some("applying")).then_some("startup reconciliation"),
                 setup.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
                 None,
                 "recover_installation",
                 serde_json::json!({"setup_operation_id":setup.get("setup_operation_id"),"project_id":setup.get("project_id")}),
-                Some("Recovery verifies existing journal bytes and never blindly overwrites destination drift."),
+                Some("Recovery checks each file against what you approved and never overwrites files that changed."),
             ));
         }
         if let Some(admissions) = setup
@@ -4641,7 +5520,7 @@ fn continuation_actions(
                         admission
                             .get("failure_reason")
                             .and_then(serde_json::Value::as_str)
-                            .unwrap_or("The retained runtime proof is no longer usable and requires a corrected scoped verification.")
+                            .unwrap_or("The earlier profile verification can no longer be used. Prepare a new verification for this profile.")
                             .to_owned(),
                         "human",
                         None,
@@ -4649,7 +5528,7 @@ fn continuation_actions(
                         None,
                         "prepare_runtime_admission",
                         serde_json::json!({"project_id":setup.get("project_id"),"task_id":admission.get("task_id"),"admission_id":admission.get("id"),"role":admission.get("role")}),
-                        Some("A corrected runtime verification is a fresh, separately scoped call and does not repair the rejected retained session."),
+                        Some("The new verification is a separate agent call that you approve before it runs."),
                     ));
                 }
             }
@@ -4676,42 +5555,45 @@ fn continuation_actions(
                 actions.push(continuation(
                     ContinuationActionKind::RefreshAndReconcile,
                     true,
-                    "The recorded workspace recovery no longer owns a current unresolved reservation tuple. Refresh before submitting another exact workspace operation.",
+                    "This workspace problem no longer matches the task's current state. Refresh to see what is current before trying again.",
                     "human",
                     None,
                     record.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
                     None,
                     "refresh_and_reconcile",
                     binding,
-                    Some("Historical or superseded workspace records never authorize a retry or cancellation."),
+                    Some("An older workspace record cannot be used to retry or cancel."),
                 ));
                 continue;
             }
             actions.push(continuation(
                 ContinuationActionKind::RecoverWorkspaceReservation,
                 true,
-                "Repository workspace ownership is uncertain; inspect the exact recorded path before retrying or cancelling it.",
+                workspace_recovery_reason(&detail),
                 "human",
                 None,
-                record.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
+                record
+                    .get("updated_at")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
                 None,
                 "recover_workspace_reservation",
                 binding,
-                Some("Retry and cancel are versioned exact-tuple operations; neither removes worktree bytes."),
+                Some("Neither retry nor cancel deletes files in the workspace folder."),
             ));
         } else if kind == Some("graceful_stop_deadline") {
             if !actionable {
                 actions.push(continuation(
                     ContinuationActionKind::RefreshAndReconcile,
                     true,
-                    "The recorded graceful-stop tuple is no longer current. Refresh the durable state; retry and force-stop are unavailable without its exact live binding.",
+                    "This stop request no longer matches the agent's current session. Refresh to see the current state; retry and force stop are not available for it.",
                     "human",
                     None,
                     record.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
                     None,
                     "refresh_and_reconcile",
                     binding,
-                    Some("A settled or superseded stop record cannot signal a process again."),
+                    Some("An older stop request cannot stop a process again."),
                 ));
                 continue;
             }
@@ -4752,7 +5634,7 @@ fn continuation_actions(
                 actions.push(continuation(
                     ContinuationActionKind::RetryGracefulStop,
                     exact_binding,
-                    "The durable graceful-stop deadline elapsed without exact quiescence.",
+                    "The agent was asked to stop but did not stop within the allowed time.",
                     "human",
                     None,
                     record
@@ -4762,25 +5644,25 @@ fn continuation_actions(
                     None,
                     "retry_graceful_stop",
                     binding.clone(),
-                    Some("Rechecks the same managed identity and preserves the original deadline."),
+                    Some("Retrying asks the same process to stop again."),
                 ));
                 actions.push(continuation(
                     ContinuationActionKind::ForceStopExactProcess,
                     exact_binding,
-                    "Force stop remains a human-only escalation for the exact managed process identity.",
+                    "If asking it to stop again does not work, you can force stop this exact process.",
                     "human",
                     None,
                     record.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
                     None,
                     "force_stop_exact_process",
                     binding,
-                    Some("Immediately rechecks identity and requires later quiescence proof; it never runs automatically."),
+                    Some("Force stop never happens automatically; LLMRelay still confirms the process has stopped afterwards."),
                 ));
             } else {
                 actions.push(continuation(
                     ContinuationActionKind::RefreshAndReconcile,
                     true,
-                    "The graceful-stop recovery no longer has its exact session projection. Refresh and inspect the durable record; generic recovery cannot safely act without that identity.",
+                    "The session for this stop request is no longer shown. Refresh and review the record in Technical details; LLMRelay cannot act on it without that session.",
                     "human",
                     None,
                     record.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
@@ -4815,9 +5697,9 @@ fn continuation_actions(
                 },
                 true,
                 if exact_process_or_check {
-                    "Durable process or ownership recovery must be resolved before automatic work can continue."
+                    "LLMRelay must confirm that the agent's processes have stopped before automatic work can continue. Describe what you saw, then choose Check recovery and continue."
                 } else {
-                    "This historical control record has no exact process, check, workspace, or claim binding. Refresh and submit a corrected control instead of using generic recovery."
+                    "This earlier request can no longer be recovered here. Refresh the task and use its current controls to submit a corrected request."
                 },
                 "human",
                 None,
@@ -4868,9 +5750,9 @@ fn continuation_actions(
             actions.push(continuation(
                 ContinuationActionKind::WaitForExit,
                 false,
-                "A verified exact process-group exit is required before replacement or resume.",
+                "Waiting for the agent to stop. It can be replaced or resumed only after LLMRelay confirms it has exited.",
                 "service",
-                Some("verified process-group exit"),
+                Some("the agent to exit"),
                 since.clone(),
                 deadline_at.clone(),
                 "wait_for_exit",
@@ -4879,9 +5761,30 @@ fn continuation_actions(
             ));
         }
         if status == Some("exited") {
-            if native_resume_fenced {
+            let ordinary_task = session
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|task_id| tasks.iter().find(|task| task.id == task_id));
+            // Finished, cancelled and archived tasks keep their sessions only as
+            // history; nothing about them can be resumed.
+            if native_resume_fenced
+                || ordinary_task.is_some_and(|task| {
+                    task.archived || matches!(task.lifecycle.as_str(), "done" | "cancelled")
+                })
+            {
                 continue;
             }
+            // An ordinary role session that reported its result in its latest
+            // invocation was stopped after completing that turn, and a
+            // superseded generation no longer owns the role. Both are history;
+            // the coordinator owns any later dispatch.
+            let historical_role_session = ordinary_task.is_some()
+                && (!session_generation_current
+                    || session
+                        .get("reported_in_latest_invocation")
+                        .is_some_and(|value| {
+                            value.as_bool() == Some(true) || value.as_i64() == Some(1)
+                        }));
             let matching_rejection = history.iter().find(|event| {
                 event.get("event_code").and_then(serde_json::Value::as_str)
                     == Some("session.resume.rejected")
@@ -4977,9 +5880,9 @@ fn continuation_actions(
                     (
                         ContinuationActionKind::ReplaceStaleAuthority,
                         same_profile_authority && current_capability_supported,
-                        "The provider compatibility contract needs a reviewed exact version and fresh proof.",
+                        "This agent version is not verified for this LLMRelay release. Install a supported agent version or update LLMRelay, then verify the profile again.",
                         "human", "replace_stale_authority",
-                        Some("Fresh dispatch requires a current matching contract and proof."),
+                        Some("A new session can start only after the profile is verified."),
                     )
                 } else if category == "frozen_runtime_identity_changed"
                     || (category == "native_history_unavailable"
@@ -4995,23 +5898,23 @@ fn continuation_actions(
                             ReviewerFreshRoute::FinalFreshOnly => (
                                 ContinuationActionKind::AuthorizationRequired,
                                 false,
-                                "Final verification is fresh-only. Its observed delivery remains spent, so this rejected resume cannot create another final-review call.",
+                                "Final verification always runs as a new session, and this one was already used, so it can't be resumed or run again here.",
                                 "external",
                                 "authorization_required",
-                                Some("No dashboard action extends final-review accounting or reuses a delivered final verification."),
+                                Some("The dashboard cannot add another final verification."),
                             ),
                             ReviewerFreshRoute::AllowanceExhausted if same_profile_authority => (
                                 ContinuationActionKind::AuthorizationRequired,
                                 false,
-                                "The exact delivered review has no remaining allowance for a fresh request.",
+                                "This review was already delivered and no reviews are left for a new request.",
                                 "external",
                                 "authorization_required",
-                                Some("No dashboard action extends review allowance; preserve the delivered review and obtain separate authorization before changing it."),
+                                Some("The dashboard cannot add reviews."),
                             ),
                             ReviewerFreshRoute::Stale if same_profile_authority => (
                                 ContinuationActionKind::ReplaceStaleAuthority,
                                 true,
-                                "The review request or its frozen evidence no longer matches this rejected session.",
+                                "The review this session was working on has changed, so the session can't be resumed. Review the role's settings and approve a replacement.",
                                 "human",
                                 "replace_stale_authority",
                                 None,
@@ -5023,14 +5926,14 @@ fn continuation_actions(
                                 detail
                                     .get("reason")
                                     .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("The exact native resume is no longer authorized."),
+                                    .unwrap_or("This session can no longer be resumed."),
                                 "human",
                                 if typed_setup {
                                     "trip_setup_dispatch"
                                 } else {
                                     "fresh_accounted_retry"
                                 },
-                                Some("A fresh route consumes the existing role-specific provider or review accounting; it never converts an exact resume silently."),
+                                Some("Starting fresh uses one of this role's allowed agent calls or reviews."),
                             ),
                             _ => (
                                 ContinuationActionKind::ReplaceStaleAuthority,
@@ -5038,7 +5941,7 @@ fn continuation_actions(
                                 detail
                                     .get("reason")
                                     .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("The rejected session no longer has current replacement authority."),
+                                    .unwrap_or("This session can no longer be replaced with its current settings."),
                                 "human",
                                 "replace_stale_authority",
                                 None,
@@ -5079,6 +5982,7 @@ fn continuation_actions(
                     accounting_note,
                 ));
             } else if !rejection_authority_replaced
+                && !historical_role_session
                 && session.get("role").and_then(serde_json::Value::as_str) != Some("final_verifier")
                 && !restart_candidate_managed
             {
@@ -5122,14 +6026,14 @@ fn continuation_actions(
                     },
                     resumable,
                     if resumable && runtime_probe {
-                        "The retained native runtime probe is eligible only for its exact scoped runtime resume."
+                        "The profile verification stopped before finishing. You can resume that same verification."
                     } else if resumable {
-                        "The retained native session is eligible for an exact resume with its frozen identity."
+                        "The session stopped before reporting its result. You can resume the same session where it left off."
                     } else {
-                        "Exact resume remains unavailable until the native identity, process-group quiescence, and current frozen authority are proven."
+                        "The session stopped before reporting its result. It can be resumed once LLMRelay confirms it has fully exited."
                     },
                     if resumable { "human" } else { "service" },
-                    (!resumable).then_some("verified process-group exit and current scoped authority"),
+                    (!resumable).then_some("LLMRelay to confirm the session has fully exited"),
                     session.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
                     None,
                     if resumable {
@@ -5139,9 +6043,9 @@ fn continuation_actions(
                     },
                     serde_json::json!({"task_id":session.get("task_id"),"attempt_id":session.get("attempt_id"),"session_id":id,"role_generation_id":session.get("role_generation_id"),"transcript_epoch":session.get("transcript_epoch"),"runtime_admission_id":runtime_admission,"role":session.get("role")}),
                     Some(if runtime_probe {
-                        "Exact runtime resume reuses only the retained scoped native probe and never creates a fresh provider call."
+                        "Resuming continues the same verification; it does not start a new agent call."
                     } else {
-                        "Exact resume reuses only the retained native conversation and never creates a fresh provider call."
+                        "Resuming continues the same conversation; it does not start a new agent call."
                     }),
                 ));
             }
@@ -5174,7 +6078,7 @@ fn continuation_actions(
                     .first()
                     .and_then(|prerequisite| prerequisite.message.as_deref())
             })
-            .unwrap_or("Recorded restart authority requires revalidation.");
+            .unwrap_or("LLMRelay must recheck this session after the restart.");
         let owner = match next_action.owner {
             DecisionOwner::Service => "service",
             DecisionOwner::Human => "human",
@@ -5203,7 +6107,7 @@ fn continuation_actions(
             .and_then(|payload| payload.get("failure"))
             .is_some()
         {
-            actions.push(continuation(ContinuationActionKind::RefreshAndReconcile, true, "The selected control was definitively rejected. Refresh, review its failure, and submit a corrected versioned control; generic ownership recovery is unavailable because this control has no independent exact ownership tuple.", "human", None, control.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned), None, "refresh_and_reconcile", serde_json::json!({"control_id":control.get("id"),"attempt_id":control.get("attempt_id")}), None));
+            actions.push(continuation(ContinuationActionKind::RefreshAndReconcile, true, "Your earlier request was rejected. Refresh, read why in Technical details, and submit it again if it is still needed.", "human", None, control.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned), None, "refresh_and_reconcile", serde_json::json!({"control_id":control.get("id"),"attempt_id":control.get("attempt_id")}), None));
         }
     }
     for switch in switches {
@@ -5211,7 +6115,7 @@ fn continuation_actions(
             switch.get("state").and_then(serde_json::Value::as_str),
             Some("recovery_required" | "rejected")
         ) {
-            actions.push(continuation(ContinuationActionKind::RefreshAndReconcile, true, "The role switch was rejected before dispatch. Refresh and submit a corrected, versioned replacement; any separately recorded exact recovery remains on its owning process, check, or workspace action.", "human", None, switch.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned), None, "refresh_and_reconcile", serde_json::json!({"switch_intent_id":switch.get("id"),"attempt_id":switch.get("attempt_id")}), None));
+            actions.push(continuation(ContinuationActionKind::RefreshAndReconcile, true, "The role change was rejected before it started. Refresh and submit the change again if it is still needed.", "human", None, switch.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned), None, "refresh_and_reconcile", serde_json::json!({"switch_intent_id":switch.get("id"),"attempt_id":switch.get("attempt_id")}), None));
         }
     }
     for decision in trip_explorer {
@@ -5240,10 +6144,257 @@ fn continuation_actions(
             && task.is_some()
         {
             let task = task.expect("checked above");
-            actions.push(continuation(ContinuationActionKind::AuthorizeAdditionalExplorer, true, "A bounded rescue Explorer call requires a separate human justification.", "human", None, decision.get("created_at").and_then(serde_json::Value::as_str).map(str::to_owned), None, "authorize_additional_explorer", serde_json::json!({"task_id":task.id,"attempt_id":attempt_id,"expected_task_version":task.version,"stage":"rescue"}), Some("Consumes only the explicitly authorized additional Explorer allowance.")));
+            actions.push(continuation(ContinuationActionKind::AuthorizeAdditionalExplorer, true, "The manager asked for one more Explorer call. It runs only if you approve it with a short reason.", "human", None, decision.get("created_at").and_then(serde_json::Value::as_str).map(str::to_owned), None, "authorize_additional_explorer", serde_json::json!({"task_id":task.id,"attempt_id":attempt_id,"expected_task_version":task.version,"stage":"rescue"}), Some("Approving allows exactly one extra Explorer call.")));
         }
     }
     actions
+}
+
+/// The newest authoritative workflow evidence for an attempt: reports the
+/// workflow consumed and did not later retire as stale (an unconsumed report is
+/// added separately, only when the current phase would consume it), decided permissions, confirmed
+/// guidance submission, recorded holds and releases, audited phase changes,
+/// settings materialization, safe-boundary and nondelivery reconciliation,
+/// resolved recoveries, finished reviews, captures and your own decisions.
+/// Hooks, session updates, review bookkeeping, process observations and a
+/// generic attempt rewrite are deliberately absent: they show that something
+/// happened, not that the workflow advanced.
+const MEANINGFUL_EVIDENCE_SQL: &str = "
+    SELECT at,event FROM (
+      SELECT rr.created_at AS at,'report_'||rr.outcome AS event FROM role_results rr
+        JOIN role_generations rg ON rg.id=rr.role_generation_id WHERE rg.attempt_id=?1
+          AND rr.consumed_at IS NOT NULL
+          AND NOT EXISTS(SELECT 1 FROM audit_events retired
+            WHERE retired.event_code='role_result.superseded' AND retired.entity_id=rr.id)
+      UNION ALL SELECT updated_at,'permission_'||state FROM permission_requests
+        WHERE attempt_id=?1 AND state!='pending'
+      UNION ALL SELECT submitted_at,'guidance_submitted' FROM guidance_messages
+        WHERE attempt_id=?1 AND submitted_at IS NOT NULL
+      UNION ALL SELECT acknowledged_at,'guidance_acknowledged' FROM guidance_messages
+        WHERE attempt_id=?1 AND acknowledged_at IS NOT NULL
+      UNION ALL SELECT created_at,event_code FROM audit_events
+        WHERE entity_kind='attempt' AND entity_id=?1
+          AND event_code IN ('attempt.attention.changed','attempt.attention.superseded',
+            'attempt.phase.changed','task.profile.materialized_at_safe_boundary')
+      UNION ALL SELECT e.created_at,e.event_code FROM audit_events e
+        JOIN sessions s ON s.id=e.entity_id JOIN role_generations g ON g.id=s.role_generation_id
+        WHERE e.entity_kind='session' AND g.attempt_id=?1
+          AND e.event_code IN ('provider.codex_stop_idle.reconciled','session.launch.proven_nondelivery')
+      UNION ALL SELECT updated_at,'recovery_'||state FROM recovery_records
+        WHERE attempt_id=?1 AND state!='attention_required'
+      UNION ALL SELECT updated_at,'review_finished' FROM review_requests
+        WHERE attempt_id=?1 AND delivery_state='finished'
+      UNION ALL SELECT created_at,'snapshot_'||kind FROM snapshots WHERE attempt_id=?1
+      UNION ALL SELECT created_at,'your_decision' FROM audit_events
+        WHERE event_code='human.command.applied'
+          AND ((entity_kind='task' AND entity_id=?2) OR (entity_kind='attempt' AND entity_id=?1))
+          AND COALESCE(json_extract(detail_json,'$.state'),'') NOT IN ('guidance_queued')
+    ) WHERE at IS NOT NULL ORDER BY julianday(at) DESC LIMIT 1";
+
+/// When the task's current wait began: the creation of the unresolved thing it
+/// is waiting on, not the time of the latest progress. `None` when that start
+/// is not recorded, rather than a guess.
+fn blocker_started_at(
+    connection: &Connection,
+    task: &TaskDto,
+    attempt_id: &str,
+    decision: &DecisionExplanation,
+) -> Result<Option<String>> {
+    let first = |sql: &str| -> Result<Option<String>> {
+        Ok(connection
+            .query_row(sql, params![attempt_id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten())
+    };
+    if let Some(at) = first(
+        "SELECT MIN(created_at) FROM permission_requests WHERE attempt_id=?1 AND state='pending'",
+    )? {
+        return Ok(Some(at));
+    }
+    if task.attention != "none" {
+        // The hold currently in force, when its start was recorded.
+        let hold: Option<(Option<String>, String)> = connection
+            .query_row(
+                "SELECT json_extract(detail_json,'$.attention'),created_at FROM audit_events
+                 WHERE event_code='attempt.attention.changed' AND entity_kind='attempt' AND entity_id=?1
+                 ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                params![attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((Some(attention), at)) = hold {
+            if attention == task.attention {
+                return Ok(Some(at));
+            }
+        }
+    }
+    for sql in [
+        "SELECT MIN(created_at) FROM recovery_records WHERE attempt_id=?1 AND state='attention_required'",
+        "SELECT MIN(created_at) FROM controls WHERE attempt_id=?1
+           AND state NOT IN ('finished','cancelled','superseded','rejected','failed','abandoned')
+           AND kind!='transition_proposal'",
+        "SELECT MAX(created_at) FROM review_requests WHERE attempt_id=?1
+           AND delivery_state IN ('reserved','launching','delivered','ambiguous')",
+    ] {
+        if let Some(at) = first(sql)? {
+            return Ok(Some(at));
+        }
+    }
+    if task.attention != "none" {
+        return Ok(None);
+    }
+    if decision
+        .primary_blocker
+        .as_ref()
+        .is_some_and(|blocker| blocker.owner == DecisionOwner::Provider)
+    {
+        // Waiting for an agent's step: the step began with its invocation.
+        return first(
+            "SELECT COALESCE(
+               (SELECT ri.created_at FROM resume_invocations ri
+                WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
+                ORDER BY ri.resume_ordinal DESC LIMIT 1),s.created_at)
+             FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+             WHERE g.attempt_id=?1 AND s.status='running' AND g.status='running'
+             ORDER BY s.created_at DESC LIMIT 1",
+        );
+    }
+    Ok(None)
+}
+
+/// A user-facing label for a decision's next operation. Unknown operations are
+/// left unnamed rather than shown as internal identifiers.
+fn next_operation_label(operation: &str) -> Option<&'static str> {
+    Some(match operation {
+        "inspect_project" => "Open project setup",
+        "verify_task_profile" => "Open agent settings",
+        "approve_plan" | "review_plan" => "Review plan",
+        "resolve_recovery" => "Resolve issue",
+        _ => return None,
+    })
+}
+
+fn task_progress(
+    connection: &Connection,
+    task: &TaskDto,
+    decisions: &[DecisionExplanation],
+    task_actions: &[crate::domain::TaskAction],
+    attention: &[AttentionItem],
+) -> Result<Option<crate::domain::TaskProgress>> {
+    if task.archived || matches!(task.lifecycle.as_str(), "done" | "cancelled") {
+        return Ok(None);
+    }
+    let Some(attempt_id) = active_attempt_id(task) else {
+        return Ok(None);
+    };
+    let Some(decision) = decisions
+        .iter()
+        .find(|decision| decision.subject.task_id.as_deref() == Some(task.id.as_str()))
+    else {
+        return Ok(None);
+    };
+    let (mut last_meaningful_at, mut last_meaningful_event) = connection
+        .query_row(
+            MEANINGFUL_EVIDENCE_SQL,
+            params![attempt_id, task.id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()?
+        .unwrap_or((None, None));
+    // Reports not yet consumed count only when the current phase would consume
+    // them from the current authority.
+    for (at, outcome) in crate::coordinator::current_progress_reports(connection, attempt_id)? {
+        let newer = match &last_meaningful_at {
+            Some(current) => connection.query_row(
+                "SELECT julianday(?1)>julianday(?2)",
+                params![at, current],
+                |row| row.get::<_, bool>(0),
+            )?,
+            None => true,
+        };
+        if newer {
+            last_meaningful_at = Some(at);
+            last_meaningful_event = Some(format!("report_{outcome}"));
+        }
+    }
+    let (last_agent_activity_at, live_role): (Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT (SELECT h.received_at FROM hook_events h JOIN sessions s ON s.id=h.session_id
+                       JOIN role_generations g ON g.id=s.role_generation_id
+                     WHERE g.attempt_id=?1 ORDER BY h.rowid DESC LIMIT 1),
+                    (SELECT g.role FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+                     WHERE g.attempt_id=?1 AND s.status='running' AND g.status='running'
+                     ORDER BY CASE g.role WHEN 'manager' THEN 1 ELSE 0 END,s.updated_at DESC LIMIT 1)",
+            params![attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+    let newer_activity: bool = match (&last_agent_activity_at, &last_meaningful_at) {
+        (Some(activity), Some(evidence)) => connection.query_row(
+            "SELECT julianday(?1)>julianday(?2)",
+            params![activity, evidence],
+            |row| row.get(0),
+        )?,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let activity = match (&live_role, newer_activity) {
+        (None, _) => "no_live_agent",
+        (Some(_), true) => "agent_active_without_progress",
+        (Some(_), false) => "agent_live_idle",
+    };
+    let blocker = decision.primary_blocker.as_ref();
+    let owner = blocker.map(|blocker| blocker.owner);
+    let responsible = match owner {
+        Some(DecisionOwner::Human) => "you",
+        Some(DecisionOwner::Provider) => "agent",
+        Some(DecisionOwner::External) => "external",
+        _ => "llmrelay",
+    };
+    let responsible_role = blocker
+        .and_then(|blocker| json_text(&blocker.evidence, "role"))
+        .and_then(|role| role.parse().ok())
+        .or_else(|| {
+            (owner == Some(DecisionOwner::Provider))
+                .then(|| live_role.as_deref().and_then(|role| role.parse().ok()))
+                .flatten()
+        });
+    let action = task_actions.iter().find(|action| action.task_id == task.id);
+    let item = action.and_then(|action| attention.iter().find(|item| item.id == action.item_id));
+    let waiting = decision.disposition != DecisionDisposition::Ready;
+    Ok(Some(crate::domain::TaskProgress {
+        reason_code: decision.reason_code.clone(),
+        waiting_reason: blocker
+            .and_then(|blocker| blocker.message.clone())
+            .unwrap_or_else(|| plain_decision_reason(&decision.reason_code)),
+        responsible: responsible.to_owned(),
+        responsible_role,
+        next_operation: action
+            .map(|action| action.action.label.clone())
+            .or_else(|| {
+                decision
+                    .next_action
+                    .as_ref()
+                    .and_then(|next| next_operation_label(&next.operation))
+                    .map(str::to_owned)
+            }),
+        next_target: item.and_then(|item| item.target.clone()),
+        waiting_since: if waiting {
+            blocker_started_at(connection, task, attempt_id, decision)?
+        } else {
+            None
+        },
+        last_meaningful_at,
+        last_meaningful_event,
+        last_agent_activity_at,
+        activity: activity.to_owned(),
+    }))
 }
 
 /// Rows already read for one snapshot, so attention derives from exactly what
@@ -5257,6 +6408,8 @@ struct AttentionSources<'a> {
     trip_setups: &'a [serde_json::Value],
     decisions: &'a [DecisionExplanation],
     continuation_actions: &'a [ContinuationAction],
+    /// Set while the coordinator keeps failing the same step.
+    coordinator_deferral: Option<crate::coordinator::TickDeferral>,
 }
 
 impl AttentionSources<'_> {
@@ -5269,6 +6422,7 @@ impl AttentionSources<'_> {
     fn items(&self) -> Vec<AttentionItem> {
         let mut items: Vec<AttentionItem> = self.permission_items().collect();
         items.extend(self.restore_hold_item());
+        items.extend(self.coordinator_deferral_item());
         items.extend(self.recovery_items());
         items.extend(self.setup_items());
         items.extend(self.continuation_items());
@@ -5291,12 +6445,15 @@ impl AttentionSources<'_> {
             .map(|request| AttentionItem {
                 id: format!("permission_request:{}", request.id),
                 category: AttentionCategory::Permission,
-                title: format!("{} · {}", request.task_id, request.tool_name),
-                reason: format!(
-                    "The {} role ({}) is waiting for a permission decision.",
-                    request.role.to_string().replace('_', " "),
-                    request.provider
+                title: format!(
+                    "{} is asking to use {}",
+                    request.role.label(),
+                    request.tool_name
                 ),
+                reason: "The agent is waiting for you to approve or deny this request. Nothing runs until you decide.".into(),
+                task_title: self.task(&request.task_id).map(|task| task.title.clone()),
+                role: Some(request.role),
+                action: AttentionActionKind::ReviewRequest.into(),
                 target: Some(AttentionTarget::PermissionRequest {
                     project_id: request.project_id.clone(),
                     task_id: request.task_id.clone(),
@@ -5306,6 +6463,7 @@ impl AttentionSources<'_> {
                     request_revision: request.revision,
                 }),
                 held_tasks: Vec::new(),
+                details: None,
             })
     }
 
@@ -5321,7 +6479,7 @@ impl AttentionSources<'_> {
         Some(AttentionItem {
             id: "restore_hold".into(),
             category: AttentionCategory::Recovery,
-            title: "Instance restore hold · offline release required".into(),
+            title: "Work is on hold after a database restore".into(),
             reason: hold
                 .prerequisites
                 .iter()
@@ -5329,8 +6487,52 @@ impl AttentionSources<'_> {
                 .map(|item| item.message.as_deref().unwrap_or(&item.code))
                 .collect::<Vec<_>>()
                 .join("; "),
+            task_title: None,
+            role: None,
+            action: AttentionActionKind::ResolveIssue.into(),
             target: None,
             held_tasks: self.tasks.iter().filter(held).map(task_target).collect(),
+            details: None,
+        })
+    }
+
+    fn coordinator_deferral_item(&self) -> Option<AttentionItem> {
+        let deferral = self.coordinator_deferral.as_ref()?;
+        let details = Some(format!(
+            "Failing since {}: {}",
+            deferral.since, deferral.cause
+        ));
+        // A failure while advancing one attempt belongs to that task; anything
+        // else is service-wide and opens Diagnostics, which lists the event.
+        if let Some(task) = deferral
+            .attempt_id
+            .as_deref()
+            .and_then(|attempt| self.task_with_active_attempt(attempt))
+        {
+            return Some(AttentionItem {
+                id: format!("coordinator_deferred:{}", task.id),
+                category: AttentionCategory::Blocked,
+                title: "Automatic progress is paused for this task".into(),
+                reason: "The next workflow step for this task failed on every try. LLMRelay keeps retrying it and continues on its own once it succeeds. Open the task to see its current state; Technical details has the failure.".into(),
+                task_title: Some(task.title.clone()),
+                role: None,
+                action: AttentionActionKind::ResolveIssue.into(),
+                target: Some(AttentionTarget::Task(task_target(task))),
+                held_tasks: Vec::new(),
+                details,
+            });
+        }
+        Some(AttentionItem {
+            id: "coordinator_deferred".into(),
+            category: AttentionCategory::Blocked,
+            title: "Automatic progress is paused".into(),
+            reason: "A service step failed on every try, so waiting work is not advancing. LLMRelay keeps retrying it and continues on its own once it succeeds. Diagnostics lists the failure.".into(),
+            task_title: None,
+            role: None,
+            action: AttentionActionKind::OpenDiagnostics.into(),
+            target: Some(AttentionTarget::Diagnostics),
+            held_tasks: Vec::new(),
+            details,
         })
     }
 
@@ -5342,15 +6544,22 @@ impl AttentionSources<'_> {
                 let recovery_id =
                     json_text(record, "id").filter(|id| *id != "database-restore-hold")?;
                 let attempt_id = json_text(record, "attempt_id");
-                let (subject, target) = match self.setup_owning_recovery(recovery_id) {
+                let kind = record
+                    .get("detail")
+                    .and_then(|detail| json_text(detail, "kind"))
+                    .unwrap_or("process_ownership");
+                let role = json_text(record, "session_id")
+                    .and_then(|session_id| self.session_role(session_id));
+                let problem = recovery_title(kind, role);
+                let (title, task_title, target) = match self.setup_owning_recovery(recovery_id) {
                     Some(setup) => {
                         let project_id = json_text(setup, "project_id").unwrap_or_default();
-                        let project = self.project(project_id);
+                        let project = self
+                            .project(project_id)
+                            .map_or(project_id, |item| item.display_name.as_str());
                         (
-                            format!(
-                                "{} setup",
-                                project.map_or(project_id, |item| item.display_name.as_str())
-                            ),
+                            format!("{project} setup: {problem}"),
+                            None,
                             json_text(setup, "setup_operation_id")
                                 .and_then(|id| self.setup_target(id)),
                         )
@@ -5359,7 +6568,8 @@ impl AttentionSources<'_> {
                         .and_then(|id| Some((id, self.task_with_active_attempt(id)?)))
                     {
                         Some((attempt_id, task)) => (
-                            task.id.clone(),
+                            problem,
+                            Some(task.title.clone()),
                             Some(AttentionTarget::RecoveryRecord {
                                 project_id: task.project_id.clone(),
                                 task_id: task.id.clone(),
@@ -5367,23 +6577,24 @@ impl AttentionSources<'_> {
                                 recovery_id: recovery_id.to_owned(),
                             }),
                         ),
+                        // Unresolved records of a replaced attempt stay listed;
+                        // they are still safety holds even without a current view.
                         None => (
-                            attempt_id.map_or("Unbound".into(), |id| format!("Attempt {id}")),
+                            format!("{problem} (earlier attempt)"),
+                            attempt_id
+                                .and_then(|id| self.task_with_any_attempt(id))
+                                .map(|task| task.title.clone()),
                             None,
                         ),
                     },
                 };
-                let kind = record
-                    .get("detail")
-                    .and_then(|detail| json_text(detail, "kind"))
-                    .unwrap_or("process_ownership");
                 let reason = self
                     .continuation_actions
                     .iter()
                     .find(|action| json_text(&action.binding, "recovery_id") == Some(recovery_id))
                     .map_or_else(
                         || {
-                            "Durable recovery must be resolved before automatic work can continue."
+                            "LLMRelay must confirm what happened before automatic work can continue."
                                 .to_owned()
                         },
                         |action| action.reason.clone(),
@@ -5391,10 +6602,14 @@ impl AttentionSources<'_> {
                 Some(AttentionItem {
                     id: format!("recovery_record:{recovery_id}"),
                     category: AttentionCategory::Recovery,
-                    title: format!("{subject} · {} recovery", kind.replace('_', " ")),
+                    title,
                     reason,
+                    task_title,
+                    role,
+                    action: AttentionActionKind::ResolveIssue.into(),
                     target,
                     held_tasks: Vec::new(),
+                    details: None,
                 })
             })
     }
@@ -5403,23 +6618,40 @@ impl AttentionSources<'_> {
         self.projects
             .iter()
             .filter(|project| json_text(&project.trip, "readiness") != Some("ready"))
-            .map(|project| AttentionItem {
-                id: format!("project_setup:{}", project.id),
-                category: if json_text(&project.trip, "readiness") == Some("recovery_required") {
-                    AttentionCategory::Recovery
-                } else {
-                    AttentionCategory::Compatibility
-                },
-                title: format!("{} · project setup", project.display_name),
-                reason: json_text(&project.trip, "reason")
-                    .unwrap_or("Project setup has not been inspected.")
-                    .to_owned(),
-                target: Some(AttentionTarget::ProjectSetup {
-                    project_id: project.id.clone(),
-                    setup_operation_id: json_text(&project.trip, "setup_operation_id")
-                        .map(str::to_owned),
-                }),
-                held_tasks: Vec::new(),
+            .map(|project| {
+                let readiness = json_text(&project.trip, "readiness");
+                AttentionItem {
+                    id: format!("project_setup:{}", project.id),
+                    category: if readiness == Some("recovery_required") {
+                        AttentionCategory::Recovery
+                    } else {
+                        AttentionCategory::Compatibility
+                    },
+                    title: format!(
+                        "{} {}",
+                        project.display_name,
+                        match readiness {
+                            Some("not_initialized") | None => "is not set up yet",
+                            Some("setup_in_progress") => "setup is in progress",
+                            Some("needs_upgrade_review") => "setup needs your review",
+                            Some("recovery_required") => "setup needs recovery",
+                            Some(_) => "setup has a problem",
+                        }
+                    ),
+                    reason: json_text(&project.trip, "reason")
+                        .unwrap_or("Project setup has not been inspected.")
+                        .to_owned(),
+                    task_title: None,
+                    role: None,
+                    action: AttentionActionKind::OpenProjectSetup.into(),
+                    target: Some(AttentionTarget::ProjectSetup {
+                        project_id: project.id.clone(),
+                        setup_operation_id: json_text(&project.trip, "setup_operation_id")
+                            .map(str::to_owned),
+                    }),
+                    held_tasks: Vec::new(),
+                    details: None,
+                }
             })
     }
 
@@ -5458,10 +6690,74 @@ impl AttentionSources<'_> {
                     {
                         None
                     }
-                    _ => Some(continuation_item(action, target)),
+                    _ => Some(self.continuation_item(action, target)),
                 }
             })
             .collect()
+    }
+
+    fn continuation_item(
+        &self,
+        action: &ContinuationAction,
+        target: Option<AttentionTarget>,
+    ) -> AttentionItem {
+        let identity = [
+            "session_id",
+            "recovery_id",
+            "control_id",
+            "switch_intent_id",
+            "admission_id",
+            "setup_operation_id",
+            "attempt_id",
+            "task_id",
+            "project_id",
+        ]
+        .into_iter()
+        .find_map(|key| json_text(&action.binding, key))
+        .unwrap_or("instance");
+        let role = json_text(&action.binding, "role")
+            .and_then(|role| role.parse::<RoleKind>().ok())
+            .or_else(|| {
+                json_text(&action.binding, "session_id")
+                    .and_then(|session_id| self.session_role(session_id))
+            });
+        let task_title = match &target {
+            Some(AttentionTarget::ProjectSetup { .. }) => None,
+            Some(target) => attention_task_id(target),
+            None => json_text(&action.binding, "task_id"),
+        }
+        .and_then(|task_id| self.task(task_id))
+        .map(|task| task.title.clone());
+        let action_kind = match (&target, &action.kind) {
+            (Some(AttentionTarget::ProjectSetup { .. }), _) => {
+                AttentionActionKind::OpenProjectSetup
+            }
+            (
+                Some(AttentionTarget::Session { .. }),
+                ContinuationActionKind::WaitForExit
+                | ContinuationActionKind::WaitForCapacity
+                | ContinuationActionKind::WaitForService,
+            ) => AttentionActionKind::OpenAgentOutput,
+            (_, ContinuationActionKind::AuthorizeAdditionalExplorer) => {
+                AttentionActionKind::ReviewRequest
+            }
+            _ => AttentionActionKind::ResolveIssue,
+        };
+        AttentionItem {
+            id: format!("continuation:{}:{identity}", action.operation),
+            category: continuation_category(&action.kind),
+            title: continuation_title(&action.kind, role),
+            reason: match &action.waiting_for {
+                Some(waiting_for) => format!("{} Waiting for {waiting_for}.", action.reason),
+                None => action.reason.clone(),
+            },
+            task_title,
+            role,
+            action: action_kind.into(),
+            target,
+            held_tasks: Vec::new(),
+            details: None,
+        }
     }
 
     fn continuation_target(&self, action: &ContinuationAction) -> Option<AttentionTarget> {
@@ -5514,43 +6810,89 @@ impl AttentionSources<'_> {
             .and_then(|attempt| json_text(attempt, "phase"))
             .filter(|_| !terminal);
         let task_scope = || Some(AttentionTarget::Task(task_target(task)));
-        let (id, category, reason, target) = match (phase, task.attention.as_str()) {
+        let (id, category, title, reason, action, target) = match (phase, task.attention.as_str()) {
             (Some(phase @ "awaiting_plan_approval"), _) => (
                 format!("attempt:{}:{phase}", attempt_id?),
                 AttentionCategory::Decision,
-                "The reviewed plan is waiting for your approval.".to_owned(),
+                "Plan ready for your approval".to_owned(),
+                "The plan passed its independent review and is waiting for your approval."
+                    .to_owned(),
+                AttentionActionKind::ReviewPlan,
                 attempt_target(task, attempt_id?),
             ),
             (Some(phase @ "awaiting_implementation_authorization"), _) => (
                 format!("attempt:{}:{phase}", attempt_id?),
                 AttentionCategory::Decision,
-                "The approved plan needs a separate implementation authorization.".to_owned(),
+                "Approved plan is waiting to start".to_owned(),
+                "Implementation starts only after you allow it for this exact plan.".to_owned(),
+                AttentionActionKind::ReviewPlan,
                 attempt_target(task, attempt_id?),
             ),
             (Some(phase @ "awaiting_human_review"), _) => (
                 format!("attempt:{}:{phase}", attempt_id?),
                 AttentionCategory::AwaitingAcceptance,
-                "The candidate passed its checks and final review and awaits your acceptance."
+                "Result ready for your review".to_owned(),
+                "The result passed its checks and final review. Review it, then accept it or request rework."
                     .to_owned(),
+                AttentionActionKind::ReviewResult,
                 attempt_target(task, attempt_id?),
             ),
             (_, "none") => {
+                // Automatic waits (capacity, queue order, admission) are shown
+                // on the task; only a hold the user can act on is attention.
+                let verify_profile = |decision: &&DecisionExplanation| {
+                    decision
+                        .next_action
+                        .as_ref()
+                        .is_some_and(|action| action.operation == "verify_task_profile")
+                };
                 let decision = self.decisions.iter().find(|decision| {
                     decision.subject.task_id.as_deref() == Some(task.id.as_str())
                         && (task.lifecycle == "ready"
-                            || decision.disposition == DecisionDisposition::RetryDeferred)
+                            || decision.disposition == DecisionDisposition::RetryDeferred
+                            || verify_profile(decision))
                         && decision.disposition != DecisionDisposition::Ready
+                        && decision
+                            .primary_blocker
+                            .as_ref()
+                            .is_some_and(|blocker| blocker.owner == DecisionOwner::Human)
                 })?;
                 let reason = decision
                     .primary_blocker
                     .as_ref()
                     .and_then(|blocker| blocker.message.clone())
-                    .unwrap_or_else(|| decision.reason_code.replace(['.', '_'], " "));
+                    .unwrap_or_else(|| plain_decision_reason(&decision.reason_code));
+                // New agent settings that need verifying open that exact role
+                // and settings revision in the task's Agent settings.
+                let settings = decision
+                    .next_action
+                    .as_ref()
+                    .filter(|action| action.operation == "verify_task_profile")
+                    .and_then(|action| {
+                        Some(AttentionTarget::RoleSettings {
+                            project_id: task.project_id.clone(),
+                            task_id: task.id.clone(),
+                            role: action.binding.role?,
+                            settings_revision: action.binding.settings_revision?,
+                        })
+                    });
                 (
                     format!("task:{}:decision", task.id),
                     AttentionCategory::Blocked,
+                    if settings.is_some() {
+                        "New agent settings need verifying".to_owned()
+                    } else if task.lifecycle == "ready" {
+                        "Queued, but can't start yet".to_owned()
+                    } else {
+                        "Waiting to continue".to_owned()
+                    },
                     reason,
-                    task_scope(),
+                    if settings.is_some() {
+                        AttentionActionKind::OpenAgentSettings
+                    } else {
+                        AttentionActionKind::ResolveIssue
+                    },
+                    settings.or_else(task_scope),
                 )
             }
             (_, attention @ ("needs_recovery" | "restart_parked")) => {
@@ -5565,28 +6907,76 @@ impl AttentionSources<'_> {
                 (
                     format!("task:{}:{attention}", task.id),
                     AttentionCategory::Recovery,
+                    if attention == "restart_parked" {
+                        "Paused after LLMRelay restarted".to_owned()
+                    } else {
+                        "Needs recovery before it can continue".to_owned()
+                    },
                     self.task_reason(task),
+                    AttentionActionKind::ResolveIssue,
                     task_scope(),
                 )
             }
-            (_, attention) => (
-                format!("task:{}:{attention}", task.id),
-                match attention {
-                    "needs_human_review" => AttentionCategory::AwaitingAcceptance,
-                    "needs_input" | "needs_review_budget" => AttentionCategory::Decision,
-                    _ => AttentionCategory::Blocked,
-                },
-                self.task_reason(task),
-                task_scope(),
-            ),
+            (_, attention) => {
+                let answer = (attention == "needs_input")
+                    .then(|| self.question_target(task))
+                    .flatten();
+                (
+                    format!("task:{}:{attention}", task.id),
+                    match attention {
+                        "needs_human_review" => AttentionCategory::AwaitingAcceptance,
+                        "needs_input" | "needs_review_budget" => AttentionCategory::Decision,
+                        _ => AttentionCategory::Blocked,
+                    },
+                    task_attention_title(attention),
+                    self.task_reason(task),
+                    match attention {
+                        "needs_human_review" => AttentionActionKind::ReviewResult,
+                        _ if answer.is_some() => AttentionActionKind::AnswerQuestion,
+                        _ => AttentionActionKind::ResolveIssue,
+                    },
+                    answer.or_else(task_scope),
+                )
+            }
         };
         Some(AttentionItem {
             id,
             category,
-            title: format!("{} · {}", task.id, task.title),
+            title,
             reason,
+            task_title: Some(task.title.clone()),
+            role: None,
+            action: action.into(),
             target,
             held_tasks: Vec::new(),
+            details: None,
+        })
+    }
+
+    /// A running manager of the active attempt that is waiting on a reported
+    /// question, which the dashboard can answer through guidance.
+    fn question_target(&self, task: &TaskDto) -> Option<AttentionTarget> {
+        let attempt_id = active_attempt_id(task)?;
+        let asked = self.decisions.iter().any(|decision| {
+            decision.subject.task_id.as_deref() == Some(task.id.as_str())
+                && decision.primary_blocker.as_ref().is_some_and(|blocker| {
+                    json_text(&blocker.evidence, "hold_reason") == Some("role_needs_input")
+                })
+        });
+        if !asked {
+            return None;
+        }
+        let manager = self.sessions.iter().find(|session| {
+            json_text(session, "attempt_id") == Some(attempt_id)
+                && json_text(session, "role") == Some("manager")
+                && json_text(session, "status") == Some("running")
+        })?;
+        Some(AttentionTarget::Session {
+            project_id: task.project_id.clone(),
+            task_id: task.id.clone(),
+            attempt_id: attempt_id.to_owned(),
+            session_id: json_text(manager, "id")?.to_owned(),
+            role_generation_id: json_text(manager, "role_generation_id")?.to_owned(),
         })
     }
 
@@ -5596,16 +6986,19 @@ impl AttentionSources<'_> {
             .find(|decision| decision.subject.task_id.as_deref() == Some(task.id.as_str()))
             .and_then(|decision| decision.primary_blocker.as_ref()?.message.clone())
             .unwrap_or_else(|| match task.attention.as_str() {
-                "needs_input" => "The task needs your input before it can continue.".into(),
+                "needs_input" => "The task is waiting for you. Open it to see what it needs, then choose Continue when it can go on.".into(),
                 "needs_review_budget" => {
-                    "The review allowance is exhausted and needs a human decision.".into()
+                    "Every allowed review for this attempt has been used. Open the task to decide how to continue.".into()
                 }
                 "needs_recovery" => {
-                    "The task needs recovery before automatic work can continue.".into()
+                    "LLMRelay must confirm what happened to this task's agents before automatic work can continue.".into()
                 }
-                "restart_parked" => "The task is parked until its restart is resolved.".into(),
-                "paused" => "Automatic progress is paused for this task.".into(),
-                other => other.replace('_', " "),
+                "restart_parked" => "This task was paused when LLMRelay restarted. Open it to resume or continue.".into(),
+                "paused" => "Automatic progress is paused for this task. Choose Continue when you want it to go on.".into(),
+                "pause_requested" => "The task will pause when the current step finishes.".into(),
+                "queued_capacity" => "The task is waiting for a free agent slot and will continue automatically.".into(),
+                "blocked" => "The task cannot continue with its current settings. Open it to see why.".into(),
+                other => plain_words(other),
             })
     }
 
@@ -5617,6 +7010,24 @@ impl AttentionSources<'_> {
         self.tasks
             .iter()
             .find(|task| active_attempt_id(task) == Some(attempt_id))
+    }
+
+    /// The task that owns `attempt_id` through a session, even when a newer
+    /// attempt has replaced it; for labelling only, never for targeting.
+    fn task_with_any_attempt(&self, attempt_id: &str) -> Option<&TaskDto> {
+        self.sessions
+            .iter()
+            .find(|session| json_text(session, "attempt_id") == Some(attempt_id))
+            .and_then(|session| json_text(session, "task_id"))
+            .and_then(|task_id| self.task(task_id))
+    }
+
+    fn session_role(&self, session_id: &str) -> Option<RoleKind> {
+        self.sessions
+            .iter()
+            .find(|session| json_text(session, "id") == Some(session_id))
+            .and_then(|session| json_text(session, "role"))
+            .and_then(|role| role.parse().ok())
     }
 
     fn project(&self, project_id: &str) -> Option<&ProjectDto> {
@@ -5654,77 +7065,157 @@ impl AttentionSources<'_> {
     }
 }
 
-fn continuation_item(
-    action: &ContinuationAction,
-    target: Option<AttentionTarget>,
-) -> AttentionItem {
-    let (category, label) = continuation_attention(&action.kind);
-    let identity = [
-        "session_id",
-        "recovery_id",
-        "control_id",
-        "switch_intent_id",
-        "admission_id",
-        "setup_operation_id",
-        "attempt_id",
-        "task_id",
-        "project_id",
-    ]
-    .into_iter()
-    .find_map(|key| json_text(&action.binding, key))
-    .unwrap_or("instance");
-    let subject = match &target {
-        Some(AttentionTarget::ProjectSetup { .. }) => Some("project setup"),
-        Some(target) => attention_task_id(target),
-        None => json_text(&action.binding, "task_id"),
-    };
-    AttentionItem {
-        id: format!("continuation:{}:{identity}", action.operation),
-        category,
-        title: subject.map_or_else(
-            || label.to_owned(),
-            |subject| format!("{label} · {subject}"),
+fn plain_words(value: &str) -> String {
+    let words = value.replace(['_', '.'], " ");
+    let mut characters = words.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(characters).collect()
+    })
+}
+
+fn role_name(role: Option<RoleKind>) -> &'static str {
+    role.map_or("An agent", RoleKind::label)
+}
+
+fn recovery_title(kind: &str, role: Option<RoleKind>) -> String {
+    match kind {
+        "workspace_reservation" => "The task's workspace could not be prepared".into(),
+        "graceful_stop_deadline" => format!("{} did not stop in time", role_name(role)),
+        "rework_materialization" => "Rework could not be set up".into(),
+        "database_restore_claim" | "database_restore_freeze" => {
+            "Restored work needs your confirmation".into()
+        }
+        _ => format!(
+            "Confirm that {} has stopped",
+            role_name(role).to_lowercase()
         ),
-        reason: match &action.waiting_for {
-            Some(waiting_for) => format!("{} Waiting for {waiting_for}.", action.reason),
-            None => action.reason.clone(),
-        },
-        target,
-        held_tasks: Vec::new(),
     }
 }
 
-fn continuation_attention(kind: &ContinuationActionKind) -> (AttentionCategory, &'static str) {
+fn task_attention_title(attention: &str) -> String {
+    match attention {
+        "needs_input" => "Needs your input".into(),
+        "needs_human_review" => "Result ready for your review".into(),
+        "needs_review_budget" => "Review allowance used up".into(),
+        "paused" => "Paused".into(),
+        "pause_requested" => "Pausing after the current step".into(),
+        "queued_capacity" => "Waiting for a free agent slot".into(),
+        "blocked" => "Can't continue with current settings".into(),
+        "run_next_requested" => "Starting next".into(),
+        other => plain_words(other),
+    }
+}
+
+/// Plain explanation for a decision whose blocker carries no message.
+fn plain_decision_reason(reason_code: &str) -> String {
+    plain_scheduler_reason(reason_code)
+        .unwrap_or_else(|| plain_words(reason_code.rsplit('.').next().unwrap_or(reason_code)))
+}
+
+/// Plain explanations for scheduler admission holds, used when the hold
+/// itself carries no message.
+pub(crate) fn plain_scheduler_reason(reason_code: &str) -> Option<String> {
+    Some(match reason_code {
+        "scheduler.global_capacity_full" => {
+            "The maximum number of tasks is already running. This task starts automatically when one finishes."
+        }
+        "scheduler.queue_paused" => {
+            "Task pickup is paused for this project. Choose Resume pickup to let queued tasks start, or Run next to start only this task."
+        }
+        "scheduler.repository_claim_active" => {
+            "Another task is using this repository. This task starts automatically when that task finishes."
+        }
+        "scheduler.dependency_incomplete" => {
+            "This task is waiting for a task it depends on to be completed."
+        }
+        "scheduler.role_settings_missing" => {
+            "Some agent roles for this task have no settings. Open the task and configure every role."
+        }
+        "scheduler.capability_authority_stale" | "scheduler.task_profile_authority_stale" => {
+            "An agent profile for this task needs verification before it can start. Open Project setup or the task's agent settings."
+        }
+        "scheduler.manager_capacity_full" => {
+            "A manager agent for this provider is busy with another task. This task starts automatically when it is free."
+        }
+        _ => return None,
+    }
+    .to_owned())
+}
+
+fn continuation_category(kind: &ContinuationActionKind) -> AttentionCategory {
     use AttentionCategory::{Blocked, Compatibility, Decision, Recovery};
     match kind {
-        ContinuationActionKind::ExactResume => (Recovery, "Exact resume"),
-        ContinuationActionKind::FreshAccountedRetry => (Recovery, "Fresh accounted retry"),
-        ContinuationActionKind::ReplaceStaleAuthority => (Recovery, "Replace stale authority"),
-        ContinuationActionKind::WaitForExit => (Recovery, "Waiting for exit"),
-        ContinuationActionKind::WaitForCapacity => (Blocked, "Waiting for capacity"),
-        ContinuationActionKind::WaitForService => (Blocked, "Waiting for service"),
-        ContinuationActionKind::RecoverOwnership => (Recovery, "Recover ownership"),
-        ContinuationActionKind::RetryGracefulStop => (Recovery, "Retry graceful stop"),
-        ContinuationActionKind::ForceStopExactProcess => (Recovery, "Force stop exact process"),
+        ContinuationActionKind::WaitForCapacity | ContinuationActionKind::WaitForService => Blocked,
+        ContinuationActionKind::PrepareCorrectedRuntime
+        | ContinuationActionKind::MigrateAttempt
+        | ContinuationActionKind::StartManagedLegacyAttempt => Compatibility,
+        ContinuationActionKind::AuthorizeImplementation
+        | ContinuationActionKind::AuthorizeAdditionalExplorer
+        | ContinuationActionKind::AuthorizationRequired => Decision,
+        ContinuationActionKind::ExactResume
+        | ContinuationActionKind::FreshAccountedRetry
+        | ContinuationActionKind::ReplaceStaleAuthority
+        | ContinuationActionKind::WaitForExit
+        | ContinuationActionKind::RecoverOwnership
+        | ContinuationActionKind::RetryGracefulStop
+        | ContinuationActionKind::ForceStopExactProcess
+        | ContinuationActionKind::RecoverSetupApply
+        | ContinuationActionKind::RecoverWorkspaceReservation
+        | ContinuationActionKind::ContinueFreshDispatch
+        | ContinuationActionKind::RefreshAndReconcile
+        | ContinuationActionKind::TerminalIncomplete => Recovery,
+    }
+}
+
+fn continuation_title(kind: &ContinuationActionKind, role: Option<RoleKind>) -> String {
+    let who = role_name(role);
+    match kind {
+        ContinuationActionKind::ExactResume => format!("{who} stopped before finishing"),
+        ContinuationActionKind::FreshAccountedRetry => format!("{who} needs a fresh start"),
+        ContinuationActionKind::ReplaceStaleAuthority => format!("{who} needs updated settings"),
+        ContinuationActionKind::WaitForExit => {
+            format!("Waiting for {} to stop", who.to_lowercase())
+        }
+        ContinuationActionKind::WaitForCapacity => "Waiting for a free agent slot".into(),
+        ContinuationActionKind::WaitForService => "Waiting for LLMRelay to be ready".into(),
+        ContinuationActionKind::RecoverOwnership => {
+            format!("Confirm that {} has stopped", who.to_lowercase())
+        }
+        ContinuationActionKind::RetryGracefulStop
+        | ContinuationActionKind::ForceStopExactProcess => {
+            format!("{who} did not stop in time")
+        }
         ContinuationActionKind::PrepareCorrectedRuntime => {
-            (Compatibility, "Prepare corrected runtime")
+            format!("{who} profile needs a new verification")
         }
-        ContinuationActionKind::AuthorizeImplementation => (Decision, "Authorize implementation"),
-        ContinuationActionKind::MigrateAttempt => (Compatibility, "Migrate attempt"),
+        ContinuationActionKind::AuthorizeImplementation => {
+            "Approved plan is waiting to start".into()
+        }
+        ContinuationActionKind::MigrateAttempt => {
+            "Task needs to move to the current workflow".into()
+        }
         ContinuationActionKind::AuthorizeAdditionalExplorer => {
-            (Decision, "Authorize additional Explorer")
+            "An extra Explorer call needs your approval".into()
         }
-        ContinuationActionKind::RecoverSetupApply => (Recovery, "Recover setup installation"),
+        ContinuationActionKind::RecoverSetupApply => "Setup installation needs recovery".into(),
         ContinuationActionKind::RecoverWorkspaceReservation => {
-            (Recovery, "Recover workspace reservation")
+            "The task's workspace could not be prepared".into()
         }
-        ContinuationActionKind::ContinueFreshDispatch => (Recovery, "Continue with fresh dispatch"),
+        ContinuationActionKind::ContinueFreshDispatch => {
+            "Ready to continue with a new agent session".into()
+        }
         ContinuationActionKind::StartManagedLegacyAttempt => {
-            (Compatibility, "Start managed legacy attempt")
+            "Imported task needs a fresh start".into()
         }
-        ContinuationActionKind::RefreshAndReconcile => (Recovery, "Refresh and reconcile"),
-        ContinuationActionKind::AuthorizationRequired => (Decision, "Authorization required"),
-        ContinuationActionKind::TerminalIncomplete => (Recovery, "Terminal incomplete"),
+        ContinuationActionKind::RefreshAndReconcile => {
+            "A request was rejected; review it and try again".into()
+        }
+        ContinuationActionKind::AuthorizationRequired => {
+            format!("{who} can't continue without a new approval")
+        }
+        ContinuationActionKind::TerminalIncomplete => {
+            format!("{who} can't continue automatically")
+        }
     }
 }
 
@@ -5754,14 +7245,7 @@ fn task_target(task: &TaskDto) -> TaskAttentionTarget {
 }
 
 fn attention_task_id(target: &AttentionTarget) -> Option<&str> {
-    match target {
-        AttentionTarget::Task(target) => Some(&target.task_id),
-        AttentionTarget::Attempt { task_id, .. }
-        | AttentionTarget::Session { task_id, .. }
-        | AttentionTarget::PermissionRequest { task_id, .. }
-        | AttentionTarget::RecoveryRecord { task_id, .. } => Some(task_id),
-        AttentionTarget::ProjectSetup { .. } => None,
-    }
+    target.task_id()
 }
 
 fn active_attempt_id(task: &TaskDto) -> Option<&str> {
@@ -5939,6 +7423,342 @@ fn validate_task(title: &str, criteria: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Fresh ordinary review allowances of every new attempt lineage.
+const LINEAGE_REVIEW_BUDGETS: [(&str, i64); 3] = [("plan", 2), ("code", 2), ("final", 1)];
+
+/// The task scope and complete role configuration a new lineage child binds.
+struct LineageScope {
+    scope_hash: String,
+    configuration_hash: String,
+    configuration_revision: i64,
+}
+
+fn current_lineage_scope(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    base: &str,
+    parent_configuration_revision: i64,
+) -> Result<LineageScope> {
+    let task_scope: (String, String, String) = transaction.query_row(
+        "SELECT title,description,acceptance_criteria_json FROM tasks WHERE id=?1",
+        params![task_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let scope_hash = json_hash(
+        &serde_json::json!({"title":task_scope.0,"description":task_scope.1,"acceptance_criteria":serde_json::from_str::<serde_json::Value>(&task_scope.2)?,"base_revision":base}),
+    )?;
+    let configurations = {
+        let mut statement=transaction.prepare("SELECT role,revision,config_json FROM role_settings r WHERE task_id=?1 AND revision=(SELECT MAX(revision) FROM role_settings WHERE task_id=r.task_id AND role=r.role) ORDER BY role")?;
+        let rows = statement
+            .query_map(params![task_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    Ok(LineageScope {
+        scope_hash,
+        configuration_hash: json_hash(&configurations)?,
+        configuration_revision: configurations
+            .iter()
+            .map(|(_, revision, _)| *revision)
+            .max()
+            .unwrap_or(parent_configuration_revision),
+    })
+}
+
+struct LineageChild<'a> {
+    task_id: &'a str,
+    parent_attempt_id: &'a str,
+    operation_id: &'a str,
+    phase: &'a str,
+    base_revision: &'a str,
+    scope: &'a LineageScope,
+    carried_plan_hash: Option<&'a str>,
+    carry_plan_approval: bool,
+    accepted_snapshot_id: Option<&'a str>,
+    source_snapshot_id: &'a str,
+    feedback: &'a str,
+}
+
+/// Stages a rework child and its reserved intent in the caller's transaction:
+/// the child copies the parent's attempt profiles and gets fresh review
+/// allowances, and the parent's roles are revoked and asked to stop. The
+/// workspace is materialized later by `prepare_rework`. Returns the child and
+/// intent ids.
+fn stage_rework_lineage(
+    transaction: &Transaction<'_>,
+    child: &LineageChild<'_>,
+    now: &str,
+) -> Result<(String, String)> {
+    let new_attempt = uuid::Uuid::new_v4().to_string();
+    transaction.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at,parent_attempt_id,plan_hash,plan_approved_at,accepted_snapshot_id,scope_hash,configuration_hash,workflow_version,workflow_hash,upstream_source_hash,overlay_hash,legacy_migration_required)
+        VALUES(?1,?2,?3,?4,?5,?6,'materialization_pending',?7,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,0)",
+        params![new_attempt, child.task_id, uuid::Uuid::new_v4().to_string(), child.phase, child.base_revision, child.scope.configuration_revision, now, child.parent_attempt_id,
+            child.carried_plan_hash, child.carry_plan_approval.then_some(now), child.accepted_snapshot_id, child.scope.scope_hash, child.scope.configuration_hash, crate::workflow_resources::WORKFLOW_VERSION, crate::workflow_resources::workflow_hash(), crate::trip::source_hash(), crate::trip::overlay_hash()])?;
+    transaction.execute("INSERT INTO trip_attempt_profiles(attempt_id,role,settings_revision,activation_id,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at)
+        SELECT ?1,role,settings_revision,activation_id,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,?2 FROM trip_attempt_profiles WHERE attempt_id=?3",
+        params![new_attempt, now, child.parent_attempt_id])?;
+    for (kind, allowance) in LINEAGE_REVIEW_BUDGETS {
+        transaction.execute("INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance) VALUES(?1,?2,?3,?4)",
+            params![uuid::Uuid::new_v4().to_string(), new_attempt, kind, allowance])?;
+    }
+    transaction.execute("UPDATE tasks SET lifecycle='in_progress',attention='none',version=version+1,description=description,updated_at=?1 WHERE id=?2", params![now, child.task_id])?;
+    transaction.execute(
+        "UPDATE attempts SET status='rework_staging',updated_at=?1 WHERE id=?2",
+        params![now, child.parent_attempt_id],
+    )?;
+    transaction.execute("UPDATE role_credentials SET revoked_at=?1 WHERE role_generation_id IN (SELECT id FROM role_generations WHERE attempt_id=?2) AND revoked_at IS NULL", params![now, child.parent_attempt_id])?;
+    transaction.execute("UPDATE role_generations SET status='stopping',updated_at=?1 WHERE attempt_id=?2 AND status IN ('launch_reserved','running')", params![now, child.parent_attempt_id])?;
+    let intent = uuid::Uuid::new_v4().to_string();
+    transaction.execute("INSERT INTO rework_intents(id,operation_id,parent_attempt_id,new_attempt_id,snapshot_id,feedback,carry_plan_approval,scope_hash,configuration_hash,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'reserved',?10,?10)",
+        params![intent, child.operation_id, child.parent_attempt_id, new_attempt, child.source_snapshot_id, child.feedback, child.carry_plan_approval, child.scope.scope_hash, child.scope.configuration_hash, now])?;
+    transaction.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+        VALUES(?1,?2,'human','rework.lineage.created','attempt',?3,?4,?5)", params![uuid::Uuid::new_v4().to_string(), child.operation_id, new_attempt,
+            serde_json::json!({"parent_attempt_id":child.parent_attempt_id,"feedback":child.feedback,"carry_plan_approval":child.carry_plan_approval}).to_string(), now])?;
+    Ok((new_attempt, intent))
+}
+
+struct TerminalReplan<'a> {
+    task_id: &'a str,
+    attempt_id: &'a str,
+    expected_version: i64,
+    review_request_id: &'a str,
+    role_result_id: &'a str,
+    candidate_hash: &'a str,
+    snapshot_id: &'a str,
+    reason: &'a str,
+}
+
+/// Holds and ownership that must be settled on the parent before a terminal
+/// replan is staged. `?1` is the parent attempt. A live manager is not listed:
+/// the coordinator stops it, and materialization waits for proof it exited.
+const TERMINAL_REPLAN_FENCES: &[(&str, &str)] = &[
+    (
+        "a review of the attempt is active or its delivery is uncertain",
+        "SELECT EXISTS(SELECT 1 FROM review_requests WHERE attempt_id=?1
+        AND delivery_state IN ('reserved','launching','delivered','ambiguous'))",
+    ),
+    (
+        "a review result of the attempt has not been consumed",
+        "SELECT EXISTS(SELECT 1 FROM role_results rr
+        JOIN review_requests r ON r.id=json_extract(rr.metadata_json,'$.review_request_id')
+        WHERE r.attempt_id=?1 AND rr.consumed_at IS NULL)",
+    ),
+    (
+        "an implementer is still working",
+        "SELECT EXISTS(SELECT 1 FROM role_generations WHERE attempt_id=?1 AND role='implementer'
+        AND status IN ('launch_reserved','running','stopping'))",
+    ),
+    (
+        "a recovery is open",
+        "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=?1
+        AND state='attention_required')",
+    ),
+    (
+        "a restart hold is open",
+        "SELECT EXISTS(SELECT 1 FROM restart_candidates WHERE attempt_id=?1
+        AND state NOT IN ('resumed','released_fresh_dispatch','cancelled'))",
+    ),
+    (
+        "a task control is pending",
+        "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
+        AND kind NOT IN ('transition_proposal','manager_stop','manager_change')
+        AND state IN ('requested','draining','held','recovery_required'))",
+    ),
+    (
+        "a manager stop or change is unresolved",
+        "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
+        AND kind IN ('manager_stop','manager_change')
+        AND state NOT IN ('finished','cancelled','superseded','rejected'))",
+    ),
+    (
+        "an agent switch is pending",
+        "SELECT EXISTS(SELECT 1 FROM switch_intents WHERE attempt_id=?1
+        AND state NOT IN ('dispatched','completed','cancelled','rejected','superseded'))",
+    ),
+];
+
+/// Stages the explicitly requested fresh planning attempt after the parent's
+/// terminal nonapproving code or final review. Every binding is derived from
+/// the ledger: the parent's latest review, its single consumed result, the
+/// complete rejected candidate snapshot, and a closed dedicated recheck when
+/// one exists. The child starts from that candidate as a source only, with no
+/// plan, approval, checks, conformance or accepted snapshot, and fresh
+/// allowances. Parent requests, results, budgets, receipts and snapshots are
+/// not changed. Returns the child and its immutable provenance.
+fn stage_terminal_replan(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+    request: &TerminalReplan<'_>,
+    now: &str,
+) -> Result<(String, serde_json::Value)> {
+    let reason = request.reason.trim();
+    if reason.is_empty() || reason.len() > 4096 {
+        bail!("a replan reason of at most 4096 bytes is required")
+    }
+    let parent: Option<(String, i64)> = transaction
+        .query_row(
+            "SELECT a.base_revision,a.configuration_revision
+             FROM tasks t JOIN attempts a ON a.task_id=t.id
+             WHERE t.id=?1 AND a.id=?2 AND t.version=?3 AND t.archived_at IS NULL
+               AND t.lifecycle IN ('in_progress','validation')
+               AND t.attention IN ('none','needs_input')
+               AND a.status IN ('running','needs_input','held')
+               AND a.phase='needs_input' AND a.candidate_hash IS NULL
+               AND a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=t.id
+                 ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)",
+            params![
+                request.task_id,
+                request.attempt_id,
+                request.expected_version
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((base, configuration_revision)) = parent else {
+        bail!("task version is stale, or the attempt is not the task's current attempt left incomplete by a terminal review")
+    };
+    let replanned: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rework_intents WHERE parent_attempt_id=?1)",
+        params![request.attempt_id],
+        |row| row.get(0),
+    )?;
+    if replanned {
+        bail!("this attempt already has a continuation lineage; it cannot be replanned again")
+    }
+    let terminal: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT r.review_kind,r.verdict FROM review_requests r
+             JOIN role_results rr ON rr.id=?3 AND rr.role_generation_id=r.role_generation_id
+               AND rr.session_id=r.session_id AND rr.outcome=r.verdict AND rr.consumed_at IS NOT NULL
+               AND json_extract(rr.metadata_json,'$.review_request_id')=r.id
+               AND json_extract(rr.metadata_json,'$.review_kind')=r.review_kind
+               AND json_extract(rr.metadata_json,'$.candidate_hash')=r.candidate_hash
+             JOIN snapshots s ON s.id=?5 AND s.attempt_id=r.attempt_id AND s.kind='candidate'
+               AND s.complete=1 AND s.manifest_hash=r.candidate_hash
+             WHERE r.id=?2 AND r.attempt_id=?1 AND r.review_kind IN ('code','final')
+               AND r.delivery_state='finished' AND r.verdict IN ('request_changes','needs_rework')
+               AND r.candidate_hash=?4
+               AND r.rowid=(SELECT MAX(latest.rowid) FROM review_requests latest
+                 WHERE latest.attempt_id=r.attempt_id)
+               AND (SELECT COUNT(*) FROM role_results other
+                 WHERE json_extract(other.metadata_json,'$.review_request_id')=r.id)=1",
+            params![
+                request.attempt_id,
+                request.review_request_id,
+                request.role_result_id,
+                request.candidate_hash,
+                request.snapshot_id
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((review_kind, verdict)) = terminal else {
+        bail!("the review, its consumed result and the complete candidate snapshot are not the attempt's latest nonapproving code or final review")
+    };
+    let recheck: Option<(String, Option<String>, Option<String>, Option<String>)> = transaction
+        .query_row(
+            "SELECT state,review_request_id,verdict,closed_reason FROM final_repair_rechecks
+             WHERE attempt_id=?1",
+            params![request.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    match &recheck {
+        None if verdict == "needs_rework" => {}
+        None => bail!("a request_changes verdict leaves the attempt open for repair; only a terminal review can be replanned"),
+        Some((state, Some(recheck_request), _, _))
+            if state == "closed" && recheck_request == request.review_request_id => {}
+        Some(_) => bail!("the attempt's dedicated final-repair recheck is not the closed review given"),
+    }
+    for (blocker, sql) in TERMINAL_REPLAN_FENCES {
+        let blocked: bool =
+            transaction.query_row(sql, params![request.attempt_id], |row| row.get(0))?;
+        if blocked {
+            bail!("the attempt cannot be replanned while {blocker}")
+        }
+    }
+    let parent_budgets: String = transaction.query_row(
+        "SELECT json_group_object(review_kind,json_object('allowance',
+           initial_allowance+extension_allowance,'spent',spent))
+         FROM review_budgets WHERE attempt_id=?1",
+        params![request.attempt_id],
+        |row| row.get(0),
+    )?;
+    let scope = current_lineage_scope(transaction, request.task_id, &base, configuration_revision)?;
+    let (child, intent) = stage_rework_lineage(
+        transaction,
+        &LineageChild {
+            task_id: request.task_id,
+            parent_attempt_id: request.attempt_id,
+            operation_id,
+            phase: "planning",
+            base_revision: &base,
+            scope: &scope,
+            carried_plan_hash: None,
+            carry_plan_approval: false,
+            accepted_snapshot_id: None,
+            source_snapshot_id: request.snapshot_id,
+            feedback: reason,
+        },
+        now,
+    )?;
+    let child_profiles: String = transaction.query_row(
+        "SELECT json_group_array(json_object('role',role,'settings_revision',settings_revision,
+           'profile_hash',profile_hash))
+         FROM (SELECT role,settings_revision,profile_hash FROM trip_attempt_profiles
+               WHERE attempt_id=?1 ORDER BY role)",
+        params![child],
+        |row| row.get(0),
+    )?;
+    let parent_recheck = recheck.map(|(state, recheck_request, recheck_verdict, closed_reason)| {
+        serde_json::json!({"state":state,"review_request_id":recheck_request,
+            "verdict":recheck_verdict,"closed_reason":closed_reason})
+    });
+    let child_budgets = LINEAGE_REVIEW_BUDGETS
+        .iter()
+        .map(|(kind, allowance)| {
+            (
+                (*kind).to_owned(),
+                serde_json::json!({"allowance":allowance,"spent":0}),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let parent_budgets: serde_json::Value = serde_json::from_str(&parent_budgets)?;
+    let child_profiles: serde_json::Value = serde_json::from_str(&child_profiles)?;
+    let detail = serde_json::json!({
+        "intent_id":intent,"parent_attempt_id":request.attempt_id,"child_attempt_id":child,
+        "source_snapshot_id":request.snapshot_id,"candidate_hash":request.candidate_hash,
+        "terminal_review":{"review_request_id":request.review_request_id,"review_kind":review_kind,
+            "verdict":verdict,"role_result_id":request.role_result_id},
+        "parent_final_repair_recheck":parent_recheck,
+        "parent_review_budgets":parent_budgets,
+        "child_review_budgets":child_budgets,
+        "child_profiles":child_profiles,
+        "reason":reason,"accepted_authority_inherited":false,"plan_approval_carried":false,
+        "parent_lifecycle":{"status":"rework_staging","credentials_revoked":true,
+            "live_roles_stopping":true},
+        "materialization":"pending_parent_quiescence",
+    });
+    transaction.execute(
+        "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+         VALUES(?1,?2,'human','rework.terminal_replan.created','attempt',?3,?4,?5)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            operation_id,
+            child,
+            detail.to_string(),
+            now
+        ],
+    )?;
+    Ok((child, detail))
+}
+
 fn task_version(transaction: &Transaction<'_>, task_id: &str, expected: i64) -> Result<()> {
     transaction
         .query_row(
@@ -5986,10 +7806,17 @@ fn apply_review_transition(
     attempt: &str,
     kind: &str,
     verdict: &str,
+    recheck: bool,
     now: &str,
 ) -> Result<()> {
-    let phase = review_transition_phase(kind, verdict)?;
     let clearing = verdict != "approved";
+    // A nonapproving final-repair recheck ends incomplete; it never reopens
+    // implementation for another repair or ordinary review.
+    let phase = if recheck && clearing {
+        "needs_input"
+    } else {
+        review_transition_phase(kind, verdict)?
+    };
     transaction.execute(
         "UPDATE attempts SET phase=?1,
          plan_hash=CASE WHEN ?2 AND ?3='plan' THEN NULL ELSE plan_hash END,

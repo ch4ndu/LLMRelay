@@ -5,9 +5,11 @@ import type { Root } from "react-dom/client";
 import { ROLES } from "./types";
 import type {
   AppState,
+  AttentionActionKind,
   AttentionItem,
   AttentionTarget,
   CmuxSessionSurface,
+  ContinuationAction,
   CmuxViewOutcome,
   DecisionExplanation,
   PermissionRequest,
@@ -69,6 +71,11 @@ const { liveEnvironment, liveTiming, startLiveState } = await import(
 );
 const { attentionTargetProblem } = await import("./components/AttentionInbox");
 const { App } = await import("./App");
+const { MarkdownContent, safeMarkdownUrl } = await import(
+  "./components/MarkdownContent"
+);
+const { taskStatus } = await import("./components/TaskBoard");
+const { explainError } = await import("./components/ErrorNotice");
 const nativeFetch = globalThis.fetch;
 const fixtureSource = Symbol("protocol fixture source");
 type FixtureFetch = typeof fetch & { [fixtureSource]?: typeof fetch };
@@ -553,7 +560,7 @@ Deno.test("M9 App opens created and recovered recipe drafts after authoritative 
       await settle();
       click(recovered ? "Retry exact pending request" : "Create draft");
       await settle();
-      check(!document.querySelector("aside.detail") && live.reads.length >= 2,
+      check(!document.querySelector('[role="dialog"]') && live.reads.length >= 2,
         "task detail opened before the authoritative read");
       if (outcome === "left") click("Board");
       const next = outcome === "missing" ? initial : created;
@@ -567,10 +574,10 @@ Deno.test("M9 App opens created and recovered recipe drafts after authoritative 
         (!recovered || requests.at(-1)?.operation_id === "pending-create"),
         `${outcome} draft did not submit the exact command`);
       if (outcome === "created" || outcome === "recovered") {
-        check(document.querySelector("aside.detail header .eyebrow")?.textContent === "AJ-created",
+        check(document.querySelector('[role="dialog"]')?.getAttribute("data-attention-target") === "task:AJ-created",
           `${outcome} draft did not open its task detail`);
       } else {
-        check(!document.querySelector("aside.detail") &&
+        check(!document.querySelector('[role="dialog"]') &&
           (outcome === "left" || document.body.textContent?.includes("not in the latest state")),
           `${outcome} draft crossed navigation or selected a task missing from the refresh`);
       }
@@ -662,6 +669,7 @@ Deno.test("M9 task detail Archive submits the never-attempted draft version", as
   }) as typeof fetch;
   try {
     mount(<TaskDetail task={draft} state={{ ...liveBase, tasks: [draft] }} onClose={noop} onChanged={noop} />);
+    click("Activity");
     click("Archive");
     await settle();
     check(requests.some((body) => body.kind === "archive" && body.task_id === draft.id &&
@@ -669,6 +677,51 @@ Deno.test("M9 task detail Archive submits the never-attempted draft version", as
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("task detail explains an unset-up project plainly and routes to project setup", () => {
+  const draft: Task = { ...task, id: "AJ-unset", lifecycle: "backlog",
+    active_attempt: undefined, can_archive: true };
+  const unset: Project = { ...initialized, trip: { readiness: "not_initialized",
+    reason: "Project setup has not been inspected", detected_installation: "unknown" } };
+  const raw = "project TRIP readiness is not_initialized; execution requires ready";
+  const decision: DecisionExplanation = {
+    decision_schema: 1, reason_code: "task.backlog_readiness", disposition: "waiting",
+    subject: { project_id: unset.id, task_id: draft.id },
+    observed_revision: { task_version: draft.version },
+    primary_blocker: { code: "task.project_ready", state: "missing", owner: "human",
+      evidence: null, message: raw },
+    prerequisites: [],
+    ownership: { owner: "human", state: "recorded_task_status", binding: {} },
+    next_action: { operation: "inspect_project", enabled: true, owner: "human",
+      binding: { project_id: unset.id } },
+    control_policy: { allowed_controls: ["inspect_project"],
+      disabled_reason_code: "task.project_ready" },
+  };
+  const opened: string[] = [];
+  try {
+    mount(<TaskDetail task={draft} state={{ ...liveBase, projects: [unset], tasks: [draft],
+      decisions: [decision] }} onClose={noop} onChanged={noop}
+      onOpenSetup={(projectId) => opened.push(projectId)} />);
+    const waiting = document.querySelector('[aria-labelledby="task-waiting-title"]');
+    const primary = waiting?.querySelector("p")?.textContent || "";
+    const summary = document.querySelector(".decision-summary")?.textContent || "";
+    check(primary.includes("has not been set up yet") && summary.includes("has not been set up yet"),
+      `unset-up project was not explained plainly: ${primary} | ${summary}`);
+    check(![primary, summary].some((text) => text.includes("not_initialized")),
+      "raw readiness enum was the primary explanation");
+    check(waiting?.querySelector(".technical-details")?.textContent?.includes(raw),
+      "raw readiness diagnostic was not kept under Technical details");
+    const makeReady = [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim() === "Make Ready");
+    check(makeReady?.disabled && !makeReady.title.includes("not_initialized"),
+      "Make Ready was enabled or explained with the raw enum");
+    click("Open project setup");
+    check(opened.length === 1 && opened[0] === unset.id,
+      "Open project setup did not route to the task's project");
+  } finally {
+    unmount();
   }
 });
 
@@ -686,8 +739,9 @@ Deno.test("M9 malformed can_archive state is rejected before controls render", a
     }
     check(refused, "non-boolean can_archive crossed the snapshot boundary");
     mount(<TaskDetail task={task} state={liveBase} onClose={noop} onChanged={noop} />);
+    click("Activity");
     const archive = [...document.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
-      button.textContent?.includes("Archive"));
+      button.textContent === "Archive");
     check(archive?.disabled, "last known good state unexpectedly enabled Archive");
   } finally {
     unmount();
@@ -709,8 +763,9 @@ Deno.test("M9 board and detail display exact scheduled draft provenance", () => 
     check(document.body.textContent?.includes("Scheduled draft · Review revision 2"),
       "board omitted the scheduled recipe revision");
     rerender(<TaskDetail task={scheduled} state={{ ...liveBase, tasks: [scheduled] }} onClose={noop} onChanged={noop} />);
+    click("Activity");
     check(document.body.textContent?.includes("Exact recipe revision revision-2") &&
-      document.body.textContent?.includes("Created by schedule schedule-1 at 2026-09-25T09:00:00Z"),
+      document.body.textContent?.includes("schedule schedule-1 at 2026-09-25T09:00:00Z"),
       "detail omitted exact scheduled provenance");
   } finally {
     unmount();
@@ -1032,7 +1087,7 @@ Deno.test("M7 fresh Codex discovery and stale probe retry preserve exact resume 
 
     mount(<ProjectSetup project={initialized} setup={{ ...probing, sessions: [session] }} onChanged={noop} onViewSession={cmuxFixture} />);
     click("Agents");
-    click("Resume retained session");
+    click("Resume the stopped session");
     await settle();
     if (requests.at(-1)?.kind !== "role_resume" || requests.at(-1)?.session_id !== session.id) {
       throw new Error("first setup probe could not resume to produce its missing qualification receipt");
@@ -1043,7 +1098,7 @@ Deno.test("M7 fresh Codex discovery and stale probe retry preserve exact resume 
       ...session, id: "discovery-session", attempt_id: "discovery-attempt", role: "manager",
     }] }} onChanged={noop} onViewSession={cmuxFixture} />);
     click("Discover");
-    click("Resume retained session");
+    click("Resume the stopped session");
     await settle();
     if (requests.at(-1)?.kind !== "role_resume" || requests.at(-1)?.session_id !== "discovery-session") {
       throw new Error("first discovery turn could not resume before its qualification receipt exists");
@@ -1058,7 +1113,7 @@ Deno.test("M7 fresh Codex discovery and stale probe retry preserve exact resume 
     click("Agents");
     const staleRow = [...document.querySelectorAll(".setup-invocation")].find((row) => row.querySelector("strong")?.textContent === "Explorer");
     if (!staleRow?.textContent?.includes("Launch exact-profile retry") ||
-      staleRow.textContent.includes("Resume retained session")) {
+      staleRow.textContent.includes("Resume the stopped session")) {
       throw new Error("stale probe did not offer fresh retry while holding exact resume");
     }
     const retry = [...staleRow.querySelectorAll("button")].find((button) => button.textContent?.includes("Launch exact-profile retry"))!;
@@ -1235,7 +1290,7 @@ async function settle() {
 function assertLiveCmuxLossFence() {
   if (
     [...document.querySelectorAll<HTMLButtonElement>("button")].some((button) =>
-      /View output|Take keyboard control|Release keyboard control|Discard unknown/
+      /View output|Take control|Release control|Discard unknown/
         .test(
           button.textContent || "",
         ) && !button.disabled
@@ -1960,7 +2015,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     }) as typeof fetch;
   try {
     mount(<WorkflowControls task={task} onChanged={() => {}} />);
-    click("Pause after role");
+    click("Pause after this step");
     await settle();
     if (
       requests.at(-1)?.kind !== "control" ||
@@ -1999,12 +2054,12 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       />,
     );
     const gatedPause = [...document.querySelectorAll("button")].find((button) =>
-      button.textContent?.includes("Pause after role")
+      button.textContent?.includes("Pause after this step")
     ) as HTMLButtonElement | undefined;
     if (!gatedPause?.disabled) {
       throw new Error("fresh dispatch recovery did not gate ordinary controls");
     }
-    click("Continue with fresh dispatch");
+    click("Continue with a new session");
     await settle();
     if (
       requests.at(-1)?.kind !== "control" ||
@@ -2027,7 +2082,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     );
     const releasedPause = [...document.querySelectorAll("button")].find((
       button,
-    ) => button.textContent?.includes("Pause after role")) as
+    ) => button.textContent?.includes("Pause after this step")) as
       | HTMLButtonElement
       | undefined;
     if (releasedPause?.disabled) {
@@ -2061,7 +2116,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     );
     if (
       !document.body.textContent?.includes("Make Ready") ||
-      document.body.textContent.includes("Start a fresh managed attempt")
+      document.body.textContent.includes("Start a fresh attempt")
     ) {
       throw new Error(
         "normalized legacy work did not return to normal Ready admission",
@@ -2142,16 +2197,15 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     );
     await settle();
     if (
-      !document.body.textContent?.includes("requested rev 2") ||
-      !document.body.textContent?.includes("effective rev 1") ||
-      !document.body.textContent?.includes("running") ||
-      !document.body.textContent?.includes("Production Unverified") ||
+      !document.body.textContent?.includes("requested revision 2") ||
+      !document.body.textContent?.includes("effective revision 1") ||
+      !document.body.textContent?.includes("requested change, not active yet") ||
+      !document.body.textContent?.includes("Running now") ||
+      !document.body.textContent?.includes("Needs verification") ||
       !document.body.textContent?.includes("not a usable replacement") ||
+      !document.body.textContent?.includes("Settings from the project") ||
       !document.body.textContent?.includes(
-        "Authority source: project default · adapter codex",
-      ) ||
-      !document.body.textContent?.includes(
-        "native approvals are honored and may avoid a new inbox item",
+        "Approvals the agent already granted itself are honored",
       )
     ) {
       throw new Error(
@@ -2159,7 +2213,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       );
     }
     await settle();
-    click("Prepare exact runtime proof");
+    click("Prepare verification");
     await settle();
     if (
       requests.at(-1)?.action !== "prepare_runtime_admission" ||
@@ -2181,8 +2235,8 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       );
     act(() => implementerEdit!.click());
     if (
-      !implementerRow?.textContent?.includes("Production Unverified") ||
-      !implementerRow.textContent.includes("Validation required")
+      !implementerRow?.textContent?.includes("Needs verification") ||
+      !implementerRow.textContent.includes("Verification required")
     ) {
       throw new Error(
         "Codex Implementer edit selection hid its validation gate",
@@ -2209,7 +2263,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       />,
     );
     await settle();
-    click("Prepare corrected runtime verification");
+    click("Prepare a new verification");
     await settle();
     if (
       requests.at(-1)?.action !== "prepare_runtime_admission" ||
@@ -2277,7 +2331,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         onViewSession={cmuxFixture}
       />,
     );
-    click("Prepare corrected runtime verification");
+    click("Prepare a new verification");
     await settle();
     if (
       requests.at(-1)?.action !== "prepare_runtime_admission" ||
@@ -2568,7 +2622,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         "LLMRelay will check the recorded",
       ) ||
       !document.body.textContent.includes("resume or retry action") ||
-      document.body.textContent.includes("Resume retained session")
+      document.body.textContent.includes("Resume the stopped session")
     ) {
       throw new Error(
         "current setup output/recovery identity or conditional guidance drifted",
@@ -2579,7 +2633,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     // recovery record into a keyboard-control target.
     if (
       [...document.querySelectorAll("button")].some((button) =>
-        button.textContent?.includes("Take keyboard control")
+        button.textContent?.includes("Take control")
       )
     ) {
       throw new Error(
@@ -2671,7 +2725,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     ) {
       throw new Error("retained setup completion state was not explained");
     }
-    click("Resume retained session");
+    click("Resume the stopped session");
     await settle();
     if (
       requests.at(-1)?.kind !== "role_resume" ||
@@ -2704,7 +2758,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       />,
     );
     if (
-      document.body.textContent?.includes("Resume retained session") ||
+      document.body.textContent?.includes("Resume the stopped session") ||
       document.body.textContent?.includes(
         "first pass complete · retained resume ready",
       ) || !document.body.textContent?.includes(
@@ -2802,7 +2856,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     );
     click("View output");
     await settle();
-    click("Take keyboard control");
+    click("Take control");
     await settle();
     if (
       JSON.stringify(runtimeViewedSessions) !==
@@ -2815,7 +2869,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         "runtime output did not preserve its exact current session",
       );
     }
-    click("Release keyboard control");
+    click("Release control");
     await settle();
     const runtimeControls = requests.filter((request) =>
       request.kind === "cmux_set_keyboard_control" &&
@@ -2918,7 +2972,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     );
     await settle();
     if (
-      !document.body.textContent?.includes("Validation required") ||
+      !document.body.textContent?.includes("Verification required") ||
       !document.body.textContent?.includes(
         "current preparation key has not yet appeared",
       )
@@ -3072,7 +3126,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       [...document.querySelectorAll("button")].some((button) =>
         [
           "Edit",
-          "Resume exact native session",
+          "Resume the stopped session",
           "Freeze safe plan checkpoint",
           "Request checkpoint switch",
         ].includes(button.textContent || "")
@@ -3162,38 +3216,43 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         onChanged={() => {}}
       />,
     );
+    let historyText = "";
+    for (const tab of ["Overview", "Changes", "Checks", "Activity"]) {
+      click(tab);
+      historyText += document.body.textContent || "";
+      for (
+        const action of [
+          "Apply proposed step",
+          "Run the approved check",
+          "Record",
+          "Add",
+          "Extend +1",
+        ]
+      ) {
+        if (
+          [...document.querySelectorAll("button")].some((button) =>
+            button.textContent?.trim() === action
+          )
+        ) throw new Error(`terminal task exposed ${action} on ${tab}`);
+      }
+      if (
+        document.querySelector('[aria-label="Dependency task"]') ||
+        document.querySelector('[aria-label^="Integration ref for"]')
+      ) throw new Error("terminal task exposed dependency mutation fields");
+    }
     for (
       const historical of [
-        "Manager transition proposal",
+        "The manager proposed moving to another step",
         "contracts",
         "AJ-0",
-        "2 spent · 1 remaining",
-        "approved",
+        "2 used · 1 left",
+        "Approved",
       ]
     ) {
-      if (!document.body.textContent?.includes(historical)) {
+      if (!historyText.includes(historical)) {
         throw new Error(`terminal history hid ${historical}`);
       }
     }
-    for (
-      const action of [
-        "Apply proposed transition",
-        "Run",
-        "Record",
-        "Add",
-        "Extend +1",
-      ]
-    ) {
-      if (
-        [...document.querySelectorAll("button")].some((button) =>
-          button.textContent?.trim() === action
-        )
-      ) throw new Error(`terminal task exposed ${action}`);
-    }
-    if (
-      document.querySelector('[aria-label="Dependency task"]') ||
-      document.querySelector('[aria-label^="Integration ref for"]')
-    ) throw new Error("terminal task exposed dependency mutation fields");
     unmount();
 
     mount(
@@ -3234,7 +3293,6 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     }
     unmount();
 
-    localStorage.setItem("agenticjira.workspace.sideWidth", "330");
     const restoreState = {
       schema: 2,
       generated_at: "",
@@ -3629,7 +3687,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       />,
     );
     if (
-      !document.body.textContent?.includes("Restart candidates") ||
+      !document.body.textContent?.includes("Waiting after restart") ||
       !document.body.textContent?.includes(
         "eligible exact native binding is parked",
       )
@@ -3678,7 +3736,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     if (
       previewPaths.join(",") !== "/api/restart-preview" ||
       !document.body.textContent?.includes("fresh only") ||
-      !document.body.textContent.includes("No current resume route")
+      !document.body.textContent.includes("Cannot be resumed")
     ) {
       throw new Error(
         "explicit preview did not render its read-only classification",
@@ -3722,8 +3780,15 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     click("Resume eligible");
     await settle();
     if (
-      !document.body.textContent?.includes("Queued 1: restore-s") ||
-      !document.body.textContent.includes("Omitted 1: restore-s-2") ||
+      !document.body.textContent?.includes(
+        "1 session(s) queued to resume; 1 not resumed",
+      ) ||
+      !document.body.textContent.includes(
+        "Manager · Existing: queued · serialized admission",
+      ) ||
+      !document.body.textContent.includes(
+        "Implementer · Existing: omitted · bounded batch",
+      ) ||
       document.body.textContent.includes("Restart resume · resumed")
     ) {
       throw new Error("bulk result hid queued or omitted work");
@@ -3732,12 +3797,12 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     if (
       !document.body.textContent.includes("Project setup session") ||
       !document.body.textContent.includes(
-        "Stop or Replace remains an explicit human action",
+        "Stop or replace this session from Project setup",
       ) ||
       !document.body.textContent.includes(
-        "Keyboard control is active. Automatic progress is paused",
+        "You have keyboard control. Automatic progress waits",
       ) ||
-      !document.body.textContent.includes("Ctrl-] detaches") ||
+      !document.body.textContent.includes("Ctrl-]") ||
       document.body.textContent.includes(
         "error: invalid model identifier gpt-missing",
       ) ||
@@ -3750,9 +3815,12 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     const directTakeRow = [
       ...document.querySelectorAll(".session-tree article"),
     ]
-      .find((row) => row.textContent?.includes("explorer · codex"));
+      .find((row) =>
+        row.querySelector("strong")?.textContent?.startsWith("Explorer") &&
+        row.textContent?.includes("Codex")
+      );
     const directTake = [...(directTakeRow?.querySelectorAll("button") || [])]
-      .find((button) => button.textContent?.includes("Take keyboard control"));
+      .find((button) => button.textContent?.includes("Take control"));
     if (!directTake || (directTake as HTMLButtonElement).disabled) {
       throw new Error(
         "a running session without a surface did not expose direct Take",
@@ -3807,10 +3875,10 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     }
     click("View output again");
     await settle();
-    click("Take keyboard control");
+    click("Take control");
     await settle();
     if (
-      !document.body.textContent?.includes("Exit 1") ||
+      !document.body.textContent?.includes("Exit code 1") ||
       !document.body.textContent?.includes("Discard unknown reservation")
     ) {
       throw new Error(
@@ -3852,7 +3920,8 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       ...document.querySelectorAll(".session-tree article"),
     ]
       .find((row) =>
-        row.textContent?.includes("implementer · codex")
+        row.querySelector("strong")?.textContent?.startsWith("Implementer") &&
+        row.textContent?.includes("Codex")
       );
     const liveView = [
       ...(implementerSession?.querySelectorAll("button") || []),
@@ -3898,7 +3967,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       ) ||
       unknownLiveView?.hasAttribute("disabled") ||
       [...(implementerSession?.querySelectorAll("button") || [])]
-        .some((button) => button.textContent?.includes("Take keyboard control"))
+        .some((button) => button.textContent?.includes("Take control"))
     ) {
       throw new Error(
         "an exited unknown presentation did not preserve recorded-only access",
@@ -3925,26 +3994,9 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       requests.at(-1)?.expected_version !== 4 ||
       requests.at(-1)?.enabled !== true
     ) throw new Error("versioned auto-resume setting was not submitted");
-    click("Open task recovery");
+    click("Open task: Existing");
     if (selectedRecoveryTask?.id !== "AJ-1") {
       throw new Error("restart candidate did not open its exact task recovery");
-    }
-    const sideDivider = document.querySelector<HTMLElement>(
-      '[aria-label="Resize workspace details"]',
-    )!;
-    act(() =>
-      sideDivider.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }),
-      )
-    );
-    await settle();
-    if (
-      localStorage.getItem("agenticjira.workspace.sideWidth") !== "346" ||
-      sideDivider.getAttribute("aria-valuenow") !== "346"
-    ) {
-      throw new Error(
-        "bounded workspace side divider did not persist",
-      );
     }
     unmount();
     mount(
@@ -3955,7 +4007,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         onChanged={noop}
       />,
     );
-    click("Resume retained restart session");
+    click("Resume after restart");
     await settle();
     if (
       requests.at(-1)?.kind !== "restart_resume" ||
@@ -3973,10 +4025,23 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         onChanged={() => {}}
       />,
     );
-    if (
-      document.querySelector('[aria-label="Resize workspace details"]')
-        ?.getAttribute("aria-valuenow") !== "346"
-    ) throw new Error("workspace side divider did not survive remount");
+    const workspaceSection = () =>
+      document.querySelector(
+        '[aria-label="Workspace task section"] [aria-pressed="true"]',
+      )?.textContent;
+    click("Completed");
+    unmount();
+    mount(
+      <Workspace
+        state={restoreState}
+        onSelect={() => {}}
+        onChanged={() => {}}
+      />,
+    );
+    if (!workspaceSection()?.startsWith("Completed")) {
+      throw new Error("workspace task section did not survive remount");
+    }
+    click("Active");
     unmount();
 
     const raceOpen = persistentSurface(
@@ -4099,7 +4164,13 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         onChanged={() => {}}
       />,
     );
-    for (const label of ["queued", "submitted", "acknowledged"]) {
+    for (
+      const label of [
+        "Waiting for the manager to pause",
+        "Sent to the manager",
+        "Received by the manager",
+      ]
+    ) {
       if (!document.body.textContent?.includes(label)) {
         throw new Error(`${label} guidance state hidden`);
       }
@@ -4309,17 +4380,13 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
         onChanged={() => changed++}
       />,
     );
-    document.querySelector<HTMLButtonElement>(".approval-target")!.click();
+    document.querySelector<HTMLButtonElement>(".approval-request .link-button")!.click();
     if (
       JSON.stringify(selections) !== JSON.stringify([["AJ-1", "session-1"]])
     ) throw new Error("permission request selected the wrong task or session");
     const completeInput = [...document.querySelectorAll("details")].find((
       item,
-    ) =>
-      item.querySelector("summary")?.textContent?.includes(
-        "Complete structured input",
-      )
-    )!;
+    ) => item.textContent?.includes("Complete structured input"))!;
     completeInput.querySelector<HTMLElement>("summary")!.click();
     if (
       !completeInput.open ||
@@ -4380,12 +4447,12 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
         "response reserved",
         "response delivered",
         "response unknown",
-        "does not prove the native command executed",
+        "does not prove the command ran",
         "provider executable version, hook and security policy",
-        "authorized 2 reserved responses",
+        "used 2 times",
         "Codex Implementer still requires exact current native validation",
-        "Codex may reuse an approval already granted natively",
-        "does not revoke native Codex approvals",
+        "may reuse an approval it already has",
+        "change the agent's own approvals",
       ]
     ) {
       if (!audit.includes(expected)) {
@@ -4513,8 +4580,8 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
     }
     for (
       const expected of [
-        "service check · current reviewed selection",
-        "Source: service-owned selected check",
+        "Verification check waiting to run",
+        "Service-owned selected check",
         "./gradlew with all arguments",
         "git:/registered/.git",
       ]
@@ -4560,6 +4627,7 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
         onChanged={() => changed++}
       />,
     );
+    click("Checks");
     const inactiveActions = [...document.querySelectorAll<HTMLButtonElement>(
       ".service-check-permission .approval-actions button",
     )];
@@ -4613,11 +4681,12 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
         onChanged={() => changed++}
       />,
     );
+    click("Checks");
     if (!document.body.textContent?.includes("Revoke service-check rule")) {
       throw new Error("task detail hid service-check revocation");
     }
     if (
-      !document.body.textContent?.includes("Rerun approved check") ||
+      !document.body.textContent?.includes("Run the approved check again") ||
       !document.body.textContent?.includes("Approve once to rerun")
     ) throw new Error("task detail hid explicit service-check rerun controls");
     const matchedFamilyApproval = [
@@ -4741,7 +4810,7 @@ Deno.test("T20 durable cmux projections fence stale View results and local contr
   };
   const assertPendingBlocksInput = () => {
     const control = [...document.querySelectorAll<HTMLButtonElement>("button")]
-      .find((button) => button.textContent?.includes("Take keyboard control"));
+      .find((button) => button.textContent?.includes("Take control"));
     if (!control?.disabled) {
       throw new Error(
         "pending durable revision allowed local keyboard control",
@@ -4808,7 +4877,7 @@ Deno.test("T20 durable cmux projections fence stale View results and local contr
       updated_at: "2026-09-20T00:00:02Z",
     });
     assertCardState("control");
-    if (!document.body.textContent?.includes("Release keyboard control")) {
+    if (!document.body.textContent?.includes("Release control")) {
       throw new Error(
         "current durable control state did not reload as releasable",
       );
@@ -4850,7 +4919,7 @@ Deno.test("T20 durable cmux projections fence stale View results and local contr
       updated_at: "2026-09-20T00:00:06Z",
     });
     assertCardState("view only");
-    if (document.body.textContent?.includes("Release keyboard control")) {
+    if (document.body.textContent?.includes("Release control")) {
       throw new Error("view-only durable release still exposed local control");
     }
 
@@ -4869,7 +4938,7 @@ Deno.test("T20 durable cmux projections fence stale View results and local contr
     );
     await render(lostLive);
     assertCardState("lost");
-    const liveRetirementActions = ["View output", "Take keyboard control"].map(
+    const liveRetirementActions = ["View output", "Take control"].map(
       (label) =>
         [...document.querySelectorAll<HTMLButtonElement>("button")]
           .find((button) => button.textContent?.includes(label)),
@@ -4902,7 +4971,7 @@ Deno.test("T20 durable cmux projections fence stale View results and local contr
     const retiredTake = [
       ...document.querySelectorAll<HTMLButtonElement>("button"),
     ]
-      .find((button) => button.textContent?.includes("Take keyboard control"));
+      .find((button) => button.textContent?.includes("Take control"));
     if (
       !freshView || freshView.disabled || !retiredTake?.disabled ||
       !document.body.textContent?.includes(
@@ -4972,7 +5041,7 @@ Deno.test("T20 durable cmux projections fence stale View results and local contr
       await settle();
       assertCardState("view only");
       const take = [...document.querySelectorAll<HTMLButtonElement>("button")]
-        .find((button) => button.textContent === "Take keyboard control");
+        .find((button) => button.textContent === "Take control");
       if (!take || take.disabled) throw new Error("completed opening response kept the live route pending");
     }
     unmount();
@@ -5181,7 +5250,7 @@ Deno.test("T21 ambiguous mutation transport failures preserve durable operation 
         "recordless historical control failure exposed guaranteed-reject recovery commands",
       );
     }
-    click("Refresh and review corrected control");
+    click("Refresh to see the current state");
     if (genericRecoveryRefreshes !== 1) {
       throw new Error(
         "recordless historical control failure became actionless",
@@ -6233,7 +6302,9 @@ Deno.test("M6 attention rail groups exact items, preserves forms across snapshot
   const focused = () =>
     document.activeElement?.getAttribute("data-attention-target");
   const open = (selector: string) => {
-    const button = document.querySelector<HTMLButtonElement>(selector);
+    const button = document.querySelector<HTMLButtonElement>(
+      selector.endsWith("button") ? selector : `${selector} button`,
+    );
     if (!button) throw new Error(`attention control not found: ${selector}`);
     act(() => button.click());
   };
@@ -6246,7 +6317,7 @@ Deno.test("M6 attention rail groups exact items, preserves forms across snapshot
       .map((group) => group.getAttribute("aria-label")).join("|");
     check(
       groups ===
-        "Permissions (1)|Decisions (1)|Recovery (3)|Compatibility (1)|Blocked (1)|Completed · awaiting acceptance (1)",
+        "Waiting for your approval (1)|Waiting for your decision (1)|Manual action needed (3)|Setup needs attention (1)|Can't continue yet (1)|Ready for your review (1)",
       `attention groups drifted: ${groups}`,
     );
     check(
@@ -6263,7 +6334,7 @@ Deno.test("M6 attention rail groups exact items, preserves forms across snapshot
         document.activeElement?.classList.contains("review-panel"),
       `the plan decision did not focus its review panel: ${focused()}`,
     );
-    const scroller = document.querySelector(".detail-scroll");
+    const scroller = document.querySelector(".task-dialog-body");
     change(
       document.querySelector<HTMLTextAreaElement>(
         '[aria-label="Guidance message"]',
@@ -6296,9 +6367,10 @@ Deno.test("M6 attention rail groups exact items, preserves forms across snapshot
         document.querySelector<HTMLSelectElement>(
             '[aria-label="Guidance target"]',
           )?.value === "g1" &&
-        document.querySelector(".detail-scroll") === scroller &&
-        document.querySelector(".detail header .eyebrow")?.textContent ===
-          "AJ-1",
+        document.querySelector(".task-dialog-body") === scroller &&
+        document.querySelector('[role="dialog"]')?.getAttribute(
+            "data-attention-target",
+          ) === "task:AJ-1",
       "a new snapshot reset the guidance draft, target, or open task",
     );
     check(
@@ -6330,7 +6402,7 @@ Deno.test("M6 attention rail groups exact items, preserves forms across snapshot
     await settle();
     check(
       focused() === "permission_request:pr1" &&
-        !document.querySelector("aside.detail"),
+        !document.querySelector('[role="dialog"]'),
       `the permission request was not focused in the approval inbox: ${focused()}`,
     );
 
@@ -6340,7 +6412,7 @@ Deno.test("M6 attention rail groups exact items, preserves forms across snapshot
     check(
       live.reads.length === reads + 1 &&
         focused() === "permission_request:pr1" &&
-        !document.querySelector("aside.detail") &&
+        !document.querySelector('[role="dialog"]') &&
         document.querySelector(".attention-notice")?.textContent?.includes(
           "a newer attempt or decision replaced it",
         ),
@@ -6583,7 +6655,7 @@ Deno.test("M6 attention routes fail closed when the exact record or marker is go
   localStorage.setItem("agenticjira.page", "workspace");
   const open = (id: string) => {
     const button = document.querySelector<HTMLButtonElement>(
-      `[data-attention-id="${id}"]`,
+      `[data-attention-id="${id}"] button`,
     );
     if (!button) throw new Error(`attention control not found: ${id}`);
     act(() => button.click());
@@ -6605,7 +6677,7 @@ Deno.test("M6 attention routes fail closed when the exact record or marker is go
       ),
     }));
     await settle();
-    const recovery = document.querySelector(".detail .recovery");
+    const recovery = document.querySelector(".task-dialog .recovery");
     check(
       recovery?.textContent?.includes("was resolved or changed") &&
         !recovery.querySelector("button, textarea") &&
@@ -6625,7 +6697,7 @@ Deno.test("M6 attention routes fail closed when the exact record or marker is go
         ?.includes("Waiting for exit could not be opened");
     check(
       live.reads.length === reads + 1 && explained() &&
-        !document.querySelector("aside.detail") &&
+        !document.querySelector('[role="dialog"]') &&
         document.activeElement?.getAttribute("data-attention-target") !==
           "task:AJ-1",
       "a missing exact marker was accepted, unexplained, or not refreshed once",
@@ -6691,13 +6763,13 @@ Deno.test("M6 direct task opens drop a stale attention selection and route notic
   };
   const open = (id: string) => {
     const button = document.querySelector<HTMLButtonElement>(
-      `[data-attention-id="${id}"]`,
+      `[data-attention-id="${id}"] button`,
     );
     if (!button) throw new Error(`attention control not found: ${id}`);
     act(() => button.click());
   };
   const recovery = () => {
-    const panel = document.querySelector(".detail .recovery");
+    const panel = document.querySelector(".task-dialog .recovery");
     return {
       record: panel?.getAttribute("data-attention-target"),
       stale: panel?.textContent?.includes("was resolved or changed"),
@@ -6717,7 +6789,7 @@ Deno.test("M6 direct task opens drop a stale attention selection and route notic
     await settle();
     const routed = recovery().record;
     click("Board");
-    click("AJ-2 · Normal");
+    click("RecoveringManual action needed");
     check(
       routed === "recovery_record:r-target" &&
         recovery().record === "recovery_record:r-first",
@@ -6738,7 +6810,7 @@ Deno.test("M6 direct task opens drop a stale attention selection and route notic
         mutations[0]?.recovery_id === "r-target",
       "the selected record did not fail closed after its failed submission",
     );
-    click("Open task recovery");
+    click("Open task: Recovering");
     await settle();
     const reopened = recovery();
     check(
@@ -6770,11 +6842,12 @@ Deno.test("M6 direct task opens drop a stale attention selection and route notic
       "the unmarked route was not explained",
     );
     click("History");
-    click("AJ-4 · Finished");
+    click("FinishedFixture");
     check(
       notice() === undefined &&
-        document.querySelector(".detail header .eyebrow")?.textContent ===
-          "AJ-4" &&
+        document.querySelector('[role="dialog"]')?.getAttribute(
+            "data-attention-target",
+          ) === "task:AJ-4" &&
         mutations.length === 2,
       `a history open kept the obsolete route notice or mutated: ${notice()}`,
     );
@@ -6830,13 +6903,34 @@ Deno.test("User errors explain recovery while retaining collapsed diagnostics", 
 
 Deno.test("session startup notice follows current readiness and preserves explicit console control", () => {
   const actions: string[] = [];
+  const outcome: CmuxViewOutcome = {
+    state: "pending",
+    message: "fixture",
+    retry_available: false,
+  };
+  const access = {
+    routes: {},
+    discarding: {},
+    routeFor: () => undefined,
+    view: (id: string) => {
+      actions.push(`view:${id}`);
+      return Promise.resolve(outcome);
+    },
+    take: (id: string) => {
+      actions.push(`take:${id}`);
+      return Promise.resolve();
+    },
+    release: (id: string) => {
+      actions.push(`release:${id}`);
+      return Promise.resolve();
+    },
+    discard: () => Promise.resolve(),
+    close: () => {},
+  };
   const renderSession = (overrides: Partial<Session> = {}) => (
     <SessionTree
       sessions={[{ ...managerSession, readiness: "unknown", ...overrides }]}
-      routes={{}}
-      onView={(id) => actions.push(`view:${id}`)}
-      onTake={(id) => actions.push(`take:${id}`)}
-      onRelease={(id) => actions.push(`release:${id}`)}
+      access={access}
       setupProjectId={() => undefined}
       onOpenSetup={() => {}}
     />
@@ -6845,14 +6939,15 @@ Deno.test("session startup notice follows current readiness and preserves explic
     mount(renderSession());
     const notice = () => document.querySelector(".session-startup-notice");
     check(notice()?.getAttribute("role") === "status", "startup wait is not announced");
-    check(document.querySelector(".session-metadata > small")?.textContent?.includes("Waiting for startup"), "primary status still implies active work");
+    check(document.querySelector(".session-metadata .session-state")?.textContent?.includes("Waiting for startup"), "primary status still implies active work");
     check(!document.querySelector(".session-metadata .technical-details")?.hasAttribute("open"), "process diagnostics are not collapsed");
     check(notice()?.textContent?.includes("has not confirmed"), "process start was treated as readiness");
     check(notice()?.textContent?.includes("If Codex shows"), "hook trust was asserted without evidence");
-    check(notice()?.textContent?.includes("Release keyboard control"), "recovery omits releasing input");
+    check(notice()?.textContent?.includes("Release control"), "recovery omits releasing input");
+    check(document.body.textContent?.includes("Closing the output does not stop the agent"), "output help omits that closing does not stop work");
     check(actions.length === 0, "startup notice automatically took control");
     click("View output");
-    click("Take keyboard control");
+    click("Take control");
     check(actions.join(",") === "view:s1,take:s1", "startup actions targeted the wrong session");
     rerender(renderSession({ readiness: "busy" }));
     check(!notice(), "startup notice remained after native work began");
@@ -6866,7 +6961,1110 @@ Deno.test("session startup notice follows current readiness and preserves explic
     check(actions.at(-1) === "view:replacement", "replacement opened the previous session");
     rerender(renderSession({ status: "exited" }));
     check(!notice(), "exited session still asks for startup input");
-    check(![...document.querySelectorAll("button")].some((button) => button.textContent === "Take keyboard control"), "exited session offers keyboard input");
+    check(![...document.querySelectorAll("button")].some((button) => button.textContent === "Take control"), "exited session offers keyboard input");
+  } finally {
+    unmount();
+  }
+});
+
+Deno.test("Task details open as a modal that closes by keyboard and returns focus", async () => {
+  const waiting: Task = { ...task, attention: "needs_input" };
+  const state: AppState = {
+    ...liveBase,
+    tasks: [waiting],
+    active_sessions: [managerSession],
+    attention: [{
+      id: "task:AJ-1:needs_input",
+      category: "decision",
+      title: "Needs your input",
+      reason: "Manager needs your input before it can continue.",
+      task_title: "Existing",
+      role: null,
+      action: { kind: "answer_question", label: "Answer question" },
+      target: {
+        kind: "session",
+        project_id: "p1",
+        task_id: "AJ-1",
+        attempt_id: "a1",
+        session_id: "s1",
+        role_generation_id: "g1",
+      },
+      held_tasks: [],
+    }],
+  };
+  const Harness = () => {
+    const [open, setOpen] = useState(false);
+    const [filter, setFilter] = useState("");
+    return (
+      <>
+        <div id="board" style={{ overflow: "auto" }}>
+          <input
+            id="filter"
+            value={filter}
+            onChange={(event) => setFilter(event.currentTarget.value)}
+          />
+        </div>
+        <button id="opener" onClick={() => setOpen(true)}>Open details</button>
+        {open && (
+          <TaskDetail
+            task={waiting}
+            state={state}
+            onClose={() => setOpen(false)}
+            onChanged={noop}
+          />
+        )}
+      </>
+    );
+  };
+  globalThis.fetch = (async () => new Response("{}", { status: 404 })) as typeof fetch;
+  try {
+    mount(<Harness />);
+    change(document.getElementById("filter") as HTMLInputElement, "migration");
+    const board = document.getElementById("board")!;
+    board.scrollTop = 120;
+    const opener = document.getElementById("opener") as HTMLButtonElement;
+    act(() => opener.focus());
+    click("Open details");
+    await settle();
+    const dialog = document.querySelector('[role="dialog"]');
+    check(dialog?.getAttribute("aria-modal") === "true", "details are not a modal dialog");
+    const title = document.getElementById(dialog?.getAttribute("aria-labelledby") || "");
+    check(title?.textContent === "Existing", "dialog is not named by the task title");
+    const close = document.querySelector<HTMLButtonElement>('[aria-label="Close task details"]');
+    check(close?.textContent?.trim() === "×", "close is not icon-only");
+    check(document.activeElement === close, "focus did not move into the dialog");
+    check(
+      dialog!.querySelectorAll('[aria-label="Close task details"]').length === 1 &&
+        ![...dialog!.querySelectorAll("button")].some((button) => /back/i.test(button.textContent || "")),
+      "narrow view replaces the icon-only close with another control",
+    );
+    const tab = (name: string) =>
+      [...document.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find((item) =>
+        item.textContent === name
+      )!;
+    check(tab("Overview").getAttribute("aria-selected") === "true", "Overview is not the first tab");
+    act(() => {
+      tab("Overview").focus();
+      tab("Overview").dispatchEvent(
+        new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }),
+      );
+    });
+    check(
+      tab("Changes").getAttribute("aria-selected") === "true" &&
+        document.activeElement === tab("Changes"),
+      "arrow keys did not move between tabs",
+    );
+    click("Overview");
+    const reply = document.querySelector<HTMLTextAreaElement>("textarea");
+    check(!!reply, "a waiting task with a running manager offers no reply");
+    change(reply!, "Use the smaller migration");
+    act(() => {
+      reply!.focus();
+      reply!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+    await settle();
+    check(!document.querySelector('[role="dialog"]'), "one Escape in a text field did not close the dialog");
+    check(document.activeElement === opener, "focus did not return to what opened the dialog");
+    check(
+      (document.getElementById("filter") as HTMLInputElement).value === "migration" &&
+        board.scrollTop === 120,
+      "closing the dialog lost the page filter or scroll position",
+    );
+    click("Open details");
+    await settle();
+    act(() => {
+      const handled = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+      handled.preventDefault();
+      document.querySelector<HTMLTextAreaElement>("textarea")!.dispatchEvent(handled);
+    });
+    check(!!document.querySelector('[role="dialog"]'), "an Escape already handled inside the dialog closed it");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Markdown renders readable structure and never executes or links unsafe content", () => {
+  const text = [
+    "# Plan heading",
+    "",
+    "Paragraph with [safe](https://example.com/docs), [bad](javascript:alert(1)),",
+    "[data](data:text/html;base64,PHNjcmlwdD4=), [other host](//evil.example/x) and [relative](docs/WORKFLOWS.md).",
+    "",
+    "<script>globalThis.pwned = true</script>",
+    '<img src="x" onerror="globalThis.pwned = true">',
+    "",
+    "| Step | Result |",
+    "| --- | --- |",
+    "| build | passed |",
+    "",
+    "- [x] done",
+    "- [ ] pending",
+    "",
+    "```ts",
+    "const value = 1;",
+    "```",
+  ].join("\n");
+  try {
+    mount(<MarkdownContent text={text} />);
+    const root = document.querySelector(".markdown-content")!;
+    check(root.querySelector("h1")?.textContent === "Plan heading", "heading was not rendered");
+    const links = [...root.querySelectorAll<HTMLAnchorElement>("a")];
+    check(
+      links.map((link) => link.getAttribute("href")).join("|") ===
+        "https://example.com/docs|docs/WORKFLOWS.md",
+      `unsafe links stayed clickable: ${links.map((link) => link.getAttribute("href"))}`,
+    );
+    check(
+      links[0].getAttribute("rel")?.includes("noopener") &&
+        links[0].getAttribute("target") === "_blank",
+      "external links do not isolate the dashboard",
+    );
+    check(
+      [...root.querySelectorAll(".markdown-inert-link")].map((item) => item.textContent)
+        .join("|") === "bad|data|other host",
+      "unsafe links lost their visible text",
+    );
+    check(
+      !root.querySelector("script, img, iframe") &&
+        !("pwned" in globalThis),
+      "raw HTML was rendered",
+    );
+    check(!!root.querySelector(".markdown-table table td"), "GFM table was not rendered");
+    check(
+      root.querySelectorAll('input[type="checkbox"]').length === 2,
+      "task list items were not rendered",
+    );
+    check(
+      root.querySelector("pre code")?.textContent?.includes("const value = 1;"),
+      "fenced code was not rendered",
+    );
+    check(
+      safeMarkdownUrl("mailto:team@example.com") === "mailto:team@example.com" &&
+        safeMarkdownUrl(" JavaScript:alert(1)") === "" &&
+        safeMarkdownUrl("vbscript:x") === "",
+      "URL policy drifted",
+    );
+  } finally {
+    unmount();
+  }
+});
+
+Deno.test("Active and Completed work stay separate and Ready means queued", () => {
+  const done: Task = { ...task, id: "AJ-done", title: "Shipped", lifecycle: "done", active_attempt: undefined };
+  const ready: Task = { ...task, id: "AJ-ready", title: "Queued work", lifecycle: "ready", active_attempt: undefined };
+  const recovering: Task = { ...task, id: "AJ-rec", title: "Recovering", attention: "needs_recovery" };
+  try {
+    mount(
+      <TaskBoard
+        tasks={[ready, done, recovering]}
+        projects={[initialized]}
+        onOpen={noop}
+        onEdit={noop}
+        onChanged={noop}
+      />,
+    );
+    const text = () => document.body.textContent || "";
+    check(
+      text().includes("Queued work") && !text().includes("Shipped") &&
+        text().includes("Active2") && text().includes("Completed1"),
+      "completed work crowded the active board or counts drifted",
+    );
+    click("Completed");
+    check(text().includes("Shipped") && !text().includes("Queued work"), "Completed did not show finished work");
+    click("Active");
+    const readyStatus = taskStatus(ready, { project: initialized });
+    check(
+      readyStatus.label === "Ready" &&
+        readyStatus.detail.includes("Queued and eligible to start") &&
+        !/review/i.test(readyStatus.label + readyStatus.detail),
+      "Ready was described as ready for review",
+    );
+    check(
+      taskStatus(ready, { project: { ...initialized, queue_paused: true } }).detail
+        .includes("pickup is paused"),
+      "a paused queue was not explained",
+    );
+    check(taskStatus(recovering).label === "Manual action needed", "recovery was not named plainly");
+    check(taskStatus(done).label === "Completed" && taskStatus(done).completed, "done work was not completed");
+    check(
+      taskStatus(task, {
+        sessions: [{ ...managerSession, attempt_id: "a1", readiness: "unknown" }],
+      }).label === "Waiting for startup",
+      "a starting agent was shown as working",
+    );
+    unmount();
+    mount(
+      <Workspace state={{ ...liveBase, tasks: [] }} onSelect={noop} onChanged={noop} />,
+    );
+    check(
+      text().includes("Nothing is waiting for you.") &&
+        text().includes("No approvals are waiting.") &&
+        text().includes("No active tasks."),
+      "empty workspace states were not explained",
+    );
+  } finally {
+    unmount();
+  }
+});
+
+Deno.test("Recovery names the affected role and errors explain the setup baseline", () => {
+  const implementer: Session = { ...managerSession, id: "s-impl", role: "implementer" };
+  try {
+    mount(
+      <RecoveryPanel
+        task={task}
+        sessions={[implementer]}
+        records={[{ id: "r1", session_id: "s-impl", attempt_id: "a1", state: "attention_required", detail: {} }]}
+        onChanged={noop}
+      />,
+    );
+    const text = document.body.textContent || "";
+    check(text.includes("Manual action needed: Implementer"), "recovery did not name the role");
+    check(text.includes("the implementer has fully stopped"), "recovery reason is not plain");
+    check(!/human/i.test(text.replace(/Technical details[\s\S]*/, "")), "primary recovery copy mentions a human");
+    const baseline = explainError(
+      "Files that new tasks need were changed after commit abc123 and are not committed: AGENTS.md.",
+    );
+    check(
+      baseline.summary.includes("uncommitted changes") &&
+        baseline.nextStep.includes("Validate and relink"),
+      "baseline error guidance drifted",
+    );
+    const moved = explainError("The project folder is now at commit abc, but LLMRelay starts new tasks from commit def.");
+    check(moved.nextStep.includes("Validate and relink"), "moved commit guidance drifted");
+  } finally {
+    unmount();
+  }
+});
+
+Deno.test("Role settings edit fields keep visible labels", async () => {
+  const configured: Task = {
+    ...task,
+    role_settings: [{
+      id: "rs-manager",
+      role: "manager",
+      revision: 1,
+      config: { provider: "codex", model: "gpt-5.6-sol", effort: "high" },
+    }],
+  };
+  globalThis.fetch = (async () => new Response("[]")) as typeof fetch;
+  try {
+    mount(<RoleSettings task={configured} project={initialized} sessions={[]} onChanged={noop} />);
+    await settle();
+    click("Edit");
+    check(findSelect("Provider").value === "codex", "provider has no visible label");
+    check(findSelect("Effort").value === "high", "effort has no visible label");
+    check(!!document.querySelector(".role-edit-fields .model-selector"), "model field is not in the labelled grid");
+    click("Cancel");
+    check(!document.querySelector(".role-edit-fields"), "Cancel did not leave editing");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Open agent output routes to the task's Activity tab and its exact session", async () => {
+  const live = liveHarness();
+  const priorEnvironment = { ...liveEnvironment };
+  globalThis.fetch = (async () => new Response("[]")) as typeof fetch;
+  liveEnvironment.transport = live.environment.transport;
+  liveEnvironment.scheduler = live.environment.scheduler;
+  localStorage.clear();
+  localStorage.setItem("agenticjira.page", "workspace");
+  const state = snapshotAt("service-a", "50", {
+    tasks: [{ ...task, title: "Starting task" }],
+    active_sessions: [{ ...managerSession, readiness: "unknown" }],
+    attention: [{
+      id: "continuation:wait_for_service:s1",
+      category: "blocked",
+      title: "Waiting for LLMRelay to be ready",
+      reason: "Waiting.",
+      task_title: "Starting task",
+      role: "manager",
+      action: { kind: "open_agent_output", label: "Open agent output" },
+      target: {
+        kind: "session",
+        project_id: "p1",
+        task_id: "AJ-1",
+        attempt_id: "a1",
+        session_id: "s1",
+        role_generation_id: "g1",
+      },
+      held_tasks: [],
+    }],
+  });
+  try {
+    mount(<App />);
+    await settle();
+    live.reads[0].resolve(state);
+    await settle();
+    const item = document.querySelector('[data-attention-id="continuation:wait_for_service:s1"]');
+    check(
+      item?.textContent?.includes("Starting task") &&
+        item.querySelector("button")?.textContent?.startsWith("Open agent output"),
+      "attention item lacks its task title or action label",
+    );
+    act(() => item!.querySelector("button")!.click());
+    await settle();
+    const selected = document.querySelector('[role="tab"][aria-selected="true"]');
+    check(selected?.textContent === "Activity", `output route opened ${selected?.textContent}`);
+    check(
+      document.activeElement?.getAttribute("data-attention-target") === "session:s1" &&
+        !!document.activeElement?.closest('[role="dialog"]'),
+      "the exact session inside the dialog was not focused",
+    );
+    check(
+      document.querySelector("main.content")?.hasAttribute("inert") &&
+        document.querySelector("aside.sidebar")?.hasAttribute("inert"),
+      "the page behind the dialog stayed interactive",
+    );
+  } finally {
+    unmount();
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Board cards and the task header offer the host's next step and open its exact target", async () => {
+  const live = liveHarness();
+  const priorEnvironment = { ...liveEnvironment };
+  globalThis.fetch = (async () => new Response("[]")) as typeof fetch;
+  liveEnvironment.transport = live.environment.transport;
+  liveEnvironment.scheduler = live.environment.scheduler;
+  localStorage.clear();
+  localStorage.setItem("agenticjira.page", "board");
+  const itemId = "continuation:wait_for_service:s1";
+  const state = snapshotAt("service-a", "50", {
+    tasks: [{ ...task, title: "Starting task" }],
+    active_sessions: [{ ...managerSession, readiness: "unknown" }],
+    attention: [{
+      id: itemId,
+      category: "blocked",
+      title: "Waiting for LLMRelay to be ready",
+      reason: "Waiting.",
+      task_title: "Starting task",
+      role: "manager",
+      action: { kind: "open_agent_output", label: "Open agent output" },
+      target: {
+        kind: "session",
+        project_id: "p1",
+        task_id: "AJ-1",
+        attempt_id: "a1",
+        session_id: "s1",
+        role_generation_id: "g1",
+      },
+      held_tasks: [],
+    }],
+    task_actions: [{
+      task_id: "AJ-1",
+      item_id: itemId,
+      action: { kind: "open_agent_output", label: "Open agent output" },
+      item_ids: [itemId, "task:AJ-1:blocked"],
+    }],
+  });
+  try {
+    mount(<App />);
+    await settle();
+    live.reads[0].resolve(state);
+    await settle();
+    const next = document.querySelector<HTMLButtonElement>(".task-card .task-next-action");
+    check(
+      next?.textContent === "Open agent output: Starting task +1 more",
+      `card action reads ${next?.textContent}`,
+    );
+    // The card names the task by title; its ID is only in Technical details.
+    const cardText = document.querySelector(".task-card")?.textContent ?? "";
+    check(
+      cardText.includes("Starting task") && !cardText.includes("AJ-1"),
+      `board card shows a raw task ID: ${cardText}`,
+    );
+    act(() => next!.click());
+    await settle();
+    const dialog = document.querySelector('[role="dialog"]');
+    check(!!dialog, "the card action did not open the task");
+    const selected = dialog!.querySelector('[role="tab"][aria-selected="true"]');
+    check(selected?.textContent === "Activity", `card action opened ${selected?.textContent}`);
+    check(
+      document.activeElement?.getAttribute("data-attention-target") === "session:s1",
+      "the card action did not focus the exact session",
+    );
+    const header = dialog!.querySelector(".task-dialog-next");
+    check(
+      header?.querySelector("button")?.textContent === "Open agent output" &&
+        header.textContent?.includes("2 items need you"),
+      `header action reads ${header?.textContent}`,
+    );
+    // The header repeats the route after the user moves elsewhere.
+    const overview = [...dialog!.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
+      .find((tab) => tab.textContent === "Overview");
+    act(() => overview!.click());
+    await settle();
+    act(() => header!.querySelector("button")!.click());
+    await settle();
+    check(
+      document.querySelector('[role="dialog"] [role="tab"][aria-selected="true"]')?.textContent === "Activity",
+      "the header action did not return to the exact target",
+    );
+  } finally {
+    unmount();
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("A generic wait never offers a reply; only the Answer question item does", async () => {
+  const waiting: Task = { ...task, attention: "needs_input" };
+  globalThis.fetch = (async () => new Response("{}", { status: 404 })) as typeof fetch;
+  try {
+    mount(
+      <TaskDetail
+        task={waiting}
+        state={{ ...liveBase, tasks: [waiting], active_sessions: [managerSession], attention: [] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    await settle();
+    check(!document.querySelector(".next-step textarea"), "a generic wait offered a reply");
+    check(
+      document.body.textContent?.includes("not a question the manager can take a reply"),
+      "the generic wait does not explain why there is no reply",
+    );
+    unmount();
+    // A question whose exact session is gone is explained, not answered elsewhere.
+    mount(
+      <TaskDetail
+        task={waiting}
+        state={{
+          ...liveBase,
+          tasks: [waiting],
+          active_sessions: [{ ...managerSession, id: "s2", role_generation_id: "g2" }],
+          attention: [{
+            id: "task:AJ-1:needs_input",
+            category: "decision",
+            title: "Needs your input",
+            reason: "Manager needs your input before it can continue.",
+            task_title: "Existing",
+            role: null,
+            action: { kind: "answer_question", label: "Answer question" },
+            target: {
+              kind: "session",
+              project_id: "p1",
+              task_id: "AJ-1",
+              attempt_id: "a1",
+              session_id: "s1",
+              role_generation_id: "g1",
+            },
+            held_tasks: [],
+          }],
+        }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    await settle();
+    check(!document.querySelector(".next-step textarea"), "a reply was offered to a replaced manager");
+    check(
+      document.body.textContent?.includes("no longer running"),
+      "the replaced manager is not explained",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Board and header actions open every destination kind exactly, list every item, and refuse stale bindings", async () => {
+  const priorEnvironment = { ...liveEnvironment };
+  globalThis.fetch = (async () => new Response("[]")) as typeof fetch;
+  const settingsItem: AttentionItem = {
+    ...railItem("task:AJ-1:decision", "blocked", "New agent settings need verifying", {
+      kind: "role_settings",
+      project_id: "p1",
+      task_id: "AJ-1",
+      role: "plan_reviewer",
+      settings_revision: 2,
+    }),
+    action: { kind: "open_agent_settings", label: "Open agent settings" },
+  };
+  const questionItem: AttentionItem = {
+    ...railItem("task:AJ-1:needs_input", "decision", "Needs your input", {
+      kind: "session",
+      project_id: "p1",
+      task_id: "AJ-1",
+      attempt_id: "a1",
+      session_id: "s1",
+      role_generation_id: "g1",
+    }),
+    action: { kind: "answer_question", label: "Answer question" },
+  };
+  const staleItem: AttentionItem = {
+    ...railItem("attempt:a1:stale_plan", "decision", "Old plan", {
+      kind: "attempt",
+      project_id: "p1",
+      task_id: "AJ-1",
+      attempt_id: "a1",
+      phase: "awaiting_plan_approval",
+      plan_hash: "plan-0",
+      candidate_hash: null,
+    }),
+    action: { kind: "review_plan", label: "Review plan" },
+  };
+  const labelled = (item: AttentionItem, kind: AttentionActionKind, label: string) => ({
+    ...item,
+    action: { kind, label },
+  });
+  const base = {
+    ...railState,
+    tasks: railState.tasks.map((item) =>
+      item.id === "AJ-1"
+        ? {
+          ...item,
+          role_settings: [{
+            id: "rs-2",
+            role: "plan_reviewer" as const,
+            revision: 2,
+            config: { provider: "claude" as const, model: "fable", effort: "high" },
+          }],
+        }
+        : item
+    ),
+    attention: [
+      ...railState.attention.map((item) =>
+        item.id === "permission_request:pr1"
+          ? labelled(item, "review_request", "Review request")
+          : item.id === "attempt:a1:awaiting_plan_approval"
+          ? labelled(item, "review_plan", "Review plan")
+          : item.id === "recovery_record:r-target"
+          ? labelled(item, "resolve_issue", "Resolve issue")
+          : item
+      ),
+      settingsItem,
+      questionItem,
+      staleItem,
+    ],
+  };
+  const cases: Array<{
+    name: string;
+    task: string;
+    primary: string;
+    rest?: string[];
+    marker: string;
+    dialog: boolean;
+  }> = [
+    { name: "Review plan", task: "AJ-1", primary: "attempt:a1:awaiting_plan_approval", rest: ["task:AJ-1:decision"], marker: "attempt:a1", dialog: true },
+    { name: "Review request", task: "AJ-1", primary: "permission_request:pr1", marker: "permission_request:pr1", dialog: false },
+    { name: "Answer question", task: "AJ-1", primary: "task:AJ-1:needs_input", marker: "session:s1", dialog: true },
+    { name: "Resolve issue", task: "AJ-2", primary: "recovery_record:r-target", marker: "recovery_record:r-target", dialog: true },
+    { name: "Open agent settings", task: "AJ-1", primary: "task:AJ-1:decision", marker: "role_settings:AJ-1:plan_reviewer", dialog: true },
+  ];
+  const cardAction = (title: string) =>
+    [...document.querySelectorAll<HTMLButtonElement>(".task-card .task-next-action")]
+      .find((button) => button.textContent?.includes(title));
+  const focused = () => document.activeElement?.getAttribute("data-attention-target");
+  try {
+    for (const item of cases) {
+      const live = liveHarness();
+      liveEnvironment.transport = live.environment.transport;
+      liveEnvironment.scheduler = live.environment.scheduler;
+      localStorage.clear();
+      localStorage.setItem("agenticjira.page", "board");
+      const ids = [item.primary, ...(item.rest ?? [])];
+      const state = snapshotAt("service-a", "60", {
+        ...base,
+        task_actions: [{
+          task_id: item.task,
+          item_id: item.primary,
+          action: base.attention.find((entry) => entry.id === item.primary)!.action!,
+          item_ids: ids,
+        }],
+      });
+      mount(<App />);
+      await settle();
+      live.reads[0].resolve(state);
+      await settle();
+      const title = state.tasks.find((entry) => entry.id === item.task)!.title;
+      const button = cardAction(title);
+      check(button?.textContent?.startsWith(item.name), `${item.name}: card reads ${button?.textContent}`);
+      if (ids.length > 1) {
+        check(button!.textContent!.includes(`+${ids.length - 1} more`), `${item.name}: count missing`);
+      }
+      act(() => button!.click());
+      await settle();
+      check(
+        !!document.querySelector('[role="dialog"]') === item.dialog,
+        `${item.name}: dialog state is wrong`,
+      );
+      check(focused() === item.marker, `${item.name}: focused ${focused()}`);
+      if (item.name === "Open agent settings") {
+        check(
+          !!document.activeElement?.closest("details[open]"),
+          "Agent settings did not open to the affected role",
+        );
+      }
+      if (item.dialog) {
+        const header = document.querySelector(".task-dialog-next");
+        check(
+          header?.querySelector("button")?.textContent === item.name,
+          `${item.name}: header reads ${header?.textContent}`,
+        );
+        // Every other item for the task is listed and opens its own target.
+        for (const rest of item.rest ?? []) {
+          const entry = base.attention.find((candidate) => candidate.id === rest)!;
+          const other = [...header!.querySelectorAll<HTMLButtonElement>(".task-dialog-more button")]
+            .find((candidate) => candidate.textContent?.includes(entry.title));
+          check(!!other, `${item.name}: ${entry.title} is not listed`);
+          act(() => other!.click());
+          await settle();
+          check(
+            focused() === "role_settings:AJ-1:plan_reviewer",
+            `${item.name}: the listed item focused ${focused()}`,
+          );
+        }
+      }
+      unmount();
+    }
+
+    // A card whose item was replaced refuses and refreshes instead of retargeting.
+    const live = liveHarness();
+    liveEnvironment.transport = live.environment.transport;
+    liveEnvironment.scheduler = live.environment.scheduler;
+    localStorage.clear();
+    localStorage.setItem("agenticjira.page", "board");
+    mount(<App />);
+    await settle();
+    live.reads[0].resolve(snapshotAt("service-a", "61", {
+      ...base,
+      task_actions: [{
+        task_id: "AJ-1",
+        item_id: "attempt:a1:stale_plan",
+        action: { kind: "review_plan", label: "Review plan" },
+        item_ids: ["attempt:a1:stale_plan"],
+      }],
+    }));
+    await settle();
+    const reads = live.reads.length;
+    act(() => cardAction("Existing")!.click());
+    await settle();
+    check(!document.querySelector('[role="dialog"]'), "a stale binding opened the task");
+    check(
+      document.body.textContent?.includes("changed before it could open"),
+      "the stale binding was not explained",
+    );
+    check(live.reads.length > reads, "the stale binding did not request the latest state");
+    unmount();
+
+    // An item with no current destination offers Refresh, never a false route.
+    const refreshLive = liveHarness();
+    liveEnvironment.transport = refreshLive.environment.transport;
+    liveEnvironment.scheduler = refreshLive.environment.scheduler;
+    localStorage.clear();
+    localStorage.setItem("agenticjira.page", "workspace");
+    mount(<App />);
+    await settle();
+    refreshLive.reads[0].resolve(snapshotAt("service-a", "62", {
+      ...base,
+      attention: [railItem("unbound", "blocked", "Unbound item", null)],
+      task_actions: [],
+    }));
+    await settle();
+    const unbound = document.querySelector('[data-attention-id="unbound"]');
+    check(!unbound?.textContent?.includes("earlier attempt"), "a targetless item claimed to be historical");
+    const refresh = [...(unbound?.querySelectorAll("button") ?? [])]
+      .find((candidate) => candidate.textContent?.startsWith("Refresh"));
+    check(!!refresh, "a targetless item offers no refresh");
+    const before = refreshLive.reads.length;
+    act(() => refresh!.click());
+    await settle();
+    check(refreshLive.reads.length > before, "Refresh did not request the latest state");
+  } finally {
+    unmount();
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Progress facts and paused-service notices keep raw causes in technical details", async () => {
+  const priorEnvironment = { ...liveEnvironment };
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({
+      events: [{
+        timestamp: "2026-01-01T00:00:00Z",
+        severity: "warn",
+        event_code: "coordinator.tick",
+        component: "coordinator",
+        outcome: "deferred",
+        detail: { cause: "sqlite busy at 0xdeadbeef" },
+      }],
+    }))) as typeof fetch;
+  const progressing: Task = {
+    ...task,
+    progress: {
+      reason_code: "workflow.current_manager_plan_pending",
+      waiting_reason: "The manager is writing the plan.",
+      responsible: "agent",
+      responsible_role: "manager",
+      next_operation: null,
+      next_target: null,
+      waiting_since: "2026-01-01T00:02:00Z",
+      last_meaningful_at: "2026-01-01T00:02:00Z",
+      last_meaningful_event: "report_needs_input",
+      last_agent_activity_at: "2026-01-01T00:05:00Z",
+      activity: "agent_active_without_progress",
+    },
+  };
+  try {
+    mount(
+      <TaskDetail
+        task={progressing}
+        state={{ ...liveBase, tasks: [progressing], attention: [] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    await settle();
+    const facts = document.querySelector(".progress-facts")?.textContent ?? "";
+    check(facts.includes("Waiting on") && facts.includes("Manager"), `facts read ${facts}`);
+    check(
+      document.body.textContent?.includes(
+        "An agent is running and producing activity; no newer workflow step is recorded.",
+      ),
+      "activity without progress is not explained",
+    );
+    check(
+      !document.body.textContent?.includes("has done nothing new"),
+      "missing hooks were presented as proof of inactivity",
+    );
+    check(
+      !facts.includes("Next step"),
+      "a next step was shown when the host named none",
+    );
+    unmount();
+
+    const live = liveHarness();
+    liveEnvironment.transport = live.environment.transport;
+    liveEnvironment.scheduler = live.environment.scheduler;
+    localStorage.clear();
+    localStorage.setItem("agenticjira.page", "workspace");
+    mount(<App />);
+    await settle();
+    live.reads[0].resolve(snapshotAt("service-a", "70", {
+      tasks: [task],
+      attention: [{
+        id: "coordinator_deferred",
+        category: "blocked",
+        title: "Automatic progress is paused",
+        reason: "A service step failed on every try, so waiting work is not advancing.",
+        task_title: null,
+        role: null,
+        action: { kind: "open_diagnostics", label: "Open diagnostics" },
+        target: { kind: "diagnostics" },
+        held_tasks: [],
+        details: "Failing since 2026-01-01T00:00:00Z: sqlite busy at 0xdeadbeef",
+      }],
+    }));
+    await settle();
+    const item = document.querySelector('[data-attention-id="coordinator_deferred"]');
+    const copy = item?.querySelector(".attention-copy > p")?.textContent ?? "";
+    check(!copy.includes("0xdeadbeef"), "the raw cause is primary copy");
+    check(
+      item?.querySelector("details")?.textContent?.includes("0xdeadbeef"),
+      "the raw cause is not under Technical details",
+    );
+    const open = [...(item?.querySelectorAll("button") ?? [])]
+      .find((button) => button.textContent?.startsWith("Open diagnostics"));
+    act(() => open!.click());
+    await settle();
+    check(
+      document.activeElement?.getAttribute("data-attention-target") === "diagnostics",
+      "Open diagnostics did not open the Diagnostics page",
+    );
+    await settle();
+    // The durable paused step is shown from the service state, plainly.
+    const current = document.querySelector('[data-diagnostic-id="coordinator_deferred"]');
+    check(
+      current?.querySelector("strong")?.textContent === "Automatic progress is paused",
+      "Diagnostics does not show the recorded paused step",
+    );
+    check(
+      ![...current!.querySelectorAll(":scope > p, :scope > strong")]
+        .some((node) => node.textContent?.includes("0xdeadbeef")) &&
+        current!.querySelector("details")?.textContent?.includes("0xdeadbeef"),
+      "the paused step's raw cause is not confined to Technical details",
+    );
+    // Logged events read plainly; their code and JSON stay collapsed.
+    const logged = document.querySelector(".diagnostic-list article");
+    check(
+      logged?.querySelector("strong")?.textContent ===
+        "A workflow step failed and is being retried",
+      `logged event reads ${logged?.querySelector("strong")?.textContent}`,
+    );
+    check(
+      ![...logged!.querySelectorAll(":scope > strong, :scope > p")]
+        .some((node) => node.textContent?.includes("coordinator.tick")) &&
+        logged!.querySelector("details")?.textContent?.includes("coordinator.tick"),
+      "the event code is primary copy",
+    );
+  } finally {
+    unmount();
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Activity reports show a truthful empty state before any attempt and keep real loading afterwards", async () => {
+  const draft: Task = { ...task, lifecycle: "backlog", active_attempt: undefined };
+  let requests = 0;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url.includes("/content")) requests += 1;
+    return await new Promise<Response>(() => {});
+  }) as typeof fetch;
+  try {
+    mount(
+      <TaskDetail
+        task={draft}
+        state={{ ...liveBase, tasks: [draft], attention: [] }}
+        tab="activity"
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    await settle();
+    const text = document.querySelector("[role=dialog]")?.textContent ?? "";
+    check(!text.includes("Loading reports"), "a draft shows a report load that never happens");
+    check(
+      text.includes("No agent has worked on this task yet"),
+      "a draft does not explain why there are no reports",
+    );
+    check(requests === 0, "a draft requested task content");
+    unmount();
+    // A task with an attempt still shows the real loading state while fetching.
+    mount(
+      <TaskDetail
+        task={task}
+        state={{ ...liveBase, tasks: [task], attention: [] }}
+        tab="activity"
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    await settle();
+    check(
+      document.querySelector("[role=dialog]")?.textContent?.includes("Loading reports"),
+      "an attempted task lost its loading state",
+    );
+    check(requests > 0, "an attempted task did not request its content");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Task content shows only the current revision when responses arrive out of order", async () => {
+  const pending: Array<{
+    resolve: (value: Response) => void;
+    reject: (cause: unknown) => void;
+  }> = [];
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (!url.includes("/content")) return new Response("[]");
+    return await new Promise<Response>((resolve, reject) => pending.push({ resolve, reject }));
+  }) as typeof fetch;
+  const content = (revision: string, summary: string) =>
+    new Response(JSON.stringify({
+      task_id: "AJ-1",
+      attempt_id: "a1",
+      content_revision: revision,
+      truncated: false,
+      records: [{
+        kind: "report",
+        id: `report-${revision}`,
+        created_at: "2026-01-01T00:00:00Z",
+        summary,
+        role: "manager",
+        outcome: "plan_ready",
+      }],
+    }));
+  const at = (revision: string): Task => ({
+    ...task,
+    active_attempt: { ...task.active_attempt!, content_revision: revision },
+  });
+  const view = (revision: string) => (
+    <TaskDetail
+      task={at(revision)}
+      state={{ ...liveBase, tasks: [at(revision)], attention: [] }}
+      tab="activity"
+      onClose={noop}
+      onChanged={noop}
+    />
+  );
+  const shown = () => document.querySelector("[role=dialog]")?.textContent ?? "";
+  try {
+    mount(view("r1"));
+    await settle();
+    rerender(view("r2"));
+    await settle();
+    check(pending.length === 2, `expected two content requests, saw ${pending.length}`);
+    // The newer request answers first; the older one arrives afterwards.
+    pending[1].resolve(content("r2", "Newer report"));
+    await settle();
+    pending[0].resolve(content("r1", "Older report"));
+    await settle();
+    check(shown().includes("Newer report"), "the current revision is not shown");
+    check(!shown().includes("Older report"), "an older revision replaced the current one");
+    // A response for another revision of the same attempt is never shown.
+    rerender(view("r3"));
+    await settle();
+    check(!shown().includes("Newer report"), "content of a replaced revision stayed visible");
+    pending[2].resolve(content("r2", "Mismatched report"));
+    await settle();
+    check(!shown().includes("Mismatched report"), "a response for another revision was shown");
+    check(shown().includes("Loading reports"), "the current revision is not being loaded");
+    // A superseded request that fails does not show an error for current content.
+    rerender(view("r4"));
+    await settle();
+    rerender(view("r5"));
+    await settle();
+    pending[3].reject(new Error("Stale failure from an older request"));
+    pending[4].resolve(content("r5", "Current report"));
+    await settle();
+    check(!shown().includes("Stale failure"), "an error from an older request was shown");
+    check(shown().includes("Current report"), "the current report was not shown");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Waiting after restart lists only current sessions with an enabled step", () => {
+  const unfinished = (id: string, attempt: string, title: string): Task => ({
+    ...task,
+    id,
+    title,
+    active_attempt: { ...task.active_attempt!, id: attempt },
+  });
+  const tasks: Task[] = [
+    unfinished("AJ-1", "a1", "Resumable task"),
+    unfinished("AJ-2", "a2", "Fresh continuation task"),
+    { ...unfinished("AJ-3", "a3", "Completed task"), lifecycle: "done" },
+  ];
+  const row = (session: string, attempt: string, taskId: string) => ({
+    session_id: session,
+    attempt_id: attempt,
+    task_id: taskId,
+    source: "planned_shutdown",
+    state: "parked",
+    reason: "fixture",
+    result: {},
+    updated_at: "now",
+  });
+  const action = (
+    session: string,
+    attempt: string,
+    taskId: string,
+    kind: ContinuationAction["kind"],
+    operation: string,
+    enabled = true,
+  ): ContinuationAction => ({
+    kind,
+    enabled,
+    reason: `Step for ${session}`,
+    owner: "human",
+    operation,
+    binding: { session_id: session, attempt_id: attempt, task_id: taskId },
+  });
+  const restartState = (rows: ReturnType<typeof row>[], actions: ContinuationAction[]): AppState => ({
+    ...liveBase,
+    tasks,
+    attention: [],
+    restart_candidates: rows,
+    continuation_actions: actions,
+  });
+  const allRows = [
+    row("s-resume", "a1", "AJ-1"),
+    row("s-fresh", "a2", "AJ-2"),
+    row("s-completed", "a3", "AJ-3"),
+    row("s-stale", "a-old", "AJ-1"),
+    row("s-missing-task", "a9", "AJ-404"),
+    row("s-no-action", "a2", "AJ-2"),
+    row("s-waiting", "a1", "AJ-1"),
+  ];
+  const allActions = [
+    action("s-resume", "a1", "AJ-1", "exact_resume", "restart_resume"),
+    action("s-fresh", "a2", "AJ-2", "continue_fresh_dispatch", "continue"),
+    action("s-completed", "a3", "AJ-3", "exact_resume", "restart_resume"),
+    action("s-stale", "a-old", "AJ-1", "exact_resume", "restart_resume"),
+    action("s-missing-task", "a9", "AJ-404", "exact_resume", "restart_resume"),
+    action("s-waiting", "a1", "AJ-1", "wait_for_capacity", "wait_for_capacity", false),
+  ];
+  const bulk = () =>
+    [...document.querySelectorAll<HTMLButtonElement>(".restart-tools button")]
+      .find((button) => button.textContent?.startsWith("Resume eligible sessions"));
+  try {
+    mount(<Workspace state={restartState(allRows, allActions)} onSelect={noop} onChanged={noop} />);
+    const urgent = document.querySelector(".restart-candidates");
+    const urgentRows = [...(urgent?.querySelectorAll(".restart-candidate") ?? [])];
+    check(urgentRows.length === 2, `expected two current restart rows, saw ${urgentRows.length}`);
+    check(
+      urgentRows[0].textContent?.includes("Resumable task") &&
+        urgentRows[0].textContent.includes("Can resume the same conversation") &&
+        urgentRows[1].textContent?.includes("Fresh continuation task") &&
+        urgentRows[1].textContent.includes("Can continue with a new session"),
+      "current rows do not name their projected step",
+    );
+    check(
+      !urgent?.textContent?.includes("resume it or let it continue"),
+      "the section still promises resume to every session",
+    );
+    const history = document.querySelector(".restart-history");
+    check(
+      history?.querySelector("summary")?.textContent === "Earlier restart sessions (5)",
+      `history reads ${history?.querySelector("summary")?.textContent}`,
+    );
+    check(
+      !history?.textContent?.includes("Can resume the same conversation"),
+      "a non-current row offered resume",
+    );
+    check(!!bulk() && !bulk()!.disabled, "bulk resume is not offered for an exact resume");
+    unmount();
+    // Fresh continuation alone never enables bulk resume.
+    mount(
+      <Workspace
+        state={restartState([row("s-fresh", "a2", "AJ-2")], [
+          action("s-fresh", "a2", "AJ-2", "continue_fresh_dispatch", "continue"),
+        ])}
+        onSelect={noop}
+        onChanged={noop}
+      />,
+    );
+    check(
+      document.querySelectorAll(".restart-candidates .restart-candidate").length === 1,
+      "the fresh continuation row is not current",
+    );
+    check(!!bulk() && bulk()!.disabled, "bulk resume was enabled for a fresh continuation");
+    unmount();
+    // Only historical rows: no urgent section at all.
+    mount(
+      <Workspace
+        state={restartState([row("s-completed", "a3", "AJ-3")], [
+          action("s-completed", "a3", "AJ-3", "exact_resume", "restart_resume"),
+        ])}
+        onSelect={noop}
+        onChanged={noop}
+      />,
+    );
+    check(!document.querySelector(".restart-candidates"), "a completed task was shown as urgent recovery");
+    check(!!bulk() && bulk()!.disabled, "bulk resume was enabled for a completed task");
   } finally {
     unmount();
   }

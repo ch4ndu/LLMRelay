@@ -529,6 +529,8 @@ export interface Attempt {
   phase: string;
   status: string;
   base_revision: string;
+  /** Changes when the attempt's plans, reports or review state change. */
+  content_revision?: string;
   plan_hash?: string;
   plan?: string;
   candidate_hash?: string;
@@ -599,6 +601,8 @@ export interface Task {
   role_overrides: Partial<Record<Role, RoleConfig>>;
   dependencies: Array<Record<string, unknown>>;
   active_attempt?: Attempt;
+  /** Absent from older services and for finished tasks. */
+  progress?: TaskProgress | null;
   role_settings: Array<
     {
       id: string;
@@ -667,6 +671,8 @@ export interface Session {
     permission_policy: string;
     security_policy: Record<string, unknown>;
   };
+  /** Whether the session reported its result in its latest run. */
+  reported_in_latest_invocation?: boolean | number;
   cmux_surface?: CmuxSessionSurface | null;
   input_control?: ActiveInputControl | null;
 }
@@ -914,14 +920,80 @@ export type AttentionTarget =
     kind: "project_setup";
     project_id: string;
     setup_operation_id: string | null;
-  };
+  }
+  | {
+    kind: "role_settings";
+    project_id: string;
+    task_id: string;
+    role: Role;
+    settings_revision: number;
+  }
+  | { kind: "diagnostics" };
+export type AttentionActionKind =
+  | "review_plan"
+  | "review_request"
+  | "review_result"
+  | "answer_question"
+  | "open_agent_output"
+  | "open_project_setup"
+  | "open_agent_settings"
+  | "open_diagnostics"
+  | "resolve_issue";
 export interface AttentionItem {
   id: string;
   category: AttentionCategory;
   title: string;
   reason: string;
+  task_title?: string | null;
+  role?: Role | null;
+  /** Label for the item's button; routing uses only `target`. */
+  action?: { kind: AttentionActionKind; label: string } | null;
   target: AttentionTarget | null;
   held_tasks: TaskAttentionTarget[];
+  /** Raw diagnostic text, shown only under Technical details. */
+  details?: string | null;
+}
+/** Where an unfinished task stands, from authoritative workflow evidence. */
+export interface TaskProgress {
+  reason_code: string;
+  waiting_reason: string;
+  responsible: "you" | "llmrelay" | "agent" | "external";
+  responsible_role: Role | null;
+  next_operation: string | null;
+  next_target: AttentionTarget | null;
+  waiting_since: string | null;
+  last_meaningful_at: string | null;
+  last_meaningful_event: string | null;
+  last_agent_activity_at: string | null;
+  activity: "no_live_agent" | "agent_live_idle" | "agent_active_without_progress";
+}
+/**
+ * The next step a task offers on its board card and in its header: the first
+ * of the task's attention items, which is the one `item_id` opens.
+ */
+export interface TaskAction {
+  task_id: string;
+  item_id: string;
+  action: { kind: AttentionActionKind; label: string };
+  /** Every attention item naming this task, in precedence order. */
+  item_ids: string[];
+}
+export interface TaskContentRecord {
+  kind: "report" | "rework_request";
+  id: string;
+  created_at: string;
+  role?: Role;
+  outcome?: string;
+  summary: string;
+  plan?: string | null;
+  review_kind?: string | null;
+}
+export interface TaskContent {
+  task_id: string;
+  attempt_id: string | null;
+  content_revision: string;
+  records: TaskContentRecord[];
+  truncated: boolean;
 }
 /** Revisions are opaque canonical decimals, comparable only within one incarnation. */
 export interface StateCursor {
@@ -975,6 +1047,8 @@ export interface AppState extends StateCursor {
   continuation_actions: ContinuationAction[];
   decisions: DecisionExplanation[];
   attention: AttentionItem[];
+  /** Absent from older services; derived from `attention` by the host. */
+  task_actions?: TaskAction[];
   resources: {
     active_sessions: number;
     active_controls: number;
