@@ -507,6 +507,11 @@ impl Application {
         )? {
             crate::permissions::BridgeStart::Immediate(response) => Ok(response),
             crate::permissions::BridgeStart::Pending { request_id } => loop {
+                if let Some(response) =
+                    crate::permissions::native_resolution_bridge_response(&self.store, &request_id)?
+                {
+                    return Ok(response);
+                }
                 let current_context = match self.store.role_context(credential) {
                     Ok(current)
                         if current.project_id == context.project_id
@@ -4684,7 +4689,9 @@ const REWORK_PARENT_FENCES: &[(&str, &str)] = &[
         AND state IN ('reserved','capturing','recovery_required'))"),
     ("a parent permission request is pending",
      "SELECT EXISTS(SELECT 1 FROM permission_requests WHERE attempt_id=?1
-        AND consumed_at IS NULL AND delivery_state NOT IN ('expired','not_delivered'))"),
+        AND consumed_at IS NULL AND delivery_state NOT IN ('expired','not_delivered')
+        AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+          WHERE native.permission_request_id=permission_requests.id))"),
     ("someone has keyboard control of a parent agent",
      "SELECT EXISTS(SELECT 1 FROM input_leases lease JOIN sessions s ON s.id=lease.session_id
         JOIN role_generations g ON g.id=s.role_generation_id

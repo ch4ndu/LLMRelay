@@ -4191,7 +4191,9 @@ pub fn reconcile_superseded_role_hold(
                  JOIN role_generations session_generation ON session_generation.id=s.role_generation_id
                  JOIN permission_requests permission ON permission.session_id=s.id
                  WHERE session_generation.attempt_id=a.id AND permission.consumed_at IS NULL
-                   AND permission.delivery_state NOT IN ('expired','not_delivered'))
+                   AND permission.delivery_state NOT IN ('expired','not_delivered')
+                   AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+                     WHERE native.permission_request_id=permission.id))
                AND NOT EXISTS(SELECT 1 FROM sessions s
                  JOIN role_generations session_generation ON session_generation.id=s.role_generation_id
                  JOIN input_leases lease ON lease.session_id=s.id
@@ -4246,7 +4248,9 @@ pub fn reconcile_superseded_role_hold(
                 "SELECT rr.id FROM role_results rr
                  JOIN role_generations rg ON rg.id=rr.role_generation_id
                  WHERE rg.attempt_id=?1 AND rr.consumed_at IS NULL
-                   AND rr.outcome IN ('blocked','needs_input')",
+                   AND rr.outcome IN ('blocked','needs_input')
+                   AND NOT EXISTS(SELECT 1 FROM role_result_supersessions superseded
+                                  WHERE superseded.role_result_id=rr.id)",
             )?;
             let rows = statement
                 .query_map(params![attempt], |row| row.get::<_, String>(0))?
@@ -4393,7 +4397,9 @@ fn manager_change_boundary(
                      ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)
                    AND NOT EXISTS(SELECT 1 FROM permission_requests permission
                      WHERE permission.session_id=s.id AND permission.consumed_at IS NULL
-                       AND permission.delivery_state NOT IN ('expired','not_delivered'))
+                       AND permission.delivery_state NOT IN ('expired','not_delivered')
+                       AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+                         WHERE native.permission_request_id=permission.id))
                    AND NOT EXISTS(SELECT 1 FROM input_leases lease
                      WHERE lease.session_id=s.id AND lease.revoked_at IS NULL
                        AND julianday(lease.expires_at)>julianday('now'))
@@ -6050,7 +6056,7 @@ fn record_attention_hold_with_source(
 
 /// Records that the attempt's hold ended, so an older recorded reason can never
 /// be shown for a later, unrelated wait.
-fn record_hold_release(
+pub(crate) fn record_hold_release(
     transaction: &rusqlite::Transaction<'_>,
     attempt: &str,
     reason: &str,
@@ -6753,6 +6759,8 @@ fn eligible_blocked_result(
          JOIN role_generations rg ON rg.id=rr.role_generation_id
          WHERE rg.attempt_id=?1 AND rr.outcome IN ('blocked','needs_input')
            AND rr.consumed_at IS NULL
+           AND NOT EXISTS(SELECT 1 FROM role_result_supersessions superseded
+                          WHERE superseded.role_result_id=rr.id)
          ORDER BY rr.created_at DESC,rr.rowid DESC",
     )?;
     let rows = statement

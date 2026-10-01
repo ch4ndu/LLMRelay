@@ -161,3 +161,9 @@ Workflow/configuration pins and required checks are revalidated at Ready and cla
 only the current Manager selects checks. Internal setup projects cannot receive
 recipe intake. Scheduled fire records, task insertion, provenance and next-fire
 advancement are transactional, with a unique schedule/time identity.
+
+## Observed native resolution and notification identity
+
+Native tool resolution is recorded independently from the app decision and response delivery. Only exact current invocation, tool-call identity and request correlation make an observed native resolution non-actionable. Ambiguous or missing correlation cannot clear a pending approval. Response delivery does not prove execution. Generic Claude Notification prompts route to agent output and cannot create an approval or reusable permission rule.
+
+Registering Claude Notification changes the generated hook identity and compatibility pack. Old Claude capability proofs are stale; qualify each needed profile against the current identity before a new launch. Exact resume cannot reuse earlier hook evidence. Codex retains its own hook identity. Provider versions and admission restrictions are unchanged. See the [signal matrix](PERMISSION_SIGNAL_MATRIX.md) for supported and unsupported prompt types.

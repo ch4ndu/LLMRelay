@@ -10,8 +10,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
+sys.dont_write_bytecode = True
 from role_config import ALLOWED_ARGUMENT_PLACEHOLDERS, ROLE_REQUIREMENTS, validate_role_configuration
 
 
@@ -70,17 +72,25 @@ def load_role(project: Path, role: str) -> tuple[dict[str, object], dict[str, ob
     return profile, adapter
 
 
-def codex_command(executable: str, project: Path, prompt: str, result: Path, profile: dict[str, object]) -> list[str]:
-    command = [executable, "exec", "--skip-git-repo-check", "--sandbox", str(profile["authority"]), "--color", "always", "--model", str(profile["model"])]
+def codex_command(executable: str, project: Path, prompt: str, result: Path, profile: dict[str, object], resume: str | None = None) -> list[str]:
+    command = [executable, "exec"]
+    if resume:
+        command.extend(("resume", "-c", f'sandbox_mode="{profile["authority"]}"'))
+    else:
+        command.extend(("--sandbox", str(profile["authority"]), "--color", "always", "--cd", str(project)))
+    command.extend(("--skip-git-repo-check", "--model", str(profile["model"])))
     if profile.get("effort"):
         command.extend(("-c", f'model_reasoning_effort="{profile["effort"]}"'))
     if profile.get("service_tier"):
         command.extend(("-c", f'service_tier="{profile["service_tier"]}"'))
-    command.extend(("--output-last-message", str(result), "--cd", str(project), prompt))
+    command.extend(("--output-last-message", str(result)))
+    if resume:
+        command.append(resume)
+    command.append(prompt)
     return command
 
 
-def claude_command(executable: str, prompt: str, profile: dict[str, object]) -> list[str]:
+def claude_command(executable: str, prompt: str, profile: dict[str, object], session_id: str, resume: bool = False) -> list[str]:
     allowed = ["Read", "Grep", "Glob", "Bash"]
     command = [executable, "--disable-slash-commands", "--model", str(profile["model"])]
     if profile.get("effort"):
@@ -89,7 +99,8 @@ def claude_command(executable: str, prompt: str, profile: dict[str, object]) -> 
         command.extend(("--safe-mode", "--permission-mode", "dontAsk", "--allowedTools", *allowed, "--disallowedTools", "Edit", "Write", "NotebookEdit"))
     else:
         command.extend(("--permission-mode", "dontAsk", "--allowedTools", *allowed, "Edit", "Write"))
-    command.extend(("--output-format", "text", "--no-session-persistence", "-p", prompt))
+    command.extend(("--resume" if resume else "--session-id", session_id))
+    command.extend(("--output-format", "text", "-p", prompt))
     return command
 
 
@@ -120,6 +131,7 @@ def main() -> int:
     parser.add_argument("--prompt-file", type=Path, required=True)
     parser.add_argument("--result-file", type=Path, required=True)
     parser.add_argument("--completion-file", type=Path, required=True)
+    parser.add_argument("--resume-session")
     args = parser.parse_args()
 
     project = args.project.resolve(strict=True)
@@ -133,6 +145,10 @@ def main() -> int:
     result_file.parent.mkdir(parents=True, exist_ok=True)
 
     profile, adapter = load_role(project, args.role)
+    if args.resume_session:
+        uuid.UUID(args.resume_session)
+        if profile["session"] != "retained":
+            raise RuntimeError("fresh roles cannot resume a session")
     if adapter["kind"] == "native-agent":
         raise RuntimeError("native-agent profiles must be invoked by the active host manager, not the CLI runner")
     executable = resolve_executable(str(adapter["executable"]))
@@ -142,10 +158,11 @@ def main() -> int:
     direct_prompt_file.write_text(prompt, encoding="utf-8")
     builtin = adapter.get("builtin")
     if adapter["kind"] == "builtin-cli" and builtin == "codex":
-        command = codex_command(executable, project, prompt, result_file, profile)
+        command = codex_command(executable, project, prompt, result_file, profile, args.resume_session)
         capture = False
     elif adapter["kind"] == "builtin-cli" and builtin == "claude":
-        command = claude_command(executable, prompt, profile)
+        session_id = args.resume_session or str(uuid.uuid4())
+        command = claude_command(executable, prompt, profile, session_id, bool(args.resume_session))
         capture = True
     elif adapter["kind"] == "custom-cli":
         command = custom_command(
@@ -168,13 +185,15 @@ def main() -> int:
     environment.pop("NO_COLOR", None)
     environment["CMUX_CODEX_HOOKS_DISABLED"] = "1"
     if capture:
-        completed = subprocess.run(command, cwd=project, env=environment, check=False, capture_output=True, text=True)
+        completed = subprocess.Popen(command, cwd=project, env=environment, stdout=subprocess.PIPE, text=True)
+        output: list[str] = []
+        assert completed.stdout is not None
+        for line in completed.stdout:
+            print(line, end="", flush=True)
+            output.append(line)
+        completed.wait()
         if not result_file.exists():
-            result_file.write_text(completed.stdout, encoding="utf-8")
-        if completed.stdout:
-            print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n", flush=True)
-        if completed.stderr:
-            print(completed.stderr, file=sys.stderr, end="" if completed.stderr.endswith("\n") else "\n", flush=True)
+            result_file.write_text("".join(output), encoding="utf-8")
     else:
         completed = subprocess.run(command, cwd=project, env=environment, check=False)
     write_json(completion_file, {
@@ -182,6 +201,7 @@ def main() -> int:
         "exit_code": completed.returncode, "model": profile["model"], "provider": profile["provider"],
         "reasoning_effort": profile.get("effort"), "result_file": str(result_file), "role": args.role,
         "session": profile["session"], "started_at": started,
+        "native_session_id": session_id if builtin == "claude" else args.resume_session,
     })
     print(f"TRIP role finished with exit code {completed.returncode}.", flush=True)
     return completed.returncode

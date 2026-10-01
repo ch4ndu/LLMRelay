@@ -1,4 +1,4 @@
-use super::{shell_quote, toml_string, HookAssets, PreparedLaunch, HOOK_REVISION};
+use super::{shell_quote, toml_string, HookAssets, PreparedLaunch, CODEX_HOOK_REVISION};
 use crate::domain::{CapabilityIdentity, CapabilityStatus, LaunchConfig, Provider, RoleKind};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -290,7 +290,7 @@ pub(crate) fn prepare_with_bundles(
                 format!("codex denied-read floor {DENIED_READ_FLOOR_VERSION}; named {permission_base} profile {DENIED_READ_FLOOR_PROFILE}; canonical control socket {} denied; restricted proxy enabled with no allowed domains and only canonical role socket {} allowed; local binding, upstream proxy, SOCKS5, credential broker, non-loopback proxy, and arbitrary Unix sockets disabled; configured local MCP servers disabled under {MCP_COVERAGE_REVISION}; approvals never with user reviewer; additive permission features disabled; native Allow may skip the AgenticJira inbox but cannot discard the local-command sandbox; no sandbox or hook-trust bypass", canonical_control_socket.display(), canonical_role_socket.display())
             },
             security_policy,
-            hook_revision: format!("{HOOK_REVISION}:{}", assets.codex_revision_hash),
+            hook_revision: format!("{CODEX_HOOK_REVISION}:{}", assets.codex_revision_hash),
             capability_status: CapabilityStatus::Unverified,
             compatibility: Some(contract_binding),
         },

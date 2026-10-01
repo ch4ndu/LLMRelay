@@ -1156,7 +1156,9 @@ pub(crate) fn read_only_profile_boundary(
             AND state NOT IN ('completed','cancelled','rejected','superseded'))"),
         ("permission_pending",
          "SELECT EXISTS(SELECT 1 FROM permission_requests WHERE attempt_id=?1
-            AND consumed_at IS NULL AND delivery_state NOT IN ('expired','not_delivered'))"),
+            AND consumed_at IS NULL AND delivery_state NOT IN ('expired','not_delivered')
+            AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+              WHERE native.permission_request_id=permission_requests.id))"),
         ("input_control",
          "SELECT EXISTS(SELECT 1 FROM input_leases lease JOIN sessions s ON s.id=lease.session_id
             JOIN role_generations g ON g.id=s.role_generation_id
@@ -1615,7 +1617,9 @@ const GUIDANCE_REAUTHORIZATION_FENCES: &[(&str, &str)] = &[
           AND julianday(lease.expires_at)>julianday('now'))"),
     ("a permission request is pending",
      "SELECT EXISTS(SELECT 1 FROM permission_requests WHERE attempt_id=?1
-        AND consumed_at IS NULL AND delivery_state NOT IN ('expired','not_delivered'))"),
+        AND consumed_at IS NULL AND delivery_state NOT IN ('expired','not_delivered')
+            AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+              WHERE native.permission_request_id=permission_requests.id))"),
     ("a control or proposed transition is pending",
      "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
         AND state NOT IN ('finished','cancelled','superseded','rejected','failed','abandoned'))"),

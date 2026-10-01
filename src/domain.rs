@@ -1556,6 +1556,167 @@ pub struct PermissionRequestDto {
     pub delivery_unknown_at: Option<String>,
     pub delivery_reason: Option<String>,
     pub consumed_at: Option<String>,
+    /// Pending an application decision with no observed native resolution.
+    pub actionable: bool,
+    /// Whether this request's own PermissionRequest hook was identified
+    /// exactly; without it a native answer can never be observed.
+    pub native_correlation_available: bool,
+    pub native_resolution: Option<PermissionNativeResolutionDto>,
+}
+
+/// The provider hook that proved the native prompt for a request was answered
+/// outside LLMRelay. It records no LLMRelay decision and no delivery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PermissionNativeResolutionDto {
+    pub kind: PermissionNativeResolutionKind,
+    pub hook_event_id: String,
+    pub tool_use_id: String,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionNativeResolutionKind {
+    /// `PostToolUse`: the provider reports the tool call finished.
+    ToolFinished,
+    /// `PostToolUseFailure`: the provider reports the tool call failed.
+    ToolFailed,
+    /// `PermissionDenied`: the provider denied the call natively.
+    NativeDenied,
+}
+
+impl PermissionNativeResolutionKind {
+    pub fn from_hook_event(event_name: &str) -> Option<Self> {
+        match event_name {
+            "PostToolUse" => Some(Self::ToolFinished),
+            "PostToolUseFailure" => Some(Self::ToolFailed),
+            "PermissionDenied" => Some(Self::NativeDenied),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolFinished => "tool_finished",
+            Self::ToolFailed => "tool_failed",
+            Self::NativeDenied => "native_denied",
+        }
+    }
+}
+
+impl FromStr for PermissionNativeResolutionKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "tool_finished" => Ok(Self::ToolFinished),
+            "tool_failed" => Ok(Self::ToolFailed),
+            "native_denied" => Ok(Self::NativeDenied),
+            other => Err(format!("unknown native permission resolution {other}")),
+        }
+    }
+}
+
+/// The newest native turn of a session's current invocation, taken only from
+/// trusted hooks of that exact session, generation, native identity and
+/// transcript epoch. Written input bytes are not a turn.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeTurnDto {
+    /// The trusted `UserPromptSubmit` that opened the turn, when one exists.
+    pub accepted_hook_event_id: Option<String>,
+    pub accepted_at: Option<String>,
+    /// Set when the provider ended this turn with a supported failure hook;
+    /// a later Stop, tool activity or accepted turn clears it.
+    pub failure: Option<NativeTurnFailureDto>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeTurnFailureDto {
+    /// The turn's first failure hook, stable across duplicate deliveries.
+    pub hook_event_id: String,
+    pub kind: NativeTurnFailureKind,
+    /// The provider's own error value, bounded.
+    pub provider_error: String,
+    pub details: Option<String>,
+    pub observed_at: String,
+}
+
+/// A generic wait the provider announced with a Notification hook in the
+/// current turn. It names no operation, so it is answered only in the agent's
+/// own output and never becomes an application approval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativePromptDto {
+    /// The wait's first notification, stable across repeated reminders.
+    pub hook_event_id: String,
+    pub kind: NativePromptKind,
+    pub observed_at: String,
+}
+
+/// Notification types of the admitted Claude Code release that announce a
+/// wait for the user; other types claim no wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePromptKind {
+    PermissionPrompt,
+    ElicitationDialog,
+    ElicitationUrlDialog,
+    AgentNeedsInput,
+}
+
+impl FromStr for NativePromptKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "permission_prompt" => Ok(Self::PermissionPrompt),
+            "elicitation_dialog" => Ok(Self::ElicitationDialog),
+            "elicitation_url_dialog" => Ok(Self::ElicitationUrlDialog),
+            "agent_needs_input" => Ok(Self::AgentNeedsInput),
+            other => Err(format!(
+                "notification type {other} does not announce a wait"
+            )),
+        }
+    }
+}
+
+/// Claude `StopFailure` error values of the admitted Claude Code release. Any
+/// other value is `Unknown`; its text stays in `provider_error`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeTurnFailureKind {
+    AuthenticationFailed,
+    OauthOrgNotAllowed,
+    AccountOnHold,
+    VerificationRequired,
+    BillingError,
+    RateLimit,
+    Overloaded,
+    InvalidRequest,
+    ModelNotFound,
+    ServerError,
+    MaxOutputTokens,
+    CloudCredentialError,
+    Unknown,
+}
+
+impl NativeTurnFailureKind {
+    pub fn from_provider_error(value: &str) -> Self {
+        match value {
+            "authentication_failed" => Self::AuthenticationFailed,
+            "oauth_org_not_allowed" => Self::OauthOrgNotAllowed,
+            "account_on_hold" => Self::AccountOnHold,
+            "verification_required" => Self::VerificationRequired,
+            "billing_error" => Self::BillingError,
+            "rate_limit" => Self::RateLimit,
+            "overloaded" => Self::Overloaded,
+            "invalid_request" => Self::InvalidRequest,
+            "model_not_found" => Self::ModelNotFound,
+            "server_error" => Self::ServerError,
+            "max_output_tokens" => Self::MaxOutputTokens,
+            "cloud_credential_error" => Self::CloudCredentialError,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

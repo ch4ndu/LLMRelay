@@ -1,6 +1,7 @@
 use crate::domain::{
-    OperationResult, PermissionDecision, PermissionLifetime, PermissionRequestDto,
-    PermissionRuleDto, Provider, RoleContext, RoleKind,
+    OperationResult, PermissionDecision, PermissionLifetime, PermissionNativeResolutionDto,
+    PermissionNativeResolutionKind, PermissionRequestDto, PermissionRuleDto, Provider, RoleContext,
+    RoleKind,
 };
 use crate::store::Store;
 use anyhow::{anyhow, bail, Context, Result};
@@ -222,9 +223,13 @@ fn expire_request(
     now: &str,
     terminal_delivery: Option<&str>,
 ) -> Result<usize> {
+    // A natively answered request awaits nothing more, so no LLMRelay expiry or
+    // decision is ever written over its observed resolution.
     let delivery: Option<String> = connection
         .query_row(
-            "SELECT delivery_state FROM permission_requests WHERE id=?1",
+            "SELECT delivery_state FROM permission_requests pr WHERE pr.id=?1
+               AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+                              WHERE native.permission_request_id=pr.id)",
             params![request_id],
             |row| row.get(0),
         )
@@ -514,6 +519,17 @@ pub fn begin_request(
             &now.to_rfc3339(),
         )?;
     }
+    let request_hook_event_id = if actionable {
+        link_request_hook(
+            &transaction,
+            context,
+            &request_id,
+            payload,
+            &now.to_rfc3339(),
+        )?
+    } else {
+        None
+    };
     transaction.execute(
         "INSERT INTO audit_events(id,operation_id,actor_kind,actor_id,event_code,entity_kind,entity_id,detail_json,created_at)
          VALUES(?1,?2,'hook',?3,?4,'permission_request',?5,?6,?7)",
@@ -527,7 +543,14 @@ pub fn begin_request(
                 "permission.policy_denied"
             },
             request_id,
-            serde_json::json!({"provider":context.provider,"role":context.role,"tool_name":tool_name,"input_digest":input_digest}).to_string(),
+            serde_json::json!({
+                "provider":context.provider,
+                "role":context.role,
+                "tool_name":tool_name,
+                "input_digest":input_digest,
+                "request_hook_event_id":request_hook_event_id
+            })
+            .to_string(),
             now.to_rfc3339()
         ],
     )?;
@@ -567,6 +590,355 @@ pub fn begin_request(
     }
 }
 
+/// SQL predicate over alias `pr`: the request awaits an application decision
+/// and its native prompt has not been observed answered.
+pub(crate) const ACTIONABLE_REQUEST_SQL: &str = "(pr.state='pending' AND NOT EXISTS(
+    SELECT 1 FROM permission_native_resolutions native WHERE native.permission_request_id=pr.id))";
+
+/// Links a new request to the PermissionRequest hook the bridge recorded for
+/// the same payload in the current invocation, only when exactly one unlinked
+/// candidate exists; concurrent identical requests stay unlinked.
+fn link_request_hook(
+    transaction: &Transaction<'_>,
+    context: &RoleContext,
+    request_id: &str,
+    payload: &serde_json::Value,
+    now: &str,
+) -> Result<Option<String>> {
+    let candidates = {
+        let mut statement = transaction.prepare(
+            "SELECT h.id FROM hook_events h
+             JOIN sessions s ON s.id=h.session_id AND s.role_generation_id=h.role_generation_id
+             LEFT JOIN resume_invocations ri
+               ON ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
+             WHERE h.session_id=?1 AND h.role_generation_id=?2 AND s.transcript_epoch=?3
+               AND h.event_name='PermissionRequest' AND h.native_session_id=s.native_session_id
+               AND h.payload_json=?4
+               AND h.rowid>CASE
+                 WHEN ri.id IS NULL THEN s.initial_hook_event_boundary_rowid
+                 ELSE ri.hook_event_boundary_rowid
+               END
+               AND NOT EXISTS(SELECT 1 FROM permission_request_hooks link
+                              WHERE link.hook_event_id=h.id)
+             LIMIT 2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    context.session_id,
+                    context.role_generation_id,
+                    context.transcript_epoch,
+                    serde_json::to_string(payload)?
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let [hook_event_id] = candidates.as_slice() else {
+        return Ok(None);
+    };
+    transaction.execute(
+        "INSERT INTO permission_request_hooks(permission_request_id,hook_event_id,created_at)
+         VALUES(?1,?2,?3)",
+        params![request_id, hook_event_id, now],
+    )?;
+    Ok(Some(hook_event_id.clone()))
+}
+
+/// The action a tool call performs, comparable across its PreToolUse,
+/// PermissionRequest and terminal hooks. Codex adds request-only fields such as
+/// a description, so whole-input digests differ between those hooks.
+fn native_action_key(
+    provider: Provider,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> Option<String> {
+    validate_exact_action(provider, tool_name, input).ok()?;
+    consistent_command_field(input)
+        .ok()
+        .flatten()
+        .map(serde_json::Value::to_string)
+}
+
+struct InvocationToolHook {
+    rowid: i64,
+    id: String,
+    event_name: String,
+    tool_use_id: Option<String>,
+    action: Option<String>,
+}
+
+impl InvocationToolHook {
+    fn is_terminal(&self) -> bool {
+        PermissionNativeResolutionKind::from_hook_event(&self.event_name).is_some()
+    }
+}
+
+/// Records that an undelivered request's native prompt was answered, proven by
+/// the first trusted terminal hook of the exact tool call it asked about. The
+/// caller passes only a hook it accepted as trusted in the invocation that
+/// began after `invocation_start_rowid`. Nothing is recorded unless exactly one
+/// same-action call was in flight when the request's own hook arrived.
+pub(crate) fn record_native_resolution(
+    transaction: &Transaction<'_>,
+    context: &RoleContext,
+    terminal_hook_event_id: &str,
+    terminal_rowid: i64,
+    payload: &serde_json::Value,
+    invocation_start_rowid: i64,
+    now: &str,
+) -> Result<Option<String>> {
+    let Some(kind) = payload
+        .get("hook_event_name")
+        .and_then(serde_json::Value::as_str)
+        .and_then(PermissionNativeResolutionKind::from_hook_event)
+    else {
+        return Ok(None);
+    };
+    let text = |field: &str| {
+        payload
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    };
+    let (Some(tool_use_id), Some(tool_name)) = (text("tool_use_id"), text("tool_name")) else {
+        return Ok(None);
+    };
+    let Some(action) = native_action_key(
+        context.provider,
+        tool_name,
+        payload
+            .get("tool_input")
+            .unwrap_or(&serde_json::Value::Null),
+    ) else {
+        return Ok(None);
+    };
+    let hooks = {
+        let mut statement = transaction.prepare(
+            "SELECT h.rowid,h.id,h.event_name,h.payload_json FROM hook_events h
+             JOIN sessions s ON s.id=h.session_id
+             WHERE h.session_id=?1 AND h.role_generation_id=?2
+               AND h.rowid>?3 AND h.rowid<?4
+               AND (h.event_name='UntrustedNativeEvent'
+                 OR (h.native_session_id=s.native_session_id
+                   AND h.event_name IN ('PreToolUse','PermissionRequest','PostToolUse',
+                                        'PostToolUseFailure','PermissionDenied')
+                   AND json_valid(h.payload_json)
+                   AND json_extract(h.payload_json,'$.tool_name')=?5))
+             ORDER BY h.rowid",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    context.session_id,
+                    context.role_generation_id,
+                    invocation_start_rowid,
+                    terminal_rowid,
+                    tool_name
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(rowid, id, event_name, payload_json)| {
+                let hook_payload = serde_json::from_str::<serde_json::Value>(&payload_json)
+                    .unwrap_or(serde_json::Value::Null);
+                InvocationToolHook {
+                    rowid,
+                    id,
+                    event_name,
+                    tool_use_id: hook_payload
+                        .get("tool_use_id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::to_owned),
+                    action: native_action_key(
+                        context.provider,
+                        tool_name,
+                        hook_payload
+                            .get("tool_input")
+                            .unwrap_or(&serde_json::Value::Null),
+                    ),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let same_action = |hook: &&InvocationToolHook| hook.action.as_deref() == Some(action.as_str());
+    let terminated_before = |call: &InvocationToolHook, rowid: i64| {
+        hooks.iter().any(|hook| {
+            hook.is_terminal() && hook.rowid < rowid && hook.tool_use_id == call.tool_use_id
+        })
+    };
+    if hooks
+        .iter()
+        .any(|hook| hook.is_terminal() && hook.tool_use_id.as_deref() == Some(tool_use_id))
+    {
+        return Ok(None);
+    }
+    let calls = hooks
+        .iter()
+        .filter(|hook| {
+            hook.event_name == "PreToolUse" && hook.tool_use_id.as_deref() == Some(tool_use_id)
+        })
+        .collect::<Vec<_>>();
+    let [call] = calls.as_slice() else {
+        return Ok(None);
+    };
+    if call.action.as_deref() != Some(action.as_str())
+        || hooks
+            .iter()
+            .any(|hook| hook.event_name == "UntrustedNativeEvent" && hook.rowid > call.rowid)
+    {
+        return Ok(None);
+    }
+    let requests = hooks
+        .iter()
+        .filter(|hook| hook.event_name == "PermissionRequest" && hook.rowid > call.rowid)
+        .filter(same_action)
+        .collect::<Vec<_>>();
+    let [request_hook] = requests.as_slice() else {
+        return Ok(None);
+    };
+    let in_flight_at_request = hooks
+        .iter()
+        .filter(|hook| hook.event_name == "PreToolUse" && hook.rowid < request_hook.rowid)
+        .filter(same_action)
+        .filter(|hook| hook.tool_use_id.is_none() || !terminated_before(*hook, request_hook.rowid))
+        .count();
+    if in_flight_at_request != 1 {
+        return Ok(None);
+    }
+    // A request already decided in the app but not yet reserved is resolved too,
+    // so its bridge is released instead of delivering a second response.
+    let request: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT pr.id,pr.input_json FROM permission_request_hooks link
+             JOIN permission_requests pr ON pr.id=link.permission_request_id
+             JOIN sessions s ON s.id=pr.session_id
+             WHERE link.hook_event_id=?1 AND pr.session_id=?2 AND pr.role_generation_id=?3
+               AND pr.provider=?4 AND pr.tool_name=?5
+               AND pr.native_session_id=s.native_session_id
+               AND pr.policy_fingerprint=s.capability_key
+               AND pr.delivery_state IN ('not_reserved','deny_required')
+               AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+                              WHERE native.permission_request_id=pr.id)",
+            params![
+                request_hook.id,
+                context.session_id,
+                context.role_generation_id,
+                context.provider.to_string(),
+                tool_name
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((request_id, input_json)) = request else {
+        return Ok(None);
+    };
+    let requested_action = serde_json::from_str::<serde_json::Value>(&input_json)
+        .ok()
+        .and_then(|input| native_action_key(context.provider, tool_name, &input));
+    if requested_action.as_deref() != Some(action.as_str()) {
+        return Ok(None);
+    }
+    let changed = transaction.execute(
+        "INSERT INTO permission_native_resolutions(permission_request_id,resolution_kind,
+             request_hook_event_id,pre_tool_hook_event_id,resolving_hook_event_id,tool_use_id,
+             session_id,role_generation_id,native_session_id,transcript_epoch,resume_invocation_id,
+             settings_revision,observed_at)
+         SELECT ?1,?2,?3,?4,?5,?6,s.id,rg.id,s.native_session_id,s.transcript_epoch,
+                (SELECT ri.id FROM resume_invocations ri
+                 WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch),
+                rg.config_revision,?7
+         FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
+         WHERE s.id=?8 AND rg.id=?9 AND s.transcript_epoch=?10",
+        params![
+            request_id,
+            kind.as_str(),
+            request_hook.id,
+            call.id,
+            terminal_hook_event_id,
+            tool_use_id,
+            now,
+            context.session_id,
+            context.role_generation_id,
+            context.transcript_epoch
+        ],
+    )?;
+    if changed != 1 {
+        return Ok(None);
+    }
+    permission_lifecycle_event(
+        transaction,
+        &request_id,
+        "permission.native_resolution.observed",
+        serde_json::json!({
+            "resolution_kind":kind.as_str(),
+            "resolving_hook_event_id":terminal_hook_event_id,
+            "request_hook_event_id":request_hook.id,
+            "tool_use_id":tool_use_id,
+            "application_decision_recorded":false,
+            "native_command_execution_proven":false
+        }),
+        now,
+    )?;
+    Ok(Some(request_id))
+}
+
+/// Ends the bridge wait for a request whose native prompt was answered in the
+/// provider. Nothing is reserved or delivered and no decision is recorded; the
+/// empty hook output carries no decision, since the provider already decided.
+fn release_after_native_resolution(
+    transaction: &Transaction<'_>,
+    request_id: &str,
+    now: &str,
+) -> Result<Option<serde_json::Value>> {
+    let resolved: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM permission_requests pr
+           JOIN permission_native_resolutions native ON native.permission_request_id=pr.id
+           WHERE pr.id=?1 AND pr.delivery_state IN ('not_reserved','deny_required'))",
+        params![request_id],
+        |row| row.get(0),
+    )?;
+    if !resolved {
+        return Ok(None);
+    }
+    permission_lifecycle_event(
+        transaction,
+        request_id,
+        "permission.bridge.released_after_native_resolution",
+        serde_json::json!({
+            "application_decision_recorded":false,
+            "response_reserved":false,
+            "native_command_execution_proven":false
+        }),
+        now,
+    )?;
+    Ok(Some(serde_json::json!({})))
+}
+
+/// Releases a waiting bridge once its request was natively resolved; `None`
+/// while the request still awaits an application decision.
+pub fn native_resolution_bridge_response(
+    store: &Store,
+    request_id: &str,
+) -> Result<Option<serde_json::Value>> {
+    let now = Utc::now().to_rfc3339();
+    let mut connection = store.lock()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let response = release_after_native_resolution(&transaction, request_id, &now)?;
+    transaction.commit()?;
+    Ok(response)
+}
+
 pub fn consume_ready_response(
     store: &Store,
     request_id: &str,
@@ -579,6 +951,12 @@ pub fn consume_ready_response(
     let mut connection = store.lock()?;
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // An application decision made before the native answer was observed is
+    // kept as history but never delivered as a second response.
+    if let Some(response) = release_after_native_resolution(&transaction, request_id, &now)? {
+        transaction.commit()?;
+        return Ok(Some(response));
+    }
     let credential_permissions: Option<String> = transaction
         .query_row(
             "SELECT permissions_json FROM role_credentials
@@ -857,8 +1235,10 @@ pub fn reserve_connection_denial(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let request: Option<String> = transaction
         .query_row(
-            "SELECT id FROM permission_requests
+            "SELECT id FROM permission_requests pr
              WHERE connection_nonce=?1 AND delivery_state IN ('not_reserved','deny_required')
+               AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+                              WHERE native.permission_request_id=pr.id)
              ORDER BY created_at DESC LIMIT 1",
             params![connection_nonce],
             |row| row.get(0),
@@ -1086,6 +1466,14 @@ pub fn apply_human_decision(
     if reason.len() > 8192 {
         bail!("permission decision reason is limited to 8192 characters")
     }
+    let natively_resolved: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM permission_native_resolutions WHERE permission_request_id=?1)",
+        params![request_id],
+        |row| row.get(0),
+    )?;
+    if natively_resolved {
+        bail!("the agent's own prompt for this permission request was already answered in its terminal; no decision was recorded")
+    }
     let now = Utc::now().to_rfc3339();
     let (
         provider,
@@ -1290,14 +1678,41 @@ pub fn state_rows(
 ) -> Result<(Vec<PermissionRequestDto>, Vec<PermissionRuleDto>)> {
     let requests = {
         let mut statement = connection.prepare(
-            "SELECT id,project_id,task_id,attempt_id,session_id,role_generation_id,role,provider,native_session_id,tool_name,input_json,requested_access_json,reason,command_display,family_json,family_unavailable_reason,created_at,deadline_at,state,revision,decision_kind,decision_actor,decision_reason,decided_at,matching_rule_id,delivery_state,delivery_reserved_at,reserved_behavior,delivered_at,delivery_unknown_at,delivery_reason,consumed_at
-             FROM permission_requests
-             ORDER BY CASE state WHEN 'pending' THEN 0 ELSE 1 END,created_at DESC LIMIT 200",
+            "SELECT pr.id,pr.project_id,pr.task_id,pr.attempt_id,pr.session_id,pr.role_generation_id,pr.role,pr.provider,pr.native_session_id,pr.tool_name,pr.input_json,pr.requested_access_json,pr.reason,pr.command_display,pr.family_json,pr.family_unavailable_reason,pr.created_at,pr.deadline_at,pr.state,pr.revision,pr.decision_kind,pr.decision_actor,pr.decision_reason,pr.decided_at,pr.matching_rule_id,pr.delivery_state,pr.delivery_reserved_at,pr.reserved_behavior,pr.delivered_at,pr.delivery_unknown_at,pr.delivery_reason,pr.consumed_at,
+                    link.hook_event_id IS NOT NULL,native.resolution_kind,native.resolving_hook_event_id,native.tool_use_id,native.observed_at
+             FROM permission_requests pr
+             LEFT JOIN permission_request_hooks link ON link.permission_request_id=pr.id
+             LEFT JOIN permission_native_resolutions native ON native.permission_request_id=pr.id
+             ORDER BY CASE WHEN pr.state='pending' AND native.permission_request_id IS NULL THEN 0 ELSE 1 END,
+                      pr.created_at DESC LIMIT 200",
         )?;
         let rows = statement.query_map([], |row| {
             let role: String = row.get(6)?;
             let provider: String = row.get(7)?;
             let family: Option<String> = row.get(14)?;
+            let state: String = row.get(18)?;
+            let native_resolution = match (
+                row.get::<_, Option<String>>(33)?,
+                row.get::<_, Option<String>>(34)?,
+                row.get::<_, Option<String>>(35)?,
+                row.get::<_, Option<String>>(36)?,
+            ) {
+                (Some(kind), Some(hook_event_id), Some(tool_use_id), Some(observed_at)) => {
+                    Some(PermissionNativeResolutionDto {
+                        kind: kind.parse().map_err(|error: String| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                33,
+                                rusqlite::types::Type::Text,
+                                error.into(),
+                            )
+                        })?,
+                        hook_event_id,
+                        tool_use_id,
+                        observed_at,
+                    })
+                }
+                _ => None,
+            };
             Ok(PermissionRequestDto {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
@@ -1329,7 +1744,8 @@ pub fn state_rows(
                 family_unavailable_reason: row.get(15)?,
                 created_at: row.get(16)?,
                 deadline_at: row.get(17)?,
-                state: row.get(18)?,
+                actionable: state == "pending" && native_resolution.is_none(),
+                state,
                 revision: row.get(19)?,
                 decision_kind: row.get(20)?,
                 decision_actor: row.get(21)?,
@@ -1343,6 +1759,8 @@ pub fn state_rows(
                 delivery_unknown_at: row.get(29)?,
                 delivery_reason: row.get(30)?,
                 consumed_at: row.get(31)?,
+                native_correlation_available: row.get(32)?,
+                native_resolution,
             })
         })?;
         let collected = rows.collect::<rusqlite::Result<Vec<_>>>()?;

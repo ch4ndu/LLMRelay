@@ -1,5 +1,5 @@
 {
-  "adapters_sha256": "f38e15b010ec897e83bd8df165d9cc028024f59474f6cdfa95eedd22e6463c3f",
+  "adapters_sha256": "000588a230567fe4a6580b2aaa51c94a9a55bed0d1a41405698270d6f824c838",
   "base": {
     "bin/cmux_observer.py": "2b6f3eeb68a84a0f711c38c723cf81a51221d98b491564d6ca82d50e742eaf4b",
     "bin/cmux_role_runner.py": "8af9608595f52384f9ed1cabc459ea901d4769f76ed36c4ba3cef3de7b3ce754",
@@ -15,18 +15,18 @@
     "skills/trip-explorer-workflow/references/explorer-activation.md": "2f114434383976d5dc1c47c2a14483d5e01cf3fb0a4c89a4d7f97473ffae96af"
   },
   "bin": {
-    "cmux_observer.py": "2b6f3eeb68a84a0f711c38c723cf81a51221d98b491564d6ca82d50e742eaf4b",
-    "cmux_role_runner.py": "8af9608595f52384f9ed1cabc459ea901d4769f76ed36c4ba3cef3de7b3ce754",
+    "cmux_observer.py": "1fe66caff5552a8b4b82f0a15f4ac3bfc1d8ba6f41cc66a5cae355af9d69d7f2",
+    "cmux_role_runner.py": "7ecb61d20fbec519a7b2c8177228ab75ebbbce69b040d88a79bab3a75fcb1d1d",
     "role_config.py": "5df37514d8639177186a85d1014e74b6c8d551d7224c207a4950edbbde2454ad",
     "validate_installed.py": "249a548553b8fc416a63fb87dfe0dc077a77cb7cc7c311c5e2641ad4db20b44f"
   },
-  "config_sha256": "8f916016901c0b8f82c5a43357589f72723255532f05cd12b5780845d62cfedb",
+  "config_sha256": "29853b04de2fe505f3df5cb399adfced792b4833d52efba725c4233f3646b799",
   "installed_at": "2026-09-28T00:52:24Z",
   "llmrelay": {
     "overlay_hash": "ede5ea9eddcb61eff3b5a790315b8006203feb8bedc4141ea030440e4f7db767",
     "upstream_source_hash": "66ba1f219199e715723b26fef0fbd55cb1b1d11fc2a803aec4108ef23db799ae",
     "workflow_id": "trip-explorer-0.9.0-llmrelay-1"
   },
-  "preflight_sha256": "496192e183a4aa18cb2fa56a4c4a23ffc93e351e162d479c34ead5f7f674189e",
+  "preflight_sha256": "86aed05149c278106c0c0c1c0f7d9c4269b0301a5b55b2ae5ac18a8eb9f5f0e6",
   "version": "0.9.0"
 }

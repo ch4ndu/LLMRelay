@@ -21,7 +21,7 @@
   },
   "profiles": {
     "claude-fable-read-fresh": {
-      "adapter": "llmrelay_codex",
+      "adapter": "direct-codex-cli",
       "authority": "read-only",
       "effort": "medium",
       "model": "gpt-5.6-sol",
@@ -30,7 +30,7 @@
       "session": "fresh"
     },
     "claude-fable-read-retained": {
-      "adapter": "llmrelay_codex",
+      "adapter": "direct-codex-cli",
       "authority": "read-only",
       "effort": "medium",
       "model": "gpt-5.6-sol",
@@ -39,7 +39,7 @@
       "session": "retained"
     },
     "codex-sol-read-retained": {
-      "adapter": "llmrelay_codex",
+      "adapter": "direct-codex-cli",
       "authority": "read-only",
       "effort": "medium",
       "model": "gpt-5.6-sol",
@@ -48,7 +48,7 @@
       "session": "retained"
     },
     "codex-terra-write-retained": {
-      "adapter": "llmrelay_claude",
+      "adapter": "direct-claude-cli",
       "authority": "workspace-write",
       "effort": "high",
       "model": "claude-opus-5-5",

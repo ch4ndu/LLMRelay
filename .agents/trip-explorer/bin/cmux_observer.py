@@ -133,6 +133,7 @@ def launch(args: argparse.Namespace, binary: str) -> int:
             str(args.result_file.resolve()),
             "--completion-file",
             str(args.completion_file.resolve()),
+            *(["--resume-session", args.resume_session] if args.resume_session else []),
         ]
     )
     for command in (
@@ -264,6 +265,7 @@ def main() -> int:
     launch_parser.add_argument("--prompt-file", required=True, type=Path)
     launch_parser.add_argument("--result-file", required=True, type=Path)
     launch_parser.add_argument("--completion-file", required=True, type=Path)
+    launch_parser.add_argument("--resume-session")
 
     args = parser.parse_args()
     if getattr(args, "context", None) and not CONTEXT_PATTERN.fullmatch(args.context):

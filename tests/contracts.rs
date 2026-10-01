@@ -1388,6 +1388,7 @@ impl Fixture {
                 providers::claude::NATIVE_SANDBOX_POLICY_REVISION.into();
             contract["launch_revision"] = providers::claude::LAUNCH_CONTRACT_REVISION.into();
             contract["resume_revision"] = providers::claude::RESUME_CONTRACT_REVISION.into();
+            contract["hook_revision"] = providers::CLAUDE_HOOK_REVISION.into();
         }
         claude["selectors"] = serde_json::json!([selector]);
         let claude = claude.to_string();
@@ -18291,6 +18292,7 @@ fn m7_claude_fixture_selector_is_isolated_from_embedded_production() {
         contract["native_policy_revision"] = "claude-native-sandbox-role-socket-v1".into();
         contract["launch_revision"] = providers::claude::LAUNCH_CONTRACT_REVISION.into();
         contract["resume_revision"] = providers::claude::RESUME_CONTRACT_REVISION.into();
+        contract["hook_revision"] = providers::CLAUDE_HOOK_REVISION.into();
     }
     claude["selectors"] = serde_json::json!([selector]);
     let fixture = BundleSet::synthetic_for_tests(
@@ -22894,7 +22896,20 @@ fn codex_unbalanced_stop_is_reconciled_then_completes_retained_setup_first_turn(
         "SELECT readiness_state FROM sessions WHERE id=(SELECT id FROM sessions LIMIT 1)",
         "idle_candidate".into(),
     );
+    let stop_rowid = fixture.scalar::<i64>("SELECT MAX(rowid) FROM hook_events");
+    for (event, payload) in [
+        ("SubagentStop", "{}"),
+        ("Notification", r#"{"notification_type":"idle_prompt"}"#),
+    ] {
+        fixture.execute(
+            "INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,payload_json,
+               peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+             VALUES(?1,?2,?3,'codex',?4,?5,?6,42,42,'peer-start','managed_process_group_untrusted_payload','2026-01-01T00:00:01Z')",
+            params![uuid::Uuid::new_v4().to_string(),context.session_id,context.role_generation_id,event,native,payload],
+        );
+    }
     let completed = app.coordinator_tick().unwrap();
+    assert_eq!(completed["stop_event_rowid"], stop_rowid);
     assert_eq!(
         completed["action"],
         "setup_retained_first_turn_stop_requested"
@@ -23023,6 +23038,20 @@ fn claude_idle_setup_first_turn_uses_provider_neutral_completion_gate() {
          VALUES(?1,?2,?3,'claude','Stop',?4,'{}',42,42,'peer-start','managed_process_group_untrusted_payload','2026-01-01T00:00:00Z')",
         params![uuid::Uuid::new_v4().to_string(),context.session_id,context.role_generation_id,native],
     );
+    let stop_rowid = fixture.scalar::<i64>("SELECT MAX(rowid) FROM hook_events");
+    // Claude 2.1.283 can report subagent shutdown and an idle notice after the
+    // safe Stop; neither is new work.
+    for (event, payload) in [
+        ("SubagentStop", "{}"),
+        ("Notification", r#"{"notification_type":"idle_prompt"}"#),
+    ] {
+        fixture.execute(
+            "INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,payload_json,
+               peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+             VALUES(?1,?2,?3,'claude',?4,?5,?6,42,42,'peer-start','managed_process_group_untrusted_payload','2026-01-01T00:00:01Z')",
+            params![uuid::Uuid::new_v4().to_string(),context.session_id,context.role_generation_id,event,native,payload],
+        );
+    }
     let app = Application::new_with_synthetic_compatibility_for_tests(
         paths.clone(),
         fixture.store.clone(),
@@ -23062,10 +23091,12 @@ fn claude_idle_setup_first_turn_uses_provider_neutral_completion_gate() {
         "UPDATE sessions SET resume_count=0 WHERE id=?1",
         params![context.session_id],
     );
+    let claimed = app.coordinator_tick().unwrap();
     assert_eq!(
-        app.coordinator_tick().unwrap()["action"],
+        claimed["action"],
         "setup_retained_first_turn_stop_requested"
     );
+    assert_eq!(claimed["stop_event_rowid"], stop_rowid);
     fixture.assert_scalar::<i64>(
         "SELECT resume_count FROM sessions WHERE id=(SELECT id FROM sessions LIMIT 1)",
         0,
@@ -28239,6 +28270,953 @@ fn t18_permission_decision_is_idempotent_one_shot_and_restart_fenced() {
     );
 }
 
+/// A running implementer whose hooks pass the trusted native-identity gate,
+/// with the managed worktree its permission requests are checked against.
+/// Returns the fixture, role context, native session and worktree path.
+fn trusted_implementer_hooks_fixture(
+    name: &str,
+    provider: Provider,
+) -> (Fixture, RoleContext, String, String) {
+    let fixture = Fixture::new(name);
+    let repository_path = fixture.repository("repository");
+    let repository = workspace::inspect(&repository_path).unwrap();
+    let workspace_path = fixture.root.join("worktree");
+    workspace::create_detached_worktree(&repository, &workspace_path, &repository.head).unwrap();
+    seed_attempt(&fixture, "implementation");
+    seed_session_for_provider(
+        &fixture,
+        "a",
+        "implementer",
+        "generation",
+        "session",
+        "running",
+        provider,
+    );
+    let native = uuid::Uuid::new_v4().to_string();
+    let connection = fixture.connection();
+    let repository_root = repository.root.to_string_lossy();
+    connection.execute(
+        "UPDATE projects SET repository_path=?1,repository_identity=?2,base_revision=?3 WHERE id='p'",
+        params![repository_root, repository.identity, repository.head],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO workspaces(id,attempt_id,repository_identity,path,base_revision,worktree_head,policy_json,state,created_at,updated_at) VALUES('workspace','a',?1,?2,?3,?3,'{}','ready','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![repository.identity, workspace_path.to_string_lossy(), repository.head],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at) VALUES('credential','generation',?1,'[\"read_context\",\"report_hook\",\"report_result\"]','2026-01-01T00:00:00Z')",
+        params![auth::hash_secret("credential")],
+    ).unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET native_session_id=?1,capability_key='policy' WHERE id='session'",
+            params![native],
+        )
+        .unwrap();
+    let context = fixture.store.role_context("credential").unwrap();
+    let workspace = workspace_path.to_string_lossy().into_owned();
+    (fixture, context, native, workspace)
+}
+
+fn try_record_trusted_hook(
+    fixture: &Fixture,
+    context: &RoleContext,
+    native: &str,
+    cwd: &str,
+    event: &str,
+    mut payload: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    payload["hook_event_name"] = serde_json::json!(event);
+    payload["session_id"] = serde_json::json!(native);
+    payload["cwd"] = serde_json::json!(cwd);
+    fixture.store.save_hook_event(
+        context,
+        &HookEnvelope {
+            provider: context.provider,
+            payload,
+        },
+        &RolePeerProvenance {
+            peer_pid: 42,
+            peer_process_group_id: 42,
+            peer_start_marker: "native-resolution-peer".into(),
+            managed_root_pid: 42,
+            managed_root_start_marker: "native-resolution-root".into(),
+            state: "managed_process_group_untrusted_payload".into(),
+        },
+    )
+}
+
+fn record_trusted_hook(
+    fixture: &Fixture,
+    context: &RoleContext,
+    native: &str,
+    cwd: &str,
+    event: &str,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    try_record_trusted_hook(fixture, context, native, cwd, event, payload).unwrap()
+}
+
+/// Records a Codex PermissionRequest hook and begins its request, as the
+/// bridge does, so the request is linked to that exact hook. Codex adds a
+/// description to the requested input that its tool hooks lack.
+fn begin_hooked_permission(
+    fixture: &Fixture,
+    context: &RoleContext,
+    native: &str,
+    workspace: &str,
+    nonce: &str,
+    command: &str,
+) -> String {
+    let payload = permission_payload(
+        native,
+        nonce,
+        serde_json::json!({"command":command,"description":"native resolution fixture"}),
+        Some(serde_json::json!(workspace)),
+    );
+    record_trusted_hook(
+        fixture,
+        context,
+        native,
+        workspace,
+        "PermissionRequest",
+        payload.clone(),
+    );
+    match agenticjira::permissions::begin_request(&fixture.store, context, &payload, "boot", nonce)
+        .unwrap()
+    {
+        agenticjira::permissions::BridgeStart::Pending { request_id } => request_id,
+        agenticjira::permissions::BridgeStart::Immediate(response) => {
+            panic!("expected a pending permission request, got {response}")
+        }
+    }
+}
+
+#[test]
+fn native_permission_resolution_requires_the_exact_in_flight_tool_call() {
+    use agenticjira::domain::PermissionNativeResolutionKind;
+    use serde_json::json;
+    let (fixture, context, native, workspace) =
+        trusted_implementer_hooks_fixture("native-permission-resolution", Provider::Codex);
+    let hook = |event: &str, payload: serde_json::Value| {
+        record_trusted_hook(&fixture, &context, &native, &workspace, event, payload)
+    };
+    let call = |id: &str, command: &str| json!({"tool_use_id":id,"tool_name":"shell","tool_input":{"command":command}});
+    let request = |nonce: &str, command: &str| {
+        begin_hooked_permission(&fixture, &context, &native, &workspace, nonce, command)
+    };
+    let observe = |request_id: &str| {
+        let state = workflow::state(&fixture.store).unwrap();
+        let request = state
+            .permission_requests
+            .iter()
+            .find(|request| request.id == request_id)
+            .unwrap()
+            .clone();
+        let listed = state
+            .attention
+            .iter()
+            .any(|item| item.id == format!("permission_request:{request_id}"));
+        (request, state.tasks[0].permission_waiting, listed)
+    };
+    let resolved_by = |response: &serde_json::Value| {
+        response["natively_resolved_permission_request_id"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    hook("SessionStart", json!({}));
+    hook("UserPromptSubmit", json!({"prompt":"implement"}));
+
+    hook("PreToolUse", call("call-1", "./gradlew build"));
+    let exact = request("exact", "./gradlew build");
+    let (pending, waiting, listed) = observe(&exact);
+    assert!(pending.actionable && pending.native_correlation_available);
+    assert_eq!(pending.native_resolution, None);
+    assert!(waiting && listed);
+
+    let terminal = hook("PostToolUse", call("call-1", "./gradlew build"));
+    assert_eq!(resolved_by(&terminal).as_deref(), Some(exact.as_str()));
+    let (resolved, waiting, listed) = observe(&exact);
+    let resolution = resolved.native_resolution.clone().unwrap();
+    assert_eq!(
+        resolution.kind,
+        PermissionNativeResolutionKind::ToolFinished
+    );
+    assert_eq!(
+        resolution.hook_event_id,
+        terminal["hook_event_id"].as_str().unwrap()
+    );
+    assert_eq!(resolution.tool_use_id, "call-1");
+    assert!(!resolved.actionable && !waiting && !listed);
+    // Native resolution never becomes an application decision or delivery.
+    assert_eq!(
+        (
+            resolved.state.as_str(),
+            resolved.decision_kind.as_deref(),
+            resolved.delivery_state.as_str(),
+            resolved.consumed_at.as_deref(),
+        ),
+        ("pending", None, "not_reserved", None)
+    );
+    let refused = workflow::execute(
+        &fixture.store,
+        &HumanCommand::DecidePermission {
+            operation_id: "decide-natively-resolved".into(),
+            request_id: exact.clone(),
+            expected_revision: resolved.revision,
+            decision: PermissionDecision::ApproveOnce,
+            lifetime: None,
+            reason: String::new(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("already answered"),
+        "{refused:#}"
+    );
+    assert_eq!(
+        resolved_by(&hook("PostToolUse", call("call-1", "./gradlew build"))),
+        None
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM permission_native_resolutions", 1_i64);
+
+    // A terminal hook for another action or an unknown call proves nothing.
+    hook("PreToolUse", call("call-2", "./gradlew test"));
+    let mismatched = request("mismatched", "./gradlew test");
+    assert_eq!(
+        resolved_by(&hook("PostToolUse", call("call-2", "./gradlew check"))),
+        None
+    );
+    assert_eq!(
+        resolved_by(&hook("PostToolUse", call("call-unknown", "./gradlew test"))),
+        None
+    );
+    assert!(observe(&mismatched).0.actionable);
+
+    // Two same-action calls in flight when the request arrived stay ambiguous.
+    hook("PreToolUse", call("call-a", "./gradlew build"));
+    hook("PreToolUse", call("call-b", "./gradlew build"));
+    let ambiguous = request("ambiguous", "./gradlew build");
+    for id in ["call-a", "call-b"] {
+        assert_eq!(
+            resolved_by(&hook("PostToolUse", call(id, "./gradlew build"))),
+            None
+        );
+    }
+    let (ambiguous, waiting, listed) = observe(&ambiguous);
+    assert!(ambiguous.actionable && waiting && listed);
+
+    // A request without its own identified hook can never be resolved natively.
+    let unlinked = begin_pending_permission(
+        &fixture,
+        &context,
+        &native,
+        "unlinked",
+        "unlinked",
+        "boot",
+        json!({"command":"./gradlew assemble"}),
+    );
+    let (unlinked, _, _) = observe(&unlinked);
+    assert!(unlinked.actionable && !unlinked.native_correlation_available);
+}
+
+#[test]
+fn native_turn_failure_is_bound_to_the_newest_accepted_turn() {
+    use serde_json::json;
+    let (fixture, context, native, workspace) =
+        trusted_implementer_hooks_fixture("native-turn-failure", Provider::Claude);
+    let hook = |event: &str, payload: serde_json::Value| {
+        record_trusted_hook(&fixture, &context, &native, &workspace, event, payload)
+    };
+    let native_turn = || {
+        workflow::state(&fixture.store)
+            .unwrap()
+            .active_sessions
+            .iter()
+            .find(|session| session["id"] == "session")
+            .unwrap()["native_turn"]
+            .clone()
+    };
+    assert!(native_turn().is_null());
+    hook("SessionStart", json!({}));
+    let first = hook("UserPromptSubmit", json!({"prompt":"implement"}));
+    let turn = native_turn();
+    assert_eq!(turn["accepted_hook_event_id"], first["hook_event_id"]);
+    assert!(turn["failure"].is_null());
+
+    let failed = hook(
+        "StopFailure",
+        json!({"error":"rate_limit","error_details":"429 Too Many Requests"}),
+    );
+    hook("StopFailure", json!({"error":"rate_limit"}));
+    let turn = native_turn();
+    assert_eq!(turn["accepted_hook_event_id"], first["hook_event_id"]);
+    assert_eq!(turn["failure"]["hook_event_id"], failed["hook_event_id"]);
+    assert_eq!(turn["failure"]["kind"], "rate_limit");
+    assert_eq!(turn["failure"]["details"], "429 Too Many Requests");
+
+    let next = hook("UserPromptSubmit", json!({"prompt":"continue"}));
+    let turn = native_turn();
+    assert_eq!(turn["accepted_hook_event_id"], next["hook_event_id"]);
+    assert!(turn["failure"].is_null());
+    // A failure hook outside the managed worktree is untrusted and never shown.
+    record_trusted_hook(
+        &fixture,
+        &context,
+        &native,
+        "/",
+        "StopFailure",
+        json!({"error":"overloaded"}),
+    );
+    assert!(native_turn()["failure"].is_null());
+
+    let unrecognized = hook("StopFailure", json!({"error":"a_future_error"}));
+    let failure = native_turn()["failure"].clone();
+    assert_eq!(failure["kind"], "unknown");
+    assert_eq!(failure["provider_error"], "a_future_error");
+    let item_id = format!(
+        "native_turn_failure:{}",
+        unrecognized["hook_event_id"].as_str().unwrap()
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    let item = state
+        .attention
+        .iter()
+        .find(|item| item.id == item_id)
+        .unwrap();
+    assert_eq!(item.action.kind, AttentionActionKind::OpenAgentOutput);
+    assert!(matches!(
+        &item.target,
+        Some(AttentionTarget::Session { session_id, .. }) if session_id == "session"
+    ));
+
+    // A later Stop shows the turn went on, so the failure no longer stands.
+    hook("Stop", json!({"background_tasks":[],"session_crons":[]}));
+    assert!(native_turn()["failure"].is_null());
+    assert!(workflow::state(&fixture.store)
+        .unwrap()
+        .attention
+        .iter()
+        .all(|item| item.id != item_id));
+}
+
+#[test]
+fn native_prompt_is_a_current_turn_output_wait_only() {
+    use serde_json::json;
+    let (fixture, context, native, workspace) =
+        trusted_implementer_hooks_fixture("native-prompt", Provider::Claude);
+    let hook = |event: &str, payload: serde_json::Value| {
+        record_trusted_hook(&fixture, &context, &native, &workspace, event, payload)
+    };
+    let notify = |kind: &str, prompt_id: &str| {
+        hook(
+            "Notification",
+            json!({"message":"Claude needs your attention","notification_type":kind,"prompt_id":prompt_id}),
+        )
+    };
+    let session = || {
+        workflow::state(&fixture.store)
+            .unwrap()
+            .active_sessions
+            .into_iter()
+            .find(|session| session["id"] == "session")
+            .unwrap()
+    };
+    hook("SessionStart", json!({}));
+    hook(
+        "UserPromptSubmit",
+        json!({"prompt":"implement","prompt_id":"turn-1"}),
+    );
+    let prompt = notify("permission_prompt", "turn-1");
+    notify("permission_prompt", "turn-1");
+    let waiting = session();
+    assert_eq!(
+        waiting["native_prompt"]["hook_event_id"],
+        prompt["hook_event_id"]
+    );
+    assert_eq!(waiting["native_prompt"]["kind"], "permission_prompt");
+    let item_id = format!(
+        "native_prompt:{}",
+        prompt["hook_event_id"].as_str().unwrap()
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    let item = state
+        .attention
+        .iter()
+        .find(|item| item.id == item_id)
+        .unwrap();
+    assert_eq!(item.action.kind, AttentionActionKind::OpenAgentOutput);
+    assert!(
+        state.permission_requests.is_empty(),
+        "no reviewable approval is created"
+    );
+
+    // A notification names no tool call, so unrelated tool or subagent
+    // activity leaves the wait standing under its first identity.
+    hook(
+        "PostToolUse",
+        json!({"tool_use_id":"parallel-call","tool_name":"Bash","tool_input":{"command":"true"}}),
+    );
+    hook("SubagentStop", json!({"agent_id":"helper"}));
+    assert_eq!(
+        session()["native_prompt"]["hook_event_id"],
+        prompt["hook_event_id"]
+    );
+    // A turn-ending hook retires it; an unsupported type announces none.
+    hook(
+        "Stop",
+        json!({"background_tasks":[],"session_crons":[],"prompt_id":"turn-1"}),
+    );
+    assert!(session()["native_prompt"].is_null());
+    notify("idle_prompt", "turn-1");
+    assert!(session()["native_prompt"].is_null());
+
+    // A newly accepted turn retires a standing wait, and a late reminder or
+    // failure of the earlier turn is never resurrected.
+    hook(
+        "UserPromptSubmit",
+        json!({"prompt":"continue","prompt_id":"turn-2"}),
+    );
+    notify("permission_prompt", "turn-2");
+    assert_eq!(session()["native_prompt"]["kind"], "permission_prompt");
+    hook(
+        "UserPromptSubmit",
+        json!({"prompt":"resume","prompt_id":"turn-3"}),
+    );
+    notify("permission_prompt", "turn-2");
+    hook(
+        "StopFailure",
+        json!({"error":"overloaded","prompt_id":"turn-2"}),
+    );
+    let late = session();
+    assert!(late["native_prompt"].is_null());
+    assert!(late["native_turn"]["failure"].is_null());
+    // A notification outside the managed worktree is untrusted.
+    record_trusted_hook(
+        &fixture,
+        &context,
+        &native,
+        "/",
+        "Notification",
+        json!({"notification_type":"agent_needs_input","prompt_id":"turn-3"}),
+    );
+    assert!(session()["native_prompt"].is_null());
+    let current = notify("elicitation_dialog", "turn-3");
+    assert_eq!(
+        session()["native_prompt"]["hook_event_id"],
+        current["hook_event_id"]
+    );
+
+    // A supported failure of the current turn and a later prompt of that same
+    // turn are separate facts: both stand while the process stays open, and
+    // neither records a verdict, completion, retry or budget change.
+    let workflow_facts = "SELECT (SELECT COUNT(*) FROM role_results)
+             ||'|'||(SELECT COUNT(*)||':'||COALESCE(SUM(spent),0) FROM review_budgets)
+             ||'|'||(SELECT COUNT(*) FROM review_requests)
+             ||'|'||(SELECT COUNT(*) FROM role_generations)||'|'||(SELECT COUNT(*) FROM sessions)
+             ||'|'||(SELECT lifecycle||':'||attention||':'||version FROM tasks WHERE id='t')
+             ||'|'||(SELECT phase||':'||status FROM attempts WHERE id='a')";
+    let before = fixture.scalar::<String>(workflow_facts);
+    let failed = hook(
+        "StopFailure",
+        json!({"error":"rate_limit","prompt_id":"turn-3"}),
+    );
+    let delayed = notify("agent_needs_input", "turn-3");
+    let both = session();
+    assert_eq!(both["status"], "running");
+    assert_eq!(
+        both["native_turn"]["failure"]["hook_event_id"],
+        failed["hook_event_id"]
+    );
+    assert_eq!(both["native_turn"]["failure"]["kind"], "rate_limit");
+    assert_eq!(
+        both["native_prompt"]["hook_event_id"],
+        delayed["hook_event_id"]
+    );
+    assert_eq!(both["native_prompt"]["kind"], "agent_needs_input");
+    let state = workflow::state(&fixture.store).unwrap();
+    for item_id in [
+        format!(
+            "native_turn_failure:{}",
+            failed["hook_event_id"].as_str().unwrap()
+        ),
+        format!(
+            "native_prompt:{}",
+            delayed["hook_event_id"].as_str().unwrap()
+        ),
+    ] {
+        let item = state
+            .attention
+            .iter()
+            .find(|item| item.id == item_id)
+            .unwrap();
+        assert_eq!(item.action.kind, AttentionActionKind::OpenAgentOutput);
+        assert!(matches!(
+            &item.target,
+            Some(AttentionTarget::Session { session_id, .. }) if session_id == "session"
+        ));
+    }
+    assert_eq!(fixture.scalar::<String>(workflow_facts), before);
+}
+
+#[test]
+fn latest_invocation_report_is_the_current_turns_own_unsuperseded_report() {
+    use serde_json::json;
+    let (fixture, context, native, workspace) =
+        trusted_implementer_hooks_fixture("latest-invocation-report", Provider::Codex);
+    let hook = |event: &str, payload: serde_json::Value| {
+        record_trusted_hook(&fixture, &context, &native, &workspace, event, payload)
+    };
+    let session = || {
+        workflow::state(&fixture.store)
+            .unwrap()
+            .active_sessions
+            .into_iter()
+            .find(|session| session["id"] == "session")
+            .unwrap()
+    };
+    let report = |id: &str, session: &str, generation: &str, outcome: &str| {
+        fixture.execute(
+            "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+             VALUES(?1,?1,?2,?3,?4,'summary','[]','{}',?5)",
+            params![id, session, generation, outcome, chrono::Utc::now().to_rfc3339()],
+        );
+    };
+    hook("SessionStart", json!({}));
+    hook("UserPromptSubmit", json!({"prompt":"implement"}));
+    assert!(session()["latest_invocation_report"].is_null());
+    assert_eq!(session()["reported_in_latest_invocation"], false);
+
+    report("candidate", "session", "generation", "candidate_ready");
+    // Another session's report and a durably superseded one never count.
+    seed_session(
+        &fixture,
+        "a",
+        "code_reviewer",
+        "reviewer-generation",
+        "reviewer-session",
+        "running",
+    );
+    report(
+        "reviewer-report",
+        "reviewer-session",
+        "reviewer-generation",
+        "approved",
+    );
+    report(
+        "superseded-question",
+        "session",
+        "generation",
+        "needs_input",
+    );
+    fixture.execute_batch(
+        "INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,
+             launch_config_json,capability_key,capability_identity_json,state,created_at,updated_at)
+         VALUES('fixture-resume','session',1,'fixture-prior-epoch','{}','policy','{}','finished',
+             '2025-01-01T00:00:00Z','2025-01-01T00:00:00Z');
+         INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,
+             detail_json,created_at)
+         VALUES('fixture-audit','fixture-audit','hook','session.resume.turn_reconciled',
+             'session','session','{}','2026-01-01T00:00:00Z');",
+    );
+    fixture.execute(
+        "INSERT INTO role_result_supersessions(role_result_id,superseding_hook_event_id,session_id,
+             role_generation_id,native_session_id,transcript_epoch,resume_invocation_id,
+             settings_revision,audit_event_id,created_at)
+         VALUES('superseded-question',(SELECT id FROM hook_events WHERE event_name='UserPromptSubmit'
+             AND session_id='session' ORDER BY rowid DESC LIMIT 1),'session','generation',?1,'e','fixture-resume',
+             1,'fixture-audit','2026-01-01T00:00:00Z')",
+        params![native],
+    );
+    let submitted = session();
+    assert_eq!(submitted["reported_in_latest_invocation"], true);
+    assert_eq!(
+        submitted["latest_invocation_report"],
+        json!({
+            "id":"candidate","outcome":"candidate_ready",
+            "created_at":fixture.scalar::<String>("SELECT created_at FROM role_results WHERE id='candidate'"),
+            "consumed_at":null
+        })
+    );
+
+    // Processing is the stored consumption fact, not acceptance.
+    fixture.execute(
+        "UPDATE role_results SET consumed_at='2026-12-01T00:00:00Z' WHERE id='candidate'",
+        [],
+    );
+    assert_eq!(
+        session()["latest_invocation_report"]["consumed_at"],
+        "2026-12-01T00:00:00Z"
+    );
+
+    // A later accepted turn is new work that has not reported yet.
+    hook("UserPromptSubmit", json!({"prompt":"address the review"}));
+    let resumed = session();
+    assert!(resumed["latest_invocation_report"].is_null());
+    assert_eq!(resumed["reported_in_latest_invocation"], false);
+}
+
+#[test]
+fn natively_resolved_request_releases_its_bridge_without_a_decision_or_delivery() {
+    use serde_json::json;
+    let (fixture, context, native, workspace) =
+        trusted_implementer_hooks_fixture("native-resolution-bridge", Provider::Codex);
+    let hook = |event: &str, payload: serde_json::Value| {
+        record_trusted_hook(&fixture, &context, &native, &workspace, event, payload)
+    };
+    let call = json!({"tool_use_id":"call-1","tool_name":"shell","tool_input":{"command":"./gradlew build"}});
+    hook("SessionStart", json!({}));
+    hook("UserPromptSubmit", json!({"prompt":"implement"}));
+    hook("PreToolUse", call.clone());
+    let request = begin_hooked_permission(
+        &fixture,
+        &context,
+        &native,
+        &workspace,
+        "bridge",
+        "./gradlew build",
+    );
+    // The app decision lands, then the provider reports the natively answered
+    // call before the bridge reserved the app's response.
+    decide_permission(
+        &fixture,
+        "approve-before-native",
+        &request,
+        PermissionDecision::ApproveOnce,
+        None,
+        "",
+    );
+    let terminal = hook("PostToolUse", call);
+    assert_eq!(
+        terminal["natively_resolved_permission_request_id"],
+        request.as_str()
+    );
+    let response = agenticjira::permissions::consume_ready_response(
+        &fixture.store,
+        &request,
+        "boot",
+        "bridge",
+        "credential",
+        &context,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(response, json!({}), "no second decision is delivered");
+    assert_eq!(
+        agenticjira::permissions::mark_response_delivered(&fixture.store, "bridge").unwrap(),
+        0
+    );
+    assert_eq!(
+        agenticjira::permissions::expire_session(&fixture.store, "session", "fixture resume")
+            .unwrap(),
+        0
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT state||':'||decision_kind||':'||delivery_state||':'||COALESCE(reserved_behavior,'-')
+                ||':'||COALESCE(consumed_at,'-')||':'||COALESCE(delivered_at,'-')
+         FROM permission_requests",
+        "approved_once:approve_once:not_reserved:-:-:-".into(),
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events
+         WHERE event_code='permission.bridge.released_after_native_resolution'",
+        1,
+    );
+}
+
+/// An implementer session whose exact resume of a rejected retained state is
+/// running. The rejection holds the task at resume_failed, an unread
+/// needs_input report predates the resume and an effective manager's proposal
+/// is bound to the held task version. Returns the fixture, current role
+/// context, native session, worktree and rejection event.
+fn resumed_after_rejection_fixture(name: &str) -> (Fixture, RoleContext, String, String, String) {
+    let (fixture, _, native, workspace) = trusted_implementer_hooks_fixture(name, Provider::Codex);
+    fixture.execute(
+        "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+         VALUES('stale-question','stale-question-report','session','generation','needs_input','Which API?','[]','{}','2026-01-01T12:00:00Z')",
+        [],
+    );
+    let rejection =
+        seed_permanent_resume_rejection(&fixture, "session", "generation", "implementer", true);
+    make_effective(&fixture, "implementer", "generation");
+    seed_session(&fixture, "a", "manager", "g-manager", "s-manager", "exited");
+    make_effective(&fixture, "manager", "g-manager");
+    let version = fixture.scalar::<i64>("SELECT version FROM tasks WHERE id='t'");
+    fixture.execute(
+        "INSERT INTO controls(id,attempt_id,role_generation_id,kind,state,expected_version,payload_json,created_at,updated_at)
+         VALUES('proposal','a','g-manager','transition_proposal','proposed',?1,?2,'2026-01-02T00:00:01Z','2026-01-02T00:00:01Z')",
+        params![
+            version,
+            serde_json::json!({
+                "expected_task_version":version,"source_phase":"implementation",
+                "plan_hash":null,"candidate_hash":null,"role_generation_id":"g-manager"
+            })
+            .to_string()
+        ],
+    );
+    fixture.execute(
+        "UPDATE sessions SET transcript_epoch='resumed-epoch',resume_count=1 WHERE id='session'",
+        [],
+    );
+    fixture.execute(
+        "INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,launch_config_json,capability_key,capability_identity_json,state,prior_transcript_epoch,hook_event_boundary_rowid,created_at,updated_at)
+         VALUES('resume','session',1,'resumed-epoch','{}','policy','{}','running','e',
+                (SELECT COALESCE(MAX(rowid),0) FROM hook_events),'2026-01-03T00:00:00Z','2026-01-03T00:00:00Z')",
+        [],
+    );
+    let context = fixture.store.role_context("credential").unwrap();
+    (fixture, context, native, workspace, rejection)
+}
+
+#[test]
+fn accepted_resume_turn_releases_only_its_own_rejection_hold() {
+    use serde_json::json;
+    let (fixture, context, native, workspace, rejection) =
+        resumed_after_rejection_fixture("resume-turn-reconciled");
+    let hook = |event: &str, payload: serde_json::Value| {
+        record_trusted_hook(&fixture, &context, &native, &workspace, event, payload)
+    };
+    let held_version = fixture.scalar::<i64>("SELECT version FROM tasks WHERE id='t'");
+    let attempt_changed_at =
+        fixture.scalar::<String>("SELECT updated_at FROM attempts WHERE id='a'");
+    hook("SessionStart", json!({}));
+    let accepted = hook("UserPromptSubmit", json!({"prompt":"continue"}));
+    let accepted_hook = accepted["hook_event_id"].as_str().unwrap();
+    let reconciliation = &accepted["resume_reconciliation"];
+    assert_eq!(reconciliation["hold_released"], true);
+    assert_eq!(reconciliation["rejection_event_ids"], json!([rejection]));
+    assert_eq!(
+        reconciliation["superseded_result_ids"],
+        json!(["stale-question"])
+    );
+    assert_eq!(reconciliation["retired_transition_proposals"], 1);
+    fixture.assert_scalar::<String>(
+        "SELECT t.attention||':'||t.version||':'||a.status||':'||a.updated_at
+         FROM tasks t JOIN attempts a ON a.task_id=t.id",
+        format!("none:{}:running:{attempt_changed_at}", held_version + 1),
+    );
+    // The report and rejection stay history; only additive provenance is new.
+    fixture.assert_scalar::<Option<String>>(
+        "SELECT consumed_at FROM role_results WHERE id='stale-question'",
+        None,
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT superseding_hook_event_id||':'||superseded_rejection_event_id||':'||resume_invocation_id
+         FROM role_result_supersessions WHERE role_result_id='stale-question'",
+        format!("{accepted_hook}:{rejection}:resume"),
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='session.resume.rejected'",
+        1,
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM controls WHERE id='proposal'",
+        "superseded".into(),
+    );
+    let content = workflow::task_content(&fixture.store, "t").unwrap();
+    let stale = content["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["id"] == "stale-question")
+        .unwrap();
+    assert_eq!(
+        stale["superseded_by_native_turn"]["hook_event_id"],
+        accepted_hook
+    );
+
+    // A blocker reported during the resumed turn is current and stays actionable.
+    fixture.execute(
+        "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+         VALUES('current-question','current-question-report','session','generation','needs_input','Which file?','[]','{}','2026-01-04T00:00:00Z')",
+        [],
+    );
+    assert!(hook("UserPromptSubmit", json!({"prompt":"again"}))["resume_reconciliation"].is_null());
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM role_result_supersessions WHERE role_result_id='current-question'",
+        0,
+    );
+}
+
+#[test]
+fn accepted_resume_turn_keeps_independent_holds_and_other_rejections() {
+    use serde_json::json;
+    let (fixture, context, native, workspace, rejection) =
+        resumed_after_rejection_fixture("resume-turn-independent-hold");
+    let hook = |event: &str, payload: serde_json::Value| {
+        record_trusted_hook(&fixture, &context, &native, &workspace, event, payload)
+    };
+    let held_version = fixture.scalar::<i64>("SELECT version FROM tasks WHERE id='t'");
+    fixture.execute(
+        "INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+         VALUES('pause','a','pause_now','requested',?1,'{}','2026-01-03T00:00:01Z','2026-01-03T00:00:01Z')",
+        params![held_version],
+    );
+    hook("SessionStart", json!({}));
+    let paused = &hook("UserPromptSubmit", json!({"prompt":"continue"}))["resume_reconciliation"];
+    assert_eq!(paused["hold_released"], false);
+    assert_eq!(paused["hold_retained_reason"], "independent_hold");
+    assert_eq!(paused["rejection_event_ids"], json!([]));
+    assert_eq!(paused["superseded_result_ids"], json!(["stale-question"]));
+    let held = format!("resume_failed:{held_version}:needs_input:proposed");
+    let hold_state = "SELECT t.attention||':'||t.version||':'||a.status||':'||c.state
+         FROM tasks t JOIN attempts a ON a.task_id=t.id JOIN controls c ON c.id='proposal'";
+    fixture.assert_scalar::<String>(hold_state, held.clone());
+    // Once the pause settles, a later accepted turn may release the same hold.
+    fixture.execute("UPDATE controls SET state='finished' WHERE id='pause'", []);
+    let released = &hook("UserPromptSubmit", json!({"prompt":"resume"}))["resume_reconciliation"];
+    assert_eq!(released["hold_released"], true);
+    assert_eq!(released["rejection_event_ids"], json!([rejection]));
+    assert_eq!(released["superseded_result_ids"], json!([]));
+
+    // Another role's rejection that still binds its own session keeps the hold.
+    let (fixture, context, native, workspace, _) =
+        resumed_after_rejection_fixture("resume-turn-other-rejection");
+    seed_session(
+        &fixture,
+        "a",
+        "code_reviewer",
+        "reviewer-generation",
+        "reviewer-session",
+        "exited",
+    );
+    seed_permanent_resume_rejection(
+        &fixture,
+        "reviewer-session",
+        "reviewer-generation",
+        "code_reviewer",
+        true,
+    );
+    let held_version = fixture.scalar::<i64>("SELECT version FROM tasks WHERE id='t'");
+    record_trusted_hook(
+        &fixture,
+        &context,
+        &native,
+        &workspace,
+        "SessionStart",
+        json!({}),
+    );
+    let retained = record_trusted_hook(
+        &fixture,
+        &context,
+        &native,
+        &workspace,
+        "UserPromptSubmit",
+        json!({"prompt":"continue"}),
+    );
+    assert_eq!(
+        retained["resume_reconciliation"]["hold_retained_reason"],
+        "other_resume_rejection"
+    );
+    fixture.assert_scalar::<String>(
+        hold_state,
+        format!("resume_failed:{held_version}:needs_input:proposed"),
+    );
+}
+
+#[test]
+fn reconciliation_requires_the_exact_rejected_state_and_effective_generation() {
+    use serde_json::json;
+    // The resume replaced a different state than the one that was rejected.
+    let (fixture, context, native, workspace, _) =
+        resumed_after_rejection_fixture("resume-turn-other-epoch");
+    fixture.execute(
+        "UPDATE resume_invocations SET prior_transcript_epoch='older-epoch' WHERE id='resume'",
+        [],
+    );
+    let held_version = fixture.scalar::<i64>("SELECT version FROM tasks WHERE id='t'");
+    record_trusted_hook(
+        &fixture,
+        &context,
+        &native,
+        &workspace,
+        "SessionStart",
+        json!({}),
+    );
+    let unmatched = record_trusted_hook(
+        &fixture,
+        &context,
+        &native,
+        &workspace,
+        "UserPromptSubmit",
+        json!({"prompt":"continue"}),
+    );
+    assert_eq!(
+        unmatched["resume_reconciliation"]["rejection_event_ids"],
+        json!([])
+    );
+    assert_eq!(unmatched["resume_reconciliation"]["hold_released"], false);
+    fixture.assert_scalar::<String>(
+        "SELECT attention||':'||version FROM tasks WHERE id='t'",
+        format!("resume_failed:{held_version}"),
+    );
+
+    // A generation that is no longer the role's effective one proves nothing.
+    let (fixture, context, native, workspace, _) =
+        resumed_after_rejection_fixture("resume-turn-not-effective");
+    fixture.execute(
+        "UPDATE role_settings SET effective_generation_id=NULL WHERE role='implementer'",
+        [],
+    );
+    record_trusted_hook(
+        &fixture,
+        &context,
+        &native,
+        &workspace,
+        "SessionStart",
+        json!({}),
+    );
+    let unbound = record_trusted_hook(
+        &fixture,
+        &context,
+        &native,
+        &workspace,
+        "UserPromptSubmit",
+        json!({"prompt":"continue"}),
+    );
+    assert!(unbound["resume_reconciliation"].is_null());
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM role_result_supersessions", 0);
+}
+
+#[test]
+fn accepted_resume_turn_reconciliation_rolls_back_with_its_hook() {
+    use serde_json::json;
+    let (fixture, context, native, workspace, _) =
+        resumed_after_rejection_fixture("resume-turn-rollback");
+    record_trusted_hook(
+        &fixture,
+        &context,
+        &native,
+        &workspace,
+        "SessionStart",
+        json!({}),
+    );
+    // Only this fixture database refuses the provenance insert, after the hold
+    // release and proposal retirement ran in the same transaction.
+    fixture.execute_batch(
+        "CREATE TRIGGER forced_supersession_failure BEFORE INSERT ON role_result_supersessions
+         BEGIN SELECT RAISE(ABORT,'forced supersession failure'); END;",
+    );
+    let observed = "SELECT t.attention||':'||t.version||':'||a.status||':'||c.state
+             ||':'||(SELECT COUNT(*) FROM hook_events)||':'||(SELECT COUNT(*) FROM audit_events)
+         FROM tasks t JOIN attempts a ON a.task_id=t.id JOIN controls c ON c.id='proposal'";
+    let before = fixture.scalar::<String>(observed);
+    let error = try_record_trusted_hook(
+        &fixture,
+        &context,
+        &native,
+        &workspace,
+        "UserPromptSubmit",
+        json!({"prompt":"continue"}),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("forced supersession failure"),
+        "{error:#}"
+    );
+    assert_eq!(fixture.scalar::<String>(observed), before);
+}
+
 #[test]
 fn t18_permission_rules_match_only_current_verified_scope_and_reservation() {
     let fixture = Fixture::new("t18-rule-scope");
@@ -31938,7 +32916,7 @@ fn mb14_stale_exit_cannot_mutate_reserved_or_running_replacement_generation() {
 }
 
 /// Tables read directly or through helper decisions by `workflow::state`.
-const STATE_PROJECTED_TABLES: [&str; 65] = [
+const STATE_PROJECTED_TABLES: [&str; 68] = [
     "attempts",
     "audit_events",
     "capabilities",
@@ -31955,6 +32933,8 @@ const STATE_PROJECTED_TABLES: [&str; 65] = [
     "instance_settings",
     "lane_generations",
     "launch_permits",
+    "permission_native_resolutions",
+    "permission_request_hooks",
     "permission_requests",
     "permission_rules",
     "project_profile_set_revisions",
@@ -31970,6 +32950,7 @@ const STATE_PROJECTED_TABLES: [&str; 65] = [
     "rework_intents",
     "role_credentials",
     "role_generations",
+    "role_result_supersessions",
     "role_results",
     "role_settings",
     "scheduler_projects",
@@ -32285,16 +33266,17 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
             .unwrap();
     }
     connection
-        .execute_batch(
-            "DROP TABLE final_repair_rechecks;
+        .execute_batch(&format!(
+            "{DROP_NATIVE_RESOLUTION_TABLES}
+         DROP TABLE final_repair_rechecks;
          DROP TABLE recipe_schedule_fires;
          DROP TABLE task_recipe_bindings;
          DROP TABLE recipe_schedules;
          DROP TABLE task_recipe_revisions;
          DROP TABLE task_recipes;
          DROP TABLE project_profile_set_revisions;
-         DROP TABLE project_profile_sets;",
-        )
+         DROP TABLE project_profile_sets;"
+        ))
         .unwrap();
     connection
         .execute_batch(
@@ -32312,7 +33294,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 32_i64);
+    fixture.assert_scalar("PRAGMA user_version", 33_i64);
     fixture.assert_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%'",
         i64::try_from(triggers.len()).unwrap(),
@@ -32332,8 +33314,9 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
     let fixture = Fixture::new("m9-schema-29");
     fixture
         .connection()
-        .execute_batch(
-            "DROP TABLE final_repair_rechecks;
+        .execute_batch(&format!(
+            "{DROP_NATIVE_RESOLUTION_TABLES}
+         DROP TABLE final_repair_rechecks;
          DROP TABLE recipe_schedule_fires;
          DROP TABLE task_recipe_bindings;
          DROP TABLE recipe_schedules;
@@ -32341,12 +33324,12 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
          DROP TABLE task_recipes;
          DROP TABLE project_profile_set_revisions;
          DROP TABLE project_profile_sets;
-         PRAGMA user_version=29;",
-        )
+         PRAGMA user_version=29;"
+        ))
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 32_i64);
+    fixture.assert_scalar("PRAGMA user_version", 33_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -36594,12 +37577,14 @@ fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordina
 #[test]
 fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
-    fixture.assert_scalar("PRAGMA user_version", 32_i64);
+    fixture.assert_scalar("PRAGMA user_version", 33_i64);
     let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
-    fixture.execute_batch("DROP TABLE final_repair_rechecks; PRAGMA user_version=30;");
+    fixture.execute_batch(&format!(
+        "{DROP_NATIVE_RESOLUTION_TABLES} DROP TABLE final_repair_rechecks; PRAGMA user_version=30;"
+    ));
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 32_i64);
+    fixture.assert_scalar("PRAGMA user_version", 33_i64);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
@@ -37367,6 +38352,8 @@ fn stale_restart_candidate_cancellation_refuses_live_sessions_and_pending_admiss
 }
 
 const MIGRATION_031_SQL: &str = include_str!("../migrations/031_final_repair_recheck.sql");
+const DROP_NATIVE_RESOLUTION_TABLES: &str = "DROP TABLE permission_native_resolutions;
+     DROP TABLE permission_request_hooks; DROP TABLE role_result_supersessions;";
 
 /// Every column a schema-31 receipt has, quoted so that NULLs compare exactly.
 const SCHEMA_31_RECEIPT_ROWS: &str = "SELECT group_concat(
@@ -37387,7 +38374,8 @@ const SCHEMA_31_RECEIPT_ROWS: &str = "SELECT group_concat(
 fn schema_31_receipt_fixture(name: &str) -> Fixture {
     let fixture = final_repair_recheck_fixture(name);
     fixture.execute_batch(&format!(
-        "DROP TABLE final_repair_rechecks; {MIGRATION_031_SQL} PRAGMA user_version=31;"
+        "{DROP_NATIVE_RESOLUTION_TABLES} DROP TABLE final_repair_rechecks; {MIGRATION_031_SQL}
+         PRAGMA user_version=31;"
     ));
     fixture.execute_batch(
         r#"INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
@@ -37462,7 +38450,7 @@ fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
     fixture.assert_scalar("PRAGMA user_version", 31_i64);
 
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 32_i64);
+    fixture.assert_scalar("PRAGMA user_version", 33_i64);
     assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(

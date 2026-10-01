@@ -15,7 +15,10 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const HOOK_REVISION: &str = "agenticjira-hook-v3-permission-events";
+pub const CODEX_HOOK_REVISION: &str = "agenticjira-hook-v3-permission-events";
+/// Claude also registers Notification, so every Claude capability proof bound
+/// to the earlier generated hook settings is superseded rather than reused.
+pub const CLAUDE_HOOK_REVISION: &str = "agenticjira-hook-v4-claude-notification";
 
 /// The narrow provider-side permissions needed for one service-owned runtime
 /// probe. These values are generated from the persisted probe row, never from
@@ -116,6 +119,7 @@ pub fn install_hook_assets(paths: &InstancePaths, executable: &Path) -> Result<H
         "PostToolUseFailure",
         "Stop",
         "StopFailure",
+        "Notification",
         "SubagentStart",
         "SubagentStop",
         "SessionEnd",
@@ -168,7 +172,7 @@ pub fn install_hook_assets(paths: &InstancePaths, executable: &Path) -> Result<H
     )?;
 
     let codex_definition = json!({
-        "revision": HOOK_REVISION,
+        "revision": CODEX_HOOK_REVISION,
         "source": "per-run command-line config",
         "command": format!("{hook_command} --event <trusted-configured-event>"),
         "events": ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "Stop", "Interrupt", "SubagentStart", "SubagentStop", "SessionEnd"],

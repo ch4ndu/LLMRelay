@@ -1,10 +1,19 @@
 import { ErrorNotice } from "./ErrorNotice";
 import { useMemo, useState } from "react";
 import { command, operationId } from "../api";
-import type { Project, Session, Task, TaskAction } from "../types";
+import {
+  type PermissionRequest,
+  type Project,
+  roleLabel,
+  type Session,
+  type Task,
+  type TaskAction,
+} from "../types";
+import { nativePromptLabel, nativeTurnFailureLabel } from "./SessionTree";
 
 export type StatusTone =
   | "neutral"
+  | "draft"
   | "active"
   | "waiting"
   | "attention"
@@ -172,7 +181,7 @@ export function taskStatus(
       }
       : {
         label: "Draft",
-        tone: "neutral",
+        tone: "draft",
         detail: "Not queued yet. Choose Make Ready when it should start.",
         completed,
       };
@@ -218,10 +227,37 @@ export function taskStatus(
     };
   }
   const attempt = task.active_attempt;
-  const startup = context.sessions?.some((session) =>
-    session.attempt_id === attempt?.id && session.status === "running" &&
-    session.readiness === "unknown"
+  const running = (context.sessions ?? []).filter((session) =>
+    session.attempt_id === attempt?.id && session.status === "running"
   );
+  const prompted = running.find((session) => session.native_prompt);
+  const promptDetail = prompted?.native_prompt &&
+    `The ${roleLabel(prompted.role)} is ${
+      nativePromptLabel[prompted.native_prompt.kind]
+    }. LLMRelay cannot answer it; open the agent's output to answer it there.`;
+  // A later prompt never hides a failed turn; it stays as a secondary detail.
+  const failed = running.find((session) => session.native_turn?.failure);
+  if (failed?.native_turn?.failure) {
+    return {
+      label: "Agent turn stopped",
+      tone: "danger",
+      detail: `The ${roleLabel(failed.role)}'s latest turn stopped because ${
+        nativeTurnFailureLabel[failed.native_turn.failure.kind]
+      }. Its session is still open. Open the agent's output to decide how to continue; nothing is retried automatically.${
+        promptDetail ? ` ${promptDetail}` : ""
+      }`,
+      completed,
+    };
+  }
+  if (promptDetail) {
+    return {
+      label: "Waiting in the agent's terminal",
+      tone: "attention",
+      detail: promptDetail,
+      completed,
+    };
+  }
+  const startup = running.some((session) => session.readiness === "unknown");
   if (startup) {
     return {
       label: "Waiting for startup",
@@ -271,13 +307,16 @@ export function StatusBadge({ status }: { status: TaskStatus }) {
 }
 
 const activeLanes = [
+  "awaiting_review",
   "backlog",
   "ready",
   "in_progress",
   "validation",
-  "awaiting_review",
 ];
 const completedLanes = ["done", "cancelled"];
+const reviewFirst = (left: Task, right: Task) =>
+  Number(right.lifecycle === "awaiting_review") -
+  Number(left.lifecycle === "awaiting_review");
 export const lifecycleLabels: Record<string, string> = {
   backlog: "Drafts",
   ready: "Ready (queued)",
@@ -350,25 +389,56 @@ function TaskActionButton(
 const actionFor = (actions: TaskAction[] | undefined, task: Task) =>
   actions?.find((action) => action.task_id === task.id);
 
+// Sits beside the host's next step so an independent hold never hides a permission wait.
+function PermissionActionButton(
+  { task, requests, action, onOpen }: {
+    task: Task;
+    requests: PermissionRequest[];
+    action?: TaskAction;
+    onOpen?: (request: PermissionRequest) => void;
+  },
+) {
+  if (!onOpen || action?.action.kind === "review_request") return null;
+  const waiting = requests.filter((request) =>
+    request.actionable && request.task_id === task.id
+  ).sort((left, right) => left.created_at.localeCompare(right.created_at));
+  const [first] = waiting;
+  if (!first) return null;
+  return (
+    <button className="task-permission-action" onClick={() => onOpen(first)}>
+      <span>Review approval request</span>
+      <small>
+        {roleLabel(first.role)} wants to use {first.tool_name}
+        {waiting.length > 1 && ` · +${waiting.length - 1} more`}
+      </small>
+      <span className="visually-hidden">: {task.title}</span>
+    </button>
+  );
+}
+
 export function TaskBoard(
   {
     tasks,
     projects,
     sessions = [],
     taskActions,
+    permissionRequests = [],
     onOpen,
     onEdit,
     onChanged,
     onTaskAction,
+    onOpenPermission,
   }: {
     tasks: Task[];
     projects: Project[];
     sessions?: Session[];
     taskActions?: TaskAction[];
+    permissionRequests?: PermissionRequest[];
     onOpen: (task: Task) => void;
     onEdit: (task: Task) => void;
     onChanged: () => void;
     onTaskAction?: (action: TaskAction) => void;
+    onOpenPermission?: (request: PermissionRequest) => void;
   },
 ) {
   const [query, setQuery] = useState("");
@@ -457,6 +527,12 @@ export function TaskBoard(
           action={actionFor(taskActions, task)}
           onAction={onTaskAction}
         />
+        <PermissionActionButton
+          task={task}
+          requests={permissionRequests}
+          action={actionFor(taskActions, task)}
+          onOpen={onOpenPermission}
+        />
         {["backlog", "ready"].includes(task.lifecycle) && (
           <div className="card-actions">
             <button
@@ -526,10 +602,14 @@ export function TaskBoard(
                 filtered.filter((task) => task.lifecycle === lane),
               );
               return (
-                <section className="lane" key={lane} aria-label={lifecycleLabels[lane]}>
+                <section
+                  className={`lane lane-${lane}`}
+                  key={lane}
+                  aria-label={lifecycleLabels[lane]}
+                >
                   <header>
                     <h2>{lifecycleLabels[lane]}</h2>
-                    <span>{items.length}</span>
+                    <span className="count">{items.length}</span>
                   </header>
                   {items.length === 0 && <p className="empty">No tasks</p>}
                   {items.map(card)}
@@ -540,7 +620,7 @@ export function TaskBoard(
         )
         : (
           <div className="task-list">
-            {sorted(filtered).map((task) => {
+            {sorted(filtered).sort(reviewFirst).map((task) => {
               const project = projectFor(task.project_id);
               const status = taskStatus(task, { project, sessions });
               return (
@@ -559,6 +639,12 @@ export function TaskBoard(
                         } from ${task.recipe_provenance.recipe_name}`}
                     </small>
                   </button>
+                  <PermissionActionButton
+                    task={task}
+                    requests={permissionRequests}
+                    action={actionFor(taskActions, task)}
+                    onOpen={onOpenPermission}
+                  />
                   {["backlog", "ready"].includes(task.lifecycle) && (
                     <div className="button-row">
                       <button onClick={() => move(task, -1)}>
@@ -589,13 +675,24 @@ export function TaskBoard(
  * of the active list so current work is easy to scan.
  */
 export function TaskSections(
-  { tasks, projects, sessions, taskActions, onOpen, onTaskAction }: {
+  {
+    tasks,
+    projects,
+    sessions,
+    taskActions,
+    permissionRequests = [],
+    onOpen,
+    onTaskAction,
+    onOpenPermission,
+  }: {
     tasks: Task[];
     projects: Project[];
     sessions: Session[];
     taskActions?: TaskAction[];
+    permissionRequests?: PermissionRequest[];
     onOpen: (task: Task) => void;
     onTaskAction?: (action: TaskAction) => void;
+    onOpenPermission?: (request: PermissionRequest) => void;
   },
 ) {
   const [section, setSection] = useState<TaskSection>(() =>
@@ -604,7 +701,7 @@ export function TaskSections(
   const visible = tasks.filter((task) => !task.archived);
   const active = visible.filter((task) => !isCompletedTask(task));
   const completed = visible.filter(isCompletedTask);
-  const shown = section === "active" ? active : completed;
+  const shown = section === "active" ? [...active].sort(reviewFirst) : completed;
   const choose = (value: TaskSection) => {
     setSection(value);
     localStorage.setItem("llmrelay.workspace.section", value);
@@ -640,6 +737,12 @@ export function TaskSections(
                 task={task}
                 action={actionFor(taskActions, task)}
                 onAction={onTaskAction}
+              />
+              <PermissionActionButton
+                task={task}
+                requests={permissionRequests}
+                action={actionFor(taskActions, task)}
+                onOpen={onOpenPermission}
               />
             </li>
           );

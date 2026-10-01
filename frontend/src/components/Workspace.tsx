@@ -10,6 +10,7 @@ import {
   type CmuxSessionSurface,
   type CmuxViewOutcome,
   type ContinuationActionKind,
+  type PermissionRequest,
   type RestartPreview,
   type RestartResumeResult,
   roleLabel,
@@ -40,6 +41,7 @@ export function Workspace(
     onOpenSetup = () => {},
     onNavigateAttention = () => undefined,
     onTaskAction,
+    onOpenPermission,
     onViewCmuxSession = async () => {
       throw new Error("persistent cmux presentation is not available");
     },
@@ -59,6 +61,7 @@ export function Workspace(
       target: AttentionTarget,
     ) => string | undefined;
     onTaskAction?: (action: TaskAction) => void;
+    onOpenPermission?: (request: PermissionRequest) => void;
     onViewCmuxSession?: (sessionId: string) => Promise<CmuxViewOutcome>;
     onSetCmuxKeyboardControl?: (
       sessionId: string,
@@ -290,8 +293,10 @@ export function Workspace(
         projects={state.projects}
         sessions={state.active_sessions}
         taskActions={state.task_actions}
+        permissionRequests={state.permission_requests}
         onOpen={onSelect}
         onTaskAction={onTaskAction}
+        onOpenPermission={onOpenPermission}
       />
       <section className="panel workspace-sessions" aria-labelledby="workspace-sessions-title">
         <header>
@@ -302,6 +307,7 @@ export function Workspace(
           empty="No agent is running right now."
           sessions={liveSessions}
           access={access}
+          permissionRequests={state.permission_requests}
           taskTitle={(session) => taskById(session.task_id)?.title}
           setupProjectId={(session) =>
             state.trip_setups?.find((setup) =>
@@ -317,6 +323,7 @@ export function Workspace(
               title="Earlier sessions"
               sessions={pastSessions}
               access={access}
+              permissionRequests={state.permission_requests}
               taskTitle={(session) => taskById(session.task_id)?.title}
               setupProjectId={(session) =>
                 state.trip_setups?.find((setup) =>

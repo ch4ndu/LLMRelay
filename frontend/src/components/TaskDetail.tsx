@@ -19,6 +19,7 @@ import {
   type CmuxKeyboardControlOutcome,
   type CmuxSessionSurface,
   type CmuxViewOutcome,
+  type PermissionRequest,
   roleLabel,
   type Role,
   type Task,
@@ -225,7 +226,8 @@ function ReportList(
   if (!content) return <p className="hint">Loading reports…</p>;
   const records = onlyLatest
     ? content.records.filter((record) =>
-      record.outcome === "needs_input" || record.outcome === "blocked"
+      (record.outcome === "needs_input" || record.outcome === "blocked") &&
+      !record.superseded_by_native_turn
     ).slice(-1)
     : [...content.records].reverse();
   if (!records.length) {
@@ -256,6 +258,13 @@ function ReportList(
               {new Date(record.created_at).toLocaleString()}
             </time>
           </header>
+          {record.superseded_by_native_turn && (
+            <small className="hint">
+              Superseded: the agent accepted a later turn on{" "}
+              {new Date(record.superseded_by_native_turn.superseded_at)
+                .toLocaleString()}, so this report no longer holds the task.
+            </small>
+          )}
           <MarkdownContent text={record.summary} />
           {record.plan && record.plan !== record.summary && (
             <details>
@@ -359,6 +368,7 @@ export function TaskDetail(
     onChanged,
     onOpenSetup = () => {},
     onTaskAction,
+    onOpenPermission,
     onViewCmuxSession = async () => {
       throw new Error("persistent cmux presentation is not available");
     },
@@ -381,6 +391,7 @@ export function TaskDetail(
     onOpenSetup?: (projectId: string) => void;
     /** Opens `itemId`, or the action's primary item, exactly. */
     onTaskAction?: (action: TaskAction, itemId?: string) => void;
+    onOpenPermission?: (request: PermissionRequest) => void;
     onViewCmuxSession?: (sessionId: string) => Promise<CmuxViewOutcome>;
     onSetCmuxKeyboardControl?: (
       sessionId: string,
@@ -406,6 +417,12 @@ export function TaskDetail(
   const nextAction = state.task_actions?.find((action) =>
     action.task_id === task.id
   );
+  const waitingPermissions = state.permission_requests.filter((request) =>
+    request.actionable && request.task_id === task.id
+  ).sort((left, right) => left.created_at.localeCompare(right.created_at));
+  const headerPermission = nextAction?.action.kind === "review_request"
+    ? undefined
+    : waitingPermissions[0];
   const tab = controlledTab ?? localTab;
   const chooseTab = (next: TaskTab) =>
     onTabChange ? onTabChange(next) : setLocalTab(next);
@@ -1129,6 +1146,7 @@ export function TaskDetail(
           empty="No agent has run for this task yet."
           sessions={taskSessions}
           access={access}
+          permissionRequests={state.permission_requests}
           taskTitle={() => undefined}
           setupProjectId={() => task.project_id}
           onOpenSetup={onOpenSetup}
@@ -1366,6 +1384,23 @@ export function TaskDetail(
                   </ul>
                 </details>
               )}
+            </div>
+          )}
+          {headerPermission && onOpenPermission && (
+            <div className="task-dialog-permission" role="status">
+              <span>
+                <strong>Waiting for your approval:</strong>{" "}
+                {roleLabel(headerPermission.role)} wants to use{" "}
+                {headerPermission.tool_name}
+                {waitingPermissions.length > 1 &&
+                  ` · ${waitingPermissions.length} requests waiting`}
+              </span>
+              <button
+                className="task-permission-action"
+                onClick={() => onOpenPermission(headerPermission)}
+              >
+                Review approval request
+              </button>
             </div>
           )}
           <PhaseProgress task={task} />

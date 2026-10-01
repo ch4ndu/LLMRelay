@@ -5,7 +5,11 @@ Status: M4A, M5, approved M4B and the M6 live-state/attention slice completed;
 M7 engineering implementation passed ordinary and fresh final review plus integrated
 verification; its engineering slice is locally packaged. M8A passed ordinary and
 fresh final review and the integrated verification matrix; local packaging is complete. M9 passed ordinary and fresh final review; local packaging is complete.
-M6 native notifications remain deferred.
+M6 native notifications are being addressed in ledger task AJ-1701EE4D,
+alongside exact resume/status reconciliation and review access/theme consistency.
+This consolidated task is in engineering review; browser/provider verification
+and the final completion gate remain pending. It does not change the historical
+managed TaskFocus attempt's acceptance state.
 Fresh-install scope supersedes historical migration work. On 2026-09-23 the user
 authorized autonomous completion of finalized in-scope plans and necessary review
 and test increases, then deferred milestones and checks requiring their intervention.

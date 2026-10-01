@@ -157,6 +157,7 @@ const MIGRATION_029: &str = include_str!("../migrations/029_state_revision.sql")
 const MIGRATION_030: &str = include_str!("../migrations/030_recipes.sql");
 const MIGRATION_031: &str = include_str!("../migrations/031_final_repair_recheck.sql");
 const MIGRATION_032: &str = include_str!("../migrations/032_normal_final_repair.sql");
+const MIGRATION_033: &str = include_str!("../migrations/033_native_resolution.sql");
 
 type CmuxRouteRow = (
     String,
@@ -1283,6 +1284,7 @@ impl Store {
                 | "PostToolUseFailure"
                 | "Stop"
                 | "StopFailure"
+                | "Notification"
                 | "Interrupt"
                 | "SubagentStart"
                 | "SubagentStop"
@@ -1326,11 +1328,12 @@ impl Store {
         if !current_invocation {
             bail!("hook credential or invocation identity is revoked, stale, or no longer running")
         }
+        let hook_event_id = uuid::Uuid::new_v4().to_string();
         transaction.execute(
             "INSERT INTO hook_events(id, session_id, role_generation_id, provider, event_name, native_session_id, payload_json,
                     peer_pid, peer_process_group_id, peer_start_marker, provenance_state, received_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![uuid::Uuid::new_v4().to_string(), context.session_id, context.role_generation_id, envelope.provider.to_string(), event_name, native_session_id,
+            params![hook_event_id, context.session_id, context.role_generation_id, envelope.provider.to_string(), event_name, native_session_id,
                 serde_json::to_string(&envelope.payload)?, provenance.peer_pid, provenance.peer_process_group_id,
                 provenance.peer_start_marker.as_str(), provenance.state.as_str(), now],
         )?;
@@ -1405,7 +1408,10 @@ impl Store {
                 };
             if let Some(submit) = submit_rowid {
                 let permission_pending: bool = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM permission_requests WHERE session_id=?1 AND state='pending')",
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM permission_requests pr WHERE pr.session_id=?1 AND {})",
+                        crate::permissions::ACTIONABLE_REQUEST_SQL
+                    ),
                     params![context.session_id],
                     |row| row.get(0),
                 )?;
@@ -1902,6 +1908,18 @@ impl Store {
         } else {
             false
         };
+        let natively_resolved_permission = match current_invocation_start_rowid {
+            Some(start) => crate::permissions::record_native_resolution(
+                &transaction,
+                context,
+                &hook_event_id,
+                hook_rowid,
+                &envelope.payload,
+                start,
+                &now,
+            )?,
+            None => None,
+        };
         let current_invocation_submit =
             event_name == "UserPromptSubmit" && current_invocation_start_rowid.is_some();
         if current_invocation_submit {
@@ -1959,6 +1977,11 @@ impl Store {
                 }
             }
         }
+        let resume_reconciliation = if current_invocation_submit {
+            reconcile_accepted_resume_turn(&transaction, context, &hook_event_id, &now)?
+        } else {
+            None
+        };
         let readiness = match event_name.as_str() {
             "SessionStart" => Some("unknown"),
             "Stop" if safe_idle_boundary => Some("idle_candidate"),
@@ -1983,6 +2006,9 @@ impl Store {
         transaction.commit()?;
         Ok(serde_json::json!({
             "recorded": true, "session_id": context.session_id, "event_name": event_name,
+            "hook_event_id": hook_event_id,
+            "natively_resolved_permission_request_id": natively_resolved_permission,
+            "resume_reconciliation": resume_reconciliation,
             "native_identity_candidate": identity_eligible,
             "native_identity_authoritative": false,
             "provenance": provenance.state.as_str(), "safe_idle_boundary": safe_idle_boundary
@@ -8915,7 +8941,7 @@ impl Store {
     }
 }
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 32;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 33;
 
 /// Reads the durable state cursor. It is committed state only when the
 /// connection is in autocommit mode.
@@ -8925,9 +8951,9 @@ pub(crate) fn read_state_revision(connection: &Connection) -> rusqlite::Result<i
         .query_row([], |row| row.get(0))
 }
 
-/// The one prior schema an existing database may be migrated from at service
+/// The prior schemas an existing database may be migrated from at service
 /// start. Every other non-current version is left unchanged and refused.
-const SERVICE_UPGRADABLE_SCHEMA_VERSION: i64 = 31;
+const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 2] = [31, 32];
 
 fn upgrade_supported_service_schema(path: &Path) -> Result<()> {
     let mut connection = Connection::open_with_flags(
@@ -8939,7 +8965,7 @@ fn upgrade_supported_service_schema(path: &Path) -> Result<()> {
     connection.pragma_update(None, "synchronous", "FULL")?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != SERVICE_UPGRADABLE_SCHEMA_VERSION {
+    if !SERVICE_UPGRADABLE_SCHEMA_VERSIONS.contains(&version) {
         return Ok(());
     }
     connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -9393,7 +9419,280 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .commit()
             .context("commit normal final-repair receipt migration")?;
     }
+    if version <= 32 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_033)?;
+        transaction.pragma_update(None, "user_version", 33)?;
+        transaction
+            .commit()
+            .context("commit native-resolution provenance migration")?;
+    }
     Ok(())
+}
+
+struct AcceptedResumeAuthority {
+    resume_invocation_id: String,
+    resume_ordinal: i64,
+    prior_transcript_epoch: Option<String>,
+    reserved_at: String,
+    native_session_id: String,
+    settings_revision: i64,
+    attempt_id: String,
+    task_id: String,
+    task_version: i64,
+    attention: String,
+    attempt_status: String,
+}
+
+/// A trusted UserPromptSubmit of an exact running resume proves the session
+/// accepted a new native turn. That supersedes the session's own earlier
+/// unconsumed blocked or needs_input reports and the resume rejection of the
+/// exact state this resume replaced; its resume_failed hold is released only
+/// when no independent hold or other still-binding rejection remains. Runs
+/// inside the hook's transaction, so a failed update or later error rolls the
+/// hook and every reconciliation write back together.
+fn reconcile_accepted_resume_turn(
+    transaction: &Transaction<'_>,
+    context: &RoleContext,
+    hook_event_id: &str,
+    now: &str,
+) -> Result<Option<serde_json::Value>> {
+    let authority = transaction
+        .query_row(
+            "SELECT ri.id,ri.resume_ordinal,ri.prior_transcript_epoch,ri.created_at,
+                    s.native_session_id,rg.config_revision,a.id,t.id,t.version,t.attention,a.status
+             FROM sessions s
+             JOIN role_generations rg ON rg.id=s.role_generation_id
+             JOIN resume_invocations ri ON ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
+             JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
+             WHERE s.id=?1 AND rg.id=?2 AND s.transcript_epoch=?3
+               AND s.status='running' AND rg.status='running' AND ri.state='running'
+               AND ri.capability_key=s.capability_key AND s.native_session_id IS NOT NULL
+               AND t.archived_at IS NULL
+               AND a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=t.id
+                         ORDER BY latest.created_at DESC LIMIT 1)
+               AND (EXISTS(SELECT 1 FROM role_settings rs WHERE rs.task_id=t.id AND rs.role=rg.role
+                             AND rs.revision=rg.config_revision AND rs.effective_generation_id=rg.id)
+                 OR (rg.role='implementer' AND rg.lane_id!='default' AND EXISTS(
+                       SELECT 1 FROM lane_generations lg
+                       WHERE lg.lane_id=rg.lane_id AND lg.effective_generation_id=rg.id)))",
+            params![
+                context.session_id,
+                context.role_generation_id,
+                context.transcript_epoch
+            ],
+            |row| {
+                Ok(AcceptedResumeAuthority {
+                    resume_invocation_id: row.get(0)?,
+                    resume_ordinal: row.get(1)?,
+                    prior_transcript_epoch: row.get(2)?,
+                    reserved_at: row.get(3)?,
+                    native_session_id: row.get(4)?,
+                    settings_revision: row.get(5)?,
+                    attempt_id: row.get(6)?,
+                    task_id: row.get(7)?,
+                    task_version: row.get(8)?,
+                    attention: row.get(9)?,
+                    attempt_status: row.get(10)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(authority) = authority else {
+        return Ok(None);
+    };
+    let superseded_results = {
+        let mut statement = transaction.prepare(
+            "SELECT rr.id FROM role_results rr
+             WHERE rr.session_id=?1 AND rr.role_generation_id=?2
+               AND rr.outcome IN ('blocked','needs_input') AND rr.consumed_at IS NULL
+               AND julianday(rr.created_at)<julianday(?3)
+               AND NOT EXISTS(SELECT 1 FROM role_result_supersessions superseded
+                              WHERE superseded.role_result_id=rr.id)
+             ORDER BY rr.rowid",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    context.session_id,
+                    context.role_generation_id,
+                    authority.reserved_at
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    // Only a rejection of the exact exited state this resume replaced counts;
+    // one already consumed by a fresh route or reconciled stays history.
+    let rejections = {
+        let mut statement = transaction.prepare(
+            "SELECT event.id FROM audit_events event
+             WHERE event.event_code='session.resume.rejected' AND event.entity_kind='session'
+               AND event.entity_id=?1
+               AND json_extract(event.detail_json,'$.role_generation_id')=?2
+               AND json_extract(event.detail_json,'$.attempt_id')=?3
+               AND json_extract(event.detail_json,'$.transcript_epoch')=?4
+               AND CAST(json_extract(event.detail_json,'$.resume_count') AS INTEGER)=?5
+               AND julianday(event.created_at)<=julianday(?6)
+               AND NOT EXISTS(SELECT 1 FROM audit_events route
+                 WHERE route.event_code='session.resume.fresh_route.reserved'
+                   AND json_extract(route.detail_json,'$.rejection_event_id')=event.id)
+               AND NOT EXISTS(SELECT 1 FROM audit_events reconciled,
+                   json_each(reconciled.detail_json,'$.rejection_event_ids') reconciled_rejection
+                 WHERE reconciled.event_code='session.resume.turn_reconciled'
+                   AND reconciled_rejection.value=event.id)
+             ORDER BY event.rowid",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    context.session_id,
+                    context.role_generation_id,
+                    authority.attempt_id,
+                    authority.prior_transcript_epoch,
+                    authority.resume_ordinal - 1,
+                    authority.reserved_at
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let retained_hold = if rejections.is_empty() || authority.attention != "resume_failed" {
+        None
+    } else if authority.attempt_status != "needs_input" {
+        Some("attempt_not_waiting_on_resume")
+    } else if transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=?1
+             AND c.kind!='transition_proposal'
+             AND c.state NOT IN ('finished','cancelled','superseded','rejected','failed','abandoned'))
+           OR EXISTS(SELECT 1 FROM restart_candidates rc WHERE rc.attempt_id=?1
+             AND rc.state NOT IN ('resumed','released_fresh_dispatch','cancelled'))
+           OR EXISTS(SELECT 1 FROM recovery_records r WHERE r.attempt_id=?1
+             AND r.state='attention_required')
+           OR EXISTS(SELECT 1 FROM rework_intents rw WHERE rw.new_attempt_id=?1
+             AND rw.state NOT IN ('completed','cancelled','failed'))
+           OR EXISTS(SELECT 1 FROM switch_intents si WHERE si.attempt_id=?1
+             AND si.state NOT IN ('completed','cancelled','superseded'))",
+        params![authority.attempt_id],
+        |row| row.get::<_, bool>(0),
+    )? {
+        Some("independent_hold")
+    } else if transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM audit_events event
+           JOIN sessions other ON other.id=event.entity_id
+           WHERE event.event_code='session.resume.rejected' AND event.entity_kind='session'
+             AND json_extract(event.detail_json,'$.attempt_id')=?1 AND other.id!=?2
+             AND other.transcript_epoch=json_extract(event.detail_json,'$.transcript_epoch')
+             AND other.resume_count=CAST(json_extract(event.detail_json,'$.resume_count') AS INTEGER)
+             AND NOT EXISTS(SELECT 1 FROM audit_events route
+               WHERE route.event_code='session.resume.fresh_route.reserved'
+                 AND json_extract(route.detail_json,'$.rejection_event_id')=event.id))",
+        params![authority.attempt_id, context.session_id],
+        |row| row.get::<_, bool>(0),
+    )? {
+        Some("other_resume_rejection")
+    } else {
+        None
+    };
+    // A rejection whose hold must stay stays unreconciled, so a later accepted
+    // turn can release it once the independent hold is gone.
+    let reconciled_rejections = if retained_hold.is_some() {
+        Vec::new()
+    } else {
+        rejections
+    };
+    let hold_released = !reconciled_rejections.is_empty() && authority.attention == "resume_failed";
+    if superseded_results.is_empty() && reconciled_rejections.is_empty() {
+        return Ok(None);
+    }
+    let mut retired_proposals = 0;
+    if hold_released {
+        if transaction.execute(
+            "UPDATE tasks SET attention='none',version=version+1,updated_at=?1
+             WHERE id=?2 AND version=?3 AND attention='resume_failed'",
+            params![now, authority.task_id, authority.task_version],
+        )? != 1
+        {
+            bail!("task changed while releasing a superseded resume failure")
+        }
+        // The attempt's change time is left alone: it anchors which reports
+        // are current and is not evidence of this recovery.
+        if transaction.execute(
+            "UPDATE attempts SET status='running' WHERE id=?1 AND status='needs_input'",
+            params![authority.attempt_id],
+        )? != 1
+        {
+            bail!("attempt changed while releasing a superseded resume failure")
+        }
+        crate::coordinator::record_hold_release(
+            transaction,
+            &authority.attempt_id,
+            "resume_failure_superseded_by_accepted_turn",
+            None,
+            now,
+        )?;
+        retired_proposals = crate::trip::retire_unmatchable_transition_proposals(
+            transaction,
+            &authority.attempt_id,
+            "resume_failure_superseded_by_accepted_turn",
+            now,
+        )?;
+    }
+    let new_version = authority.task_version + i64::from(hold_released);
+    let detail = serde_json::json!({
+        "session_id":context.session_id,
+        "role_generation_id":context.role_generation_id,
+        "native_session_id":authority.native_session_id,
+        "transcript_epoch":context.transcript_epoch,
+        "resume_invocation_id":authority.resume_invocation_id,
+        "settings_revision":authority.settings_revision,
+        "superseding_hook_event_id":hook_event_id,
+        "rejection_event_ids":reconciled_rejections,
+        "superseded_result_ids":superseded_results,
+        "hold_released":hold_released,
+        "hold_retained_reason":retained_hold,
+        "retired_transition_proposals":retired_proposals,
+        "workflow_consumption_recorded":false,
+    });
+    let audit_event_id = uuid::Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO audit_events(id,operation_id,actor_kind,actor_id,event_code,entity_kind,entity_id,old_version,new_version,detail_json,created_at)
+         VALUES(?1,?2,'hook',?3,'session.resume.turn_reconciled','session',?4,?5,?6,?7,?8)",
+        params![
+            audit_event_id,
+            uuid::Uuid::new_v4().to_string(),
+            context.role_generation_id,
+            context.session_id,
+            authority.task_version,
+            new_version,
+            detail.to_string(),
+            now
+        ],
+    )?;
+    for result_id in &superseded_results {
+        transaction.execute(
+            "INSERT INTO role_result_supersessions(role_result_id,superseding_hook_event_id,session_id,
+                 role_generation_id,native_session_id,transcript_epoch,resume_invocation_id,
+                 settings_revision,superseded_rejection_event_id,audit_event_id,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                result_id,
+                hook_event_id,
+                context.session_id,
+                context.role_generation_id,
+                authority.native_session_id,
+                context.transcript_epoch,
+                authority.resume_invocation_id,
+                authority.settings_revision,
+                reconciled_rejections.last(),
+                audit_event_id,
+                now
+            ],
+        )?;
+    }
+    Ok(Some(detail))
 }
 
 pub fn json_hash<T: Serialize>(value: &T) -> Result<String> {
@@ -9751,7 +10050,9 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
                AND NOT EXISTS(SELECT 1 FROM permission_requests permission
                  WHERE permission.session_id=bounded_turn.session_id
                    AND permission.consumed_at IS NULL
-                   AND permission.delivery_state NOT IN ('expired','not_delivered'))
+                   AND permission.delivery_state NOT IN ('expired','not_delivered')
+                   AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+                     WHERE native.permission_request_id=permission.id))
                AND NOT EXISTS(SELECT 1 FROM input_leases lease
                  WHERE lease.session_id=bounded_turn.session_id AND lease.revoked_at IS NULL
                    AND julianday(lease.expires_at)>julianday('now'))
@@ -9773,7 +10074,9 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
                  AND NOT EXISTS(SELECT 1 FROM permission_requests permission
                    WHERE permission.attempt_id=bounded_turn.attempt_id
                      AND permission.consumed_at IS NULL
-                     AND permission.delivery_state NOT IN ('expired','not_delivered'))
+                     AND permission.delivery_state NOT IN ('expired','not_delivered')
+                     AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+                       WHERE native.permission_request_id=permission.id))
                  AND NOT EXISTS(SELECT 1 FROM controls control
                    WHERE control.attempt_id=bounded_turn.attempt_id
                      AND control.state NOT IN ('finished','cancelled','superseded','rejected','failed','abandoned')
@@ -9820,60 +10123,143 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
         .map_err(Into::into)
 }
 
+/// The newest trusted Stop of the setup session's first invocation, over
+/// aliases `s` (sessions) and `rg` (role_generations).
+const SETUP_FIRST_TURN_STOP_ROWID_SQL: &str = "(SELECT MAX(stop.rowid) FROM hook_events stop
+    WHERE stop.session_id=s.id AND stop.role_generation_id=rg.id AND stop.event_name='Stop'
+      AND stop.native_session_id=s.native_session_id
+      AND stop.provenance_state='managed_process_group_untrusted_payload'
+      AND stop.rowid>s.initial_hook_event_boundary_rowid)";
+
+/// The terminal notification observed from the admitted Claude release.
+const BENIGN_TERMINAL_NOTIFICATION_TYPES: [&str; 1] = ["idle_prompt"];
+
+/// Whether every hook after a first-turn Stop is a terminal hook of that same
+/// stopped turn: a subagent shutdown or a benign notification, each from the
+/// exact generation, native session and managed process group. Any other or
+/// unclassifiable hook, a supported native prompt, or a turn failure means the
+/// turn is not over, so the stop cannot be claimed or relied on after exit.
+fn setup_first_turn_stop_has_terminal_suffix(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+    generation_id: &str,
+    native_session_id: &str,
+    stop_rowid: i64,
+) -> Result<bool> {
+    let mut statement = connection.prepare(
+        "SELECT event_name,role_generation_id,native_session_id,provenance_state,payload_json
+         FROM hook_events WHERE session_id=?1 AND rowid>?2 ORDER BY rowid",
+    )?;
+    let suffix = statement
+        .query_map(params![session_id, stop_rowid], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(suffix.iter().all(
+        |(event_name, generation, native, provenance, payload_json)| {
+            generation == generation_id
+                && native.as_deref() == Some(native_session_id)
+                && provenance == "managed_process_group_untrusted_payload"
+                && match event_name.as_str() {
+                    "SubagentStop" => true,
+                    "Notification" => serde_json::from_str::<serde_json::Value>(payload_json)
+                        .ok()
+                        .and_then(|payload| {
+                            payload
+                                .get("notification_type")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .is_some_and(|kind| {
+                            kind.parse::<crate::domain::NativePromptKind>().is_err()
+                                && BENIGN_TERMINAL_NOTIFICATION_TYPES.contains(&kind.as_str())
+                        }),
+                    _ => false,
+                }
+        },
+    ))
+}
+
 pub(crate) fn eligible_setup_retained_first_turn_stop(
     connection: &rusqlite::Connection,
     session_id: Option<&str>,
 ) -> Result<Option<SetupRetainedFirstTurnStopReceipt>> {
-    connection.query_row(
-        "SELECT s.id,rg.id,rc.id,s.transcript_epoch,s.native_session_id,s.process_identity_json,
-                (SELECT MAX(h.rowid) FROM hook_events h WHERE h.session_id=s.id),sp.id
-         FROM sessions s
-         JOIN role_generations rg ON rg.id=s.role_generation_id
-         JOIN attempts a ON a.id=rg.attempt_id
-         JOIN role_settings rs ON rs.task_id=a.task_id AND rs.role=rg.role
-           AND rs.effective_generation_id=rg.id
-         JOIN role_credentials rc ON rc.role_generation_id=rg.id AND rc.revoked_at IS NULL
-         JOIN trip_setup_permits sp ON sp.id=s.setup_permit_id
-         WHERE (?1 IS NULL OR s.id=?1)
-           AND s.status='running' AND s.readiness_state='idle_candidate'
-           AND rg.status='running' AND s.resume_count=0
-           AND s.native_session_id IS NOT NULL AND s.native_session_id!=''
-           AND s.process_identity_json IS NOT NULL AND s.process_identity_json!=''
-           AND sp.state='issued' AND sp.attempt_id=a.id AND sp.role=rg.role
-           AND sp.purpose IN ('setup_discovery','profile_probe')
-           AND rg.role!='final_verifier'
-           AND ((sp.purpose='setup_discovery' AND s.validation_cell='trip_setup_discovery')
-             OR (sp.purpose='profile_probe' AND s.validation_cell='trip_setup_probe'))
-           AND (SELECT h.event_name FROM hook_events h WHERE h.session_id=s.id
-                ORDER BY h.rowid DESC LIMIT 1)='Stop'
-           AND (SELECT h.native_session_id FROM hook_events h WHERE h.session_id=s.id
-                ORDER BY h.rowid DESC LIMIT 1)=s.native_session_id
-           AND (SELECT h.provenance_state FROM hook_events h WHERE h.session_id=s.id
-                ORDER BY h.rowid DESC LIMIT 1)='managed_process_group_untrusted_payload'
-           AND NOT EXISTS(SELECT 1 FROM role_results result
-             WHERE result.session_id=s.id AND result.role_generation_id=rg.id
-               AND result.outcome='capability_observed')
-           AND NOT EXISTS(SELECT 1 FROM permission_requests permission
-             WHERE permission.session_id=s.id AND permission.consumed_at IS NULL
-               AND permission.delivery_state NOT IN ('expired','not_delivered'))
-           AND NOT EXISTS(SELECT 1 FROM input_leases lease
-             WHERE lease.session_id=s.id AND lease.revoked_at IS NULL
-               AND julianday(lease.expires_at)>julianday('now'))
-           AND NOT EXISTS(SELECT 1 FROM guidance_messages guidance
-             WHERE guidance.role_generation_id=rg.id
-               AND guidance.state IN ('delivery_reserved','written_awaiting_submit','delivery_unknown'))
-           AND NOT EXISTS(SELECT 1 FROM controls control WHERE control.attempt_id=a.id
-             AND control.state IN ('requested','draining','held','recovery_required'))
-           AND NOT EXISTS(SELECT 1 FROM recovery_records recovery
-             WHERE recovery.session_id=s.id AND recovery.state!='resolved_quiescent')
-         ORDER BY s.updated_at,s.rowid LIMIT 1",
-        params![session_id],
-        |row| Ok(SetupRetainedFirstTurnStopReceipt {
-            session_id: row.get(0)?, generation_id: row.get(1)?, credential_id: row.get(2)?,
-            transcript_epoch: row.get(3)?, native_session_id: row.get(4)?,
-            process_identity_json: row.get(5)?, stop_rowid: row.get(6)?, setup_permit_id: row.get(7)?,
-        }),
-    ).optional().map_err(Into::into)
+    let candidates = {
+        let mut statement = connection.prepare(&format!(
+            "SELECT s.id,rg.id,rc.id,s.transcript_epoch,s.native_session_id,s.process_identity_json,
+                    {SETUP_FIRST_TURN_STOP_ROWID_SQL},sp.id
+             FROM sessions s
+             JOIN role_generations rg ON rg.id=s.role_generation_id
+             JOIN attempts a ON a.id=rg.attempt_id
+             JOIN role_settings rs ON rs.task_id=a.task_id AND rs.role=rg.role
+               AND rs.effective_generation_id=rg.id
+             JOIN role_credentials rc ON rc.role_generation_id=rg.id AND rc.revoked_at IS NULL
+             JOIN trip_setup_permits sp ON sp.id=s.setup_permit_id
+             WHERE (?1 IS NULL OR s.id=?1)
+               AND s.status='running' AND s.readiness_state='idle_candidate'
+               AND rg.status='running' AND s.resume_count=0
+               AND s.native_session_id IS NOT NULL AND s.native_session_id!=''
+               AND s.process_identity_json IS NOT NULL AND s.process_identity_json!=''
+               AND sp.state='issued' AND sp.attempt_id=a.id AND sp.role=rg.role
+               AND sp.purpose IN ('setup_discovery','profile_probe')
+               AND rg.role!='final_verifier'
+               AND ((sp.purpose='setup_discovery' AND s.validation_cell='trip_setup_discovery')
+                 OR (sp.purpose='profile_probe' AND s.validation_cell='trip_setup_probe'))
+               AND {SETUP_FIRST_TURN_STOP_ROWID_SQL} IS NOT NULL
+               AND NOT EXISTS(SELECT 1 FROM role_results result
+                 WHERE result.session_id=s.id AND result.role_generation_id=rg.id
+                   AND result.outcome='capability_observed')
+               AND NOT EXISTS(SELECT 1 FROM permission_requests permission
+                 WHERE permission.session_id=s.id AND permission.consumed_at IS NULL
+                   AND permission.delivery_state NOT IN ('expired','not_delivered')
+                   AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+                     WHERE native.permission_request_id=permission.id))
+               AND NOT EXISTS(SELECT 1 FROM input_leases lease
+                 WHERE lease.session_id=s.id AND lease.revoked_at IS NULL
+                   AND julianday(lease.expires_at)>julianday('now'))
+               AND NOT EXISTS(SELECT 1 FROM guidance_messages guidance
+                 WHERE guidance.role_generation_id=rg.id
+                   AND guidance.state IN ('delivery_reserved','written_awaiting_submit','delivery_unknown'))
+               AND NOT EXISTS(SELECT 1 FROM controls control WHERE control.attempt_id=a.id
+                 AND control.state IN ('requested','draining','held','recovery_required'))
+               AND NOT EXISTS(SELECT 1 FROM recovery_records recovery
+                 WHERE recovery.session_id=s.id AND recovery.state!='resolved_quiescent')
+             ORDER BY s.updated_at,s.rowid"
+        ))?;
+        let rows = statement
+            .query_map(params![session_id], |row| {
+                Ok(SetupRetainedFirstTurnStopReceipt {
+                    session_id: row.get(0)?,
+                    generation_id: row.get(1)?,
+                    credential_id: row.get(2)?,
+                    transcript_epoch: row.get(3)?,
+                    native_session_id: row.get(4)?,
+                    process_identity_json: row.get(5)?,
+                    stop_rowid: row.get(6)?,
+                    setup_permit_id: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for receipt in candidates {
+        if setup_first_turn_stop_has_terminal_suffix(
+            connection,
+            &receipt.session_id,
+            &receipt.generation_id,
+            &receipt.native_session_id,
+            receipt.stop_rowid,
+        )? {
+            return Ok(Some(receipt));
+        }
+    }
+    Ok(None)
 }
 
 fn setup_retained_first_turn_stop_timeout_candidate_in(
@@ -10002,7 +10388,9 @@ pub(crate) fn eligible_manager_service_stop(
                AND NOT EXISTS(SELECT 1 FROM permission_requests permission
                  WHERE permission.session_id=stopped_turn.session_id
                    AND permission.consumed_at IS NULL
-                   AND permission.delivery_state NOT IN ('expired','not_delivered'))
+                   AND permission.delivery_state NOT IN ('expired','not_delivered')
+                   AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+                     WHERE native.permission_request_id=permission.id))
                AND NOT EXISTS(SELECT 1 FROM input_leases lease
                  WHERE lease.session_id=stopped_turn.session_id AND lease.revoked_at IS NULL
                    AND julianday(lease.expires_at)>julianday('now'))
@@ -10393,8 +10781,8 @@ fn has_completed_setup_first_turn_stop_authority(
     let Some(setup_permit_id) = setup_permit_id else {
         return Ok(false);
     };
-    connection.query_row(
-        "SELECT EXISTS(SELECT 1
+    let claimed_stop: Option<(i64, String)> = connection.query_row(
+        &format!("SELECT CAST(json_extract(audit.detail_json,'$.stop_event_rowid') AS INTEGER),s.native_session_id
          FROM sessions s
          JOIN role_generations rg ON rg.id=s.role_generation_id
          JOIN trip_setup_permits sp ON sp.id=s.setup_permit_id
@@ -10414,22 +10802,27 @@ fn has_completed_setup_first_turn_stop_authority(
            AND json_extract(audit.detail_json,'$.native_session_id')=s.native_session_id
            AND json_extract(audit.detail_json,'$.process_identity_json')=s.process_identity_json
            AND json_extract(audit.detail_json,'$.setup_permit_id')=sp.id
-           AND json_extract(audit.detail_json,'$.stop_event_rowid')=(SELECT MAX(h.rowid)
-             FROM hook_events h WHERE h.session_id=s.id)
-           AND EXISTS(SELECT 1 FROM hook_events stop
-             WHERE stop.rowid=json_extract(audit.detail_json,'$.stop_event_rowid')
-               AND stop.session_id=s.id AND stop.role_generation_id=rg.id
-               AND stop.event_name='Stop' AND stop.native_session_id=s.native_session_id
-               AND stop.provenance_state='managed_process_group_untrusted_payload')
+           AND json_extract(audit.detail_json,'$.stop_event_rowid')={SETUP_FIRST_TURN_STOP_ROWID_SQL}
            AND COALESCE(json_extract(audit.detail_json,'$.resume_spent'),1)=0
            AND revoked.role_generation_id=rg.id AND revoked.revoked_at IS NOT NULL
            AND NOT EXISTS(SELECT 1 FROM role_credentials current
              WHERE current.role_generation_id=rg.id AND current.revoked_at IS NULL)
            AND NOT EXISTS(SELECT 1 FROM recovery_records recovery
-             WHERE recovery.session_id=s.id AND recovery.state!='resolved_quiescent'))",
+             WHERE recovery.session_id=s.id AND recovery.state!='resolved_quiescent')
+         ORDER BY audit.rowid DESC LIMIT 1"),
         params![session_id, role_generation_id, setup_permit_id],
-        |row| row.get(0),
-    ).map_err(Into::into)
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    let Some((stop_rowid, native_session_id)) = claimed_stop else {
+        return Ok(false);
+    };
+    setup_first_turn_stop_has_terminal_suffix(
+        connection,
+        session_id,
+        role_generation_id,
+        &native_session_id,
+        stop_rowid,
+    )
 }
 
 fn validate_typed_setup_launch(
@@ -11008,7 +11401,7 @@ mod interruption_tests {
     }
 
     #[test]
-    fn service_start_upgrades_only_schema_thirty_one_and_preserves_receipts() {
+    fn service_start_upgrades_only_schemas_thirty_one_and_thirty_two_and_preserves_receipts() {
         let root =
             std::env::temp_dir().join(format!("llmrelay-service-upgrade-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -11031,12 +11424,15 @@ mod interruption_tests {
              FROM (SELECT name, sql FROM sqlite_master ORDER BY name)";
         let version = "PRAGMA user_version";
         let current_schema = scalar(schema);
+        let drop_native_resolution = "DROP TABLE permission_native_resolutions;
+             DROP TABLE permission_request_hooks; DROP TABLE role_result_supersessions;";
         // The applied schema-31 receipt table, holding one historical receipt.
         store
             .lock()
             .unwrap()
             .execute_batch(&format!(
-                "DROP TABLE final_repair_rechecks; {MIGRATION_031} PRAGMA user_version=31;"
+                "{drop_native_resolution} DROP TABLE final_repair_rechecks; {MIGRATION_031}
+                 PRAGMA user_version=31;"
             ))
             .unwrap();
         store.lock().unwrap().execute_batch(
@@ -11113,7 +11509,7 @@ mod interruption_tests {
 
         for _ in 0..2 {
             drop(Store::open_service(&database).unwrap());
-            assert_eq!(scalar(version), "Integer(32)");
+            assert_eq!(scalar(version), "Integer(33)");
             assert_eq!(scalar(history), expected_history);
             assert_eq!(scalar(schema), current_schema);
             assert_eq!(
@@ -11124,23 +11520,33 @@ mod interruption_tests {
                 "Text(\"historical_sixth_review_recovery:none\")"
             );
         }
+        // The released schema 32 upgrades by adding only the native-resolution
+        // provenance tables.
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(&format!("{drop_native_resolution} PRAGMA user_version=32;"))
+            .unwrap();
+        drop(Store::open_service(&database).unwrap());
+        assert_eq!(scalar(version), "Integer(33)");
+        assert_eq!(scalar(history), expected_history);
+        assert_eq!(scalar(schema), current_schema);
         // An ordinary open of the current schema reopens it without migrating;
         // only a newer schema is refused as unknown.
         drop(Store::open(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(32)");
+        assert_eq!(scalar(version), "Integer(33)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         set_version(CURRENT_SCHEMA_VERSION + 1);
         let error = Store::open(&database).err().unwrap();
         assert!(
-            error.to_string().contains("database schema 33 is newer"),
+            error.to_string().contains("database schema 34 is newer"),
             "{error:#}"
         );
-        assert_eq!(scalar(version), "Integer(33)");
+        assert_eq!(scalar(version), "Integer(34)");
         assert_eq!(scalar(history), expected_history);
         set_version(CURRENT_SCHEMA_VERSION);
 
-        for unsupported in [0, 14, 29, 30, 33] {
+        for unsupported in [0, 14, 29, 30, 34] {
             set_version(unsupported);
             let error = Store::open_service(&database).err().unwrap();
             assert!(
@@ -11153,6 +11559,152 @@ mod interruption_tests {
             assert_eq!(scalar(history), expected_history);
             assert_eq!(scalar(schema), current_schema);
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn setup_first_turn_stop_binds_its_stop_and_accepts_only_a_terminal_suffix() {
+        const TRUSTED: &str = "managed_process_group_untrusted_payload";
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-setup-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&root.join("state.sqlite3")).unwrap();
+        store.lock().unwrap().execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             INSERT INTO tasks(id,project_id,title,lifecycle,created_at,updated_at)
+               VALUES('t','p','t','validation','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+               VALUES('a','t','context','planning','base',1,'held','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+               VALUES('g','a','manager','claude',1,1,'running','f','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+               VALUES('rs','t','manager',1,'{}','g','2026-01-01T00:00:00Z');
+             INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at)
+               VALUES('c','g','hash','[]','2026-01-01T00:00:00Z');
+             INSERT INTO trip_setup_permits(id,setup_operation_id,attempt_id,fixture_project_id,fixture_repository_identity,
+                 role,profile_hash,settings_revision,purpose,approved_action,state,created_at)
+               VALUES('permit','setup','a','p','identity','manager','profile',1,'profile_probe',
+                 'nonce_only_profile_invocation','issued','2026-01-01T00:00:00Z');
+             INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,
+                 native_session_id,process_identity_json,readiness_state,setup_permit_id,validation_cell,created_at,updated_at)
+               VALUES('s','g','claude','running','{}','fixture','e','native','{\"pid\":41}','idle_candidate','permit',
+                 'trip_setup_probe','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+        ).unwrap();
+        let hook = |event: &str,
+                    generation: &str,
+                    native: &str,
+                    provenance: &str,
+                    payload: &str| {
+            let connection = store.lock().unwrap();
+            connection.execute(
+                "INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,
+                   payload_json,peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+                 VALUES(?1,'s',?2,'claude',?3,?4,?5,42,42,'peer',?6,'2026-01-01T00:00:00Z')",
+                params![uuid::Uuid::new_v4().to_string(), generation, event, native, payload, provenance],
+            ).unwrap();
+            connection.last_insert_rowid()
+        };
+        let eligible =
+            || eligible_setup_retained_first_turn_stop(&store.lock().unwrap(), None).unwrap();
+        // The observed Claude 2.1.283 order: Stop, then SubagentStop, then a notification.
+        hook("PostToolUse", "g", "native", TRUSTED, "{}");
+        let stop = hook("Stop", "g", "native", TRUSTED, "{}");
+        hook("SubagentStop", "g", "native", TRUSTED, "{}");
+        hook(
+            "Notification",
+            "g",
+            "native",
+            TRUSTED,
+            r#"{"notification_type":"idle_prompt"}"#,
+        );
+        let receipt = eligible().unwrap();
+        assert_eq!(receipt.stop_rowid, stop);
+
+        for (event, generation, native, provenance, payload) in [
+            (
+                "Notification",
+                "g",
+                "native",
+                TRUSTED,
+                r#"{"notification_type":"permission_prompt"}"#,
+            ),
+            (
+                "Notification",
+                "g",
+                "native",
+                TRUSTED,
+                r#"{"notification_type":"push_notification"}"#,
+            ),
+            (
+                "Notification",
+                "g",
+                "native",
+                TRUSTED,
+                r#"{"notification_type":"agent_completed"}"#,
+            ),
+            ("Notification", "g", "native", TRUSTED, "{}"),
+            (
+                "StopFailure",
+                "g",
+                "native",
+                TRUSTED,
+                r#"{"error":"overloaded"}"#,
+            ),
+            ("UserPromptSubmit", "g", "native", TRUSTED, "{}"),
+            ("PreToolUse", "g", "native", TRUSTED, "{}"),
+            ("PermissionRequest", "g", "native", TRUSTED, "{}"),
+            ("UntrustedNativeEvent", "g", "native", TRUSTED, "{}"),
+            ("SubagentStop", "g", "other-native", TRUSTED, "{}"),
+            ("SubagentStop", "other-generation", "native", TRUSTED, "{}"),
+            ("SubagentStop", "g", "native", "unmanaged", "{}"),
+        ] {
+            let late = hook(event, generation, native, provenance, payload);
+            assert_eq!(eligible(), None, "{event} {native} {provenance} {payload}");
+            // The receipt selected before this hook arrived is stale at claim time.
+            assert_eq!(
+                store
+                    .claim_setup_retained_first_turn_stop(&receipt)
+                    .unwrap(),
+                ManagerServiceStopClaim::Stale,
+                "{event} {payload}"
+            );
+            store
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM hook_events WHERE rowid=?1", params![late])
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .claim_setup_retained_first_turn_stop(&receipt)
+                .unwrap(),
+            ManagerServiceStopClaim::Claimed
+        );
+        store.lock().unwrap().execute_batch(
+            "UPDATE sessions SET status='exited',exit_json='{\"process_group_quiescent\":true}' WHERE id='s';
+             UPDATE role_generations SET status='exited' WHERE id='g';",
+        ).unwrap();
+        let authority = || {
+            has_completed_setup_first_turn_stop_authority(
+                &store.lock().unwrap(),
+                "s",
+                "g",
+                Some("permit"),
+            )
+            .unwrap()
+        };
+        assert!(authority());
+        // Ingestion refuses the revoked credential; a row written anyway still
+        // withdraws the authority under the same suffix rule.
+        hook(
+            "Notification",
+            "g",
+            "native",
+            TRUSTED,
+            r#"{"notification_type":"agent_needs_input"}"#,
+        );
+        assert!(!authority());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 

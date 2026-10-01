@@ -616,6 +616,213 @@ One recommendation remains an explicit product decision: whether to require the
 milestone 4 migration-safety subset before starting the selected LaunchAgent
 milestone. The review does not grant that decision or authorize implementation.
 
+### September 30 Jinn runtime reference inventory
+
+This follow-up records the September 30 inventory walkthrough alongside the
+September 20 research. It uses the same pinned Jinn revision
+`62f026aa6cb740c807ac74c350a356538ba6eea8`; it does not claim to describe the
+latest release. The findings below come from source inspection, without running
+Jinn or establishing end-to-end parity. Recording them does not select, schedule,
+or authorize additional implementation.
+
+The inventory focused on Claude and Codex interactive execution, permission
+waits, turn completion, input acknowledgement, and causal regression coverage.
+LLMRelay retains its own task ledger, scheduler, provider supervision, review
+gates, and human acceptance.
+
+| Area | Observed Jinn behavior at the pinned revision | LLMRelay disposition |
+| --- | --- | --- |
+| Claude permission waits | Recognizes the structured `Notification` event with `notification_type: permission_prompt`. | Useful detection reference. Validate the exact admitted provider version and event contract; a generic notification may support an attention notice and **Open agent output**, but cannot establish a reviewable operation, approval, resolution, or execution. |
+| Native safety-dialog answers | Parses terminal questions, numbered options, and cursor position, then chooses an affirmative option and sends arrow keys and Enter. Claude safety-prompt auto-answering defaults to enabled unless explicitly configured off. | Intentional non-adoption. Preserve explicit human decisions through supported routes. Jinn's unattended responsiveness must be assessed with its default auto-answering behavior in mind. |
+| Codex approvals | Adds `--dangerously-bypass-approvals-and-sandbox` to fresh and resumed execution. | Intentional non-adoption. This is not evidence that Jinn implements an equivalent human permission inbox. Retain LLMRelay's admitted native policy, isolation, and exact capability evidence. |
+| Turn failures and process lifetime | Its turn resolver handles structured `StopFailure`, later completion evidence, and activity/grace behavior independently of a surviving PTY process. | Useful semantic distinction. Preserve exact native identity, invocation, ordering, audit, and acceptance fences. Do not transplant its timer/fallback machinery or infer completed work from an open or idle process. |
+| Input submission | Tracks submission acknowledgement and may resend Enter when acknowledgement remains unconfirmed, with a busy-work guard. | Preserve the distinction between transport delivery and native acceptance. Do not adopt automatic retries for ambiguous input or treat unrelated in-turn activity as acceptance of the exact submitted turn. |
+| Permission regression coverage | Exercises permission hook → terminal viewport interpretation → keystrokes with a fake PTY and a headless terminal. | Useful causal-test reference for the guarantee Jinn tests. It does not prove LLMRelay's live behavior or authorize a terminal parser; exercise LLMRelay's actual hook, store, projection, decision, and native-resolution path. |
+
+Pinned primary-source references:
+
+- [Claude interactive engine: notification detection, turn resolver, default
+  safety auto-answer, and input acknowledgement](https://github.com/hristo2612/jinn/blob/62f026aa6cb740c807ac74c350a356538ba6eea8/packages/jinn/src/engines/claude-interactive.ts).
+- [Claude permission-dialog parser and response helper](https://github.com/hristo2612/jinn/blob/62f026aa6cb740c807ac74c350a356538ba6eea8/packages/jinn/src/engines/claude-permission-prompt.ts).
+- [Codex fresh and retained-session launcher](https://github.com/hristo2612/jinn/blob/62f026aa6cb740c807ac74c350a356538ba6eea8/packages/jinn/src/engines/codex.ts).
+- [Codex interactive runner](https://github.com/hristo2612/jinn/blob/62f026aa6cb740c807ac74c350a356538ba6eea8/packages/jinn/src/engines/codex-interactive.ts)
+  and [rollout reader](https://github.com/hristo2612/jinn/blob/62f026aa6cb740c807ac74c350a356538ba6eea8/packages/jinn/src/engines/codex-rollout.ts).
+- [Claude interactive permission regression tests](https://github.com/hristo2612/jinn/blob/62f026aa6cb740c807ac74c350a356538ba6eea8/packages/jinn/src/engines/__tests__/claude-interactive-permission-prompt.test.ts).
+
+The [official Claude hook reference](https://code.claude.com/docs/en/hooks#notification),
+inspected during the September 30 walkthrough, supplied a narrower correction
+for network prompts: ordinary `PermissionRequest` hooks do not cover sandbox
+network approval, while terminal `Notification/permission_prompt` support for
+those requests is documented from Claude Code **2.1.246** onward. The notification
+is delayed by roughly six seconds and can be deferred by typing. This is a
+version-qualified detection candidate; it does not establish support in the
+older admitted **2.1.220** tuple, nor does a newer engineering CLI automatically
+change the application's admitted provider contract.
+
+Remaining evidence boundaries from this walkthrough:
+
+- **Plugin recommendations and onboarding:** the inspected subset did not
+  establish a general supported structured signal. Keep those cases separate
+  from a generic permission notification.
+- **Reconnect and duplicate notifications:** Jinn parity was not established.
+  Verify LLMRelay's accepted snapshots, stable request/incarnation identity,
+  actionability, and duplicate handling on its own running application.
+- **Native resolution:** generic later activity cannot resolve a particular
+  pending approval. Require an exact correlated request/tool/native event;
+  keep the app decision, response reservation, response delivery, native
+  resolution, and observed execution separate.
+- **Resume recovery and completion cleanup:** reference behavior cannot replace
+  LLMRelay's transactional authority, retained audit history, review budgets,
+  exact accepted-turn evidence, or independent pause/recovery/rework holds.
+
+The broader engine-path inventory also identifies startup, background activity,
+late recovery, races, compaction, transcript recovery, process exit, PTY
+lifecycle, and pooled/retry tests as possible future reading. Finding those paths
+is not a review of their behavior or confirmation of a current LLMRelay defect.
+The delivered comparison and supported/unsupported signal dispositions belong
+in the [permission and provider signal matrix](PERMISSION_SIGNAL_MATRIX.md);
+that matrix must continue to distinguish source/test evidence from actual live
+provider and dashboard verification.
+
+### September 30 hardening-first Jinn comparison (latest release)
+
+**Status: research-backed candidates agreed by two independent reviewers; not
+selected, scheduled, or authorized for implementation.**
+
+This pass compared the latest Jinn release, `main` at
+`3ae6465715b6195db057d4c23156b696c71dc179` (v0.33.4, September 27, 2026), with
+the current LLMRelay tree. It covered Jinn's engines, sessions, work items,
+gateway, workflows and web dashboard, and its changelog's fix entries as a
+catalogue of real bug classes. It was then checked against the open rows in the
+AJ-1701EE4D issue reconciliation. The user asked for hardening before new
+features because the application is currently unstable.
+
+Two reviewers worked read-only: Claude Opus 5.5 and an independent Claude Fable
+5.1 (high effort) session. Fable explored first without seeing the Opus list,
+then critiqued it. They reached consensus after one review round. Every LLMRelay
+claim below was verified in source; line numbers refer to the tree at the time
+of review.
+
+Between the pinned `62f026aa` revision used above and `3ae6465`, Jinn's runtime
+source changed in one line: `shared/engine-failure.ts` now classifies Codex's
+"selected model is at capacity" error as a provider outage. That is the open
+"Codex model capacity error remains busy" row. The pinned analyses therefore
+describe current Jinn source.
+
+#### Corrections to the September 30 runtime inventory
+
+- The admitted Claude Code version is **2.1.283**
+  (`resources/provider-compatibility/claude.json`), not 2.1.220; 2.1.220 is the
+  version Jinn characterized. Because 2.1.283 is above 2.1.246, the documented
+  network-prompt `Notification` is in scope for the admitted version, subject
+  to live verification.
+- The inventory rejected input resubmission but missed its root cause. Claude
+  Code's terminal treats a leading `/`, `@` or `!` in pasted text as a command,
+  mention or shell mode. It also auto-attaches a bare image path and discards
+  keystrokes, including the submitting Enter, while it encodes the image.
+- It did not check the current tree for the `StopFailure` readiness wedge (H2).
+
+#### Agreed hardening list
+
+**P0**
+
+| # | Item | LLMRelay evidence | Jinn reference |
+| --- | --- | --- | --- |
+| H1 | Contain coordinator tick failures to the attempt or session that caused them and record a durable hold for that subject. Replace substring matching on formatted errors with typed error classification. Preserve one committed action per tick. | `src/coordinator.rs:15-27, 148-180` return out of `tick` on any unclassified attempt error, skipping later attempts and the scheduler claim every second. `src/supervisor.rs:970-976` fails reconciliation for every handle when process inventory fails. | `work-items/recovery-controller.ts:127-150`, `gateway/status-reconciler.ts:96-108` |
+| H2 | After a trusted `StopFailure` for the current accepted turn, apply the existing safe-idle-boundary predicate and record a distinct idle-after-failure readiness. Guidance delivery, manager proposals and review eligibility accept it; any later trusted hook supersedes it. No timer, fallback or fabricated result. | `src/store.rs:1984-1992` maps `StopFailure` to `busy`. Guidance (`src/roles.rs:888-890`), manager transition proposals (`src/coordinator.rs:3897-3925`) and review eligibility (`src/review.rs:169`) require `idle_candidate`. Claude emits no `Stop` after non-retrying failures, so the only exit is kill and resume. | `engines/claude-interactive.ts:455-617, 1460-1464` |
+
+**P1**
+
+| # | Item | LLMRelay evidence | Jinn reference |
+| --- | --- | --- | --- |
+| H3 | Classify-only liveness and anomaly sweep that writes one durable attention item per entity and kind and never settles, stops or retries. Kinds: process live without an accepted turn; stalled turn (elapsed and quiet, confirmed on two sweeps; a pending permission prompt is not work); attempt without a live session; guidance `written_awaiting_submit` beyond a bound; permission pending on an exited session; `resume_failed` despite a later accepted turn; `busy` readiness with an exited process. | Session `running` means process alive (`src/store.rs:3138-3152`); `TaskProgress.activity` is presentation only (`src/workflow.rs:6567-6571`). | `work-items/anomaly-detect.ts:10-114`, `gateway/status-reconciler.ts:7-108`, `engines/claude-interactive.ts:641-676` |
+| H4 | Failure-kind holds. Rate limit or overload: clock hold until the provider-stated reset, or a bounded default. Authentication, billing or account state: human hold naming the required action. No model fallback; a human resume overrides. | `NativeTurnFailureKind` (`src/domain.rs:1686-1719`) has no consumer in dispatch, auto-resume (`src/operations.rs:707-775`) or guidance/rework retry (`src/coordinator.rs:3927, 4299`). | `work-items/respawn-guards.ts:93-120`, `work-items/availability-resume.ts`, `shared/engine-failure.ts`, `work-items/stop-cause.ts` |
+| H5 | Neutralize paste triggers (leading `/`, `@`, `!` and bare image paths) in the guidance body **before it is stored**, so the submit match still compares like with like. | Raw body pasted, then one Enter after 100 ms (`src/roles.rs:1036-1045`); stored at `src/workflow.rs:2906`; submit match `src/store.rs:1951-1955`. | `shared/skill-commands.ts:30-37`, `engines/claude-interactive.ts:789-835` |
+| H6 | Durable "input written, not accepted" fact per resume invocation, surfaced after a bound. Report only; never resend input. | Acceptance is the trusted `UserPromptSubmit` (`src/domain.rs:1620-1629`); the keyboard lease is released immediately after the Enter (`src/roles.rs:1047-1049`). | `engines/claude-interactive.ts:679-683, 767-787` (report-only half) |
+| H7 | Per-instance session cookie name. | Fixed `agenticjira_session` (`src/server.rs:743, 1411`). Cookies ignore port, so isolated verification services on 127.0.0.1 sign the main dashboard out. | `gateway/auth.ts:285-312` |
+| H8 | React error boundary around the dashboard shell. | None in `frontend/src`; one render error unmounts the only operator surface. | Route-failure recovery, `CHANGELOG.md` 0.23.2 and 0.33.2 |
+| H9 | Fake-provider PTY regression harness: drops the first Enter, emits `StopFailure` without `Stop`, never stops, emits `permission_prompt`. Also confirm whether Claude 2.1.283 still drops the Enter on an image path. | Current fixtures are synthetic compatibility bundles and hook CLI calls (`tests/contracts.rs`, `tests/runtime.rs`). | `engines/__tests__/` permission-prompt, grace and late-recovery tests |
+| H10 | Restart resume states that the host, not the user, interrupted the session and instructs the agent to re-verify any in-flight command before repeating it. | Role restart resume re-sends the persisted original invocation prompt (`src/operations.rs` role resume path) with no restart wording. | `sessions/restart-resume.ts:118-124` |
+
+**P2**
+
+- **H11.** Delay the `StopFailure` attention item for kinds the CLI normally
+  retries (`server_error`, `invalid_request`, `unknown`), so it does not flap
+  before a superseding `Stop` (`src/workflow.rs:5345-5350, 7240-7280`; Jinn
+  `engines/claude-interactive.ts:455-459, 509-513`).
+- **H12.** Retire a `permission_prompt` notice only on the exact correlated
+  native resolution from migration 033 (`src/workflow.rs:5448-5451`).
+- **H13.** Set `busy_timeout` before WAL and DDL on the fresh-database open path
+  (`src/store.rs:900-908`).
+- **H14.** Audit `consume_blocked_result`, `eligible_progress_result` and
+  `eligible_review_result` (`src/coordinator.rs`) for ordering against the
+  latest human control. Add a causal floor only where missing; most
+  human-decision precedence already exists.
+- **H15.** Bounded counter for recurring same-kind blocked or needs-input
+  reports from the same role, routing to attention (Jinn `work-items/blocks.ts`).
+- **H16.** Classify the Codex capacity error only if a live check shows Codex
+  session history records it as a structured event; attention text only. Codex
+  registers no failure hook (`src/providers/codex.rs:163-173`).
+
+#### User decision required
+
+- **Fail-closed restore point and free-space preflight before the serve-path
+  schema upgrade.** `upgrade_supported_service_schema` (`src/store.rs:8955-8972`)
+  migrates the live database from schema 31 or 32 without a restore point;
+  `require_capacity` is used only by backup and restore (`src/database.rs`).
+  [Next milestone plan](NEXT_MILESTONE_PLAN.md) records that automatic
+  pre-migration backup orchestration was removed from scope. Both reviewers
+  recommend approving it: it reuses the existing verified online backup
+  (`src/database.rs:203-270`) and, unlike Jinn's warn-only copy
+  (`shared/db.ts:29-96`), must fail closed.
+
+#### Documentation corrections
+
+- Sept 30 runtime inventory: admitted Claude Code version 2.1.220 → 2.1.283.
+- [Signal matrix](PERMISSION_SIGNAL_MATRIX.md): the Jinn link points at
+  `jinn-network/jinn` (404); use `hristo2612/jinn`.
+- [Operations](OPERATIONS.md) documents a 31 → 32 upgrade; the code upgrades
+  31 or 32 to 33.
+- [README](../README.md) names Codex 0.155.1; the matrix names 0.157.1.
+- Milestone 4 "complete" wording should state that automatic pre-migration
+  restore points were removed by the scope correction.
+
+#### Features after hardening
+
+- Opt-in, audited reminder (at most two, never for the final verifier) when a
+  role's turn ends without a role report (Jinn `sessions/stop-nudge.ts`).
+- Scheduled in-service verified backup; restore remains offline CLI-only.
+- Usage and limit display plus per-turn token accounting, presentation only.
+- Per-attempt handoff fields in role reports (changed files, verification,
+  retry notes, residual risk) fed into rework prompts (Jinn `work-items/runs.ts`).
+- Edit or cancel queued guidance.
+- Task comments and a unified activity stream.
+- Drafts that survive a reload without erasing newer edits.
+- Command-palette search over tasks with FTS5, treating user input as literal
+  phrases.
+
+#### Already present; do not re-propose
+
+Child environment allowlist (`src/providers/mod.rs:48-87`); diagnostic log
+rotation and retention (`src/diagnostics.rs:118-155`); transcript bounds;
+owner-only file modes; exact Host/Origin checks and constant-time token
+comparison (`src/server.rs:1368-1402`, `src/auth.rs:20`); loopback-only bind;
+embedded dashboard assets; control-message and input-write size caps;
+verified backup and restore; post-commit revision notification; operation
+idempotency receipts; atomic scheduler claims; exactly-once restart admission;
+interrupt deadlines with exact-process verification; refusal of exact resume
+when native history is missing; long-poll reconnect backoff.
+
+#### Additional ideas not adopted
+
+These extend [Ideas intentionally not adopted](#ideas-intentionally-not-adopted):
+resending Enter until acknowledged; auto-settling stalled turns or recovering
+completion text from transcripts; model or engine fallback chains; wall-clock
+expiring claim leases; automatic recovery mode; deriving task status from
+session liveness; warn-only pre-migration copies; a detached restart helper;
+inferring Codex completion from a quiet session-history tail; approval gates
+that any agent holding the service credential can pass.
+
 ## Related documentation
 
 - [Current usage](../README.md)

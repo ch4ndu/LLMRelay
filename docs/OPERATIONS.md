@@ -536,3 +536,13 @@ Created tasks retain their provenance and ordinary authority checks.
 ### Sessions waiting at startup
 
 A running provider process is not proof that work has begun. The session card shows **Waiting for startup** while its current readiness is unknown, including after a retained resume. Choose **View output** to inspect a possible native startup prompt, then **Take keyboard control** if it needs an answer. If Codex displays **Hooks need review**, inspect the listed hooks before deciding whether to trust them. Choose **Release keyboard control** afterward so automatic work can continue. The notice clears when current readiness is reported or the process exits; it does not infer a particular prompt from terminal text or authorize hook trust. Process, launch, readiness, and capture diagnostics remain under **Technical details**.
+
+## Permission notices and appearance
+
+The dashboard lists current waits in **Waiting for you now**. A managed approval opens the exact request in Approvals; a provider-native prompt or turn failure opens the exact agent output. An independent task hold remains visible alongside an approval. A failed or uncertain approval response requests fresh state and is never automatically resent.
+
+Choose **Enable browser notifications** to enable alerts for this dashboard visit and request browser permission if needed. Previously granted site permission does not enable app alerts by itself. New waits may notify while the dashboard is unfocused; denied or unavailable browser support leaves the in-app notice available. Initial and reset snapshots list current waits without replaying historical alerts. An alert is navigation, never permission or proof of provider execution. External Codex completion watchers are separate local engineering tooling.
+
+Session Access keeps **Session open**, native accepted-turn evidence and report submission separate. An implementation report awaits processing or verification; neither label means the task is accepted. A later accepted turn can make that report historical. For native dialogs without a supported signal, use **View output** and explicit keyboard control; the app does not guess from terminal text. See the [signal matrix](PERMISSION_SIGNAL_MATRIX.md).
+
+The sidebar **Appearance** selector offers System, Light and Dark. An explicit choice overrides the operating-system preference and is stored for this browser origin. System follows the operating-system preference; unavailable or invalid preference storage falls back to System.

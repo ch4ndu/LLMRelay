@@ -31,10 +31,10 @@ function unresolvedTarget(
     const request = state.permission_requests.find((candidate) =>
       candidate.id === target.request_id
     );
-    return request?.state === "pending" &&
+    return request?.actionable &&
         request.revision === target.request_revision
       ? undefined
-      : "the permission request was already decided or changed.";
+      : "the permission request was already decided, answered in the agent, or changed.";
   }
   if (target.kind === "diagnostics") return undefined;
   if (target.kind === "project_setup") {
@@ -390,8 +390,9 @@ export function guidanceState(state: string): string {
     case "delivery_reserved":
       return "Waiting for the manager to pause";
     case "written_awaiting_submit":
+      return "Typed into the manager's input; not submitted yet";
     case "submitted":
-      return "Sent to the manager";
+      return "Sent to the manager; not yet confirmed as accepted";
     case "acknowledged":
       return "Received by the manager";
     case "delivery_unknown":

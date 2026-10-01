@@ -2,7 +2,7 @@
   "schema": 1,
   "provider": "claude",
   "pack_id": "llmrelay-claude-compatibility",
-  "pack_revision": "2",
+  "pack_revision": "3",
   "description": "Embedded Claude Code 2.1.283 compatibility candidates.",
   "selectors": [
     {
@@ -16,7 +16,7 @@
           "launch_revision": "llmrelay-claude-launch-v2",
           "resume_revision": "llmrelay-claude-resume-v2",
           "native_policy_revision": "claude-native-sandbox-role-socket-v1",
-          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "hook_revision": "agenticjira-hook-v4-claude-notification",
           "credential_revision": "llmrelay-local-credential-v1",
           "evidence_revision": "llmrelay-capability-proof-v1",
           "required_evidence": [
@@ -33,7 +33,7 @@
           "launch_revision": "llmrelay-claude-launch-v2",
           "resume_revision": "llmrelay-claude-resume-v2",
           "native_policy_revision": "claude-native-sandbox-role-socket-v1",
-          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "hook_revision": "agenticjira-hook-v4-claude-notification",
           "credential_revision": "llmrelay-local-credential-v1",
           "evidence_revision": "llmrelay-capability-proof-v1",
           "required_evidence": [
@@ -50,7 +50,7 @@
           "launch_revision": "llmrelay-claude-launch-v2",
           "resume_revision": "llmrelay-claude-resume-v2",
           "native_policy_revision": "claude-native-sandbox-role-socket-v1",
-          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "hook_revision": "agenticjira-hook-v4-claude-notification",
           "credential_revision": "llmrelay-local-credential-v1",
           "evidence_revision": "llmrelay-capability-proof-v1",
           "required_evidence": [
@@ -67,7 +67,7 @@
           "launch_revision": "llmrelay-claude-launch-v2",
           "resume_revision": "llmrelay-claude-resume-v2",
           "native_policy_revision": "claude-native-sandbox-role-socket-v1",
-          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "hook_revision": "agenticjira-hook-v4-claude-notification",
           "credential_revision": "llmrelay-local-credential-v1",
           "evidence_revision": "llmrelay-capability-proof-v1",
           "required_evidence": [
@@ -84,7 +84,7 @@
           "launch_revision": "llmrelay-claude-launch-v2",
           "resume_revision": "llmrelay-claude-resume-v2",
           "native_policy_revision": "claude-native-sandbox-role-socket-v1",
-          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "hook_revision": "agenticjira-hook-v4-claude-notification",
           "credential_revision": "llmrelay-local-credential-v1",
           "evidence_revision": "llmrelay-capability-proof-v1",
           "required_evidence": [
@@ -101,7 +101,7 @@
           "launch_revision": "llmrelay-claude-launch-v2",
           "resume_revision": "llmrelay-claude-resume-v2",
           "native_policy_revision": "claude-native-sandbox-role-socket-v1",
-          "hook_revision": "agenticjira-hook-v3-permission-events",
+          "hook_revision": "agenticjira-hook-v4-claude-notification",
           "credential_revision": "llmrelay-local-credential-v1",
           "evidence_revision": "llmrelay-capability-proof-v1",
           "required_evidence": [

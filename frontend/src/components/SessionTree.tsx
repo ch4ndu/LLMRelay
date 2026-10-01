@@ -15,6 +15,9 @@ import {
   type CmuxKeyboardControlOutcome,
   type CmuxSessionSurface,
   type CmuxViewOutcome,
+  type NativePrompt,
+  type NativeTurnFailureKind,
+  type PermissionRequest,
   roleLabel,
   type Session,
 } from "../types";
@@ -249,12 +252,64 @@ export function useSessionAccess(
   return { routes, discarding, routeFor, view, take, release, discard, close };
 }
 
+export const nativeTurnFailureLabel: Record<NativeTurnFailureKind, string> = {
+  authentication_failed: "sign-in failed",
+  oauth_org_not_allowed: "this sign-in's organization is not allowed",
+  account_on_hold: "the account is on hold",
+  verification_required: "the account needs verification",
+  billing_error: "a billing problem",
+  rate_limit: "a rate limit was reached",
+  overloaded: "the model is overloaded or at capacity",
+  invalid_request: "the provider rejected the request",
+  model_not_found: "the model is not available",
+  server_error: "a provider server error",
+  max_output_tokens: "the output limit was reached",
+  cloud_credential_error: "a cloud credential problem",
+  unknown: "an unrecognized provider error",
+};
+
+export const nativePromptLabel: Record<NativePrompt["kind"], string> = {
+  permission_prompt: "asking for permission in its own terminal",
+  elicitation_dialog: "showing a question in its own terminal",
+  elicitation_url_dialog: "asking you to open a link in its own terminal",
+  agent_needs_input: "waiting for your input in its own terminal",
+};
+
+const reportSupersededByTurn = (session: Session) => {
+  const report = session.latest_invocation_report;
+  const acceptedAt = session.native_turn?.accepted_at;
+  return !!report && !!acceptedAt &&
+    Date.parse(acceptedAt) > Date.parse(report.created_at);
+};
+
+// A report only describes the session until a newer accepted turn moves past it.
+function currentReportLabel(session: Session): string | undefined {
+  const report = session.latest_invocation_report;
+  if (!report) {
+    return session.reported_in_latest_invocation === true ||
+        session.reported_in_latest_invocation === 1
+      ? "Report submitted"
+      : undefined;
+  }
+  if (reportSupersededByTurn(session)) return undefined;
+  if (report.outcome !== "candidate_ready") return "Report submitted";
+  return report.consumed_at
+    ? "Implementation submitted — awaiting verification"
+    : "Implementation submitted — awaiting processing";
+}
+
 /** Plain state of one agent session, never a raw process enum. */
-export function sessionStateLabel(session: Session): string {
+export function sessionStateLabel(
+  session: Session,
+  awaitingApproval = false,
+): string {
   if (session.status === "running") {
     if (session.readiness === "unknown") return "Waiting for startup";
+    if (awaitingApproval) return "Waiting for your approval";
+    if (session.native_turn?.failure) return "Turn stopped with an error";
+    if (session.native_prompt) return "Waiting in its own terminal";
     if (session.input_control) return "You have keyboard control";
-    return "Running";
+    return currentReportLabel(session) ?? "Running";
   }
   switch (session.status) {
     case "launch_reserved":
@@ -266,10 +321,7 @@ export function sessionStateLabel(session: Session): string {
     case "launch_failed":
       return "Could not start";
     case "exited":
-      return session.reported_in_latest_invocation === true ||
-          session.reported_in_latest_invocation === 1
-        ? "Finished its turn"
-        : "Stopped";
+      return currentReportLabel(session) ? "Finished its turn" : "Stopped";
     default:
       return session.status.replaceAll("_", " ");
   }
@@ -348,6 +400,7 @@ export function SessionTree(
   {
     sessions,
     access,
+    permissionRequests = [],
     taskTitle = () => undefined,
     setupProjectId,
     onOpenSetup,
@@ -356,6 +409,7 @@ export function SessionTree(
   }: {
     sessions: Session[];
     access: SessionAccess;
+    permissionRequests?: PermissionRequest[];
     taskTitle?: (session: Session) => string | undefined;
     setupProjectId: (session: Session) => string | undefined;
     onOpenSetup: (projectId: string) => void;
@@ -406,7 +460,12 @@ export function SessionTree(
         // recorded output before it examines any stale presentation row.
         const canTake = running && actionability.takeAvailable;
         const canRelease = running && actionability.releaseAvailable;
-        const state = sessionStateLabel(session);
+        const awaitingApproval = permissionRequests.some((request) =>
+          request.actionable && request.session_id === session.id
+        );
+        const failure = session.native_turn?.failure;
+        const acceptedAt = session.native_turn?.accepted_at;
+        const state = sessionStateLabel(session, awaitingApproval);
         const owner = session.setup_operation_id
           ? "Project setup"
           : taskTitle(session);
@@ -424,7 +483,69 @@ export function SessionTree(
               <small>
                 {owner ? `${owner} · ` : ""}
                 {session.provider === "claude" ? "Claude" : "Codex"}
+                {running && " · Session open"}
+                {running && acceptedAt &&
+                  ` · Latest turn accepted by the agent ${
+                    new Date(acceptedAt).toLocaleString()
+                  }`}
               </small>
+              {awaitingApproval && running && (
+                <small className="warning">
+                  Waiting for your approval. Open Approvals to review the
+                  request.
+                </small>
+              )}
+              {running && !awaitingApproval && currentReportLabel(session) &&
+                !failure && (
+                <small>
+                  It submitted its report in this run and the session is still
+                  open. LLMRelay processes the report and verifies the work
+                  separately; this does not mean the task is complete.
+                </small>
+              )}
+              {reportSupersededByTurn(session) && session.latest_invocation_report && (
+                <small>
+                  Its report from{" "}
+                  {new Date(session.latest_invocation_report.created_at)
+                    .toLocaleString()} is history: the agent accepted a newer
+                  turn after it.
+                </small>
+              )}
+              {failure && (
+                <div className="session-turn-failure" role="status">
+                  <strong>
+                    Its latest turn stopped: {nativeTurnFailureLabel[failure.kind]}
+                  </strong>
+                  <p>{failure.provider_error}</p>
+                  <p>
+                    {running ? "The session is still open. " : ""}Choose View
+                    output to see the agent's terminal and decide how to
+                    continue. LLMRelay does not retry the turn or switch models
+                    automatically.
+                  </p>
+                  <TechnicalDetails>
+                    <p>
+                      {failure.kind} · observed{" "}
+                      {new Date(failure.observed_at).toLocaleString()} · hook
+                      event {failure.hook_event_id}
+                    </p>
+                    {failure.details && <pre>{failure.details}</pre>}
+                  </TechnicalDetails>
+                </div>
+              )}
+              {running && session.native_prompt && (
+                <div className="session-native-prompt warning" role="status">
+                  <strong>
+                    The agent is{" "}
+                    {nativePromptLabel[session.native_prompt.kind]}
+                  </strong>
+                  <p>
+                    LLMRelay cannot answer this prompt. Choose View output, then
+                    Take control to answer it in the agent's terminal, and
+                    Release control when you are done.
+                  </p>
+                </div>
+              )}
               {waitingForStartup && (
                 <div className="session-startup-notice warning" role="status">
                   <strong>Waiting for the coding tool to become ready</strong>
@@ -503,6 +624,12 @@ export function SessionTree(
                     ? `; workflow ${session.workflow_version}`
                     : ""}
                   {session.lane_id ? `; lane ${session.lane_id}` : ""}
+                  {session.native_turn?.accepted_hook_event_id
+                    ? `; accepted turn hook ${session.native_turn.accepted_hook_event_id}`
+                    : ""}
+                  {session.native_prompt
+                    ? `; native prompt ${session.native_prompt.kind} hook ${session.native_prompt.hook_event_id}`
+                    : ""}
                 </p>
                 {surface && (
                   <p>

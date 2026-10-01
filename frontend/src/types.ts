@@ -630,6 +630,28 @@ export interface Task {
   review_budgets: ReviewBudget[];
   legacy: Record<string, unknown>;
 }
+export type NativeTurnFailureKind =
+  | "authentication_failed" | "oauth_org_not_allowed" | "account_on_hold"
+  | "verification_required" | "billing_error" | "rate_limit" | "overloaded"
+  | "invalid_request" | "model_not_found" | "server_error" | "max_output_tokens"
+  | "cloud_credential_error" | "unknown";
+export interface NativeTurnFailure {
+  hook_event_id: string;
+  kind: NativeTurnFailureKind;
+  provider_error: string;
+  details: string | null;
+  observed_at: string;
+}
+export interface NativeTurn {
+  accepted_hook_event_id: string | null;
+  accepted_at: string | null;
+  failure: NativeTurnFailure | null;
+}
+export interface NativePrompt {
+  hook_event_id: string;
+  kind: "permission_prompt" | "elicitation_dialog" | "elicitation_url_dialog" | "agent_needs_input";
+  observed_at: string;
+}
 export interface Session {
   id: string;
   role_generation_id: string;
@@ -673,6 +695,14 @@ export interface Session {
   };
   /** Whether the session reported its result in its latest run. */
   reported_in_latest_invocation?: boolean | number;
+  latest_invocation_report?: {
+    id: string;
+    outcome: string;
+    created_at: string;
+    consumed_at: string | null;
+  } | null;
+  native_turn?: NativeTurn | null;
+  native_prompt?: NativePrompt | null;
   cmux_surface?: CmuxSessionSurface | null;
   input_control?: ActiveInputControl | null;
 }
@@ -987,6 +1017,7 @@ export interface TaskContentRecord {
   summary: string;
   plan?: string | null;
   review_kind?: string | null;
+  superseded_by_native_turn?: { hook_event_id: string; superseded_at: string } | null;
 }
 export interface TaskContent {
   task_id: string;
@@ -1152,6 +1183,12 @@ export interface RestartResumeResult {
     { session_id: string; state: string; reason?: string; next_due_at?: string }
   >;
 }
+export interface PermissionNativeResolution {
+  kind: "tool_finished" | "tool_failed" | "native_denied";
+  hook_event_id: string;
+  tool_use_id: string;
+  observed_at: string;
+}
 export interface PermissionRequest {
   id: string;
   project_id: string;
@@ -1175,6 +1212,9 @@ export interface PermissionRequest {
   created_at: string;
   deadline_at: string;
   state: string;
+  actionable: boolean;
+  native_correlation_available: boolean;
+  native_resolution: PermissionNativeResolution | null;
   revision: number;
   decision_kind?: string;
   decision_actor?: string;

@@ -70,7 +70,7 @@ const { liveEnvironment, liveTiming, startLiveState } = await import(
   "./liveState"
 );
 const { attentionTargetProblem } = await import("./components/AttentionInbox");
-const { App } = await import("./App");
+const { App, applyAppearance, storedAppearance } = await import("./App");
 const { MarkdownContent, safeMarkdownUrl } = await import(
   "./components/MarkdownContent"
 );
@@ -4259,6 +4259,9 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
     created_at: new Date().toISOString(),
     deadline_at: new Date(Date.now() + 60_000).toISOString(),
     state: "pending",
+    actionable: true,
+    native_correlation_available: true,
+    native_resolution: null,
     revision: 4,
     delivery_state: "not_reserved",
   } as const;
@@ -4305,6 +4308,7 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
         ...permission,
         id: "permission-reserved",
         state: "approved_once",
+        actionable: false,
         revision: 6,
         decision_kind: "approve_once",
         decision_actor: "authenticated_human",
@@ -4318,6 +4322,7 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
         ...permission,
         id: "permission-delivered",
         state: "approved_rule",
+        actionable: false,
         revision: 8,
         decision_kind: "matching_rule",
         decision_actor: "human_rule",
@@ -4335,6 +4340,7 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
         ...permission,
         id: "permission-unknown",
         state: "approved_once",
+        actionable: false,
         revision: 7,
         decision_kind: "approve_once",
         decision_actor: "authenticated_human",
@@ -6149,6 +6155,9 @@ const pendingPermission: PermissionRequest = {
   created_at: "2026-09-23T00:00:00Z",
   deadline_at: "2999-01-01T00:00:00Z",
   state: "pending",
+  actionable: true,
+  native_correlation_available: true,
+  native_resolution: null,
   revision: 3,
   delivery_state: "not_reserved",
 };
@@ -6498,7 +6507,24 @@ Deno.test("M6 attention reconciliation refuses superseded bindings instead of re
         ...railState,
         permission_requests: [{ ...pendingPermission, revision: 4 }],
       },
-      "the permission request was already decided or changed.",
+      "the permission request was already decided, answered in the agent, or changed.",
+    ],
+    [
+      "permission_request:pr1",
+      {
+        ...railState,
+        permission_requests: [{
+          ...pendingPermission,
+          actionable: false,
+          native_resolution: {
+            kind: "tool_finished",
+            hook_event_id: "hook-post-1",
+            tool_use_id: "tool-1",
+            observed_at: "2026-09-23T00:01:00Z",
+          },
+        }],
+      },
+      "the permission request was already decided, answered in the agent, or changed.",
     ],
     [
       "recovery_record:r-target",
@@ -8067,5 +8093,697 @@ Deno.test("Waiting after restart lists only current sessions with an enabled ste
     check(!!bulk() && bulk()!.disabled, "bulk resume was enabled for a completed task");
   } finally {
     unmount();
+  }
+});
+
+async function mountLiveApp(page: string, state: AppState) {
+  const live = liveHarness();
+  liveEnvironment.transport = live.environment.transport;
+  liveEnvironment.scheduler = live.environment.scheduler;
+  localStorage.setItem("agenticjira.page", page);
+  mount(<App />);
+  await settle();
+  live.reads[0].resolve(state);
+  await settle();
+  return live;
+}
+const answeredNatively: PermissionRequest["native_resolution"] = {
+  kind: "tool_finished",
+  hook_event_id: "hook-post-1",
+  tool_use_id: "tool-1",
+  observed_at: "2026-09-23T00:01:00Z",
+};
+const permissionItem = railItem("permission_request:pr1", "permission", "Manager · shell", {
+  kind: "permission_request",
+  project_id: "p1",
+  task_id: "AJ-1",
+  attempt_id: "a1",
+  session_id: "s1",
+  request_id: "pr1",
+  request_revision: 3,
+});
+
+Deno.test("A permission wait stays visible beside an independent hold and opens its exact request", async () => {
+  const priorEnvironment = { ...liveEnvironment };
+  const methods: string[] = [];
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    methods.push(init?.method ?? "GET");
+    return new Response("[]");
+  }) as typeof fetch;
+  const recoveryItem = railItem("recovery_record:r1", "recovery", "Recovery needed", {
+    kind: "recovery_record",
+    project_id: "p1",
+    task_id: "AJ-1",
+    attempt_id: "a1",
+    recovery_id: "r1",
+  });
+  const held: Task = { ...task, attention: "needs_recovery", permission_waiting: true };
+  const answered: PermissionRequest = {
+    ...pendingPermission,
+    id: "pr-native",
+    tool_name: "python",
+    actionable: false,
+    native_resolution: answeredNatively,
+  };
+  const heldState = (revision: string, requests: PermissionRequest[]) =>
+    snapshotAt("service-a", revision, {
+      tasks: [held],
+      active_sessions: [managerSession],
+      recovery: [{ id: "r1", session_id: "s1", attempt_id: "a1", state: "attention_required", detail: {} }],
+      permission_requests: requests,
+      attention: [recoveryItem, ...(requests.some((request) => request.actionable) ? [permissionItem] : [])],
+      task_actions: [{
+        task_id: "AJ-1",
+        item_id: recoveryItem.id,
+        action: { kind: "resolve_issue", label: "Resolve issue" },
+        item_ids: [recoveryItem.id, permissionItem.id],
+      }],
+    });
+  const focused = () => document.activeElement?.getAttribute("data-attention-target");
+  localStorage.clear();
+  try {
+    const live = await mountLiveApp("board", heldState("70", [pendingPermission, answered]));
+    const card = document.querySelector(".task-card");
+    const permission = card?.querySelector<HTMLButtonElement>(".task-permission-action");
+    check(
+      card?.querySelector(".status-badge")?.textContent === "Manual action needed" &&
+        card.querySelector(".task-next-action")?.textContent?.startsWith("Resolve issue") &&
+        permission?.textContent?.includes("Manager wants to use shell"),
+      `the card hid the permission wait or the independent hold: ${card?.textContent}`,
+    );
+    const approvals = [...document.querySelectorAll(".waiting-link")]
+      .find((link) => link.textContent?.startsWith("Approvals"));
+    check(
+      approvals?.querySelector(".count")?.textContent === "1" &&
+        document.querySelectorAll(".wait-notices li").length === 1,
+      "a natively answered request was still counted or announced as waiting",
+    );
+    act(() => permission!.click());
+    await settle();
+    check(
+      focused() === "permission_request:pr1" && !document.querySelector('[role="dialog"]'),
+      `the card did not open its exact request: ${focused()}`,
+    );
+    const inbox = document.querySelector("#workspace-approvals")!;
+    check(
+      inbox.querySelectorAll(".approval-actions").length === 1 &&
+        inbox.textContent?.includes("Answered in the agent (1)") &&
+        inbox.textContent.includes("the agent reported the tool finished"),
+      "native resolution was not kept as separate, non-actionable history",
+    );
+    act(() => document.querySelector<HTMLButtonElement>(".task-row")!.click());
+    await settle();
+    const header = document.querySelector('[role="dialog"] .task-dialog-permission');
+    check(
+      header?.textContent?.includes("Manager wants to use shell") &&
+        document.querySelector('[role="dialog"] .task-dialog-next button')?.textContent === "Resolve issue",
+      `the header dropped the permission wait or the hold: ${header?.textContent}`,
+    );
+    act(() => header!.querySelector("button")!.click());
+    await settle();
+    check(
+      !document.querySelector('[role="dialog"]') && focused() === "permission_request:pr1",
+      `the header did not open its exact request: ${focused()}`,
+    );
+    live.waits.at(-1)!.resolve(changedTo(heldState("71", [
+      { ...pendingPermission, actionable: false, native_resolution: answeredNatively },
+      answered,
+    ])));
+    await settle();
+    check(
+      !document.querySelector(".wait-notices") &&
+        !document.querySelector(".task-permission-action") &&
+        !document.querySelector("#workspace-approvals .approval-actions") &&
+        document.querySelector("#workspace-approvals")?.textContent?.includes("Answered in the agent (2)"),
+      "a request answered in the agent stayed actionable",
+    );
+    check(methods.every((method) => method === "GET"), `navigation dispatched a mutation: ${methods}`);
+  } finally {
+    unmount();
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("An uncertain approval refreshes and is never resent automatically", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    throw new TypeError("Load failed");
+  }) as typeof fetch;
+  let refreshed = 0;
+  localStorage.clear();
+  try {
+    mount(
+      <ApprovalInbox
+        state={{ ...liveBase, permission_requests: [pendingPermission] }}
+        onSelect={noop}
+        onChanged={() => refreshed++}
+      />,
+    );
+    click("Approve once");
+    await settle();
+    await settle();
+    check(
+      bodies.length === 1 && bodies[0].kind === "decide_permission" &&
+        bodies[0].request_id === "pr1" && refreshed === 1,
+      `an uncertain decision was resent or not refreshed: ${bodies.length}/${refreshed}`,
+    );
+    check(
+      document.body.textContent?.includes("it was not sent again"),
+      "the uncertain decision did not explain that nothing was resent",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Browser notifications need this page's opt-in, announce each new wait once, and never replay or act", async () => {
+  const priorEnvironment = { ...liveEnvironment };
+  const priorHasFocus = document.hasFocus;
+  const methods: string[] = [];
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    methods.push(init?.method ?? "GET");
+    return new Response("[]");
+  }) as typeof fetch;
+  class FakeNotification {
+    static permission: NotificationPermission = "default";
+    static answer: NotificationPermission = "granted";
+    static requestPermission() {
+      FakeNotification.permission = FakeNotification.answer;
+      return Promise.resolve(FakeNotification.answer);
+    }
+    onclick: (() => void) | null = null;
+    constructor(readonly title: string, readonly options?: NotificationOptions) {
+      shown.push(this);
+    }
+    close() {}
+  }
+  const shown: FakeNotification[] = [];
+  let pageFocused = false;
+  document.hasFocus = () => pageFocused;
+  const request = (id: string, tool: string): PermissionRequest => ({
+    ...pendingPermission,
+    id,
+    tool_name: tool,
+  });
+  const failed: Session = {
+    ...managerSession,
+    id: "s-fail",
+    role: "final_verifier",
+    native_turn: {
+      accepted_hook_event_id: "hook-accept",
+      accepted_at: "2026-09-29T17:00:00Z",
+      failure: {
+        hook_event_id: "hook-fail-1",
+        kind: "overloaded",
+        provider_error: "Selected model is at capacity.",
+        details: null,
+        observed_at: "2026-09-29T17:11:27Z",
+      },
+    },
+  };
+  const at = (
+    incarnation: string,
+    revision: string,
+    requests: PermissionRequest[],
+    sessions: Session[] = [managerSession],
+  ) => snapshotAt(incarnation, revision, { permission_requests: requests, active_sessions: sessions });
+  const listed = () => document.querySelector(".wait-notices")?.textContent ?? "";
+  const focused = () => document.activeElement?.getAttribute("data-attention-target");
+  const advance = (live: ReturnType<typeof liveHarness>) => (state: AppState) => {
+    live.waits.at(-1)!.resolve(changedTo(state));
+    return settle();
+  };
+  const hasEnable = () =>
+    [...document.querySelectorAll("button")].some((button) =>
+      button.textContent === "Enable browser notifications"
+    );
+  localStorage.clear();
+  try {
+    await mountLiveApp("board", at("service-a", "1", [request("pr1", "shell")]));
+    check(
+      document.body.textContent?.includes("cannot show notifications here") &&
+        listed().includes("wants to use shell"),
+      "an unavailable Notification API hid the in-page wait or its fallback",
+    );
+    unmount();
+
+    Object.defineProperty(window, "Notification", {
+      configurable: true,
+      writable: true,
+      value: FakeNotification,
+    });
+    // Blocked for the origin: the page still lists and opens every exact wait.
+    FakeNotification.permission = "denied";
+    const blocked = await mountLiveApp("board", at("service-a", "1", [request("pr1", "shell")]));
+    await advance(blocked)(at("service-a", "2", [request("pr1", "shell"), request("pr2", "python")]));
+    check(
+      document.body.textContent?.includes("blocked for this site") && !hasEnable() &&
+        shown.length === 0 && listed().includes("wants to use python"),
+      "a blocked origin offered Enable, raised an alert, or hid the in-page wait",
+    );
+    const pythonWait = [...document.querySelectorAll(".wait-notices li")]
+      .find((item) => item.textContent?.includes("wants to use python"));
+    act(() => pythonWait!.querySelector("button")!.click());
+    await settle();
+    check(
+      focused() === "permission_request:pr2" && !document.querySelector('[role="dialog"]'),
+      `a blocked origin lost exact navigation: ${focused()}`,
+    );
+    unmount();
+
+    // Denied when asked: the same in-page fallback, still no alert.
+    FakeNotification.permission = "default";
+    FakeNotification.answer = "denied";
+    const refused = await mountLiveApp("board", at("service-a", "1", [request("pr1", "shell")]));
+    click("Enable browser notifications");
+    await settle();
+    await advance(refused)(at("service-a", "2", [request("pr1", "shell"), request("pr2", "python")]));
+    check(
+      document.body.textContent?.includes("blocked for this site") && !hasEnable() &&
+        shown.length === 0 && listed().includes("wants to use python"),
+      "a denied request raised an alert or hid the in-page wait",
+    );
+    unmount();
+
+    // Permission granted to the origin earlier is not this page's opt-in.
+    FakeNotification.permission = "granted";
+    FakeNotification.answer = "granted";
+    const live = await mountLiveApp("board", at("service-a", "10", [request("pr1", "shell")]));
+    const next = advance(live);
+    check(
+      document.body.textContent?.includes("Browser notifications are optional") && hasEnable(),
+      "a previously granted origin switched alerts on without Enable",
+    );
+    await next(at("service-a", "11", [request("pr1", "shell"), request("pr2", "python")]));
+    check(
+      shown.length === 0 && listed().includes("wants to use python"),
+      "a granted origin alerted before the page opted in",
+    );
+    click("Enable browser notifications");
+    await settle();
+    check(
+      document.body.textContent?.includes("Browser notifications are on") && shown.length === 0,
+      "enabling notifications replayed waits that were already listed",
+    );
+    const current = [request("pr1", "shell"), request("pr2", "python"), request("pr3", "npm")];
+    await next(at("service-a", "12", current));
+    check(
+      shown.length === 1 && shown[0].options?.tag === "llmrelay:service-a:permission:pr3" &&
+        !!shown[0].options?.body?.includes("does not approve or run anything"),
+      `a new wait was not announced exactly once: ${shown.map((item) => item.options?.tag)}`,
+    );
+    await next(at("service-a", "13", current, [managerSession, failed]));
+    await next(at("service-a", "14", current, [managerSession, failed]));
+    check(
+      shown.length === 2 && shown[1].title.includes("latest turn stopped") &&
+        shown[1].options?.tag === "llmrelay:service-a:turn_failure:s-fail:hook-fail-1" &&
+        listed().includes("Selected model is at capacity."),
+      "a failed turn was not announced once with its provider error",
+    );
+    act(() => shown[0].onclick?.());
+    await settle();
+    check(focused() === "permission_request:pr3", `the notification opened ${focused()}`);
+
+    pageFocused = true;
+    await next(at("service-a", "15", [...current, request("pr4", "cargo")], [managerSession, failed]));
+    check(
+      shown.length === 2 && listed().includes("wants to use cargo"),
+      "a focused page raised a browser notification instead of the in-page notice",
+    );
+    pageFocused = false;
+    live.waits.at(-1)!.resolve({
+      outcome: "reset",
+      incarnation: "service-b",
+      revision: "1",
+      state: at("service-b", "1", [request("pr3", "npm"), request("pr5", "make")]),
+    });
+    await settle();
+    check(
+      shown.length === 2 && listed().includes("wants to use make"),
+      "a reconnected service replayed alerts or hid its current waits",
+    );
+    await next(at("service-b", "2", [
+      { ...request("pr3", "npm"), actionable: false, native_resolution: answeredNatively },
+      request("pr5", "make"),
+      request("pr6", "gradle"),
+    ]));
+    check(
+      shown.length === 3 && shown[2].options?.tag === "llmrelay:service-b:permission:pr6" &&
+        !listed().includes("wants to use npm"),
+      `the new incarnation's alert lost its identity or an answered wait stayed: ${shown[2]?.options?.tag}`,
+    );
+    const reads = live.reads.length;
+    act(() => shown[0].onclick?.());
+    await settle();
+    check(
+      document.body.textContent?.includes("this is no longer waiting") &&
+        live.reads.length === reads + 1 && focused() !== "permission_request:pr3",
+      "a stale notification opened a resolved request or did not refresh",
+    );
+    check(methods.every((method) => method === "GET"), `notifications dispatched a mutation: ${methods}`);
+  } finally {
+    unmount();
+    Reflect.deleteProperty(window, "Notification");
+    document.hasFocus = priorHasFocus;
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Session Access keeps the open process apart from reports, accepted turns, failed turns and native prompts", () => {
+  const access = {
+    routes: {},
+    discarding: {},
+    routeFor: () => undefined,
+    view: () => Promise.resolve<CmuxViewOutcome>({ state: "pending", message: "", retry_available: false }),
+    take: () => Promise.resolve(),
+    release: () => Promise.resolve(),
+    discard: () => Promise.resolve(),
+    close: () => {},
+  };
+  const acceptedAt = "2026-09-30T10:00:00Z";
+  const reported: Session = {
+    ...managerSession,
+    id: "s-report",
+    role: "implementer",
+    readiness: "busy",
+    reported_in_latest_invocation: true,
+    native_turn: { accepted_hook_event_id: "hook-accept", accepted_at: acceptedAt, failure: null },
+  };
+  const failed: Session = {
+    ...managerSession,
+    id: "s-fail",
+    role: "final_verifier",
+    native_turn: {
+      accepted_hook_event_id: "hook-accept-2",
+      accepted_at: acceptedAt,
+      failure: {
+        hook_event_id: "hook-fail",
+        kind: "overloaded",
+        provider_error: "Selected model is at capacity. Please try a different model.",
+        details: null,
+        observed_at: "2026-09-30T10:05:00Z",
+      },
+    },
+  };
+  const prompted: Session = {
+    ...managerSession,
+    id: "s-prompt",
+    native_prompt: { hook_event_id: "hook-prompt", kind: "elicitation_dialog", observed_at: acceptedAt },
+  };
+  const waiting: Session = { ...managerSession, id: "s-perm" };
+  const candidate = (consumedAt: string | null, createdAt = "2026-09-30T10:10:00Z") => ({
+    id: "report-1",
+    outcome: "candidate_ready",
+    created_at: createdAt,
+    consumed_at: consumedAt,
+  });
+  const pendingCandidate: Session = {
+    ...reported,
+    id: "s-candidate",
+    latest_invocation_report: candidate(null),
+  };
+  const processedCandidate: Session = {
+    ...reported,
+    id: "s-processed",
+    latest_invocation_report: candidate("2026-09-30T10:11:00Z"),
+  };
+  const movedOn: Session = {
+    ...reported,
+    id: "s-moved-on",
+    latest_invocation_report: candidate(null, "2026-09-30T09:00:00Z"),
+  };
+  const failedWithReport: Session = {
+    ...failed,
+    id: "s-fail-report",
+    latest_invocation_report: candidate(null),
+  };
+  // A supported prompt observed after the StopFailure of the same accepted turn.
+  const failedThenPrompted: Session = {
+    ...failed,
+    id: "s-fail-prompt",
+    native_prompt: {
+      hook_event_id: "hook-prompt-after-failure",
+      kind: "permission_prompt",
+      observed_at: "2026-09-30T10:06:00Z",
+    },
+  };
+  try {
+    mount(
+      <SessionTree
+        sessions={[
+          reported,
+          failed,
+          prompted,
+          waiting,
+          pendingCandidate,
+          processedCandidate,
+          movedOn,
+          failedWithReport,
+          failedThenPrompted,
+        ]}
+        access={access}
+        permissionRequests={[{ ...pendingPermission, session_id: "s-perm" }]}
+        setupProjectId={() => undefined}
+        onOpenSetup={noop}
+      />,
+    );
+    const article = (id: string) =>
+      document.querySelector(`[data-attention-target="session:${id}"]`)!;
+    const label = (id: string) => article(id).querySelector(".session-state")?.textContent;
+    const text = (id: string) => article(id).textContent ?? "";
+    check(
+      label("s-report") === "Report submitted" && text("s-report").includes("Session open") &&
+        text("s-report").includes(
+          `Latest turn accepted by the agent ${new Date(acceptedAt).toLocaleString()}`,
+        ) && text("s-report").includes("does not mean the task is complete"),
+      `a submitted report read as active work or completion: ${text("s-report")}`,
+    );
+    check(
+      label("s-fail") === "Turn stopped with an error" && text("s-fail").includes("Session open") &&
+        text("s-fail").includes("the model is overloaded or at capacity") &&
+        text("s-fail").includes("Selected model is at capacity. Please try a different model.") &&
+        text("s-fail").includes("does not retry the turn or switch models"),
+      `a failed turn was not explained apart from its open process: ${text("s-fail")}`,
+    );
+    const promptButtons = [...article("s-prompt").querySelectorAll("button")]
+      .map((button) => button.textContent ?? "");
+    check(
+      label("s-prompt") === "Waiting in its own terminal" &&
+        text("s-prompt").includes("LLMRelay cannot answer this prompt") &&
+        promptButtons.includes("Take control") &&
+        !promptButtons.some((button) => /Approve|Deny/.test(button)),
+      `a native prompt offered an app decision: ${promptButtons}`,
+    );
+    check(label("s-perm") === "Waiting for your approval", `permission wait reads ${label("s-perm")}`);
+    check(
+      label("s-candidate") === "Implementation submitted — awaiting processing" &&
+        label("s-processed") === "Implementation submitted — awaiting verification" &&
+        text("s-processed").includes("Session open") &&
+        text("s-processed").includes("does not mean the task is complete"),
+      `candidate submission read as ${label("s-candidate")} / ${label("s-processed")}`,
+    );
+    check(
+      label("s-moved-on") === "Running" &&
+        text("s-moved-on").includes("is history: the agent accepted a newer turn") &&
+        !text("s-moved-on").includes("Implementation submitted"),
+      `a report older than the accepted turn still set the state: ${label("s-moved-on")}`,
+    );
+    check(
+      label("s-fail-report") === "Turn stopped with an error",
+      `a pending candidate report hid the failed turn: ${label("s-fail-report")}`,
+    );
+    const bothButtons = [...article("s-fail-prompt").querySelectorAll("button")]
+      .map((button) => button.textContent ?? "");
+    check(
+      label("s-fail-prompt") === "Turn stopped with an error" &&
+        text("s-fail-prompt").includes("Session open") &&
+        text("s-fail-prompt").includes("does not retry the turn or switch models") &&
+        text("s-fail-prompt").includes("LLMRelay cannot answer this prompt") &&
+        !text("s-fail-prompt").includes("Implementation submitted") &&
+        !text("s-fail-prompt").includes("Finished its turn") &&
+        bothButtons.includes("Take control") &&
+        !bothButtons.some((button) => /Approve|Deny|Retry|Switch model/.test(button)),
+      `a later prompt replaced the failed turn or dropped its output route: ${text("s-fail-prompt")}`,
+    );
+    const verifying: Task = { ...task, active_attempt: { ...task.active_attempt!, phase: "final_review" } };
+    const stopped = taskStatus(verifying, { sessions: [{ ...failed, attempt_id: "a1" }] });
+    check(
+      stopped.label === "Agent turn stopped" && stopped.tone === "danger" &&
+        stopped.detail.includes("Its session is still open"),
+      `a failed turn still read as verification: ${stopped.label}`,
+    );
+    check(
+      taskStatus({ ...verifying, attention: "needs_recovery" }, { sessions: [failed] }).label ===
+        "Manual action needed",
+      "a failed turn replaced an independent hold",
+    );
+    const stoppedThenPrompted = taskStatus(verifying, { sessions: [failedThenPrompted] });
+    check(
+      stoppedThenPrompted.label === "Agent turn stopped" && stoppedThenPrompted.tone === "danger" &&
+        stoppedThenPrompted.detail.includes("nothing is retried automatically") &&
+        stoppedThenPrompted.detail.includes("asking for permission in its own terminal") &&
+        !stoppedThenPrompted.completed,
+      `a later prompt hid the failed turn on the task: ${stoppedThenPrompted.label}`,
+    );
+    check(
+      taskStatus({ ...verifying, permission_waiting: true }, { sessions: [failedThenPrompted] })
+          .label === "Waiting for your approval" &&
+        taskStatus({ ...verifying, attention: "needs_recovery" }, { sessions: [failedThenPrompted] })
+            .label === "Manual action needed",
+      "failed-turn precedence displaced a permission wait or an independent hold",
+    );
+  } finally {
+    unmount();
+  }
+});
+
+Deno.test("Awaiting your review leads the board and list in reading order", () => {
+  const drafts: Task[] = [1, 2, 3].map((index) => ({
+    ...task,
+    id: `AJ-d${index}`,
+    title: `Draft ${index}`,
+    lifecycle: "backlog",
+    active_attempt: undefined,
+  }));
+  const review: Task = {
+    ...task,
+    id: "AJ-r",
+    title: "Ready to accept",
+    lifecycle: "awaiting_review",
+    attention: "needs_human_review",
+  };
+  const board = (tasks: Task[]) => (
+    <TaskBoard tasks={tasks} projects={[initialized]} onOpen={noop} onEdit={noop} onChanged={noop} />
+  );
+  localStorage.clear();
+  try {
+    mount(board(drafts));
+    const firstLane = document.querySelector(".lane");
+    check(
+      firstLane?.getAttribute("aria-label") === "Awaiting your review" &&
+        firstLane.textContent?.includes("No tasks"),
+      "the empty review lane did not lead the board",
+    );
+    check(
+      document.querySelector(".lane-backlog .count")?.textContent === "3" &&
+        document.querySelector(".lane-backlog .status-badge.tone-draft")?.textContent === "Draft",
+      "Drafts lost their count or text label",
+    );
+    rerender(board([...drafts, review]));
+    check(
+      document.querySelector(".lane .card-body")?.textContent?.includes("Ready to accept"),
+      "Drafts came before your review in reading order",
+    );
+    click("List");
+    check(
+      document.querySelector(".task-list > article button")?.textContent?.includes("Ready to accept"),
+      "the list buried your review under drafts",
+    );
+  } finally {
+    unmount();
+    localStorage.clear();
+  }
+});
+
+Deno.test("Appearance follows System or an explicit choice and survives unavailable storage", async () => {
+  const priorEnvironment = { ...liveEnvironment };
+  const priorMatchMedia = window.matchMedia;
+  const realStorage = localStorage;
+  globalThis.fetch = (async () => new Response("[]")) as typeof fetch;
+  const os = { dark: true, listeners: new Set<() => void>() };
+  window.matchMedia = ((media: string) => ({
+    media,
+    get matches() {
+      return os.dark;
+    },
+    addEventListener: (_type: string, listener: () => void) => os.listeners.add(listener),
+    removeEventListener: (_type: string, listener: () => void) => os.listeners.delete(listener),
+  })) as unknown as typeof window.matchMedia;
+  const theme = () => document.documentElement.dataset.theme;
+  const osChanges = (dark: boolean) => {
+    os.dark = dark;
+    act(() => os.listeners.forEach((listener) => listener()));
+  };
+  localStorage.clear();
+  try {
+    localStorage.setItem("llmrelay.appearance", "sepia");
+    check(storedAppearance() === "system", "an unknown stored appearance was trusted");
+    await mountLiveApp("board", snapshotAt("service-a", "1", {
+      attention: Array.from({ length: 21 }, (_, index) =>
+        railItem(`item-${index}`, "blocked", `Item ${index}`, null)),
+    }));
+    const workspace = [...document.querySelectorAll(".sidebar nav button")]
+      .find((button) => button.textContent?.includes("Workspace"));
+    check(
+      workspace?.querySelector('.nav-badge [aria-hidden="true"]')?.textContent === "21" &&
+        workspace.textContent?.includes(", 21 waiting for you"),
+      `the Workspace badge lost its exact count or accessible name: ${workspace?.textContent}`,
+    );
+    const select = findSelect("Appearance");
+    check(select.value === "system", "an invalid preference did not fall back to System");
+    change(select, "light");
+    check(
+      theme() === "light" && localStorage.getItem("llmrelay.appearance") === "light",
+      "Light did not apply synchronously or persist",
+    );
+    osChanges(true);
+    check(theme() === "light", "an explicit Light choice followed the OS");
+    change(select, "system");
+    check(theme() === "dark", "System did not use the OS preference");
+    osChanges(false);
+    check(theme() === "light", "System did not follow an OS change");
+    unmount();
+
+    // A reload applies the stored explicit choice before rendering, against the OS.
+    localStorage.setItem("llmrelay.appearance", "dark");
+    applyAppearance(storedAppearance());
+    check(theme() === "dark", "a stored Dark choice was not applied before render");
+    await mountLiveApp("board", snapshotAt("service-a", "2"));
+    check(findSelect("Appearance").value === "dark", "the stored choice was not selected after reload");
+    unmount();
+
+    const refuse = (key: string) => {
+      if (key === "llmrelay.appearance") throw new DOMException("denied", "SecurityError");
+    };
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      writable: true,
+      value: {
+        getItem: (key: string) => (refuse(key), realStorage.getItem(key)),
+        setItem: (key: string, value: string) => (refuse(key), realStorage.setItem(key, value)),
+        removeItem: (key: string) => realStorage.removeItem(key),
+        clear: () => realStorage.clear(),
+        key: (index: number) => realStorage.key(index),
+        get length() {
+          return realStorage.length;
+        },
+      },
+    });
+    check(storedAppearance() === "system", "unavailable storage did not fall back to System");
+    await mountLiveApp("board", snapshotAt("service-a", "3"));
+    change(findSelect("Appearance"), "dark");
+    check(theme() === "dark", "unavailable storage blocked the selected appearance");
+  } finally {
+    unmount();
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      writable: true,
+      value: realStorage,
+    });
+    window.matchMedia = priorMatchMedia;
+    document.documentElement.removeAttribute("data-theme");
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
   }
 });

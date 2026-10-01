@@ -1,4 +1,4 @@
-use super::{HookAssets, PreparedLaunch, RuntimeProbeCommandPolicy, HOOK_REVISION};
+use super::{HookAssets, PreparedLaunch, RuntimeProbeCommandPolicy, CLAUDE_HOOK_REVISION};
 use crate::domain::{CapabilityIdentity, CapabilityStatus, LaunchConfig, Provider, RoleKind};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -322,7 +322,7 @@ pub(crate) fn prepare_with_bundles(
             environment_keys: environment.iter().map(|(key, _)| key.clone()).collect(),
             permission_policy,
             security_policy,
-            hook_revision: format!("{HOOK_REVISION}:{hook_hash}"),
+            hook_revision: format!("{CLAUDE_HOOK_REVISION}:{hook_hash}"),
             capability_status: CapabilityStatus::Unverified,
             compatibility: Some(contract_binding),
         },
@@ -564,6 +564,7 @@ pub fn require_native_sandbox(
         "PostToolUseFailure",
         "Stop",
         "StopFailure",
+        "Notification",
         "SubagentStart",
         "SubagentStop",
         "SessionEnd",
@@ -688,6 +689,7 @@ mod tests {
             contract["native_policy_revision"] = NATIVE_SANDBOX_POLICY_REVISION.into();
             contract["launch_revision"] = LAUNCH_CONTRACT_REVISION.into();
             contract["resume_revision"] = RESUME_CONTRACT_REVISION.into();
+            contract["hook_revision"] = CLAUDE_HOOK_REVISION.into();
         }
         claude["selectors"] = serde_json::json!([selector]);
         let bundles = crate::provider_compatibility::BundleSet::synthetic_for_tests(
@@ -744,7 +746,7 @@ mod tests {
             binding.effective_hash
         );
         assert_eq!(identity.hook_revision, prepared.config.hook_revision);
-        assert!(identity.hook_revision.starts_with(HOOK_REVISION));
+        assert!(identity.hook_revision.starts_with(CLAUDE_HOOK_REVISION));
         assert_eq!(
             identity.environment_contract,
             prepared.config.environment_keys

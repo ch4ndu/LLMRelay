@@ -3,6 +3,7 @@ import { useMemo, useRef, useState } from "react";
 import { ApiError, command, reuseOperationIdentity } from "../api";
 import {
   type AppState,
+  type PermissionNativeResolution,
   type PermissionRequest,
   type PermissionScopePreview,
   roleLabel,
@@ -125,10 +126,9 @@ const shownScopeValue = (value: unknown) => {
   return JSON.stringify(value) || "Unavailable — not provided";
 };
 
-/** Pending native permission requests plus actionable service-check approvals. */
+/** Actionable native permission requests plus actionable service-check approvals. */
 export const pendingApprovalCount = (state: AppState) =>
-  state.permission_requests.filter((request) => request.state === "pending")
-    .length +
+  state.permission_requests.filter((request) => request.actionable).length +
   (state.trip_task_verification || []).filter((check) =>
     check.authorization.state === "pending" &&
     check.authorization.action_state === "actionable"
@@ -142,16 +142,20 @@ export function ApprovalInbox(
   },
 ) {
   const pending = useMemo(
+    () => state.permission_requests.filter((request) => request.actionable),
+    [state.permission_requests],
+  );
+  const answeredInAgent = useMemo(
     () =>
       state.permission_requests.filter((request) =>
-        request.state === "pending"
+        !request.actionable && request.native_resolution
       ),
     [state.permission_requests],
   );
   const decided = useMemo(
     () =>
       state.permission_requests.filter((request) =>
-        request.state !== "pending"
+        !request.actionable && !request.native_resolution
       ),
     [state.permission_requests],
   );
@@ -237,7 +241,7 @@ export function ApprovalInbox(
       ) {
         setError(
           cause.ambiguous
-            ? `${cause.message} Refresh and reconcile before retrying.`
+            ? `${cause.message} Your decision may already be recorded, so it was not sent again. The latest state was requested; check whether this request is still waiting before choosing again.`
             : "The request changed in another view. State was refreshed.",
         );
         onChanged();
@@ -388,6 +392,25 @@ export function ApprovalInbox(
       ))}
       {!count && <p className="empty">No approvals are waiting.</p>}
       {error && <ErrorNotice error={error} />}
+      {answeredInAgent.length > 0 && (
+        <details className="decided-requests">
+          <summary>Answered in the agent ({answeredInAgent.length})</summary>
+          <small className="hint">
+            These were answered in the agent's own terminal, not in LLMRelay.
+            They stay here as history and can no longer be approved or denied.
+          </small>
+          {answeredInAgent.map((request) => (
+            <PermissionRequestCard
+              key={request.id}
+              request={request}
+              subject={subject(request)}
+              busy={false}
+              onDecide={() => {}}
+              onAlways={() => {}}
+            />
+          ))}
+        </details>
+      )}
       {decided.length > 0 && (
         <details className="decided-requests">
           <summary>Recent decisions ({decided.length})</summary>
@@ -507,7 +530,8 @@ function PermissionRequestCard(
     onAlways: () => void;
   },
 ) {
-  const isPending = request.state === "pending";
+  const isPending = request.actionable;
+  const resolution = request.native_resolution;
   return (
     <article
       className={`approval-request ${isPending ? "pending" : "decided"}`}
@@ -522,7 +546,11 @@ function PermissionRequestCard(
         </strong>
         <small>
           {subject || "Task not shown"} · asked {age(request.created_at)} ago
-          {!isPending && ` · ${decisionLabel(request)}`}
+          {!isPending && ` · ${
+            resolution
+              ? nativeResolutionLabel[resolution.kind]
+              : `${decisionLabel(request)} · ${responseLabel(request)}`
+          }`}
         </small>
       </div>
       {onOpenTask && (
@@ -561,6 +589,13 @@ function PermissionRequestCard(
         <small className="hint">
           {request.family_unavailable_reason}. Approve this exact request once,
           deny it, or answer the prompt in the agent's own terminal.
+        </small>
+      )}
+      {isPending && !request.native_correlation_available && (
+        <small className="hint">
+          If you answer this in the agent's own terminal instead, LLMRelay
+          cannot see that answer, so this request stays listed until it
+          expires.
         </small>
       )}
       {!isPending && request.decision_reason && (
@@ -604,9 +639,20 @@ function PermissionRequestCard(
             <dt>Original decision</dt>
             <dd>
               {request.decision_kind?.replaceAll("_", " ") ||
-                "Awaiting a decision"}
+                (resolution ? "None in LLMRelay" : "Awaiting a decision")}
             </dd>
           </div>
+          {resolution && (
+            <div>
+              <dt>Answered in the agent</dt>
+              <dd>
+                {resolution.kind.replaceAll("_", " ")} ·{" "}
+                {new Date(resolution.observed_at).toLocaleString()} · tool call
+                {" "}
+                {resolution.tool_use_id} · hook event {resolution.hook_event_id}
+              </dd>
+            </div>
+          )}
           <div>
             <dt>Decided by</dt>
             <dd>{request.decision_actor || "Not decided"}</dd>
@@ -671,6 +717,30 @@ const decisionLabel = (request: PermissionRequest) => {
     default:
       return request.state.replaceAll("_", " ");
   }
+};
+
+const responseLabel = (request: PermissionRequest) => {
+  switch (request.delivery_state) {
+    case "not_reserved":
+      return "not sent to the agent yet";
+    case "reserved":
+      return "waiting to be sent to the agent";
+    case "delivered":
+      return "sent to the agent, which does not show the command ran";
+    case "unknown":
+      return "sending was not confirmed and it will not be resent; check the agent's output";
+    default:
+      return `response ${request.delivery_state.replaceAll("_", " ")}`;
+  }
+};
+
+const nativeResolutionLabel: Record<
+  PermissionNativeResolution["kind"],
+  string
+> = {
+  tool_finished: "answered in the agent's terminal; the agent reported the tool finished",
+  tool_failed: "answered in the agent's terminal; the agent reported the tool failed",
+  native_denied: "denied in the agent's terminal",
 };
 
 function ScopeDialog(

@@ -577,7 +577,9 @@ impl RoleService {
                                AND submit.rowid<stop.rowid))
                        AND NOT EXISTS(SELECT 1 FROM permission_requests permission
                          WHERE permission.session_id=s.id AND permission.consumed_at IS NULL
-                           AND permission.delivery_state NOT IN ('expired','not_delivered'))
+                           AND permission.delivery_state NOT IN ('expired','not_delivered')
+                           AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+                             WHERE native.permission_request_id=permission.id))
                        AND NOT EXISTS(SELECT 1 FROM input_leases lease
                          WHERE lease.session_id=s.id AND lease.revoked_at IS NULL
                            AND julianday(lease.expires_at)>julianday('now'))

@@ -3,7 +3,8 @@ use crate::domain::{
     ContinuationAction, ContinuationActionKind, DecisionActionBinding, DecisionControlPolicy,
     DecisionDisposition, DecisionEvidenceState, DecisionExplanation, DecisionNextAction,
     DecisionObservedRevision, DecisionOwner, DecisionOwnership, DecisionPrerequisite,
-    DecisionSubject, HumanCommand, OperationResult, PermissionRequestDto, ProjectDto,
+    DecisionSubject, HumanCommand, NativePromptDto, NativePromptKind, NativeTurnDto,
+    NativeTurnFailureDto, NativeTurnFailureKind, OperationResult, PermissionRequestDto, ProjectDto,
     RestartCandidateResult, RoleKind, StaleRestartCandidateCancellation, TaskAttentionTarget,
     TaskDto, UnconfirmedGuidanceAbandonment,
 };
@@ -4099,7 +4100,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
     };
     let mut tasks = Vec::new();
     for id in task_ids {
-        let mut task = connection.query_row("SELECT id,project_id,title,description,acceptance_criteria_json,priority,manual_order,lifecycle,attention,version,archived_at,role_overrides_json,legacy_json,EXISTS(SELECT 1 FROM permission_requests pr WHERE pr.task_id=tasks.id AND pr.state='pending'),(archived_at IS NULL AND (lifecycle='done' OR (lifecycle='backlog' AND ready_at IS NULL AND NOT EXISTS(SELECT 1 FROM attempts WHERE task_id=tasks.id)))) FROM tasks WHERE id=?1",
+        let mut task = connection.query_row(&format!("SELECT id,project_id,title,description,acceptance_criteria_json,priority,manual_order,lifecycle,attention,version,archived_at,role_overrides_json,legacy_json,EXISTS(SELECT 1 FROM permission_requests pr WHERE pr.task_id=tasks.id AND {}),(archived_at IS NULL AND (lifecycle='done' OR (lifecycle='backlog' AND ready_at IS NULL AND NOT EXISTS(SELECT 1 FROM attempts WHERE task_id=tasks.id)))) FROM tasks WHERE id=?1", crate::permissions::ACTIONABLE_REQUEST_SQL),
             params![id], |row| Ok(TaskDto { id:row.get(0)?,project_id:row.get(1)?,title:row.get(2)?,description:row.get(3)?,acceptance_criteria:serde_json::from_str(&row.get::<_,String>(4)?).unwrap_or_default(),priority:row.get(5)?,manual_order:row.get(6)?,lifecycle:row.get(7)?,attention:row.get(8)?,version:row.get(9)?,archived:row.get::<_,Option<String>>(10)?.is_some(),can_archive:row.get(14)?,recipe_provenance:None,role_overrides:parse(row.get(11)?),legacy:parse(row.get(12)?),permission_waiting:row.get(13)?,dependencies:vec![],active_attempt:None,role_settings:vec![],reviews:vec![],snapshots:vec![],review_budgets:vec![],progress:None }))?;
         task.recipe_provenance = crate::recipes::task_provenance(&connection, &id)?;
         task.dependencies = json_rows(&connection, "SELECT json_object('task_id',depends_on_task_id,'integration_ref',integration_ref,'verified_at',verified_at) FROM task_dependencies WHERE task_id=?1", &id)?;
@@ -4250,12 +4251,6 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             'capture_state',s.capture_state,'updated_at',s.updated_at,
             'interrupt_requested_at',s.interrupt_requested_at,
             'transcript_epoch',s.transcript_epoch,'resume_count',s.resume_count,
-            'reported_in_latest_invocation',EXISTS(
-                SELECT 1 FROM role_results result
-                 WHERE result.session_id=s.id AND result.role_generation_id=s.role_generation_id
-                   AND result.created_at>=COALESCE((SELECT MAX(invocation.created_at)
-                     FROM resume_invocations invocation WHERE invocation.session_id=s.id),
-                     s.created_at)),
             'process_identity',json(s.process_identity_json),'task_id',t.id,
             'attempt_id',a.id,'role',rg.role,'generation',rg.generation,
             'config_revision',rg.config_revision,'lane_id',rg.lane_id,
@@ -4346,6 +4341,18 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
                 && capability.get("status").and_then(serde_json::Value::as_str) == Some("supported")
         });
         session["capability_current"] = serde_json::json!(current.is_some());
+        if let Some(session_id) = session
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        {
+            let report = latest_invocation_report(&connection, &session_id)?;
+            session["reported_in_latest_invocation"] = serde_json::json!(report.is_some());
+            session["latest_invocation_report"] = report.unwrap_or(serde_json::Value::Null);
+            session["native_turn"] = serde_json::to_value(native_turn(&connection, &session_id)?)?;
+            session["native_prompt"] =
+                serde_json::to_value(native_prompt(&connection, &session_id)?)?;
+        }
     }
     let controls = json_rows_no_param(&connection, "SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,'kind',kind,'state',state,'payload',json(payload_json),'updated_at',updated_at) FROM controls WHERE state NOT IN ('finished','cancelled') ORDER BY created_at")?;
     let guidance=json_rows_no_param(&connection,"SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,'body',body,'state',state,'reason',reason,'created_at',created_at,'acknowledged_at',acknowledged_at) FROM guidance_messages ORDER BY created_at DESC LIMIT 200")?;
@@ -5272,17 +5279,229 @@ fn permanent_resume_rejection_route(
     }
 }
 
+const NATIVE_TURN_TEXT_LIMIT: usize = 2048;
+
+/// CTEs over one session's current invocation: its trusted hooks after that
+/// invocation's own SessionStart, and the newest accepted UserPromptSubmit.
+/// Only hooks that ingestion kept as trusted keep their event names.
+const CURRENT_TURN_HOOKS_SQL: &str = "invocation AS (
+       SELECT s.id,s.role_generation_id,s.native_session_id,s.status,
+              CASE WHEN ri.id IS NULL THEN s.initial_hook_event_boundary_rowid
+                   ELSE ri.hook_event_boundary_rowid END AS boundary
+       FROM sessions s
+       LEFT JOIN resume_invocations ri
+         ON ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
+       WHERE s.id=?1 AND s.native_session_id IS NOT NULL
+     ),
+     invocation_start AS (
+       SELECT MIN(start.rowid) AS hook_rowid FROM hook_events start JOIN invocation i
+         ON start.session_id=i.id AND start.role_generation_id=i.role_generation_id
+        AND start.native_session_id=i.native_session_id
+       WHERE start.event_name='SessionStart' AND start.rowid>i.boundary
+     ),
+     current_hooks AS (
+       SELECT h.rowid AS hook_rowid,h.id,h.event_name,h.payload_json,h.received_at
+       FROM hook_events h JOIN invocation i ON h.session_id=i.id
+       WHERE h.role_generation_id=i.role_generation_id
+         AND h.native_session_id=i.native_session_id
+         AND h.rowid>(SELECT hook_rowid FROM invocation_start)
+     ),
+     accepted AS (
+       SELECT hook_rowid,id,payload_json,received_at FROM current_hooks
+       WHERE event_name='UserPromptSubmit' ORDER BY hook_rowid DESC LIMIT 1
+     )";
+
+/// A hook carrying a provider `prompt_id` other than the accepted turn's
+/// belongs to an earlier turn that arrived late; without both ids, arrival
+/// order is the only evidence.
+fn belongs_to_accepted_turn(alias: &str) -> String {
+    format!(
+        "(json_type({alias}.payload_json,'$.prompt_id') IS NOT 'text'
+          OR (SELECT json_type(payload_json,'$.prompt_id') FROM accepted) IS NOT 'text'
+          OR json_extract({alias}.payload_json,'$.prompt_id')=
+             (SELECT json_extract(payload_json,'$.prompt_id') FROM accepted))"
+    )
+}
+
+/// The session's newest native turn in its current invocation. A failure is
+/// reported only after the newest UserPromptSubmit and while no later Stop or
+/// tool activity shows the turn went on.
+fn native_turn(connection: &Connection, session_id: &str) -> Result<Option<NativeTurnDto>> {
+    type TurnRow = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let turn: Option<TurnRow> = connection
+        .query_row(
+            &format!(
+                "WITH {CURRENT_TURN_HOOKS_SQL},
+                 failure AS (
+                   SELECT failed.id,failed.payload_json,failed.received_at FROM current_hooks failed
+                   WHERE failed.event_name='StopFailure'
+                     AND failed.hook_rowid>COALESCE((SELECT hook_rowid FROM accepted),0)
+                     AND {}
+                     AND NOT EXISTS(SELECT 1 FROM current_hooks later
+                       WHERE later.hook_rowid>failed.hook_rowid
+                         AND later.event_name IN ('Stop','PreToolUse','PostToolUse',
+                           'PostToolUseFailure','PermissionRequest','PermissionDenied',
+                           'SubagentStart','SubagentStop'))
+                   ORDER BY failed.hook_rowid LIMIT 1
+                 )
+                 SELECT (SELECT id FROM accepted),(SELECT received_at FROM accepted),
+                        (SELECT id FROM failure),(SELECT payload_json FROM failure),
+                        (SELECT received_at FROM failure)
+                 FROM invocation WHERE (SELECT hook_rowid FROM invocation_start) IS NOT NULL",
+                belongs_to_accepted_turn("failed")
+            ),
+            params![session_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((accepted_hook_event_id, accepted_at, failure_id, failure_payload, failure_at)) = turn
+    else {
+        return Ok(None);
+    };
+    let bounded = |value: &str| {
+        value
+            .chars()
+            .take(NATIVE_TURN_TEXT_LIMIT)
+            .collect::<String>()
+    };
+    let failure = match (failure_id, failure_payload, failure_at) {
+        (Some(hook_event_id), Some(payload), Some(observed_at)) => {
+            let payload = serde_json::from_str::<serde_json::Value>(&payload)
+                .unwrap_or(serde_json::Value::Null);
+            let provider_error = payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let details = payload.get("error_details").and_then(|value| match value {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(text) => Some(bounded(text)),
+                other => Some(bounded(&other.to_string())),
+            });
+            Some(NativeTurnFailureDto {
+                hook_event_id,
+                kind: NativeTurnFailureKind::from_provider_error(provider_error),
+                provider_error: bounded(provider_error),
+                details,
+                observed_at,
+            })
+        }
+        _ => None,
+    };
+    Ok(Some(NativeTurnDto {
+        accepted_hook_event_id,
+        accepted_at,
+        failure,
+    }))
+}
+
+/// The session's newest report from its exact current generation and latest
+/// invocation, unless a durable supersession retired it or a trusted accepted
+/// turn followed it. Its consumption is the stored workflow fact, not
+/// acceptance.
+fn latest_invocation_report(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<serde_json::Value>> {
+    let report: Option<String> = connection
+        .query_row(
+            &format!(
+                "WITH {CURRENT_TURN_HOOKS_SQL}
+                 SELECT json_object('id',result.id,'outcome',result.outcome,
+                          'created_at',result.created_at,'consumed_at',result.consumed_at)
+                 FROM role_results result
+                 JOIN sessions s ON s.id=result.session_id
+                   AND s.role_generation_id=result.role_generation_id
+                 WHERE s.id=?1
+                   AND result.created_at>=COALESCE((SELECT MAX(invocation.created_at)
+                     FROM resume_invocations invocation WHERE invocation.session_id=s.id),
+                     s.created_at)
+                   AND NOT EXISTS(SELECT 1 FROM role_result_supersessions superseded
+                                  WHERE superseded.role_result_id=result.id)
+                   AND NOT EXISTS(SELECT 1 FROM accepted
+                     WHERE julianday(accepted.received_at)>julianday(result.created_at))
+                 ORDER BY result.created_at DESC,result.rowid DESC LIMIT 1"
+            ),
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    report
+        .map(|report| serde_json::from_str(&report).context("parse latest invocation report"))
+        .transpose()
+}
+
+/// The generic wait the provider announced in the session's current turn, if
+/// it still stands: the first supported Notification after the newest
+/// accepted turn or turn-ending hook. A notification names no tool call, so
+/// other tool or subagent activity never retires it; later reminders keep the
+/// first one's identity, and an unsupported notification type announces
+/// nothing.
+fn native_prompt(connection: &Connection, session_id: &str) -> Result<Option<NativePromptDto>> {
+    let prompt: Option<(String, String, String)> = connection
+        .query_row(
+            &format!(
+                "WITH {CURRENT_TURN_HOOKS_SQL},
+                 wait_start AS (
+                   SELECT COALESCE(MAX(ending.hook_rowid),0) AS hook_rowid FROM current_hooks ending
+                   WHERE ending.event_name IN ('UserPromptSubmit','Stop','StopFailure','SessionEnd')
+                     AND {}
+                 )
+                 SELECT prompt.id,json_extract(prompt.payload_json,'$.notification_type'),
+                        prompt.received_at
+                 FROM current_hooks prompt JOIN invocation ON invocation.status='running'
+                 WHERE prompt.event_name='Notification' AND json_valid(prompt.payload_json)
+                   AND json_extract(prompt.payload_json,'$.notification_type') IN (
+                     'permission_prompt','elicitation_dialog','elicitation_url_dialog',
+                     'agent_needs_input')
+                   AND prompt.hook_rowid>(SELECT hook_rowid FROM wait_start)
+                   AND {}
+                 ORDER BY prompt.hook_rowid LIMIT 1",
+                belongs_to_accepted_turn("ending"),
+                belongs_to_accepted_turn("prompt")
+            ),
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((hook_event_id, kind, observed_at)) = prompt else {
+        return Ok(None);
+    };
+    Ok(Some(NativePromptDto {
+        hook_event_id,
+        kind: kind.parse().map_err(|error: String| anyhow!(error))?,
+        observed_at,
+    }))
+}
+
 const TASK_CONTENT_RECORD_LIMIT: usize = 50;
 const TASK_CONTENT_BYTE_LIMIT: usize = 512 * 1024;
 
 /// Changes whenever the current attempt gains a report, its review state
-/// changes or rework feedback is recorded; the dashboard refetches the task
-/// content when it differs.
+/// changes, rework feedback is recorded or a report is superseded; the
+/// dashboard refetches the task content when it differs.
 const TASK_CONTENT_REVISION_SQL: &str = "(SELECT COUNT(*)||':'||COALESCE(MAX(rr.created_at),'')
       FROM role_results rr JOIN role_generations rg ON rg.id=rr.role_generation_id
       WHERE rg.attempt_id=a.id)
     ||'|'||(SELECT COUNT(*)||':'||COALESCE(MAX(r.updated_at),'') FROM review_requests r WHERE r.attempt_id=a.id)
-    ||'|'||(SELECT COUNT(*) FROM rework_intents ri WHERE ri.new_attempt_id=a.id)";
+    ||'|'||(SELECT COUNT(*) FROM rework_intents ri WHERE ri.new_attempt_id=a.id)
+    ||'|'||(SELECT COUNT(*) FROM role_result_supersessions superseded
+      JOIN role_generations superseded_generation
+        ON superseded_generation.id=superseded.role_generation_id
+      WHERE superseded_generation.attempt_id=a.id)";
 
 /// Readable plans, agent reports and rework feedback for a task's current
 /// attempt, oldest first. Only presentation text is returned: no metadata
@@ -5312,11 +5531,19 @@ pub fn task_content(store: &Store, task_id: &str) -> Result<serde_json::Value> {
             "SELECT rr.id,rr.created_at,rg.role,rr.outcome,rr.summary,
                     CASE WHEN json_type(rr.metadata_json,'$.plan')='text'
                          THEN json_extract(rr.metadata_json,'$.plan') END,
-                    json_extract(rr.metadata_json,'$.review_kind')
+                    json_extract(rr.metadata_json,'$.review_kind'),
+                    superseded.superseding_hook_event_id,superseded.created_at
              FROM role_results rr JOIN role_generations rg ON rg.id=rr.role_generation_id
+             LEFT JOIN role_result_supersessions superseded ON superseded.role_result_id=rr.id
              WHERE rg.attempt_id=?1 ORDER BY rr.created_at,rr.id",
         )?;
         let rows = statement.query_map(params![attempt_id], |row| {
+            let superseded_by_native_turn = row
+                .get::<_, Option<String>>(7)?
+                .zip(row.get::<_, Option<String>>(8)?)
+                .map(|(hook_event_id, superseded_at)| {
+                    serde_json::json!({"hook_event_id":hook_event_id,"superseded_at":superseded_at})
+                });
             Ok(serde_json::json!({
                 "kind":"report",
                 "id":row.get::<_, String>(0)?,
@@ -5326,6 +5553,7 @@ pub fn task_content(store: &Store, task_id: &str) -> Result<serde_json::Value> {
                 "summary":row.get::<_, String>(4)?,
                 "plan":row.get::<_, Option<String>>(5)?,
                 "review_kind":row.get::<_, Option<String>>(6)?,
+                "superseded_by_native_turn":superseded_by_native_turn,
             }))
         })?;
         for row in rows {
@@ -6208,9 +6436,11 @@ fn blocker_started_at(
             .optional()?
             .flatten())
     };
-    if let Some(at) = first(
-        "SELECT MIN(created_at) FROM permission_requests WHERE attempt_id=?1 AND state='pending'",
-    )? {
+    let actionable_permission_since = format!(
+        "SELECT MIN(pr.created_at) FROM permission_requests pr WHERE pr.attempt_id=?1 AND {}",
+        crate::permissions::ACTIONABLE_REQUEST_SQL
+    );
+    if let Some(at) = first(&actionable_permission_since)? {
         return Ok(Some(at));
     }
     if task.attention != "none" {
@@ -6424,6 +6654,8 @@ impl AttentionSources<'_> {
         items.extend(self.restore_hold_item());
         items.extend(self.coordinator_deferral_item());
         items.extend(self.recovery_items());
+        items.extend(self.native_turn_failure_items());
+        items.extend(self.native_prompt_items());
         items.extend(self.setup_items());
         items.extend(self.continuation_items());
         let task_items = self
@@ -6441,7 +6673,7 @@ impl AttentionSources<'_> {
     fn permission_items(&self) -> impl Iterator<Item = AttentionItem> + '_ {
         self.permission_requests
             .iter()
-            .filter(|request| request.state == "pending")
+            .filter(|request| request.actionable)
             .map(|request| AttentionItem {
                 id: format!("permission_request:{}", request.id),
                 category: AttentionCategory::Permission,
@@ -7002,6 +7234,100 @@ impl AttentionSources<'_> {
             })
     }
 
+    /// One item per failed turn of a still-open session of a task's current
+    /// attempt. The item routes to agent output; it grants no retry and records
+    /// no verdict, and a later turn or activity removes it.
+    fn native_turn_failure_items(&self) -> impl Iterator<Item = AttentionItem> + '_ {
+        self.sessions.iter().filter_map(|session| {
+            let failure = session.pointer("/native_turn/failure")?;
+            let hook_event_id = json_text(failure, "hook_event_id")?;
+            if json_text(session, "status") != Some("running") {
+                return None;
+            }
+            let attempt_id = json_text(session, "attempt_id")?;
+            let task = self.task_with_active_attempt(attempt_id)?;
+            let role = json_text(session, "role").and_then(|role| role.parse::<RoleKind>().ok());
+            Some(AttentionItem {
+                id: format!("native_turn_failure:{hook_event_id}"),
+                category: AttentionCategory::Blocked,
+                title: format!(
+                    "{}'s turn stopped with a provider error",
+                    role.map_or("The agent", RoleKind::label)
+                ),
+                reason: format!(
+                    "The provider ended the agent's turn ({}). The session is still open, and nothing was retried or switched to another model. Open agent output to see the error and choose the next step.",
+                    native_turn_failure_reason(json_text(failure, "kind").unwrap_or("unknown"))
+                ),
+                task_title: Some(task.title.clone()),
+                role,
+                action: AttentionActionKind::OpenAgentOutput.into(),
+                target: Some(AttentionTarget::Session {
+                    project_id: task.project_id.clone(),
+                    task_id: task.id.clone(),
+                    attempt_id: attempt_id.to_owned(),
+                    session_id: json_text(session, "id")?.to_owned(),
+                    role_generation_id: json_text(session, "role_generation_id")?.to_owned(),
+                }),
+                held_tasks: Vec::new(),
+                details: json_text(failure, "provider_error")
+                    .map(|error| format!("Provider error: {error}")),
+            })
+        })
+    }
+
+    /// One item per standing generic wait of a still-open session of a task's
+    /// current attempt. It only routes to agent output; while the same session
+    /// has an actionable application request, that request's item already
+    /// leads there and this one is withheld.
+    fn native_prompt_items(&self) -> impl Iterator<Item = AttentionItem> + '_ {
+        self.sessions.iter().filter_map(|session| {
+            let prompt = session.get("native_prompt")?;
+            let hook_event_id = json_text(prompt, "hook_event_id")?;
+            let kind = json_text(prompt, "kind")?.parse::<NativePromptKind>().ok()?;
+            let session_id = json_text(session, "id")?;
+            if json_text(session, "status") != Some("running")
+                || self
+                    .permission_requests
+                    .iter()
+                    .any(|request| request.session_id == session_id && request.actionable)
+            {
+                return None;
+            }
+            let attempt_id = json_text(session, "attempt_id")?;
+            let task = self.task_with_active_attempt(attempt_id)?;
+            let role = json_text(session, "role").and_then(|role| role.parse::<RoleKind>().ok());
+            Some(AttentionItem {
+                id: format!("native_prompt:{hook_event_id}"),
+                category: AttentionCategory::Blocked,
+                title: format!(
+                    "{} is waiting in its terminal",
+                    role.map_or("The agent", RoleKind::label)
+                ),
+                reason: format!(
+                    "{} LLMRelay cannot see or answer this prompt itself. Open agent output to respond there.",
+                    match kind {
+                        NativePromptKind::PermissionPrompt => "The agent's terminal is asking for a permission, for example a network or tool approval.",
+                        NativePromptKind::ElicitationDialog => "A tool connected to the agent is asking for input in its terminal.",
+                        NativePromptKind::ElicitationUrlDialog => "A tool connected to the agent asks you to open a link from its terminal.",
+                        NativePromptKind::AgentNeedsInput => "The agent's terminal says it needs your input.",
+                    }
+                ),
+                task_title: Some(task.title.clone()),
+                role,
+                action: AttentionActionKind::OpenAgentOutput.into(),
+                target: Some(AttentionTarget::Session {
+                    project_id: task.project_id.clone(),
+                    task_id: task.id.clone(),
+                    attempt_id: attempt_id.to_owned(),
+                    session_id: session_id.to_owned(),
+                    role_generation_id: json_text(session, "role_generation_id")?.to_owned(),
+                }),
+                held_tasks: Vec::new(),
+                details: None,
+            })
+        })
+    }
+
     fn task(&self, task_id: &str) -> Option<&TaskDto> {
         self.tasks.iter().find(|task| task.id == task_id)
     }
@@ -7252,6 +7578,23 @@ fn active_attempt_id(task: &TaskDto) -> Option<&str> {
     task.active_attempt
         .as_ref()
         .and_then(|attempt| json_text(attempt, "id"))
+}
+
+fn native_turn_failure_reason(kind: &str) -> &'static str {
+    match kind {
+        "rate_limit" => "the provider's rate limit was reached",
+        "overloaded" => "the model was overloaded",
+        "server_error" => "the provider's service returned an error",
+        "billing_error" => "the account's usage limit was reached",
+        "authentication_failed" | "oauth_org_not_allowed" | "cloud_credential_error" => {
+            "the provider could not authenticate the session"
+        }
+        "account_on_hold" | "verification_required" => "the provider account needs attention",
+        "invalid_request" => "the provider rejected the request",
+        "model_not_found" => "the selected model is unavailable",
+        "max_output_tokens" => "the response reached its output limit",
+        _ => "the provider did not say why",
+    }
 }
 
 fn json_text<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {

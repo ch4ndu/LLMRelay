@@ -475,7 +475,7 @@ fn validate_compiled(
     selector: &Selector,
     contract: &RoleContract,
 ) -> Result<(), ()> {
-    let (native, launch, resume, credential) = match provider {
+    let (native, launch, resume, credential, hook) = match provider {
         Provider::Codex => {
             if selector.exact_version != crate::providers::codex::EXACT_CODEX_VERSION
                 || selector.exact_version != CODEX_EXACT_VERSION
@@ -491,6 +491,7 @@ fn validate_compiled(
                 crate::providers::codex::LAUNCH_CONTRACT_REVISION,
                 crate::providers::codex::RESUME_CONTRACT_REVISION,
                 crate::providers::codex::CREDENTIAL_CONTRACT_REVISION,
+                crate::providers::CODEX_HOOK_REVISION,
             )
         }
         Provider::Claude => (
@@ -498,12 +499,13 @@ fn validate_compiled(
             crate::providers::claude::LAUNCH_CONTRACT_REVISION,
             crate::providers::claude::RESUME_CONTRACT_REVISION,
             crate::providers::claude::CREDENTIAL_CONTRACT_REVISION,
+            crate::providers::CLAUDE_HOOK_REVISION,
         ),
     };
     if contract.launch_revision != launch
         || contract.resume_revision != resume
         || contract.native_policy_revision != native
-        || contract.hook_revision != crate::providers::HOOK_REVISION
+        || contract.hook_revision != hook
         || contract.credential_revision != credential
         || contract.evidence_revision != crate::store::CAPABILITY_PROOF_REVISION
         || contract

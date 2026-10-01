@@ -20,17 +20,23 @@ import {
   type LiveStatus,
   startLiveState,
 } from "./liveState";
-import type {
-  AppState,
-  AttentionItem,
-  AttentionTarget,
-  CmuxKeyboardControlAction,
-  CmuxSessionSurface,
-  Project,
-  Task,
-  TaskAction,
-  TripSetupState,
+import {
+  type AppState,
+  type AttentionItem,
+  type AttentionTarget,
+  type CmuxKeyboardControlAction,
+  type CmuxSessionSurface,
+  type PermissionRequest,
+  type Project,
+  roleLabel,
+  type Task,
+  type TaskAction,
+  type TripSetupState,
 } from "./types";
+import {
+  nativePromptLabel,
+  nativeTurnFailureLabel,
+} from "./components/SessionTree";
 import {
   attentionFocusElement,
   attentionTargetProblem,
@@ -55,6 +61,130 @@ const pages: Array<{ id: Page; label: string; icon: string }> = [
   { id: "history", label: "History", icon: "◴" },
   { id: "diagnostics", label: "Diagnostics", icon: "⚙" },
 ];
+export type Appearance = "system" | "light" | "dark";
+const appearanceKey = "llmrelay.appearance";
+const isAppearance = (value: unknown): value is Appearance =>
+  value === "system" || value === "light" || value === "dark";
+
+export function storedAppearance(): Appearance {
+  try {
+    const value = localStorage.getItem(appearanceKey);
+    return isAppearance(value) ? value : "system";
+  } catch {
+    return "system";
+  }
+}
+
+const systemPrefersDark = () =>
+  typeof window.matchMedia === "function" &&
+  window.matchMedia("(prefers-color-scheme: dark)").matches;
+
+export function applyAppearance(appearance: Appearance): void {
+  document.documentElement.dataset.theme = appearance === "dark" ||
+      (appearance === "system" && systemPrefersDark())
+    ? "dark"
+    : "light";
+}
+
+type BrowserAlerts = "unavailable" | "off" | "on" | "blocked" | "failed";
+const browserAlertHints: Record<BrowserAlerts, string> = {
+  unavailable:
+    "This browser cannot show notifications here, so waiting items appear only at the top of the page.",
+  off:
+    "Waiting items always appear at the top of the page. Browser notifications are optional.",
+  on:
+    "Browser notifications are on for new waits while LLMRelay is in the background, until this page is reloaded. A notification never approves or runs anything.",
+  blocked:
+    "Browser notifications are blocked for this site, so waiting items appear only at the top of the page.",
+  failed:
+    "This browser could not show a notification, so waiting items appear only at the top of the page.",
+};
+const notificationApi = () =>
+  "Notification" in window ? window.Notification : undefined;
+const browserAlertsFor = (permission: NotificationPermission): BrowserAlerts =>
+  permission === "granted" ? "on" : permission === "denied" ? "blocked" : "off";
+const pageFocused = () =>
+  document.visibilityState === "visible" && document.hasFocus();
+
+/** Something that needs you now, keyed by its exact request or hook event. */
+interface WaitNotice {
+  key: string;
+  title: string;
+  detail: string;
+  action: string;
+  target: AttentionTarget;
+}
+const permissionWait = (
+  state: AppState,
+  request: PermissionRequest,
+): WaitNotice => ({
+  key: `permission:${request.id}`,
+  title: `${roleLabel(request.role)} is waiting for your approval`,
+  detail: `${
+    state.tasks.find((task) => task.id === request.task_id)?.title || "A task"
+  } · wants to use ${request.tool_name}`,
+  action: "Review approval request",
+  target: {
+    kind: "permission_request",
+    project_id: request.project_id,
+    task_id: request.task_id,
+    attempt_id: request.attempt_id,
+    session_id: request.session_id,
+    request_id: request.id,
+    request_revision: request.revision,
+  },
+});
+function currentWaits(state: AppState): WaitNotice[] {
+  const permissions = state.permission_requests
+    .filter((request) => request.actionable)
+    .map((request) => permissionWait(state, request));
+  const sessions = state.active_sessions
+    .filter((session) => !["exited", "launch_failed"].includes(session.status))
+    .flatMap((session) => {
+      const task = state.tasks.find((item) => item.id === session.task_id);
+      const owner = task?.title || "Project setup";
+      const target: AttentionTarget = {
+        kind: "session",
+        project_id: task?.project_id ||
+          state.trip_setups?.find((setup) =>
+            setup.setup_operation_id === session.setup_operation_id
+          )?.project_id || "",
+        task_id: session.task_id,
+        attempt_id: session.attempt_id,
+        session_id: session.id,
+        role_generation_id: session.role_generation_id,
+      };
+      const waits: WaitNotice[] = [];
+      const failure = session.native_turn?.failure;
+      if (failure) {
+        waits.push({
+          key: `turn_failure:${session.id}:${failure.hook_event_id}`,
+          title: `${roleLabel(session.role)}'s latest turn stopped: ${
+            nativeTurnFailureLabel[failure.kind]
+          }`,
+          detail:
+            `${owner} · ${failure.provider_error} · The session is still open; nothing is retried automatically.`,
+          action: "Open agent output",
+          target,
+        });
+      }
+      if (session.native_prompt) {
+        waits.push({
+          key: `native_prompt:${session.id}:${session.native_prompt.hook_event_id}`,
+          title: `${roleLabel(session.role)} is ${
+            nativePromptLabel[session.native_prompt.kind]
+          }`,
+          detail:
+            `${owner} · LLMRelay cannot answer it; open the agent's output to answer it there.`,
+          action: "Open agent output",
+          target,
+        });
+      }
+      return waits;
+    });
+  return [...permissions, ...sessions];
+}
+
 const stateLabel = (value: string) => {
   const words = value.replaceAll("_", " ");
   return words[0].toUpperCase() + words.slice(1);
@@ -159,6 +289,18 @@ export function App() {
   const [attentionFocus, setAttentionFocus] = useState<AttentionTarget>();
   const [navigationNotice, setNavigationNotice] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
+  const [appearance, setAppearance] = useState<Appearance>(storedAppearance);
+  const [browserAlerts, setBrowserAlerts] = useState<BrowserAlerts>(() => {
+    const api = notificationApi();
+    // Origin permission granted earlier is not this page's opt-in; only Enable turns alerts on.
+    if (!api) return "unavailable";
+    return api.permission === "denied" ? "blocked" : "off";
+  });
+  // Wait keys already listed per service incarnation; only later ones alert.
+  const announcedWaits = useRef<
+    { incarnation: string; keys: Set<string> } | undefined
+  >(undefined);
+  const openWaitRef = useRef<(wait: WaitNotice) => void>(() => {});
   // Each task keeps the tab it was last shown with while the app is open.
   const [taskTabs, setTaskTabs] = useState<Record<string, TaskTab>>({});
   const pendingSection = useRef<string | undefined>(undefined);
@@ -269,6 +411,51 @@ export function App() {
     element?.focus({ preventScroll: true });
   });
   useEffect(() => {
+    if (appearance !== "system" || typeof window.matchMedia !== "function") {
+      return;
+    }
+    const query = window.matchMedia("(prefers-color-scheme: dark)");
+    const follow = () => applyAppearance("system");
+    query.addEventListener("change", follow);
+    return () => query.removeEventListener("change", follow);
+  }, [appearance]);
+  useEffect(() => {
+    if (!state.incarnation) return;
+    const waits = currentWaits(state);
+    const announced = announcedWaits.current;
+    if (announced?.incarnation !== state.incarnation) {
+      // A first or reset snapshot lists current waits without replaying alerts.
+      announcedWaits.current = {
+        incarnation: state.incarnation,
+        keys: new Set(waits.map((wait) => wait.key)),
+      };
+      return;
+    }
+    const fresh = waits.filter((wait) => !announced.keys.has(wait.key));
+    for (const wait of fresh) announced.keys.add(wait.key);
+    const api = notificationApi();
+    if (!fresh.length || browserAlerts !== "on" || !api || pageFocused()) {
+      return;
+    }
+    for (const wait of fresh) {
+      try {
+        const notification = new api(`LLMRelay: ${wait.title}`, {
+          body:
+            `${wait.detail}\nOpen LLMRelay to act; this notification does not approve or run anything.`,
+          tag: `llmrelay:${state.incarnation}:${wait.key}`,
+        });
+        notification.onclick = () => {
+          window.focus();
+          notification.close();
+          openWaitRef.current(wait);
+        };
+      } catch {
+        setBrowserAlerts("failed");
+        return;
+      }
+    }
+  }, [state, browserAlerts]);
+  useEffect(() => {
     localStorage.setItem("agenticjira.page", page);
   }, [page]);
   useEffect(() => {
@@ -352,6 +539,25 @@ export function App() {
       void refresh();
       return `${item.title} changed before it could open: ${problem} The latest state was requested; nothing was executed.`;
     }
+    // Live output and Agent settings are on the Activity tab; every other
+    // exact destination is on Overview.
+    routeTo(
+      latest,
+      item.title,
+      target,
+      item.action?.kind === "open_agent_output" ||
+        target.kind === "role_settings"
+        ? "activity"
+        : "overview",
+    );
+    return undefined;
+  };
+  const routeTo = (
+    latest: AppState,
+    title: string,
+    target: AttentionTarget,
+    taskTab: TaskTab,
+  ) => {
     if (
       "project_id" in target &&
       latest.projects.some((candidate) => candidate.id === target.project_id)
@@ -373,21 +579,56 @@ export function App() {
         setSelectedId(undefined);
         break;
       default:
-        // Live output and Agent settings are on the Activity tab; every
-        // other exact destination is on Overview.
-        setTaskTabs((current) => ({
-          ...current,
-          [target.task_id]: item.action?.kind === "open_agent_output" ||
-              target.kind === "role_settings"
-            ? "activity"
-            : "overview",
-        }));
+        // A setup session has no task; its output is on the Workspace.
+        if (!latest.tasks.some((task) => task.id === target.task_id)) {
+          setPage("workspace");
+          setSelectedId(undefined);
+          break;
+        }
+        setTaskTabs((current) => ({ ...current, [target.task_id]: taskTab }));
         setSelectedId(target.task_id);
     }
     // A fresh object re-renders, and so re-focuses, a repeated click.
     setAttentionFocus({ ...target });
-    pendingFocus.current = { title: item.title, target };
-    return undefined;
+    pendingFocus.current = { title, target };
+  };
+  // Rechecks the wait against the newest accepted snapshot; opening never acts.
+  const openWait = (wait: WaitNotice) => {
+    setNavigationNotice("");
+    const latest = live.current?.latest() ?? state;
+    const current = currentWaits(latest).find((item) => item.key === wait.key);
+    if (!current) {
+      void refresh();
+      setNavigationNotice(
+        `${wait.title}: this is no longer waiting. The latest state was requested; nothing was executed.`,
+      );
+      return;
+    }
+    routeTo(latest, current.title, current.target, "activity");
+  };
+  openWaitRef.current = openWait;
+  const openPermission = (request: PermissionRequest) =>
+    openWait(permissionWait(state, request));
+  const chooseAppearance = (next: Appearance) => {
+    setAppearance(next);
+    applyAppearance(next);
+    try {
+      localStorage.setItem(appearanceKey, next);
+    } catch {
+      // Unavailable storage keeps the choice for this page only.
+    }
+  };
+  const enableBrowserAlerts = async () => {
+    const api = notificationApi();
+    if (!api) {
+      setBrowserAlerts("unavailable");
+      return;
+    }
+    try {
+      setBrowserAlerts(browserAlertsFor(await api.requestPermission()));
+    } catch {
+      setBrowserAlerts("failed");
+    }
   };
   // A card or header action opens the same exact item the inbox would.
   const openTaskAction = (action: TaskAction, itemId = action.item_id) => {
@@ -437,6 +678,7 @@ export function App() {
     item.target.project_id === project
   ).length;
   const approvalCount = pendingApprovalCount(state);
+  const waits = currentWaits(state);
   const dialogOpen = !!selected;
   return (
     <div className={`app-shell${menuOpen ? " menu-open" : ""}`}>
@@ -465,14 +707,14 @@ export function App() {
                 aria-current={page === item.id ? "page" : undefined}
                 onClick={() => nav(item.id)}
               >
-                <span aria-hidden="true">{item.icon}</span>
-                {item.label}
+                <span className="nav-icon" aria-hidden="true">{item.icon}</span>
+                <span className="nav-label">{item.label}</span>
                 {item.id === "workspace" && attentionCount + approvalCount > 0 && (
-                  <span
-                    className="nav-badge"
-                    aria-label={`${attentionCount + approvalCount} waiting for you`}
-                  >
-                    {attentionCount + approvalCount}
+                  <span className="nav-badge">
+                    <span aria-hidden="true">{attentionCount + approvalCount}</span>
+                    <span className="visually-hidden">
+                      , {attentionCount + approvalCount} waiting for you
+                    </span>
                   </span>
                 )}
               </button>
@@ -485,6 +727,31 @@ export function App() {
             onChanged={refresh}
             onAdded={openSetup}
           />
+          <div className="sidebar-preferences">
+            <label>
+              Appearance
+              <select
+                value={appearance}
+                onChange={(event) => {
+                  if (isAppearance(event.target.value)) {
+                    chooseAppearance(event.target.value);
+                  }
+                }}
+              >
+                <option value="system">System</option>
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+              </select>
+            </label>
+            {browserAlerts === "off" && (
+              <button type="button" onClick={() => void enableBrowserAlerts()}>
+                Enable browser notifications
+              </button>
+            )}
+            <small className="browser-alerts-hint">
+              {browserAlertHints[browserAlerts]}
+            </small>
+          </div>
           <footer
             title={lastSuccessfulAt || state.generated_at
               ? `Last successful update: ${
@@ -572,6 +839,25 @@ export function App() {
             </button>
           </div>
         )}
+        {waits.length > 0 && (
+          <section className="wait-notices" aria-labelledby="wait-notices-title">
+            <h2 id="wait-notices-title">Waiting for you now</h2>
+            <ul aria-live="polite">
+              {waits.map((wait) => (
+                <li key={wait.key}>
+                  <span className="wait-notice-copy">
+                    <strong>{wait.title}</strong>
+                    <small>{wait.detail}</small>
+                  </span>
+                  <button type="button" onClick={() => openWait(wait)}>
+                    {wait.action}
+                    <span className="visually-hidden">: {wait.title}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
         {navigationNotice && (
           <p className="attention-notice" role="status">
             {navigationNotice}
@@ -594,6 +880,7 @@ export function App() {
             onOpenSetup={openSetup}
             onNavigateAttention={navigateAttention}
             onTaskAction={openTaskAction}
+            onOpenPermission={openPermission}
             onViewCmuxSession={viewCmuxSession}
             onSetCmuxKeyboardControl={setCmuxSessionKeyboardControl}
             onDiscardCmuxSurface={discardCmuxSessionSurface}
@@ -615,7 +902,9 @@ export function App() {
               projects={state.projects}
               sessions={state.active_sessions}
               taskActions={state.task_actions}
+              permissionRequests={state.permission_requests}
               onTaskAction={openTaskAction}
+              onOpenPermission={openPermission}
               onOpen={openTask}
               onEdit={(task) => {
                 setEditing(task);
@@ -784,6 +1073,7 @@ export function App() {
             openSetup(projectId);
           }}
           onTaskAction={openTaskAction}
+          onOpenPermission={openPermission}
           onViewCmuxSession={viewCmuxSession}
           onSetCmuxKeyboardControl={setCmuxSessionKeyboardControl}
           onDiscardCmuxSurface={discardCmuxSessionSurface}

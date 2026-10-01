@@ -210,3 +210,9 @@ archived from task detail and listed in History. Restore
 returns them to backlog; it does not repair stale pins or make them Ready.
 
 A plan/code reviewer stopped before a native session identity was recorded cannot be exact-resumed. A resume inspection can record current prepared runtime identity without reserving or launching a provider. Once the stopped session, unchanged profile, current frozen review, supported runtime proof, and remaining review allowance all match, the dashboard offers an explicit fresh accounted replacement. Missing proof or an existing native identity does not use this startup-replacement route. The original delivered call remains spent; final verification and other roles are excluded. A later inspection may append the missing runtime observation to rejection history without rewriting the original rejection.
+
+## Accepted turns, superseded reports and permission waits
+
+A trusted accepted resumed turn can supersede its own prior unconsumed blocked or needs-input report only under exact session, generation, configuration, epoch and invocation fences. Supersession preserves the report and correlated audit; it does not fabricate workflow consumption. Releasing a matching resume-failed hold, advancing the task version and retiring invalidated transition proposals occur in one transaction. Independent committed controls and still-current blockers remain binding. Merely starting a process or sending input cannot perform this reconciliation.
+
+Permission decisions, response delivery, native resolution, role report submission, verification and human acceptance remain separate. A native notification or failed turn does not consume a review call or imply a role verdict. See [operations](OPERATIONS.md#permission-notices-and-appearance) and the [signal matrix](PERMISSION_SIGNAL_MATRIX.md).
