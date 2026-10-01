@@ -419,15 +419,18 @@ reuse old qualification evidence to bypass these checks.
 The database commands operate on the instance selected by `--data-dir`. Current
 schema only is supported: they do not upgrade an earlier installation. Fresh
 service initialization still creates the current schema. Service start, under
-the instance lock, upgrades supported existing schemas 31, 32 and 33 to schema
-34 through the existing migration transactions. Unsupported existing schemas,
+the instance lock, upgrades supported existing schemas 31, 32, 33 and 34 to schema
+35 through the existing migration transactions. Unsupported existing schemas,
 including schema 30 and newer unknown schemas, are refused. Each failed
 migration rolls back its own transaction. Schema 32 records final-repair receipt
 provenance; schema 33 records native-resolution provenance; schema 34 adds the
 exact submitted guidance text and digest while preserving the original body.
-Existing receipts retain their recorded values. Automatic pre-migration restore
-points are outside the selected scope; database observation and backup commands
-do not grant upgrade authority.
+Schema 35 adds durable provider failure holds. Existing receipts retain their
+recorded values. A schema-34 backup cannot be restored by the schema-35 build:
+backup verification and restore still require the executable's exact current
+schema. Automatic pre-upgrade restore points and backward-schema recovery remain
+pending in the deferred hardening program; this migration does not provide them.
+Database observation and backup commands do not grant upgrade authority.
 
 ```sh
 llmrelay database --data-dir <ABSOLUTE_INSTANCE_PATH> inspect

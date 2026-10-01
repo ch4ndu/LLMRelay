@@ -24,6 +24,13 @@ pub(crate) struct ManagerSafeIdleBoundary {
     pub stop_event_rowid: i64,
 }
 
+/// Only a human replacement interrupts the old role and retires its provider holds.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SwitchOrigin {
+    HumanReplacement,
+    ManagerChange,
+}
+
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const MAX_GUIDANCE_INPUT_BYTES: usize = 64 * 1024;
@@ -309,7 +316,7 @@ impl RoleService {
                 "requested_settings_revision":settings_revision
             }),
             expected_task_version,
-            false,
+            SwitchOrigin::ManagerChange,
             safe_idle,
         )
     }
@@ -477,7 +484,7 @@ impl RoleService {
             snapshot_id,
             handoff,
             expected_task_version,
-            true,
+            SwitchOrigin::HumanReplacement,
             None,
         )
     }
@@ -493,7 +500,7 @@ impl RoleService {
         snapshot_id: &str,
         handoff: serde_json::Value,
         expected_task_version: i64,
-        interrupt_old: bool,
+        origin: SwitchOrigin,
         safe_idle: Option<&ManagerSafeIdleBoundary>,
     ) -> Result<String> {
         if !handoff.is_object() || serde_json::to_vec(&handoff)?.len() > 256 * 1024 {
@@ -839,11 +846,20 @@ impl RoleService {
                 params![target_phase, now, attempt],
             )?;
         }
+        if origin == SwitchOrigin::HumanReplacement {
+            crate::store::retire_replaced_role_holds(
+                &transaction,
+                old_generation,
+                &id,
+                operation_id,
+                &now,
+            )?;
+        }
         let result = serde_json::json!({"intent_id":id,"state":"stopping_old","supplemental_review":supplemental_review.map(|(kind,_)|kind)});
         transaction.execute("INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at) VALUES(?1,'human_control','role_switch',?2,?3,?4)",params![operation_id,request_hash,result.to_string(),now])?;
         transaction.commit()?;
         drop(connection);
-        if interrupt_old {
+        if origin == SwitchOrigin::HumanReplacement {
             let session = {
                 let connection = self.store.lock()?;
                 connection.query_row(
@@ -1003,6 +1019,17 @@ impl RoleService {
                 "engine_generated":true
             }));
         }
+        let held_queued = |held: &crate::store::ProviderFailureHeld| {
+            serde_json::json!({"action":"guidance_queued","guidance_id":guidance_id,"session_id":session,"attempt_id":attempt,
+                "state":"queued","reason":"provider_failure_hold","hold_id":held.hold_id,"engine_generated":engine_generated})
+        };
+        let held = {
+            let connection = self.store.lock()?;
+            crate::store::provider_failure_hold_for_session(&connection, &session)?
+        };
+        if let Some(held) = held {
+            return Ok(held_queued(&held));
+        }
         if !self.supervisor.native_idle_ready(&session)? {
             return Ok(
                 serde_json::json!({"action":"guidance_queued","guidance_id":guidance_id,"session_id":session,"attempt_id":attempt,"state":"queued","reason":"native_hook_or_tool_descendants_active","engine_generated":engine_generated}),
@@ -1010,29 +1037,41 @@ impl RoleService {
         }
         let submitted = guidance_submission(&provider, capability_identity.as_deref(), &body)?;
         let submitted_digest = crate::store::json_hash(&submitted)?;
-        let (lease, _) = match self.supervisor.acquire_input(
+        let (lease, _) = match self.supervisor.acquire_input_for(
+            crate::store::InputLeasePurpose::AutomatedGuidance,
             &session,
             &format!("guidance:{guidance_id}"),
             30,
         ) {
             Ok(lease) => lease,
             Err(error) => {
+                if let Some(held) = crate::store::ProviderFailureHeld::in_error(&error) {
+                    return Ok(held_queued(held));
+                }
                 return Ok(
                     serde_json::json!({"action":"guidance_queued","guidance_id":guidance_id,"session_id":session,"attempt_id":attempt,
                 "state":"queued","reason":"input_owned_or_process_not_ready","detail":format!("{error:#}"),"engine_generated":engine_generated}),
-                )
+                );
             }
         };
         // All work after acquisition stays in this scope so the exact lease is released on every exit.
         let mut reserved = false;
         let delivery = (|| -> Result<Option<serde_json::Value>> {
-            reserved = self.store.reserve_guidance_delivery(
+            reserved = match self.store.reserve_guidance_delivery(
                 guidance_id,
                 &session,
                 &transcript_epoch,
                 resume_invocation.as_deref(),
                 &submitted,
-            )?;
+            ) {
+                Ok(reserved) => reserved,
+                Err(error) => {
+                    return match crate::store::ProviderFailureHeld::in_error(&error) {
+                        Some(held) => Ok(Some(held_queued(held))),
+                        None => Err(error),
+                    }
+                }
+            };
             if !reserved {
                 let connection = self.store.lock()?;
                 let held: bool = connection.query_row(
@@ -1146,7 +1185,7 @@ impl RoleService {
     pub fn retry_ready_guidance(&self) -> Result<Vec<serde_json::Value>> {
         let sessions = {
             let connection = self.store.lock()?;
-            let mut statement=connection.prepare(&format!("SELECT DISTINCT s.id,rg.attempt_id FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id JOIN guidance_messages g ON g.role_generation_id=s.role_generation_id WHERE s.status='running' AND s.readiness_state='idle_candidate' AND g.state='queued' AND {}", crate::coordinator::coordinator_hold_absent("rg.attempt_id")))?;
+            let mut statement=connection.prepare(&format!("SELECT DISTINCT s.id,rg.attempt_id FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id JOIN guidance_messages g ON g.role_generation_id=s.role_generation_id WHERE s.status='running' AND s.readiness_state='idle_candidate' AND g.state='queued' AND {} AND NOT {}", crate::coordinator::coordinator_hold_absent("rg.attempt_id"), crate::store::provider_failure_hold_restricts("rg.attempt_id", "rg.role", "rg.lane_id")))?;
             let rows = statement
                 .query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))

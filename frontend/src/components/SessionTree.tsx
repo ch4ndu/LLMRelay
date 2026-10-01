@@ -1,6 +1,6 @@
-import { TechnicalDetails } from "./ErrorNotice";
+import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import { useEffect, useRef, useState } from "react";
-import { operationId } from "../api";
+import { ApiError, command, operationId } from "../api";
 import {
   cmuxNewestSurface,
   cmuxOutcomeWithDurableSurface,
@@ -18,6 +18,9 @@ import {
   type NativePrompt,
   type NativeTurnFailureKind,
   type PermissionRequest,
+  type ProviderFailureHold,
+  type ProviderFailureHoldRelease,
+  type Role,
   roleLabel,
   type Session,
 } from "../types";
@@ -47,6 +50,7 @@ export interface SessionAccess {
   discard: (sessionId: string) => Promise<void>;
   /** Hides the output locally. The session and any keyboard control continue. */
   close: (sessionId: string) => void;
+  refresh: () => void;
 }
 
 /**
@@ -249,7 +253,17 @@ export function useSessionAccess(
       return rest;
     });
 
-  return { routes, discarding, routeFor, view, take, release, discard, close };
+  return {
+    routes,
+    discarding,
+    routeFor,
+    view,
+    take,
+    release,
+    discard,
+    close,
+    refresh: handlers.onChanged,
+  };
 }
 
 export const nativeTurnFailureLabel: Record<NativeTurnFailureKind, string> = {
@@ -274,6 +288,120 @@ export const nativePromptLabel: Record<NativePrompt["kind"], string> = {
   elicitation_url_dialog: "asking you to open a link in its own terminal",
   agent_needs_input: "waiting for your input in its own terminal",
 };
+
+const releaseOutcomeMessage: Record<ProviderFailureHoldRelease, string> = {
+  released:
+    "Hold released. The agent was not restarted or sent anything; automatic work that is already allowed may continue at a later step.",
+  already_released:
+    "This hold was already released, so nothing changed. Refresh to see the current state.",
+  expired:
+    "This hold's cooldown had already ended, so nothing changed. Automatic work that is already allowed may continue at a later step.",
+  superseded:
+    "This hold no longer applies because the agent accepted a newer turn, the role was replaced, or the task moved on. Nothing changed.",
+};
+
+const releaseOutcomes: ProviderFailureHoldRelease[] = [
+  "released",
+  "already_released",
+  "expired",
+  "superseded",
+];
+
+function ProviderFailureHoldNotice(
+  { hold, role, onReleased }: {
+    hold: ProviderFailureHold;
+    role: Role;
+    onReleased: () => void;
+  },
+) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [outcome, setOutcome] = useState<ProviderFailureHoldRelease>();
+  const retry = useRef<{ body: string; id: string } | undefined>(undefined);
+  const release = async () => {
+    const request = {
+      task_id: hold.task_id,
+      attempt_id: hold.attempt_id,
+      session_id: hold.session_id,
+      hold_id: hold.id,
+      expected_task_version: hold.task_version,
+    };
+    const body = JSON.stringify(request);
+    // An uncertain release is retried under its first operation ID.
+    const id = retry.current?.body === body ? retry.current.id : operationId();
+    retry.current = { body, id };
+    setBusy(true);
+    setError("");
+    try {
+      const response = await command({
+        kind: "release_provider_failure_hold",
+        operation_id: id,
+        ...request,
+      });
+      const state = releaseOutcomes.find((value) =>
+        value === response.result.state
+      );
+      if (!state) {
+        throw new Error(
+          "The service returned an unsupported provider hold result. Refresh the dashboard and check the hold before retrying.",
+        );
+      }
+      retry.current = undefined;
+      setOutcome(state);
+      onReleased();
+    } catch (cause) {
+      if (!(cause instanceof ApiError && cause.ambiguous)) {
+        retry.current = undefined;
+      }
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="session-provider-hold warning" role="status">
+      <strong>{roleLabel(role)} is on hold after a provider error</strong>
+      <p>
+        The provider reported a failure: {nativeTurnFailureLabel[hold.kind]}.{" "}
+        {hold.expires_at
+          ? `LLMRelay is pausing automatic work for this role for a short cooldown of its own, until about ${
+            new Date(hold.expires_at).toLocaleTimeString()
+          }. This is not the provider's reset time.`
+          : "This needs your action: LLMRelay will not start, resume or send input to this role while the hold stands. Fix the problem first."}
+      </p>
+      <p>
+        Release provider hold lets automatic work that is already allowed
+        continue at a later step. It does not restart the agent or send it
+        anything.
+      </p>
+      {outcome
+        ? <p>{releaseOutcomeMessage[outcome]}</p>
+        : (
+          <div className="button-row">
+            <button disabled={busy} onClick={() => void release()}>
+              {busy ? "Releasing provider hold…" : "Release provider hold"}
+            </button>
+          </div>
+        )}
+      {error && <ErrorNotice error={error} />}
+      <TechnicalDetails>
+        <p>
+          {hold.kind} · {hold.attribution} attribution · held since{" "}
+          {new Date(hold.created_at).toLocaleString()}
+          {hold.expires_at
+            ? ` · app cooldown until ${new Date(hold.expires_at).toLocaleString()}`
+            : " · no app cooldown; needs your action"}
+        </p>
+        <p>
+          hold {hold.id} · failure hook {hold.failure_hook_event_id}
+          {hold.accepted_hook_event_id
+            ? ` · accepted turn hook ${hold.accepted_hook_event_id}`
+            : ""}
+        </p>
+      </TechnicalDetails>
+    </div>
+  );
+}
 
 const reportSupersededByTurn = (session: Session) => {
   const report = session.latest_invocation_report;
@@ -533,6 +661,14 @@ export function SessionTree(
                   </TechnicalDetails>
                 </div>
               )}
+              {session.provider_failure_holds?.map((hold) => (
+                <ProviderFailureHoldNotice
+                  key={hold.id}
+                  hold={hold}
+                  role={session.role}
+                  onReleased={access.refresh}
+                />
+              ))}
               {running && session.native_prompt && (
                 <div className="session-native-prompt warning" role="status">
                   <strong>

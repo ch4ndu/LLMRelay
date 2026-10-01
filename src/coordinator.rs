@@ -4,6 +4,7 @@ use crate::domain::{
     DecisionOwnership, DecisionPrerequisite, DecisionSubject, RoleKind, DECISION_SCHEMA_V1,
 };
 use crate::operations::Application;
+use crate::store::ProviderFailureHeld;
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -159,6 +160,13 @@ fn tick_steps(app: &Application) -> Result<serde_json::Value> {
         };
         let value = match advanced {
             Ok(value) => value,
+            Err(error) if ProviderFailureHeld::in_error(&error).is_some() => {
+                let refreshed = refreshed_attempt_decision(app, &attempt.id)?;
+                if fallback_decision.is_none() {
+                    fallback_decision = refreshed;
+                }
+                continue;
+            }
             Err(error) if format!("{error:#}").contains("capacity") => {
                 let refreshed = refreshed_attempt_decision(app, &attempt.id)?;
                 if fallback_decision.is_none() {
@@ -554,6 +562,7 @@ enum PlanningSelection {
     QuiesceCompletedManager { session_id: String },
     WaitForManagerPlan,
     DispatchManager,
+    ProviderHeld(ProviderFailureHeld),
     ApplyManagerProposal,
     WaitForManagerProposal,
 }
@@ -585,6 +594,7 @@ enum ReviewAction {
         needs_person: bool,
         settings_revision: i64,
     },
+    ProviderHeld(ProviderFailureHeld),
 }
 
 enum ImplementationSelection {
@@ -619,6 +629,7 @@ enum ImplementationSelection {
     },
     FreezeCandidate,
     DispatchImplementer,
+    ProviderHeld(ProviderFailureHeld),
     StopManagerForCandidate,
     WaitForManagerTransition,
 }
@@ -637,6 +648,7 @@ enum ChecksSelection {
     StopManagerForFinalExplorer,
     WaitForFinalExplorerDecision,
     WaitForActivatedExplorer,
+    ProviderHeld(ProviderFailureHeld),
     Complete(ManagerCompletionBoundary),
 }
 
@@ -644,6 +656,7 @@ enum HandoffSelection {
     Complete(ManagerCompletionBoundary),
     WaitForManagerStop { session_id: String },
     DispatchManager,
+    ProviderHeld(ProviderFailureHeld),
     StopManager,
     WaitForManagerHandoff,
 }
@@ -1196,11 +1209,17 @@ fn classify_planning(connection: &Connection, attempt: &Attempt) -> Result<Plann
                 });
             }
         }
-        return Ok(if active_role_on(connection, &attempt.id, "manager")? {
-            PlanningSelection::WaitForManagerPlan
+        return if active_role_on(connection, &attempt.id, "manager")? {
+            Ok(PlanningSelection::WaitForManagerPlan)
         } else {
-            PlanningSelection::DispatchManager
-        });
+            unless_provider_held(
+                connection,
+                attempt,
+                RoleKind::Manager,
+                PlanningSelection::DispatchManager,
+                PlanningSelection::ProviderHeld,
+            )
+        };
     }
     Ok(
         if eligible_manager_transition(connection, attempt, "plan_review")?.is_some() {
@@ -1246,6 +1265,9 @@ fn evaluate_planning(
             RoleKind::Manager,
             "workflow.manager_plan_dispatch_available",
         )?,
+        PlanningSelection::ProviderHeld(held) => {
+            provider_hold_decision(attempt, prerequisites, held)
+        }
         PlanningSelection::ApplyManagerProposal => ready_attempt_decision(
             attempt,
             prerequisites,
@@ -1351,6 +1373,16 @@ fn classify_review(connection: &Connection, attempt: &Attempt) -> Result<ReviewS
         }
         action => action,
     };
+    let action = match action {
+        ReviewAction::Dispatch => unless_provider_held(
+            connection,
+            attempt,
+            role,
+            ReviewAction::Dispatch,
+            ReviewAction::ProviderHeld,
+        )?,
+        action => action,
+    };
     Ok(ReviewSelection { kind, role, action })
 }
 
@@ -1429,6 +1461,7 @@ fn evaluate_review(
             selection.role,
             "workflow.review_dispatch_available",
         )?,
+        ReviewAction::ProviderHeld(held) => provider_hold_decision(attempt, prerequisites, held),
         ReviewAction::WaitForProfileChange {
             boundary,
             message,
@@ -1576,6 +1609,14 @@ fn evaluate_activated_explorer(
             settings_revision,
         )));
     }
+    if let Some(held) = crate::store::provider_failure_hold_on(
+        connection,
+        &attempt.id,
+        RoleKind::Explorer,
+        "default",
+    )? {
+        return Ok(Some(provider_hold_decision(attempt, prerequisites, &held)));
+    }
     decision = role_dispatch_decision(
         connection,
         attempt,
@@ -1602,7 +1643,13 @@ fn classify_implementation(
         return Ok(ImplementationSelection::WaitForManagerStop { session_id });
     }
     if !active_role_on(connection, &attempt.id, "manager")? {
-        return Ok(ImplementationSelection::DispatchManager);
+        return unless_provider_held(
+            connection,
+            attempt,
+            RoleKind::Manager,
+            ImplementationSelection::DispatchManager,
+            ImplementationSelection::ProviderHeld,
+        );
     }
     if attempt.candidate_hash.is_none() {
         let reviewed_lanes = crate::trip::reviewed_parallel_lane_count(connection, &attempt.id)?;
@@ -1620,6 +1667,7 @@ fn classify_implementation(
             }
             let unyielded = lane_state.unyielded;
             if unyielded != 0 {
+                // Only lanes without generation history dispatch here, so no hold names one.
                 if let Some(dispatch) = next_implementation_lane_on(connection, attempt)? {
                     return Ok(ImplementationSelection::DispatchLane {
                         dispatch,
@@ -1644,10 +1692,16 @@ fn classify_implementation(
                 let capsule = lane_state
                     .capsule
                     .ok_or_else(|| anyhow!("integration request is missing its capsule"))?;
-                return Ok(ImplementationSelection::DispatchIntegration {
-                    request_id,
-                    capsule,
-                });
+                return unless_provider_held(
+                    connection,
+                    attempt,
+                    RoleKind::Implementer,
+                    ImplementationSelection::DispatchIntegration {
+                        request_id,
+                        capsule,
+                    },
+                    ImplementationSelection::ProviderHeld,
+                );
             }
         }
         if has_result_on(connection, &attempt.id, "implementer", "candidate_ready")? {
@@ -1662,7 +1716,13 @@ fn classify_implementation(
             );
         }
         if no_configured_lanes && !active_role_on(connection, &attempt.id, "implementer")? {
-            return Ok(ImplementationSelection::DispatchImplementer);
+            return unless_provider_held(
+                connection,
+                attempt,
+                RoleKind::Implementer,
+                ImplementationSelection::DispatchImplementer,
+                ImplementationSelection::ProviderHeld,
+            );
         }
     } else if crate::store::eligible_manager_service_stop(connection, &attempt.id, &attempt.phase)?
         .is_some()
@@ -1844,6 +1904,9 @@ fn evaluate_implementation(
             RoleKind::Implementer,
             "workflow.implementer_dispatch_available",
         )?,
+        ImplementationSelection::ProviderHeld(held) => {
+            provider_hold_decision(attempt, prerequisites, held)
+        }
         ImplementationSelection::StopManagerForCandidate => ready_attempt_decision(
             attempt,
             prerequisites,
@@ -1886,7 +1949,13 @@ fn classify_checks(connection: &Connection, attempt: &Attempt) -> Result<ChecksS
             return Ok(ChecksSelection::WaitForManagerStop { session_id });
         }
         if !active_role_on(connection, &attempt.id, "manager")? {
-            return Ok(ChecksSelection::DispatchConformanceManager);
+            return unless_provider_held(
+                connection,
+                attempt,
+                RoleKind::Manager,
+                ChecksSelection::DispatchConformanceManager,
+                ChecksSelection::ProviderHeld,
+            );
         }
         if crate::store::eligible_manager_service_stop(connection, &attempt.id, &attempt.phase)?
             .is_some()
@@ -1901,7 +1970,13 @@ fn classify_checks(connection: &Connection, attempt: &Attempt) -> Result<ChecksS
                 return Ok(ChecksSelection::WaitForManagerStop { session_id });
             }
             if !active_role_on(connection, &attempt.id, "manager")? {
-                return Ok(ChecksSelection::DispatchFinalExplorerManager);
+                return unless_provider_held(
+                    connection,
+                    attempt,
+                    RoleKind::Manager,
+                    ChecksSelection::DispatchFinalExplorerManager,
+                    ChecksSelection::ProviderHeld,
+                );
             }
             if crate::store::eligible_manager_service_stop(connection, &attempt.id, &attempt.phase)?
                 .is_some()
@@ -2068,6 +2143,7 @@ fn evaluate_checks(
                 "candidate_hash":candidate,
             }),
         ),
+        ChecksSelection::ProviderHeld(held) => provider_hold_decision(attempt, prerequisites, held),
         ChecksSelection::Complete(boundary) => manager_boundary_decision(
             attempt,
             prerequisites,
@@ -2090,7 +2166,13 @@ fn classify_handoff(connection: &Connection, attempt: &Attempt) -> Result<Handof
         return Ok(HandoffSelection::WaitForManagerStop { session_id });
     }
     if !active_role_on(connection, &attempt.id, "manager")? {
-        return Ok(HandoffSelection::DispatchManager);
+        return unless_provider_held(
+            connection,
+            attempt,
+            RoleKind::Manager,
+            HandoffSelection::DispatchManager,
+            HandoffSelection::ProviderHeld,
+        );
     }
     if crate::store::eligible_manager_service_stop(connection, &attempt.id, &attempt.phase)?
         .is_some()
@@ -2136,6 +2218,9 @@ fn evaluate_handoff(
             RoleKind::Manager,
             "workflow.handoff_manager_dispatch_available",
         )?,
+        HandoffSelection::ProviderHeld(held) => {
+            provider_hold_decision(attempt, prerequisites, held)
+        }
         HandoffSelection::StopManager => ready_attempt_decision(
             attempt,
             prerequisites,
@@ -2273,6 +2358,75 @@ fn phase_wait_decision(
         None,
         Vec::new(),
     )
+}
+
+fn unless_provider_held<T>(
+    connection: &Connection,
+    attempt: &Attempt,
+    role: RoleKind,
+    dispatch: T,
+    held: impl FnOnce(ProviderFailureHeld) -> T,
+) -> Result<T> {
+    // Every selection guarded here starts or resumes the role's default lane.
+    let hold = crate::store::provider_failure_hold_on(connection, &attempt.id, role, "default")?;
+    Ok(hold.map_or(dispatch, held))
+}
+
+fn provider_hold_decision(
+    attempt: &Attempt,
+    prerequisites: Vec<DecisionPrerequisite>,
+    held: &ProviderFailureHeld,
+) -> AttemptDecision {
+    let cooldown = held.expires_at.is_some();
+    let mut decision = blocked_attempt_decision(
+        attempt,
+        "workflow.provider_failure_hold",
+        DecisionDisposition::Held,
+        DecisionEvidenceState::Pending,
+        if cooldown {
+            DecisionOwner::Service
+        } else {
+            DecisionOwner::Human
+        },
+        serde_json::json!({
+            "hold_id":held.hold_id,
+            "session_id":held.session_id,
+            "role":held.role,
+            "kind":held.kind,
+            "expires_at":held.expires_at,
+        }),
+        Some(crate::workflow::provider_failure_hold_message(
+            held.role, held.kind, cooldown,
+        )),
+        prerequisites,
+        provider_hold_wait(&attempt.id, held),
+        AttemptDecisionFlow::Skip,
+        Some(DecisionNextAction {
+            operation: "release_provider_failure_hold".into(),
+            enabled: true,
+            owner: DecisionOwner::Human,
+            binding: DecisionActionBinding {
+                session_id: Some(held.session_id.clone()),
+                role: Some(held.role),
+                ..attempt_binding(attempt)
+            },
+            accounting_note: None,
+        }),
+        vec!["release_provider_failure_hold".into()],
+    );
+    decision.explanation.subject.session_id = Some(held.session_id.clone());
+    decision
+}
+
+fn provider_hold_wait(attempt_id: &str, held: &ProviderFailureHeld) -> serde_json::Value {
+    serde_json::json!({
+        "action":"held",
+        "for":"provider_failure_hold",
+        "attempt_id":attempt_id,
+        "hold_id":held.hold_id,
+        "session_id":held.session_id,
+        "role":held.role,
+    })
 }
 
 fn role_dispatch_decision(
@@ -2777,6 +2931,7 @@ fn advance_planning(
                 "session_id":launch.session_id
             }))
         }
+        PlanningSelection::ProviderHeld(held) => Ok(provider_hold_wait(&attempt.id, &held)),
         PlanningSelection::ApplyManagerProposal => {
             Ok(apply_manager_proposal(app, attempt, "plan_review")?
                 .unwrap_or_else(|| waiting(attempt, "manager_plan_and_transition")))
@@ -3020,6 +3175,7 @@ fn advance_implementation(
                 "session_id":launch.session_id,
             }))
         }
+        ImplementationSelection::ProviderHeld(held) => Ok(provider_hold_wait(&attempt.id, &held)),
         ImplementationSelection::StopManagerForCandidate => {
             queue_manager_notice(app, attempt, CANDIDATE_FROZEN_NOTICE, false)?;
             Ok(quiesce_manager_for_obligation(
@@ -3323,6 +3479,7 @@ fn advance_review(
             "attempt_id":attempt.id,
             "role":role,
         })),
+        ReviewAction::ProviderHeld(held) => Ok(provider_hold_wait(&attempt.id, &held)),
         ReviewAction::CloseUnansweredRecheck { request_id } => {
             let now = Utc::now().to_rfc3339();
             let mut connection = app.store.lock()?;
@@ -3875,6 +4032,7 @@ fn advance_checks(
             "attempt_id":attempt.id,
             "candidate_hash":attempt.candidate_hash,
         })),
+        ChecksSelection::ProviderHeld(held) => Ok(provider_hold_wait(&attempt.id, &held)),
         ChecksSelection::Complete(boundary) => {
             if let Some(wait) = advance_manager_boundary(
                 app,
@@ -3961,6 +4119,7 @@ fn advance_handoff(
                 "context":"final_handoff",
             }))
         }
+        HandoffSelection::ProviderHeld(held) => Ok(provider_hold_wait(&attempt.id, &held)),
         HandoffSelection::StopManager | HandoffSelection::WaitForManagerHandoff => {
             let final_review: String = {
                 let connection = app.store.lock()?;
@@ -5310,7 +5469,10 @@ fn advance_one_switch(app: &Application) -> Result<Option<serde_json::Value>> {
                     OR json_extract(c.payload_json,'$.switch_intent_id') IS NOT si.id)
               ))
               AND {}
-            ORDER BY si.created_at LIMIT 1", coordinator_hold_absent("si.attempt_id")),[],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).optional()?
+              AND (si.state!='ready_for_dispatch' OR NOT {})
+            ORDER BY si.created_at LIMIT 1", coordinator_hold_absent("si.attempt_id"),
+            crate::store::provider_failure_hold_restricts("si.attempt_id", "si.role",
+                "(SELECT lane_id FROM role_generations WHERE id=si.old_generation_id)")),[],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).optional()?
     };
     let Some((id, state, handoff, role, attempt)) = intent else {
         return Ok(None);
@@ -5386,6 +5548,11 @@ fn advance_switch_intent(
     };
     let launch = match app.dispatch_switch(id, &prompt) {
         Ok(launch) => launch,
+        Err(error) if ProviderFailureHeld::in_error(&error).is_some() => {
+            return Ok(Some(serde_json::json!({
+                "action":"held","for":"provider_failure_hold","intent_id":id,"attempt_id":attempt,
+            })));
+        }
         Err(error) => {
             return disposition_switch_failure(
                 app,

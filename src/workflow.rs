@@ -5,8 +5,9 @@ use crate::domain::{
     DecisionObservedRevision, DecisionOwner, DecisionOwnership, DecisionPrerequisite,
     DecisionSubject, HumanCommand, NativePromptDto, NativePromptKind, NativeTurnDto,
     NativeTurnFailureDto, NativeTurnFailureKind, OperationResult, PermissionRequestDto, ProjectDto,
-    RestartCandidateResult, RoleKind, StaleRestartCandidateCancellation, TaskAttentionTarget,
-    TaskDto, UnacceptedInputDto, UnacceptedInputKind, UnconfirmedGuidanceAbandonment,
+    ProviderFailureHoldDto, RestartCandidateResult, RoleKind, StaleRestartCandidateCancellation,
+    TaskAttentionTarget, TaskDto, UnacceptedInputDto, UnacceptedInputKind,
+    UnconfirmedGuidanceAbandonment,
 };
 use crate::store::{json_hash, Store};
 use crate::supervisor::GRACEFUL_STOP_SECONDS;
@@ -401,6 +402,9 @@ pub(crate) fn ordinary_control_policy(
     if let Some(attempt_id) = attempt_id {
         if pending_continue(connection, attempt_id, None)? {
             controls.retain(|control| control != "continue");
+        }
+        if crate::store::provider_failure_hold_in_attempt(connection, attempt_id)?.is_some() {
+            controls.retain(|control| control != "retry");
         }
     }
     Ok(controls)
@@ -2438,6 +2442,15 @@ pub fn execute_with_runtime(
                 {
                     bail!("terminal attempts accept only an explicit retry that creates fresh lineage")
                 }
+                if action == "retry" {
+                    if let Some(held) =
+                        crate::store::provider_failure_hold_in_attempt(&transaction, &attempt)?
+                    {
+                        return Err(anyhow::Error::from(held).context(
+                            "retry waits for the provider failure hold to end because it would replace the held work",
+                        ));
+                    }
+                }
                 if action == "stop_manager" {
                     if lifecycle == "awaiting_review" {
                         bail!("awaiting human review preserves final evidence and does not accept manager stop")
@@ -2957,6 +2970,13 @@ pub fn execute_with_runtime(
                     let snapshot = snapshot.ok_or_else(|| {
                         anyhow!("rework requires the exact reviewed accepted snapshot")
                     })?;
+                    if let Some(held) =
+                        crate::store::provider_failure_hold_in_attempt(&transaction, attempt_id)?
+                    {
+                        return Err(anyhow::Error::from(held).context(
+                            "rework waits for the provider failure hold to end because it would replace the held work",
+                        ));
+                    }
                     let scope = current_lineage_scope(&transaction, task_id, &base, config)?;
                     let carry = *carry_plan_approval
                         && plan_hash.is_some()
@@ -3639,6 +3659,38 @@ pub fn execute_with_runtime(
             );
             applied.detail = detail;
             applied
+        }
+        HumanCommand::ReleaseProviderFailureHold {
+            task_id,
+            attempt_id,
+            session_id,
+            hold_id,
+            expected_task_version,
+            ..
+        } => {
+            let disposition = crate::store::release_provider_failure_hold(
+                &transaction,
+                operation_id,
+                task_id,
+                attempt_id,
+                session_id,
+                hold_id,
+                *expected_task_version,
+                &now,
+            )?;
+            let version = if disposition == crate::store::ProviderFailureHoldRelease::Released {
+                bump_task(&transaction, task_id, *expected_task_version, &now)?;
+                expected_task_version + 1
+            } else {
+                *expected_task_version
+            };
+            result(
+                operation_id,
+                "provider_failure_hold",
+                hold_id.clone(),
+                Some(version),
+                disposition.as_str(),
+            )
         }
         HumanCommand::RetryWorkspaceReservation { .. }
         | HumanCommand::CancelWorkspaceReservation { .. }
@@ -4527,6 +4579,8 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
                 serde_json::to_value(native_prompt(&connection, &session_id)?)?;
             session["unaccepted_inputs"] =
                 serde_json::to_value(unaccepted_inputs(&connection, &session_id)?)?;
+            session["provider_failure_holds"] =
+                serde_json::to_value(provider_failure_holds(&connection, &session_id)?)?;
         }
     }
     let controls = json_rows_no_param(&connection, "SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,'kind',kind,'state',state,'payload',json(payload_json),'updated_at',updated_at) FROM controls WHERE state NOT IN ('finished','cancelled') ORDER BY created_at")?;
@@ -5473,7 +5527,7 @@ const NATIVE_TURN_TEXT_LIMIT: usize = 2048;
 /// CTEs over one session's current invocation: its trusted hooks after that
 /// invocation's own SessionStart, and the newest accepted UserPromptSubmit.
 /// Only hooks that ingestion kept as trusted keep their event names.
-const CURRENT_TURN_HOOKS_SQL: &str = "invocation AS (
+pub(crate) const CURRENT_TURN_HOOKS_SQL: &str = "invocation AS (
        SELECT s.id,s.role_generation_id,s.native_session_id,s.status,
               CASE WHEN ri.id IS NULL THEN s.initial_hook_event_boundary_rowid
                    ELSE ri.hook_event_boundary_rowid END AS boundary
@@ -5503,7 +5557,7 @@ const CURRENT_TURN_HOOKS_SQL: &str = "invocation AS (
 /// A hook carrying a provider `prompt_id` other than the accepted turn's
 /// belongs to an earlier turn that arrived late; without both ids, arrival
 /// order is the only evidence.
-fn belongs_to_accepted_turn(alias: &str) -> String {
+pub(crate) fn belongs_to_accepted_turn(alias: &str) -> String {
     format!(
         "(json_type({alias}.payload_json,'$.prompt_id') IS NOT 'text'
           OR (SELECT json_type(payload_json,'$.prompt_id') FROM accepted) IS NOT 'text'
@@ -5674,6 +5728,52 @@ fn native_prompt(connection: &Connection, session_id: &str) -> Result<Option<Nat
         kind: kind.parse().map_err(|error: String| anyhow!(error))?,
         observed_at,
     }))
+}
+
+/// Includes exited sessions: a hold outlives the session that recorded it.
+fn provider_failure_holds(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<ProviderFailureHoldDto>> {
+    let holds = json_rows(
+        connection,
+        &format!(
+            "SELECT json_object('id',hold.id,'task_id',t.id,'task_version',t.version,
+                      'attempt_id',hold.attempt_id,'session_id',hold.session_id,
+                      'role_generation_id',hold.role_generation_id,
+                      'transcript_epoch',hold.transcript_epoch,
+                      'accepted_hook_event_id',hold.accepted_hook_event_id,
+                      'failure_hook_event_id',hold.failure_hook_event_id,
+                      'kind',hold.failure_kind,'attribution',hold.attribution,
+                      'created_at',hold.created_at,'expires_at',hold.expires_at)
+             FROM provider_failure_holds hold JOIN attempts a ON a.id=hold.attempt_id
+             JOIN tasks t ON t.id=a.task_id
+             WHERE hold.session_id=?1 AND {}
+               AND t.archived_at IS NULL AND t.lifecycle NOT IN ('done','cancelled')
+             ORDER BY hold.created_at,hold.rowid",
+            crate::store::provider_failure_hold_active("hold")
+        ),
+        session_id,
+    )?;
+    holds
+        .into_iter()
+        .map(|hold| serde_json::from_value(hold).context("parse provider failure hold"))
+        .collect()
+}
+
+/// Plain copy only; identifiers belong in the collapsed technical details.
+pub(crate) fn provider_failure_hold_message(
+    role: RoleKind,
+    kind: NativeTurnFailureKind,
+    cooldown: bool,
+) -> String {
+    let (cause, _) = native_turn_failure_explanation(kind.as_str());
+    let role = role.label();
+    if cooldown {
+        format!("The provider reported a failure for {role} ({cause}). LLMRelay paused automatic work for this role for a short cooldown of its own, which is not the provider's reset time. Work that is already allowed may continue after it; to end it sooner, choose Release provider hold on the agent's session.")
+    } else {
+        format!("The provider reported a failure for {role} ({cause}). This needs your action: LLMRelay will not start, resume or send input to this role while the hold stands. Fix the cause, then choose Release provider hold on the agent's session.")
+    }
 }
 
 /// How long after LLMRelay writes guidance or reserves a resumed turn the
@@ -6786,6 +6886,7 @@ fn next_operation_label(operation: &str) -> Option<&'static str> {
         "verify_task_profile" => "Open agent settings",
         "approve_plan" | "review_plan" => "Review plan",
         "resolve_recovery" => "Resolve issue",
+        "release_provider_failure_hold" => "Release provider hold",
         _ => return None,
     })
 }
@@ -6939,6 +7040,7 @@ impl AttentionSources<'_> {
         items.extend(self.coordinator_deferral_item());
         items.extend(self.recovery_items());
         items.extend(self.native_turn_failure_items());
+        items.extend(self.provider_failure_hold_items());
         items.extend(self.native_prompt_items());
         items.extend(self.unaccepted_input_items());
         items.extend(self.setup_items());
@@ -7559,6 +7661,72 @@ impl AttentionSources<'_> {
                     .map(|error| format!("Provider error: {error}")),
             })
         })
+    }
+
+    /// Not filtered to running sessions: an exited session's hold still restricts its role.
+    fn provider_failure_hold_items(&self) -> Vec<AttentionItem> {
+        let mut items = Vec::new();
+        for session in self.sessions {
+            let Some(holds) = session
+                .get("provider_failure_holds")
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            let (Some(session_id), Some(role_generation_id), Some(attempt_id), Some(role)) = (
+                json_text(session, "id"),
+                json_text(session, "role_generation_id"),
+                json_text(session, "attempt_id"),
+                json_text(session, "role").and_then(|role| role.parse::<RoleKind>().ok()),
+            ) else {
+                continue;
+            };
+            let Some(task) = self.task_with_active_attempt(attempt_id) else {
+                continue;
+            };
+            for hold in holds {
+                let Ok(hold) = serde_json::from_value::<ProviderFailureHoldDto>(hold.clone())
+                else {
+                    continue;
+                };
+                let cooldown = hold
+                    .expires_at
+                    .as_deref()
+                    .map_or_else(String::new, |until| {
+                        format!(" · app cooldown until {until}")
+                    });
+                items.push(AttentionItem {
+                    id: format!("provider_failure_hold:{}", hold.id),
+                    category: AttentionCategory::Blocked,
+                    title: format!("{} is on hold after a provider error", role.label()),
+                    reason: provider_failure_hold_message(
+                        role,
+                        hold.kind,
+                        hold.expires_at.is_some(),
+                    ),
+                    task_title: Some(task.title.clone()),
+                    role: Some(role),
+                    // The release control is on the session, which only the Activity tab shows.
+                    action: AttentionActionKind::OpenAgentOutput.into(),
+                    target: Some(AttentionTarget::Session {
+                        project_id: task.project_id.clone(),
+                        task_id: task.id.clone(),
+                        attempt_id: attempt_id.to_owned(),
+                        session_id: session_id.to_owned(),
+                        role_generation_id: role_generation_id.to_owned(),
+                    }),
+                    held_tasks: Vec::new(),
+                    details: Some(format!(
+                        "{} · {} attribution{cooldown} · hold {} · failure hook {}",
+                        hold.kind.as_str(),
+                        hold.attribution.as_str(),
+                        hold.id,
+                        hold.failure_hook_event_id
+                    )),
+                });
+            }
+        }
+        items
     }
 
     /// One item per standing generic wait of a still-open session of a task's
@@ -8409,6 +8577,13 @@ fn stage_terminal_replan(
         if blocked {
             bail!("the attempt cannot be replanned while {blocker}")
         }
+    }
+    if let Some(held) =
+        crate::store::provider_failure_hold_in_attempt(transaction, request.attempt_id)?
+    {
+        return Err(anyhow::Error::from(held).context(
+            "replanning waits for the provider failure hold to end because it would replace the held work",
+        ));
     }
     let parent_budgets: String = transaction.query_row(
         "SELECT json_group_object(review_kind,json_object('allowance',

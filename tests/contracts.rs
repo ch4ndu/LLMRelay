@@ -20932,6 +20932,110 @@ fn m4b_resumed_spawning_rejects_prior_anchor_then_accepts_current_anchor() {
 }
 
 #[test]
+fn explicit_role_replacement_retires_only_the_replaced_roles_provider_holds() {
+    let fixture = Fixture::new("provider-hold-replacement");
+    let (_, task, plan) = new_task(&fixture, "p", "task");
+    fixture.execute(
+        "UPDATE attempts SET phase='code_review',candidate_hash='candidate' WHERE id=?1",
+        params![plan.attempt_id],
+    );
+    fixture.execute(
+        "INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at,workspace_id,workspace_hash)
+         VALUES('snap',?1,'candidate',?2,'candidate','{}',1,'2026-01-01T00:00:00Z',?3,'candidate')",
+        params![plan.attempt_id, plan.base_revision, plan.workspace_id],
+    );
+    seed_session(
+        &fixture,
+        &plan.attempt_id,
+        "code_reviewer",
+        "old",
+        "old-session",
+        "exited",
+    );
+    seed_session(
+        &fixture,
+        &plan.attempt_id,
+        "manager",
+        "manager-generation",
+        "manager-session",
+        "exited",
+    );
+    fixture.execute("UPDATE role_settings SET effective_generation_id='old' WHERE task_id=?1 AND role='code_reviewer' AND revision=1",params![task]);
+    fixture.execute(
+        "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,prompt_hash,handoff_hash,delivery_state,created_at,updated_at)
+         VALUES('old-review',?1,'code','candidate','old','prompt','handoff','delivered','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![plan.attempt_id],
+    );
+    for (hold, generation, session) in [
+        ("reviewer-hold", "old", "old-session"),
+        ("manager-hold", "manager-generation", "manager-session"),
+    ] {
+        fixture.execute(
+            "INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,
+               payload_json,peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+             VALUES(?1,?2,?3,'codex','StopFailure',NULL,'{}',42,42,'peer',
+               'managed_process_group_untrusted_payload','2026-01-01T00:00:00Z')",
+            params![format!("{hold}-failure"), session, generation],
+        );
+        fixture.execute(
+            "INSERT INTO provider_failure_holds(id,attempt_id,role_generation_id,session_id,transcript_epoch,
+               failure_hook_event_id,failure_kind,attribution,created_at,state)
+             VALUES(?1,?2,?3,?4,'e',?5,'authentication_failed','arrival_order','2026-01-01T00:00:00Z','active')",
+            params![hold, plan.attempt_id, generation, session, format!("{hold}-failure")],
+        );
+    }
+    let replacement = RoleOverride {
+        provider: Provider::Codex,
+        model: "replacement-model".into(),
+        effort: "high".into(),
+    };
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::SetRoleSettings {
+            operation_id: "replacement-settings".into(),
+            task_id: task.clone(),
+            role: RoleKind::CodeReviewer,
+            expected_version: 2,
+            config: replacement.clone(),
+        },
+    )
+    .unwrap();
+    seed_supported_capabilities_for_config(&fixture, &replacement);
+    agenticjira::trip::activate_task_profile(
+        &fixture.store,
+        &capability_runtime(&fixture),
+        "activate-replacement",
+        &task,
+        RoleKind::CodeReviewer,
+        2,
+        3,
+    )
+    .unwrap();
+    let intent = role_service(&fixture)
+        .request_switch(
+            "replace-reviewer",
+            &plan.attempt_id,
+            "code_reviewer",
+            "old",
+            2,
+            "snap",
+            serde_json::json!({"checkpoint":"snap"}),
+            4,
+        )
+        .unwrap();
+    fixture.assert_scalar::<String>(
+        "SELECT state||'|'||resolution_kind||'|'||resolution_ref FROM provider_failure_holds WHERE id='reviewer-hold'",
+        format!("superseded|role_replacement|{intent}"),
+    );
+    assert_eq!(provider_hold_state(&fixture, "manager-hold"), "active");
+    fixture.assert_scalar::<String>(
+        "SELECT operation_id||'|'||entity_id||'|'||json_extract(detail_json,'$.hold_ids')
+         FROM audit_events WHERE event_code='provider_failure_hold.retired'",
+        format!("replace-reviewer|{intent}|[\"reviewer-hold\"]"),
+    );
+}
+
+#[test]
 fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
     let fixture = Fixture::new("t06");
     let (project, task, plan) = new_task(&fixture, "p", "task");
@@ -29276,6 +29380,462 @@ fn native_prompt_is_a_current_turn_output_wait_only() {
     assert_eq!(fixture.scalar::<String>(workflow_facts), before);
 }
 
+fn provider_hold_id(response: &serde_json::Value) -> Option<String> {
+    response["provider_failure_hold_id"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn provider_hold_state(fixture: &Fixture, hold_id: &str) -> String {
+    fixture.scalar(&format!(
+        "SELECT state FROM provider_failure_holds WHERE id='{hold_id}'"
+    ))
+}
+
+#[test]
+fn provider_failure_hold_binds_its_attributed_turn_and_ends_only_by_its_own_rules() {
+    use serde_json::json;
+    let (fixture, context, native, workspace) =
+        trusted_implementer_hooks_fixture("provider-failure-hold", Provider::Claude);
+    let hook = |event: &str, payload: serde_json::Value| {
+        record_trusted_hook(&fixture, &context, &native, &workspace, event, payload)
+    };
+    let fail = |payload: serde_json::Value| provider_hold_id(&hook("StopFailure", payload));
+    let binding = |hold: &str| {
+        fixture.scalar::<String>(&format!(
+            "SELECT COALESCE(accepted_hook_event_id,'none')||'|'||failure_kind||'|'||attribution
+                    ||'|'||COALESCE(expires_at,'none')||'|'||state
+             FROM provider_failure_holds WHERE id='{hold}'"
+        ))
+    };
+    let workflow_facts = "SELECT (SELECT lifecycle||':'||attention||':'||version FROM tasks WHERE id='t')
+             ||'|'||(SELECT phase||':'||status FROM attempts WHERE id='a')
+             ||'|'||(SELECT COUNT(*) FROM recovery_records)||'|'||(SELECT COUNT(*) FROM role_results)
+             ||'|'||(SELECT COUNT(*) FROM role_generations)||'|'||(SELECT COUNT(*) FROM launch_permits)";
+    let before = fixture.scalar::<String>(workflow_facts);
+
+    // Nothing can be attributed before the invocation's own SessionStart.
+    assert_eq!(fail(json!({"error":"authentication_failed"})), None);
+    hook("SessionStart", json!({}));
+    let startup = fail(json!({"error":"authentication_failed"})).unwrap();
+    assert_eq!(
+        binding(&startup),
+        "none|authentication_failed|startup_invocation|none|active"
+    );
+    assert_eq!(
+        fail(json!({"error":"authentication_failed"})).as_deref(),
+        Some(startup.as_str())
+    );
+    // A stale invocation, another native identity or an untrusted cwd holds nothing.
+    let mut stale = context.clone();
+    stale.transcript_epoch = "replaced-epoch".into();
+    assert!(try_record_trusted_hook(
+        &fixture,
+        &stale,
+        &native,
+        &workspace,
+        "StopFailure",
+        json!({"error":"billing_error"})
+    )
+    .is_err());
+    let other_native = uuid::Uuid::new_v4().to_string();
+    assert!(try_record_trusted_hook(
+        &fixture,
+        &context,
+        &other_native,
+        &workspace,
+        "StopFailure",
+        json!({"error":"billing_error"})
+    )
+    .is_err());
+    assert_eq!(
+        provider_hold_id(&record_trusted_hook(
+            &fixture,
+            &context,
+            &native,
+            "/",
+            "StopFailure",
+            json!({"error":"billing_error"})
+        )),
+        None
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM provider_failure_holds", 1);
+
+    // A later accepted turn of the session supersedes its earlier hold.
+    let turn = hook(
+        "UserPromptSubmit",
+        json!({"prompt":"implement","prompt_id":"turn-1"}),
+    );
+    let turn_id = turn["hook_event_id"].as_str().unwrap().to_owned();
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT state||'|'||resolution_kind||'|'||resolution_ref
+             FROM provider_failure_holds WHERE id='{startup}'"
+        ),
+        format!("superseded|accepted_turn|{turn_id}"),
+    );
+    // A rate limit cools down from its first observation; a same-turn repeat never extends it.
+    let limited = fail(json!({"error":"rate_limit","prompt_id":"turn-1"})).unwrap();
+    let limited_binding = binding(&limited);
+    assert!(
+        limited_binding.starts_with(&format!("{turn_id}|rate_limit|prompt_id_matched|")),
+        "{limited_binding}"
+    );
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT CAST(ROUND((julianday(expires_at)-julianday(created_at))*86400) AS INTEGER)
+             FROM provider_failure_holds WHERE id='{limited}'"
+        ),
+        60,
+    );
+    assert_eq!(
+        fail(json!({"error":"rate_limit","prompt_id":"turn-1"})).as_deref(),
+        Some(limited.as_str())
+    );
+    assert_eq!(binding(&limited), limited_binding);
+    // A failure naming another turn belongs to that turn and holds nothing.
+    assert_eq!(
+        fail(json!({"error":"overloaded","prompt_id":"turn-0"})),
+        None
+    );
+    // Tool activity and Stop end the failed-turn presentation, never the hold.
+    hook(
+        "PostToolUse",
+        json!({"tool_use_id":"call","tool_name":"Bash","tool_input":{"command":"true"}}),
+    );
+    hook(
+        "Stop",
+        json!({"background_tasks":[],"session_crons":[],"prompt_id":"turn-1"}),
+    );
+    let session = || {
+        workflow::state(&fixture.store)
+            .unwrap()
+            .active_sessions
+            .into_iter()
+            .find(|session| session["id"] == "session")
+            .unwrap()
+    };
+    assert!(session()["native_turn"]["failure"].is_null());
+    assert_eq!(
+        session()["provider_failure_holds"][0]["id"],
+        limited.as_str()
+    );
+    // After the cooldown, a new failure is a new hold; the expired row keeps its deadline.
+    fixture.execute(
+        "UPDATE provider_failure_holds SET expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
+        params![limited],
+    );
+    let expired_binding = binding(&limited);
+    let renewed = fail(json!({"error":"rate_limit","prompt_id":"turn-1"})).unwrap();
+    assert_ne!(renewed, limited);
+    assert_eq!(binding(&limited), expired_binding);
+    // Without both prompt ids, arrival order attributes a failure to the accepted turn.
+    hook("UserPromptSubmit", json!({"prompt":"continue"}));
+    assert_eq!(provider_hold_state(&fixture, &renewed), "superseded");
+    let billing = fail(json!({"error":"billing_error"})).unwrap();
+    assert!(
+        binding(&billing).ends_with("|billing_error|arrival_order|none|active"),
+        "{}",
+        binding(&billing)
+    );
+
+    // Running or exited, the session shows the hold and its item opens that session.
+    for status in ["running", "exited"] {
+        fixture.execute(
+            "UPDATE sessions SET status=?1 WHERE id='session'",
+            params![status],
+        );
+        let state = workflow::state(&fixture.store).unwrap();
+        let projected = state
+            .active_sessions
+            .iter()
+            .find(|session| session["id"] == "session")
+            .unwrap()["provider_failure_holds"]
+            .clone();
+        assert_eq!(projected.as_array().map(Vec::len), Some(1), "{status}");
+        assert_eq!(projected[0]["id"], billing.as_str());
+        assert_eq!(projected[0]["kind"], "billing_error");
+        assert_eq!(projected[0]["attribution"], "arrival_order");
+        assert!(projected[0]["expires_at"].is_null());
+        assert_eq!(
+            projected[0]["task_version"],
+            fixture.scalar::<i64>("SELECT version FROM tasks WHERE id='t'")
+        );
+        let item = state
+            .attention
+            .iter()
+            .find(|item| item.id == format!("provider_failure_hold:{billing}"))
+            .unwrap();
+        assert_eq!(item.action.kind, AttentionActionKind::OpenAgentOutput);
+        assert!(matches!(
+            &item.target,
+            Some(AttentionTarget::Session { session_id, .. }) if session_id == "session"
+        ));
+        assert!(
+            item.reason.contains("The provider reported a failure")
+                && item.reason.contains("needs your action")
+                && !item.reason.contains("ended")
+                && item.reason.contains("Release provider hold")
+                && !item.reason.contains(&billing),
+            "{}",
+            item.reason
+        );
+        assert!(item.details.as_deref().is_some_and(|details| {
+            details.contains("arrival_order attribution") && details.contains(&billing)
+        }));
+    }
+    // Recording holds is not a workflow step, and they survive a reopen.
+    assert_eq!(fixture.scalar::<String>(workflow_facts), before);
+    let reopened = Store::open(&fixture.database).unwrap();
+    assert_eq!(
+        workflow::state(&reopened)
+            .unwrap()
+            .active_sessions
+            .iter()
+            .find(|session| session["id"] == "session")
+            .unwrap()["provider_failure_holds"][0]["id"],
+        billing.as_str()
+    );
+}
+
+#[test]
+fn provider_failure_hold_keeps_guidance_queued_until_its_cooldown_passes() {
+    use serde_json::json;
+    let (fixture, context, native, workspace) =
+        trusted_implementer_hooks_fixture("provider-hold-guidance", Provider::Claude);
+    let hook = |event: &str, payload: serde_json::Value| {
+        record_trusted_hook(&fixture, &context, &native, &workspace, event, payload)
+    };
+    hook("SessionStart", json!({}));
+    hook("UserPromptSubmit", json!({"prompt":"implement"}));
+    let overloaded = provider_hold_id(&hook("StopFailure", json!({"error":"overloaded"}))).unwrap();
+    hook("Stop", json!({"background_tasks":[],"session_crons":[]}));
+    fixture.assert_scalar::<String>(
+        "SELECT readiness_state FROM sessions WHERE id='session'",
+        "idle_candidate".into(),
+    );
+    fixture.execute(
+        "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at)
+         VALUES('held-guidance','a','generation','Use the smaller scope','queued','2026-01-01T00:00:00Z')",
+        [],
+    );
+    let roles = role_service(&fixture);
+    let delivery =
+        "SELECT g.state||'|'||COALESCE(g.delivery_session_id,'none')||'|'||s.readiness_state
+         FROM guidance_messages g JOIN sessions s ON s.id='session' WHERE g.id='held-guidance'";
+    let undelivered = fixture.scalar::<String>(delivery);
+    let reserve = || {
+        fixture.store.reserve_guidance_delivery(
+            "held-guidance",
+            "session",
+            "e",
+            None,
+            "Use the smaller scope",
+        )
+    };
+    let refused_while_held = |when: &str| {
+        assert!(roles.retry_ready_guidance().unwrap().is_empty(), "{when}");
+        let queued = roles.deliver_guidance("held-guidance").unwrap();
+        assert_eq!(
+            (
+                queued["state"].as_str(),
+                queued["reason"].as_str(),
+                queued["hold_id"].as_str()
+            ),
+            (
+                Some("queued"),
+                Some("provider_failure_hold"),
+                Some(overloaded.as_str())
+            ),
+            "{when}"
+        );
+        let refused = reserve().unwrap_err().to_string();
+        assert!(
+            refused.contains("on hold after a provider failure"),
+            "{when}: {refused}"
+        );
+        assert_eq!(fixture.scalar::<String>(delivery), undelivered, "{when}");
+    };
+    refused_while_held("fresh cooldown");
+    fixture.execute(
+        "UPDATE provider_failure_holds SET expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+30 seconds') WHERE id=?1",
+        params![overloaded],
+    );
+    refused_while_held("just before the deadline");
+    let item = workflow::state(&fixture.store)
+        .unwrap()
+        .attention
+        .into_iter()
+        .find(|item| item.id == format!("provider_failure_hold:{overloaded}"))
+        .unwrap();
+    assert!(
+        item.reason.contains("short cooldown of its own")
+            && item.reason.contains("not the provider's reset time"),
+        "{}",
+        item.reason
+    );
+
+    // Reaching the deadline only lifts the restriction; nothing runs and readiness is unchanged.
+    let effects = format!(
+        "SELECT (SELECT COUNT(*) FROM sessions)||'|'||(SELECT COUNT(*) FROM role_generations)
+             ||'|'||(SELECT COUNT(*) FROM resume_invocations)||'|'||(SELECT COUNT(*) FROM role_results)
+             ||'|'||(SELECT COUNT(*) FROM review_requests)||'|'||(SELECT COUNT(*) FROM recovery_records)
+             ||'|'||(SELECT state FROM provider_failure_holds WHERE id='{overloaded}')"
+    );
+    let before_deadline = fixture.scalar::<String>(&effects);
+    fixture.execute(
+        "UPDATE provider_failure_holds SET expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
+        params![overloaded],
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    assert!(state
+        .attention
+        .iter()
+        .all(|item| item.id != format!("provider_failure_hold:{overloaded}")));
+    assert!(state
+        .active_sessions
+        .iter()
+        .find(|session| session["id"] == "session")
+        .unwrap()["provider_failure_holds"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(fixture.scalar::<String>(&effects), before_deadline);
+    assert_eq!(fixture.scalar::<String>(delivery), undelivered);
+    assert!(reserve().unwrap());
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM guidance_messages WHERE id='held-guidance'",
+        "delivery_reserved".into(),
+    );
+}
+
+#[test]
+fn provider_failure_hold_release_is_receipt_first_version_bound_and_exactly_scoped() {
+    use serde_json::json;
+    let (fixture, context, native, workspace) =
+        trusted_implementer_hooks_fixture("provider-hold-release", Provider::Claude);
+    let hook = |event: &str, payload: serde_json::Value| {
+        record_trusted_hook(&fixture, &context, &native, &workspace, event, payload)
+    };
+    hook("SessionStart", json!({}));
+    hook("UserPromptSubmit", json!({"prompt":"implement"}));
+    let billing = provider_hold_id(&hook("StopFailure", json!({"error":"billing_error"}))).unwrap();
+    // Another role of the same attempt holds independently.
+    seed_session(
+        &fixture,
+        "a",
+        "manager",
+        "manager-generation",
+        "manager-session",
+        "exited",
+    );
+    fixture.execute_batch(
+        "INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,payload_json,
+           peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+         VALUES('manager-failure','manager-session','manager-generation','codex','StopFailure',NULL,'{}',
+           42,42,'peer','managed_process_group_untrusted_payload','2026-01-01T00:00:00Z');
+         INSERT INTO provider_failure_holds(id,attempt_id,role_generation_id,session_id,transcript_epoch,
+           failure_hook_event_id,failure_kind,attribution,created_at,state)
+         VALUES('manager-hold','a','manager-generation','manager-session','e','manager-failure',
+           'authentication_failed','arrival_order','2026-01-01T00:00:00Z','active');",
+    );
+    let version = || fixture.scalar::<i64>("SELECT version FROM tasks WHERE id='t'");
+    let release = |operation: &str, task: &str, session: &str, hold: &str, expected: i64| {
+        workflow::execute(
+            &fixture.store,
+            &HumanCommand::ReleaseProviderFailureHold {
+                operation_id: operation.into(),
+                task_id: task.into(),
+                attempt_id: "a".into(),
+                session_id: session.into(),
+                hold_id: hold.into(),
+                expected_task_version: expected,
+            },
+        )
+    };
+    let current = version();
+    for (operation, task, session, hold) in [
+        ("wrong-task", "other-task", "session", billing.as_str()),
+        ("wrong-session", "t", "manager-session", billing.as_str()),
+        ("wrong-hold", "t", "session", "missing-hold"),
+    ] {
+        let refused = release(operation, task, session, hold, current)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("binding is stale"),
+            "{operation}: {refused}"
+        );
+    }
+    let stale = release("stale-version", "t", "session", &billing, current - 1)
+        .unwrap_err()
+        .to_string();
+    assert!(stale.contains("task version is stale"), "{stale}");
+    assert_eq!(
+        (version(), provider_hold_state(&fixture, &billing)),
+        (current, "active".to_owned())
+    );
+
+    let released = release("release", "t", "session", &billing, current).unwrap();
+    assert_eq!(
+        (
+            released.state.as_str(),
+            released.version,
+            released.entity_id.as_str()
+        ),
+        ("released", Some(current + 1), billing.as_str())
+    );
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT state||'|'||resolution_kind||'|'||resolution_ref
+             FROM provider_failure_holds WHERE id='{billing}'"
+        ),
+        "human_released|human_release|release".into(),
+    );
+    assert_eq!(provider_hold_state(&fixture, "manager-hold"), "active");
+    // The receipt replays before the version check; another payload under it is refused.
+    let replayed = release("release", "t", "session", &billing, current).unwrap();
+    assert_eq!(
+        (replayed.state.as_str(), replayed.version),
+        ("released", Some(current + 1))
+    );
+    let reused = release("release", "t", "session", &billing, current + 1)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        reused.contains("already used with different input"),
+        "{reused}"
+    );
+    // Every other disposition is a receipt only.
+    let again = release("release-again", "t", "session", &billing, version()).unwrap();
+    assert_eq!(
+        (again.state.as_str(), again.version, version()),
+        ("already_released", Some(current + 1), current + 1)
+    );
+    let cooldown = provider_hold_id(&hook("StopFailure", json!({"error":"rate_limit"}))).unwrap();
+    fixture.execute(
+        "UPDATE provider_failure_holds SET expires_at='2026-01-01T00:00:00Z' WHERE id=?1",
+        params![cooldown],
+    );
+    let expired = release("release-expired", "t", "session", &cooldown, version()).unwrap();
+    assert_eq!(
+        (expired.state.as_str(), expired.version),
+        ("expired", Some(current + 1))
+    );
+    assert_eq!(provider_hold_state(&fixture, &cooldown), "active");
+    let server = provider_hold_id(&hook("StopFailure", json!({"error":"server_error"}))).unwrap();
+    hook("UserPromptSubmit", json!({"prompt":"continue"}));
+    assert_eq!(provider_hold_state(&fixture, &server), "superseded");
+    assert_eq!(provider_hold_state(&fixture, "manager-hold"), "active");
+    let superseded = release("release-superseded", "t", "session", &server, version()).unwrap();
+    assert_eq!(
+        (superseded.state.as_str(), superseded.version, version()),
+        ("superseded", Some(current + 1), current + 1)
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM launch_permits", 0);
+}
+
 #[test]
 fn unaccepted_input_is_shown_after_its_bound_until_its_own_invocation_accepts_it() {
     use serde_json::json;
@@ -33548,7 +34108,7 @@ fn mb14_stale_exit_cannot_mutate_reserved_or_running_replacement_generation() {
 }
 
 /// Tables read directly or through helper decisions by `workflow::state`.
-const STATE_PROJECTED_TABLES: [&str; 68] = [
+const STATE_PROJECTED_TABLES: [&str; 69] = [
     "attempts",
     "audit_events",
     "capabilities",
@@ -33572,6 +34132,7 @@ const STATE_PROJECTED_TABLES: [&str; 68] = [
     "project_profile_set_revisions",
     "project_profile_sets",
     "projects",
+    "provider_failure_holds",
     "recipe_schedule_fires",
     "recipe_schedules",
     "recovery_records",
@@ -33933,7 +34494,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 34_i64);
+    fixture.assert_scalar("PRAGMA user_version", 35_i64);
     fixture.assert_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%'",
         i64::try_from(triggers.len()).unwrap(),
@@ -33968,7 +34529,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 34_i64);
+    fixture.assert_scalar("PRAGMA user_version", 35_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -35596,6 +36157,338 @@ fn a_held_launch_step_retries_only_after_every_effect_outcome_is_known() {
     fixture.assert_scalar::<String>(
         "SELECT state FROM recovery_records WHERE id='later-recovery'",
         "attention_required".into(),
+    );
+}
+
+#[test]
+fn provider_failure_hold_skips_its_manager_until_released_and_refuses_direct_launches() {
+    use serde_json::json;
+    let fixture = Fixture::new("provider-hold-coordinator");
+    let (_, held_task, held) = new_task(&fixture, "held-project", "held-task");
+    let app = synthetic_coordinator(&fixture);
+    let dispatched = app.coordinator_tick().unwrap();
+    assert_eq!(dispatched["action"], "manager_dispatched", "{dispatched}");
+    let session = dispatched["session_id"].as_str().unwrap().to_owned();
+    let manager = app.synthetic_role_context_for_tests(&session).unwrap();
+    let native = uuid::Uuid::new_v4().to_string();
+    let hook = |event: &str, mut payload: serde_json::Value| {
+        payload["hook_event_name"] = json!(event);
+        payload["session_id"] = json!(native);
+        payload["cwd"] = json!(held.workspace_path);
+        fixture
+            .store
+            .save_hook_event(
+                &manager,
+                &HookEnvelope {
+                    provider: manager.provider,
+                    payload,
+                },
+                &RolePeerProvenance {
+                    peer_pid: 42,
+                    peer_process_group_id: 42,
+                    peer_start_marker: "provider-hold-peer".into(),
+                    managed_root_pid: 42,
+                    managed_root_start_marker: "provider-hold-root".into(),
+                    state: "managed_process_group_untrusted_payload".into(),
+                },
+            )
+            .unwrap()
+    };
+    hook("SessionStart", json!({}));
+    hook(
+        "UserPromptSubmit",
+        json!({"prompt":"plan","prompt_id":"plan-turn"}),
+    );
+    let hold = provider_hold_id(&hook(
+        "StopFailure",
+        json!({"error":"billing_error","prompt_id":"plan-turn"}),
+    ))
+    .unwrap();
+    finish_synthetic_role(&fixture, &manager);
+    let effects = || {
+        fixture.scalar::<String>(&format!(
+            "SELECT (SELECT COUNT(*) FROM role_generations WHERE attempt_id='{attempt}')
+                 ||'|'||(SELECT COUNT(*) FROM launch_permits WHERE attempt_id='{attempt}')
+                 ||'|'||(SELECT resume_count FROM sessions WHERE id='{session}')
+                 ||'|'||(SELECT COUNT(*) FROM resume_invocations WHERE session_id='{session}')
+                 ||'|'||(SELECT COUNT(*) FROM recovery_records)
+                 ||'|'||(SELECT COUNT(*) FROM audit_events WHERE event_code='session.resume.rejected')
+                 ||'|'||(SELECT COUNT(*) FROM controls WHERE kind='retry')",
+            attempt = held.attempt_id
+        ))
+    };
+    let unchanged = effects();
+    let version =
+        || fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{held_task}'"));
+
+    // The exited manager would be resumed; its hold makes the tick wait instead.
+    let waiting = app.coordinator_tick().unwrap();
+    assert_eq!(
+        waiting["decision"]["reason_code"], "workflow.provider_failure_hold",
+        "{waiting}"
+    );
+    let decision = workflow::state(&fixture.store)
+        .unwrap()
+        .decisions
+        .into_iter()
+        .find(|decision| decision.subject.attempt_id.as_deref() == Some(held.attempt_id.as_str()))
+        .unwrap();
+    assert_eq!(decision.disposition, DecisionDisposition::Held);
+    assert_eq!(
+        decision.ownership.owner,
+        agenticjira::domain::DecisionOwner::Human
+    );
+    assert_eq!(
+        decision
+            .next_action
+            .as_ref()
+            .map(|action| action.operation.as_str()),
+        Some("release_provider_failure_hold")
+    );
+    assert!(decision
+        .primary_blocker
+        .as_ref()
+        .and_then(|blocker| blocker.message.as_deref())
+        .is_some_and(|message| message.contains("Release provider hold")));
+    // Direct dispatch and a person's direct resume are no overrides.
+    for refused in [
+        app.dispatch_attempt_role(&held.attempt_id, RoleKind::Manager, "direct prompt")
+            .unwrap_err(),
+        app.resume_role_session(&session, "").unwrap_err(),
+    ] {
+        assert!(
+            format!("{refused:#}").contains("on hold after a provider failure"),
+            "{refused:#}"
+        );
+    }
+    // Retry would replace the held work, so it is refused with the hold.
+    fixture.execute(
+        "UPDATE tasks SET attention='needs_input' WHERE id=?1",
+        params![held_task],
+    );
+    let retry = workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: "retry-held".into(),
+            task_id: held_task.clone(),
+            expected_version: version(),
+            action: "retry".into(),
+            payload: json!({}),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{retry:#}").contains("retry waits for the provider failure hold"),
+        "{retry:#}"
+    );
+    fixture.execute(
+        "UPDATE tasks SET attention='none' WHERE id=?1",
+        params![held_task],
+    );
+    // Continue keeps its meaning and does not clear the hold.
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: "continue-held".into(),
+            task_id: held_task.clone(),
+            expected_version: version(),
+            action: "continue".into(),
+            payload: json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(app.coordinator_tick().unwrap()["action"], "continued");
+    assert_eq!(
+        app.coordinator_tick().unwrap()["decision"]["reason_code"],
+        "workflow.provider_failure_hold"
+    );
+    assert_eq!(provider_hold_state(&fixture, &hold), "active");
+    assert_eq!(effects(), unchanged);
+
+    // Releasing starts nothing; the next tick may resume the authorized manager.
+    let released = workflow::execute(
+        &fixture.store,
+        &HumanCommand::ReleaseProviderFailureHold {
+            operation_id: "release-held-manager".into(),
+            task_id: held_task.clone(),
+            attempt_id: held.attempt_id.clone(),
+            session_id: session.clone(),
+            hold_id: hold.clone(),
+            expected_task_version: version(),
+        },
+    )
+    .unwrap();
+    assert_eq!(released.state, "released");
+    assert_eq!(effects(), unchanged);
+    let resumed = app.coordinator_tick().unwrap();
+    assert_eq!(resumed["action"], "manager_resumed", "{resumed}");
+    assert_eq!(resumed["session_id"], session.as_str());
+}
+
+#[test]
+fn provider_failure_hold_found_by_the_reservation_is_a_wait_while_other_work_proceeds() {
+    let fixture = Fixture::new("provider-hold-reservation-race");
+    let (_, _, held) = new_task(&fixture, "race-project", "race-task");
+    let later_project = add_project(&fixture, fixture.repository("later"), "later");
+    let later_task = create_task(&fixture, &later_project, "later-task", 1);
+    seed_session(
+        &fixture,
+        &held.attempt_id,
+        "manager",
+        "g-earlier",
+        "s-earlier",
+        "exited",
+    );
+    // The hold appears after the dispatch was selected and its permit issued.
+    fixture.execute_batch(&format!(
+        "UPDATE role_generations SET status='exited' WHERE id='g-earlier';
+         INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,
+           payload_json,peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+         VALUES('earlier-failure','s-earlier','g-earlier','codex','StopFailure',NULL,'{{}}',42,42,'peer',
+           'managed_process_group_untrusted_payload','2026-01-01T00:00:00Z');
+         CREATE TRIGGER provider_hold_after_selection AFTER INSERT ON launch_permits
+         WHEN NEW.attempt_id='{attempt}' AND NEW.role='manager'
+         BEGIN
+           INSERT OR IGNORE INTO provider_failure_holds(id,attempt_id,role_generation_id,session_id,
+             transcript_epoch,failure_hook_event_id,failure_kind,attribution,created_at,state)
+           VALUES('race-hold',NEW.attempt_id,'g-earlier','s-earlier','e','earlier-failure',
+             'billing_error','arrival_order',strftime('%Y-%m-%dT%H:%M:%fZ','now'),'active');
+         END;",
+        attempt = held.attempt_id
+    ));
+    let effects = || {
+        fixture.scalar::<String>(&format!(
+            "SELECT (SELECT COUNT(*) FROM role_generations WHERE attempt_id='{attempt}')
+                 ||'|'||(SELECT group_concat(state) FROM launch_permits WHERE attempt_id='{attempt}')
+                 ||'|'||(SELECT COUNT(*) FROM recovery_records)",
+            attempt = held.attempt_id
+        ))
+    };
+    let app = synthetic_coordinator(&fixture);
+    let raced = app.coordinator_tick().unwrap();
+    assert_eq!(raced["action"], "workspace_created", "{raced}");
+    assert_eq!(raced["task_id"], later_task.as_str());
+    assert_eq!(effects(), "1|released_nondelivery|0");
+    let held_decision = || {
+        workflow::state(&fixture.store)
+            .unwrap()
+            .decisions
+            .into_iter()
+            .find(|decision| {
+                decision.subject.attempt_id.as_deref() == Some(held.attempt_id.as_str())
+            })
+            .unwrap()
+            .reason_code
+    };
+    assert_eq!(held_decision(), "workflow.provider_failure_hold");
+
+    // An automatic manager change for the held role waits while the later task's manager starts.
+    fixture.execute(
+        "INSERT INTO switch_intents(id,attempt_id,role,old_generation_id,requested_settings_revision,
+           handoff_json,state,created_at,updated_at)
+         VALUES('held-manager-change',?1,'manager','g-earlier',1,'{}','ready_for_dispatch',
+           '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![held.attempt_id],
+    );
+    let later = app.coordinator_tick().unwrap();
+    assert_eq!(later["action"], "manager_dispatched", "{later}");
+    assert_eq!(later["attempt_id"], raced["attempt_id"]);
+    assert_eq!(effects(), "1|released_nondelivery|0");
+    fixture.assert_scalar::<String>(
+        "SELECT state||'|'||COALESCE(new_generation_id,'none') FROM switch_intents WHERE id='held-manager-change'",
+        "ready_for_dispatch|none".into(),
+    );
+    assert_eq!(held_decision(), "workflow.provider_failure_hold");
+}
+
+#[test]
+fn provider_failure_hold_leaves_its_restart_candidate_for_a_later_one_and_tells_people_why() {
+    let fixture = Fixture::new("provider-hold-restart");
+    seed_attempt(&fixture, "implementation");
+    fixture.execute_batch(
+        "INSERT INTO tasks(id,project_id,title,description,acceptance_criteria_json,lifecycle,created_at,updated_at)
+           VALUES('t2','p','Later','Description','[\"criterion\"]','in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+         INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,scope_hash,
+             configuration_hash,workflow_version,workflow_hash,upstream_source_hash,overlay_hash,
+             legacy_migration_required,created_at,updated_at)
+           SELECT 'b','t2','context-b',phase,base_revision,configuration_revision,status,scope_hash,
+             configuration_hash,workflow_version,workflow_hash,upstream_source_hash,overlay_hash,
+             legacy_migration_required,created_at,updated_at
+           FROM attempts WHERE id='a';",
+    );
+    seed_session(&fixture, "a", "manager", "g-held", "s-held", "exited");
+    seed_session(&fixture, "b", "manager", "g-later", "s-later", "exited");
+    fixture.execute_batch(
+        "INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,
+           payload_json,peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+         VALUES('held-failure','s-held','g-held','codex','StopFailure',NULL,'{}',42,42,'peer',
+           'managed_process_group_untrusted_payload','2026-01-01T00:00:00Z');
+         INSERT INTO provider_failure_holds(id,attempt_id,role_generation_id,session_id,transcript_epoch,
+           failure_hook_event_id,failure_kind,attribution,created_at,state)
+         VALUES('held-restart','a','g-held','s-held','e','held-failure','account_on_hold',
+           'arrival_order','2026-01-01T00:00:00Z','active');
+         INSERT INTO restart_candidates(session_id,attempt_id,task_id,source,state,reason,result_json,created_at,updated_at)
+         VALUES('s-held','a','t','unclean_shutdown','parked','awaiting restart','{}',
+             '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'),
+           ('s-later','b','t2','unclean_shutdown','parked','awaiting restart','{}',
+             '2026-01-01T00:00:01Z','2026-01-01T00:00:01Z');
+         UPDATE instance_settings SET auto_resume_eligible=1;",
+    );
+    let held_candidate =
+        "SELECT state||'|'||result_json||'|'||updated_at||'|'||COALESCE(requested_by,'none')
+         FROM restart_candidates WHERE session_id='s-held'";
+    let untouched = fixture.scalar::<String>(held_candidate);
+    let app = synthetic_coordinator(&fixture);
+
+    // The held first candidate is skipped and the later one is admitted in the same tick.
+    let admitted = app.coordinator_tick().unwrap();
+    assert_eq!(admitted["action"], "auto_resume", "{admitted}");
+    assert_eq!(
+        admitted["result"]["outcomes"][0]["session_id"], "s-later",
+        "{admitted}"
+    );
+    assert_eq!(fixture.scalar::<String>(held_candidate), untouched);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+    // A person's batch or single selection reports the hold and changes nothing.
+    let batch = app.resume_restart_sessions("held-batch", None).unwrap();
+    let outcome = batch["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|outcome| outcome["session_id"] == "s-held")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (
+            outcome["state"].as_str(),
+            outcome["reason_code"].as_str(),
+            outcome["hold_id"].as_str()
+        ),
+        (
+            Some("held"),
+            Some("restart.provider_failure_hold"),
+            Some("held-restart")
+        )
+    );
+    let single = app
+        .resume_restart_sessions("held-single", Some(&["s-held".to_owned()]))
+        .unwrap();
+    assert_eq!(single["outcomes"][0]["state"], "held", "{single}");
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='held-single'",
+        0,
+    );
+    assert_eq!(fixture.scalar::<String>(held_candidate), untouched);
+    // Once the hold ends, the same candidate is eligible again.
+    fixture.execute(
+        "UPDATE provider_failure_holds SET state='human_released',resolved_at='2026-01-01T00:00:02Z',
+           resolution_kind='human_release',resolution_ref='fixture-release' WHERE id='held-restart'",
+        [],
+    );
+    let after = app.coordinator_tick().unwrap();
+    assert_eq!(
+        after["result"]["outcomes"][0]["session_id"], "s-held",
+        "{after}"
     );
 }
 
@@ -39273,14 +40166,14 @@ fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordina
 #[test]
 fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
-    fixture.assert_scalar("PRAGMA user_version", 34_i64);
+    fixture.assert_scalar("PRAGMA user_version", 35_i64);
     let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
     fixture.execute_batch(&format!(
         "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; PRAGMA user_version=30;"
     ));
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 34_i64);
+    fixture.assert_scalar("PRAGMA user_version", 35_i64);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
@@ -40048,7 +40941,8 @@ fn stale_restart_candidate_cancellation_refuses_live_sessions_and_pending_admiss
 }
 
 const MIGRATION_031_SQL: &str = include_str!("../migrations/031_final_repair_recheck.sql");
-const DROP_AFTER_SCHEMA_32: &str = "DROP TRIGGER guidance_submitted_form_paired;
+const DROP_AFTER_SCHEMA_32: &str = "DROP TABLE provider_failure_holds;
+     DROP TRIGGER guidance_submitted_form_paired;
      DROP TRIGGER guidance_submitted_form_once;
      ALTER TABLE guidance_messages DROP COLUMN submitted_digest;
      ALTER TABLE guidance_messages DROP COLUMN submitted_text;
@@ -40150,7 +41044,7 @@ fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
     fixture.assert_scalar("PRAGMA user_version", 31_i64);
 
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 34_i64);
+    fixture.assert_scalar("PRAGMA user_version", 35_i64);
     assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(

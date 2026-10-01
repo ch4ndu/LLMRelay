@@ -14,6 +14,7 @@ import type {
   DecisionExplanation,
   PermissionRequest,
   Project,
+  ProviderFailureHold,
   Session,
   StateCursor,
   StateWaitResult,
@@ -6954,6 +6955,7 @@ Deno.test("session startup notice follows current readiness and preserves explic
     },
     discard: () => Promise.resolve(),
     close: () => {},
+    refresh: () => {},
   };
   const renderSession = (overrides: Partial<Session> = {}) => (
     <SessionTree
@@ -8470,6 +8472,7 @@ Deno.test("Session Access keeps the open process apart from reports, accepted tu
     release: () => Promise.resolve(),
     discard: () => Promise.resolve(),
     close: () => {},
+    refresh: () => {},
   };
   const acceptedAt = "2026-09-30T10:00:00Z";
   const reported: Session = {
@@ -8645,6 +8648,316 @@ Deno.test("Session Access keeps the open process apart from reports, accepted tu
     );
   } finally {
     unmount();
+  }
+});
+
+Deno.test("A provider failure hold shows on exited and running sessions and Release provider hold posts its exact binding", async () => {
+  const requests: Record<string, unknown>[] = [];
+  let refreshes = 0;
+  let respond: () => Response | Promise<Response> = () =>
+    new Response(JSON.stringify({
+      result: {
+        operation_id: "release",
+        entity_kind: "provider_failure_hold",
+        entity_id: "hold-billing",
+        version: 8,
+        state: "released",
+        detail: {},
+      },
+    }));
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return respond();
+  }) as typeof fetch;
+  const access = {
+    routes: {},
+    discarding: {},
+    routeFor: () => undefined,
+    view: () => Promise.resolve<CmuxViewOutcome>({ state: "pending", message: "", retry_available: false }),
+    take: () => Promise.resolve(),
+    release: () => Promise.resolve(),
+    discard: () => Promise.resolve(),
+    close: () => {},
+    refresh: () => {
+      refreshes += 1;
+    },
+  };
+  const hold = (
+    id: string,
+    sessionId: string,
+    overrides: Partial<ProviderFailureHold> = {},
+  ): ProviderFailureHold => ({
+    id,
+    task_id: "AJ-1",
+    task_version: 7,
+    attempt_id: "a1",
+    session_id: sessionId,
+    role_generation_id: "g1",
+    transcript_epoch: "epoch-1",
+    accepted_hook_event_id: null,
+    failure_hook_event_id: `hook-${id}`,
+    kind: "billing_error",
+    attribution: "startup_invocation",
+    created_at: "2026-10-01T15:00:00Z",
+    expires_at: null,
+    ...overrides,
+  });
+  const exited: Session = {
+    ...managerSession,
+    id: "s-exited",
+    status: "exited",
+    provider_failure_holds: [hold("hold-billing", "s-exited")],
+  };
+  const cooling: Session = {
+    ...managerSession,
+    id: "s-cooling",
+    role: "implementer",
+    role_generation_id: "g2",
+    provider_failure_holds: [
+      hold("hold-rate", "s-cooling", {
+        role_generation_id: "g2",
+        kind: "rate_limit",
+        attribution: "prompt_id_matched",
+        accepted_hook_event_id: "hook-accept",
+        expires_at: "2026-10-01T15:01:00Z",
+      }),
+    ],
+  };
+  const render = (sessions: Session[]) => (
+    <SessionTree
+      sessions={sessions}
+      access={access}
+      setupProjectId={() => undefined}
+      onOpenSetup={noop}
+    />
+  );
+  const notice = (sessionId: string) =>
+    document.querySelector(
+      `[data-attention-target="session:${sessionId}"] .session-provider-hold`,
+    );
+  const primary = (sessionId: string) =>
+    [...notice(sessionId)!.children]
+      .filter((element) => element.tagName === "STRONG" || element.tagName === "P")
+      .map((element) => element.textContent ?? "").join(" ");
+  const releaseButton = (sessionId: string) =>
+    [...notice(sessionId)!.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("provider hold")
+    ) as HTMLButtonElement;
+  try {
+    mount(render([exited, cooling]));
+    check(
+      primary("s-exited").includes("Manager is on hold after a provider error") &&
+        primary("s-exited").includes("The provider reported a failure: a billing problem") &&
+        primary("s-exited").includes("This needs your action") &&
+        primary("s-exited").includes("will not start, resume or send input") &&
+        primary("s-exited").includes("does not restart the agent") &&
+        !primary("s-exited").includes("ended"),
+      `a startup-attributed hold claimed an ended turn or lost its plain explanation: ${primary("s-exited")}`,
+    );
+    check(
+      primary("s-cooling").includes("The provider reported a failure: a rate limit was reached") &&
+        primary("s-cooling").includes("short cooldown of its own") &&
+        primary("s-cooling").includes("not the provider's reset time") &&
+        !primary("s-cooling").includes("will not start") &&
+        !primary("s-cooling").includes("ended"),
+      `a cooldown claimed an ended turn, a provider reset or human-only release: ${primary("s-cooling")}`,
+    );
+    const details = notice("s-exited")!.querySelector("details")!;
+    check(
+      !details.open && details.textContent?.includes("startup_invocation attribution") &&
+        details.textContent.includes("no app cooldown; needs your action") &&
+        !details.textContent.includes("only by release") &&
+        details.textContent.includes("hold-billing") &&
+        !primary("s-exited").includes("hold-billing") &&
+        !primary("s-exited").includes("startup_invocation"),
+      "hold identity or attribution was primary copy, details claimed release is the only end, or expanded by default",
+    );
+
+    act(() => releaseButton("s-exited").click());
+    await settle();
+    check(
+      requests.length === 1 && requests[0].kind === "release_provider_failure_hold" &&
+        typeof requests[0].operation_id === "string" &&
+        requests[0].task_id === "AJ-1" && requests[0].attempt_id === "a1" &&
+        requests[0].session_id === "s-exited" && requests[0].hold_id === "hold-billing" &&
+        requests[0].expected_task_version === 7,
+      `Release provider hold posted ${JSON.stringify(requests)}`,
+    );
+    check(
+      refreshes === 1 && primary("s-exited").includes("Hold released") &&
+        primary("s-exited").includes("not restarted or sent anything") &&
+        !releaseButton("s-exited"),
+      `a release was not confirmed without restarting work: ${primary("s-exited")}`,
+    );
+
+    respond = () => new Response(JSON.stringify({ error: "task version is stale" }), { status: 409 });
+    act(() => releaseButton("s-cooling").click());
+    await settle();
+    check(
+      notice("s-cooling")!.querySelector('[role="alert"] strong')?.textContent?.includes(
+        "older version",
+      ) && refreshes === 1 && !!releaseButton("s-cooling"),
+      "a stale release was not explained or was treated as released",
+    );
+
+    let finish: (response: Response) => void = noop;
+    respond = () => new Promise<Response>((resolve) => {
+      finish = resolve;
+    });
+    act(() => releaseButton("s-cooling").click());
+    await settle();
+    check(
+      releaseButton("s-cooling").disabled &&
+        releaseButton("s-cooling").textContent === "Releasing provider hold…",
+      "a pending release could be submitted twice",
+    );
+    finish(new Response(JSON.stringify({ error: "task version is stale" }), { status: 409 }));
+    await settle();
+
+    respond = () => {
+      throw new TypeError("Failed to fetch");
+    };
+    act(() => releaseButton("s-cooling").click());
+    await settle();
+    check(
+      notice("s-cooling")!.querySelector('[role="alert"]')?.textContent?.includes(
+        "Refresh the dashboard and check the task or session before retrying",
+      ),
+      "an uncertain release did not ask for a refresh before retrying",
+    );
+    respond = () =>
+      new Response(JSON.stringify({
+        result: { operation_id: "release", entity_kind: "provider_failure_hold", entity_id: "hold-rate", version: 7, state: "expired", detail: {} },
+      }));
+    act(() => releaseButton("s-cooling").click());
+    await settle();
+    const operations = requests.map((request) => request.operation_id);
+    check(
+      requests.length === 5 && operations[4] === operations[3] &&
+        operations[3] !== operations[2] && operations[2] !== operations[1] &&
+        primary("s-cooling").includes("cooldown had already ended, so nothing changed"),
+      `a refused release kept its operation, an uncertain one did not, or the outcome was misreported: ${JSON.stringify(requests.slice(1))}`,
+    );
+
+    rerender(render([{ ...exited, provider_failure_holds: [] }, cooling]));
+    check(!notice("s-exited"), "a released hold stayed after the authoritative snapshot");
+    rerender(render([exited, { ...cooling, provider_failure_holds: [] }]));
+    check(
+      !!notice("s-exited") && !notice("s-cooling"),
+      "the session list did not follow the authoritative hold state",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("A provider hold's attention item opens its exited session, whose Release provider hold posts the exact binding", async () => {
+  const live = liveHarness();
+  const priorEnvironment = { ...liveEnvironment };
+  const commands: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input) !== "/api/command") return new Response("[]");
+    commands.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({
+      result: {
+        operation_id: "release",
+        entity_kind: "provider_failure_hold",
+        entity_id: "hold-billing",
+        version: 8,
+        state: "released",
+        detail: {},
+      },
+    }));
+  }) as typeof fetch;
+  liveEnvironment.transport = live.environment.transport;
+  liveEnvironment.scheduler = live.environment.scheduler;
+  localStorage.clear();
+  localStorage.setItem("agenticjira.page", "workspace");
+  const itemId = "provider_failure_hold:hold-billing";
+  const state = snapshotAt("service-a", "50", {
+    tasks: [{ ...task, title: "Held task" }],
+    active_sessions: [{
+      ...managerSession,
+      id: "s-exited",
+      status: "exited",
+      provider_failure_holds: [{
+        id: "hold-billing",
+        task_id: "AJ-1",
+        task_version: 7,
+        attempt_id: "a1",
+        session_id: "s-exited",
+        role_generation_id: "g1",
+        transcript_epoch: "epoch-1",
+        accepted_hook_event_id: null,
+        failure_hook_event_id: "hook-billing",
+        kind: "billing_error",
+        attribution: "startup_invocation",
+        created_at: "2026-10-01T15:00:00Z",
+        expires_at: null,
+      }],
+    }],
+    attention: [{
+      id: itemId,
+      category: "blocked",
+      title: "Manager is on hold after a provider error",
+      reason: "The provider reported a failure for Manager. This needs your action.",
+      task_title: "Held task",
+      role: "manager",
+      action: { kind: "open_agent_output", label: "Open agent output" },
+      target: {
+        kind: "session",
+        project_id: "p1",
+        task_id: "AJ-1",
+        attempt_id: "a1",
+        session_id: "s-exited",
+        role_generation_id: "g1",
+      },
+      held_tasks: [],
+    }],
+  });
+  try {
+    mount(<App />);
+    await settle();
+    live.reads[0].resolve(state);
+    await settle();
+    act(() =>
+      document.querySelector<HTMLButtonElement>(`[data-attention-id="${itemId}"] button`)!.click()
+    );
+    await settle();
+    const session = document.activeElement;
+    check(
+      session?.getAttribute("data-attention-target") === "session:s-exited" &&
+        !!session.closest('[role="dialog"]'),
+      `the hold's attention item focused ${session?.getAttribute("data-attention-target")}`,
+    );
+    const release = [...session!.querySelectorAll<HTMLButtonElement>(".session-provider-hold button")]
+      .find((button) => button.textContent === "Release provider hold");
+    check(!!release, "the opened exited session offers no Release provider hold");
+    act(() => release!.click());
+    await settle();
+    const sent: Record<string, unknown> = commands[0] ?? {};
+    const { operation_id, ...binding } = sent;
+    const expected: Record<string, unknown> = {
+      kind: "release_provider_failure_hold",
+      task_id: "AJ-1",
+      attempt_id: "a1",
+      session_id: "s-exited",
+      hold_id: "hold-billing",
+      expected_task_version: 7,
+    };
+    check(
+      commands.length === 1 && typeof operation_id === "string" &&
+        Object.keys(binding).length === Object.keys(expected).length &&
+        Object.entries(expected).every(([key, value]) => binding[key] === value),
+      `the routed release posted ${JSON.stringify(commands)}`,
+    );
+  } finally {
+    unmount();
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
   }
 });
 

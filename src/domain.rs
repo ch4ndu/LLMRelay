@@ -1742,6 +1742,81 @@ impl NativeTurnFailureKind {
             _ => Self::Unknown,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthenticationFailed => "authentication_failed",
+            Self::OauthOrgNotAllowed => "oauth_org_not_allowed",
+            Self::AccountOnHold => "account_on_hold",
+            Self::VerificationRequired => "verification_required",
+            Self::BillingError => "billing_error",
+            Self::RateLimit => "rate_limit",
+            Self::Overloaded => "overloaded",
+            Self::InvalidRequest => "invalid_request",
+            Self::ModelNotFound => "model_not_found",
+            Self::ServerError => "server_error",
+            Self::MaxOutputTokens => "max_output_tokens",
+            Self::CloudCredentialError => "cloud_credential_error",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn app_cooldown(self) -> bool {
+        match self {
+            Self::RateLimit | Self::Overloaded => true,
+            Self::AuthenticationFailed
+            | Self::OauthOrgNotAllowed
+            | Self::AccountOnHold
+            | Self::VerificationRequired
+            | Self::BillingError
+            | Self::InvalidRequest
+            | Self::ModelNotFound
+            | Self::ServerError
+            | Self::MaxOutputTokens
+            | Self::CloudCredentialError
+            | Self::Unknown => false,
+        }
+    }
+}
+
+/// Restricts work only; no attribution proves the turn ended or the agent is idle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureAttribution {
+    PromptIdMatched,
+    /// An accepted turn exists but one of the two prompt ids is missing.
+    ArrivalOrder,
+    /// The invocation started but no turn was accepted yet.
+    StartupInvocation,
+}
+
+impl ProviderFailureAttribution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PromptIdMatched => "prompt_id_matched",
+            Self::ArrivalOrder => "arrival_order",
+            Self::StartupInvocation => "startup_invocation",
+        }
+    }
+}
+
+/// While active, nothing starts, resumes or sends input to its role and lane in the attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderFailureHoldDto {
+    pub id: String,
+    pub task_id: String,
+    pub task_version: i64,
+    pub attempt_id: String,
+    pub session_id: String,
+    pub role_generation_id: String,
+    pub transcript_epoch: String,
+    pub accepted_hook_event_id: Option<String>,
+    pub failure_hook_event_id: String,
+    pub kind: NativeTurnFailureKind,
+    pub attribution: ProviderFailureAttribution,
+    pub created_at: String,
+    /// LLMRelay's own cooldown end, never a provider reset time; `None` needs a release.
+    pub expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2472,6 +2547,15 @@ pub enum HumanCommand {
         #[serde(default)]
         reason: String,
     },
+    /// Starts, resumes or sends nothing; already-allowed automatic work may continue later.
+    ReleaseProviderFailureHold {
+        operation_id: String,
+        task_id: String,
+        attempt_id: String,
+        session_id: String,
+        hold_id: String,
+        expected_task_version: i64,
+    },
 }
 
 impl HumanCommand {
@@ -2521,7 +2605,8 @@ impl HumanCommand {
             | Self::Restore { operation_id, .. }
             | Self::SetAutoResume { operation_id, .. }
             | Self::DecidePermission { operation_id, .. }
-            | Self::RevokePermissionRule { operation_id, .. } => operation_id,
+            | Self::RevokePermissionRule { operation_id, .. }
+            | Self::ReleaseProviderFailureHold { operation_id, .. } => operation_id,
         }
     }
 }

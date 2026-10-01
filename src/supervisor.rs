@@ -4,7 +4,7 @@ use crate::domain::{
     Provider, RolePeerProvenance,
 };
 use crate::providers::PreparedLaunch;
-use crate::store::Store;
+use crate::store::{InputLeasePurpose, Store};
 use crate::transcript::{self, TranscriptSink};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Duration, Utc};
@@ -1427,6 +1427,21 @@ impl Supervisor {
         owner_id: &str,
         seconds: i64,
     ) -> Result<(String, String)> {
+        self.acquire_input_for(
+            InputLeasePurpose::HumanControl,
+            session_id,
+            owner_id,
+            seconds,
+        )
+    }
+
+    pub(crate) fn acquire_input_for(
+        &self,
+        purpose: InputLeasePurpose,
+        session_id: &str,
+        owner_id: &str,
+        seconds: i64,
+    ) -> Result<(String, String)> {
         if !(1..=300).contains(&seconds) {
             bail!("input lease duration must be between 1 and 300 seconds")
         }
@@ -1439,7 +1454,8 @@ impl Supervisor {
         let secret = crate::auth::issue_secret();
         let process_json = serde_json::to_string(&binding.process)?;
         let expires_at = (Utc::now() + Duration::seconds(seconds)).to_rfc3339();
-        self.store.acquire_input_lease(
+        self.store.acquire_input_lease_for(
+            purpose,
             session_id,
             &secret,
             owner_id,
@@ -4288,6 +4304,150 @@ mod tests {
         assert!(std::fs::read(&terminal_input).unwrap().is_empty());
         // Nothing still owns the terminal, so a person can take input at once.
         supervisor.acquire_input(session, "human", 30).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_provider_hold_after_guidance_selection_refuses_its_input_lease_but_not_a_person() {
+        use std::os::unix::process::CommandExt;
+        let root = std::env::temp_dir().join(format!(
+            "agenticjira-guidance-provider-hold-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&root.join("state.sqlite3")).unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let process = ProcessIdentity {
+            pid,
+            process_group_id: pid as i32,
+            native_start_marker: native_start_marker(pid).unwrap(),
+            observed_started_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let (session, generation, epoch) = (
+            "7a2d3c0f-4b5e-4f60-9b8c-2d3e4f5a6b70",
+            "7a2d3c0f-4b5e-4f60-9b8c-2d3e4f5a6b71",
+            "7a2d3c0f-4b5e-4f60-9b8c-2d3e4f5a6b72",
+        );
+        {
+            let connection = store.lock().unwrap();
+            // The idle check's process record lands the hold between selection and acquisition.
+            connection.execute_batch(&format!(
+                "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+                   VALUES('p','Project','/tmp/project','identity','base','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO tasks(id,project_id,title,description,acceptance_criteria_json,lifecycle,attention,created_at,updated_at)
+                   VALUES('t','p','Task','Task','[]','in_progress','none','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+                   VALUES('a','t','context','implementation','base',1,'running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+                   VALUES('{generation}','a','implementer','codex',1,1,'running','authority','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,
+                   transcript_epoch,readiness_state,created_at,updated_at)
+                   VALUES('{session}','{generation}','codex','running','{{}}','fixture','{epoch}','idle_candidate',
+                   '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at)
+                   VALUES('guidance','a','{generation}','Use the smaller scope','queued','2026-01-01T00:00:00Z');
+                 INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,
+                   payload_json,peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+                   VALUES('failure','{session}','{generation}','codex','StopFailure',NULL,'{{}}',42,42,'peer',
+                   'managed_process_group_untrusted_payload','2026-01-01T00:00:00Z');
+                 CREATE TRIGGER provider_hold_after_selection AFTER INSERT ON session_processes
+                 BEGIN
+                   INSERT OR IGNORE INTO provider_failure_holds(id,attempt_id,role_generation_id,session_id,
+                     transcript_epoch,failure_hook_event_id,failure_kind,attribution,created_at,state)
+                   VALUES('hold','a','{generation}','{session}','{epoch}','failure','billing_error',
+                     'arrival_order','2026-01-01T00:00:00Z','active');
+                 END;"
+            ))
+            .unwrap();
+            connection
+                .execute(
+                    "UPDATE sessions SET process_identity_json=?1 WHERE id=?2",
+                    rusqlite::params![serde_json::to_string(&process).unwrap(), session],
+                )
+                .unwrap();
+        }
+        let supervisor = Supervisor::new(store.clone(), root.join("transcripts"));
+        let terminal_input = root.join("terminal-input");
+        let pty = native_pty_system().openpty(PtySize::default()).unwrap();
+        supervisor.sessions.write().unwrap().insert(
+            session.into(),
+            Arc::new(SessionHandle {
+                session_id: session.into(),
+                role_generation_id: generation.into(),
+                transcript_epoch: epoch.into(),
+                process: process.clone(),
+                group_leader: ProcessGenerationAnchor {
+                    pid,
+                    process_group_id: process.process_group_id,
+                    native_start_marker: process.native_start_marker.clone(),
+                    boot_identity: system_boot_identity().unwrap(),
+                },
+                child: Mutex::new(Box::new(RunningChild {
+                    kill_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                })),
+                input: Mutex::new(Box::new(std::fs::File::create(&terminal_input).unwrap())),
+                io_boundary: Mutex::new(()),
+                known_members: Mutex::new(HashMap::from([(
+                    pid,
+                    process.native_start_marker.clone(),
+                )])),
+                first_stop_requested_at: Mutex::new(None),
+                codex_helper_image: None,
+                codex_helper_identity: Mutex::new(None),
+                _master: Mutex::new(pty.master),
+            }),
+        );
+        let facts = || {
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT (SELECT state||':'||COALESCE(delivery_session_id,'none')
+                             FROM guidance_messages WHERE id='guidance')
+                        ||'|'||(SELECT COUNT(*) FROM input_leases)
+                        ||'|'||(SELECT COUNT(*) FROM recovery_records)
+                        ||'|'||COALESCE((SELECT state FROM provider_failure_holds WHERE id='hold'),'none')",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(facts(), "queued:none|0|0|none");
+
+        let queued = crate::roles::RoleService::new(store.clone(), supervisor.clone())
+            .deliver_guidance("guidance")
+            .unwrap();
+        assert_eq!(
+            (
+                queued["state"].as_str(),
+                queued["reason"].as_str(),
+                queued["hold_id"].as_str()
+            ),
+            (Some("queued"), Some("provider_failure_hold"), Some("hold")),
+            "{queued}"
+        );
+        assert_eq!(facts(), "queued:none|0|0|active");
+        assert!(std::fs::read(&terminal_input).unwrap().is_empty());
+        supervisor.acquire_input(session, "human", 30).unwrap();
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT owner_id FROM input_leases WHERE session_id=?1 AND revoked_at IS NULL",
+                    rusqlite::params![session],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "human"
+        );
         child.kill().unwrap();
         child.wait().unwrap();
         let _ = std::fs::remove_dir_all(root);

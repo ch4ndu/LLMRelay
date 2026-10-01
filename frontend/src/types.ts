@@ -652,6 +652,31 @@ export interface NativePrompt {
   kind: "permission_prompt" | "elicitation_dialog" | "elicitation_url_dialog" | "agent_needs_input";
   observed_at: string;
 }
+export type ProviderFailureAttribution =
+  | "prompt_id_matched"
+  | "arrival_order"
+  | "startup_invocation";
+export interface ProviderFailureHold {
+  id: string;
+  task_id: string;
+  task_version: number;
+  attempt_id: string;
+  session_id: string;
+  role_generation_id: string;
+  transcript_epoch: string;
+  accepted_hook_event_id: string | null;
+  failure_hook_event_id: string;
+  kind: NativeTurnFailureKind;
+  attribution: ProviderFailureAttribution;
+  created_at: string;
+  /** End of LLMRelay's own cooldown, never the provider's reset time. */
+  expires_at: string | null;
+}
+export type ProviderFailureHoldRelease =
+  | "released"
+  | "already_released"
+  | "expired"
+  | "superseded";
 export interface Session {
   id: string;
   role_generation_id: string;
@@ -703,6 +728,8 @@ export interface Session {
   } | null;
   native_turn?: NativeTurn | null;
   native_prompt?: NativePrompt | null;
+  /** Holds that still restrict this role, whether or not the session runs. */
+  provider_failure_holds?: ProviderFailureHold[];
   cmux_surface?: CmuxSessionSurface | null;
   input_control?: ActiveInputControl | null;
 }

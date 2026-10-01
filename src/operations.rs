@@ -770,7 +770,7 @@ impl Application {
         };
         let due = Utc::now();
         // A held attempt gets no automatic restart, while a person's queued
-        // restart stops only on its own unresolved failure.
+        // restart stops only on its own unresolved failure or provider hold.
         let candidates = {
             let connection = self.store.lock()?;
             let mut statement = connection.prepare(&format!(
@@ -784,9 +784,10 @@ impl Application {
                             AND json_extract(failure.detail_json,'$.causal_identity.session_id')=rc.session_id)
                  FROM restart_candidates rc JOIN sessions s ON s.id=rc.session_id
                  JOIN role_generations rg ON rg.id=s.role_generation_id
-                 WHERE rc.state IN ('parked','queued_capacity')
+                 WHERE rc.state IN ('parked','queued_capacity') AND NOT {}
                  ORDER BY CASE rg.role WHEN 'manager' THEN 0 ELSE 1 END,rc.created_at,rc.session_id",
-                crate::coordinator::coordinator_hold_absent("rc.attempt_id")
+                crate::coordinator::coordinator_hold_absent("rc.attempt_id"),
+                crate::store::provider_failure_hold_restricts("rc.attempt_id", "rg.role", "rg.lane_id")
             ))?;
             let rows = statement
                 .query_map([], |row| {
@@ -996,6 +997,11 @@ impl Application {
                 }));
                 continue;
             }
+            if let Some(held) = crate::store::provider_failure_hold_for_session(&tx, &session)? {
+                omitted.push(session.clone());
+                outcomes.push(held_restart_outcome(&session, &held));
+                continue;
+            }
             let mut facts = crate::recovery::restart_session_facts(&tx, Some(&session))?;
             let Some(facts) = facts.pop() else {
                 omitted.push(session.clone());
@@ -1202,6 +1208,16 @@ impl Application {
                     membership: RestartBatchMembership::Queued,
                 })?;
             }
+        }
+        if let Some(held) = crate::store::provider_failure_hold_for_session(&tx, session)? {
+            return Ok(RestartAdmissionStart::Finished(restart_operation_result(
+                receipt.map(|value| value.0),
+                if automatic { "auto" } else { "selected" },
+                &[session.to_owned()],
+                &[],
+                &[session.to_owned()],
+                vec![held_restart_outcome(session, &held)],
+            )));
         }
         let mut facts = crate::recovery::restart_session_facts(&tx, Some(session))?;
         let facts = facts
@@ -4859,6 +4875,9 @@ fn rework_parent_blocker(
             return Ok(Some(*blocker));
         }
     }
+    if crate::store::provider_failure_hold_in_attempt(connection, parent)?.is_some() {
+        return Ok(Some("a parent role is on hold after a provider failure"));
+    }
     Ok(None)
 }
 
@@ -4928,6 +4947,17 @@ fn restart_operation_result(
         "omitted_ids":omitted,
         "omitted_count":omitted.len(),
         "outcomes":outcomes,
+    })
+}
+
+/// The candidate stays as it was; the restart waits for its hold to end.
+fn held_restart_outcome(
+    session: &str,
+    held: &crate::store::ProviderFailureHeld,
+) -> serde_json::Value {
+    serde_json::json!({
+        "session_id":session,"state":"held","reason":held.to_string(),
+        "reason_code":"restart.provider_failure_hold","hold_id":held.hold_id,
     })
 }
 
@@ -5125,6 +5155,9 @@ fn browser_launch_receipt(receipt: serde_json::Value) -> Result<ValidationLaunch
 }
 
 fn permanent_resume_rejection_category(error: &anyhow::Error) -> Option<&'static str> {
+    if crate::store::ProviderFailureHeld::in_error(error).is_some() {
+        return None;
+    }
     if let Some(compatibility) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<crate::provider_compatibility::CompatibilityError>())

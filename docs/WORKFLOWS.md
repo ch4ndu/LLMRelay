@@ -125,6 +125,24 @@ bindings fail before writing; Codex retains its existing raw-paste behavior.
 
 When an agent asks a question or reports that it is blocked, the task waits for you. **Answer question** appears only when the service has matched the question to the manager session that asked it, and your reply goes to exactly that session; a wait that is not a question has no reply form. If the same agent then sends a newer, usable report, for example a finished plan, LLMRelay releases the wait by itself exactly once and continues from that report; you do not also need to choose **Continue**. The wait stays in place while a permission request, keyboard control, an unconfirmed guidance delivery, a recovery, a pending control, or another unread blocked report still needs you. Only an agent's newest report can hold its task: older questions it has already moved past are retired once and recorded, so **Retry** or **Continue** never brings an answered question back, and a report made while the task waited stays available afterwards instead of being treated as stale.
 
+A provider failure also places a durable hold on automatic work for the affected
+role and lane. Rate-limit and overload failures use a 60-second app cooldown;
+other failure kinds require you to fix the cause and choose **Release provider
+hold** on the agent's session. The hold remains visible after the session exits.
+It does not turn into a generic coordinator-failure recovery item, and unrelated
+eligible work can continue.
+
+**Continue** and **Run next** retain their pause behavior but do not clear this
+hold. **Retry** and rework cannot create another attempt to escape it. Releasing
+a hold does not start an agent, send input or establish that a session is idle;
+automatic work that was already authorized may become eligible at a later step.
+If the release response is uncertain, refresh and check the current state before
+retrying. An accepted newer turn supersedes that session's older holds, and an
+explicit human role replacement retires the replaced role's holds. Stop and tool
+activity alone do not clear them. Failure attribution and identifiers appear in
+**Technical details**. The cooldown is LLMRelay's own restriction, not a claimed
+provider reset time.
+
 A Codex manager turn sometimes ends without a completion hook for every tool it started. LLMRelay then treats the turn as finished only after the service has checked, for the manager's exact current session, credential, invocation and hooks, that nothing else is pending (permission, keyboard control, uncertain guidance, control, switch, restart, recovery, capture or check) and the process inventory shows the manager idle. A completion hook that arrives late for a tool from that turn counts as bookkeeping; any new work keeps the turn busy. Elapsed time or a quiet terminal is never used. Queued guidance, such as your answer, is delivered only after that boundary, and it counts as submitted only when the manager's own prompt-submit event carries exactly its text.
 
 Each task card on the Board and in Workspace, and the task's header, shows the same next step as the Workspace inbox, for example **Review plan**, **Review request**, **Answer question**, **Open agent output**, **Open agent settings** or **Resolve issue**, and opens the same exact item. When a task has more than one waiting item, the card shows how many more there are and the task header lists each of them with its own button. If an item changed before it could open, nothing is opened or run and the latest state is requested. An item with no current page to open offers **Refresh**.

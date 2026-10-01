@@ -17,7 +17,7 @@ Provider boundary: embedded compatibility candidates are Codex 0.157.1 and Claud
 | Compound command, heredoc, redirect or interpreter | Reference automatic response policy differs | Existing structured permission families retain their exact argument, path, cwd and invocation fences. | Unsupported families require one-time review or the native route. No blanket Python/shell permission. |
 | Delayed or duplicate signals | Runner-specific event checks | Current invocation identity and accepted state determine visibility; repeated notifications retain a stable event identity. | Without provider turn identifiers, hook arrival order is weaker evidence. No stronger causal claim is made. |
 | Reconnect / initial snapshot | Reference parity not established | In-app notices list current waits; initial/reset state does not replay historical browser alerts. | Browser delivery does not change provider or workflow state. |
-| Claude turn failure | Structured StopFailure normalization | A trusted current StopFailure exposes the failure kind while keeping process state separate. | No fabricated role result, review call, paid retry or model fallback. |
+| Claude turn failure | Structured StopFailure normalization and durable role/lane hold | A trusted current StopFailure exposes the failure kind and restricts affected automatic work. Rate-limit/overload uses an app cooldown; other kinds require Release provider hold. Holds remain visible on exited sessions. | No fabricated role result, readiness promotion, review call, paid retry, model fallback or provider-reset claim. |
 | Codex capacity / process-open error | Runner-specific output handling | Recorded launch/process errors and Open agent output remain available. | No equivalent admitted StopFailure/Notification hook is assumed. |
 | Submitted implementation / open process | Native output and result channel | Authenticated role report is awaiting processing or verification; the session may remain open. | A candidate report and hook completion are separate from human acceptance. |
 | Resume recovery | Runner/session machinery | Exact accepted resumed-turn evidence may supersede its own earlier blocker and release its matching hold atomically. | Independent controls, current blockers, original reports and rejection history remain intact. |
@@ -45,3 +45,17 @@ This was a model-availability error, not a capacity error. LLMRelay has no runti
 Codex session-history reader, and the test established no supported structured
 capacity signal. The output route remains available; neither terminal text nor
 an installed version establishes model eligibility or permission to retry.
+
+Provider failure holds reuse the current invocation and accepted-turn identity
+checks. Matching prompt IDs, arrival-order attribution when an ID is absent, and
+startup-invocation attribution are distinct strengths of evidence for a
+restriction. None proves that a failed turn is quiescent. Releasing a hold and
+expiry of its app cooldown remove only that restriction; all other workflow,
+permission and readiness prerequisites remain in force.
+
+The deferred-program local failure probe stopped at the CLI's startup network
+check before a prompt, hook or local API request. It did not establish failure
+readiness or provider reset timing. Managed-process provenance establishes the
+origin of a hook, while its payload assertions remain untrusted; that label alone
+does not disqualify the origin. The missing failed-turn quiescence and unique
+notification/request correlation remain separate evidence gaps.

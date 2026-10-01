@@ -325,3 +325,19 @@ using existing OS boot proof rather than accepting missing-process risk. User
 approved one additional focused Fable/medium plan recheck (call 3). Cover release
 refusal/success and unavailable/same/changed boot within scenario 7, not a new
 scenario or harness. All current scope and access restrictions remain intact.
+
+## October 1 deferred hardening continuation
+
+Continue the original proposal in four sequential slices: provider behavior
+(H2/H4/H11/H12), durable anomaly/repeated-block attention (H3/H15), existing PTY
+fixture extensions and a conditional structured capacity reader (H9/H16), then
+verified pre-upgrade restore points with free-space checks and recovery. Do not
+count the later feature list as part of these slices.
+
+The independently approved H4 plan delivers durable role/lane failure holds and
+an exact human release action. Its implementation passed integration checks,
+independent code review and fresh final verification. This bounded app-owned H4
+increment is complete. The default cooldown does not implement
+provider reset parsing, and release never grants idle readiness. H2/H11/H12 and
+the remaining slices stay open. See [Milestones](MILESTONES.md#deferred-hardening-continuation-october-1)
+and the current [workflow behavior](WORKFLOWS.md).

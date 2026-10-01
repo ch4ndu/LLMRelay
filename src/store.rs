@@ -3,8 +3,9 @@ use crate::domain::{
     AttachmentBinding, CapabilityIdentity, CapabilityProofInput, CmuxAttachmentControlDirective,
     CmuxAttachmentControlDisposition, CmuxAttachmentMode, CmuxAttachmentRoute,
     CmuxKeyboardControlAction, CmuxKeyboardControlOutcome, CmuxSessionSurface, CmuxTaskWorkspace,
-    CmuxViewOutcome, HookEnvelope, LaunchConfig, ObservedProcessIdentity, RestartCandidateResult,
-    RoleContext, RoleKind, RolePeerProvenance, RoleResultReport, ValidationLaunchRequest,
+    CmuxViewOutcome, HookEnvelope, LaunchConfig, NativeTurnFailureKind, ObservedProcessIdentity,
+    RestartCandidateResult, RoleContext, RoleKind, RolePeerProvenance, RoleResultReport,
+    ValidationLaunchRequest,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -47,6 +48,61 @@ impl std::fmt::Display for RoleLaunchCapacityError {
 }
 
 impl std::error::Error for RoleLaunchCapacityError {}
+
+/// An expected wait on the held role and lane, never a failed step.
+#[derive(Clone, Debug)]
+pub(crate) struct ProviderFailureHeld {
+    pub(crate) hold_id: String,
+    pub(crate) session_id: String,
+    pub(crate) role: RoleKind,
+    pub(crate) kind: NativeTurnFailureKind,
+    pub(crate) expires_at: Option<String>,
+}
+
+impl ProviderFailureHeld {
+    pub(crate) fn in_error(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
+impl std::fmt::Display for ProviderFailureHeld {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} is on hold after a provider failure; release provider failure hold {} before starting, resuming or sending input to this role",
+            self.role.label(),
+            self.hold_id
+        )
+    }
+}
+
+impl std::error::Error for ProviderFailureHeld {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderFailureHoldRelease {
+    Released,
+    AlreadyReleased,
+    Expired,
+    Superseded,
+}
+
+impl ProviderFailureHoldRelease {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Released => "released",
+            Self::AlreadyReleased => "already_released",
+            Self::Expired => "expired",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+/// A provider failure hold refuses automated guidance input; a person keeps keyboard control.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputLeasePurpose {
+    HumanControl,
+    AutomatedGuidance,
+}
 
 #[derive(Clone, Debug)]
 pub struct RoleLaunchContext {
@@ -170,6 +226,7 @@ const MIGRATION_031: &str = include_str!("../migrations/031_final_repair_recheck
 const MIGRATION_032: &str = include_str!("../migrations/032_normal_final_repair.sql");
 const MIGRATION_033: &str = include_str!("../migrations/033_native_resolution.sql");
 const MIGRATION_034: &str = include_str!("../migrations/034_guidance_submitted_text.sql");
+const MIGRATION_035: &str = include_str!("../migrations/035_provider_failure_holds.sql");
 // Same value rusqlite installs at open; set explicitly before any pragma or DDL can contend.
 const STATE_DATABASE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1935,9 +1992,27 @@ impl Store {
             )?,
             None => None,
         };
+        let provider_failure_hold =
+            if event_name == "StopFailure" && current_invocation_start_rowid.is_some() {
+                record_provider_failure_hold(
+                    &transaction,
+                    context,
+                    &hook_event_id,
+                    &envelope.payload,
+                    &now,
+                )?
+            } else {
+                None
+            };
         let current_invocation_submit =
             event_name == "UserPromptSubmit" && current_invocation_start_rowid.is_some();
         if current_invocation_submit {
+            transaction.execute(
+                "UPDATE provider_failure_holds SET state='superseded',resolved_at=?1,
+                        resolution_kind='accepted_turn',resolution_ref=?2
+                 WHERE session_id=?3 AND state='active'",
+                params![now, hook_event_id, context.session_id],
+            )?;
             let submitted_text = envelope
                 .payload
                 .get("prompt")
@@ -2026,6 +2101,7 @@ impl Store {
             "recorded": true, "session_id": context.session_id, "event_name": event_name,
             "hook_event_id": hook_event_id,
             "natively_resolved_permission_request_id": natively_resolved_permission,
+            "provider_failure_hold_id": provider_failure_hold,
             "resume_reconciliation": resume_reconciliation,
             "native_identity_candidate": identity_eligible,
             "native_identity_authoritative": false,
@@ -2165,6 +2241,7 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_session_provider_failure_hold(&transaction, session_id)?;
         let reserved = transaction.execute(
             "UPDATE guidance_messages SET state='delivery_reserved',reason='automatic_post_hook_idle_verified',
                delivery_session_id=?2,delivery_transcript_epoch=?3,delivery_resume_invocation_id=?4,
@@ -4044,6 +4121,7 @@ impl Store {
         if check_running {
             bail!("role launch conflicts with a durably owned running check")
         }
+        require_no_provider_failure_hold(&transaction, attempt_id, role, &lane_id)?;
         if !role_capacity_available(&transaction, &provider, role, None, None)? {
             return Err(RoleLaunchCapacityError.into());
         }
@@ -4177,6 +4255,7 @@ impl Store {
         if check_running {
             bail!("switched role conflicts with a durably owned running check")
         }
+        require_no_provider_failure_hold(&transaction, &attempt_id, role, &old_lane)?;
         let provider = config.provider.to_string();
         if !role_capacity_available(&transaction, &provider, role, None, None)? {
             bail!("role capacity is full")
@@ -4637,6 +4716,7 @@ impl Store {
         if held {
             bail!("attempt became held before authoritative reservation")
         }
+        require_no_provider_failure_hold(&transaction, &attempt_id, config.role, &context.lane_id)?;
         let provider = config.provider.to_string();
         if !role_capacity_available(
             &transaction,
@@ -8354,6 +8434,7 @@ impl Store {
         if role != launch.role {
             bail!("resume role changed")
         }
+        require_no_session_provider_failure_hold(&transaction, session_id)?;
         if !role_capacity_available(&transaction, &provider, role, Some(session_id), None)? {
             bail!("role capacity is full for exact resume")
         }
@@ -8726,6 +8807,7 @@ impl Store {
         if role != launch.role {
             bail!("resume role changed")
         }
+        require_no_session_provider_failure_hold(&tx, session_id)?;
         if !role_capacity_available(&tx, &provider, role, Some(session_id), None)? {
             return Err(RoleResumeCapacityError.into());
         }
@@ -8812,6 +8894,28 @@ impl Store {
         role_generation_id: &str,
         expires_at: &str,
     ) -> Result<()> {
+        self.acquire_input_lease_for(
+            InputLeasePurpose::HumanControl,
+            session_id,
+            lease_secret,
+            owner_id,
+            process_json,
+            role_generation_id,
+            expires_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn acquire_input_lease_for(
+        &self,
+        purpose: InputLeasePurpose,
+        session_id: &str,
+        lease_secret: &str,
+        owner_id: &str,
+        process_json: &str,
+        role_generation_id: &str,
+        expires_at: &str,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -8822,6 +8926,9 @@ impl Store {
         )?;
         if status != "running" {
             bail!("input lease requires a running session")
+        }
+        if purpose == InputLeasePurpose::AutomatedGuidance {
+            require_no_session_provider_failure_hold(&transaction, session_id)?;
         }
         let active: Option<(String, Option<String>)> = transaction
             .query_row(
@@ -9062,7 +9169,7 @@ impl Store {
     }
 }
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 34;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 35;
 
 /// Reads the durable state cursor. It is committed state only when the
 /// connection is in autocommit mode.
@@ -9074,7 +9181,7 @@ pub(crate) fn read_state_revision(connection: &Connection) -> rusqlite::Result<i
 
 /// The prior schemas an existing database may be migrated from at service
 /// start. Every other non-current version is left unchanged and refused.
-const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 3] = [31, 32, 33];
+const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 4] = [31, 32, 33, 34];
 
 fn upgrade_supported_service_schema(path: &Path) -> Result<()> {
     let mut connection = Connection::open_with_flags(
@@ -9556,6 +9663,336 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .commit()
             .context("commit guidance submitted-form migration")?;
     }
+    if version <= 34 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_035)?;
+        transaction.pragma_update(None, "user_version", 35)?;
+        transaction
+            .commit()
+            .context("commit provider failure hold migration")?;
+    }
+    Ok(())
+}
+
+/// LLMRelay's own wait after a rate limit or overload, never the provider's reset time.
+const PROVIDER_FAILURE_COOLDOWN_SECONDS: i64 = 60;
+
+/// Expiry is only observed here; nothing runs when a cooldown passes.
+pub(crate) fn provider_failure_hold_active(hold: &str) -> String {
+    format!(
+        "({hold}.state='active' AND ({hold}.expires_at IS NULL
+           OR julianday({hold}.expires_at)>julianday('now')))"
+    )
+}
+
+/// Keyed by role and lane, so a newer generation cannot escape an earlier one's hold.
+pub(crate) fn provider_failure_hold_restricts(attempt: &str, role: &str, lane: &str) -> String {
+    format!(
+        "EXISTS(SELECT 1 FROM provider_failure_holds provider_hold
+           JOIN role_generations provider_hold_generation
+             ON provider_hold_generation.id=provider_hold.role_generation_id
+           WHERE provider_hold.attempt_id={attempt} AND provider_hold_generation.role={role}
+             AND provider_hold_generation.lane_id={lane} AND {})",
+        provider_failure_hold_active("provider_hold")
+    )
+}
+
+fn first_provider_failure_hold(
+    connection: &Connection,
+    subject: &str,
+    params: impl rusqlite::Params,
+) -> Result<Option<ProviderFailureHeld>> {
+    let hold: Option<(String, String, String, String, Option<String>)> = connection
+        .query_row(
+            &format!(
+                "SELECT provider_hold.id,provider_hold.session_id,provider_hold_generation.role,
+                        provider_hold.failure_kind,provider_hold.expires_at
+                 FROM provider_failure_holds provider_hold
+                 JOIN role_generations provider_hold_generation
+                   ON provider_hold_generation.id=provider_hold.role_generation_id
+                 WHERE {subject} AND {}
+                 ORDER BY provider_hold.created_at,provider_hold.rowid LIMIT 1",
+                provider_failure_hold_active("provider_hold")
+            ),
+            params,
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    hold.map(|(hold_id, session_id, role, kind, expires_at)| {
+        Ok(ProviderFailureHeld {
+            hold_id,
+            session_id,
+            role: role.parse().map_err(|error: String| anyhow!(error))?,
+            kind: NativeTurnFailureKind::from_provider_error(&kind),
+            expires_at,
+        })
+    })
+    .transpose()
+}
+
+pub(crate) fn provider_failure_hold_on(
+    connection: &Connection,
+    attempt_id: &str,
+    role: RoleKind,
+    lane_id: &str,
+) -> Result<Option<ProviderFailureHeld>> {
+    first_provider_failure_hold(
+        connection,
+        "provider_hold.attempt_id=?1 AND provider_hold_generation.role=?2
+         AND provider_hold_generation.lane_id=?3",
+        params![attempt_id, role.to_string(), lane_id],
+    )
+}
+
+/// Any role's active hold in the attempt, which a replacement attempt would escape.
+pub(crate) fn provider_failure_hold_in_attempt(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<Option<ProviderFailureHeld>> {
+    first_provider_failure_hold(
+        connection,
+        "provider_hold.attempt_id=?1",
+        params![attempt_id],
+    )
+}
+
+/// Keyed by the session's role and lane, not only by holds this session recorded.
+pub(crate) fn provider_failure_hold_for_session(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<ProviderFailureHeld>> {
+    first_provider_failure_hold(
+        connection,
+        "EXISTS(SELECT 1 FROM sessions held_session JOIN role_generations held_generation
+           ON held_generation.id=held_session.role_generation_id
+           WHERE held_session.id=?1 AND held_generation.attempt_id=provider_hold.attempt_id
+             AND held_generation.role=provider_hold_generation.role
+             AND held_generation.lane_id=provider_hold_generation.lane_id)",
+        params![session_id],
+    )
+}
+
+fn require_no_provider_failure_hold(
+    connection: &Connection,
+    attempt_id: &str,
+    role: RoleKind,
+    lane_id: &str,
+) -> Result<()> {
+    match provider_failure_hold_on(connection, attempt_id, role, lane_id)? {
+        Some(held) => Err(held.into()),
+        None => Ok(()),
+    }
+}
+
+fn require_no_session_provider_failure_hold(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<()> {
+    match provider_failure_hold_for_session(connection, session_id)? {
+        Some(held) => Err(held.into()),
+        None => Ok(()),
+    }
+}
+
+/// Repeat failures of one turn and kind join the standing hold without renewing its deadline.
+fn record_provider_failure_hold(
+    transaction: &Transaction<'_>,
+    context: &RoleContext,
+    hook_event_id: &str,
+    payload: &serde_json::Value,
+    now: &str,
+) -> Result<Option<String>> {
+    let attributed: Option<(Option<String>, String)> = transaction
+        .query_row(
+            &format!(
+                "WITH {}
+                 SELECT (SELECT id FROM accepted),
+                        CASE WHEN NOT EXISTS(SELECT 1 FROM accepted) THEN 'startup_invocation'
+                             WHEN json_type(failed.payload_json,'$.prompt_id')='text'
+                              AND (SELECT json_type(payload_json,'$.prompt_id') FROM accepted)='text'
+                             THEN 'prompt_id_matched' ELSE 'arrival_order' END
+                 FROM current_hooks failed
+                 WHERE failed.id=?2 AND failed.event_name='StopFailure'
+                   AND failed.hook_rowid>COALESCE((SELECT hook_rowid FROM accepted),0)
+                   AND {}",
+                crate::workflow::CURRENT_TURN_HOOKS_SQL,
+                crate::workflow::belongs_to_accepted_turn("failed")
+            ),
+            params![context.session_id, hook_event_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((accepted_hook_event_id, attribution)) = attributed else {
+        return Ok(None);
+    };
+    let kind = NativeTurnFailureKind::from_provider_error(
+        payload
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown"),
+    );
+    let standing: Option<String> = transaction
+        .query_row(
+            &format!(
+                "SELECT standing.id FROM provider_failure_holds standing
+                 WHERE standing.session_id=?1 AND standing.transcript_epoch=?2
+                   AND standing.accepted_hook_event_id IS ?3 AND standing.failure_kind=?4
+                   AND {}",
+                provider_failure_hold_active("standing")
+            ),
+            params![
+                context.session_id,
+                context.transcript_epoch,
+                accepted_hook_event_id,
+                kind.as_str()
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if standing.is_some() {
+        return Ok(standing);
+    }
+    let expires_at = kind
+        .app_cooldown()
+        .then(|| {
+            chrono::DateTime::parse_from_rfc3339(now).map(|created| {
+                (created + chrono::Duration::seconds(PROVIDER_FAILURE_COOLDOWN_SECONDS))
+                    .to_rfc3339()
+            })
+        })
+        .transpose()?;
+    let hold_id = uuid::Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO provider_failure_holds(id,attempt_id,role_generation_id,session_id,
+            transcript_epoch,accepted_hook_event_id,failure_hook_event_id,failure_kind,
+            attribution,created_at,expires_at,state)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'active')",
+        params![
+            hold_id,
+            context.attempt_id,
+            context.role_generation_id,
+            context.session_id,
+            context.transcript_epoch,
+            accepted_hook_event_id,
+            hook_event_id,
+            kind.as_str(),
+            attribution,
+            now,
+            expires_at
+        ],
+    )?;
+    Ok(Some(hold_id))
+}
+
+/// Identity is checked before any state is revealed, then the task version.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn release_provider_failure_hold(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+    task_id: &str,
+    attempt_id: &str,
+    session_id: &str,
+    hold_id: &str,
+    expected_task_version: i64,
+    now: &str,
+) -> Result<ProviderFailureHoldRelease> {
+    let hold: Option<(String, bool, bool, i64)> = transaction
+        .query_row(
+            &format!(
+                "SELECT hold.state,{},
+                        t.archived_at IS NULL AND t.lifecycle NOT IN ('done','cancelled')
+                          AND (a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=t.id
+                                     ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)
+                            OR EXISTS(SELECT 1 FROM rework_intents rework
+                                      WHERE rework.parent_attempt_id=a.id
+                                        AND rework.state NOT IN ('completed','cancelled'))),
+                        t.version
+                 FROM provider_failure_holds hold
+                 JOIN attempts a ON a.id=hold.attempt_id JOIN tasks t ON t.id=a.task_id
+                 WHERE hold.id=?1 AND hold.session_id=?2 AND hold.attempt_id=?3 AND t.id=?4",
+                provider_failure_hold_active("hold")
+            ),
+            params![hold_id, session_id, attempt_id, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((state, restricting, current, task_version)) = hold else {
+        bail!("provider failure hold binding is stale: hold {hold_id} does not belong to session {session_id}, attempt {attempt_id} and task {task_id}")
+    };
+    if task_version != expected_task_version {
+        bail!("task version is stale")
+    }
+    let disposition = match state.as_str() {
+        "human_released" => ProviderFailureHoldRelease::AlreadyReleased,
+        "superseded" => ProviderFailureHoldRelease::Superseded,
+        "active" if !current => ProviderFailureHoldRelease::Superseded,
+        "active" if !restricting => ProviderFailureHoldRelease::Expired,
+        "active" => ProviderFailureHoldRelease::Released,
+        other => bail!("provider failure hold has unsupported state {other}"),
+    };
+    if disposition == ProviderFailureHoldRelease::Released {
+        transaction.execute(
+            "UPDATE provider_failure_holds SET state='human_released',resolved_at=?1,
+                    resolution_kind='human_release',resolution_ref=?2
+             WHERE id=?3 AND state='active'",
+            params![now, operation_id, hold_id],
+        )?;
+    }
+    Ok(disposition)
+}
+
+/// Only an explicit human replacement retires holds; a manager change keeps them.
+pub(crate) fn retire_replaced_role_holds(
+    transaction: &Transaction<'_>,
+    old_generation_id: &str,
+    switch_intent_id: &str,
+    operation_id: &str,
+    now: &str,
+) -> Result<()> {
+    let replaced_role_holds = "SELECT hold.id FROM provider_failure_holds hold
+         JOIN role_generations source ON source.id=hold.role_generation_id
+         JOIN role_generations replaced ON replaced.id=?1
+         WHERE hold.state='active' AND hold.attempt_id=replaced.attempt_id
+           AND source.role=replaced.role AND source.lane_id=replaced.lane_id";
+    let retired = transaction
+        .prepare(replaced_role_holds)?
+        .query_map(params![old_generation_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if retired.is_empty() {
+        return Ok(());
+    }
+    transaction.execute(
+        &format!(
+            "UPDATE provider_failure_holds SET state='superseded',resolved_at=?2,
+                    resolution_kind='role_replacement',resolution_ref=?3
+             WHERE id IN ({replaced_role_holds})"
+        ),
+        params![old_generation_id, now, switch_intent_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+         VALUES(?1,?2,'human','provider_failure_hold.retired','switch_intent',?3,?4,?5)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            operation_id,
+            switch_intent_id,
+            serde_json::json!({
+                "hold_ids":retired,
+                "old_generation_id":old_generation_id,
+                "reason":"explicit role replacement",
+            })
+            .to_string(),
+            now
+        ],
+    )?;
     Ok(())
 }
 
@@ -11602,7 +12039,7 @@ mod interruption_tests {
     }
 
     #[test]
-    fn service_start_upgrades_only_schemas_thirty_one_to_thirty_three_and_preserves_receipts() {
+    fn service_start_upgrades_only_schemas_thirty_one_to_thirty_four_and_preserves_receipts() {
         let root =
             std::env::temp_dir().join(format!("llmrelay-service-upgrade-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -11625,10 +12062,13 @@ mod interruption_tests {
              FROM (SELECT name, sql FROM sqlite_master ORDER BY name)";
         let version = "PRAGMA user_version";
         let current_schema = scalar(schema);
-        let drop_schema_34 = "DROP TRIGGER guidance_submitted_form_paired;
+        let drop_schema_35 = "DROP TABLE provider_failure_holds;";
+        let drop_schema_34 = format!(
+            "{drop_schema_35} DROP TRIGGER guidance_submitted_form_paired;
              DROP TRIGGER guidance_submitted_form_once;
              ALTER TABLE guidance_messages DROP COLUMN submitted_digest;
-             ALTER TABLE guidance_messages DROP COLUMN submitted_text;";
+             ALTER TABLE guidance_messages DROP COLUMN submitted_text;"
+        );
         let drop_after_schema_32 = format!(
             "{drop_schema_34} DROP TABLE permission_native_resolutions;
              DROP TABLE permission_request_hooks; DROP TABLE role_result_supersessions;"
@@ -11716,7 +12156,7 @@ mod interruption_tests {
 
         for _ in 0..2 {
             drop(Store::open_service(&database).unwrap());
-            assert_eq!(scalar(version), "Integer(34)");
+            assert_eq!(scalar(version), "Integer(35)");
             assert_eq!(scalar(history), expected_history);
             assert_eq!(scalar(schema), current_schema);
             assert_eq!(
@@ -11728,41 +12168,50 @@ mod interruption_tests {
             );
         }
         // The released schema 32 upgrades by adding only the native-resolution
-        // provenance tables and the guidance submitted form.
+        // provenance tables, the guidance submitted form and provider failure holds.
         Connection::open(&database)
             .unwrap()
             .execute_batch(&format!("{drop_after_schema_32} PRAGMA user_version=32;"))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(34)");
+        assert_eq!(scalar(version), "Integer(35)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
-        // The released schema 33 upgrades by adding only the guidance submitted form.
+        // Schema 33 upgrades by adding only the guidance submitted form and provider holds.
         Connection::open(&database)
             .unwrap()
             .execute_batch(&format!("{drop_schema_34} PRAGMA user_version=33;"))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(34)");
+        assert_eq!(scalar(version), "Integer(35)");
+        assert_eq!(scalar(history), expected_history);
+        assert_eq!(scalar(schema), current_schema);
+        // The released schema 34 upgrades by adding only provider failure holds.
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(&format!("{drop_schema_35} PRAGMA user_version=34;"))
+            .unwrap();
+        drop(Store::open_service(&database).unwrap());
+        assert_eq!(scalar(version), "Integer(35)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         // An ordinary open of the current schema reopens it without migrating;
         // only a newer schema is refused as unknown.
         drop(Store::open(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(34)");
+        assert_eq!(scalar(version), "Integer(35)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         set_version(CURRENT_SCHEMA_VERSION + 1);
         let error = Store::open(&database).err().unwrap();
         assert!(
-            error.to_string().contains("database schema 35 is newer"),
+            error.to_string().contains("database schema 36 is newer"),
             "{error:#}"
         );
-        assert_eq!(scalar(version), "Integer(35)");
+        assert_eq!(scalar(version), "Integer(36)");
         assert_eq!(scalar(history), expected_history);
         set_version(CURRENT_SCHEMA_VERSION);
 
-        for unsupported in [0, 14, 29, 30, 35] {
+        for unsupported in [0, 14, 29, 30, 36] {
             set_version(unsupported);
             let error = Store::open_service(&database).err().unwrap();
             assert!(

@@ -746,6 +746,21 @@ describe current Jinn source.
   keystrokes, including the submitting Enter, while it encodes the image.
 - It did not check the current tree for the `StopFailure` readiness wedge (H2).
 
+#### Deferred hardening continuation (October 1)
+
+The user selected all remaining original proposal outcomes in four sequential
+slices: H2/H4/H11/H12; H3/H15; H9/H16; and verified pre-upgrade restore points,
+free-space checks and recovery. These are separate from the later feature list.
+
+The H4 increment now implements app-owned provider failure holds, a bounded
+rate-limit/overload cooldown, and an explicit session release action. Integration
+checks, independent code review and fresh final verification passed. This
+bounded app-owned H4 increment is complete. This is not completion of
+slice 1 or the full program. H2 automatic readiness, H11 attention timing, H12
+notification correlation and H4 provider-stated reset deadlines remain open;
+the local failure characterization did not produce qualifying runtime evidence.
+The H3/H15, H9/H16 and restore-point slices remain pending.
+
 #### Agreed hardening list
 
 **P0**
