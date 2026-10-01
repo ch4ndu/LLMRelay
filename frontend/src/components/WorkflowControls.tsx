@@ -79,6 +79,7 @@ const actionTitles: Record<ContinuationActionKind, string> = {
   start_managed_legacy_attempt: "Imported task needs a fresh start",
   refresh_and_reconcile: "A request was rejected",
   authorization_required: "Needs a new approval",
+  recover_failed_step: "An automatic step failed",
   terminal_incomplete: "Cannot continue automatically",
 };
 
@@ -93,6 +94,7 @@ export function WorkflowControls(
     decision,
     onChanged,
     onOpenSetup = () => {},
+    onOpenRecoveryRecord,
   }: {
     task: Task;
     project?: Project;
@@ -103,10 +105,16 @@ export function WorkflowControls(
     decision?: DecisionExplanation;
     onChanged: () => void;
     onOpenSetup?: (projectId: string) => void;
+    /** Opens the exact recovery record, or returns why it cannot. */
+    onOpenRecoveryRecord?: (
+      attemptId: string,
+      recoveryId: string,
+    ) => string | undefined;
   },
 ) {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const [routeNotice, setRouteNotice] = useState("");
   const setupProblem = projectSetupProblem(
     project,
     decision?.primary_blocker?.code,
@@ -251,6 +259,8 @@ export function WorkflowControls(
     (typeof action.binding.attempt_id === "string" &&
       action.binding.attempt_id === attemptId);
   const projected = actions.filter(attemptAction);
+  // recover_failed_step is absent from both lists so a held step never disables
+  // Pause or Cancel here; the service itself refuses Continue for that hold.
   const exactGate = projected.some((action) =>
     [
       "exact_resume",
@@ -299,6 +309,7 @@ export function WorkflowControls(
   };
   const actionButton = (action: ContinuationAction) => {
     const attemptId = actionValue(action, "attempt_id");
+    const recoveryId = actionValue(action, "recovery_id");
     const workspaceId = actionValue(action, "workspace_id");
     const sessionId = actionValue(action, "session_id");
     const runtimeAdmissionId = actionValue(action, "runtime_admission_id");
@@ -449,6 +460,21 @@ export function WorkflowControls(
             onClick={onChanged}
           >
             Refresh to see the current state
+          </button>
+        );
+      // The failed step's form lives only in its exact recovery panel.
+      case "recover_failed_step":
+        return (
+          <button
+            disabled={!action.enabled || !attemptId || !recoveryId ||
+              !onOpenRecoveryRecord}
+            onClick={() => {
+              if (attemptId && recoveryId && onOpenRecoveryRecord) {
+                setRouteNotice(onOpenRecoveryRecord(attemptId, recoveryId) ?? "");
+              }
+            }}
+          >
+            Review the failed step
           </button>
         );
       default:
@@ -705,6 +731,7 @@ export function WorkflowControls(
           ))}
         </section>
       )}
+      {routeNotice && <p className="hint" role="status">{routeNotice}</p>}
       {error && <ErrorNotice error={error} />}
       <small className="hint">
         {terminal

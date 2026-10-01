@@ -5,6 +5,20 @@ export type ErrorGuidance = { summary: string; nextStep: string };
 // Backend diagnostics remain unchanged. This is display copy, never retry authority.
 export function explainError(error: string): ErrorGuidance {
   const text = error.toLowerCase();
+  // Matched first: the listed outcomes are free text that can contain other
+  // patterns' keywords, such as "timeout".
+  if (
+    text.startsWith(
+      "the failed step may have started an agent action, so it cannot be retried until these have a known outcome:",
+    )
+  ) {
+    return {
+      summary:
+        "LLMRelay can't retry this step until the outcome of its agent action is known.",
+      nextStep:
+        "The failed step may have started an agent action. Check the task's Activity tab, then refresh the dashboard. Retry failed step becomes available after LLMRelay records that outcome; to stop the task instead, choose Cancel in Controls. Technical details lists the actions still waiting.",
+    };
+  }
   if (
     /browser session required|unauthorized|bootstrap.*(expired|invalid|used)/
       .test(text)

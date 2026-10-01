@@ -82,7 +82,7 @@ Attaching does not launch another agent or resume an ended conversation. It stay
 
 LLMRelay restores the browser workspace independently from execution. The selected project, open task, page, board and Workspace Active/Completed section persist locally, and an open task keeps its tab while the dashboard stays open. Live output belongs to cmux; old embedded-terminal layout and scrollback settings are no longer used. Reopening an ended session shows recorded history and never launches a provider. LLMRelay does not register its short-lived attachment command as cmux resume metadata: the command contains an exact process binding and route token which must not be restored after that binding changes. After a service restart, recover or resume eligible work in LLMRelay and open its current attachment; LLMRelay creates terminal access from the new current binding.
 
-Guidance that was being delivered when the service stopped is marked as uncertain at the next startup and is never sent again automatically. It becomes submitted only if the agent's own prompt-submit event for the same session and invocation later carries exactly its text; otherwise it stays uncertain and is shown as such. Queued guidance that had not started delivery stays queued for the next safe boundary. A session whose launch never began is recorded as proven nondelivery and may be replaced; a session that had started but whose process ownership is unknown needs recovery before anything is delivered to it.
+Guidance that was being delivered when the service stopped is marked as uncertain at the next startup and is never sent again automatically. It becomes submitted only if the agent's own prompt-submit event for the same session and invocation later matches the recorded submitted form; otherwise it stays uncertain and is shown as such. Queued guidance that had not started delivery stays queued for the next safe boundary. A session whose launch never began is recorded as proven nondelivery and may be replaced; a session that had started but whose process ownership is unknown needs recovery before anything is delivered to it.
 
 Automatic work resumption is off by default and remains off across service restarts until you enable **Resume eligible work automatically** under the Workspace page's **Restart and recovery tools**. During a deliberate restart, stop with drain so the service records the exact running native bindings before it interrupts them:
 
@@ -103,6 +103,15 @@ llmrelay resume-work \
 ```
 
 Every selected-session response lists that session’s durable `resumed`, `queued_capacity`, `blocked`, or `failed` result and reason; the restoration list separately retains skipped candidates and their reasons. Submitting a request is not reported as a successful resume. Resume always uses the recorded provider’s exact native session, worktree, generation, candidate/review authorization, configuration, credentials, budgets, and normal capacity locks. A Claude executable changed by an external upgrade or another user-managed session legitimately fails the frozen executable check; LLMRelay does not pin, downgrade, or copy the old binary, so recovery requires a fresh accounted handoff. Paused, Needs input, Awaiting review, completed, cancelled, archived, isolated-validation, stale/replaced, missing-history, incompatible-policy, or process-uncertain sessions remain stopped. There is no fresh-session fallback labeled as restoration. Auto mode retries only a capacity wait; a real preflight or proven non-delivery failure remains visible for human recovery instead of spending another provider turn automatically.
+
+A host-restart resume includes a fixed notice identifying the host interruption
+and telling the agent to verify any in-flight command before repeating it. The
+service retains the original prompt and its hash unchanged and records the
+actual delivered resume text separately. It rechecks the exact admission,
+attempt, generation and task authority when reserving delivery. If that
+admission becomes stale before any delivery, its own candidate becomes blocked
+with a recovery explanation; a newer control or replacement admission is left
+intact. Uncertain delivery is never relabeled as proven nondelivery.
 
 ## Optional legacy task import
 
@@ -410,12 +419,15 @@ reuse old qualification evidence to bypass these checks.
 The database commands operate on the instance selected by `--data-dir`. Current
 schema only is supported: they do not upgrade an earlier installation. Fresh
 service initialization still creates the current schema. Service start, under
-the instance lock, upgrades an existing schema 31 database to schema 32 in one
-migration transaction. It refuses every other older or newer schema, including
-schema 30, without changing it, and a failed upgrade leaves the database at
-schema 31. Schema 32 records whether each final-repair recheck receipt came from
-a normal final change request or the historical sixth-review recovery; existing
-receipts keep every recorded value.
+the instance lock, upgrades supported existing schemas 31, 32 and 33 to schema
+34 through the existing migration transactions. Unsupported existing schemas,
+including schema 30 and newer unknown schemas, are refused. Each failed
+migration rolls back its own transaction. Schema 32 records final-repair receipt
+provenance; schema 33 records native-resolution provenance; schema 34 adds the
+exact submitted guidance text and digest while preserving the original body.
+Existing receipts retain their recorded values. Automatic pre-migration restore
+points are outside the selected scope; database observation and backup commands
+do not grant upgrade authority.
 
 ```sh
 llmrelay database --data-dir <ABSOLUTE_INSTANCE_PATH> inspect
@@ -539,7 +551,41 @@ A running provider process is not proof that work has begun. The session card sh
 
 ## Permission notices and appearance
 
+If an automatic step fails for an identified attempt, **An automatic step failed**
+opens that attempt's exact recovery record. Other eligible tasks can progress on
+later coordinator ticks. Inspect Activity, enter a note, and choose **Retry failed
+step** when available. It releases only that record for reevaluation; it does
+not repeat an action with an unknown outcome or clear another hold. **Review the
+failed step** in Controls opens the same exact record. A stale or disappeared
+record requests fresh state instead of substituting another recovery item.
+Ordinary Pause and Cancel remain available subject to their existing process
+and task-state checks. Some completed or disposed subjects can settle their
+exact hold automatically; unrelated activity, time and task-version changes
+cannot do so. Failures that cannot be attributed to an attempt retain the global
+coordinator deferral.
+
+An unavailable process table is reported as unknown, not as an empty or stopped
+set of processes. Recorded status and database-only permission expiry remain
+available, while process-dependent actions wait. A drain cannot report verified
+quiescence or finish shutdown solely because its lists are empty when the process
+inventory is unknown.
+
 The dashboard lists current waits in **Waiting for you now**. A managed approval opens the exact request in Approvals; a provider-native prompt or turn failure opens the exact agent output. An independent task hold remains visible alongside an approval. A failed or uncertain approval response requests fresh state and is never automatically resent.
+
+Guidance written to a current running session, or a current resumed invocation,
+appears in attention when trusted input acceptance has not been observed for
+30 seconds. The notice opens that agent's output. It is an observation, not a
+claim that the agent is stuck or permission to resend. An older invocation's
+hook, ordinary tool activity or a running process cannot establish acceptance.
+The dashboard's existing 30-second state refresh updates time-dependent notices
+even without a committed state change, so the notice can appear on the next
+refresh after its threshold; background-browser throttling or disconnection may
+delay presentation. Initial-launch acceptance is not covered by this notice.
+
+If dashboard rendering fails, the page displays a recovery screen with an
+explicit **Reload page** button and collapsed, sanitized technical details.
+Reloading does not replay a mutation. The boundary covers rendering failures;
+ordinary request failures continue to use the existing error messages.
 
 Choose **Enable browser notifications** to enable alerts for this dashboard visit and request browser permission if needed. Previously granted site permission does not enable app alerts by itself. New waits may notify while the dashboard is unfocused; denied or unavailable browser support leaves the in-app notice available. Initial and reset snapshots list current waits without replaying historical alerts. An alert is navigation, never permission or proof of provider execution. External Codex completion watchers are separate local engineering tooling.
 

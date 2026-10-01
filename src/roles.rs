@@ -24,6 +24,59 @@ pub(crate) struct ManagerSafeIdleBoundary {
     pub stop_event_rowid: i64,
 }
 
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+const MAX_GUIDANCE_INPUT_BYTES: usize = 64 * 1024;
+
+/// Guidance that cannot be submitted literally, found before any lease, reservation or write.
+#[derive(Debug)]
+pub(crate) struct GuidanceNotDeliverable(String);
+
+impl std::fmt::Display for GuidanceNotDeliverable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for GuidanceNotDeliverable {}
+
+pub(crate) fn guidance_submission(
+    provider: &str,
+    capability_identity: Option<&str>,
+    body: &str,
+) -> Result<String> {
+    let submitted = match provider.parse::<crate::domain::Provider>() {
+        Ok(crate::domain::Provider::Claude) => {
+            let compatibility = capability_identity
+                .and_then(|identity| serde_json::from_str::<serde_json::Value>(identity).ok())
+                .and_then(|identity| {
+                    serde_json::from_value::<crate::provider_compatibility::AuthorityBinding>(
+                        identity["compatibility"].clone(),
+                    )
+                    .ok()
+                });
+            crate::providers::claude::literal_guidance_submission(compatibility.as_ref(), body)
+                .map_err(|error| GuidanceNotDeliverable(format!("{error:#}")))?
+        }
+        Ok(crate::domain::Provider::Codex) => body.to_owned(),
+        Err(_) => {
+            return Err(GuidanceNotDeliverable(format!(
+                "guidance delivery is undefined for provider {provider}"
+            ))
+            .into())
+        }
+    };
+    if submitted.len() + BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len() + 1
+        > MAX_GUIDANCE_INPUT_BYTES
+    {
+        return Err(GuidanceNotDeliverable(
+            "guidance exceeds the 64 KiB input limit in the form its provider must submit".into(),
+        )
+        .into());
+    }
+    Ok(submitted)
+}
+
 fn manager_preplan_snapshot_valid(
     transaction: &rusqlite::Transaction<'_>,
     snapshot_id: &str,
@@ -867,8 +920,20 @@ impl RoleService {
 
     pub fn deliver_guidance(&self, guidance_id: &str) -> Result<serde_json::Value> {
         self.store.require_execution_unheld("guidance delivery")?;
-        let (session, body, reason, attention, attempt, transcript_epoch, resume_invocation): (
+        let (
+            session,
+            provider,
+            capability_identity,
+            body,
+            reason,
+            attention,
+            attempt,
+            transcript_epoch,
+            resume_invocation,
+        ): (
             String,
+            String,
+            Option<String>,
             String,
             Option<String>,
             String,
@@ -879,7 +944,8 @@ impl RoleService {
             let connection = self.store.lock()?;
             connection
                 .query_row(
-                    "SELECT s.id,g.body,g.reason,t.attention,a.id,s.transcript_epoch,
+                    "SELECT s.id,s.provider,s.capability_identity_json,g.body,g.reason,t.attention,a.id,
+                       s.transcript_epoch,
                        (SELECT ri.id FROM resume_invocations ri
                         WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
                         ORDER BY ri.resume_ordinal DESC LIMIT 1)
@@ -899,6 +965,8 @@ impl RoleService {
                             row.get(4)?,
                             row.get(5)?,
                             row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
                         ))
                     },
                 )
@@ -940,9 +1008,8 @@ impl RoleService {
                 serde_json::json!({"action":"guidance_queued","guidance_id":guidance_id,"session_id":session,"attempt_id":attempt,"state":"queued","reason":"native_hook_or_tool_descendants_active","engine_generated":engine_generated}),
             );
         }
-        if body.as_bytes().len() + 12 + 1 > 64 * 1024 {
-            bail!("guidance exceeds the 64 KiB input limit")
-        }
+        let submitted = guidance_submission(&provider, capability_identity.as_deref(), &body)?;
+        let submitted_digest = crate::store::json_hash(&submitted)?;
         let (lease, _) = match self.supervisor.acquire_input(
             &session,
             &format!("guidance:{guidance_id}"),
@@ -956,27 +1023,18 @@ impl RoleService {
                 )
             }
         };
-        let now = Utc::now().to_rfc3339();
-        let lost_reservation = {
-            let connection = self.store.lock()?;
-            let changed = connection.execute(
-                "UPDATE guidance_messages SET state='delivery_reserved',reason='automatic_post_hook_idle_verified',
-                   delivery_session_id=?2,delivery_transcript_epoch=?3,delivery_resume_invocation_id=?4
-                 WHERE id=?1 AND state='queued'
-                   AND EXISTS(SELECT 1 FROM sessions s
-                     WHERE s.id=?2 AND s.role_generation_id=guidance_messages.role_generation_id
-                       AND s.status='running' AND s.readiness_state='idle_candidate'
-                       AND s.transcript_epoch=?3
-                       AND (SELECT ri.id FROM resume_invocations ri
-                            WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
-                            ORDER BY ri.resume_ordinal DESC LIMIT 1) IS ?4)
-                   AND NOT(COALESCE(reason,'') IN ('engine_plan_rejection_notice','engine_plan_rejection_notice_blocked_hold')
-                     AND EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
-                       WHERE a.id=guidance_messages.attempt_id
-                         AND t.attention IN ('paused','pause_requested','needs_recovery')))",
-                params![guidance_id, &session, &transcript_epoch, &resume_invocation],
+        // All work after acquisition stays in this scope so the exact lease is released on every exit.
+        let mut reserved = false;
+        let delivery = (|| -> Result<Option<serde_json::Value>> {
+            reserved = self.store.reserve_guidance_delivery(
+                guidance_id,
+                &session,
+                &transcript_epoch,
+                resume_invocation.as_deref(),
+                &submitted,
             )?;
-            if changed != 1 {
+            if !reserved {
+                let connection = self.store.lock()?;
                 let held: bool = connection.query_row(
                     "SELECT EXISTS(SELECT 1 FROM guidance_messages g
                      JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id
@@ -986,28 +1044,15 @@ impl RoleService {
                     params![guidance_id],
                     |row| row.get(0),
                 )?;
-                if held {
-                    connection.execute(
-                        "UPDATE guidance_messages SET reason='engine_plan_rejection_notice_blocked_hold'
-                         WHERE id=?1 AND state='queued'",
-                        params![guidance_id],
-                    )?;
+                if !held {
+                    bail!("guidance delivery was concurrently claimed")
                 }
-                Some(held)
-            } else {
                 connection.execute(
-                    "UPDATE sessions SET readiness_state='idle_verified',updated_at=?1 WHERE id=?2",
-                    params![now, session],
+                    "UPDATE guidance_messages SET reason='engine_plan_rejection_notice_blocked_hold'
+                     WHERE id=?1 AND state='queued'",
+                    params![guidance_id],
                 )?;
-                None
-            }
-        };
-        if let Some(held) = lost_reservation {
-            if held {
-                self.supervisor
-                    .release_input(&session, &lease)
-                    .context("failed to release input lease after guidance was held")?;
-                return Ok(serde_json::json!({
+                return Ok(Some(serde_json::json!({
                     "action":"guidance_queued",
                     "guidance_id":guidance_id,
                     "session_id":session,
@@ -1015,43 +1060,54 @@ impl RoleService {
                     "state":"queued",
                     "reason":"engine_notice_blocked_by_task_hold",
                     "engine_generated":true
-                }));
+                })));
             }
-            self.supervisor
-                .release_input(&session, &lease)
-                .context("failed to release input lease after guidance was concurrently claimed")?;
-            bail!("guidance delivery was concurrently claimed")
-        }
-        let delivery = (|| -> Result<()> {
-            let write = (|| -> Result<()> {
-                let mut bytes = Vec::with_capacity(body.as_bytes().len() + 12);
-                bytes.extend_from_slice(b"\x1b[200~");
-                bytes.extend_from_slice(body.as_bytes());
-                bytes.extend_from_slice(b"\x1b[201~");
-                self.supervisor.write_input(&session, &lease, &bytes)?;
-                {
-                    let connection = self.store.lock()?;
-                    let changed = connection.execute(
-                        "UPDATE guidance_messages SET state='written_awaiting_submit',reason='written_through_verified_input_lease',written_at=?1 WHERE id=?2 AND state='delivery_reserved'",
-                        params![Utc::now().to_rfc3339(),guidance_id],
-                    )?;
-                    if changed != 1 {
-                        bail!("guidance delivery reservation changed before submit")
-                    }
+            let mut bytes = Vec::with_capacity(
+                BRACKETED_PASTE_START.len() + submitted.len() + BRACKETED_PASTE_END.len(),
+            );
+            bytes.extend_from_slice(BRACKETED_PASTE_START);
+            bytes.extend_from_slice(submitted.as_bytes());
+            bytes.extend_from_slice(BRACKETED_PASTE_END);
+            self.supervisor.write_input(&session, &lease, &bytes)?;
+            {
+                let connection = self.store.lock()?;
+                let changed = connection.execute(
+                    "UPDATE guidance_messages SET state='written_awaiting_submit',reason='written_through_verified_input_lease',written_at=?1
+                     WHERE id=?2 AND state='delivery_reserved' AND submitted_digest=?3",
+                    params![Utc::now().to_rfc3339(),guidance_id,submitted_digest],
+                )?;
+                if changed != 1 {
+                    bail!("guidance delivery reservation changed before submit")
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                self.supervisor.write_input(&session, &lease, b"\r")?;
-                Ok(())
-            })();
-            let release = self.supervisor.release_input(&session, &lease);
-            write?;
-            release?;
-            Ok(())
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            self.supervisor.write_input(&session, &lease, b"\r")?;
+            Ok(None)
         })();
-        let connection = self.store.lock()?;
-        match delivery {
-            Ok(()) => {
-                let state: String = connection.query_row(
+        let release = self.supervisor.release_input(&session, &lease);
+        // Only a reserved delivery can have reached the terminal; otherwise the guidance stays queued.
+        let delivery = match delivery {
+            Err(error) if reserved => {
+                let recorded = self.store.lock().and_then(|connection| {
+                    connection.execute(
+                        "UPDATE guidance_messages SET state='delivery_unknown',reason=?1 WHERE id=?2 AND state IN ('delivery_reserved','written_awaiting_submit')",
+                        params![format!("{error:#}"),guidance_id],
+                    )?;
+                    Ok(())
+                });
+                Err(match recorded {
+                    Ok(()) => error.context("guidance write outcome is not confirmed"),
+                    Err(recording_error) => error.context(format!(
+                        "guidance failure-state recording also failed: {recording_error:#}"
+                    )),
+                })
+            }
+            delivery => delivery,
+        };
+        match (delivery, release) {
+            (Ok(Some(queued)), Ok(())) => Ok(queued),
+            (Ok(None), Ok(())) => {
+                let state: String = self.store.lock()?.query_row(
                     "SELECT state FROM guidance_messages WHERE id=?1",
                     params![guidance_id],
                     |row| row.get(0),
@@ -1061,17 +1117,13 @@ impl RoleService {
                     serde_json::json!({"action":"guidance_delivered","guidance_id":guidance_id,"session_id":session,"attempt_id":attempt,"state":state,"acknowledged":acknowledged,"engine_generated":engine_generated}),
                 )
             }
-            Err(error) => {
-                if let Err(recording_error) = connection.execute(
-                    "UPDATE guidance_messages SET state='delivery_unknown',reason=?1 WHERE id=?2 AND state IN ('delivery_reserved','written_awaiting_submit')",
-                    params![format!("{error:#}"),guidance_id],
-                ) {
-                    return Err(error.context(format!(
-                        "guidance failure-state recording also failed: {recording_error:#}"
-                    )));
-                }
-                Err(error.context("guidance write outcome is not confirmed"))
+            (Ok(_), Err(release_error)) => {
+                Err(release_error.context("failed to release the guidance input lease"))
             }
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(release_error)) => Err(error.context(format!(
+                "the guidance input lease was also not released: {release_error:#}"
+            ))),
         }
     }
 
@@ -1094,15 +1146,31 @@ impl RoleService {
     pub fn retry_ready_guidance(&self) -> Result<Vec<serde_json::Value>> {
         let sessions = {
             let connection = self.store.lock()?;
-            let mut statement=connection.prepare("SELECT DISTINCT s.id FROM sessions s JOIN guidance_messages g ON g.role_generation_id=s.role_generation_id WHERE s.status='running' AND s.readiness_state='idle_candidate' AND g.state='queued'")?;
+            let mut statement=connection.prepare(&format!("SELECT DISTINCT s.id,rg.attempt_id FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id JOIN guidance_messages g ON g.role_generation_id=s.role_generation_id WHERE s.status='running' AND s.readiness_state='idle_candidate' AND g.state='queued' AND {}", crate::coordinator::coordinator_hold_absent("rg.attempt_id")))?;
             let rows = statement
-                .query_map([], |row| row.get::<_, String>(0))?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
         let mut outcomes = Vec::new();
-        for session in sessions {
-            if let Some(outcome) = self.deliver_next_for_session(&session)? {
+        for (session, attempt) in sessions {
+            let outcome = self.deliver_next_for_session(&session).map_err(|error| {
+                let effect = if error.is::<GuidanceNotDeliverable>() {
+                    crate::coordinator::StepEffect::None
+                } else {
+                    crate::coordinator::StepEffect::Possible
+                };
+                crate::coordinator::subject_failure(
+                    error,
+                    &attempt,
+                    crate::coordinator::SubjectStep::GuidanceDelivery,
+                    effect,
+                    serde_json::json!({"session_id":session}),
+                )
+            })?;
+            if let Some(outcome) = outcome {
                 let delivered =
                     outcome.get("state").and_then(|state| state.as_str()) != Some("queued");
                 outcomes.push(outcome);

@@ -646,6 +646,24 @@ export function App() {
     const problem = navigateAttention(item, item.target);
     if (problem) setNavigationNotice(problem);
   };
+  // Controls' failed-step row opens the exact attention item the inbox would;
+  // a binding the newest snapshot no longer offers is refused, never replaced.
+  const openRecoveryRecord = (
+    taskId: string,
+    attemptId: string,
+    recoveryId: string,
+  ): string | undefined => {
+    const latest = live.current?.latest() ?? state;
+    const item = latest.attention.find(({ target }) =>
+      target?.kind === "recovery_record" && target.task_id === taskId &&
+      target.attempt_id === attemptId && target.recovery_id === recoveryId
+    );
+    if (!item?.target) {
+      void refresh();
+      return "That failed step changed before it could open. The latest state was requested; nothing was executed.";
+    }
+    return navigateAttention(item, item.target);
+  };
   const queue = async () => {
     const current = state.projects.find((v) => v.id === project);
     if (!current) return;
@@ -1073,6 +1091,8 @@ export function App() {
             openSetup(projectId);
           }}
           onTaskAction={openTaskAction}
+          onOpenRecoveryRecord={(attemptId, recoveryId) =>
+            openRecoveryRecord(selected.id, attemptId, recoveryId)}
           onOpenPermission={openPermission}
           onViewCmuxSession={viewCmuxSession}
           onSetCmuxKeyboardControl={setCmuxSessionKeyboardControl}

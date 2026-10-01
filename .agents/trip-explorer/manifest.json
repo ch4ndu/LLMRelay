@@ -16,7 +16,7 @@
   },
   "bin": {
     "cmux_observer.py": "1fe66caff5552a8b4b82f0a15f4ac3bfc1d8ba6f41cc66a5cae355af9d69d7f2",
-    "cmux_role_runner.py": "7ecb61d20fbec519a7b2c8177228ab75ebbbce69b040d88a79bab3a75fcb1d1d",
+    "cmux_role_runner.py": "efd72c2b0e48edaa9d6ad75d54106a78b6c78aacbcd2f78696a7b4d6bfea6ce0",
     "role_config.py": "5df37514d8639177186a85d1014e74b6c8d551d7224c207a4950edbbde2454ad",
     "validate_installed.py": "249a548553b8fc416a63fb87dfe0dc077a77cb7cc7c311c5e2641ad4db20b44f"
   },

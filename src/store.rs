@@ -77,6 +77,17 @@ pub(crate) enum BrowserLaunchReservation {
     Existing(serde_json::Value),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RestartAdmissionBinding<'a> {
+    pub admission_id: &'a str,
+    pub attempt_id: &'a str,
+    pub task_id: &'a str,
+    pub role_generation_id: &'a str,
+    pub expected_task_version: i64,
+    pub prior_transcript_epoch: &'a str,
+    pub expected_resume_ordinal: u32,
+}
+
 pub const CAPABILITY_PROOF_REVISION: &str = "llmrelay-capability-proof-v1";
 
 #[derive(Clone, Debug)]
@@ -158,6 +169,9 @@ const MIGRATION_030: &str = include_str!("../migrations/030_recipes.sql");
 const MIGRATION_031: &str = include_str!("../migrations/031_final_repair_recheck.sql");
 const MIGRATION_032: &str = include_str!("../migrations/032_normal_final_repair.sql");
 const MIGRATION_033: &str = include_str!("../migrations/033_native_resolution.sql");
+const MIGRATION_034: &str = include_str!("../migrations/034_guidance_submitted_text.sql");
+// Same value rusqlite installs at open; set explicitly before any pragma or DDL can contend.
+const STATE_DATABASE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 type CmuxRouteRow = (
     String,
@@ -900,11 +914,11 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let mut connection = Connection::open(path)
             .with_context(|| format!("open state database {}", path.display()))?;
+        connection.busy_timeout(STATE_DATABASE_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         migrate(&mut connection)?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self::from_connection(connection))
     }
 
@@ -929,6 +943,7 @@ impl Store {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .with_context(|| format!("open state database read-only {}", path.display()))?;
+        connection.busy_timeout(STATE_DATABASE_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "query_only", "ON")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         require_current_schema(&connection)?;
@@ -941,9 +956,9 @@ impl Store {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .with_context(|| format!("open current state database {}", path.display()))?;
+        connection.busy_timeout(STATE_DATABASE_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         require_current_schema(&connection)?;
         Ok(Self::from_connection(connection))
     }
@@ -1931,47 +1946,50 @@ impl Store {
                 .or_else(|| envelope.payload.get("message"))
                 .and_then(|value| value.as_str());
             if let Some(text) = submitted_text {
-                let mut statement = transaction.prepare(
-                    "SELECT g.id,g.body
-                     FROM guidance_messages g JOIN sessions s ON s.id=?2
-                     WHERE g.role_generation_id=?1 AND g.state IN ('written_awaiting_submit','delivery_unknown')
-                       AND g.delivery_session_id=s.id
-                       AND g.delivery_transcript_epoch=s.transcript_epoch
-                       AND g.delivery_resume_invocation_id IS (
-                         SELECT ri.id FROM resume_invocations ri
-                         WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
-                         ORDER BY ri.resume_ordinal DESC LIMIT 1)
-                     ORDER BY g.rowid DESC LIMIT 101",
-                )?;
+                let mut statement = transaction.prepare(&format!(
+                    "SELECT id,COALESCE(submitted_text,body),submitted_digest
+                     FROM guidance_messages
+                     WHERE role_generation_id=?1 AND state IN ('written_awaiting_submit','delivery_unknown')
+                       AND {CURRENT_GUIDANCE_DELIVERY}
+                     ORDER BY rowid DESC LIMIT 101"
+                ))?;
                 let pending = statement
                     .query_map(
                         params![context.role_generation_id, context.session_id],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                            ))
+                        },
                     )?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 drop(statement);
                 let matching = pending
                     .iter()
-                    .filter(|(_, body)| body.trim() == text.trim())
+                    .filter(|(_, submitted, digest)| {
+                        submitted_form_intact(submitted, digest.as_deref())
+                            && submitted.trim() == text.trim()
+                    })
                     .collect::<Vec<_>>();
                 // Bound comparison work and fail closed when more than one current
-                // delivery has the same complete edge-normalized body.
+                // delivery has the same complete edge-normalized submitted form.
                 if pending.len() <= 100 && matching.len() == 1 {
                     transaction.execute(
-                        "UPDATE guidance_messages
-                         SET state='submitted',reason='matched_native_user_prompt_submit',submitted_at=?1
-                         WHERE id=?2 AND role_generation_id=?3 AND state IN ('written_awaiting_submit','delivery_unknown')
-                           AND delivery_session_id=?4 AND delivery_transcript_epoch=(
-                             SELECT transcript_epoch FROM sessions WHERE id=?4)
-                           AND delivery_resume_invocation_id IS (
-                             SELECT ri.id FROM resume_invocations ri JOIN sessions s ON s.id=?4
-                             WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
-                             ORDER BY ri.resume_ordinal DESC LIMIT 1)",
+                        &format!(
+                            "UPDATE guidance_messages
+                             SET state='submitted',reason='matched_native_user_prompt_submit',submitted_at=?3
+                             WHERE id=?4 AND role_generation_id=?1
+                               AND state IN ('written_awaiting_submit','delivery_unknown')
+                               AND submitted_digest IS ?5 AND {CURRENT_GUIDANCE_DELIVERY}"
+                        ),
                         params![
+                            context.role_generation_id,
+                            context.session_id,
                             now,
                             matching[0].0.as_str(),
-                            context.role_generation_id,
-                            context.session_id
+                            matching[0].2.as_deref()
                         ],
                     )?;
                 }
@@ -2095,16 +2113,92 @@ impl Store {
             bail!("only the current manager can acknowledge submitted guidance")
         }
         let now = Utc::now().to_rfc3339();
-        let connection = self.lock()?;
-        let changed = connection.execute(
-            "UPDATE guidance_messages SET state='acknowledged',acknowledged_at=?1,reason=NULL
-             WHERE id=?2 AND role_generation_id=?3 AND state='submitted'",
-            params![now, guidance_id, context.role_generation_id],
-        )?;
-        if changed != 1 {
-            bail!("guidance is unknown, lacks a matching native submit, or belongs to another role generation")
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let submitted: Option<(String, Option<String>)> = transaction
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(submitted_text,body),submitted_digest FROM guidance_messages
+                     WHERE id=?3 AND role_generation_id=?1 AND state='submitted'
+                       AND {CURRENT_GUIDANCE_DELIVERY}"
+                ),
+                params![context.role_generation_id, context.session_id, guidance_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let acknowledged = match submitted {
+            Some((text, digest)) if submitted_form_intact(&text, digest.as_deref()) => {
+                transaction.execute(
+                    &format!(
+                        "UPDATE guidance_messages SET state='acknowledged',acknowledged_at=?4,reason=NULL
+                         WHERE id=?3 AND role_generation_id=?1 AND state='submitted'
+                           AND submitted_digest IS ?5 AND {CURRENT_GUIDANCE_DELIVERY}"
+                    ),
+                    params![
+                        context.role_generation_id,
+                        context.session_id,
+                        guidance_id,
+                        now,
+                        digest
+                    ],
+                )? == 1
+            }
+            _ => false,
+        };
+        if !acknowledged {
+            bail!("guidance is unknown, lacks a matching native submit for this session invocation, or belongs to another role generation")
         }
+        transaction.commit()?;
         Ok(serde_json::json!({"guidance_id":guidance_id,"state":"acknowledged"}))
+    }
+
+    /// Reserves queued guidance for this exact idle invocation and records its submitted form once.
+    pub fn reserve_guidance_delivery(
+        &self,
+        guidance_id: &str,
+        session_id: &str,
+        transcript_epoch: &str,
+        resume_invocation_id: Option<&str>,
+        submitted_text: &str,
+    ) -> Result<bool> {
+        let submitted_digest = json_hash(&submitted_text)?;
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reserved = transaction.execute(
+            "UPDATE guidance_messages SET state='delivery_reserved',reason='automatic_post_hook_idle_verified',
+               delivery_session_id=?2,delivery_transcript_epoch=?3,delivery_resume_invocation_id=?4,
+               submitted_text=?5,submitted_digest=?6
+             WHERE id=?1 AND state='queued'
+               AND (submitted_text IS NULL OR (submitted_text=?5 AND submitted_digest=?6))
+               AND EXISTS(SELECT 1 FROM sessions s
+                 WHERE s.id=?2 AND s.role_generation_id=guidance_messages.role_generation_id
+                   AND s.status='running' AND s.readiness_state='idle_candidate'
+                   AND s.transcript_epoch=?3
+                   AND (SELECT ri.id FROM resume_invocations ri
+                        WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
+                        ORDER BY ri.resume_ordinal DESC LIMIT 1) IS ?4)
+               AND NOT(COALESCE(reason,'') IN ('engine_plan_rejection_notice','engine_plan_rejection_notice_blocked_hold')
+                 AND EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
+                   WHERE a.id=guidance_messages.attempt_id
+                     AND t.attention IN ('paused','pause_requested','needs_recovery')))",
+            params![
+                guidance_id,
+                session_id,
+                transcript_epoch,
+                resume_invocation_id,
+                submitted_text,
+                submitted_digest
+            ],
+        )? == 1;
+        if reserved {
+            transaction.execute(
+                "UPDATE sessions SET readiness_state='idle_verified',updated_at=?1 WHERE id=?2",
+                params![now, session_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(reserved)
     }
 
     pub fn mark_session_spawning(
@@ -8407,10 +8501,33 @@ impl Store {
         launch: &LaunchConfig,
         token: &str,
     ) -> Result<()> {
-        match self.reserve_role_resume_inner(session_id, epoch, launch, token, None)? {
+        match self.reserve_role_resume_inner(session_id, epoch, launch, token, None, None)? {
             BrowserLaunchReservation::Reserved => Ok(()),
             BrowserLaunchReservation::Existing(_) => {
                 bail!("non-browser role resume unexpectedly found a browser receipt")
+            }
+        }
+    }
+
+    pub(crate) fn reserve_role_resume_for_restart_admission(
+        &self,
+        session_id: &str,
+        epoch: &str,
+        launch: &LaunchConfig,
+        token: &str,
+        admission: RestartAdmissionBinding<'_>,
+    ) -> Result<()> {
+        match self.reserve_role_resume_inner(
+            session_id,
+            epoch,
+            launch,
+            token,
+            None,
+            Some(admission),
+        )? {
+            BrowserLaunchReservation::Reserved => Ok(()),
+            BrowserLaunchReservation::Existing(_) => {
+                bail!("host-restart role resume unexpectedly found a browser receipt")
             }
         }
     }
@@ -8423,7 +8540,7 @@ impl Store {
         token: &str,
         receipt: BrowserLaunchReceipt<'_>,
     ) -> Result<BrowserLaunchReservation> {
-        self.reserve_role_resume_inner(session_id, epoch, launch, token, Some(receipt))
+        self.reserve_role_resume_inner(session_id, epoch, launch, token, Some(receipt), None)
     }
 
     fn reserve_role_resume_inner(
@@ -8433,6 +8550,7 @@ impl Store {
         launch: &LaunchConfig,
         token: &str,
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
+        restart_admission: Option<RestartAdmissionBinding<'_>>,
     ) -> Result<BrowserLaunchReservation> {
         self.require_execution_unheld("role resume reservations")?;
         if launch.role == RoleKind::FinalReviewer {
@@ -8441,6 +8559,9 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(admission) = restart_admission {
+            require_current_restart_admission(&tx, session_id, admission)?;
+        }
         if let Some(receipt) = browser_receipt {
             if let Some(existing) = browser_launch_receipt_in(
                 &tx,
@@ -8941,7 +9062,7 @@ impl Store {
     }
 }
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 33;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 34;
 
 /// Reads the durable state cursor. It is committed state only when the
 /// connection is in autocommit mode.
@@ -8953,7 +9074,7 @@ pub(crate) fn read_state_revision(connection: &Connection) -> rusqlite::Result<i
 
 /// The prior schemas an existing database may be migrated from at service
 /// start. Every other non-current version is left unchanged and refused.
-const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 2] = [31, 32];
+const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 3] = [31, 32, 33];
 
 fn upgrade_supported_service_schema(path: &Path) -> Result<()> {
     let mut connection = Connection::open_with_flags(
@@ -8961,9 +9082,9 @@ fn upgrade_supported_service_schema(path: &Path) -> Result<()> {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("open state database for upgrade {}", path.display()))?;
+    connection.busy_timeout(STATE_DATABASE_BUSY_TIMEOUT)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
-    connection.busy_timeout(std::time::Duration::from_secs(5))?;
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if !SERVICE_UPGRADABLE_SCHEMA_VERSIONS.contains(&version) {
         return Ok(());
@@ -9427,6 +9548,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .commit()
             .context("commit native-resolution provenance migration")?;
     }
+    if version <= 33 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_034)?;
+        transaction.pragma_update(None, "user_version", 34)?;
+        transaction
+            .commit()
+            .context("commit guidance submitted-form migration")?;
+    }
     Ok(())
 }
 
@@ -9442,6 +9571,67 @@ struct AcceptedResumeAuthority {
     task_version: i64,
     attention: String,
     attempt_status: String,
+}
+
+fn require_current_restart_admission(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    admission: RestartAdmissionBinding<'_>,
+) -> Result<()> {
+    let candidate: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT rc.state,rc.result_json FROM restart_candidates rc
+             JOIN sessions s ON s.id=rc.session_id
+             JOIN role_generations rg ON rg.id=s.role_generation_id
+             JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
+             WHERE rc.session_id=?1 AND rc.attempt_id=?2 AND rc.task_id=?3
+               AND a.id=?2 AND t.id=?3 AND rg.id=?4 AND t.version=?5
+               AND s.transcript_epoch=?6 AND s.resume_count+1=?7",
+            params![
+                session_id,
+                admission.attempt_id,
+                admission.task_id,
+                admission.role_generation_id,
+                admission.expected_task_version,
+                admission.prior_transcript_epoch,
+                admission.expected_resume_ordinal
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let owned = candidate.is_some_and(|(state, result)| {
+        state == "admitting"
+            && RestartCandidateResult::parse(&result)
+                .ok()
+                .and_then(|result| result.restart.admission)
+                .is_some_and(|durable| {
+                    durable.id == admission.admission_id
+                        && durable.attempt_id == admission.attempt_id
+                        && durable.role_generation_id == admission.role_generation_id
+                        && durable.expected_task_version == admission.expected_task_version
+                        && durable.prior_transcript_epoch == admission.prior_transcript_epoch
+                        && durable.expected_resume_ordinal == admission.expected_resume_ordinal
+                })
+    });
+    if !owned {
+        bail!("host-restart admission was superseded before its exact resume was reserved")
+    }
+    Ok(())
+}
+
+/// A guidance row delivered to the exact current invocation of session `?2`.
+const CURRENT_GUIDANCE_DELIVERY: &str = "delivery_session_id=?2
+    AND delivery_transcript_epoch=(SELECT transcript_epoch FROM sessions WHERE id=?2)
+    AND delivery_resume_invocation_id IS (
+      SELECT ri.id FROM resume_invocations ri JOIN sessions s ON s.id=?2
+      WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
+      ORDER BY ri.resume_ordinal DESC LIMIT 1)";
+
+// A row without a digest was written before submitted forms were recorded, as its body.
+fn submitted_form_intact(submitted: &str, digest: Option<&str>) -> bool {
+    digest.map_or(true, |digest| {
+        json_hash(&submitted).is_ok_and(|actual| actual == digest)
+    })
 }
 
 /// A trusted UserPromptSubmit of an exact running resume proves the session
@@ -9824,6 +10014,7 @@ pub(crate) struct SetupRetainedFirstTurnStopReceipt {
     pub process_identity_json: String,
     pub stop_rowid: i64,
     pub setup_permit_id: String,
+    pub attempt_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9835,6 +10026,7 @@ pub(crate) struct SetupRetainedFirstTurnStopTimeoutReceipt {
     pub process_identity_json: String,
     pub stop_rowid: i64,
     pub claim_rowid: i64,
+    pub attempt_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9869,7 +10061,7 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
 ) -> Result<Option<CodexStopIdleReceipt>> {
     connection
         .query_row(
-            "WITH current_codex AS (
+            &format!("WITH current_codex AS (
                SELECT s.id AS session_id,rg.id AS generation_id,rc.id AS credential_id,
                       s.transcript_epoch,s.native_session_id,a.id AS attempt_id,COALESCE(t.version,0) AS task_version,
                       a.phase,a.plan_hash,a.candidate_hash,
@@ -10002,7 +10194,7 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
                      ORDER BY result.rowid DESC LIMIT 1) AS accepted_result_id,
                     bounded_turn.phase,bounded_turn.plan_hash,bounded_turn.candidate_hash
              FROM bounded_turn
-             WHERE bounded_turn.submit_rowid IS NOT NULL
+             WHERE bounded_turn.submit_rowid IS NOT NULL AND {hold_absent}
                AND bounded_turn.later_hooks=bounded_turn.late_terminal_hooks
                -- Each late completion closes a different unmatched tool.
                AND bounded_turn.late_terminal_hooks=bounded_turn.late_terminal_tools
@@ -10097,6 +10289,8 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
                    WHERE check_run.attempt_id=bounded_turn.attempt_id
                      AND check_run.status IN ('launch_reserved','running','recovery_required','launch_ambiguous')))
              ORDER BY bounded_turn.stop_rowid LIMIT 1",
+                hold_absent = crate::coordinator::coordinator_hold_absent("bounded_turn.attempt_id"),
+            ),
             params![session_id],
             |row| {
                 Ok(CodexStopIdleReceipt {
@@ -10193,7 +10387,7 @@ pub(crate) fn eligible_setup_retained_first_turn_stop(
     let candidates = {
         let mut statement = connection.prepare(&format!(
             "SELECT s.id,rg.id,rc.id,s.transcript_epoch,s.native_session_id,s.process_identity_json,
-                    {SETUP_FIRST_TURN_STOP_ROWID_SQL},sp.id
+                    {SETUP_FIRST_TURN_STOP_ROWID_SQL},sp.id,a.id
              FROM sessions s
              JOIN role_generations rg ON rg.id=s.role_generation_id
              JOIN attempts a ON a.id=rg.attempt_id
@@ -10201,7 +10395,7 @@ pub(crate) fn eligible_setup_retained_first_turn_stop(
                AND rs.effective_generation_id=rg.id
              JOIN role_credentials rc ON rc.role_generation_id=rg.id AND rc.revoked_at IS NULL
              JOIN trip_setup_permits sp ON sp.id=s.setup_permit_id
-             WHERE (?1 IS NULL OR s.id=?1)
+             WHERE (?1 IS NULL OR s.id=?1) AND {hold_absent}
                AND s.status='running' AND s.readiness_state='idle_candidate'
                AND rg.status='running' AND s.resume_count=0
                AND s.native_session_id IS NOT NULL AND s.native_session_id!=''
@@ -10230,7 +10424,8 @@ pub(crate) fn eligible_setup_retained_first_turn_stop(
                  AND control.state IN ('requested','draining','held','recovery_required'))
                AND NOT EXISTS(SELECT 1 FROM recovery_records recovery
                  WHERE recovery.session_id=s.id AND recovery.state!='resolved_quiescent')
-             ORDER BY s.updated_at,s.rowid"
+             ORDER BY s.updated_at,s.rowid",
+            hold_absent = crate::coordinator::coordinator_hold_absent("a.id"),
         ))?;
         let rows = statement
             .query_map(params![session_id], |row| {
@@ -10243,6 +10438,7 @@ pub(crate) fn eligible_setup_retained_first_turn_stop(
                     process_identity_json: row.get(5)?,
                     stop_rowid: row.get(6)?,
                     setup_permit_id: row.get(7)?,
+                    attempt_id: row.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -10269,14 +10465,16 @@ fn setup_retained_first_turn_stop_timeout_candidate_in(
 ) -> Result<Option<SetupRetainedFirstTurnStopTimeoutReceipt>> {
     connection
         .query_row(
-            "SELECT s.id,rg.id,s.transcript_epoch,s.native_session_id,s.process_identity_json,
-                    CAST(json_extract(audit.detail_json,'$.stop_event_rowid') AS INTEGER),audit.rowid
+            &format!(
+                "SELECT s.id,rg.id,s.transcript_epoch,s.native_session_id,s.process_identity_json,
+                    CAST(json_extract(audit.detail_json,'$.stop_event_rowid') AS INTEGER),audit.rowid,
+                    rg.attempt_id
              FROM sessions s
              JOIN role_generations rg ON rg.id=s.role_generation_id
              JOIN audit_events audit ON audit.entity_kind='session' AND audit.entity_id=s.id
                AND audit.actor_kind='service'
                AND audit.event_code='setup.retained_first_turn.stop_claimed'
-             WHERE (?1 IS NULL OR s.id=?1)
+             WHERE (?1 IS NULL OR s.id=?1) AND {}
                AND s.status='interrupt_requested' AND s.readiness_state='idle_candidate'
                AND json_extract(audit.detail_json,'$.role_generation_id')=rg.id
                AND json_extract(audit.detail_json,'$.transcript_epoch')=s.transcript_epoch
@@ -10286,6 +10484,8 @@ fn setup_retained_first_turn_stop_timeout_candidate_in(
                AND NOT EXISTS(SELECT 1 FROM recovery_records recovery
                  WHERE recovery.session_id=s.id AND recovery.state!='resolved_quiescent')
              ORDER BY audit.created_at,audit.rowid,s.id LIMIT 1",
+                crate::coordinator::coordinator_hold_absent("rg.attempt_id")
+            ),
             params![session_id, now],
             |row| {
                 Ok(SetupRetainedFirstTurnStopTimeoutReceipt {
@@ -10296,6 +10496,7 @@ fn setup_retained_first_turn_stop_timeout_candidate_in(
                     process_identity_json: row.get(4)?,
                     stop_rowid: row.get(5)?,
                     claim_rowid: row.get(6)?,
+                    attempt_id: row.get(7)?,
                 })
             },
         )
@@ -11401,7 +11602,7 @@ mod interruption_tests {
     }
 
     #[test]
-    fn service_start_upgrades_only_schemas_thirty_one_and_thirty_two_and_preserves_receipts() {
+    fn service_start_upgrades_only_schemas_thirty_one_to_thirty_three_and_preserves_receipts() {
         let root =
             std::env::temp_dir().join(format!("llmrelay-service-upgrade-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -11424,14 +11625,20 @@ mod interruption_tests {
              FROM (SELECT name, sql FROM sqlite_master ORDER BY name)";
         let version = "PRAGMA user_version";
         let current_schema = scalar(schema);
-        let drop_native_resolution = "DROP TABLE permission_native_resolutions;
-             DROP TABLE permission_request_hooks; DROP TABLE role_result_supersessions;";
+        let drop_schema_34 = "DROP TRIGGER guidance_submitted_form_paired;
+             DROP TRIGGER guidance_submitted_form_once;
+             ALTER TABLE guidance_messages DROP COLUMN submitted_digest;
+             ALTER TABLE guidance_messages DROP COLUMN submitted_text;";
+        let drop_after_schema_32 = format!(
+            "{drop_schema_34} DROP TABLE permission_native_resolutions;
+             DROP TABLE permission_request_hooks; DROP TABLE role_result_supersessions;"
+        );
         // The applied schema-31 receipt table, holding one historical receipt.
         store
             .lock()
             .unwrap()
             .execute_batch(&format!(
-                "{drop_native_resolution} DROP TABLE final_repair_rechecks; {MIGRATION_031}
+                "{drop_after_schema_32} DROP TABLE final_repair_rechecks; {MIGRATION_031}
                  PRAGMA user_version=31;"
             ))
             .unwrap();
@@ -11509,7 +11716,7 @@ mod interruption_tests {
 
         for _ in 0..2 {
             drop(Store::open_service(&database).unwrap());
-            assert_eq!(scalar(version), "Integer(33)");
+            assert_eq!(scalar(version), "Integer(34)");
             assert_eq!(scalar(history), expected_history);
             assert_eq!(scalar(schema), current_schema);
             assert_eq!(
@@ -11521,32 +11728,41 @@ mod interruption_tests {
             );
         }
         // The released schema 32 upgrades by adding only the native-resolution
-        // provenance tables.
+        // provenance tables and the guidance submitted form.
         Connection::open(&database)
             .unwrap()
-            .execute_batch(&format!("{drop_native_resolution} PRAGMA user_version=32;"))
+            .execute_batch(&format!("{drop_after_schema_32} PRAGMA user_version=32;"))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(33)");
+        assert_eq!(scalar(version), "Integer(34)");
+        assert_eq!(scalar(history), expected_history);
+        assert_eq!(scalar(schema), current_schema);
+        // The released schema 33 upgrades by adding only the guidance submitted form.
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(&format!("{drop_schema_34} PRAGMA user_version=33;"))
+            .unwrap();
+        drop(Store::open_service(&database).unwrap());
+        assert_eq!(scalar(version), "Integer(34)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         // An ordinary open of the current schema reopens it without migrating;
         // only a newer schema is refused as unknown.
         drop(Store::open(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(33)");
+        assert_eq!(scalar(version), "Integer(34)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         set_version(CURRENT_SCHEMA_VERSION + 1);
         let error = Store::open(&database).err().unwrap();
         assert!(
-            error.to_string().contains("database schema 34 is newer"),
+            error.to_string().contains("database schema 35 is newer"),
             "{error:#}"
         );
-        assert_eq!(scalar(version), "Integer(34)");
+        assert_eq!(scalar(version), "Integer(35)");
         assert_eq!(scalar(history), expected_history);
         set_version(CURRENT_SCHEMA_VERSION);
 
-        for unsupported in [0, 14, 29, 30, 34] {
+        for unsupported in [0, 14, 29, 30, 35] {
             set_version(unsupported);
             let error = Store::open_service(&database).err().unwrap();
             assert!(

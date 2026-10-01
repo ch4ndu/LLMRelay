@@ -368,6 +368,7 @@ export function TaskDetail(
     onChanged,
     onOpenSetup = () => {},
     onTaskAction,
+    onOpenRecoveryRecord,
     onOpenPermission,
     onViewCmuxSession = async () => {
       throw new Error("persistent cmux presentation is not available");
@@ -391,6 +392,11 @@ export function TaskDetail(
     onOpenSetup?: (projectId: string) => void;
     /** Opens `itemId`, or the action's primary item, exactly. */
     onTaskAction?: (action: TaskAction, itemId?: string) => void;
+    /** Opens this task's exact recovery record, or returns why it cannot. */
+    onOpenRecoveryRecord?: (
+      attemptId: string,
+      recoveryId: string,
+    ) => string | undefined;
     onOpenPermission?: (request: PermissionRequest) => void;
     onViewCmuxSession?: (sessionId: string) => Promise<CmuxViewOutcome>;
     onSetCmuxKeyboardControl?: (
@@ -767,6 +773,7 @@ export function TaskDetail(
           actions={continuationActions}
           decision={workflowDecision}
           onOpenSetup={onOpenSetup}
+          onOpenRecoveryRecord={onOpenRecoveryRecord}
           onChanged={onChanged}
         />
         <RecoveryPanel

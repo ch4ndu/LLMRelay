@@ -823,6 +823,7 @@ export type ContinuationActionKind =
   | "start_managed_legacy_attempt"
   | "refresh_and_reconcile"
   | "authorization_required"
+  | "recover_failed_step"
   | "terminal_incomplete";
 export interface ContinuationAction {
   kind: ContinuationActionKind;
@@ -835,6 +836,16 @@ export interface ContinuationAction {
   operation: string;
   binding: Record<string, unknown>;
   accounting_note?: string | null;
+}
+/** `recovery[].detail` of a failed automatic step; its record has no session. */
+export interface FailedStepDetail {
+  kind: "coordinator_failure";
+  task_id: string;
+  operation: string;
+  causal_identity: unknown;
+  effect_certainty: "none" | "possible";
+  cause: string;
+  failure_key: string;
 }
 export interface ProductionRoleRestriction {
   provider: Provider;

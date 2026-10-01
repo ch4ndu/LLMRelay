@@ -1373,6 +1373,31 @@ button:disabled {
   justify-items: center;
   color: var(--muted);
 }
+.render-failure {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.render-failure > .panel {
+  width: min(100%, 560px);
+  margin: 0;
+}
+.render-failure h1 {
+  margin: 0 0 10px;
+  font-size: 22px;
+}
+.render-failure h1:focus-visible {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+.render-failure > .panel > p {
+  margin: 0 0 12px;
+  line-height: 1.5;
+}
+.render-failure .technical-details {
+  margin-top: 16px;
+}
 .task-list,
 .check-suite-list {
   display: grid;

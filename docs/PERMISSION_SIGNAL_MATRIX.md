@@ -2,7 +2,7 @@
 
 LLMRelay owns task state, permission decisions and workflow review. Provider hooks describe observed native activity; a notification, response write or open process is not task acceptance. This matrix distinguishes supported signals from prompts that remain visible only in agent output.
 
-Reference snapshot: [Jinn](https://github.com/jinn-network/jinn/tree/62f026aa6cb740c807ac74c350a356538ba6eea8), commit `62f026aa6cb740c807ac74c350a356538ba6eea8`. The comparison used its Codex/Claude interactive runners, Claude permission prompt handler, rollout reader and prompt-handler tests. The inspected Jinn runners include terminal prompt handling and automatic safety-prompt approval. LLMRelay intentionally retains explicit human decisions and supported structured signals instead.
+Reference snapshot: [Jinn](https://github.com/hristo2612/jinn/tree/62f026aa6cb740c807ac74c350a356538ba6eea8), commit `62f026aa6cb740c807ac74c350a356538ba6eea8`. The comparison used its Codex/Claude interactive runners, Claude permission prompt handler, rollout reader and prompt-handler tests. The inspected Jinn runners include terminal prompt handling and automatic safety-prompt approval. LLMRelay intentionally retains explicit human decisions and supported structured signals instead.
 
 Provider boundary: embedded compatibility candidates are Codex 0.157.1 and Claude Code 2.1.283. Installed versions alone do not qualify a role. Each role must satisfy the current manifest, generated hook identity and capability evidence. The Claude Notification registration changes its hook revision to `agenticjira-hook-v4-claude-notification` and compatibility pack revision to 3; prior Claude evidence requires requalification. Codex retains its existing hook revision and pack.
 
@@ -30,3 +30,18 @@ The existing contract tests exercise production hook ingestion, request correlat
 Real browser checks must use an isolated service and cover focused/unfocused delivery, denied/unavailable notification support, reconnect, responsive geometry, appearance persistence and open surfaces. Supported live provider checks must use current qualified profiles in an isolated fixture. Unsupported plugin/onboarding/Codex modal signals remain explicit output-route boundaries rather than successful automated detection.
 
 Claude's [hook reference](https://code.claude.com/docs/en/hooks) documents Notification and StopFailure payloads. Generic notifications cannot authorize a tool, resolve an unrelated request or establish account/model eligibility. Jinn's fake-terminal tests demonstrate its own handler behavior; they are not live provider or LLMRelay acceptance evidence.
+
+October 1 isolated observations used admitted Claude Code 2.1.283 and Codex
+0.157.1. Claude normal Stop events carried empty background-task and scheduled
+wakeup lists, and notifications carried a turn identifier. That identifier did
+not uniquely associate a notice with a tool permission request. No trustworthy
+StopFailure quiescence evidence was established; these observations do not
+authorize automatic readiness after failure or retirement of ambiguous notices.
+The observed fixture hooks had untrusted payload provenance, so successful
+transport observations do not qualify runtime workflow authority.
+
+The Codex fixture rejected its requested model for the current ChatGPT account.
+This was a model-availability error, not a capacity error. LLMRelay has no runtime
+Codex session-history reader, and the test established no supported structured
+capacity signal. The output route remains available; neither terminal text nor
+an installed version establishes model eligibility or permission to retry.

@@ -167,6 +167,11 @@ pub struct ProcessIdentity {
     pub observed_started_at: String,
 }
 
+// `ps -o lstart=` pads single-digit days while inventories rejoin its fields; a blank marker proves nothing.
+pub(crate) fn same_process_start(left: &str, right: &str) -> bool {
+    !left.trim().is_empty() && left.split_whitespace().eq(right.split_whitespace())
+}
+
 /// Identity retained for the lifetime of one accepted human-control socket.
 /// The native connector establishes the PID/start pair before the supervisor
 /// consults process ancestry, so a later inventory row cannot silently stand
@@ -1468,6 +1473,7 @@ pub enum ContinuationActionKind {
     WaitForCapacity,
     WaitForService,
     RecoverOwnership,
+    RecoverFailedStep,
     RetryGracefulStop,
     ForceStopExactProcess,
     PrepareCorrectedRuntime,
@@ -1677,6 +1683,25 @@ impl FromStr for NativePromptKind {
             )),
         }
     }
+}
+
+/// Input LLMRelay sent to a session's current invocation that no trusted
+/// `UserPromptSubmit` of that invocation has accepted within the observation
+/// bound. It records only that acceptance was not observed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UnacceptedInputDto {
+    pub kind: UnacceptedInputKind,
+    /// The guidance message or resume invocation the input belongs to.
+    pub id: String,
+    /// When the guidance was written or the resumed invocation was reserved.
+    pub since: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnacceptedInputKind {
+    Guidance,
+    Resume,
 }
 
 /// Claude `StopFailure` error values of the admitted Claude Code release. Any

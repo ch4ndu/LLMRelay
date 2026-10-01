@@ -1,4 +1,5 @@
 use crate::{
+    domain::same_process_start,
     snapshot::SnapshotManifest,
     store::{
         browser_launch_receipt_in, reserve_browser_launch_receipt_in, BrowserLaunchReceipt,
@@ -377,7 +378,11 @@ impl CheckService {
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
     ) -> Result<BrowserCheckRun> {
         validate_spec(spec)?;
-        self.supervisor.reconcile()?;
+        if let crate::supervisor::ProcessInventory::Unavailable(error) =
+            self.supervisor.reconcile_inventory()?
+        {
+            return Err(error.context("no check was started"));
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let reservation = self.reserve(
             attempt,
@@ -1180,9 +1185,7 @@ impl CheckService {
                 observe_descendants(pgid, &mut known, &inventory);
                 let members = inventory
                     .into_iter()
-                    .filter(|process| {
-                        process.pgid == pgid || known.get(&process.pid) == Some(&process.start)
-                    })
+                    .filter(|process| process.pgid == pgid || is_known(&known, process))
                     .collect::<Vec<_>>();
                 ("observed", members)
             }
@@ -1275,10 +1278,7 @@ impl CheckService {
         known: &HashMap<u32, String>,
         inventory: &[ProcessInfo],
     ) -> Result<()> {
-        for process in inventory
-            .iter()
-            .filter(|p| known.get(&p.pid) == Some(&p.start))
-        {
+        for process in inventory.iter().filter(|p| is_known(known, p)) {
             self.record_process(id, process.pid, &process.start, process.pgid, process.ppid)?;
         }
         Ok(())
@@ -1297,8 +1297,19 @@ impl CheckService {
         if running.is_empty() {
             return Ok(Vec::new());
         }
-        let inventory =
-            process_inventory().context("running check process inventory is unknown")?;
+        let inventory = match process_inventory() {
+            Ok(inventory) => inventory,
+            // Recorded runs stay listed so no caller can read this as quiescence.
+            Err(error) => {
+                let reason = format!("running check process inventory is unknown: {error:#}");
+                return Ok(running
+                    .into_iter()
+                    .map(|id| {
+                        serde_json::json!({"check_id":id,"state":"process_inventory_unknown","reason":reason})
+                    })
+                    .collect());
+            }
+        };
         let connection = self.store.lock()?;
         let mut result = Vec::new();
         for id in running {
@@ -1337,7 +1348,7 @@ impl CheckService {
         for (id, process) in rows {
             if inventory
                 .iter()
-                .any(|p| p.pid == process.pid && p.start == process.start)
+                .any(|p| p.pid == process.pid && same_process_start(&p.start, &process.start))
             {
                 signal_processes(&[process], libc::SIGINT)?;
                 if !ids.contains(&id) {
@@ -1480,6 +1491,11 @@ fn process_inventory() -> Result<Vec<ProcessInfo>> {
     }
     Ok(values)
 }
+fn is_known(known: &HashMap<u32, String>, process: &ProcessInfo) -> bool {
+    known
+        .get(&process.pid)
+        .is_some_and(|start| same_process_start(start, &process.start))
+}
 fn observe_descendants(pgid: i32, known: &mut HashMap<u32, String>, inventory: &[ProcessInfo]) {
     let by_pid = inventory
         .iter()
@@ -1491,9 +1507,8 @@ fn observe_descendants(pgid: i32, known: &mut HashMap<u32, String>, inventory: &
         for process in inventory {
             let parent = by_pid
                 .get(&process.ppid)
-                .and_then(|value| known.get(&value.pid).map(|start| start == &value.start))
-                .unwrap_or(false);
-            if (process.pgid == pgid || parent) && known.get(&process.pid) != Some(&process.start) {
+                .is_some_and(|value| is_known(known, value));
+            if (process.pgid == pgid || parent) && !is_known(known, process) {
                 known.insert(process.pid, process.start.clone());
                 changed = true
             }
@@ -1503,7 +1518,7 @@ fn observe_descendants(pgid: i32, known: &mut HashMap<u32, String>, inventory: &
 fn live_known(known: &HashMap<u32, String>, inventory: &[ProcessInfo]) -> Vec<ProcessInfo> {
     inventory
         .iter()
-        .filter(|process| known.get(&process.pid) == Some(&process.start))
+        .filter(|process| is_known(known, process))
         .cloned()
         .collect()
 }
@@ -1512,7 +1527,7 @@ fn signal_known(known: &HashMap<u32, String>, signal: i32) -> Result<()> {
 }
 fn signal_processes(processes: &[ProcessInfo], signal: i32) -> Result<()> {
     for process in processes {
-        if start_marker(process.pid).ok().as_deref() == Some(&process.start) {
+        if start_marker(process.pid).is_ok_and(|start| same_process_start(&start, &process.start)) {
             let result = unsafe { libc::kill(process.pid as libc::pid_t, signal) };
             if result != 0 {
                 let error = std::io::Error::last_os_error();

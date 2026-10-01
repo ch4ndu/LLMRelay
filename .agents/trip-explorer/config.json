@@ -50,9 +50,45 @@
     "codex-terra-write-retained": {
       "adapter": "direct-claude-cli",
       "authority": "workspace-write",
-      "effort": "high",
+      "effort": "max",
       "model": "claude-opus-5-5",
       "provider": "claude",
+      "service_tier": null,
+      "session": "retained"
+    },
+    "session-astra-high-read": {
+      "adapter": "direct-codex-cli",
+      "authority": "read-only",
+      "effort": "high",
+      "model": "gpt-6-astra",
+      "provider": "codex",
+      "service_tier": null,
+      "session": "retained"
+    },
+    "session-fable-high-read": {
+      "adapter": "direct-claude-cli",
+      "authority": "read-only",
+      "effort": "high",
+      "model": "claude-fable-5-1",
+      "provider": "claude",
+      "service_tier": null,
+      "session": "retained"
+    },
+    "session-fable-medium-fresh": {
+      "adapter": "direct-claude-cli",
+      "authority": "read-only",
+      "effort": "medium",
+      "model": "claude-fable-5-1",
+      "provider": "claude",
+      "service_tier": null,
+      "session": "fresh"
+    },
+    "session-sol61-xhigh-read": {
+      "adapter": "direct-codex-cli",
+      "authority": "read-only",
+      "effort": "xhigh",
+      "model": "gpt-6.1-sol",
+      "provider": "codex",
       "service_tier": null,
       "session": "retained"
     }
@@ -60,19 +96,19 @@
   "project_name": "LLMRelay",
   "roles": {
     "code_reviewer": {
-      "profile": "codex-sol-read-retained"
+      "profile": "session-sol61-xhigh-read"
     },
     "explorer": {
-      "profile": "codex-sol-read-retained"
+      "profile": "session-astra-high-read"
     },
     "final_verifier": {
-      "profile": "claude-fable-read-fresh"
+      "profile": "session-fable-medium-fresh"
     },
     "implementer": {
       "profile": "codex-terra-write-retained"
     },
     "plan_reviewer": {
-      "profile": "claude-fable-read-retained"
+      "profile": "session-fable-high-read"
     }
   },
   "testing": {

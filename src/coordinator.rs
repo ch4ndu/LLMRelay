@@ -11,17 +11,29 @@ use sha2::{Digest, Sha256};
 
 /// Executes at most one durable workflow action. The foreground server calls this
 /// repeatedly; the public scheduler command calls the same seam for deterministic
-/// inspection and capability exercises.
+/// inspection and capability exercises. A step that fails for one identified
+/// attempt holds that attempt and ends the tick; other work continues on later
+/// ticks.
 pub fn tick(app: &Application) -> Result<serde_json::Value> {
+    tick_steps(app).or_else(|error| hold_failed_subject(app, error))
+}
+
+fn tick_steps(app: &Application) -> Result<serde_json::Value> {
     if let Some(value) =
         reconcile_one_setup_retained_first_turn_stop_timeout(&app.store, &app.supervisor)?
     {
         return Ok(value);
     }
-    app.supervisor.reconcile()?;
+    let inventory = app.supervisor.reconcile_inventory()?;
     crate::permissions::expire_deadlines(&app.store)?;
     if !app.dispatch_enabled() {
         return Ok(serde_json::json!({"action":"draining","status":app.drain_status()?}));
+    }
+    if let crate::supervisor::ProcessInventory::Unavailable(cause) = inventory {
+        return process_independent_control(app, cause);
+    }
+    if let Some(value) = release_one_settled_hold(&app.store)? {
+        return Ok(value);
     }
     if let Some(value) = reconcile_one_codex_stop_idle(app)? {
         return Ok(value);
@@ -38,18 +50,13 @@ pub fn tick(app: &Application) -> Result<serde_json::Value> {
     if let Some(value) = quiesce_retired_attempt_role(app)? {
         return Ok(value);
     }
-    if let Some(value) = match process_one_control(app) {
+    if let Some(value) = match process_one_control(app, true) {
         Ok(value) => value,
+        // A shared failure says nothing about the control, so it stays pending.
+        Err(error) if shared_infrastructure_failure(&error) => return Err(error),
         Err(error) => disposition_selected_control_failure(app, &error)?,
     } {
-        if value.get("action").and_then(|action| action.as_str()) != Some("one_step_enabled")
-            && is_committed_action(&value)
-        {
-            if let Some(attempt) = value.get("attempt_id").and_then(|value| value.as_str()) {
-                mark_attempt_served(app, attempt)?;
-            }
-        }
-        return Ok(value);
+        return served_control(app, value);
     }
     if let Some(value) = advance_one_switch(app)? {
         return Ok(value);
@@ -62,7 +69,7 @@ pub fn tick(app: &Application) -> Result<serde_json::Value> {
             && value.get("state").and_then(|value| value.as_str()) != Some("queued")
         {
             if let Some(attempt) = value.get("attempt_id").and_then(|value| value.as_str()) {
-                mark_attempt_served(app, attempt)?;
+                mark_attempt_served_for(app, attempt, &value)?;
             }
         }
         return Ok(value);
@@ -105,6 +112,17 @@ pub fn tick(app: &Application) -> Result<serde_json::Value> {
             }
             AttemptDecisionFlow::Observe => {}
         }
+        let effect = advance.effect();
+        let causal = serde_json::json!({"phase":attempt.phase,"advance":advance.label()});
+        let advance_failure = |error: anyhow::Error| {
+            subject_failure(
+                error,
+                &attempt.id,
+                SubjectStep::AttemptAdvance,
+                effect,
+                causal.clone(),
+            )
+        };
         let advanced = match advance {
             AttemptAdvance::None => Ok(legacy),
             AttemptAdvance::DispatchExplorer { prompt } => {
@@ -119,16 +137,15 @@ pub fn tick(app: &Application) -> Result<serde_json::Value> {
                 }
             }
             AttemptAdvance::QuiesceExplorer { session_id } => {
-                app.interrupt_completed_role(&session_id)?;
+                app.interrupt_completed_role(&session_id)
+                    .map_err(&advance_failure)?;
                 Ok(
                     serde_json::json!({"action":"completed_explorer_interrupt","attempt_id":attempt.id,"session_id":session_id}),
                 )
             }
-            AttemptAdvance::ConsumeBlockedResult => match consume_blocked_result(app, &attempt.id)?
-            {
-                Some(value) => return Ok(value),
-                None => Ok(legacy),
-            },
+            AttemptAdvance::ConsumeBlockedResult => Ok(consume_blocked_result(app, &attempt.id)
+                .map_err(&advance_failure)?
+                .unwrap_or(legacy)),
             AttemptAdvance::Planning(selection) => advance_planning(app, &attempt, selection),
             AttemptAdvance::SupersedeUnapprovedPlan { result_id } => {
                 supersede_unapproved_plan(app, &attempt, &result_id)
@@ -166,21 +183,19 @@ pub fn tick(app: &Application) -> Result<serde_json::Value> {
                         code: "agent_profile_unverified",
                         message: "An agent profile for this task needs verification before work can continue. Open the task's agent settings or Project setup and run the offered verification.".into(),
                     },
-                )?;
-                let refreshed = refreshed_attempt_decision(app, &attempt.id)?;
-                if fallback_decision.is_none() {
-                    fallback_decision = refreshed;
-                }
-                continue;
+                )
+                .map_err(&advance_failure)?;
+                serde_json::json!({
+                    "action":"held",
+                    "hold_recorded":true,
+                    "reason":"agent_profile_unverified",
+                    "attempt_id":attempt.id,
+                })
             }
-            Err(error) => {
-                return Err(error.context(TickSubject {
-                    attempt_id: attempt.id.clone(),
-                }))
-            }
+            Err(error) => return Err(advance_failure(error)),
         };
         if is_committed_action(&value) {
-            mark_attempt_served(app, &attempt.id)?;
+            mark_attempt_served_for(app, &attempt.id, &value)?;
             return Ok(value);
         }
         let explanation = refreshed_attempt_decision(app, &attempt.id)?.unwrap_or_else(|| {
@@ -220,27 +235,37 @@ pub(crate) fn reconcile_one_setup_retained_first_turn_stop_timeout(
     let Some(receipt) = store.setup_retained_first_turn_stop_timeout_candidate()? else {
         return Ok(None);
     };
-    Ok(
-        match supervisor.reconcile_setup_retained_first_turn_stop_timeout(&receipt)? {
-            crate::supervisor::SetupRetainedFirstTurnStopTimeoutOutcome::Quiescent => {
-                Some(serde_json::json!({
-                    "action":"setup_retained_first_turn_stop_quiescent",
-                    "session_id":receipt.session_id,
-                    "state":"exited",
-                    "automatic_resignal":false
-                }))
-            }
-            crate::supervisor::SetupRetainedFirstTurnStopTimeoutOutcome::TimedOut => {
-                Some(serde_json::json!({
-                    "action":"setup_retained_first_turn_stop_timed_out",
-                    "session_id":receipt.session_id,
-                    "state":"recovery_required",
-                    "automatic_resignal":false
-                }))
-            }
-            crate::supervisor::SetupRetainedFirstTurnStopTimeoutOutcome::Stale => None,
-        },
-    )
+    // Observing a timed-out stop only records state; it never signals again.
+    let outcome = supervisor
+        .reconcile_setup_retained_first_turn_stop_timeout(&receipt)
+        .map_err(|error| {
+            subject_failure(
+                error,
+                &receipt.attempt_id,
+                SubjectStep::SetupStopTimeout,
+                StepEffect::None,
+                serde_json::json!({"session_id":receipt.session_id}),
+            )
+        })?;
+    Ok(match outcome {
+        crate::supervisor::SetupRetainedFirstTurnStopTimeoutOutcome::Quiescent => {
+            Some(serde_json::json!({
+                "action":"setup_retained_first_turn_stop_quiescent",
+                "session_id":receipt.session_id,
+                "state":"exited",
+                "automatic_resignal":false
+            }))
+        }
+        crate::supervisor::SetupRetainedFirstTurnStopTimeoutOutcome::TimedOut => {
+            Some(serde_json::json!({
+                "action":"setup_retained_first_turn_stop_timed_out",
+                "session_id":receipt.session_id,
+                "state":"recovery_required",
+                "automatic_resignal":false
+            }))
+        }
+        crate::supervisor::SetupRetainedFirstTurnStopTimeoutOutcome::Stale => None,
+    })
 }
 
 fn reconcile_one_codex_stop_idle(app: &Application) -> Result<Option<serde_json::Value>> {
@@ -257,7 +282,16 @@ fn reconcile_one_codex_stop_idle(app: &Application) -> Result<Option<serde_json:
     ) {
         return Ok(None);
     }
-    if !app.store.mark_codex_stop_idle_candidate(&receipt)? {
+    let marked = app.store.mark_codex_stop_idle_candidate(&receipt).map_err(|error| {
+        subject_failure(
+            error,
+            &receipt.attempt_id,
+            SubjectStep::CodexStopReconciliation,
+            StepEffect::None,
+            serde_json::json!({"session_id":receipt.session_id,"stop_event_rowid":receipt.stop_rowid}),
+        )
+    })?;
+    if !marked {
         return Ok(None);
     }
     Ok(Some(serde_json::json!({
@@ -288,7 +322,15 @@ fn complete_one_setup_retained_first_turn(app: &Application) -> Result<Option<se
     ) {
         return Ok(None);
     }
-    let outcome = app.request_setup_retained_first_turn_stop(&receipt)?;
+    let outcome = app.request_setup_retained_first_turn_stop(&receipt).map_err(|error| {
+        subject_failure(
+            error,
+            &receipt.attempt_id,
+            SubjectStep::SetupFirstTurnStop,
+            StepEffect::Possible,
+            serde_json::json!({"session_id":receipt.session_id,"stop_event_rowid":receipt.stop_rowid}),
+        )
+    })?;
     if outcome == crate::supervisor::InterruptOutcome::Stale {
         return Ok(None);
     }
@@ -313,7 +355,7 @@ fn quiesce_retired_attempt_role(app: &Application) -> Result<Option<serde_json::
     let retired = {
         let connection = app.store.lock()?;
         connection.query_row(
-            "SELECT s.id,a.id,rg.role FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id JOIN attempts a ON a.id=rg.attempt_id WHERE a.status IN ('done','cancelled','rework_staging','reworked') AND s.status='running' ORDER BY s.created_at LIMIT 1",
+            &format!("SELECT s.id,a.id,rg.role FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id JOIN attempts a ON a.id=rg.attempt_id WHERE a.status IN ('done','cancelled','rework_staging','reworked') AND s.status='running' AND {} ORDER BY s.created_at LIMIT 1", coordinator_hold_absent("a.id")),
             [],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
         ).optional()?
@@ -321,7 +363,15 @@ fn quiesce_retired_attempt_role(app: &Application) -> Result<Option<serde_json::
     let Some((session, attempt, role)) = retired else {
         return Ok(None);
     };
-    app.supervisor.interrupt(&session)?;
+    app.supervisor.interrupt(&session).map_err(|error| {
+        subject_failure(
+            error,
+            &attempt,
+            SubjectStep::RetiredRoleInterrupt,
+            StepEffect::Possible,
+            serde_json::json!({"session_id":session,"role":role}),
+        )
+    })?;
     Ok(Some(
         serde_json::json!({"action":"retired_role_interrupt","session_id":session,"attempt_id":attempt,"role":role}),
     ))
@@ -394,12 +444,14 @@ fn attempts_from_connection(
     connection: &Connection,
     include_skipped: bool,
 ) -> Result<Vec<Attempt>> {
-    let mut statement = connection.prepare(
+    // Automatic classification skips a held attempt before its fallible audit; projections keep it.
+    let mut statement = connection.prepare(&format!(
         "SELECT a.id,a.task_id,t.project_id,a.phase,a.status,t.attention,t.version,
                 a.configuration_revision,a.selected_checks_revision,t.title,t.description,
                 t.acceptance_criteria_json,a.plan_hash,a.candidate_hash
          FROM attempts a JOIN tasks t ON t.id=a.task_id
          WHERE t.lifecycle IN ('in_progress','validation','awaiting_review')
+           AND (?1=1 OR {})
            AND (a.status IN ('running','workspace_reserved','needs_input')
              OR (?1=1 AND a.status='materialization_pending'
                AND a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=a.task_id
@@ -420,7 +472,8 @@ fn attempts_from_connection(
                    AND control.kind IN ('manager_stop','manager_change')
                    AND control.state NOT IN ('finished','cancelled','superseded','rejected')))))
          ORDER BY COALESCE(a.last_coordinator_at,''),a.created_at",
-    )?;
+        coordinator_hold_absent("a.id")
+    ))?;
     let rows = statement
         .query_map(params![include_skipped], |row| {
             Ok(Attempt {
@@ -461,6 +514,39 @@ enum AttemptAdvance {
     Implementation(ImplementationSelection),
     Checks(ChecksSelection),
     Handoff(HandoffSelection),
+}
+
+impl AttemptAdvance {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::DispatchExplorer { .. } => "dispatch_explorer",
+            Self::QuiesceExplorer { .. } => "quiesce_explorer",
+            Self::ConsumeBlockedResult => "consume_blocked_result",
+            Self::SupersedeUnapprovedPlan { .. } => "supersede_unapproved_plan",
+            Self::Planning(_) => "planning",
+            Self::Review(_) => "review",
+            Self::Implementation(_) => "implementation",
+            Self::Checks(_) => "checks",
+            Self::Handoff(_) => "handoff",
+        }
+    }
+
+    /// Only pure database transitions cannot have started an external effect.
+    fn effect(&self) -> StepEffect {
+        match self {
+            Self::None | Self::ConsumeBlockedResult | Self::SupersedeUnapprovedPlan { .. } => {
+                StepEffect::None
+            }
+            Self::DispatchExplorer { .. }
+            | Self::QuiesceExplorer { .. }
+            | Self::Planning(_)
+            | Self::Review(_)
+            | Self::Implementation(_)
+            | Self::Checks(_)
+            | Self::Handoff(_) => StepEffect::Possible,
+        }
+    }
 }
 
 enum PlanningSelection {
@@ -601,6 +687,40 @@ fn evaluate_attempt(connection: &Connection, attempt: &Attempt) -> Result<Attemp
 
 fn evaluate_attempt_owner(connection: &Connection, attempt: &Attempt) -> Result<AttemptDecision> {
     let mut prerequisites = Vec::new();
+    if let Some((recovery_id, operation, effect)) =
+        open_coordinator_failure(connection, &attempt.id)?
+    {
+        let mut decision = blocked_attempt_decision(
+            attempt,
+            "workflow.coordinator_failure_hold",
+            DecisionDisposition::Held,
+            DecisionEvidenceState::Pending,
+            DecisionOwner::Human,
+            serde_json::json!({"recovery_id":recovery_id,"operation":operation,"effect_certainty":effect}),
+            Some("An automatic step for this task failed, so LLMRelay stopped advancing it. Open the task's recovery item to retry that step or cancel the task.".into()),
+            prerequisites,
+            serde_json::json!({
+                "action":"held",
+                "attempt_id":attempt.id,
+                "for":"coordinator_failure",
+                "recovery_id":recovery_id,
+            }),
+            AttemptDecisionFlow::Skip,
+            Some(DecisionNextAction {
+                operation: "resolve_recovery".into(),
+                enabled: true,
+                owner: DecisionOwner::Human,
+                binding: DecisionActionBinding {
+                    recovery_id: Some(recovery_id.clone()),
+                    ..attempt_binding(attempt)
+                },
+                accounting_note: None,
+            }),
+            vec!["resolve_recovery".into()],
+        );
+        decision.explanation.subject.recovery_id = Some(recovery_id);
+        return Ok(decision);
+    }
     if attempt.attention != "none" {
         let owner = if attempt.attention == "queued_capacity" {
             DecisionOwner::Service
@@ -2467,30 +2587,41 @@ fn classify_attempt_for_tick(
     app: &Application,
     attempt_id: &str,
 ) -> Result<Option<(Attempt, AttemptDecision)>> {
-    let mut connection = app.store.lock()?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let attempt = active_attempts_from_connection(&transaction)?
-        .into_iter()
-        .find(|attempt| attempt.id == attempt_id);
-    let Some(attempt) = attempt else {
+    let classify = || -> Result<Option<(Attempt, AttemptDecision)>> {
+        let mut connection = app.store.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt = active_attempts_from_connection(&transaction)?
+            .into_iter()
+            .find(|attempt| attempt.id == attempt_id);
+        let Some(attempt) = attempt else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let decision = evaluate_attempt(&transaction, &attempt)?;
+        if matches!(
+            decision.explanation.disposition,
+            DecisionDisposition::Waiting
+                | DecisionDisposition::Held
+                | DecisionDisposition::RetryDeferred
+        ) {
+            audit_coordinator_decision(
+                &transaction,
+                &decision.explanation,
+                &Utc::now().to_rfc3339(),
+            )?;
+        }
         transaction.commit()?;
-        return Ok(None);
+        Ok(Some((attempt, decision)))
     };
-    let decision = evaluate_attempt(&transaction, &attempt)?;
-    if matches!(
-        decision.explanation.disposition,
-        DecisionDisposition::Waiting
-            | DecisionDisposition::Held
-            | DecisionDisposition::RetryDeferred
-    ) {
-        audit_coordinator_decision(
-            &transaction,
-            &decision.explanation,
-            &Utc::now().to_rfc3339(),
-        )?;
-    }
-    transaction.commit()?;
-    Ok(Some((attempt, decision)))
+    classify().map_err(|error| {
+        subject_failure(
+            error,
+            attempt_id,
+            SubjectStep::AttemptClassification,
+            StepEffect::None,
+            serde_json::json!({}),
+        )
+    })
 }
 
 fn refreshed_attempt_decision(
@@ -2565,18 +2696,24 @@ fn legacy_wait_is_visible(value: &serde_json::Value) -> bool {
 }
 
 fn is_committed_action(value: &serde_json::Value) -> bool {
-    !matches!(
-        value.get("action").and_then(|value| value.as_str()),
-        Some(
-            "waiting"
-                | "held"
-                | "idle"
-                | "guidance_queued"
-                | "draining_control"
-                | "recovery_required_for_cancel"
-                | "control_rejected",
-        ) | None
-    )
+    // A hold this step recorded changed workflow state; an observed hold did not.
+    value
+        .get("hold_recorded")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || !matches!(
+            value.get("action").and_then(|value| value.as_str()),
+            Some(
+                "waiting"
+                    | "held"
+                    | "idle"
+                    | "guidance_queued"
+                    | "draining_control"
+                    | "recovery_required_for_cancel"
+                    | "control_rejected"
+                    | "coordinator_failure_held",
+            ) | None
+        )
 }
 
 fn mark_attempt_served(app: &Application, attempt: &str) -> Result<()> {
@@ -2592,11 +2729,13 @@ fn mark_attempt_served(app: &Application, attempt: &str) -> Result<()> {
         "UPDATE attempts SET last_coordinator_at=?1,step_budget=CASE WHEN step_budget>0 THEN step_budget-1 ELSE step_budget END WHERE id=?2",
         params![now, attempt],
     )?;
-    if budget == 1 {
-        transaction.execute(
-            "UPDATE attempts SET status='held',updated_at=?1 WHERE id=?2",
+    // A step that recorded its own hold already stopped the attempt; pausing would replace that hold.
+    if budget == 1
+        && transaction.execute(
+            "UPDATE attempts SET status='held',updated_at=?1 WHERE id=?2 AND status!='needs_input'",
             params![now, attempt],
-        )?;
+        )? == 1
+    {
         transaction.execute("UPDATE tasks SET attention='paused',version=version+1,updated_at=?1 WHERE id=(SELECT task_id FROM attempts WHERE id=?2)",params![now,attempt])?;
     }
     transaction.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'service','coordinator.action.committed','attempt',?3,?4,?5)",params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),attempt,serde_json::json!({"single_step_completed":budget==1}).to_string(),now])?;
@@ -3577,6 +3716,7 @@ fn advance_checks(
             )?;
             Ok(serde_json::json!({
                 "action":"held",
+                "hold_recorded":true,
                 "reason":"check_failure",
                 "suite":check_id,
                 "status":status,
@@ -3599,6 +3739,7 @@ fn advance_checks(
                 )?;
                 return Ok(serde_json::json!({
                     "action":"held",
+                    "hold_recorded":true,
                     "reason":"selected_check_requires_service_permission",
                     "check_id":check_id,
                 }));
@@ -3638,6 +3779,7 @@ fn advance_checks(
             )?;
             Ok(serde_json::json!({
                 "action":"held",
+                "hold_recorded":true,
                 "reason":"no_plan_selected_trip_checks",
             }))
         }
@@ -3689,6 +3831,7 @@ fn advance_checks(
             )?;
             Ok(serde_json::json!({
                 "action":"held",
+                "hold_recorded":true,
                 "reason":"manager_conformance_or_lane_yield_missing",
             }))
         }
@@ -3932,17 +4075,385 @@ fn retry_one_guidance(app: &Application) -> Result<Option<serde_json::Value>> {
         .find(|value| value.get("state").and_then(|state| state.as_str()) != Some("queued")))
 }
 
-/// Names the attempt whose step failed, attached as error context so the
-/// durable deferral can point at that task instead of a global notice.
+/// Names the attempt whose automatic step failed, attached as error context.
+/// The tick holds that attempt; if the hold cannot be recorded, the durable
+/// global deferral still points at its task.
 #[derive(Debug)]
 pub struct TickSubject {
     pub attempt_id: String,
+    step: SubjectStep,
+    effect: StepEffect,
+    causal_identity: serde_json::Value,
 }
 
 impl std::fmt::Display for TickSubject {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "while advancing attempt {}", self.attempt_id)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SubjectStep {
+    SetupStopTimeout,
+    CodexStopReconciliation,
+    SetupFirstTurnStop,
+    ManagerControl,
+    AutoResume,
+    RetiredRoleInterrupt,
+    RoleSwitch,
+    GuidanceDelivery,
+    ReworkMaterialization,
+    StaleReportRetirement,
+    SupersededHoldRelease,
+    AttemptClassification,
+    AttemptAdvance,
+    ActionAccounting,
+}
+
+impl SubjectStep {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SetupStopTimeout => "setup_stop_timeout",
+            Self::CodexStopReconciliation => "codex_stop_reconciliation",
+            Self::SetupFirstTurnStop => "setup_first_turn_stop",
+            Self::ManagerControl => "manager_control",
+            Self::AutoResume => "auto_resume",
+            Self::RetiredRoleInterrupt => "retired_role_interrupt",
+            Self::RoleSwitch => "role_switch",
+            Self::GuidanceDelivery => "guidance_delivery",
+            Self::ReworkMaterialization => "rework_materialization",
+            Self::StaleReportRetirement => "stale_report_retirement",
+            Self::SupersededHoldRelease => "superseded_hold_release",
+            Self::AttemptClassification => "attempt_classification",
+            Self::AttemptAdvance => "attempt_advance",
+            Self::ActionAccounting => "action_accounting",
+        }
+    }
+}
+
+/// Whether the failed step may have started an external effect that a repeat
+/// could duplicate: a process, signal, terminal input or file change. Database
+/// writes alone are re-read by the next evaluation and are not such effects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StepEffect {
+    None,
+    Possible,
+}
+
+impl StepEffect {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Possible => "possible",
+        }
+    }
+}
+
+/// Attaches the failed step's exact subject. An inner attribution is kept, so
+/// the narrowest step that knew the subject names it.
+pub(crate) fn subject_failure(
+    error: anyhow::Error,
+    attempt_id: &str,
+    step: SubjectStep,
+    effect: StepEffect,
+    causal_identity: serde_json::Value,
+) -> anyhow::Error {
+    if error.downcast_ref::<TickSubject>().is_some() {
+        return error;
+    }
+    error.context(TickSubject {
+        attempt_id: attempt_id.to_owned(),
+        step,
+        effect,
+        causal_identity,
+    })
+}
+
+/// Shared storage or process-table failures say nothing about the selected
+/// attempt, so they keep the global deferral instead of holding it.
+fn shared_infrastructure_failure(error: &anyhow::Error) -> bool {
+    use rusqlite::ErrorCode;
+    error.chain().any(|cause| {
+        cause.is::<crate::supervisor::ProcessInventoryUnavailable>()
+            || cause
+                .downcast_ref::<rusqlite::Error>()
+                .and_then(rusqlite::Error::sqlite_error_code)
+                .is_some_and(|code| {
+                    matches!(
+                        code,
+                        ErrorCode::DatabaseBusy
+                            | ErrorCode::DatabaseLocked
+                            | ErrorCode::OutOfMemory
+                            | ErrorCode::PermissionDenied
+                            | ErrorCode::ReadOnly
+                            | ErrorCode::SystemIoFailure
+                            | ErrorCode::DatabaseCorrupt
+                            | ErrorCode::DiskFull
+                            | ErrorCode::CannotOpen
+                            | ErrorCode::FileLockingProtocolFailed
+                            | ErrorCode::NotADatabase
+                    )
+                })
+    })
+}
+
+/// Ends a tick whose step failed. An exactly attributed failure becomes that
+/// attempt's durable hold, so later ticks skip it and serve other work; any
+/// other failure keeps the global deferral.
+fn hold_failed_subject(app: &Application, error: anyhow::Error) -> Result<serde_json::Value> {
+    if shared_infrastructure_failure(&error) {
+        return Err(error);
+    }
+    let Some(subject) = error.downcast_ref::<TickSubject>() else {
+        return Err(error);
+    };
+    let cause = format!("{error:#}");
+    match record_coordinator_failure(&app.store, subject, &cause) {
+        Ok((recovery_id, recorded)) => Ok(serde_json::json!({
+            "action":"coordinator_failure_held",
+            "attempt_id":subject.attempt_id,
+            "recovery_id":recovery_id,
+            "operation":subject.step.as_str(),
+            "effect_certainty":subject.effect.as_str(),
+            "recorded":recorded,
+        })),
+        Err(record_error) => Err(error.context(format!(
+            "the failed step could not be held: {record_error:#}"
+        ))),
+    }
+}
+
+/// Opens, or finds the identical open, `coordinator_failure` recovery record
+/// for the attempt. Returns its ID and whether it was created now.
+fn record_coordinator_failure(
+    store: &crate::store::Store,
+    subject: &TickSubject,
+    cause: &str,
+) -> Result<(String, bool)> {
+    let failure_key = crate::store::json_hash(&serde_json::json!({
+        "operation":subject.step.as_str(),
+        "causal_identity":subject.causal_identity,
+        "cause":cause,
+    }))?;
+    let mut connection = store.lock()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let open: Option<String> = transaction
+        .query_row(
+            "SELECT id FROM recovery_records WHERE attempt_id=?1 AND state='attention_required'
+               AND json_extract(detail_json,'$.kind')='coordinator_failure'
+               AND json_extract(detail_json,'$.failure_key')=?2",
+            params![subject.attempt_id, failure_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(recovery_id) = open {
+        return Ok((recovery_id, false));
+    }
+    let task_id: String = transaction.query_row(
+        "SELECT task_id FROM attempts WHERE id=?1",
+        params![subject.attempt_id],
+        |row| row.get(0),
+    )?;
+    let recovery_id = uuid::Uuid::new_v4().to_string();
+    let detail = serde_json::json!({
+        "kind":"coordinator_failure",
+        "task_id":task_id,
+        "operation":subject.step.as_str(),
+        "causal_identity":subject.causal_identity,
+        "effect_certainty":subject.effect.as_str(),
+        "cause":cause,
+        "failure_key":failure_key,
+    });
+    transaction.execute(
+        "INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at)
+         VALUES(?1,NULL,?2,'attention_required',?3,?4,?4)",
+        params![
+            recovery_id,
+            subject.attempt_id,
+            detail.to_string(),
+            Utc::now().to_rfc3339()
+        ],
+    )?;
+    transaction.commit()?;
+    Ok((recovery_id, true))
+}
+
+/// The terminal outcome recorded for a held step's exact subject, or NULL.
+/// Operations not listed record no subject that can reach one, so their holds
+/// wait for a person.
+const HELD_SUBJECT_OUTCOME: &str = "CASE
+      WHEN json_extract(r.detail_json,'$.operation') IN
+        ('retired_role_interrupt','setup_first_turn_stop','setup_stop_timeout',
+         'codex_stop_reconciliation','guidance_delivery')
+      THEN COALESCE(
+        (SELECT 'session_' || s.status FROM sessions s
+          WHERE s.id=json_extract(r.detail_json,'$.causal_identity.session_id')
+            AND s.status IN ('exited','launch_failed')),
+        (SELECT 'guidance_settled' FROM sessions s
+          WHERE json_extract(r.detail_json,'$.operation')='guidance_delivery'
+            AND s.id=json_extract(r.detail_json,'$.causal_identity.session_id')
+            AND NOT EXISTS(SELECT 1 FROM guidance_messages g
+              WHERE g.role_generation_id=s.role_generation_id
+                AND g.state IN ('queued','delivery_reserved','written_awaiting_submit','delivery_unknown'))))
+      WHEN json_extract(r.detail_json,'$.operation')='manager_control'
+      THEN (SELECT 'control_' || c.state FROM controls c
+          WHERE c.id=json_extract(r.detail_json,'$.causal_identity.control_id')
+            AND c.state IN ('superseded','cancelled','rejected','finished','failed'))
+      WHEN json_extract(r.detail_json,'$.operation')='role_switch'
+      THEN (SELECT 'switch_' || si.state FROM switch_intents si
+          WHERE si.id=json_extract(r.detail_json,'$.causal_identity.switch_intent_id')
+            AND si.state IN ('rejected','superseded','cancelled'))
+      WHEN json_extract(r.detail_json,'$.operation')='auto_resume'
+      THEN (SELECT 'restart_' || rc.state FROM restart_candidates rc
+          WHERE rc.session_id=json_extract(r.detail_json,'$.causal_identity.session_id')
+            AND rc.attempt_id=r.attempt_id AND rc.state IN ('cancelled','released_fresh_dispatch'))
+      WHEN json_extract(r.detail_json,'$.operation')='rework_materialization'
+      THEN (SELECT 'rework_' || ri.state FROM rework_intents ri
+          WHERE ri.new_attempt_id=r.attempt_id AND ri.state IN ('completed','cancelled','failed'))
+    END";
+
+/// Releases one held step whose exact subject has reached a terminal outcome,
+/// once nothing the attempt started is unsettled. Only that record changes:
+/// any other coordinator hold on the attempt stays open and keeps it held.
+/// Nothing is re-executed.
+fn release_one_settled_hold(store: &crate::store::Store) -> Result<Option<serde_json::Value>> {
+    let mut connection = store.lock()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let held: Vec<(String, String, String, String, Option<String>)> = {
+        let mut statement = transaction.prepare(&format!(
+            "SELECT r.id,r.attempt_id,a.task_id,json_extract(r.detail_json,'$.operation'),
+                    {HELD_SUBJECT_OUTCOME}
+             FROM recovery_records r JOIN attempts a ON a.id=r.attempt_id
+             WHERE r.state='attention_required' AND r.session_id IS NULL
+               AND json_extract(r.detail_json,'$.kind')='coordinator_failure'
+             ORDER BY r.created_at,r.rowid"
+        ))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (recovery_id, attempt, task, operation, outcome) in held {
+        let Some(outcome) = outcome else {
+            continue;
+        };
+        if !crate::workflow::unsettled_effects(&transaction, &attempt)?.is_empty() {
+            continue;
+        }
+        let now = Utc::now().to_rfc3339();
+        transaction.execute(
+            "UPDATE recovery_records SET state='resolved_retry',resolved_at=?1,updated_at=?1,
+                    detail_json=json_set(detail_json,'$.resolution',
+                      json_object('decision','subject_outcome','outcome',?2))
+             WHERE id=?3 AND state='attention_required'",
+            params![now, outcome, recovery_id],
+        )?;
+        transaction.execute(
+            "UPDATE tasks SET version=version+1,updated_at=?1 WHERE id=?2",
+            params![now, task],
+        )?;
+        transaction.commit()?;
+        return Ok(Some(serde_json::json!({
+            "action":"coordinator_failure_released",
+            "attempt_id":attempt,
+            "recovery_id":recovery_id,
+            "operation":operation,
+            "outcome":outcome,
+        })));
+    }
+    Ok(None)
+}
+
+/// SQL that is true while the attempt in `attempt_column` has no unresolved
+/// coordinator failure. Every automatic selector applies it; human controls
+/// deliberately do not.
+pub(crate) fn coordinator_hold_absent(attempt_column: &str) -> String {
+    format!(
+        "NOT EXISTS(SELECT 1 FROM recovery_records coordinator_hold
+           WHERE coordinator_hold.attempt_id={attempt_column}
+             AND coordinator_hold.state='attention_required'
+             AND json_extract(coordinator_hold.detail_json,'$.kind')='coordinator_failure')"
+    )
+}
+
+fn coordinator_hold_open(connection: &Connection, attempt_id: &str) -> Result<bool> {
+    Ok(connection.query_row(
+        &format!("SELECT NOT {}", coordinator_hold_absent("?1")),
+        params![attempt_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// The oldest unresolved coordinator failure holding the attempt.
+fn open_coordinator_failure(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<Option<(String, Option<String>, Option<String>)>> {
+    Ok(connection
+        .query_row(
+            "SELECT id,json_extract(detail_json,'$.operation'),
+                    json_extract(detail_json,'$.effect_certainty')
+             FROM recovery_records WHERE attempt_id=?1 AND state='attention_required'
+               AND json_extract(detail_json,'$.kind')='coordinator_failure'
+             ORDER BY created_at,rowid LIMIT 1",
+            params![attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?)
+}
+
+/// Step-budget accounting for a committed action. When it cannot be recorded
+/// a single-step budget could be overrun, so the attempt is held instead.
+fn mark_attempt_served_for(
+    app: &Application,
+    attempt: &str,
+    action: &serde_json::Value,
+) -> Result<()> {
+    mark_attempt_served(app, attempt).map_err(|error| {
+        subject_failure(
+            error,
+            attempt,
+            SubjectStep::ActionAccounting,
+            StepEffect::Possible,
+            serde_json::json!({"action":action.get("action")}),
+        )
+    })
+}
+
+fn served_control(app: &Application, value: serde_json::Value) -> Result<serde_json::Value> {
+    if value.get("action").and_then(|action| action.as_str()) != Some("one_step_enabled")
+        && is_committed_action(&value)
+    {
+        if let Some(attempt) = value.get("attempt_id").and_then(|value| value.as_str()) {
+            mark_attempt_served_for(app, attempt, &value)?;
+        }
+    }
+    Ok(value)
+}
+
+/// With process inventory unknown only a human control that needs no process
+/// action may run; everything else stays pending behind the global deferral.
+fn process_independent_control(
+    app: &Application,
+    cause: anyhow::Error,
+) -> Result<serde_json::Value> {
+    let value = match process_one_control(app, false) {
+        Ok(value) => value,
+        Err(error) if shared_infrastructure_failure(&error) => return Err(error),
+        Err(error) => disposition_selected_control_failure(app, &error)?,
+    };
+    if let Some(value) = value.filter(is_committed_action) {
+        return served_control(app, value);
+    }
+    Err(cause.context("no agent was started, stopped or sent input"))
 }
 
 /// Records that the coordinator could not complete a tick. Every tick retries
@@ -4071,23 +4582,32 @@ pub fn supersede_stale_blocked_results(
 ) -> Result<Option<serde_json::Value>> {
     let mut connection = store.lock()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut stale = superseded_blockers(&transaction, None)?
-        .into_iter()
-        .map(|blocker| {
-            (
+    let retirement_failure = |error: anyhow::Error, attempt_id: &str, causal| {
+        subject_failure(
+            error,
+            attempt_id,
+            SubjectStep::StaleReportRetirement,
+            StepEffect::None,
+            causal,
+        )
+    };
+    let mut stale = Vec::new();
+    for blocker in superseded_blockers(&transaction, None)? {
+        if !coordinator_hold_open(&transaction, &blocker.attempt_id)? {
+            stale.push((
                 blocker.result_id,
                 blocker.attempt_id,
                 blocker.superseded_by,
                 "blocker",
-            )
-        })
-        .collect::<Vec<_>>();
+            ));
+        }
+    }
     // A replayed or repeated plan or candidate report: the phase consumes only
     // the newest eligible one, so older unread copies of that outcome from the
     // same generation are retired with a record instead of lingering. Nothing
     // is retired unless the newest copy is the one the phase would consume.
     {
-        let mut statement = transaction.prepare(
+        let mut statement = transaction.prepare(&format!(
             "SELECT DISTINCT rg.attempt_id,rg.id,rg.role,rr.outcome
              FROM role_results rr JOIN role_generations rg ON rg.id=rr.role_generation_id
              WHERE rr.outcome IN ('plan_ready','candidate_ready') AND rr.consumed_at IS NULL
@@ -4095,8 +4615,10 @@ pub fn supersede_stale_blocked_results(
                  WHERE newer.role_generation_id=rr.role_generation_id
                    AND newer.outcome=rr.outcome AND newer.rowid>rr.rowid
                    AND newer.consumed_at IS NULL)
+               AND {}
              LIMIT 50",
-        )?;
+            coordinator_hold_absent("rg.attempt_id")
+        ))?;
         let groups = statement
             .query_map([], |row| {
                 Ok((
@@ -4109,24 +4631,36 @@ pub fn supersede_stale_blocked_results(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         for (attempt_id, generation, role, outcome) in groups {
-            let Some((eligible, eligible_rowid)) =
-                eligible_progress_result(&transaction, &attempt_id, &generation, &role)?
-            else {
-                continue;
-            };
-            let mut older = transaction.prepare(
-                "SELECT id FROM role_results WHERE role_generation_id=?1 AND outcome=?2
-                   AND consumed_at IS NULL AND rowid<?3 ORDER BY rowid",
-            )?;
-            let ids = older
-                .query_map(params![generation, outcome, eligible_rowid], |row| {
-                    row.get::<_, String>(0)
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            stale.extend(
-                ids.into_iter()
-                    .map(|id| (id, attempt_id.clone(), eligible.clone(), "duplicate")),
-            );
+            let duplicates = (|| -> Result<Option<(String, Vec<String>)>> {
+                let Some((eligible, eligible_rowid)) =
+                    eligible_progress_result(&transaction, &attempt_id, &generation, &role)?
+                else {
+                    return Ok(None);
+                };
+                let mut older = transaction.prepare(
+                    "SELECT id FROM role_results WHERE role_generation_id=?1 AND outcome=?2
+                       AND consumed_at IS NULL AND rowid<?3 ORDER BY rowid",
+                )?;
+                let ids = older
+                    .query_map(params![generation, outcome, eligible_rowid], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(Some((eligible, ids)))
+            })()
+            .map_err(|error| {
+                retirement_failure(
+                    error,
+                    &attempt_id,
+                    serde_json::json!({"role_generation_id":generation}),
+                )
+            })?;
+            if let Some((eligible, ids)) = duplicates {
+                stale.extend(
+                    ids.into_iter()
+                        .map(|id| (id, attempt_id.clone(), eligible.clone(), "duplicate")),
+                );
+            }
         }
     }
     if stale.is_empty() {
@@ -4135,12 +4669,20 @@ pub fn supersede_stale_blocked_results(
     let now = Utc::now().to_rfc3339();
     let mut retired = Vec::new();
     for (result_id, attempt_id, newer_id, kind) in stale {
-        let changed = transaction.execute(
-            "UPDATE role_results SET consumed_at=?1 WHERE id=?2 AND consumed_at IS NULL",
-            params![now, result_id],
-        )?;
-        if changed == 1 {
-            transaction.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'service','role_result.superseded','role_result',?3,?4,?5)",params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),result_id,serde_json::json!({"attempt_id":attempt_id,"superseded_by":newer_id,"kind":kind}).to_string(),now])?;
+        let changed = (|| -> Result<bool> {
+            let changed = transaction.execute(
+                "UPDATE role_results SET consumed_at=?1 WHERE id=?2 AND consumed_at IS NULL",
+                params![now, result_id],
+            )?;
+            if changed == 1 {
+                transaction.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'service','role_result.superseded','role_result',?3,?4,?5)",params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),result_id,serde_json::json!({"attempt_id":attempt_id,"superseded_by":newer_id,"kind":kind}).to_string(),now])?;
+            }
+            Ok(changed == 1)
+        })()
+        .map_err(|error| {
+            retirement_failure(error, &attempt_id, serde_json::json!({"role_result_id":result_id}))
+        })?;
+        if changed {
             retired.push(result_id);
         }
     }
@@ -4230,68 +4772,82 @@ pub fn reconcile_superseded_role_hold(
         rows
     };
     for (attempt, task, version, hold_event, held_result, held_rowid, generation, role) in held {
-        // Only the report the current phase would consume from the agent that
-        // asked releases its hold; any other later report leaves it in place.
-        let Some((newer_result, _)) =
-            eligible_progress_result(&transaction, &attempt, &generation, &role)?
-                .filter(|(_, rowid)| *rowid > held_rowid)
-        else {
-            continue;
-        };
-        // Any unread blocker the agents have not moved past still needs you.
-        let superseded = superseded_blockers(&transaction, Some(&attempt))?
-            .into_iter()
-            .map(|blocker| blocker.result_id)
-            .collect::<std::collections::HashSet<_>>();
-        let unread: Vec<String> = {
-            let mut statement = transaction.prepare(
-                "SELECT rr.id FROM role_results rr
-                 JOIN role_generations rg ON rg.id=rr.role_generation_id
-                 WHERE rg.attempt_id=?1 AND rr.consumed_at IS NULL
-                   AND rr.outcome IN ('blocked','needs_input')
-                   AND NOT EXISTS(SELECT 1 FROM role_result_supersessions superseded
-                                  WHERE superseded.role_result_id=rr.id)",
+        let released = (|| -> Result<Option<serde_json::Value>> {
+            // Only the report the current phase would consume from the agent that
+            // asked releases its hold; any other later report leaves it in place.
+            let Some((newer_result, _)) =
+                eligible_progress_result(&transaction, &attempt, &generation, &role)?
+                    .filter(|(_, rowid)| *rowid > held_rowid)
+            else {
+                return Ok(None);
+            };
+            // Any unread blocker the agents have not moved past still needs you.
+            let superseded = superseded_blockers(&transaction, Some(&attempt))?
+                .into_iter()
+                .map(|blocker| blocker.result_id)
+                .collect::<std::collections::HashSet<_>>();
+            let unread: Vec<String> = {
+                let mut statement = transaction.prepare(
+                    "SELECT rr.id FROM role_results rr
+                     JOIN role_generations rg ON rg.id=rr.role_generation_id
+                     WHERE rg.attempt_id=?1 AND rr.consumed_at IS NULL
+                       AND rr.outcome IN ('blocked','needs_input')
+                       AND NOT EXISTS(SELECT 1 FROM role_result_supersessions superseded
+                                      WHERE superseded.role_result_id=rr.id)",
+                )?;
+                let rows = statement
+                    .query_map(params![attempt], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            if unread.iter().any(|id| !superseded.contains(id)) {
+                return Ok(None);
+            }
+            let outcome: String = transaction.query_row(
+                "SELECT outcome FROM role_results WHERE id=?1",
+                params![newer_result],
+                |row| row.get(0),
             )?;
-            let rows = statement
-                .query_map(params![attempt], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
-        };
-        if unread.iter().any(|id| !superseded.contains(id)) {
-            continue;
+            let now = Utc::now().to_rfc3339();
+            let changed = transaction.execute(
+                "UPDATE tasks SET attention='none',version=version+1,updated_at=?1
+                 WHERE id=?2 AND version=?3 AND attention='needs_input'",
+                params![now, task, version],
+            )?;
+            if changed != 1 {
+                bail!("task changed while releasing a superseded hold")
+            }
+            // The attempt's change time stays put: it anchors which reports are
+            // current, and the newer report must remain consumable.
+            transaction.execute(
+                "UPDATE attempts SET status='running' WHERE id=?1 AND status='needs_input'",
+                params![attempt],
+            )?;
+            record_hold_release(
+                &transaction,
+                &attempt,
+                "superseded_by_newer_report",
+                None,
+                &now,
+            )?;
+            transaction.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'service','attempt.attention.superseded','attempt',?3,?4,?5)",params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),attempt,serde_json::json!({"attention":"none","hold_event_id":hold_event,"held_result_id":held_result,"newer_result_id":newer_result,"newer_outcome":outcome,"task_version":version+1}).to_string(),now])?;
+            Ok(Some(
+                serde_json::json!({"action":"hold_superseded","attempt_id":attempt,"task_id":task,"result_id":newer_result,"outcome":outcome}),
+            ))
+        })()
+        .map_err(|error| {
+            subject_failure(
+                error,
+                &attempt,
+                SubjectStep::SupersededHoldRelease,
+                StepEffect::None,
+                serde_json::json!({"hold_event_id":hold_event}),
+            )
+        })?;
+        if let Some(value) = released {
+            transaction.commit()?;
+            return Ok(Some(value));
         }
-        let outcome: String = transaction.query_row(
-            "SELECT outcome FROM role_results WHERE id=?1",
-            params![newer_result],
-            |row| row.get(0),
-        )?;
-        let now = Utc::now().to_rfc3339();
-        let changed = transaction.execute(
-            "UPDATE tasks SET attention='none',version=version+1,updated_at=?1
-             WHERE id=?2 AND version=?3 AND attention='needs_input'",
-            params![now, task, version],
-        )?;
-        if changed != 1 {
-            bail!("task changed while releasing a superseded hold")
-        }
-        // The attempt's change time stays put: it anchors which reports are
-        // current, and the newer report must remain consumable.
-        transaction.execute(
-            "UPDATE attempts SET status='running' WHERE id=?1 AND status='needs_input'",
-            params![attempt],
-        )?;
-        record_hold_release(
-            &transaction,
-            &attempt,
-            "superseded_by_newer_report",
-            None,
-            &now,
-        )?;
-        transaction.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'service','attempt.attention.superseded','attempt',?3,?4,?5)",params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),attempt,serde_json::json!({"attention":"none","hold_event_id":hold_event,"held_result_id":held_result,"newer_result_id":newer_result,"newer_outcome":outcome,"task_version":version+1}).to_string(),now])?;
-        transaction.commit()?;
-        return Ok(Some(
-            serde_json::json!({"action":"hold_superseded","attempt_id":attempt,"task_id":task,"result_id":newer_result,"outcome":outcome}),
-        ));
     }
     Ok(None)
 }
@@ -4299,24 +4855,68 @@ pub fn reconcile_superseded_role_hold(
 fn retry_one_rework(app: &Application) -> Result<Option<serde_json::Value>> {
     let id = {
         let connection = app.store.lock()?;
-        connection.query_row("SELECT new_attempt_id FROM rework_intents WHERE state IN ('reserved','materializing') ORDER BY created_at LIMIT 1",[],|row|row.get::<_,String>(0)).optional()?
+        connection.query_row(&format!("SELECT new_attempt_id FROM rework_intents WHERE state IN ('reserved','materializing') AND {} ORDER BY created_at LIMIT 1", coordinator_hold_absent("new_attempt_id")),[],|row|row.get::<_,String>(0)).optional()?
     };
     let Some(id) = id else { return Ok(None) };
-    {
+    let rework_failure = |error: anyhow::Error, effect: StepEffect| {
+        subject_failure(
+            error,
+            &id,
+            SubjectStep::ReworkMaterialization,
+            effect,
+            serde_json::json!({}),
+        )
+    };
+    (|| -> Result<()> {
         let connection = app.store.lock()?;
         let project: String = connection.query_row(
             "SELECT t.project_id FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1",
             params![id],
             |row| row.get(0),
         )?;
-        crate::trip::require_project_ready(&connection, &project)?;
+        crate::trip::require_project_ready(&connection, &project)
+    })()
+    .map_err(|error| rework_failure(error, StepEffect::None))?;
+    let error = match app.prepare_rework(&id) {
+        Ok(true) => {
+            return Ok(Some(
+                serde_json::json!({"action":"rework_materialized","attempt_id":id}),
+            ))
+        }
+        Ok(false) => return Ok(None),
+        Err(error) => error,
+    };
+    // A failure the rework lifecycle recorded already holds the child for its own
+    // retry or cancel decision; a second hold would block that exact retry. Only
+    // the complete tuple the exact recovery command accepts counts as recorded.
+    let recorded = app.store.lock().and_then(|connection| {
+        Ok(connection
+            .query_row(
+                "SELECT ri.id FROM rework_intents ri
+                 JOIN attempts a ON a.id=ri.new_attempt_id JOIN tasks t ON t.id=a.task_id
+                 WHERE ri.new_attempt_id=?1 AND ri.state='recovery_required'
+                   AND a.status='needs_recovery' AND t.attention='needs_recovery'
+                   AND t.lifecycle='in_progress'",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
+    });
+    match recorded {
+        Ok(Some(recovery_id)) => Ok(Some(serde_json::json!({
+            "action":"rework_recovery_required",
+            "attempt_id":id,
+            "recovery_id":recovery_id,
+            "reason":format!("{error:#}"),
+        }))),
+        Ok(None) => Err(rework_failure(error, StepEffect::Possible)),
+        Err(lookup_error) => Err(rework_failure(
+            error.context(format!(
+                "the rework recovery state could not be read: {lookup_error:#}"
+            )),
+            StepEffect::Possible,
+        )),
     }
-    if !app.prepare_rework(&id)? {
-        return Ok(None);
-    }
-    Ok(Some(
-        serde_json::json!({"action":"rework_materialized","attempt_id":id}),
-    ))
 }
 
 fn fail_manager_control(
@@ -4473,10 +5073,17 @@ fn process_one_manager_control(app: &Application) -> Result<Option<serde_json::V
         if emergency_stop_all {
             return Ok(None);
         }
+        // These are human controls, so another step's hold never blocks them;
+        // only this control's own unresolved failure does, which ends retries.
         connection.query_row(
             "SELECT c.id,c.attempt_id,c.kind,c.state,c.payload_json
-             FROM controls c WHERE (c.kind='manager_stop' AND c.state='held')
-                OR (c.kind='manager_change' AND c.state IN ('waiting_safe_boundary','switch_requested'))
+             FROM controls c WHERE ((c.kind='manager_stop' AND c.state='held')
+                OR (c.kind='manager_change' AND c.state IN ('waiting_safe_boundary','switch_requested')))
+               AND NOT EXISTS(SELECT 1 FROM recovery_records failure
+                 WHERE failure.attempt_id=c.attempt_id AND failure.state='attention_required'
+                   AND json_extract(failure.detail_json,'$.kind')='coordinator_failure'
+                   AND json_extract(failure.detail_json,'$.operation')='manager_control'
+                   AND json_extract(failure.detail_json,'$.causal_identity.control_id')=c.id)
              ORDER BY c.created_at LIMIT 1",
             [],
             |row| Ok((
@@ -4488,12 +5095,30 @@ fn process_one_manager_control(app: &Application) -> Result<Option<serde_json::V
     let Some((id, attempt, kind, _state, payload_json)) = control else {
         return Ok(None);
     };
-    let payload: serde_json::Value = match serde_json::from_str(&payload_json) {
+    run_manager_control(app, &id, &attempt, &kind, &payload_json).map_err(|error| {
+        subject_failure(
+            error,
+            &attempt,
+            SubjectStep::ManagerControl,
+            StepEffect::Possible,
+            serde_json::json!({"control_id":id,"kind":kind}),
+        )
+    })
+}
+
+fn run_manager_control(
+    app: &Application,
+    id: &str,
+    attempt: &str,
+    kind: &str,
+    payload_json: &str,
+) -> Result<Option<serde_json::Value>> {
+    let payload: serde_json::Value = match serde_json::from_str(payload_json) {
         Ok(payload) => payload,
         Err(error) => {
             fail_manager_control(
                 app,
-                &id,
+                id,
                 &format!("invalid durable manager control payload: {error}"),
                 "Submit a fresh manager control with the current task version.",
             )?;
@@ -4509,7 +5134,7 @@ fn process_one_manager_control(app: &Application) -> Result<Option<serde_json::V
         else {
             fail_manager_control(
                 app,
-                &id,
+                id,
                 "manager stop is missing its captured manager session",
                 "Submit Stop manager again with the current task version.",
             )?;
@@ -4548,7 +5173,7 @@ fn process_one_manager_control(app: &Application) -> Result<Option<serde_json::V
             if let Err(error) = app.interrupt_completed_role(session) {
                 fail_manager_control(
                     app,
-                    &id,
+                    id,
                     &format!("manager-only interrupt request failed: {error:#}"),
                     "Resolve the manager process ownership failure, then submit a fresh Stop manager control.",
                 )?;
@@ -4590,7 +5215,7 @@ fn process_one_manager_control(app: &Application) -> Result<Option<serde_json::V
     else {
         fail_manager_control(
             app,
-            &id,
+            id,
             "manager change is missing a captured generation, revision, operation, or version",
             "Submit Change manager again with the current task version.",
         )?;
@@ -4601,7 +5226,7 @@ fn process_one_manager_control(app: &Application) -> Result<Option<serde_json::V
     let safe_boundary =
         payload.get("mode").and_then(serde_json::Value::as_str) == Some("safe_boundary");
     let boundary = if safe_boundary {
-        let Some(boundary) = manager_change_boundary(app, &id, &attempt, old_generation)? else {
+        let Some(boundary) = manager_change_boundary(app, id, attempt, old_generation)? else {
             return Ok(Some(
                 serde_json::json!({"action":"manager_change_waiting_safe_boundary","control_id":id,"attempt_id":attempt,"old_generation_id":old_generation}),
             ));
@@ -4621,7 +5246,7 @@ fn process_one_manager_control(app: &Application) -> Result<Option<serde_json::V
     };
     let switch = app.roles.request_manager_change(
         operation_id,
-        &attempt,
+        attempt,
         old_generation,
         settings_revision,
         expected_version,
@@ -4632,7 +5257,7 @@ fn process_one_manager_control(app: &Application) -> Result<Option<serde_json::V
         Err(error) => {
             fail_manager_control(
                 app,
-                &id,
+                id,
                 &format!("manager replacement was not eligible: {error:#}"),
                 "Prepare and activate exact capability proof for the requested manager revision, then submit a fresh Change manager control.",
             )?;
@@ -4645,7 +5270,7 @@ fn process_one_manager_control(app: &Application) -> Result<Option<serde_json::V
         if let Err(error) = app.interrupt_completed_role(&session) {
             let reason = format!("manager-only replacement stop request failed: {error:#}");
             app.store
-                .fail_manager_switch_after_signal_failure(&switch, &id, &reason)?;
+                .fail_manager_switch_after_signal_failure(&switch, id, &reason)?;
             return Ok(Some(
                 serde_json::json!({"action":"manager_change_failed","control_id":id,"attempt_id":attempt,"switch_intent_id":switch,"recovery_required":true,"current_manager_retained":false}),
             ));
@@ -4674,7 +5299,7 @@ fn process_one_manager_control(app: &Application) -> Result<Option<serde_json::V
 fn advance_one_switch(app: &Application) -> Result<Option<serde_json::Value>> {
     let intent = {
         let connection = app.store.lock()?;
-        connection.query_row("SELECT si.id,si.state,si.handoff_json,si.role,si.attempt_id
+        connection.query_row(&format!("SELECT si.id,si.state,si.handoff_json,si.role,si.attempt_id
             FROM switch_intents si JOIN attempts a ON a.id=si.attempt_id JOIN tasks t ON t.id=a.task_id
             WHERE (si.state='stopping_old' OR (si.state='ready_for_dispatch' AND a.status='running' AND t.attention='none'))
               AND (si.role!='manager' OR NOT EXISTS(
@@ -4684,13 +5309,33 @@ fn advance_one_switch(app: &Application) -> Result<Option<serde_json::Value>> {
                   AND (c.kind!='manager_change' OR c.state!='switching'
                     OR json_extract(c.payload_json,'$.switch_intent_id') IS NOT si.id)
               ))
-            ORDER BY si.created_at LIMIT 1",[],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).optional()?
+              AND {}
+            ORDER BY si.created_at LIMIT 1", coordinator_hold_absent("si.attempt_id")),[],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).optional()?
     };
     let Some((id, state, handoff, role, attempt)) = intent else {
         return Ok(None);
     };
+    advance_switch_intent(app, &id, &state, &handoff, &role, &attempt).map_err(|error| {
+        subject_failure(
+            error,
+            &attempt,
+            SubjectStep::RoleSwitch,
+            StepEffect::Possible,
+            serde_json::json!({"switch_intent_id":id,"state":state,"role":role}),
+        )
+    })
+}
+
+fn advance_switch_intent(
+    app: &Application,
+    id: &str,
+    state: &str,
+    handoff: &str,
+    role: &str,
+    attempt: &str,
+) -> Result<Option<serde_json::Value>> {
     if state == "stopping_old" {
-        let value = match app.roles.finish_switch(&id) {
+        let value = match app.roles.finish_switch(id) {
             Ok(value) => value,
             Err(error)
                 if format!("{error:#}").contains("active or process ownership is unknown")
@@ -4700,12 +5345,14 @@ fn advance_one_switch(app: &Application) -> Result<Option<serde_json::Value>> {
                     serde_json::json!({"action":"switch_waiting_for_quiescence","intent_id":id,"attempt_id":attempt}),
                 ))
             }
+            // An unreadable process table proves nothing about this switch.
+            Err(error) if shared_infrastructure_failure(&error) => return Err(error),
             Err(error) => {
                 return disposition_switch_failure(
                     app,
-                    &id,
-                    &attempt,
-                    &role,
+                    id,
+                    attempt,
+                    role,
                     "stopping_old",
                     &format!("replacement quiescence failed: {error:#}"),
                 );
@@ -4719,7 +5366,7 @@ fn advance_one_switch(app: &Application) -> Result<Option<serde_json::Value>> {
         let role = role
             .parse::<RoleKind>()
             .map_err(|error: String| anyhow!(error))?;
-        let handoff = serde_json::from_str::<serde_json::Value>(&handoff)?;
+        let handoff = serde_json::from_str::<serde_json::Value>(handoff)?;
         crate::workflow_resources::render(
             role,
             &serde_json::json!({"attempt_id":attempt,"switch_intent_id":id,"structured_handoff":handoff}),
@@ -4729,22 +5376,22 @@ fn advance_one_switch(app: &Application) -> Result<Option<serde_json::Value>> {
         Err(error) => {
             return disposition_switch_failure(
                 app,
-                &id,
-                &attempt,
-                &role,
+                id,
+                attempt,
+                role,
                 "ready_for_dispatch",
                 &format!("replacement preparation failed: {error:#}"),
             );
         }
     };
-    let launch = match app.dispatch_switch(&id, &prompt) {
+    let launch = match app.dispatch_switch(id, &prompt) {
         Ok(launch) => launch,
         Err(error) => {
             return disposition_switch_failure(
                 app,
-                &id,
-                &attempt,
-                &role,
+                id,
+                attempt,
+                role,
                 "ready_for_dispatch",
                 &format!("replacement dispatch failed: {error:#}"),
             );
@@ -4780,16 +5427,17 @@ fn disposition_selected_control_failure(
     let reason = format!("{error:#}");
     let mut connection = app.store.lock()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let control: Option<(String, String)> = transaction
+    let control: Option<(String, String, Option<String>)> = transaction
         .query_row(
-            "SELECT c.id,c.attempt_id FROM controls c
+            "SELECT c.id,c.attempt_id,a.task_id FROM controls c
+             LEFT JOIN attempts a ON a.id=c.attempt_id
              WHERE c.state IN ('requested','draining') AND c.kind!='transition_proposal'
              ORDER BY c.created_at LIMIT 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((control_id, attempt_id)) = control else {
+    let Some((control_id, attempt_id, task_id)) = control else {
         transaction.commit()?;
         return Err(anyhow!(reason));
     };
@@ -4831,6 +5479,9 @@ fn disposition_selected_control_failure(
             }).to_string(), now
         ],
     )?;
+    if let Some(task_id) = task_id.filter(|_| !recovery_required) {
+        restore_paused_attention_after_refusal(&transaction, &task_id, &attempt_id, &now)?;
+    }
     transaction.commit()?;
     drop(connection);
     if let Some(workspace_id) = workspace_id {
@@ -4903,7 +5554,10 @@ fn disposition_switch_failure(
     })))
 }
 
-fn process_one_control(app: &Application) -> Result<Option<serde_json::Value>> {
+fn process_one_control(
+    app: &Application,
+    inventory_observed: bool,
+) -> Result<Option<serde_json::Value>> {
     let control = {
         let connection = app.store.lock()?;
         connection.query_row("SELECT c.id,c.attempt_id,c.kind,c.payload_json,a.task_id FROM controls c JOIN attempts a ON a.id=c.attempt_id WHERE c.state IN ('requested','draining') AND c.kind!='transition_proposal' ORDER BY c.created_at LIMIT 1",[],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).optional()?
@@ -5004,6 +5658,12 @@ fn process_one_control(app: &Application) -> Result<Option<serde_json::Value>> {
         }
         "pause_now" | "cancel" => {
             if !active.is_empty() {
+                if !inventory_observed {
+                    return Ok(Some(serde_json::json!({
+                        "action":"waiting","for":"process_inventory","control_id":id,
+                        "attempt_id":attempt,"active":active
+                    })));
+                }
                 for (session, _) in &active {
                     app.supervisor.interrupt(session)?
                 }
@@ -6092,22 +6752,6 @@ fn current_attention_hold(
         (recorded.as_deref() == Some(attention)).then_some((reason?, message?))
     }))
 }
-fn set_phase(app: &Application, task: &str, attempt: &str, phase: &str) -> Result<()> {
-    let mut connection = app.store.lock()?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let now = Utc::now().to_rfc3339();
-    transaction.execute(
-        "UPDATE attempts SET phase=?1,updated_at=?2 WHERE id=?3",
-        params![phase, now, attempt],
-    )?;
-    transaction.execute(
-        "UPDATE tasks SET version=version+1,updated_at=?1 WHERE id=?2",
-        params![now, task],
-    )?;
-    transaction.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'service','attempt.phase.changed','attempt',?3,?4,?5)",params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),attempt,serde_json::json!({"phase":phase}).to_string(),now])?;
-    transaction.commit()?;
-    Ok(())
-}
 fn finish_control(
     app: &Application,
     id: &str,
@@ -6147,13 +6791,17 @@ fn disposition_continue_ownership_in(
     task: &str,
     attempt: &str,
     reason: &str,
+    coordinator_failure: Option<&str>,
 ) -> Result<serde_json::Value> {
     let workspace_id = unresolved_workspace_for_claim(tx, attempt)?;
     let recovery_required = workspace_id.is_some();
     let now = Utc::now().to_rfc3339();
     let changed = tx.execute(
         "UPDATE controls SET state=?1,
-                payload_json=json_set(payload_json,'$.failure',?2,'$.next_action',?3),updated_at=?4
+                payload_json=CASE WHEN ?8 IS NULL
+                  THEN json_set(payload_json,'$.failure',?2,'$.next_action',?3)
+                  ELSE json_set(payload_json,'$.failure',?2,'$.next_action',?3,'$.recovery_id',?8)
+                END,updated_at=?4
          WHERE id=?5 AND attempt_id=?6 AND kind='continue' AND state IN ('requested','draining')
            AND EXISTS(SELECT 1 FROM attempts WHERE id=?6 AND task_id=?7)",
         params![
@@ -6161,10 +6809,12 @@ fn disposition_continue_ownership_in(
             reason,
             if recovery_required {
                 "Use the exact workspace reservation recovery action; generic control recovery cannot dispose repository ownership."
+            } else if coordinator_failure.is_some() {
+                "Open the failed step's recovery item and choose Retry step or Cancel task; Continue cannot release it."
             } else {
                 "Submit a corrected, newly authorized control."
             },
-            now, id, attempt, task,
+            now, id, attempt, task, coordinator_failure,
         ],
     )?;
     if changed != 1 {
@@ -6197,10 +6847,34 @@ fn disposition_continue_ownership_in(
             }),
         )?;
     }
-    Ok(serde_json::json!({
+    restore_paused_attention_after_refusal(tx, task, attempt, &now)?;
+    let mut outcome = serde_json::json!({
         "action":if recovery_required {"control_workspace_recovery_required"} else {"control_rejected"},
         "control_id":id,"attempt_id":attempt,"reason":reason,
-    }))
+    });
+    if let Some(recovery_id) = coordinator_failure {
+        outcome["recovery_id"] = serde_json::json!(recovery_id);
+        outcome["public_resolution"] = serde_json::json!("resolve_recovery");
+    }
+    Ok(outcome)
+}
+
+fn restore_paused_attention_after_refusal(
+    tx: &Transaction<'_>,
+    task: &str,
+    attempt: &str,
+    now: &str,
+) -> Result<()> {
+    // Submitting the refused request cleared the attention of an attempt that is still held.
+    tx.execute(
+        "UPDATE tasks SET attention='paused',version=version+1,updated_at=?1
+         WHERE id=?2 AND attention='none'
+           AND EXISTS(SELECT 1 FROM attempts WHERE id=?3 AND task_id=?2 AND status='held'
+             AND id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=?2
+                     ORDER BY latest.created_at DESC LIMIT 1))",
+        params![now, task, attempt],
+    )?;
+    Ok(())
 }
 
 #[test]
@@ -6209,7 +6883,7 @@ fn continue_ownership_disposes_only_captured_control_and_workspace() {
     connection.execute_batch(
         "CREATE TABLE projects(id TEXT PRIMARY KEY, repository_path TEXT);
          CREATE TABLE tasks(id TEXT PRIMARY KEY, project_id TEXT, attention TEXT, version INTEGER, updated_at TEXT);
-         CREATE TABLE attempts(id TEXT PRIMARY KEY, task_id TEXT, status TEXT, updated_at TEXT);
+         CREATE TABLE attempts(id TEXT PRIMARY KEY, task_id TEXT, status TEXT, created_at TEXT, updated_at TEXT);
          CREATE TABLE controls(id TEXT PRIMARY KEY, attempt_id TEXT, kind TEXT, state TEXT, payload_json TEXT, updated_at TEXT);
          CREATE TABLE claims(id TEXT PRIMARY KEY, attempt_id TEXT, state TEXT, updated_at TEXT);
          CREATE TABLE workspaces(id TEXT PRIMARY KEY, attempt_id TEXT, repository_identity TEXT, path TEXT, base_revision TEXT, state TEXT, created_at TEXT, updated_at TEXT);
@@ -6218,8 +6892,8 @@ fn continue_ownership_disposes_only_captured_control_and_workspace() {
          INSERT INTO projects VALUES('project','/fixture/repository');
          INSERT INTO tasks VALUES('selected-task','project','none',4,'before');
          INSERT INTO tasks VALUES('other-task','project','paused',8,'before');
-         INSERT INTO attempts VALUES('selected-attempt','selected-task','held','before');
-         INSERT INTO attempts VALUES('other-attempt','other-task','held','before');
+         INSERT INTO attempts VALUES('selected-attempt','selected-task','held','before','before');
+         INSERT INTO attempts VALUES('other-attempt','other-task','held','before','before');
          INSERT INTO controls VALUES('other-control','other-attempt','continue','requested','{}','before');
          INSERT INTO controls VALUES('selected-control','selected-attempt','continue','requested','{}','before');
          INSERT INTO claims VALUES('selected-claim','selected-attempt','unknown','before');
@@ -6248,6 +6922,7 @@ fn continue_ownership_disposes_only_captured_control_and_workspace() {
         "selected-task",
         "selected-attempt",
         "ownership uncertain",
+        None,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -6303,6 +6978,188 @@ fn continue_ownership_disposes_only_captured_control_and_workspace() {
         )
         .unwrap();
     assert_eq!(selected_recovery, 1);
+}
+
+#[cfg(test)]
+fn running_attempt_store(
+    name: &str,
+) -> (std::path::PathBuf, std::path::PathBuf, crate::store::Store) {
+    let root = std::env::temp_dir().join(format!("agenticjira-{name}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite3");
+    let store = crate::store::Store::open(&database).unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+               VALUES('p','Project','/tmp/project','identity','base','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO tasks(id,project_id,title,description,acceptance_criteria_json,lifecycle,attention,created_at,updated_at)
+               VALUES('t','p','Task','Task','[]','in_progress','none','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+               VALUES('a','t','context','planning','base',1,'running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+    (root, database, store)
+}
+
+#[test]
+fn coordinator_failure_holds_deduplicate_exact_causes_across_reopen() {
+    let (root, database, store) = running_attempt_store("coordinator-failure-dedup");
+    let failure = |cause: &str| {
+        subject_failure(
+            anyhow!("{cause}"),
+            "a",
+            SubjectStep::AttemptAdvance,
+            StepEffect::Possible,
+            serde_json::json!({"phase":"planning","advance":"planning"}),
+        )
+    };
+    let record = |store: &crate::store::Store, error: &anyhow::Error| {
+        let subject = error.downcast_ref::<TickSubject>().unwrap();
+        record_coordinator_failure(store, subject, &format!("{error:#}")).unwrap()
+    };
+    let first = failure("manager launch failed");
+    let (held, created) = record(&store, &first);
+    assert!(created);
+    assert_eq!(
+        record(&store, &failure("manager launch failed")),
+        (held.clone(), false)
+    );
+    let reopened = crate::store::Store::open(&database).unwrap();
+    assert_eq!(record(&reopened, &first), (held.clone(), false));
+    let (changed, created) = record(&reopened, &failure("manager launch failed differently"));
+    assert!(created);
+    assert_ne!(changed, held);
+    let connection = reopened.lock().unwrap();
+    let (session, kind, operation, effect, count): (Option<String>, String, String, String, i64) =
+        connection
+            .query_row(
+                "SELECT session_id,json_extract(detail_json,'$.kind'),
+                        json_extract(detail_json,'$.operation'),
+                        json_extract(detail_json,'$.effect_certainty'),
+                        (SELECT COUNT(*) FROM recovery_records WHERE attempt_id='a')
+                 FROM recovery_records WHERE id=?1",
+                params![held],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+    assert_eq!(
+        (
+            session,
+            kind.as_str(),
+            operation.as_str(),
+            effect.as_str(),
+            count
+        ),
+        (
+            None,
+            "coordinator_failure",
+            "attempt_advance",
+            "possible",
+            2
+        )
+    );
+    assert!(coordinator_hold_open(&connection, "a").unwrap());
+    drop(connection);
+
+    let sqlite = |code| {
+        anyhow::Error::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some("fixture".into()),
+        ))
+        .context("advance one step")
+    };
+    assert!(shared_infrastructure_failure(&sqlite(
+        rusqlite::ffi::SQLITE_BUSY
+    )));
+    assert!(shared_infrastructure_failure(&sqlite(
+        rusqlite::ffi::SQLITE_FULL
+    )));
+    assert!(!shared_infrastructure_failure(&sqlite(
+        rusqlite::ffi::SQLITE_CONSTRAINT
+    )));
+    assert!(!shared_infrastructure_failure(&first));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn automatic_release_settles_only_the_exact_hold_whose_subject_ended() {
+    let (root, _, store) = running_attempt_store("coordinator-failure-release");
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+               VALUES('g','a','manager','codex',1,1,'running','authority','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+               VALUES('s','g','codex','running','{}','fixture','epoch','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+    let hold = |step: SubjectStep, effect: StepEffect, causal: serde_json::Value| {
+        let error = subject_failure(anyhow!("fixture failure"), "a", step, effect, causal);
+        let subject = error.downcast_ref::<TickSubject>().unwrap();
+        record_coordinator_failure(&store, subject, &format!("{error:#}"))
+            .unwrap()
+            .0
+    };
+    let advance = hold(
+        SubjectStep::AttemptAdvance,
+        StepEffect::None,
+        serde_json::json!({"phase":"planning","advance":"planning"}),
+    );
+    let classification = hold(
+        SubjectStep::AttemptClassification,
+        StepEffect::None,
+        serde_json::json!({}),
+    );
+    let retired = hold(
+        SubjectStep::RetiredRoleInterrupt,
+        StepEffect::Possible,
+        serde_json::json!({"session_id":"s","role":"manager"}),
+    );
+    assert!(release_one_settled_hold(&store).unwrap().is_none());
+
+    // The exact subject's recorded exit releases its own hold only; the other
+    // holds stay open, keep the attempt held and are never released here.
+    store
+        .lock()
+        .unwrap()
+        .execute("UPDATE sessions SET status='exited' WHERE id='s'", [])
+        .unwrap();
+    let released = release_one_settled_hold(&store).unwrap().unwrap();
+    assert_eq!(released["recovery_id"], retired.as_str());
+    assert_eq!(released["outcome"], "session_exited");
+    assert!(release_one_settled_hold(&store).unwrap().is_none());
+    let connection = store.lock().unwrap();
+    let state = |id: &str| {
+        connection
+            .query_row(
+                "SELECT state FROM recovery_records WHERE id=?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        (state(&retired), state(&advance), state(&classification)),
+        (
+            "resolved_retry".to_owned(),
+            "attention_required".to_owned(),
+            "attention_required".to_owned()
+        )
+    );
+    assert!(coordinator_hold_open(&connection, "a").unwrap());
+    drop(connection);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn finish_continue_with_restart_hold(
@@ -6417,6 +7274,7 @@ fn finish_continue_with_restart_hold(
             task,
             attempt,
             "control cannot normalize task or attempt while repository claim ownership is unknown",
+            None,
         )?;
         tx.commit()?;
         return Ok(Some(ContinueRefusal::Ownership(disposition)));
@@ -6427,12 +7285,16 @@ fn finish_continue_with_restart_hold(
         |row| row.get(0),
     )?;
     if unresolved_recovery {
+        let coordinator_failure = open_coordinator_failure(&tx, attempt)?;
         let disposition = disposition_continue_ownership_in(
             &tx,
             id,
             task,
             attempt,
             "continue cannot normalize task or attempt while unresolved recovery evidence remains",
+            coordinator_failure
+                .as_ref()
+                .map(|(recovery_id, _, _)| recovery_id.as_str()),
         )?;
         tx.commit()?;
         return Ok(Some(ContinueRefusal::Ownership(disposition)));
@@ -6455,6 +7317,7 @@ fn finish_continue_with_restart_hold(
             "UPDATE controls SET state='rejected',payload_json=json_set(payload_json,'$.reason',?1),updated_at=?2 WHERE id=?3",
             params![reason, now, id],
         )?;
+        restore_paused_attention_after_refusal(&tx, task, attempt, &now)?;
         tx.commit()?;
         return Ok(Some(ContinueRefusal::Stale(reason)));
     }
@@ -6592,6 +7455,7 @@ fn finish_control_in_transaction(
                         "UPDATE tasks SET attention='none',lifecycle='cancelled',version=version+1,updated_at=?1 WHERE id=?2",
                         params![now, task],
                     )?;
+                    dispose_coordinator_failures(tx, &[attempt, parent.as_str()], id, now)?;
                 }
             }
             "held" => {
@@ -6661,15 +7525,13 @@ fn finish_control_in_transaction(
         tx.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'service','control.applied','control',?3,?4,?5)",params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),id,serde_json::json!({"attention":applied_attention,"attempt_status":applied_status,"rework_state":applied_rework_state,"unfinished_rework":true,"parent_claim_quiescent":parent_claim_quiescent}).to_string(),now])?;
         return Ok(());
     }
-    // Releasing a hold keeps the attempt's change time, which is the anchor for
-    // which role reports are current: a report made while the task waited (for
-    // example the plan written after you answered) must stay consumable after
-    // Retry or Continue instead of looking older than the release.
-    let released_hold: bool = tx.query_row(
-        "SELECT a.status='needs_input' AND t.attention='needs_input' AND ?3='running' AND ?4='none'
+    // attempts.updated_at anchors report currency, so a report made before or during a pause stays consumable.
+    let (released_hold, paused_or_resumed): (bool, bool) = tx.query_row(
+        "SELECT a.status='needs_input' AND t.attention='needs_input' AND ?3='running' AND ?4='none',
+                (?3='held' AND ?4='paused') OR (a.status='held' AND ?3='running' AND ?4='none')
          FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1 AND t.id=?2",
         params![attempt, task, status, attention],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     tx.execute(
         "UPDATE tasks SET attention=?1,lifecycle=CASE WHEN ?2='cancelled' THEN 'cancelled' ELSE lifecycle END,version=version+1,updated_at=?3 WHERE id=?4",
@@ -6678,7 +7540,13 @@ fn finish_control_in_transaction(
     tx.execute(
         "UPDATE attempts SET status=?1,step_budget=COALESCE(?2,step_budget),
                 updated_at=CASE WHEN ?5 THEN updated_at ELSE ?3 END WHERE id=?4",
-        params![status, step_budget, now, attempt, released_hold],
+        params![
+            status,
+            step_budget,
+            now,
+            attempt,
+            released_hold || paused_or_resumed
+        ],
     )?;
     if released_hold {
         record_hold_release(tx, attempt, "released_by_control", Some(id), now)?;
@@ -6688,10 +7556,32 @@ fn finish_control_in_transaction(
             "UPDATE claims SET state='cancelled',updated_at=?1 WHERE attempt_id=?2 AND state NOT IN ('unknown','stopping')",
             params![now, attempt],
         )?;
+        dispose_coordinator_failures(tx, &[attempt], id, now)?;
     }
     tx.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'service','control.applied','control',?3,?4,?5)",params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),id,serde_json::json!({"attention":attention,"attempt_status":status}).to_string(),now])?;
     Ok(())
 }
+/// A cancelled attempt has no step left to retry, so its coordinator failures
+/// close with the cancelling control as their resolution.
+fn dispose_coordinator_failures(
+    tx: &rusqlite::Transaction<'_>,
+    attempts: &[&str],
+    control_id: &str,
+    now: &str,
+) -> Result<()> {
+    for attempt in attempts {
+        tx.execute(
+            "UPDATE recovery_records SET state='resolved_cancelled',resolved_at=?1,updated_at=?1,
+                    detail_json=json_set(detail_json,'$.resolution',
+                      json_object('decision','cancel','control_id',?2))
+             WHERE attempt_id=?3 AND state='attention_required'
+               AND json_extract(detail_json,'$.kind')='coordinator_failure'",
+            params![now, control_id, attempt],
+        )?;
+    }
+    Ok(())
+}
+
 fn consume_blocked_result(app: &Application, attempt: &str) -> Result<Option<serde_json::Value>> {
     let mut connection = app.store.lock()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -6739,7 +7629,7 @@ fn consume_blocked_result(app: &Application, attempt: &str) -> Result<Option<ser
         )?;
         transaction.commit()?;
         return Ok(Some(
-            serde_json::json!({"action":"held","reason":outcome,"summary":summary}),
+            serde_json::json!({"action":"held","hold_recorded":true,"reason":outcome,"summary":summary}),
         ));
     }
     transaction.commit()?;

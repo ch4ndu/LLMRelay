@@ -6,7 +6,7 @@ use crate::domain::{
     DecisionSubject, HumanCommand, NativePromptDto, NativePromptKind, NativeTurnDto,
     NativeTurnFailureDto, NativeTurnFailureKind, OperationResult, PermissionRequestDto, ProjectDto,
     RestartCandidateResult, RoleKind, StaleRestartCandidateCancellation, TaskAttentionTarget,
-    TaskDto, UnconfirmedGuidanceAbandonment,
+    TaskDto, UnacceptedInputDto, UnacceptedInputKind, UnconfirmedGuidanceAbandonment,
 };
 use crate::store::{json_hash, Store};
 use crate::supervisor::GRACEFUL_STOP_SECONDS;
@@ -477,6 +477,8 @@ pub(crate) fn validate_recovery_identity(
     if recovery_id.is_empty() {
         bail!("recovery_id is required")
     }
+    // A coordinator failure holds its attempt by the record alone, whatever the
+    // attempt's status, and is never superseded by or superseding another kind.
     let record = connection
         .query_row(
             "SELECT r.session_id, json_extract(r.detail_json,'$.kind'),
@@ -484,9 +486,11 @@ pub(crate) fn validate_recovery_identity(
                 json_extract(r.detail_json,'$.claim_id'),
                 json_extract(r.detail_json,'$.freeze_id'),
                 r.process_identity_json,
-                EXISTS(SELECT 1 FROM recovery_records newer
+                COALESCE(json_extract(r.detail_json,'$.kind'),'')!='coordinator_failure'
+                AND EXISTS(SELECT 1 FROM recovery_records newer
                        WHERE newer.id!=r.id AND newer.state='attention_required'
                          AND newer.attempt_id=r.attempt_id
+                         AND COALESCE(json_extract(newer.detail_json,'$.kind'),'')!='coordinator_failure'
                          AND ((newer.session_id=r.session_id AND r.session_id IS NOT NULL
                                AND COALESCE(json_extract(newer.detail_json,'$.kind'),'prior_boot_process')
                                    =COALESCE(json_extract(r.detail_json,'$.kind'),'prior_boot_process')) OR
@@ -501,7 +505,9 @@ pub(crate) fn validate_recovery_identity(
                               (newer.created_at=r.created_at AND newer.rowid>r.rowid)))
          FROM recovery_records r JOIN attempts a ON a.id=r.attempt_id
          WHERE r.id=?1 AND r.attempt_id=?2 AND a.task_id=?3
-           AND a.status IN ('needs_recovery','running') AND r.state='attention_required'",
+           AND (a.status IN ('needs_recovery','running')
+             OR json_extract(r.detail_json,'$.kind')='coordinator_failure')
+           AND r.state='attention_required'",
             params![recovery_id, attempt_id, task_id],
             |row| {
                 Ok((
@@ -569,6 +575,7 @@ pub(crate) fn validate_recovery_identity(
         }
     } else {
         let current: bool = match (record.1.as_deref(), record.2.as_deref(), record.3.as_deref(), record.4.as_deref()) {
+            (Some("coordinator_failure"), _, _, _) => true,
             (Some("database_restore_claim"), _, Some(claim), _) => connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM claims WHERE id=?1 AND attempt_id=?2 AND state IN ('reserved','launching','running','unknown','stopping'))",
                 params![claim, attempt_id], |row| row.get(0))?,
@@ -585,6 +592,131 @@ pub(crate) fn validate_recovery_identity(
         }
     }
     Ok(())
+}
+
+/// The attempt's external-effect reservations whose outcome is not yet
+/// observed. Every process start, resume, signal, terminal write, check,
+/// snapshot capture and rework materialization is reserved in one of these
+/// states before it begins and leaves them only on an observed outcome, so no
+/// row means positive settlement.
+const UNSETTLED_EFFECTS: &str = "
+    SELECT 'an open recovery item' FROM recovery_records
+     WHERE attempt_id=?1 AND state='attention_required'
+       AND COALESCE(json_extract(detail_json,'$.kind'),'')!='coordinator_failure'
+    UNION SELECT 'an agent start, resume or stop whose outcome is not recorded' FROM sessions s
+      JOIN role_generations rg ON rg.id=s.role_generation_id
+     WHERE rg.attempt_id=?1 AND s.status IN ('launch_reserved','interrupt_requested','recovery_required')
+    UNION SELECT 'guidance whose delivery is unconfirmed' FROM guidance_messages
+     WHERE attempt_id=?1 AND state IN ('delivery_reserved','written_awaiting_submit','delivery_unknown')
+    UNION SELECT 'a review whose delivery is not confirmed' FROM review_requests
+     WHERE attempt_id=?1 AND delivery_state IN ('launching','ambiguous')
+    UNION SELECT 'a check whose start is not recorded' FROM check_runs
+     WHERE attempt_id=?1 AND status IN ('launch_reserved','launch_ambiguous','recovery_required')
+    UNION SELECT 'a snapshot capture that has not finished' FROM freeze_intents
+     WHERE attempt_id=?1 AND state IN ('reserved','capturing','recovery_required')
+    UNION SELECT 'a session restart whose outcome is not recorded' FROM restart_candidates
+     WHERE attempt_id=?1 AND state IN ('admitting','pending_reconciliation')
+    UNION SELECT 'rework setup that needs recovery' FROM rework_intents
+     WHERE new_attempt_id=?1 AND state='recovery_required'
+    UNION SELECT 'rework setup that is still underway' FROM rework_intents
+     WHERE new_attempt_id=?1 AND state='materializing'";
+
+pub(crate) fn unsettled_effects(connection: &Connection, attempt_id: &str) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(UNSETTLED_EFFECTS)?;
+    let effects = statement
+        .query_map(params![attempt_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(effects)
+}
+
+/// Attempt processes that may run outside every unresolved process recovery record.
+const UNRECORDED_LIVE_PROCESSES: &str = "
+    SELECT 'an agent session that may be running' FROM sessions s
+      JOIN role_generations rg ON rg.id=s.role_generation_id
+     WHERE rg.attempt_id=?1
+       AND (s.status IN ('launch_reserved','running','interrupt_requested')
+         OR (s.status='recovery_required' AND NOT EXISTS(SELECT 1 FROM recovery_records r
+               WHERE r.attempt_id=?1 AND r.session_id=s.id AND r.state='attention_required')))
+    UNION SELECT 'a check that may be running' FROM check_runs cr
+     WHERE cr.attempt_id=?1
+       AND (cr.status IN ('launch_reserved','running','launch_ambiguous')
+         OR (cr.status='recovery_required' AND NOT EXISTS(SELECT 1 FROM recovery_records r
+               WHERE r.attempt_id=?1 AND r.state='attention_required'
+                 AND json_extract(r.detail_json,'$.check_id')=cr.id)))";
+
+/// A failed step carries no process proof, so cancelling through it needs every effect settled.
+fn require_settled_for_exact_cancel(
+    connection: &Connection,
+    attempt_id: &str,
+    failed_step: bool,
+) -> Result<()> {
+    let mut statement = connection.prepare(UNRECORDED_LIVE_PROCESSES)?;
+    let mut unsettled = statement
+        .query_map(params![attempt_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if failed_step {
+        unsettled.extend(unsettled_effects(connection, attempt_id)?);
+    }
+    if !unsettled.is_empty() {
+        bail!(
+            "cancelling now would release the task while it still has {}; use Cancel, which stops that work before releasing the task",
+            unsettled.join(", ")
+        )
+    }
+    Ok(())
+}
+
+/// Releases one failed automatic step so a later tick re-evaluates its attempt
+/// from current state. Nothing is repeated here and no other hold changes. A
+/// step that may have started an external effect stays held until every
+/// effect reservation of the attempt has an observed outcome.
+#[allow(clippy::too_many_arguments)]
+fn release_failed_step(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+    task_id: &str,
+    attempt_id: &str,
+    recovery_id: &str,
+    expected_version: i64,
+    evidence: &str,
+    now: &str,
+) -> Result<OperationResult> {
+    let effect: Option<String> = transaction
+        .query_row(
+            "SELECT json_extract(detail_json,'$.effect_certainty') FROM recovery_records
+             WHERE id=?1 AND attempt_id=?2 AND session_id IS NULL AND state='attention_required'
+               AND json_extract(detail_json,'$.kind')='coordinator_failure'",
+            params![recovery_id, attempt_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            anyhow!("only a failed automatic step can be released with retry_failed_step")
+        })?;
+    if effect.as_deref() != Some("none") {
+        let unsettled = unsettled_effects(transaction, attempt_id)?;
+        if !unsettled.is_empty() {
+            bail!(
+                "the failed step may have started an agent action, so it cannot be retried until these have a known outcome: {}",
+                unsettled.join(", ")
+            )
+        }
+    }
+    transaction.execute(
+        "UPDATE recovery_records SET state='resolved_retry',resolved_at=?1,updated_at=?1,
+                detail_json=json_set(detail_json,'$.resolution',json_object(
+                  'decision','retry_failed_step','operation_id',?2,'human_annotation',?3))
+         WHERE id=?4 AND state='attention_required'",
+        params![now, operation_id, evidence, recovery_id],
+    )?;
+    bump_task(transaction, task_id, expected_version, now)?;
+    Ok(result(
+        operation_id,
+        "attempt",
+        attempt_id.to_owned(),
+        Some(expected_version + 1),
+        "failed_step_released",
+    ))
 }
 
 fn requested_manager_revision(payload: &serde_json::Value) -> Result<i64> {
@@ -1425,15 +1557,25 @@ pub fn execute_with_runtime(
         ..
     } = command
     {
-        let (process_recovery, rework) = {
+        let (process_recovery, coordinator_failure, rework) = {
             let connection = store.lock()?;
-            let process_recovery = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE id=?1 AND attempt_id=?2 AND state='attention_required' AND (session_id IS NOT NULL OR json_extract(detail_json,'$.check_id') IS NOT NULL))",
-                params![recovery_id, attempt_id], |row| row.get::<_,bool>(0),
+            let (process_recovery, coordinator_failure) = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE id=?1 AND attempt_id=?2 AND state='attention_required' AND (session_id IS NOT NULL OR json_extract(detail_json,'$.check_id') IS NOT NULL)),
+                        EXISTS(SELECT 1 FROM recovery_records WHERE id=?1 AND attempt_id=?2 AND state='attention_required' AND json_extract(detail_json,'$.kind')='coordinator_failure')",
+                params![recovery_id, attempt_id], |row| Ok((row.get::<_,bool>(0)?, row.get::<_,bool>(1)?)),
             )?;
-            (process_recovery, rework_recovery(&connection, attempt_id)?)
+            (
+                process_recovery,
+                coordinator_failure,
+                rework_recovery(&connection, attempt_id)?,
+            )
         };
+        if coordinator_failure && decision == "confirm_quiescent" {
+            bail!("a failed automatic step owns no process to confirm; resolve it with retry_failed_step or cancel")
+        }
         if rework.is_some() && decision == "confirm_quiescent" {
+            None
+        } else if coordinator_failure && decision == "retry_failed_step" {
             None
         } else if decision == "cancel" && rework.is_some() {
             if session_id.is_some() {
@@ -2903,6 +3045,17 @@ pub fn execute_with_runtime(
             }
             let attempt: String = transaction.query_row("SELECT rg.attempt_id FROM role_generations rg JOIN attempts a ON a.id=rg.attempt_id WHERE rg.id=?1 AND a.task_id=?2 AND rg.role='manager' AND rg.status='running'", params![role_generation_id,task_id], |row| row.get(0))
                 .optional()?.ok_or_else(||anyhow!("guidance targets only the current running manager generation"))?;
+            let manager_session: Option<(String, Option<String>)> = transaction
+                .query_row(
+                    "SELECT provider,capability_identity_json FROM sessions
+                     WHERE role_generation_id=?1 AND status='running' ORDER BY created_at DESC LIMIT 1",
+                    params![role_generation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((provider, capability_identity)) = manager_session {
+                crate::roles::guidance_submission(&provider, capability_identity.as_deref(), body)?;
+            }
             transaction.execute("INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,reason,created_at) VALUES(?1,?2,?3,?4,'queued','awaiting_supported_idle_boundary',?5)",
                 params![uuid::Uuid::new_v4().to_string(), attempt, role_generation_id, body, now])?;
             bump_task(&transaction, task_id, *expected_version, &now)?;
@@ -3051,7 +3204,9 @@ pub fn execute_with_runtime(
             if evidence.trim().is_empty() || evidence.len() > 64 * 1024 {
                 bail!("bounded recovery evidence is required")
             }
-            let belongs:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1 AND task_id=?2 AND status IN ('needs_recovery','running'))",params![attempt_id,task_id],|row|row.get(0))?;
+            // Releasing a failed step changes no attempt status, so it does not
+            // need the attempt to be in a recovery status.
+            let belongs:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1 AND task_id=?2 AND (status IN ('needs_recovery','running') OR ?3))",params![attempt_id,task_id,decision == "retry_failed_step"],|row|row.get(0))?;
             if !belongs {
                 bail!("attempt is not awaiting recovery")
             }
@@ -3063,6 +3218,16 @@ pub fn execute_with_runtime(
                 bail!("failed rework recovery must retry materialization or cancel the rework lineage")
             }
             match decision.as_str() {
+                "retry_failed_step" => release_failed_step(
+                    &transaction,
+                    operation_id,
+                    task_id,
+                    attempt_id,
+                    recovery_id,
+                    *expected_version,
+                    evidence,
+                    &now,
+                )?,
                 "confirm_quiescent" => {
                     let verified = recovery_evidence
                         .as_ref()
@@ -3143,7 +3308,8 @@ pub fn execute_with_runtime(
                     if restore_hold_active {
                         transaction.execute("UPDATE claims SET state='cancelled',updated_at=?1 WHERE attempt_id=?2 AND state IN ('reserved','launching','running','unknown','stopping')",params![now,attempt_id])?;
                     }
-                    let remaining:i64=transaction.query_row("SELECT COUNT(*) FROM recovery_records WHERE attempt_id=?1 AND state='attention_required'",params![attempt_id],|row|row.get(0))?;
+                    // A coordinator failure holds through its own record, not the attempt status.
+                    let remaining:i64=transaction.query_row("SELECT COUNT(*) FROM recovery_records WHERE attempt_id=?1 AND state='attention_required' AND COALESCE(json_extract(detail_json,'$.kind'),'')!='coordinator_failure'",params![attempt_id],|row|row.get(0))?;
                     let return_to_validation_hold: bool = transaction.query_row(
                         "SELECT EXISTS(
                            SELECT 1 FROM sessions s
@@ -3291,8 +3457,15 @@ pub fn execute_with_runtime(
                                 bail!("attempt recovery ownership changed during verification")
                             }
                         }
+                        let failed_step: bool = transaction.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE id=?1
+                               AND json_extract(detail_json,'$.kind')='coordinator_failure')",
+                            params![recovery_id],
+                            |row| row.get(0),
+                        )?;
+                        require_settled_for_exact_cancel(&transaction, attempt_id, failed_step)?;
                         let verified_recovery = recovery_evidence.as_ref();
-                        transaction.execute("UPDATE role_credentials SET revoked_at=?1 WHERE role_generation_id IN (SELECT role_generation_id FROM sessions WHERE id IN (SELECT session_id FROM recovery_records WHERE attempt_id=?2 AND session_id IS NOT NULL)) AND revoked_at IS NULL",params![now,attempt_id])?;
+                        transaction.execute("UPDATE role_credentials SET revoked_at=?1 WHERE role_generation_id IN (SELECT id FROM role_generations WHERE attempt_id=?2) AND revoked_at IS NULL",params![now,attempt_id])?;
                         transaction.execute("UPDATE role_generations SET status='exited',updated_at=?1 WHERE id IN (SELECT role_generation_id FROM sessions WHERE id IN (SELECT session_id FROM recovery_records WHERE attempt_id=?2 AND session_id IS NOT NULL))",params![now,attempt_id])?;
                         transaction.execute("UPDATE sessions SET status='exited',readiness_state='unknown',exit_json=?1,updated_at=?2 WHERE id IN (SELECT session_id FROM recovery_records WHERE attempt_id=?3 AND session_id IS NOT NULL) AND status='recovery_required'",params![serde_json::json!({"process_group_quiescent":true,"source":"attempt_recovery_cancel_after_recorded_inventory","verification":verified_recovery}).to_string(),now,attempt_id])?;
                         transaction.execute("UPDATE check_runs SET status='reconciled_cancelled',finished_at=?1 WHERE id IN (SELECT json_extract(detail_json,'$.check_id') FROM recovery_records WHERE attempt_id=?2 AND session_id IS NULL)",params![now,attempt_id])?;
@@ -3335,7 +3508,7 @@ pub fn execute_with_runtime(
                     )
                 }
                 _ => bail!(
-                    "recovery decision must be confirm_quiescent, retry_materialization, or cancel"
+                    "recovery decision must be confirm_quiescent, retry_materialization, retry_failed_step, or cancel"
                 ),
             }
         }
@@ -4352,6 +4525,8 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             session["native_turn"] = serde_json::to_value(native_turn(&connection, &session_id)?)?;
             session["native_prompt"] =
                 serde_json::to_value(native_prompt(&connection, &session_id)?)?;
+            session["unaccepted_inputs"] =
+                serde_json::to_value(unaccepted_inputs(&connection, &session_id)?)?;
         }
     }
     let controls = json_rows_no_param(&connection, "SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,'kind',kind,'state',state,'payload',json(payload_json),'updated_at',updated_at) FROM controls WHERE state NOT IN ('finished','cancelled') ORDER BY created_at")?;
@@ -4411,6 +4586,20 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
            AND a.status='needs_recovery' AND t.attention='needs_recovery'
            AND t.lifecycle='in_progress' ORDER BY ri.updated_at DESC",
     )?);
+    for record in &mut recovery {
+        let detail = record.get("detail");
+        let possible_effects = json_text(record, "state") == Some("attention_required")
+            && detail.and_then(|detail| json_text(detail, "kind")) == Some("coordinator_failure")
+            && detail.and_then(|detail| json_text(detail, "effect_certainty")) != Some("none");
+        if !possible_effects {
+            continue;
+        }
+        let blocked_by = match json_text(record, "attempt_id") {
+            Some(attempt_id) => unsettled_effects(&connection, attempt_id)?,
+            None => Vec::new(),
+        };
+        record["retry_blocked_by"] = serde_json::json!(blocked_by);
+    }
     let history=json_rows_no_param(&connection,"SELECT json_object('id',id,'operation_id',operation_id,'actor_kind',actor_kind,'actor_id',actor_id,'event_code',event_code,'entity_kind',entity_kind,'entity_id',entity_id,'old_version',old_version,'new_version',new_version,'detail',json(detail_json),'created_at',created_at) FROM audit_events WHERE event_code IN ('session.resume.rejected','session.resume.fresh_route.reserved') OR rowid IN (SELECT rowid FROM audit_events ORDER BY created_at DESC LIMIT 500) ORDER BY created_at DESC")?;
     let process_observations = resource_observations(&connection)?;
     let capacity = capacity_status(&connection)?;
@@ -5487,6 +5676,63 @@ fn native_prompt(connection: &Connection, session_id: &str) -> Result<Option<Nat
     }))
 }
 
+/// How long after LLMRelay writes guidance or reserves a resumed turn the
+/// dashboard waits for a trusted acceptance before saying it is unconfirmed.
+/// It times presentation only; nothing is resent, submitted or relaunched.
+const ACCEPTANCE_OBSERVATION_SECONDS: i64 = 30;
+
+/// Guidance written into the session's current invocation and its current
+/// resumed invocation, when no trusted `UserPromptSubmit` of that invocation
+/// accepted them within the observation bound. A running process, later tool
+/// activity or a report is never taken as acceptance.
+fn unaccepted_inputs(connection: &Connection, session_id: &str) -> Result<Vec<UnacceptedInputDto>> {
+    let bound = format!("-{ACCEPTANCE_OBSERVATION_SECONDS} seconds");
+    let mut inputs = {
+        let mut statement = connection.prepare(
+            "SELECT g.id,g.written_at FROM guidance_messages g
+             JOIN sessions s ON s.id=g.delivery_session_id
+             WHERE s.id=?1 AND s.status='running' AND g.state='written_awaiting_submit'
+               AND g.delivery_transcript_epoch=s.transcript_epoch AND g.written_at IS NOT NULL
+               AND julianday(g.written_at)<=julianday('now',?2)
+             ORDER BY g.written_at,g.rowid",
+        )?;
+        let rows = statement
+            .query_map(params![session_id, bound], |row| {
+                Ok(UnacceptedInputDto {
+                    kind: UnacceptedInputKind::Guidance,
+                    id: row.get(0)?,
+                    since: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let resume = connection
+        .query_row(
+            &format!(
+                "WITH {CURRENT_TURN_HOOKS_SQL}
+                 SELECT ri.id,ri.created_at FROM invocation
+                 JOIN sessions s ON s.id=invocation.id
+                 JOIN resume_invocations ri ON ri.session_id=s.id
+                   AND ri.transcript_epoch=s.transcript_epoch
+                 WHERE invocation.status='running' AND ri.state='running'
+                   AND NOT EXISTS(SELECT 1 FROM accepted)
+                   AND julianday(ri.created_at)<=julianday('now',?2)"
+            ),
+            params![session_id, bound],
+            |row| {
+                Ok(UnacceptedInputDto {
+                    kind: UnacceptedInputKind::Resume,
+                    id: row.get(0)?,
+                    since: row.get(1)?,
+                })
+            },
+        )
+        .optional()?;
+    inputs.extend(resume);
+    Ok(inputs)
+}
+
 const TASK_CONTENT_RECORD_LIMIT: usize = 50;
 const TASK_CONTENT_BYTE_LIMIT: usize = 512 * 1024;
 
@@ -5595,6 +5841,22 @@ pub fn task_content(store: &Store, task_id: &str) -> Result<serde_json::Value> {
         "records":kept,
         "truncated":truncated,
     }))
+}
+
+/// What happened to a held automatic step and what the user can do next.
+fn failed_step_reason(detail: &serde_json::Value, blocked_by: &[serde_json::Value]) -> String {
+    if json_text(detail, "effect_certainty") == Some("none") {
+        return "An automatic step for this task failed before it could start any agent action, so LLMRelay stopped advancing the task. Describe what you checked, then choose Retry step to let LLMRelay re-check the task, or Cancel task.".into();
+    }
+    if blocked_by.is_empty() {
+        return "An automatic step for this task failed after it may have started an agent action. Every action LLMRelay recorded for this task now has a known outcome, so Retry step re-checks the task from its current state without repeating what already happened. Refresh and review the task first, then describe what you checked and choose Retry step, or Cancel task.".into();
+    }
+    let open = blocked_by
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("An automatic step for this task failed after it may have started an agent action, and LLMRelay does not yet know the outcome of: {open}. Resolve those items first; Retry step stays unavailable until then.")
 }
 
 /// Plain next step for an uncertain workspace reservation. A workspace always
@@ -5900,6 +6162,28 @@ fn continuation_actions(
                     None,
                 ));
             }
+        } else if kind == Some("coordinator_failure") {
+            let blocked_by = record
+                .get("retry_blocked_by")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut binding = binding;
+            binding["decisions"] = serde_json::json!(["retry_failed_step", "cancel"]);
+            binding["retry_enabled"] = serde_json::json!(blocked_by.is_empty());
+            binding["retry_blocked_by"] = serde_json::json!(blocked_by);
+            actions.push(continuation(
+                ContinuationActionKind::RecoverFailedStep,
+                true,
+                failed_step_reason(&detail, &blocked_by),
+                "human",
+                None,
+                record.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
+                None,
+                "resolve_recovery",
+                binding,
+                Some("Retry step only lets LLMRelay evaluate the task again from its current state; it never repeats a step whose outcome is unknown."),
+            ));
         } else {
             let exact_process_or_check = record
                 .get("session_id")
@@ -6656,6 +6940,7 @@ impl AttentionSources<'_> {
         items.extend(self.recovery_items());
         items.extend(self.native_turn_failure_items());
         items.extend(self.native_prompt_items());
+        items.extend(self.unaccepted_input_items());
         items.extend(self.setup_items());
         items.extend(self.continuation_items());
         let task_items = self
@@ -7247,6 +7532,8 @@ impl AttentionSources<'_> {
             let attempt_id = json_text(session, "attempt_id")?;
             let task = self.task_with_active_attempt(attempt_id)?;
             let role = json_text(session, "role").and_then(|role| role.parse::<RoleKind>().ok());
+            let (cause, next_step) =
+                native_turn_failure_explanation(json_text(failure, "kind").unwrap_or("unknown"));
             Some(AttentionItem {
                 id: format!("native_turn_failure:{hook_event_id}"),
                 category: AttentionCategory::Blocked,
@@ -7255,8 +7542,7 @@ impl AttentionSources<'_> {
                     role.map_or("The agent", RoleKind::label)
                 ),
                 reason: format!(
-                    "The provider ended the agent's turn ({}). The session is still open, and nothing was retried or switched to another model. Open agent output to see the error and choose the next step.",
-                    native_turn_failure_reason(json_text(failure, "kind").unwrap_or("unknown"))
+                    "The provider ended the agent's turn ({cause}). The session is still open, and nothing was retried or switched to another model. {next_step}"
                 ),
                 task_title: Some(task.title.clone()),
                 role,
@@ -7326,6 +7612,78 @@ impl AttentionSources<'_> {
                 details: None,
             })
         })
+    }
+
+    /// One item per unaccepted input of a still-open session of a task's
+    /// current attempt, kept under the exact guidance or resume invocation. It
+    /// only routes to agent output and says nothing about whether the agent is
+    /// working.
+    fn unaccepted_input_items(&self) -> Vec<AttentionItem> {
+        let mut items = Vec::new();
+        for session in self.sessions {
+            if json_text(session, "status") != Some("running") {
+                continue;
+            }
+            let Some(inputs) = session
+                .get("unaccepted_inputs")
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            let (Some(session_id), Some(role_generation_id), Some(attempt_id)) = (
+                json_text(session, "id"),
+                json_text(session, "role_generation_id"),
+                json_text(session, "attempt_id"),
+            ) else {
+                continue;
+            };
+            let Some(task) = self.task_with_active_attempt(attempt_id) else {
+                continue;
+            };
+            let role = json_text(session, "role").and_then(|role| role.parse::<RoleKind>().ok());
+            let who = role.map_or("The agent", RoleKind::label);
+            for input in inputs {
+                let Ok(input) = serde_json::from_value::<UnacceptedInputDto>(input.clone()) else {
+                    continue;
+                };
+                let (prefix, title, reason, sent) = match input.kind {
+                    UnacceptedInputKind::Guidance => (
+                        "guidance_unaccepted",
+                        format!("{who} has not confirmed your guidance yet"),
+                        "LLMRelay typed the guidance into the agent's terminal and pressed Enter once, but the agent has not reported receiving it. This does not mean the agent is stuck. Open agent output to check whether the text is still in its input box; LLMRelay will not press Enter again or resend it.",
+                        "Guidance written",
+                    ),
+                    UnacceptedInputKind::Resume => (
+                        "resume_unaccepted",
+                        format!("{who} has not confirmed its resumed instructions yet"),
+                        "LLMRelay resumed this agent session with its instructions, but the agent has not reported receiving them. This does not mean the agent is stuck. Open agent output to see what it shows; LLMRelay will not restart it or send the instructions again.",
+                        "Resume reserved",
+                    ),
+                };
+                items.push(AttentionItem {
+                    id: format!("{prefix}:{}", input.id),
+                    category: AttentionCategory::Blocked,
+                    title,
+                    reason: reason.into(),
+                    task_title: Some(task.title.clone()),
+                    role,
+                    action: AttentionActionKind::OpenAgentOutput.into(),
+                    target: Some(AttentionTarget::Session {
+                        project_id: task.project_id.clone(),
+                        task_id: task.id.clone(),
+                        attempt_id: attempt_id.to_owned(),
+                        session_id: session_id.to_owned(),
+                        role_generation_id: role_generation_id.to_owned(),
+                    }),
+                    held_tasks: Vec::new(),
+                    details: Some(format!(
+                        "{sent} at {}; no acceptance from the agent was recorded within {ACCEPTANCE_OBSERVATION_SECONDS} seconds.",
+                        input.since
+                    )),
+                });
+            }
+        }
+        items
     }
 
     fn task(&self, task_id: &str) -> Option<&TaskDto> {
@@ -7411,6 +7769,7 @@ fn recovery_title(kind: &str, role: Option<RoleKind>) -> String {
         "database_restore_claim" | "database_restore_freeze" => {
             "Restored work needs your confirmation".into()
         }
+        "coordinator_failure" => "An automatic step failed".into(),
         _ => format!(
             "Confirm that {} has stopped",
             role_name(role).to_lowercase()
@@ -7483,6 +7842,7 @@ fn continuation_category(kind: &ContinuationActionKind) -> AttentionCategory {
         | ContinuationActionKind::ReplaceStaleAuthority
         | ContinuationActionKind::WaitForExit
         | ContinuationActionKind::RecoverOwnership
+        | ContinuationActionKind::RecoverFailedStep
         | ContinuationActionKind::RetryGracefulStop
         | ContinuationActionKind::ForceStopExactProcess
         | ContinuationActionKind::RecoverSetupApply
@@ -7507,6 +7867,7 @@ fn continuation_title(kind: &ContinuationActionKind, role: Option<RoleKind>) -> 
         ContinuationActionKind::RecoverOwnership => {
             format!("Confirm that {} has stopped", who.to_lowercase())
         }
+        ContinuationActionKind::RecoverFailedStep => "An automatic step failed".into(),
         ContinuationActionKind::RetryGracefulStop
         | ContinuationActionKind::ForceStopExactProcess => {
             format!("{who} did not stop in time")
@@ -7580,20 +7941,43 @@ fn active_attempt_id(task: &TaskDto) -> Option<&str> {
         .and_then(|attempt| json_text(attempt, "id"))
 }
 
-fn native_turn_failure_reason(kind: &str) -> &'static str {
+fn native_turn_failure_explanation(kind: &str) -> (&'static str, &'static str) {
+    const CONTINUE_LATER: &str = "Continue the agent from its output once the provider recovers.";
     match kind {
-        "rate_limit" => "the provider's rate limit was reached",
-        "overloaded" => "the model was overloaded",
-        "server_error" => "the provider's service returned an error",
-        "billing_error" => "the account's usage limit was reached",
-        "authentication_failed" | "oauth_org_not_allowed" | "cloud_credential_error" => {
-            "the provider could not authenticate the session"
-        }
-        "account_on_hold" | "verification_required" => "the provider account needs attention",
-        "invalid_request" => "the provider rejected the request",
-        "model_not_found" => "the selected model is unavailable",
-        "max_output_tokens" => "the response reached its output limit",
-        _ => "the provider did not say why",
+        "rate_limit" => (
+            "the provider's rate limit was reached",
+            "When the limit resets, continue the agent from its output.",
+        ),
+        "overloaded" => ("the model was overloaded", CONTINUE_LATER),
+        "server_error" => ("the provider's service returned an error", CONTINUE_LATER),
+        "billing_error" => (
+            "the account's usage limit was reached",
+            "Check the provider account's usage or billing, then continue the agent from its output.",
+        ),
+        "authentication_failed" | "oauth_org_not_allowed" | "cloud_credential_error" => (
+            "the provider could not authenticate the session",
+            "Sign this computer in to the provider again, then continue the agent from its output.",
+        ),
+        "account_on_hold" | "verification_required" => (
+            "the provider account needs attention",
+            "Resolve the account with the provider, then continue the agent from its output.",
+        ),
+        "invalid_request" => (
+            "the provider rejected the request",
+            "Open agent output to see what the provider rejected before continuing.",
+        ),
+        "model_not_found" => (
+            "the selected model is unavailable",
+            "Choose an available model for this role before continuing.",
+        ),
+        "max_output_tokens" => (
+            "the response reached its output limit",
+            "Ask the agent to continue from its output.",
+        ),
+        _ => (
+            "the provider did not say why",
+            "Open agent output to see the error and choose the next step.",
+        ),
     }
 }
 
@@ -7695,7 +8079,7 @@ fn resource_observations(connection: &rusqlite::Connection) -> Result<Vec<serde_
             live.insert(pid, (rss, cpu, fields[3..8].join(" ")));
         }
     }
-    Ok(recorded.into_iter().map(|(session,pid,start,last)|match live.get(&pid){Some((rss,cpu,observed))if observed==&start=>serde_json::json!({"session_id":session,"pid":pid,"native_start_marker":start,"state":"observed","rss_bytes":rss*1024,"cpu_percent":cpu,"observed_at":Utc::now().to_rfc3339()}),Some(_)=>serde_json::json!({"session_id":session,"pid":pid,"native_start_marker":start,"state":"stale_pid_reused","last_identity_observed_at":last}),None=>serde_json::json!({"session_id":session,"pid":pid,"native_start_marker":start,"state":"stale_absent","last_identity_observed_at":last})}).collect())
+    Ok(recorded.into_iter().map(|(session,pid,start,last)|match live.get(&pid){Some((rss,cpu,observed))if crate::domain::same_process_start(observed,&start)=>serde_json::json!({"session_id":session,"pid":pid,"native_start_marker":start,"state":"observed","rss_bytes":rss*1024,"cpu_percent":cpu,"observed_at":Utc::now().to_rfc3339()}),Some(_)=>serde_json::json!({"session_id":session,"pid":pid,"native_start_marker":start,"state":"stale_pid_reused","last_identity_observed_at":last}),None=>serde_json::json!({"session_id":session,"pid":pid,"native_start_marker":start,"state":"stale_absent","last_identity_observed_at":last})}).collect())
 }
 
 pub(crate) fn insert_task_rows(

@@ -40,6 +40,7 @@ const MAX_STATE_WAITERS: usize = 64;
 const MAX_INCARNATION_BYTES: usize = 128;
 const DEFAULT_STATE_WAIT_MILLIS: u64 = 25_000;
 const STATE_WAIT_MILLIS: RangeInclusive<u64> = 1_000..=25_000;
+const MAX_SESSION_COOKIE_VALUE_BYTES: usize = 256;
 
 #[derive(Clone)]
 struct WebState {
@@ -47,10 +48,18 @@ struct WebState {
     instance_id: String,
     boot_id: String,
     allowed_hosts: Vec<String>,
+    session_cookie: String,
     bootstrap_hash: Arc<Mutex<Option<String>>>,
     browser_sessions: Arc<Mutex<HashSet<String>>>,
     shutdown: watch::Receiver<bool>,
     state_waiters: Arc<Semaphore>,
+}
+
+/// Browsers scope cookies by host but not port, so each data directory names
+/// its own session cookie; the canonical root is stable and not secret.
+fn browser_session_cookie_name(data_dir: &std::path::Path) -> String {
+    let digest = hex::encode(Sha256::digest(data_dir.as_os_str().as_encoded_bytes()));
+    format!("agenticjira_session_{}", &digest[..20])
 }
 
 /// Snapshot served by both `/api/state` and state waits. `incarnation` is the
@@ -378,6 +387,7 @@ pub async fn serve(paths: InstancePaths, requested_port: u16, open_browser: bool
             format!("127.0.0.1:{}", bound.port()),
             format!("localhost:{}", bound.port()),
         ],
+        session_cookie: browser_session_cookie_name(&paths.root),
         bootstrap_hash: Arc::new(Mutex::new(Some(crate::auth::hash_secret(&bootstrap)))),
         browser_sessions: Arc::new(Mutex::new(HashSet::new())),
         shutdown: shutdown_rx.clone(),
@@ -520,7 +530,8 @@ pub async fn serve(paths: InstancePaths, requested_port: u16, open_browser: bool
             match signal_app.begin_drain() {
                 Ok(status) if status.get("active").and_then(|value|value.as_array()).is_some_and(Vec::is_empty)
                     && status.get("active_checks").and_then(|value|value.as_array()).is_some_and(Vec::is_empty)
-                    && status.get("unknown").and_then(|value|value.as_array()).is_some_and(Vec::is_empty)=>{let _=signal_shutdown.send(true);break}
+                    && status.get("unknown").and_then(|value|value.as_array()).is_some_and(Vec::is_empty)
+                    && status["process_inventory"]["state"]=="observed"=>{let _=signal_shutdown.send(true);break}
                 Ok(status)=>eprintln!("LLMRelay is draining managed work before shutdown: {status}"),
                 Err(error)=>eprintln!("LLMRelay kept running because process ownership could not be reconciled: {error:#}"),
             }
@@ -740,9 +751,12 @@ async fn bootstrap_session(
     let mut response = Json(serde_json::json!({"authenticated": true})).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        format!("agenticjira_session={session}; HttpOnly; SameSite=Strict; Path=/")
-            .parse()
-            .unwrap(),
+        format!(
+            "{}={session}; HttpOnly; SameSite=Strict; Path=/",
+            state.session_cookie
+        )
+        .parse()
+        .unwrap(),
     );
     response
 }
@@ -1401,15 +1415,7 @@ fn check_origin(
 }
 
 fn has_browser_session(state: &WebState, headers: &HeaderMap) -> bool {
-    let cookie = headers
-        .get(header::COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    let Some(value) = cookie
-        .split(';')
-        .map(str::trim)
-        .find_map(|part| part.strip_prefix("agenticjira_session="))
-    else {
+    let Some(value) = instance_session_cookie(&state.session_cookie, headers) else {
         return false;
     };
     let hash = hex::encode(Sha256::digest(value.as_bytes()));
@@ -1418,6 +1424,35 @@ fn has_browser_session(state: &WebState, headers: &HeaderMap) -> bool {
         .lock()
         .map(|sessions| sessions.contains(&hash))
         .unwrap_or(false)
+}
+
+/// The one value of this instance's cookie. An unreadable Cookie header or a
+/// repeated or malformed instance cookie authenticates nothing, because the
+/// browser's choice among them cannot be known.
+fn instance_session_cookie<'a>(name: &str, headers: &'a HeaderMap) -> Option<&'a str> {
+    let mut found = None;
+    for header in headers.get_all(header::COOKIE) {
+        for pair in header.to_str().ok()?.split(';') {
+            let Some((cookie, value)) = pair.trim().split_once('=') else {
+                continue;
+            };
+            if cookie != name {
+                continue;
+            }
+            if found.is_some() || !is_cookie_value(value) {
+                return None;
+            }
+            found = Some(value);
+        }
+    }
+    found
+}
+
+/// RFC 6265 cookie-octets without quoting, within a fixed bound.
+fn is_cookie_value(value: &str) -> bool {
+    let cookie_octet =
+        |byte: u8| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e);
+    (1..=MAX_SESSION_COOKIE_VALUE_BYTES).contains(&value.len()) && value.bytes().all(cookie_octet)
 }
 
 fn append_startup_event(paths: &InstancePaths, record: &InstanceRecord) -> Result<()> {
@@ -1567,6 +1602,7 @@ mod web_operation_tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let state = WebState {
             boot_id: app.service_boot_id().to_owned(),
+            session_cookie: browser_session_cookie_name(&app.paths.root),
             app,
             instance_id: "server-boundary-instance".to_owned(),
             allowed_hosts: vec!["server-boundary.test".to_owned()],
@@ -1582,7 +1618,7 @@ mod web_operation_tests {
         );
         headers.insert(
             header::COOKIE,
-            HeaderValue::from_static("agenticjira_session=server-boundary-browser-session"),
+            HeaderValue::from_str(&format!("{}={browser_secret}", state.session_cookie)).unwrap(),
         );
         (state, headers, shutdown_tx)
     }
@@ -1677,7 +1713,8 @@ mod web_operation_tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (root, app, _, _) = server_test_application();
-        let (state, _, _) = browser_state(app);
+        let (state, headers, _) = browser_state(app);
+        let cookie = headers[header::COOKIE].to_str().unwrap().to_owned();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server =
@@ -1695,7 +1732,7 @@ mod web_operation_tests {
         ] {
             let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
             let request = format!(
-                "{method} {path} HTTP/1.1\r\nHost: server-boundary.test\r\nCookie: agenticjira_session=server-boundary-browser-session\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{{"
+                "{method} {path} HTTP/1.1\r\nHost: server-boundary.test\r\nCookie: {cookie}\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{{"
             );
             stream.write_all(request.as_bytes()).await.unwrap();
             let mut response = Vec::new();
@@ -1706,6 +1743,98 @@ mod web_operation_tests {
         }
         server.abort();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn browser_sessions_authenticate_only_their_own_instance_cookie() {
+        let (first_root, first_app, _, _) = server_test_application();
+        let (second_root, second_app, _, _) = server_test_application();
+        let (first, mut anonymous, _) = browser_state(first_app);
+        let (second, _, _) = browser_state(second_app);
+        anonymous.remove(header::COOKIE);
+        assert_ne!(first.session_cookie, second.session_cookie);
+        for state in [&first, &second] {
+            assert!(state.session_cookie.starts_with("agenticjira_session_"));
+            assert_eq!(
+                state.session_cookie.len(),
+                "agenticjira_session_".len() + 20
+            );
+        }
+        let bootstrap = |state: WebState| {
+            let anonymous = anonymous.clone();
+            async move {
+                let token = crate::auth::issue_secret();
+                *state.bootstrap_hash.lock().unwrap() = Some(crate::auth::hash_secret(&token));
+                let response =
+                    bootstrap_session(State(state), anonymous, Json(BootstrapRequest { token }))
+                        .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                response.headers()[header::SET_COOKIE]
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            }
+        };
+        let first_set = bootstrap(first.clone()).await;
+        let second_set = bootstrap(second.clone()).await;
+        let (first_cookie, attributes) = first_set.split_once("; ").unwrap();
+        assert_eq!(attributes, "HttpOnly; SameSite=Strict; Path=/");
+        let (name, secret) = first_cookie.split_once('=').unwrap();
+        assert_eq!(name, first.session_cookie);
+        let (second_cookie, _) = second_set.split_once("; ").unwrap();
+        assert!(second_cookie.starts_with(&format!("{}=", second.session_cookie)));
+        let presenting = |cookies: &[String]| {
+            let mut headers = anonymous.clone();
+            for cookie in cookies {
+                headers.append(header::COOKIE, HeaderValue::from_str(cookie).unwrap());
+            }
+            headers
+        };
+        let both = presenting(&[format!("{first_cookie}; {second_cookie}")]);
+        assert!(has_browser_session(&first, &both));
+        assert!(has_browser_session(&second, &both));
+        assert!(has_browser_session(
+            &first,
+            &presenting(&[format!("theme=dark; {first_cookie}")])
+        ));
+        for refused in [
+            vec![first_cookie.to_owned()],
+            vec![format!("{}={secret}", second.session_cookie)],
+            vec![format!("agenticjira_session={secret}")],
+        ] {
+            assert!(
+                !has_browser_session(&second, &presenting(&refused)),
+                "{refused:?}"
+            );
+        }
+        assert!(!has_browser_session(
+            &first,
+            &presenting(&[format!("agenticjira_session={secret}")])
+        ));
+        for refused in [
+            vec![format!("{first_cookie}; {first_cookie}")],
+            vec![first_cookie.to_owned(), first_cookie.to_owned()],
+            vec![format!("{first_cookie}; {name}=other")],
+            vec![format!("{name}=")],
+            vec![format!("{name}=\"{secret}\"")],
+            vec![format!(
+                "{name}={}",
+                "a".repeat(MAX_SESSION_COOKIE_VALUE_BYTES + 1)
+            )],
+        ] {
+            assert!(
+                !has_browser_session(&first, &presenting(&refused)),
+                "{refused:?}"
+            );
+        }
+        let mut unreadable = presenting(&[first_cookie.to_owned()]);
+        unreadable.append(
+            header::COOKIE,
+            HeaderValue::from_bytes(b"theme=\xff").unwrap(),
+        );
+        assert!(!has_browser_session(&first, &unreadable));
+        let _ = std::fs::remove_dir_all(first_root);
+        let _ = std::fs::remove_dir_all(second_root);
     }
 
     async fn invoke_operation(

@@ -32,10 +32,25 @@ Before calling any coding task complete, verify the delivered work against the u
   then use a local watcher to call `codex queue --thread <manager-session-UUID>
   --message <completion-reference>` once. Bind the exact task/generation and
   result paths; never infer success from a wake-up message.
-- The current project-local operational helper is
-  `.local/trip-explorer/completion-wakeup/notify.py`. It is local tooling, not
-  shipped application code. Use a unique receipt per invocation, explicit parent
-  thread UUID, and the real Codex executable. Keep its `.wake.json` delivery record.
+- Use the shared helper `/Users/murali/.codex/bin/codex-completion-wakeup.py`
+  after reading `/Users/murali/.codex/COMPLETION_WAKEUPS.md`. The older
+  `.local/trip-explorer/completion-wakeup/notify.py` is retained local tooling,
+  not the default launcher. Neither helper is shipped application code. Use a
+  unique receipt per invocation, explicit parent thread UUID, and the real Codex
+  executable. Keep its `.wake.json` delivery record.
+- A watcher's `watching` state proves only that receipt monitoring started;
+  it does not prove that `codex queue` can deliver. Detachment does not broaden
+  the launch environment's permissions. Queue submission needs write access to
+  Codex's local state database outside this repository. A previous
+  `attempt to write a readonly database` delivery failure rules out relying on
+  another watcher launched in the same sandbox. For a new job, use an approved,
+  narrowly scoped helper launch outside that sandbox, or use a supported direct
+  completion wait. Never bypass permissions or edit the queue database directly.
+- Read the latest relevant delivery record before reusing a notification route.
+  Do not equate an armed watcher with verified delivery or promise automatic
+  resumption while queue access is unresolved. A failed or ambiguous submission
+  is not authorization to resend the old notification, restart the worker, or
+  repeat completed work; recover its saved result once and record it as handled.
 - Do independent useful work while waiting. Once exhausted, leave only safely
   detached work running and yield; the completion message should resume the
   manager. Do not promise automatic resumption until the notification path has

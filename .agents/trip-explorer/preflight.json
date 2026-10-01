@@ -1,54 +1,15 @@
 {
-  "observed_at": "2026-09-30T18:20:40.140097+00:00",
+  "observed_at": "2026-10-01T03:45:24.130753+00:00",
   "receipts": [
-    {
-      "adapter": "direct-codex-cli",
-      "authority": "read-only",
-      "authority_evidence": "CLI sandbox read-only enforced on initial and explicit resume configuration; no writes requested.",
-      "effort": "medium",
-      "model": "gpt-5.6-sol",
-      "model_evidence": "Codex 0.159.0 ordinary console header exposed gpt-5.6-sol, medium, read-only; invocation completed without fallback.",
-      "native_session_id": "01a0f388-7536-79d3-a226-b9028599aaf1",
-      "nonce": "PREFLIGHT_SOL_20260930_7cf19",
-      "nonce_matched": true,
-      "profile_ids": [
-        "codex-sol-read-retained",
-        "claude-fable-read-retained"
-      ],
-      "provider": "codex",
-      "result": "pass",
-      "service_tier": null,
-      "session": "retained",
-      "session_evidence": "Explicit native UUID resume completed successfully."
-    },
-    {
-      "adapter": "direct-codex-cli",
-      "authority": "read-only",
-      "authority_evidence": "CLI sandbox read-only enforced on initial and explicit resume configuration; no writes requested.",
-      "effort": "medium",
-      "model": "gpt-5.6-sol",
-      "model_evidence": "Codex 0.159.0 ordinary console header exposed gpt-5.6-sol, medium, read-only; invocation completed without fallback.",
-      "native_session_id": "01a0f389-d1b7-70c1-9bb4-1d6297acedb7",
-      "nonce": "PREFLIGHT_FRESH_20260930_61be2",
-      "nonce_matched": true,
-      "profile_ids": [
-        "claude-fable-read-fresh"
-      ],
-      "provider": "codex",
-      "result": "pass",
-      "service_tier": null,
-      "session": "fresh",
-      "session_evidence": "Independent initial invocation, no resume identity."
-    },
     {
       "adapter": "direct-claude-cli",
       "authority": "workspace-write",
-      "authority_evidence": "Retained native session resumed; allowed Write created only isolated claude-write-probe.txt with exact PREFLIGHT_WRITE_93a84, independently checked.",
-      "effort": "high",
+      "authority_evidence": "Restricted Read/Write-only preflight; resumed Write created only task-local nonce probe, independently verified. No production writes. Existing workspace-write adapter unchanged.",
+      "effort": "max",
       "model": "claude-opus-5-5",
-      "model_evidence": "Claude 2.1.285 accepted exact claude-opus-5-5/high; returned model identity claude-opus-5-5. Provider-exposed identity only.",
-      "native_session_id": "4e52e98a-3d90-48aa-bcac-7b40f530988d",
-      "nonce": "PREFLIGHT_CLAUDE_20260930_93a84",
+      "model_evidence": "Claude Code 2.1.286, explicit claude-opus-5-5 with --effort max; initial and resumed successful API result modelUsage canonicalModel claude-opus-5-5, no fallback model. Provider-exposed identity only.",
+      "native_session_id": "7c65b0f7-0ca4-49b6-b6bf-4fbbfe77a481",
+      "nonce": "PREFLIGHT_OPUS_MAX_20261001_69c7",
       "nonce_matched": true,
       "profile_ids": [
         "codex-terra-write-retained"
@@ -57,7 +18,83 @@
       "result": "pass",
       "service_tier": null,
       "session": "retained",
-      "session_evidence": "Explicit native UUID resume completed successfully."
+      "session_evidence": "Explicit native UUID resume recalled initial nonce and completed isolated write. Results under .local/trip-explorer/hardening_20261001/preflight/."
+    },
+    {
+      "adapter": "direct-codex-cli",
+      "authority": "read-only",
+      "authority_evidence": "Codex read-only sandbox configured on initial launch and explicit resume.",
+      "effort": "high",
+      "model": "gpt-6-astra",
+      "model_evidence": "Codex0.159.2 ordinary console header matched gpt-6-astra/high/read-only; initial and explicit resume returned exact retained nonce. No fallback configured.",
+      "native_session_id": "01a0f58e-3e66-7f12-bf71-686bc298e25f",
+      "nonce": "PREFLIGHT_ASTRA_HIGH_20261001_c44a",
+      "nonce_matched": true,
+      "profile_ids": [
+        "session-astra-high-read"
+      ],
+      "provider": "codex",
+      "result": "pass",
+      "service_tier": null,
+      "session": "retained",
+      "session_evidence": "Explicit UUID resume returned retained nonce."
+    },
+    {
+      "adapter": "direct-claude-cli",
+      "authority": "read-only",
+      "authority_evidence": "Restricted safe-mode tool allowlist Read/Grep/Glob only, no Bash/Edit/Write/Agent or MCP. Matching enforcement applied to role runner.",
+      "effort": "high",
+      "model": "claude-fable-5-1",
+      "model_evidence": "Claude2.1.286 successful result modelUsage canonicalModel claude-fable-5-1; explicit --effort high; no fallback configured. Provider-exposed identity only.",
+      "native_session_id": "8aeb671c-fbe9-43a3-b274-1a04cc95d4d1",
+      "nonce": "PREFLIGHT_FABLE_HIGH_20261001_912b",
+      "nonce_matched": true,
+      "profile_ids": [
+        "session-fable-high-read"
+      ],
+      "provider": "claude",
+      "result": "pass",
+      "service_tier": null,
+      "session": "retained",
+      "session_evidence": "Explicit UUID resume returned retained nonce."
+    },
+    {
+      "adapter": "direct-codex-cli",
+      "authority": "read-only",
+      "authority_evidence": "Codex read-only sandbox configured on initial launch and explicit resume.",
+      "effort": "xhigh",
+      "model": "gpt-6.1-sol",
+      "model_evidence": "Codex0.159.2 ordinary console header matched gpt-6.1-sol/xhigh/read-only; initial and explicit resume returned exact retained nonce. No fallback configured.",
+      "native_session_id": "01a0f58e-c3fd-7402-8264-6d5d98d3de80",
+      "nonce": "PREFLIGHT_SOL61_XHIGH_20261001_422b",
+      "nonce_matched": true,
+      "profile_ids": [
+        "session-sol61-xhigh-read"
+      ],
+      "provider": "codex",
+      "result": "pass",
+      "service_tier": null,
+      "session": "retained",
+      "session_evidence": "Explicit UUID resume returned retained nonce."
+    },
+    {
+      "adapter": "direct-claude-cli",
+      "authority": "read-only",
+      "authority_evidence": "Restricted safe-mode tool allowlist Read/Grep/Glob only, no Bash/Edit/Write/Agent or MCP. Matching enforcement applied to role runner.",
+      "effort": "medium",
+      "model": "claude-fable-5-1",
+      "model_evidence": "Claude2.1.286 successful result modelUsage canonicalModel claude-fable-5-1; explicit --effort medium; no fallback configured. Provider-exposed identity only.",
+      "native_session_id": "c00f211f-73db-485b-b6e6-d89d2f9ee39e",
+      "nonce": "PREFLIGHT_FABLE_MEDIUM_20261001_280a",
+      "nonce_matched": true,
+      "profile_ids": [
+        "session-fable-medium-fresh"
+      ],
+      "provider": "claude",
+      "result": "pass",
+      "service_tier": null,
+      "session": "fresh",
+      "session_evidence": "Independent fresh native session; no resume."
     }
   ]
 }

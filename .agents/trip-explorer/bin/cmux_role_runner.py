@@ -96,7 +96,7 @@ def claude_command(executable: str, prompt: str, profile: dict[str, object], ses
     if profile.get("effort"):
         command.extend(("--effort", str(profile["effort"])))
     if profile["authority"] == "read-only":
-        command.extend(("--safe-mode", "--permission-mode", "dontAsk", "--allowedTools", *allowed, "--disallowedTools", "Edit", "Write", "NotebookEdit"))
+        command.extend(("--safe-mode", "--restricted", "--strict-mcp-config", "--tools", "Read,Grep,Glob", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--allowedTools", "Read,Grep,Glob"))
     else:
         command.extend(("--permission-mode", "dontAsk", "--allowedTools", *allowed, "Edit", "Write"))
     command.extend(("--resume" if resume else "--session-id", session_id))

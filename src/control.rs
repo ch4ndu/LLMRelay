@@ -920,12 +920,9 @@ fn dispatch(
     connection: &mut ConnectionState,
 ) -> Result<ControlResponse> {
     match request {
-        ControlRequest::Status => {
-            app.supervisor.reconcile()?;
-            ControlResponse::success(
-                serde_json::json!({"instance": instance, "sessions": app.store.list_sessions()?,"coordinator":app.drain_status()?}),
-            )
-        }
+        ControlRequest::Status => ControlResponse::success(
+            serde_json::json!({"instance": instance, "sessions": app.store.list_sessions()?,"coordinator":app.drain_status()?}),
+        ),
         ControlRequest::RestartPreview => ControlResponse::success(app.restart_preview()?),
         ControlRequest::Stop { drain } => {
             if drain {
@@ -941,7 +938,8 @@ fn dispatch(
                     && status
                         .get("unknown")
                         .and_then(|value| value.as_array())
-                        .is_some_and(Vec::is_empty);
+                        .is_some_and(Vec::is_empty)
+                    && status["process_inventory"]["state"] == "observed";
                 if quiescent {
                     signal_shutdown(shutdown)?;
                 }

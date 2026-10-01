@@ -6,6 +6,14 @@ This guide describes the implemented native CLI permission boundaries. Setup and
 
 ## Recovery and decision authority
 
+Each service data directory uses its own browser-session cookie name, derived
+from its canonical instance path. Two services on the same hostname can therefore
+keep independent logins even though browser cookies do not distinguish ports.
+The name is not a secret or an authorization token: its value is still checked
+against that service's boot-specific session secret. The old generic cookie and
+another instance's cookie do not authenticate the service. Host and Origin
+validation, HttpOnly, SameSite and cookie-path restrictions remain required.
+
 Dashboard state waits use the same browser cookie, Host and Origin checks as
 ordinary state reads. Their service-identity/revision cursor is presentation
 metadata, not approval or execution authority. Responses use the existing
@@ -23,6 +31,14 @@ provider work, then revalidates each admission. A timer cannot reset ownership,
 human approvals, consumed membership, failure limits or uncertain delivery.
 Preview reads do not reconcile processes or change saved authority, and unknown
 environment evidence is never reported as proof of safety.
+
+A failed automatic step has a separate, attempt-bound recovery record with no
+session identity. Confirming a process has stopped cannot resolve this record.
+Retry requires the exact record and current task version; if the step may have
+started an external action, its outstanding effects must have recorded outcomes.
+Releasing the record only permits another evaluation and leaves independent
+holds intact. Unknown process inventory never grants launch, input or signal
+authority, including when no process is attached to the current service boot.
 
 ## Supported Codex installation
 

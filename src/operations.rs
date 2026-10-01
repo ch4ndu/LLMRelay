@@ -1,6 +1,7 @@
 use crate::auth;
 use crate::checks::CheckService;
 use crate::config::InstancePaths;
+use crate::coordinator::StepEffect;
 use crate::diagnostics::DiagnosticSink;
 use crate::domain::{
     HumanCommand, LaunchConfig, OperationResult, ProcessIdentity, RestartAdmissionV1,
@@ -14,9 +15,9 @@ use crate::roles::RoleService;
 use crate::scheduler::Scheduler;
 use crate::store::{
     json_hash, BrowserLaunchReceipt, BrowserLaunchReservation, PreparedResumeIdentity,
-    RoleResumeCapacityError, Store,
+    RestartAdmissionBinding, RoleResumeCapacityError, Store,
 };
-use crate::supervisor::{SpawnFailure, Supervisor};
+use crate::supervisor::{ProcessInventory, SessionInventory, SpawnFailure, Supervisor};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use rusqlite::{OptionalExtension, Transaction};
@@ -66,6 +67,7 @@ const MAX_RESTART_SELECTION: usize = 200;
 const MAX_RESTART_BATCH: usize = 4;
 const MAX_RESTART_REPLACEMENT_FAILURES: u8 = 3;
 const MAX_BLOCKING_OPERATIONS: usize = 16;
+const HOST_RESTART_RESUME_NOTICE: &str = "LLMRelay restarted while this session was running and interrupted its previous turn. Before repeating any command, edit or report that may already have been in flight, check its actual effect; do not assume it did or did not happen. The task instructions below are unchanged.";
 
 #[derive(Clone, Debug)]
 struct RestartAdmissionTicket {
@@ -79,6 +81,20 @@ struct RestartAdmissionTicket {
     prior_transcript_epoch: String,
     automatic: bool,
     receipt: Option<(String, String)>,
+}
+
+impl RestartAdmissionTicket {
+    fn binding(&self) -> RestartAdmissionBinding<'_> {
+        RestartAdmissionBinding {
+            admission_id: &self.admission_id,
+            attempt_id: &self.attempt_id,
+            task_id: &self.task_id,
+            role_generation_id: &self.role_generation_id,
+            expected_task_version: self.expected_task_version,
+            prior_transcript_epoch: &self.prior_transcript_epoch,
+            expected_resume_ordinal: self.expected_resume_ordinal,
+        }
+    }
 }
 
 enum RestartAdmissionStart {
@@ -608,7 +624,7 @@ impl Application {
             .coordinator_lock
             .lock()
             .map_err(|_| anyhow!("coordinator mutex is poisoned"))?;
-        self.supervisor.reconcile()?;
+        let reconciled = self.supervisor.reconcile_inventory()?;
         let desired_running = crate::recovery::capture_desired_running_before_drain(&self.store)?;
         #[cfg(test)]
         if TEST_INTERRUPT_DRAIN_AFTER_CAPTURE.with(|armed| armed.replace(false)) {
@@ -617,39 +633,78 @@ impl Application {
                 desired_running.len()
             )
         }
-        let active = self.supervisor.active_session_ids()?;
+        let inventory = match reconciled {
+            ProcessInventory::Unavailable(error) => SessionInventory::Unknown {
+                attached: self.supervisor.attached_session_ids()?,
+                reason: format!("{error:#}"),
+            },
+            ProcessInventory::Observed => self.supervisor.session_inventory()?,
+        };
         let mut interrupted = Vec::new();
         let mut already_interrupt_requested = Vec::new();
         let mut unknown = Vec::new();
-        for session in &active {
-            match self.supervisor.interrupt_once(session) {
-                Ok(crate::supervisor::InterruptOutcome::Requested) => {
-                    interrupted.push(session.clone())
+        let (active, interrupted_checks, process_inventory) = match inventory {
+            SessionInventory::Observed(active) => {
+                for session in &active {
+                    match self.supervisor.interrupt_once(session) {
+                        Ok(crate::supervisor::InterruptOutcome::Requested) => {
+                            interrupted.push(session.clone())
+                        }
+                        Ok(crate::supervisor::InterruptOutcome::AlreadyRequested) => {
+                            already_interrupt_requested.push(session.clone())
+                        }
+                        Ok(crate::supervisor::InterruptOutcome::Stale) => unknown.push(
+                            serde_json::json!({"session_id":session,"error":"interrupt receipt became stale"}),
+                        ),
+                        Err(error) => unknown.push(
+                            serde_json::json!({"session_id":session,"error":format!("{error:#}")}),
+                        ),
+                    }
                 }
-                Ok(crate::supervisor::InterruptOutcome::AlreadyRequested) => {
-                    already_interrupt_requested.push(session.clone())
-                }
-                Ok(crate::supervisor::InterruptOutcome::Stale) => unknown.push(
-                    serde_json::json!({"session_id":session,"error":"interrupt receipt became stale"}),
-                ),
-                Err(error) => unknown
-                    .push(serde_json::json!({"session_id":session,"error":format!("{error:#}")})),
+                let interrupted_checks = self.checks.interrupt_all()?;
+                (
+                    active,
+                    interrupted_checks,
+                    serde_json::json!({"state":"observed"}),
+                )
             }
-        }
-        let interrupted_checks = self.checks.interrupt_all()?;
+            // No signal is sent without an exact current inventory, and the
+            // unknown entry keeps every caller from reading this as quiescent.
+            SessionInventory::Unknown { attached, reason } => {
+                unknown.extend(
+                    attached
+                        .iter()
+                        .map(|session| serde_json::json!({"session_id":session,"error":reason})),
+                );
+                unknown.push(serde_json::json!({"process_inventory":"unknown","error":reason}));
+                (
+                    attached,
+                    Vec::new(),
+                    serde_json::json!({"state":"unknown","reason":reason}),
+                )
+            }
+        };
         let active_checks = self.checks.active_status()?;
         Ok(
-            serde_json::json!({"draining":true,"new_dispatch":false,"desired_running_captured":desired_running,"active":active,"active_checks":active_checks,"interrupt_requested":interrupted,"already_interrupt_requested":already_interrupt_requested,"check_interrupt_requested":interrupted_checks,"unknown":unknown}),
+            serde_json::json!({"draining":true,"new_dispatch":false,"desired_running_captured":desired_running,"active":active,"active_checks":active_checks,"interrupt_requested":interrupted,"already_interrupt_requested":already_interrupt_requested,"check_interrupt_requested":interrupted_checks,"unknown":unknown,"process_inventory":process_inventory}),
         )
     }
 
     pub fn drain_status(&self) -> Result<serde_json::Value> {
-        self.supervisor.reconcile()?;
-        let active = self.supervisor.active_session_ids()?;
+        let (observed, active, inventory) = match self.supervisor.session_inventory()? {
+            SessionInventory::Observed(active) => {
+                (true, active, serde_json::json!({"state":"observed"}))
+            }
+            SessionInventory::Unknown { attached, reason } => (
+                false,
+                attached,
+                serde_json::json!({"state":"unknown","reason":reason}),
+            ),
+        };
         let checks = self.checks.active_status()?;
-        let quiescent = active.is_empty() && checks.is_empty();
+        let quiescent = observed && active.is_empty() && checks.is_empty();
         Ok(
-            serde_json::json!({"draining":self.draining.load(Ordering::SeqCst),"new_dispatch":self.dispatch_enabled(),"active":active,"active_checks":checks,"quiescent":quiescent}),
+            serde_json::json!({"draining":self.draining.load(Ordering::SeqCst),"new_dispatch":self.dispatch_enabled(),"active":active,"active_checks":checks,"process_inventory":inventory,"quiescent":quiescent}),
         )
     }
 
@@ -714,15 +769,25 @@ impl Application {
             )?
         };
         let due = Utc::now();
+        // A held attempt gets no automatic restart, while a person's queued
+        // restart stops only on its own unresolved failure.
         let candidates = {
             let connection = self.store.lock()?;
-            let mut statement = connection.prepare(
-                "SELECT rc.session_id,rc.requested_by,rc.state,rc.result_json
+            let mut statement = connection.prepare(&format!(
+                "SELECT rc.session_id,rc.requested_by,rc.state,rc.result_json,rc.attempt_id,
+                        NOT {},
+                        EXISTS(SELECT 1 FROM recovery_records failure
+                          WHERE failure.attempt_id=rc.attempt_id
+                            AND failure.state='attention_required'
+                            AND json_extract(failure.detail_json,'$.kind')='coordinator_failure'
+                            AND json_extract(failure.detail_json,'$.operation')='auto_resume'
+                            AND json_extract(failure.detail_json,'$.causal_identity.session_id')=rc.session_id)
                  FROM restart_candidates rc JOIN sessions s ON s.id=rc.session_id
                  JOIN role_generations rg ON rg.id=s.role_generation_id
                  WHERE rc.state IN ('parked','queued_capacity')
                  ORDER BY CASE rg.role WHEN 'manager' THEN 0 ELSE 1 END,rc.created_at,rc.session_id",
-            )?;
+                crate::coordinator::coordinator_hold_absent("rc.attempt_id")
+            ))?;
             let rows = statement
                 .query_map([], |row| {
                     Ok((
@@ -730,6 +795,9 @@ impl Application {
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, bool>(5)?,
+                        row.get::<_, bool>(6)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -737,7 +805,10 @@ impl Application {
         };
         let mut due_human = None;
         let mut due_automatic = None;
-        for (session, requested_by, state, result_json) in candidates {
+        for (session, requested_by, state, result_json, attempt, held, own_failure) in candidates {
+            if own_failure {
+                continue;
+            }
             let result = match RestartCandidateResult::parse(&result_json).and_then(|result| {
                 result.validate_candidate_state(&state, &session)?;
                 Ok(result)
@@ -745,30 +816,38 @@ impl Application {
                 Ok(result) => result,
                 Err(_) => continue,
             };
-            if result.restart.replacement_failures >= MAX_RESTART_REPLACEMENT_FAILURES
-                || !restart_due(&result.restart.next_due_at, &due)?
+            let human_member =
+                requested_by.as_deref() == Some("human") && result.restart.active_batch().is_some();
+            if (held && !human_member)
+                || result.restart.replacement_failures >= MAX_RESTART_REPLACEMENT_FAILURES
+                || !restart_due(&result.restart.next_due_at, &due).map_err(|error| {
+                    auto_resume_failure(error, &session, &attempt, StepEffect::None)
+                })?
             {
                 continue;
             }
-            let human_member =
-                requested_by.as_deref() == Some("human") && result.restart.active_batch().is_some();
             if human_member && due_human.is_none() {
-                due_human = Some(session);
+                due_human = Some((session, attempt));
             } else if !human_member && due_automatic.is_none() {
-                due_automatic = Some(session);
+                due_automatic = Some((session, attempt));
             }
         }
-        let selected = due_human.map(|session| (session, false)).or_else(|| {
+        let selected = due_human.map(|candidate| (candidate, false)).or_else(|| {
             enabled
                 .then_some(due_automatic)
                 .flatten()
-                .map(|session| (session, true))
+                .map(|candidate| (candidate, true))
         });
-        let Some((session, automatic)) = selected else {
+        let Some(((session, attempt), automatic)) = selected else {
             return Ok(None);
         };
-        let start = self.start_restart_admission(&session, automatic, false, None)?;
-        let result = self.finish_restart_admission(start)?;
+        // Admission is one transaction; finishing it may already have resumed the session.
+        let start = self
+            .start_restart_admission(&session, automatic, false, None)
+            .map_err(|error| auto_resume_failure(error, &session, &attempt, StepEffect::None))?;
+        let result = self.finish_restart_admission(start).map_err(|error| {
+            auto_resume_failure(error, &session, &attempt, StepEffect::Possible)
+        })?;
         Ok(Some(
             serde_json::json!({"action":"auto_resume","result":result}),
         ))
@@ -1270,7 +1349,7 @@ impl Application {
             RestartAdmissionStart::Finished(result) => return Ok(result),
         };
         let resume = self
-            .resume_role_session_inner(&ticket.session_id, "", None, false)
+            .resume_role_session_inner(&ticket.session_id, "", None, false, Some(ticket.binding()))
             .and_then(browser_launch_dispatch_result);
         self.record_restart_admission_outcome(ticket, resume)
     }
@@ -1382,13 +1461,29 @@ impl Application {
             && task_version == ticket.expected_task_version
             && current_configuration
             && controls_clear;
+        let unchanged_preflight = invocation.is_none()
+            && session_status == "exited"
+            && resume_count + 1 == i64::from(ticket.expected_resume_ordinal)
+            && transcript_epoch == ticket.prior_transcript_epoch
+            && generation == ticket.role_generation_id;
         if !authority_current {
-            let result = finish_stale_restart_outcome(
-                &tx,
-                &ticket,
-                "task, attempt, control, or role-generation authority changed during exact resume",
-                &now_text,
-            )?;
+            let result = if resume.is_err() && unchanged_preflight {
+                block_unreserved_stale_admission(
+                    &tx,
+                    &ticket,
+                    &raw_result,
+                    candidate_result,
+                    current_configuration,
+                    &now_text,
+                )?
+            } else {
+                finish_stale_restart_outcome(
+                    &tx,
+                    &ticket,
+                    "task, attempt, control, or role-generation authority changed during exact resume",
+                    &now_text,
+                )?
+            };
             tx.commit()?;
             return Ok(result);
         }
@@ -1402,11 +1497,6 @@ impl Application {
                     .as_ref()
                     .is_some_and(|(state, epoch)| state == "running" && epoch == &transcript_epoch)
         });
-        let unchanged_preflight = invocation.is_none()
-            && session_status == "exited"
-            && resume_count + 1 == i64::from(ticket.expected_resume_ordinal)
-            && transcript_epoch == ticket.prior_transcript_epoch
-            && generation == ticket.role_generation_id;
         let proven_nondelivery = invocation.as_ref().is_some_and(|(state, _)| {
             state == "proven_nondelivery"
                 && session_status == "exited"
@@ -2948,7 +3038,7 @@ impl Application {
     ) -> Result<ValidationLaunchResult> {
         self.store.require_execution_unheld("role session resume")?;
         let result = self
-            .resume_role_session_inner(session_id, prompt, None, true)
+            .resume_role_session_inner(session_id, prompt, None, true, None)
             .and_then(browser_launch_dispatch_result);
         if let Err(error) = &result {
             self.record_permanent_resume_rejection(session_id, error, None)?;
@@ -2977,7 +3067,7 @@ impl Application {
             input_hash: &request_hash,
             entity_id: session_id,
         };
-        let result = self.resume_role_session_inner(session_id, prompt, Some(receipt), true);
+        let result = self.resume_role_session_inner(session_id, prompt, Some(receipt), true, None);
         if let Err(error) = &result {
             self.record_permanent_resume_rejection(session_id, error, None)?;
         }
@@ -2990,6 +3080,7 @@ impl Application {
         prompt: &str,
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
         record_permanent_rejection: bool,
+        restart_admission: Option<RestartAdmissionBinding<'_>>,
     ) -> Result<BrowserLaunchDispatch> {
         if !self.dispatch_enabled() {
             bail!("service is draining; role resume is disabled")
@@ -3002,6 +3093,9 @@ impl Application {
             record["validation_cell"].as_str(),
             Some("trip_setup_discovery" | "trip_setup_probe")
         ) {
+            if restart_admission.is_some() {
+                bail!("a host-restart admission cannot resume a setup session")
+            }
             let invocation = self.store.invocation_input(session_id)?;
             let persisted_prompt = invocation
                 .get("prompt")
@@ -3062,6 +3156,11 @@ impl Application {
             bail!("resume input differs from the persisted invocation; create a fresh role or review request")
         }
         self.store.validate_resume_input(session_id, &invocation)?;
+        // Only this delivered turn carries the notice; the saved invocation stays the original prompt.
+        let delivered_prompt = match restart_admission {
+            Some(_) => format!("{HOST_RESTART_RESUME_NOTICE}\n\n{persisted_prompt}"),
+            None => persisted_prompt.to_owned(),
+        };
         let generation = record["role_generation_id"]
             .as_str()
             .ok_or_else(|| anyhow!("session generation is missing"))?
@@ -3078,7 +3177,7 @@ impl Application {
             &prior.model,
             &prior.effort,
             &prior.cwd,
-            persisted_prompt,
+            &delivered_prompt,
             &self.paths.role_socket,
             &token,
             &generation,
@@ -3105,6 +3204,16 @@ impl Application {
                 &token,
                 receipt,
             )
+        } else if let Some(admission) = restart_admission {
+            self.store
+                .reserve_role_resume_for_restart_admission(
+                    session_id,
+                    &epoch,
+                    &launch.config,
+                    &token,
+                    admission,
+                )
+                .map(|()| BrowserLaunchReservation::Reserved)
         } else {
             self.store
                 .reserve_role_resume(session_id, &epoch, &launch.config, &token)
@@ -3936,6 +4045,7 @@ impl Application {
             SpawnFailure::ProvenNondelivery {
                 reason,
                 owned_process_state,
+                ..
             } => {
                 let (root_pid, process_group_id, members) = owned_process_state.evidence();
                 self.store.record_session_spawn_uncertainty(
@@ -4008,7 +4118,18 @@ impl Application {
                 )?;
             }
         }
-        self.supervisor.reconcile()?;
+        // Recorded-state commands stay available while inventory is unknown;
+        // quiescence proofs re-inventory on their own and fail closed.
+        if let ProcessInventory::Unavailable(error) = self.supervisor.reconcile_inventory()? {
+            if matches!(
+                command,
+                HumanCommand::RetryGracefulStop { .. }
+                    | HumanCommand::ForceStopExactProcess { .. }
+                    | HumanCommand::Trip { .. }
+            ) {
+                return Err(error.context("LLMRelay cannot act on agent processes yet"));
+            }
+        }
         match command {
             HumanCommand::RetryWorkspaceReservation {
                 operation_id,
@@ -4159,7 +4280,7 @@ impl Application {
                 rusqlite::params![operation_id], |row| row.get(0),
             )?;
             if !prior_receipt && matches!(decision.as_str(), "confirm_quiescent" | "cancel") {
-                let rework_recovery = {
+                let (rework_recovery, coordinator_failure) = {
                     let connection = self.store.lock()?;
                     crate::workflow::validate_recovery_identity(
                         &connection,
@@ -4168,25 +4289,29 @@ impl Application {
                         attempt_id,
                         session_id.as_deref(),
                     )?;
-                    let workspace_recovery: bool = connection.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE id=?1 AND attempt_id=?2
-                           AND state='attention_required'
-                           AND json_extract(detail_json,'$.kind')='workspace_reservation')",
-                        rusqlite::params![recovery_id, attempt_id],
-                        |row| row.get(0),
-                    )?;
+                    let (workspace_recovery, coordinator_failure): (bool, bool) = connection
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE id=?1 AND attempt_id=?2
+                               AND state='attention_required'
+                               AND json_extract(detail_json,'$.kind')='workspace_reservation'),
+                                    EXISTS(SELECT 1 FROM recovery_records WHERE id=?1 AND attempt_id=?2
+                               AND state='attention_required'
+                               AND json_extract(detail_json,'$.kind')='coordinator_failure')",
+                            rusqlite::params![recovery_id, attempt_id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )?;
                     if workspace_recovery {
                         bail!("workspace reservation recovery must use retry_workspace_reservation or cancel_workspace_reservation")
                     }
-                    connection.query_row(
+                    let rework_recovery = connection.query_row(
                         "SELECT EXISTS(SELECT 1 FROM rework_intents WHERE new_attempt_id=?1 AND state='recovery_required')",
                         rusqlite::params![attempt_id],
                         |row| row.get::<_, bool>(0),
-                    )?
+                    )?;
+                    (rework_recovery, coordinator_failure)
                 };
-                if rework_recovery {
-                    // The workflow command performs aggregate parent/child verification for
-                    // cancellation and rejects quiescence-only resolution of materialization.
+                if rework_recovery || coordinator_failure {
+                    // Checked inside the workflow transaction; no process inventory applies here.
                 } else if decision == "confirm_quiescent" {
                     if let Some(session) = session_id.as_deref() {
                         crate::recovery::verify_session_quiescent(&self.store, session)?;
@@ -4737,6 +4862,21 @@ fn rework_parent_blocker(
     Ok(None)
 }
 
+fn auto_resume_failure(
+    error: anyhow::Error,
+    session: &str,
+    attempt: &str,
+    effect: StepEffect,
+) -> anyhow::Error {
+    crate::coordinator::subject_failure(
+        error,
+        attempt,
+        crate::coordinator::SubjectStep::AutoResume,
+        effect,
+        serde_json::json!({"session_id":session}),
+    )
+}
+
 fn restart_due(next_due_at: &Option<String>, now: &chrono::DateTime<Utc>) -> Result<bool> {
     let Some(next_due_at) = next_due_at.as_deref() else {
         return Ok(true);
@@ -4846,6 +4986,96 @@ fn update_restart_receipt_in(
         bail!("durable restart operation receipt changed before outcome publication")
     }
     Ok(())
+}
+
+fn block_unreserved_stale_admission(
+    tx: &Transaction<'_>,
+    ticket: &RestartAdmissionTicket,
+    raw_result: &str,
+    mut candidate_result: RestartCandidateResult,
+    generation_current: bool,
+    now: &str,
+) -> Result<serde_json::Value> {
+    let reason = "exact restart authority changed before the resume was reserved; nothing was delivered and a human decision is required";
+    candidate_result.restart.terminalize_batch();
+    candidate_result.set(
+        "startup_admission_reconciliation",
+        serde_json::json!({
+            "delivery":"proven_nondelivery_or_preflight",
+            "authority":"stale",
+            "invocation_state":"not_reserved",
+            "expected_resume_ordinal":ticket.expected_resume_ordinal,
+            "prior_transcript_epoch":ticket.prior_transcript_epoch,
+            "admission_id":ticket.admission_id,
+            "role_generation_id":ticket.role_generation_id,
+            "recovery_id":serde_json::Value::Null,
+        }),
+    );
+    candidate_result.set(
+        "last_resume_outcome",
+        serde_json::json!({
+            "admission_id":ticket.admission_id,"state":"blocked","delivery":"proven_nondelivery",
+            "expected_resume_ordinal":ticket.expected_resume_ordinal,"invocation_state":serde_json::Value::Null
+        }),
+    );
+    let replacement_failures = candidate_result.restart.replacement_failures;
+    let changed = tx.execute(
+        "UPDATE restart_candidates SET state='blocked',reason=?1,result_json=?2,updated_at=?3
+         WHERE session_id=?4 AND state='admitting' AND result_json=?5",
+        rusqlite::params![
+            reason,
+            candidate_result.encode()?,
+            now,
+            ticket.session_id,
+            raw_result
+        ],
+    )?;
+    if changed != 1 {
+        return finish_stale_restart_outcome(
+            tx,
+            ticket,
+            "restart candidate changed before its outcome committed",
+            now,
+        );
+    }
+    // Only this admission's own running hand-off is undone; a newer control, generation,
+    // task decision or still-running restored peer keeps the attempt and task as they are.
+    let reparked = generation_current
+        && tx.execute(
+            "UPDATE attempts SET status='restart_parked',updated_at=?1
+             WHERE id=?2 AND task_id=?3 AND status='running'
+               AND id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=?3
+                       ORDER BY latest.created_at DESC LIMIT 1)
+               AND EXISTS(SELECT 1 FROM tasks t WHERE t.id=?3 AND t.attention='none'
+                 AND t.archived_at IS NULL AND t.lifecycle IN ('in_progress','validation'))
+               AND NOT EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=?2
+                 AND c.kind!='transition_proposal'
+                 AND c.state NOT IN ('finished','cancelled','superseded','rejected','failed','abandoned'))
+               AND NOT EXISTS(SELECT 1 FROM restart_candidates peer JOIN sessions s ON s.id=peer.session_id
+                 WHERE peer.attempt_id=?2 AND peer.session_id!=?4 AND peer.state='resumed'
+                   AND s.status='running')",
+            rusqlite::params![now, ticket.attempt_id, ticket.task_id, ticket.session_id],
+        )? == 1;
+    if reparked {
+        tx.execute(
+            "UPDATE tasks SET attention='restart_parked',updated_at=?1 WHERE id=?2 AND attention='none'",
+            rusqlite::params![now, ticket.task_id],
+        )?;
+    }
+    let result = restart_operation_result(
+        ticket.receipt.as_ref().map(|value| value.0.as_str()),
+        if ticket.automatic { "auto" } else { "selected" },
+        &[ticket.session_id.clone()],
+        &[],
+        &[ticket.session_id.clone()],
+        vec![serde_json::json!({
+            "session_id":ticket.session_id,"state":"blocked","reason":reason,
+            "delivery":"proven_nondelivery","replacement_failures":replacement_failures,
+            "admission_id":ticket.admission_id,
+        })],
+    );
+    update_restart_receipt_in(tx, ticket, &result)?;
+    Ok(result)
 }
 
 fn finish_stale_restart_outcome(

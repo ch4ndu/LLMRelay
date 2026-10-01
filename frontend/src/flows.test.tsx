@@ -76,6 +76,7 @@ const { MarkdownContent, safeMarkdownUrl } = await import(
 );
 const { taskStatus } = await import("./components/TaskBoard");
 const { explainError } = await import("./components/ErrorNotice");
+const { AppErrorBoundary } = await import("./components/AppErrorBoundary");
 const nativeFetch = globalThis.fetch;
 const fixtureSource = Symbol("protocol fixture source");
 type FixtureFetch = typeof fetch & { [fixtureSource]?: typeof fetch };
@@ -6896,6 +6897,7 @@ Deno.test("User errors explain recovery while retaining collapsed diagnostics", 
     ["authentication credentials missing", "agent's current sign-in", "Complete sign-in there"],
     ["Provider version codex-cli 9.9 has no reviewed contract", "agent version has not been verified", "Update LLMRelay"],
     ["request deadline exceeded; mutation may have been dispatched", "could not confirm", "do not start a second copy"],
+    ["the failed step may have started an agent action, so it cannot be retried until these have a known outcome: guidance delivery to s-1 (response timeout)", "outcome of its agent action is known", "Check the task's Activity tab, then refresh the dashboard"],
     ["unexpected SQLite fixture failure <script>alert(1)</script>", "could not complete", "Diagnostics"],
   ];
   try {
@@ -8785,5 +8787,354 @@ Deno.test("Appearance follows System or an explicit choice and survives unavaila
     liveEnvironment.scheduler = priorEnvironment.scheduler;
     globalThis.fetch = nativeFetch;
     localStorage.clear();
+  }
+});
+
+Deno.test("H8 a render failure offers Reload page without showing the error", () => {
+  const priorReload = window.location.reload;
+  const priorConsoleError = console.error;
+  const privateText = "private-fixture-text-4471 from a task description";
+  const failure = new TypeError(privateText);
+  const BrokenTaskView = (): ReactNode => {
+    throw failure;
+  };
+  const ThrowsText = (): ReactNode => {
+    throw privateText;
+  };
+  const requests: string[] = [];
+  const logged: unknown[][] = [];
+  let reloads = 0;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    requests.push(String(input));
+    return new Response("{}");
+  }) as typeof fetch;
+  window.location.reload = () => {
+    reloads += 1;
+  };
+  console.error = (...args: unknown[]) => {
+    logged.push(args);
+  };
+  document.documentElement.dataset.theme = "dark";
+  try {
+    mount(<AppErrorBoundary><BrokenTaskView /></AppErrorBoundary>);
+    const page = document.body.textContent ?? "";
+    const heading = document.querySelector("main h1");
+    check(
+      heading?.textContent === "The dashboard stopped working" &&
+        heading.getAttribute("tabindex") === "-1" && document.activeElement === heading &&
+        page.includes("check whether it completed before trying it again"),
+      `the failure page did not explain itself or take focus: ${page}`,
+    );
+    const details = document.querySelector<HTMLDetailsElement>("main details");
+    check(
+      !details?.open && details?.textContent?.includes("Dashboard render error · TypeError · ") &&
+        !page.includes(privateText) && !page.includes("BrokenTaskView"),
+      `technical details were open or showed the error message or stack: ${page}`,
+    );
+    check(
+      logged.some((args) => args.includes(failure)) &&
+        document.documentElement.dataset.theme === "dark",
+      "the full error did not reach the console or the failure page changed the theme",
+    );
+    click("Reload page");
+    check(
+      reloads === 1 && requests.length === 0,
+      `Reload page did not reload exactly once without requests: ${reloads} ${requests}`,
+    );
+
+    mount(<AppErrorBoundary><ThrowsText /></AppErrorBoundary>);
+    check(
+      document.querySelector("main details")?.textContent?.includes(
+        "Dashboard render error · Non-Error value · ",
+      ) && !document.body.textContent?.includes(privateText),
+      "a thrown text value was shown instead of a fixed label",
+    );
+
+    mount(<AppErrorBoundary><p>Dashboard ready</p></AppErrorBoundary>);
+    check(
+      document.body.textContent === "Dashboard ready",
+      "the boundary replaced a dashboard that rendered normally",
+    );
+  } finally {
+    unmount();
+    window.location.reload = priorReload;
+    console.error = priorConsoleError;
+    document.documentElement.removeAttribute("data-theme");
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+const failedStepRecord = (
+  id: string,
+  detail: Record<string, unknown> = {},
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+  id,
+  session_id: null,
+  attempt_id: "a1",
+  state: "attention_required",
+  actionable: 1,
+  updated_at: "2026-10-01T00:00:00Z",
+  detail: {
+    kind: "coordinator_failure",
+    task_id: "AJ-1",
+    operation: "attempt_classification",
+    causal_identity: { attempt_id: "a1" },
+    effect_certainty: "none",
+    cause: "fixture classification failure",
+    failure_key: `failure-${id}`,
+    ...detail,
+  },
+  ...overrides,
+});
+
+Deno.test("H1 Controls and attention reach the exact failed step, and a stale retry stays visible without resending", async () => {
+  const priorEnvironment = { ...liveEnvironment };
+  const requests: Record<string, unknown>[] = [];
+  let reply = () =>
+    new Response(JSON.stringify({ error: "task version is stale" }), { status: 409 });
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method !== "POST") return new Response("[]");
+    requests.push(JSON.parse(String(init.body)));
+    return reply();
+  }) as typeof fetch;
+  const heldTask: Task = {
+    ...task,
+    attention: "needs_recovery",
+    active_attempt: {
+      id: "a1",
+      phase: "implementation",
+      status: "needs_recovery",
+      base_revision: "abc",
+    },
+  };
+  const step = failedStepRecord("r-step");
+  const recoveryTarget = (recovery_id: string): AttentionTarget => ({
+    kind: "recovery_record",
+    project_id: "p1",
+    task_id: "AJ-1",
+    attempt_id: "a1",
+    recovery_id,
+  });
+  const held = snapshotAt("service-a", "60", {
+    tasks: [heldTask],
+    recovery: [
+      { id: "r-session", session_id: "s-other", attempt_id: "a1", state: "attention_required", detail: {} },
+      step,
+    ],
+    continuation_actions: [{
+      kind: "recover_failed_step",
+      enabled: true,
+      reason: "An automatic step failed. Review it before automatic work continues.",
+      owner: "human",
+      waiting_for: null,
+      since: "2026-10-01T00:00:00Z",
+      deadline_at: null,
+      operation: "resolve_recovery",
+      binding: {
+        recovery_id: "r-step",
+        attempt_id: "a1",
+        session_id: null,
+        workspace_id: null,
+        detail: step.detail,
+        decisions: ["retry_failed_step", "cancel"],
+        retry_enabled: true,
+        retry_blocked_by: [],
+      },
+      accounting_note:
+        "Retry step only lets LLMRelay evaluate the task again from its current state; it never repeats a step whose outcome is unknown.",
+    }],
+    attention: [
+      railItem("recovery_record:r-step", "recovery", "An automatic step failed", recoveryTarget("r-step")),
+      railItem("recovery_record:r-session", "recovery", "Manual action needed", recoveryTarget("r-session")),
+    ],
+  });
+  const dialog = () => document.querySelector(".task-dialog");
+  const stepPanel = () =>
+    dialog()?.querySelector<HTMLElement>('[data-attention-target="recovery_record:r-step"]');
+  const controlButton = (label: string) =>
+    [...(dialog()?.querySelectorAll<HTMLButtonElement>(".controls button") ?? [])]
+      .find((button) => button.textContent === label);
+  const openItem = (id: string) =>
+    act(() => document.querySelector<HTMLButtonElement>(`[data-attention-id="${id}"] button`)!.click());
+  localStorage.clear();
+  try {
+    const live = await mountLiveApp("workspace", held);
+    openItem("recovery_record:r-session");
+    await settle();
+    click("Review the failed step");
+    await settle();
+    check(
+      document.activeElement === stepPanel() &&
+        !dialog()?.querySelector('[data-attention-target="recovery_record:r-session"]') &&
+        !dialog()?.textContent?.includes("changed before it could open") && requests.length === 0,
+      "Controls did not switch the attention-opened record to the exact failed step",
+    );
+
+    click("Board");
+    act(() =>
+      [...document.querySelectorAll<HTMLButtonElement>(".card-body")]
+        .find((card) => card.querySelector("strong")?.textContent === heldTask.title)!.click()
+    );
+    await settle();
+    check(
+      !!stepPanel() && !!dialog()?.querySelector('[data-attention-target="recovery_record:r-session"]') &&
+        controlButton("Pause now")?.disabled === false && controlButton("Cancel")?.disabled === false,
+      "a direct open hid an independent hold, or the failed step blocked Pause or Cancel",
+    );
+
+    click("Workspace");
+    openItem("recovery_record:r-step");
+    await settle();
+    const primary = stepPanel()?.textContent?.replace(/Technical details[\s\S]*/, "") ?? "";
+    const details = stepPanel()?.querySelector("details");
+    check(
+      document.activeElement === stepPanel() && primary.startsWith("An automatic step failed") &&
+        primary.includes("does not start agent actions") && primary.includes("choose Retry failed step") &&
+        !primary.includes("attempt_classification") && !details?.open &&
+        details?.textContent?.includes("attempt_classification · effect none") &&
+        details.textContent.includes("fixture classification failure") &&
+        !dialog()?.textContent?.includes("Check recovery and continue"),
+      `attention did not open only the plainly explained failed step: ${primary}`,
+    );
+    field("Recovery evidence", "Activity shows classification never finished");
+    click("Retry failed step");
+    await settle();
+    await settle();
+    const stale = requests[0];
+    check(
+      requests.length === 1 && stale.kind === "resolve_recovery" && stale.task_id === "AJ-1" &&
+        stale.attempt_id === "a1" && stale.recovery_id === "r-step" && "session_id" in stale &&
+        stale.session_id === null && stale.expected_version === 7 &&
+        stale.decision === "retry_failed_step" &&
+        stale.evidence === "Activity shows classification never finished" &&
+        typeof stale.operation_id === "string",
+      `the retry was resent or did not bind the exact displayed hold: ${JSON.stringify(requests)}`,
+    );
+    const alert = stepPanel()?.querySelector('[role="alert"]');
+    check(
+      alert?.querySelector("strong")?.textContent === "This page is showing an older version of the item." &&
+        alert.querySelector("p")?.textContent?.startsWith("Refresh the dashboard") &&
+        alert.querySelector("details pre")?.textContent === "task version is stale" &&
+        stepPanel()?.querySelector("textarea")?.value === "Activity shows classification never finished" &&
+        !!document.querySelector('[data-attention-id="recovery_record:r-session"]'),
+      "a stale refusal was hidden, lost the evidence, or dropped the unrelated hold",
+    );
+
+    reply = () =>
+      new Response(JSON.stringify({
+        result: { entity_kind: "attempt", entity_id: "a1", version: 9, state: "failed_step_released" },
+      }));
+    live.waits[0].resolve(changedTo({ ...held, revision: "61", tasks: [{ ...heldTask, version: 8 }] }));
+    await settle();
+    click("Retry failed step");
+    await settle();
+    check(
+      requests.length === 2 && requests[1].expected_version === 8 &&
+        requests[1].operation_id !== stale.operation_id &&
+        requests.every((request) => request.recovery_id === "r-step"),
+      `the refreshed retry reused the stale version or operation: ${JSON.stringify(requests)}`,
+    );
+
+    // The post-retry read releases the step; Review is clicked before that renders.
+    openItem("recovery_record:r-session");
+    await settle();
+    const review = controlButton("Review the failed step")!;
+    const released: AppState = {
+      ...held,
+      revision: "62",
+      tasks: [{ ...heldTask, version: 9 }],
+      recovery: held.recovery.map((record) =>
+        record.id === "r-step" ? { ...record, state: "resolved_retry" } : record
+      ),
+      continuation_actions: [],
+      attention: held.attention.filter((item) => item.id !== "recovery_record:r-step"),
+    };
+    const reads = live.reads.length;
+    await act(async () => {
+      live.reads.at(-1)!.resolve(released);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      review.click();
+    });
+    await settle();
+    check(
+      document.activeElement?.getAttribute("data-attention-target") === "recovery_record:r-session" &&
+        !stepPanel() && requests.length === 2 && live.reads.length === reads + 1 &&
+        dialog()?.textContent?.includes("That failed step changed before it could open"),
+      "a stale failed-step route substituted a record, sent a request, or was not refreshed and explained",
+    );
+  } finally {
+    unmount();
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("H1 failed-step retry waits for unknown outcomes and an exact selection never falls back", async () => {
+  const requests: unknown[] = [];
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(init?.body);
+    return new Response(JSON.stringify({ result: {} }));
+  }) as typeof fetch;
+  const sessionHold = {
+    id: "r-session",
+    session_id: "s-other",
+    attempt_id: "a1",
+    state: "attention_required",
+    detail: {},
+  };
+  const unsettled = failedStepRecord(
+    "r-step",
+    { operation: "guidance_delivery", effect_certainty: "possible" },
+    { retry_blocked_by: ["effect e-1 guidance_delivery delivery_unknown"] },
+  );
+  const panel = (step?: Record<string, unknown>) => (
+    <RecoveryPanel
+      task={task}
+      records={step ? [sessionHold, step] : [sessionHold]}
+      selectedRecordId="r-step"
+      onChanged={noop}
+    />
+  );
+  const retry = () =>
+    [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent === "Retry failed step");
+  const text = () => document.body.textContent ?? "";
+  try {
+    mount(panel(unsettled));
+    field("Recovery evidence", "The guidance was never acknowledged");
+    act(() => retry()?.click());
+    await settle();
+    check(
+      retry()?.disabled === true && requests.length === 0 &&
+        text().includes("becomes available after LLMRelay records the outcome") &&
+        document.querySelector("details")?.textContent?.includes(
+          "effect e-1 guidance_delivery delivery_unknown",
+        ) &&
+        !text().includes("Check recovery and continue") && !text().includes("Verify and cancel"),
+      `an unsettled failed step offered a retry or a process check: ${text()}`,
+    );
+    rerender(panel({ ...unsettled, retry_blocked_by: [] }));
+    check(retry()?.disabled === false, "a failed step with settled outcomes stayed blocked");
+    for (const mismatch of [{ session_id: "s-other" }, { attempt_id: "a-old" }]) {
+      rerender(panel({ ...unsettled, retry_blocked_by: [], ...mismatch }));
+      check(
+        !retry() && !text().includes("Check recovery and continue") &&
+          text().includes("do not match the task shown here"),
+        `a failed step bound to ${JSON.stringify(mismatch)} still offered an action`,
+      );
+    }
+    rerender(panel());
+    check(
+      text().includes("was resolved or changed") &&
+        !document.querySelector("button, textarea, [data-attention-target]") &&
+        requests.length === 0,
+      "a vanished failed step fell back to the remaining session hold",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
   }
 });

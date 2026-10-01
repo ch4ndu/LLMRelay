@@ -657,9 +657,94 @@ fn augmented_prompt(prompt: &str, role: RoleKind, executable: &Path, socket: &Pa
     )
 }
 
+// Only this version was observed: pasted `/`, `@`, `!` or image paths trigger actions; this envelope does not.
+const LITERAL_GUIDANCE_PREDICATE: &str = "claude-code-2.1.283";
+const LITERAL_GUIDANCE_PREFIX: &str =
+    "LLMRelay task guidance (JSON-encoded string; decode to read):\n";
+
+pub(crate) fn literal_guidance_submission(
+    compatibility: Option<&crate::provider_compatibility::AuthorityBinding>,
+    guidance: &str,
+) -> Result<String> {
+    if !compatibility.is_some_and(|binding| {
+        binding.provider == Provider::Claude
+            && !binding.synthetic_origin
+            && binding.predicate_id == LITERAL_GUIDANCE_PREDICATE
+    }) {
+        bail!("literal guidance delivery is qualified only for the admitted Claude Code 2.1.283 contract, and this session is not bound to it")
+    }
+    let encoded = serde_json::to_string(guidance)?
+        .replace('@', "\\u0040")
+        .replace('!', "\\u0021")
+        .replace('/', "\\u002f");
+    Ok(format!("{LITERAL_GUIDANCE_PREFIX}{encoded}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn literal_guidance_binding() -> crate::provider_compatibility::AuthorityBinding {
+        crate::provider_compatibility::AuthorityBinding {
+            synthetic_origin: false,
+            provider: Provider::Claude,
+            schema: 1,
+            pack_id: "llmrelay-claude-compatibility".into(),
+            predicate_id: LITERAL_GUIDANCE_PREDICATE.into(),
+            exact_version: "2.1.283 (Claude Code)".into(),
+            contract_id: "claude-manager".into(),
+            contract_revision: "claude-role-contract-v1".into(),
+            effective_hash: "fixture".into(),
+            session_class: crate::provider_compatibility::SessionClass::Retained,
+            required_evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn admitted_guidance_envelope_matches_the_observed_submission_and_decodes_verbatim() {
+        let binding = literal_guidance_binding();
+        let observed = "/hardening_literal_probe_20261001\n@envelope-only.txt\n!echo LLMRELAY_NO_SHELL_FROM_ENVELOPE\n./literal-valid.png";
+        assert_eq!(
+            literal_guidance_submission(Some(&binding), observed).unwrap(),
+            "LLMRelay task guidance (JSON-encoded string; decode to read):\n\"\\u002fhardening_literal_probe_20261001\\n\\u0040envelope-only.txt\\n\\u0021echo LLMRELAY_NO_SHELL_FROM_ENVELOPE\\n.\\u002fliteral-valid.png\""
+        );
+        for original in [
+            observed,
+            "Reply exactly LLMRELAY_TYPEAHEAD_ACCEPTED. Do not use tools.",
+            "quote \" backslash \\ tab\t carriage\r\n/compact @file !ls ./shot.png",
+            "\u{1}control, é and 🚀 stay exact",
+        ] {
+            let submitted = literal_guidance_submission(Some(&binding), original).unwrap();
+            let encoded = submitted.strip_prefix(LITERAL_GUIDANCE_PREFIX).unwrap();
+            assert!(!encoded.contains(&['/', '@', '!'][..]), "{encoded}");
+            assert_eq!(serde_json::from_str::<String>(encoded).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn unqualified_claude_bindings_never_receive_the_guidance_envelope() {
+        let qualified = literal_guidance_binding();
+        let synthetic = crate::provider_compatibility::AuthorityBinding {
+            synthetic_origin: true,
+            ..qualified.clone()
+        };
+        let other_version = crate::provider_compatibility::AuthorityBinding {
+            predicate_id: "claude-code-2.1.284".into(),
+            ..qualified.clone()
+        };
+        let other_provider = crate::provider_compatibility::AuthorityBinding {
+            provider: Provider::Codex,
+            ..qualified
+        };
+        for binding in [
+            None,
+            Some(&synthetic),
+            Some(&other_version),
+            Some(&other_provider),
+        ] {
+            assert!(literal_guidance_submission(binding, "/compact").is_err());
+        }
+    }
 
     #[test]
     fn synthetic_compatibility_preparation_preserves_claude_native_policy() {

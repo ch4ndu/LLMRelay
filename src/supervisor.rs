@@ -1,6 +1,7 @@
 use crate::domain::{
-    AttachmentBinding, ExecutableFingerprint, LaunchHandshake, ObservedProcessIdentity,
-    PeerProcessIdentity, ProcessGenerationAnchor, ProcessIdentity, Provider, RolePeerProvenance,
+    same_process_start, AttachmentBinding, ExecutableFingerprint, LaunchHandshake,
+    ObservedProcessIdentity, PeerProcessIdentity, ProcessGenerationAnchor, ProcessIdentity,
+    Provider, RolePeerProvenance,
 };
 use crate::providers::PreparedLaunch;
 use crate::store::Store;
@@ -40,6 +41,56 @@ pub(crate) enum SetupRetainedFirstTurnStopTimeoutOutcome {
     Quiescent,
     TimedOut,
     Stale,
+}
+
+/// Whether reconciliation actually read the process table. Only `Observed`
+/// permits launching, signalling or writing to a process.
+#[derive(Debug)]
+pub(crate) enum ProcessInventory {
+    Observed,
+    /// Carries a `ProcessInventoryUnavailable` error.
+    Unavailable(anyhow::Error),
+}
+
+/// Attached sessions with live exact members, from one inventory taken after
+/// reconciliation. When inventory is unknown every attached session counts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SessionInventory {
+    Observed(Vec<String>),
+    Unknown {
+        attached: Vec<String>,
+        reason: String,
+    },
+}
+
+/// The operating-system process table could not be read. This is never a
+/// fact about one session, so callers keep it apart from subject failures.
+#[derive(Debug)]
+pub(crate) struct ProcessInventoryUnavailable(anyhow::Error);
+
+impl std::fmt::Display for ProcessInventoryUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("process inventory is unavailable")
+    }
+}
+
+impl std::error::Error for ProcessInventoryUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+enum AttachedReconciliation {
+    /// Every attached root was examined. `unavailable` is set when an exited
+    /// root's descendants could not be inventoried and only ambiguity was
+    /// recorded.
+    Complete {
+        attached: bool,
+        unavailable: Option<anyhow::Error>,
+    },
+    /// A live root could not be inventoried; later roots and interrupt
+    /// deadlines were left unreconciled.
+    LiveRootUnverified(anyhow::Error),
 }
 
 struct SessionHandle {
@@ -99,7 +150,7 @@ fn peer_matches_managed_identity_or_descendant(
             peer.pid
         )
     })?;
-    if observed.start != peer.native_start_marker {
+    if !same_process_start(&observed.start, &peer.native_start_marker) {
         bail!("control peer changed before ancestry validation")
     }
     let mut current = peer.pid;
@@ -110,7 +161,7 @@ fn peer_matches_managed_identity_or_descendant(
         })?;
         if managed_members
             .get(&current)
-            .is_some_and(|start| start == &info.start)
+            .is_some_and(|start| same_process_start(start, &info.start))
         {
             return Ok(true);
         }
@@ -146,7 +197,7 @@ impl CmuxHostAncestry {
                 return false;
             };
             if current == self.pid {
-                return process.start == self.native_start_marker
+                return same_process_start(&process.start, &self.native_start_marker)
                     && process_executable_path(self.pid)
                         .map(|path| path == self.executable)
                         .unwrap_or(false);
@@ -213,6 +264,7 @@ pub enum SpawnFailure {
     ProvenNondelivery {
         reason: String,
         owned_process_state: OwnedProcessState,
+        inventory_unavailable: Option<anyhow::Error>,
     },
     DeliveryUnknown {
         reason: String,
@@ -266,6 +318,19 @@ impl SpawnFailure {
                 process_group_id: None,
                 members: Vec::new(),
             },
+            inventory_unavailable: None,
+        }
+    }
+
+    fn inventory_unavailable(error: anyhow::Error) -> Self {
+        Self::ProvenNondelivery {
+            reason: "no agent was started because the process table could not be read".into(),
+            owned_process_state: OwnedProcessState::Quiescent {
+                root_pid: None,
+                process_group_id: None,
+                members: Vec::new(),
+            },
+            inventory_unavailable: Some(error),
         }
     }
 
@@ -282,7 +347,17 @@ impl std::fmt::Display for SpawnFailure {
     }
 }
 
-impl std::error::Error for SpawnFailure {}
+impl std::error::Error for SpawnFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ProvenNondelivery {
+                inventory_unavailable: Some(error),
+                ..
+            } => Some(&**error),
+            _ => None,
+        }
+    }
+}
 
 impl Supervisor {
     pub fn new(store: Store, transcripts_root: std::path::PathBuf) -> Self {
@@ -305,7 +380,7 @@ impl Supervisor {
             .map_err(|_| anyhow!("process inventory test seam lock poisoned"))?
             .clone()
         {
-            bail!("{reason}")
+            return Err(ProcessInventoryUnavailable(anyhow!("{reason}")).into());
         }
         process_inventory()
     }
@@ -372,7 +447,9 @@ impl Supervisor {
             .mark_session_spawning(session_id, transcript_epoch, &boot_identity)
             .context("persist native spawn intent")
             .map_err(SpawnFailure::proven)?;
-        let spawn_baseline = process_inventory();
+        let spawn_baseline = self
+            .process_inventory()
+            .map_err(SpawnFailure::inventory_unavailable)?;
         let mut child = pair
             .slave
             .spawn_command(launch.command(&anchor_path))
@@ -502,7 +579,7 @@ impl Supervisor {
                             reason,
                         )
                     } else {
-                        self.classify_pidless_spawn_failure(child.as_mut(), spawn_baseline, reason)
+                        self.classify_pidless_spawn_failure(child.as_mut(), &spawn_baseline, reason)
                     });
                 }
                 Ok(None) => {}
@@ -519,7 +596,7 @@ impl Supervisor {
                 if child_pid.is_none() {
                     return Err(self.classify_pidless_spawn_failure(
                         child.as_mut(),
-                        spawn_baseline,
+                        &spawn_baseline,
                         "launch wrapper exposed neither its durable anchor nor a portable PID",
                     ));
                 }
@@ -577,7 +654,7 @@ impl Supervisor {
                     child.as_mut(),
                     Some(leader_pid),
                     Some(process_group_id),
-                    error,
+                    format!("{error:#}"),
                 ))
             }
         };
@@ -607,7 +684,7 @@ impl Supervisor {
                 ));
             }
         };
-        if leader_start != leader_anchor.native_start_marker {
+        if !same_process_start(&leader_start, &leader_anchor.native_start_marker) {
             return Err(self.classify_spawn_failure(
                 child.as_mut(),
                 Some(leader_pid),
@@ -626,7 +703,7 @@ impl Supervisor {
                 ));
             }
         };
-        if native_start_marker != provider_anchor.native_start_marker {
+        if !same_process_start(&native_start_marker, &provider_anchor.native_start_marker) {
             return Err(self.classify_spawn_failure(
                 child.as_mut(),
                 Some(leader_pid),
@@ -840,7 +917,8 @@ impl Supervisor {
         let before = process_inventory();
         if let Ok(inventory) = &before {
             for process in discover_processes(root_pid, safe_group, inventory, &[]) {
-                if native_start_marker(process.pid).ok().as_deref() == Some(process.start.as_str())
+                if native_start_marker(process.pid)
+                    .is_ok_and(|start| same_process_start(&start, &process.start))
                     && process.pgid != unsafe { libc::getpgrp() }
                 {
                     let _ = unsafe { libc::kill(process.pid as libc::pid_t, libc::SIGKILL) };
@@ -908,23 +986,25 @@ impl Supervisor {
         SpawnFailure::ProvenNondelivery {
             reason,
             owned_process_state,
+            inventory_unavailable: None,
         }
     }
 
     fn classify_pidless_spawn_failure(
         &self,
         child: &mut dyn portable_pty::Child,
-        baseline: Result<Vec<ProcessInfo>>,
+        baseline: &[ProcessInfo],
         error: impl std::fmt::Display,
     ) -> SpawnFailure {
         let reason = error.to_string();
-        let before = process_inventory();
-        let mut observed = match (&baseline, &before) {
-            (Ok(baseline), Ok(inventory)) => newly_spawned_service_descendants(baseline, inventory),
-            _ => Vec::new(),
+        let mut observed = match process_inventory() {
+            Ok(inventory) => newly_spawned_service_descendants(baseline, &inventory),
+            Err(_) => Vec::new(),
         };
         for process in &observed {
-            if native_start_marker(process.pid).ok().as_deref() == Some(process.start.as_str()) {
+            if native_start_marker(process.pid)
+                .is_ok_and(|start| same_process_start(&start, &process.start))
+            {
                 let _ = unsafe { libc::kill(process.pid as libc::pid_t, libc::SIGKILL) };
             }
         }
@@ -960,8 +1040,91 @@ impl Supervisor {
     }
 
     pub fn reconcile(&self) -> Result<()> {
-        self.store.reconcile_exited_runtime_probes()?;
+        match self.reconcile_attached()? {
+            AttachedReconciliation::Complete { .. } => Ok(()),
+            AttachedReconciliation::LiveRootUnverified(error) => Err(error),
+        }
+    }
+
+    /// Persists the same exits and ambiguity as `reconcile`. With nothing
+    /// attached it reads the table once, since no attached read proved it readable.
+    pub(crate) fn reconcile_inventory(&self) -> Result<ProcessInventory> {
+        Ok(match self.reconcile_attached()? {
+            AttachedReconciliation::Complete {
+                attached: true,
+                unavailable: None,
+            } => ProcessInventory::Observed,
+            AttachedReconciliation::Complete {
+                attached: false,
+                unavailable: None,
+            } => match self.process_inventory() {
+                Ok(_) => ProcessInventory::Observed,
+                Err(error) => ProcessInventory::Unavailable(error),
+            },
+            AttachedReconciliation::Complete {
+                unavailable: Some(error),
+                ..
+            }
+            | AttachedReconciliation::LiveRootUnverified(error) => {
+                ProcessInventory::Unavailable(error)
+            }
+        })
+    }
+
+    /// One reconciliation and one fresh inventory. Any inventory failure is
+    /// reported as unknown rather than as an error or an empty session list.
+    pub(crate) fn session_inventory(&self) -> Result<SessionInventory> {
+        Ok(match self.observe_attached_sessions()? {
+            Ok(active) => SessionInventory::Observed(active),
+            Err(error) => SessionInventory::Unknown {
+                attached: self.attached_session_ids()?,
+                reason: format!("{error:#}"),
+            },
+        })
+    }
+
+    /// The inner error is the unavailable process table; the outer one is any
+    /// other reconciliation failure.
+    fn observe_attached_sessions(&self) -> Result<Result<Vec<String>>> {
+        if let AttachedReconciliation::Complete {
+            unavailable: Some(error),
+            ..
+        }
+        | AttachedReconciliation::LiveRootUnverified(error) = self.reconcile_attached()?
+        {
+            return Ok(Err(error));
+        }
+        let inventory = match self.process_inventory() {
+            Ok(inventory) => inventory,
+            Err(error) => return Ok(Err(error)),
+        };
+        let mut active = Vec::new();
         for handle in self.handles()? {
+            self.observe_members(&handle, &inventory)?;
+            if !self.remaining_members(&handle, &inventory)?.is_empty() {
+                active.push(handle.session_id.clone());
+            }
+        }
+        Ok(Ok(active))
+    }
+
+    /// Sessions this boot holds handles for, read without process inventory.
+    pub(crate) fn attached_session_ids(&self) -> Result<Vec<String>> {
+        let mut sessions = self
+            .handles()?
+            .iter()
+            .map(|handle| handle.session_id.clone())
+            .collect::<Vec<_>>();
+        sessions.sort();
+        Ok(sessions)
+    }
+
+    fn reconcile_attached(&self) -> Result<AttachedReconciliation> {
+        self.store.reconcile_exited_runtime_probes()?;
+        let mut unavailable = None;
+        let handles = self.handles()?;
+        let attached = !handles.is_empty();
+        for handle in handles {
             let child_exit = handle
                 .child
                 .lock()
@@ -971,18 +1134,15 @@ impl Supervisor {
                 Ok(inventory) => inventory,
                 Err(error) => {
                     let Some(status) = child_exit.as_ref() else {
-                        return Err(error);
+                        return Ok(AttachedReconciliation::LiveRootUnverified(error));
                     };
-                    if service_stop_is_settling(
+                    if !service_stop_is_settling(
                         *handle
                             .first_stop_requested_at
                             .lock()
                             .map_err(|_| anyhow!("session stop-state lock poisoned"))?,
                         std::time::Instant::now(),
-                    ) {
-                        continue;
-                    }
-                    if self.store.session_json(&handle.session_id)?["status"].as_str()
+                    ) && self.store.session_json(&handle.session_id)?["status"].as_str()
                         != Some("recovery_required")
                     {
                         self.store.mark_session_delivery_ambiguous(
@@ -992,6 +1152,7 @@ impl Supervisor {
                             ),
                         )?;
                     }
+                    unavailable = Some(error);
                     continue;
                 }
             };
@@ -1050,7 +1211,10 @@ impl Supervisor {
             }
         }
         self.reconcile_interrupt_deadlines()?;
-        Ok(())
+        Ok(AttachedReconciliation::Complete {
+            attached,
+            unavailable,
+        })
     }
 
     fn reconcile_interrupt_deadlines(&self) -> Result<()> {
@@ -1608,7 +1772,7 @@ impl Supervisor {
         )
         .context("parse durable managed process identity")?;
         let observed = native_start_marker(process.pid)?;
-        if observed != process.native_start_marker {
+        if !same_process_start(&observed, &process.native_start_marker) {
             bail!(
                 "PID {} no longer matches the durable managed process start identity",
                 process.pid
@@ -1738,16 +1902,7 @@ impl Supervisor {
     }
 
     pub fn active_session_ids(&self) -> Result<Vec<String>> {
-        self.reconcile()?;
-        let inventory = process_inventory()?;
-        let mut active = Vec::new();
-        for handle in self.handles()? {
-            self.observe_members(&handle, &inventory)?;
-            if !self.remaining_members(&handle, &inventory)?.is_empty() {
-                active.push(handle.session_id.clone());
-            }
-        }
-        Ok(active)
+        self.observe_attached_sessions()?
     }
 
     pub fn peer_is_managed_or_descendant(&self, peer: &PeerProcessIdentity) -> Result<bool> {
@@ -1855,7 +2010,7 @@ impl Supervisor {
                 .get(&current)
                 .ok_or_else(|| anyhow!("role peer ancestry became unknown at PID {current}"))?;
             if process.pid == handle.process.pid
-                && process.start == handle.process.native_start_marker
+                && same_process_start(&process.start, &handle.process.native_start_marker)
             {
                 rooted = true;
                 break;
@@ -2016,7 +2171,7 @@ impl Supervisor {
 
     fn verify_process(&self, handle: &SessionHandle) -> Result<()> {
         let observed = native_start_marker(handle.process.pid)?;
-        if observed != handle.process.native_start_marker {
+        if !same_process_start(&observed, &handle.process.native_start_marker) {
             bail!(
                 "PID {} no longer matches recorded process start identity",
                 handle.process.pid
@@ -2043,6 +2198,11 @@ impl Supervisor {
             .iter()
             .map(|process| (process.pid, process))
             .collect::<HashMap<_, _>>();
+        let is_known = |known: &HashMap<u32, String>, process: &ProcessInfo| {
+            known
+                .get(&process.pid)
+                .is_some_and(|start| same_process_start(start, &process.start))
+        };
         let mut changed = true;
         while changed {
             changed = false;
@@ -2050,9 +2210,8 @@ impl Supervisor {
                 let in_group = process.pgid == handle.process.process_group_id;
                 let parent_known = by_pid
                     .get(&process.ppid)
-                    .and_then(|parent| known.get(&parent.pid).map(|start| start == &parent.start))
-                    .unwrap_or(false);
-                if (in_group || parent_known) && known.get(&process.pid) != Some(&process.start) {
+                    .is_some_and(|parent| is_known(&known, parent));
+                if (in_group || parent_known) && !is_known(&known, process) {
                     known.insert(process.pid, process.start.clone());
                     changed = true;
                 }
@@ -2060,7 +2219,7 @@ impl Supervisor {
         }
         let observed = inventory
             .iter()
-            .filter(|process| known.get(&process.pid) == Some(&process.start))
+            .filter(|process| is_known(&known, process))
             .cloned()
             .collect::<Vec<_>>();
         drop(known);
@@ -2094,7 +2253,7 @@ impl Supervisor {
                 process.pgid == handle.process.process_group_id
                     || known
                         .get(&process.pid)
-                        .is_some_and(|start| start == &process.start)
+                        .is_some_and(|start| same_process_start(start, &process.start))
             })
             .cloned()
             .collect())
@@ -2241,7 +2400,9 @@ where
     let Ok((current_start, current_image)) = inspect_helper(helper.pid) else {
         return Ok(false);
     };
-    if current_start != helper.start || !same_executable_image(expected_image, &current_image) {
+    if !same_process_start(&current_start, &helper.start)
+        || !same_executable_image(expected_image, &current_image)
+    {
         return Ok(false);
     }
     let mut identity = codex_helper_identity
@@ -2306,6 +2467,10 @@ pub(crate) fn native_start_marker(pid: u32) -> Result<String> {
 }
 
 fn process_inventory() -> Result<Vec<ProcessInfo>> {
+    read_process_inventory().map_err(|error| ProcessInventoryUnavailable(error).into())
+}
+
+fn read_process_inventory() -> Result<Vec<ProcessInfo>> {
     let output = Command::new("/bin/ps")
         .args(["-axo", "pid=,ppid=,pgid=,lstart=,comm="])
         .output()?;
@@ -2481,6 +2646,20 @@ mod tests {
             .with_synthetic_compatibility_for_tests("{}", "{}");
         let transcripts = root.join("transcripts");
         let supervisor = Supervisor::new(store, transcripts.clone());
+        let error = supervisor
+            .spawn(
+                "fixture-session",
+                "fixture-generation",
+                "fixture-epoch",
+                &fixture_launch(&root),
+            )
+            .unwrap_err();
+        assert!(error.reason().contains("synthetic compatibility context"));
+        assert!(!transcripts.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn fixture_launch(cwd: &std::path::Path) -> PreparedLaunch {
         let config = crate::domain::LaunchConfig {
             provider: Provider::Codex,
             role: crate::domain::RoleKind::Manager,
@@ -2488,7 +2667,7 @@ mod tests {
             executable_version: "fixture".into(),
             model: "fixture".into(),
             effort: "fixture".into(),
-            cwd: root.clone(),
+            cwd: cwd.to_path_buf(),
             argv: Vec::new(),
             environment_keys: Vec::new(),
             permission_policy: "fixture".into(),
@@ -2497,24 +2676,13 @@ mod tests {
             capability_status: crate::domain::CapabilityStatus::Unverified,
             compatibility: None,
         };
-        let launch = PreparedLaunch {
+        PreparedLaunch {
             config,
             executable: "/fixture/no-native-process".into(),
             arguments: Vec::new(),
             environment: Vec::new(),
             supervision_executable: "/fixture/no-wrapper".into(),
-        };
-        let error = supervisor
-            .spawn(
-                "fixture-session",
-                "fixture-generation",
-                "fixture-epoch",
-                &launch,
-            )
-            .unwrap_err();
-        assert!(error.reason().contains("synthetic compatibility context"));
-        assert!(!transcripts.exists());
-        std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[derive(Debug)]
@@ -2613,6 +2781,33 @@ mod tests {
             &managed_members,
         )
         .unwrap());
+    }
+
+    #[test]
+    fn padded_ps_start_markers_own_their_inventory_rows_but_not_other_starts() {
+        let inventory = vec![
+            process(10, 1, "Thu Oct 1 03:59:16 2026"),
+            process(20, 10, "Thu Oct 1 03:59:17 2026"),
+        ];
+        let peer = PeerProcessIdentity::new(20, "Thu Oct  1 03:59:17 2026".into()).unwrap();
+        let recorded_root = HashMap::from([(10, "Thu Oct  1 03:59:16 2026".to_owned())]);
+        assert!(
+            peer_matches_managed_identity_or_descendant(&peer, &inventory, &recorded_root).unwrap()
+        );
+        let reused_root = HashMap::from([(10, "Thu Oct  1 03:59:15 2026".to_owned())]);
+        assert!(
+            !peer_matches_managed_identity_or_descendant(&peer, &inventory, &reused_root).unwrap()
+        );
+        let replaced_peer =
+            PeerProcessIdentity::new(20, "Thu Oct  1 03:59:18 2026".into()).unwrap();
+        assert!(peer_matches_managed_identity_or_descendant(
+            &replaced_peer,
+            &inventory,
+            &recorded_root
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("control peer changed before ancestry validation"));
     }
 
     #[test]
@@ -2924,7 +3119,7 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        let nonexpired = supervisor.reconcile().unwrap_err().to_string();
+        let nonexpired = format!("{:#}", supervisor.reconcile().unwrap_err());
         assert!(nonexpired.contains("fixture inventory unavailable"));
         {
             let connection = store.lock().unwrap();
@@ -2978,10 +3173,7 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        assert!(supervisor
-            .reconcile()
-            .unwrap_err()
-            .to_string()
+        assert!(format!("{:#}", supervisor.reconcile().unwrap_err())
             .contains("fixture inventory unavailable"));
         let connection = store.lock().unwrap();
         assert_eq!(
@@ -2996,6 +3188,217 @@ mod tests {
         );
         assert_eq!(kill_count.load(std::sync::atomic::Ordering::SeqCst), 0);
         drop(connection);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unknown_inventory_keeps_database_work_and_truthful_drain_without_process_actions() {
+        let root = std::env::temp_dir().join(format!(
+            "agenticjira-unknown-inventory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = crate::config::InstancePaths::resolve(Some(root.clone())).unwrap();
+        paths.create().unwrap();
+        let store = Store::open(&paths.database).unwrap();
+        let app = crate::operations::Application::new(
+            paths,
+            store.clone(),
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        {
+            let connection = store.lock().unwrap();
+            connection.execute_batch(
+                "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+                   VALUES('p','Project','/tmp/project','identity','base','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO tasks(id,project_id,title,description,acceptance_criteria_json,lifecycle,attention,created_at,updated_at)
+                   VALUES('t','p','Task','Task','[]','in_progress','none','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+                   VALUES('a','t','context','planning','base',1,'running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+                   VALUES('g','a','manager','codex',1,1,'running','authority','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,
+                   transcript_epoch,native_session_id,created_at,updated_at)
+                   VALUES('s','g','codex','running','{}','fixture','epoch','native',
+                   '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+                   VALUES('pause-after-role','a','pause_after_role','requested',1,'{}','2026-01-01T00:00:01Z','2026-01-01T00:00:01Z'),
+                         ('cancel-now','a','cancel','requested',1,'{}','2026-01-01T00:00:02Z','2026-01-01T00:00:02Z');",
+            )
+            .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO permission_requests(id,hook_invocation_nonce,connection_nonce,provider,
+                       project_id,task_id,attempt_id,session_id,role_generation_id,role,service_boot_id,
+                       native_session_id,cwd,policy_fingerprint,tool_name,input_digest,input_json,
+                       created_at,deadline_at,state,updated_at)
+                     VALUES('permission','hook-nonce','connection-nonce','codex','p','t','a','s','g',
+                       'manager',?1,'native','/tmp/project','policy','Bash','digest','{}',
+                       '2026-01-01T00:00:00Z','2026-01-01T00:00:05Z','pending','2026-01-01T00:00:00Z')",
+                    rusqlite::params![app.service_boot_id()],
+                )
+                .unwrap();
+        }
+        // With nothing attached the table must still be read, so a launch is
+        // refused before any process exists and ends as an ordinary failed launch.
+        app.supervisor
+            .fail_process_inventory_for_tests(Some("fixture inventory unavailable"));
+        assert!(matches!(
+            app.supervisor.reconcile_inventory().unwrap(),
+            ProcessInventory::Unavailable(_)
+        ));
+        let unattached = app.drain_status().unwrap();
+        assert_eq!(unattached["quiescent"], false);
+        assert_eq!(unattached["process_inventory"]["state"], "unknown");
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+                   VALUES('g-launch','a','explorer','codex',1,1,'running','authority','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO sessions(id,role_generation_id,provider,status,launch_state,launch_config_json,executable_version,
+                   transcript_epoch,created_at,updated_at)
+                   VALUES('s-launch','g-launch','codex','launch_reserved','reserved','{}','fixture','launch-epoch',
+                   '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        let refused = app
+            .supervisor
+            .spawn(
+                "s-launch",
+                "g-launch",
+                "launch-epoch",
+                &fixture_launch(&root),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            refused,
+            SpawnFailure::ProvenNondelivery {
+                inventory_unavailable: Some(_),
+                ..
+            }
+        ));
+        store
+            .update_session_launch_failed("s-launch", refused.reason())
+            .unwrap();
+        let refused = anyhow::Error::from(refused);
+        assert!(refused
+            .chain()
+            .any(|cause| cause.is::<ProcessInventoryUnavailable>()));
+        assert!(format!("{refused:#}").contains("fixture inventory unavailable"));
+        assert!(app.supervisor.attached_session_ids().unwrap().is_empty());
+        let kill_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pty = native_pty_system().openpty(PtySize::default()).unwrap();
+        let handle = Arc::new(SessionHandle {
+            session_id: "s".into(),
+            role_generation_id: "g".into(),
+            transcript_epoch: "epoch".into(),
+            process: ProcessIdentity {
+                pid: 42,
+                process_group_id: 42,
+                native_start_marker: "fixture-start".into(),
+                observed_started_at: "2026-01-01T00:00:00Z".into(),
+            },
+            group_leader: ProcessGenerationAnchor {
+                pid: 42,
+                process_group_id: 42,
+                native_start_marker: "fixture-start".into(),
+                boot_identity: "linux:00000000-0000-0000-0000-000000000001".into(),
+            },
+            child: Mutex::new(Box::new(RunningChild {
+                kill_count: kill_count.clone(),
+            })),
+            input: Mutex::new(Box::new(std::io::sink())),
+            io_boundary: Mutex::new(()),
+            known_members: Mutex::new(HashMap::from([(42, "fixture-start".into())])),
+            first_stop_requested_at: Mutex::new(None),
+            codex_helper_image: None,
+            codex_helper_identity: Mutex::new(None),
+            _master: Mutex::new(pty.master),
+        });
+        app.supervisor
+            .sessions
+            .write()
+            .unwrap()
+            .insert("s".into(), handle.clone());
+        let state = || {
+            let connection = store.lock().unwrap();
+            connection
+                .query_row(
+                    "SELECT (SELECT state || ':' || delivery_state FROM permission_requests WHERE id='permission'),
+                            (SELECT group_concat(id || ':' || state,',') FROM controls),
+                            (SELECT status || ':' || COALESCE(interrupt_requested_at,'') FROM sessions WHERE id='s'),
+                            (SELECT COUNT(*) FROM recovery_records)",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+
+        // A pause after the role needs no process action, so it applies while
+        // the same tick still expires the elapsed permission deadline.
+        let paused = app.coordinator_tick().unwrap();
+        assert_eq!(paused["action"], "paused", "{paused}");
+        assert_eq!(
+            state(),
+            (
+                "expired:deny_required".to_owned(),
+                "pause-after-role:finished,cancel-now:requested".to_owned(),
+                "running:".to_owned(),
+                0
+            )
+        );
+        // Cancelling would signal the live session, so it waits for inventory
+        // instead of being dropped, completed or blamed on the attempt.
+        let deferred = format!("{:#}", app.coordinator_tick().unwrap_err());
+        assert!(
+            deferred.contains("process inventory is unavailable"),
+            "{deferred}"
+        );
+        assert!(
+            deferred.contains("fixture inventory unavailable"),
+            "{deferred}"
+        );
+        assert_eq!(
+            state(),
+            (
+                "expired:deny_required".to_owned(),
+                "pause-after-role:finished,cancel-now:requested".to_owned(),
+                "running:".to_owned(),
+                0
+            )
+        );
+        let status = app.drain_status().unwrap();
+        assert_eq!(status["quiescent"], false);
+        assert_eq!(status["process_inventory"]["state"], "unknown");
+        assert_eq!(status["active"], serde_json::json!(["s"]));
+        // Draining still records what was running but signals nothing, and its
+        // unknown entries keep every shutdown caller from treating it as done.
+        let drained = app.begin_drain().unwrap();
+        assert_eq!(drained["process_inventory"]["state"], "unknown");
+        assert_eq!(
+            drained["desired_running_captured"],
+            serde_json::json!(["s"])
+        );
+        assert_eq!(drained["interrupt_requested"], serde_json::json!([]));
+        assert_eq!(drained["active"], serde_json::json!(["s"]));
+        assert!(!drained["unknown"].as_array().unwrap().is_empty());
+        let draining = app.coordinator_tick().unwrap();
+        assert_eq!(draining["action"], "draining");
+        assert_eq!(draining["status"]["quiescent"], false);
+        assert_eq!(state().2, "running:");
+        assert!(format!("{:#}", app.supervisor.reconcile().unwrap_err())
+            .contains("fixture inventory unavailable"));
+        assert!(handle.first_stop_requested_at.lock().unwrap().is_none());
+        assert_eq!(kill_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(app);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3772,5 +4175,121 @@ mod tests {
             &executable_fingerprint(&executable).unwrap(),
             &executable_fingerprint(&std::env::current_exe().unwrap()).unwrap(),
         ));
+    }
+
+    #[test]
+    fn a_failed_guidance_reservation_releases_its_input_lease_without_writing() {
+        use std::os::unix::process::CommandExt;
+        let root = std::env::temp_dir().join(format!(
+            "agenticjira-guidance-lease-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&root.join("state.sqlite3")).unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let process = ProcessIdentity {
+            pid,
+            process_group_id: pid as i32,
+            native_start_marker: native_start_marker(pid).unwrap(),
+            observed_started_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let (session, generation, epoch) = (
+            "6f1c2b9e-3a4d-4e5f-8a7b-1c2d3e4f5a60",
+            "6f1c2b9e-3a4d-4e5f-8a7b-1c2d3e4f5a61",
+            "6f1c2b9e-3a4d-4e5f-8a7b-1c2d3e4f5a62",
+        );
+        {
+            let connection = store.lock().unwrap();
+            connection.execute_batch(&format!(
+                "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+                   VALUES('p','Project','/tmp/project','identity','base','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO tasks(id,project_id,title,description,acceptance_criteria_json,lifecycle,attention,created_at,updated_at)
+                   VALUES('t','p','Task','Task','[]','in_progress','none','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+                   VALUES('a','t','context','implementation','base',1,'running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+                   VALUES('{generation}','a','implementer','codex',1,1,'running','authority','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,
+                   transcript_epoch,readiness_state,created_at,updated_at)
+                   VALUES('{session}','{generation}','codex','running','{{}}','fixture','{epoch}','idle_candidate',
+                   '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at)
+                   VALUES('guidance','a','{generation}','Use the smaller scope','queued','2026-01-01T00:00:00Z');
+                 CREATE TRIGGER fail_guidance_reservation BEFORE UPDATE OF state ON guidance_messages
+                   WHEN NEW.state='delivery_reserved'
+                   BEGIN SELECT RAISE(ABORT,'injected guidance reservation failure'); END;"
+            ))
+            .unwrap();
+            connection
+                .execute(
+                    "UPDATE sessions SET process_identity_json=?1 WHERE id=?2",
+                    rusqlite::params![serde_json::to_string(&process).unwrap(), session],
+                )
+                .unwrap();
+        }
+        let supervisor = Supervisor::new(store.clone(), root.join("transcripts"));
+        let terminal_input = root.join("terminal-input");
+        let pty = native_pty_system().openpty(PtySize::default()).unwrap();
+        supervisor.sessions.write().unwrap().insert(
+            session.into(),
+            Arc::new(SessionHandle {
+                session_id: session.into(),
+                role_generation_id: generation.into(),
+                transcript_epoch: epoch.into(),
+                process: process.clone(),
+                group_leader: ProcessGenerationAnchor {
+                    pid,
+                    process_group_id: process.process_group_id,
+                    native_start_marker: process.native_start_marker.clone(),
+                    boot_identity: system_boot_identity().unwrap(),
+                },
+                child: Mutex::new(Box::new(RunningChild {
+                    kill_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                })),
+                input: Mutex::new(Box::new(std::fs::File::create(&terminal_input).unwrap())),
+                io_boundary: Mutex::new(()),
+                known_members: Mutex::new(HashMap::from([(
+                    pid,
+                    process.native_start_marker.clone(),
+                )])),
+                first_stop_requested_at: Mutex::new(None),
+                codex_helper_image: None,
+                codex_helper_identity: Mutex::new(None),
+                _master: Mutex::new(pty.master),
+            }),
+        );
+
+        let failed = crate::roles::RoleService::new(store.clone(), supervisor.clone())
+            .deliver_guidance("guidance")
+            .unwrap_err();
+        assert!(
+            format!("{failed:#}").contains("injected guidance reservation failure"),
+            "{failed:#}"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT g.state || ' ' || lease.owner_id || ' ' || (lease.revoked_at IS NOT NULL)
+                     FROM guidance_messages g JOIN input_leases lease ON lease.session_id=?1
+                     WHERE g.id='guidance'",
+                    rusqlite::params![session],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "queued guidance:guidance 1"
+        );
+        assert!(std::fs::read(&terminal_input).unwrap().is_empty());
+        // Nothing still owns the terminal, so a person can take input at once.
+        supervisor.acquire_input(session, "human", 30).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 }

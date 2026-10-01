@@ -4796,7 +4796,7 @@ fn m5_decision_tick_state_parity_and_canonical_audit_ignore_volatile_updates() {
 }
 
 #[test]
-fn m5_post_selection_refresh_audits_later_fallback_after_response_slots_fill() {
+fn m5_capability_hold_ends_its_tick_and_is_audited_after_response_slots_fill() {
     let fixture = Fixture::new("m5-post-selection-refresh");
     let project = add_project(
         &fixture,
@@ -4889,13 +4889,26 @@ fn m5_post_selection_refresh_audits_later_fallback_after_response_slots_fill() {
             .unwrap()
     };
     let before = durable_counts();
+    let committed_actions = || {
+        fixture.scalar::<i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE event_code='coordinator.action.committed'",
+        )
+    };
 
-    let first = app.coordinator_tick().unwrap();
-    assert_eq!(first["action"], "held");
-    assert_eq!(first["attempt_id"], "visible-slot-attempt");
+    // Recording the later attempt's capability hold is the tick's one action.
+    let recorded = app.coordinator_tick().unwrap();
     assert_eq!(
-        first["decision"]["reason_code"],
-        "workflow.manager_control_active"
+        (
+            recorded["action"].as_str(),
+            recorded["reason"].as_str(),
+            recorded["attempt_id"].as_str()
+        ),
+        (
+            Some("held"),
+            Some("agent_profile_unverified"),
+            Some(later.attempt_id.as_str())
+        ),
+        "{recorded}"
     );
     let later_attention: String = fixture
         .connection()
@@ -4906,7 +4919,7 @@ fn m5_post_selection_refresh_audits_later_fallback_after_response_slots_fill() {
         )
         .unwrap();
     assert_eq!(later_attention, "blocked");
-    assert_eq!(later_hold_audits(), 1);
+    assert_eq!(later_hold_audits(), 0);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM audit_events
          WHERE event_code='decision.explanation.changed' AND entity_id='fallback-slot-task'
@@ -4919,17 +4932,25 @@ fn m5_post_selection_refresh_audits_later_fallback_after_response_slots_fill() {
         "SELECT COUNT(*) FROM launch_permits WHERE state='released_nondelivery'",
         1,
     );
-    fixture.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM audit_events WHERE event_code='coordinator.action.committed'",
-        0,
-    );
+    assert_eq!(committed_actions(), 1);
 
+    // Later ticks only observe that hold: it is audited once while the visible
+    // wait keeps its response slot.
+    let first = app.coordinator_tick().unwrap();
+    assert_eq!(first["action"], "held");
+    assert_eq!(first["attempt_id"], "visible-slot-attempt");
+    assert_eq!(
+        first["decision"]["reason_code"],
+        "workflow.manager_control_active"
+    );
+    assert_eq!(later_hold_audits(), 1);
     let second = app.coordinator_tick().unwrap();
     assert_eq!(second["attempt_id"], first["attempt_id"]);
     assert_eq!(second["decision"], first["decision"]);
     assert_eq!(later_hold_audits(), 1);
     assert_eq!(durable_counts(), before);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM launch_permits", 1);
+    assert_eq!(committed_actions(), 1);
 }
 
 #[test]
@@ -10753,7 +10774,44 @@ fn m4b_continue_rejects_post_request_ownership_uncertainty() {
             params![task], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?)),
         ).unwrap();
         assert_eq!(after, before);
-        assert_eq!(app.coordinator_tick().unwrap()["action"], "idle", "{cause}");
+        // The follow-up tick still starts nothing: it records why the attempt is held
+        // as its one action, and the uncertain ownership stays exactly as it was.
+        let followup = app.coordinator_tick().unwrap();
+        assert_eq!(
+            (
+                followup["action"].as_str(),
+                followup["reason"].as_str(),
+                followup["attempt_id"].as_str(),
+                followup["hold_recorded"].as_bool()
+            ),
+            (
+                Some("held"),
+                Some("agent_profile_unverified"),
+                Some(plan.attempt_id.as_str()),
+                Some(true)
+            ),
+            "{cause}: {followup}"
+        );
+        fixture.assert_scalar::<String>(
+            &format!(
+                "SELECT t.attention||':'||a.status||':'||(
+                   SELECT json_extract(e.detail_json,'$.reason') FROM audit_events e
+                    WHERE e.event_code='attempt.attention.changed' AND e.entity_id=a.id
+                    ORDER BY e.created_at DESC,e.rowid DESC LIMIT 1)
+                 FROM tasks t JOIN attempts a ON a.task_id=t.id WHERE a.id='{}'",
+                plan.attempt_id
+            ),
+            "blocked:needs_input:agent_profile_unverified".into(),
+        );
+        fixture.assert_scalar::<i64>(
+            &format!(
+                "SELECT (SELECT COUNT(*) FROM role_generations WHERE attempt_id='{0}')
+                      + (SELECT COUNT(*) FROM sessions s JOIN role_generations rg
+                          ON rg.id=s.role_generation_id WHERE rg.attempt_id='{0}')",
+                plan.attempt_id
+            ),
+            0,
+        );
         match cause {
             "claim_unknown" => fixture.assert_scalar::<String>(
                 "SELECT state FROM claims WHERE attempt_id=(SELECT id FROM attempts LIMIT 1)",
@@ -14115,7 +14173,10 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
         checks_version,
     );
-    assert_eq!(handoff_app.coordinator_tick().unwrap()["action"], "idle");
+    assert_eq!(
+        handoff_app.coordinator_tick().unwrap()["reason"],
+        "manager_conformance_or_lane_yield_missing"
+    );
     handoff.assert_scalar::<String>(
         "SELECT attention FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
         "needs_input".into(),
@@ -14867,8 +14928,10 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         "SELECT id FROM guidance_messages WHERE role_generation_id='parallel-manager-generation' AND body LIKE '%exact ordered integration request%'",
     );
     parallel.execute(
-        "UPDATE guidance_messages SET state='submitted' WHERE id=?1",
-        params![integration_notice],
+        "UPDATE guidance_messages SET state='submitted',delivery_session_id=?2,
+           delivery_transcript_epoch=(SELECT transcript_epoch FROM sessions WHERE id=?2)
+         WHERE id=?1",
+        params![integration_notice, manager.session_id],
     );
     assert_eq!(
         parallel
@@ -16898,6 +16961,50 @@ fn t05_unknown_claim_cannot_be_replaced_or_cleared_by_human_text() {
         &[(412, 410, "unproven-member".into())],
     )
     .is_err());
+    // `ps -p` keeps the padded single-digit day that the parsed inventory collapses.
+    let padded_start = "Thu Oct  1 03:59:16 2026";
+    let padded_leader = ProcessGenerationAnchor {
+        native_start_marker: padded_start.into(),
+        ..leader.clone()
+    };
+    let live_inventory =
+        recovery::parse_process_inventory(b"410 410 Thu Oct  1 03:59:16 2026\n").unwrap();
+    for (recorded, still_live) in [
+        (
+            vec![(410, padded_start.to_owned(), 410)],
+            "identities remain live",
+        ),
+        (Vec::new(), "generation anchor remains live"),
+    ] {
+        let refused = recovery::verify_generation_absent_evidence(
+            "check",
+            "padded-live-leader",
+            &recorded,
+            Some(410),
+            Some(&padded_leader),
+            Some(&current_boot),
+            &current_boot,
+            &live_inventory,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains(still_live), "{refused}");
+    }
+    let replaced = recovery::verify_generation_absent_evidence(
+        "check",
+        "padded-replaced-leader",
+        &[(410, padded_start.to_owned(), 410)],
+        Some(410),
+        Some(&padded_leader),
+        Some(&current_boot),
+        &current_boot,
+        &recovery::parse_process_inventory(b"410 410 Thu Oct  1 03:59:17 2026\n").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        replaced["source"],
+        "process_group_leader_generation_replaced"
+    );
     assert!(recovery::parse_process_inventory(b"").is_err());
     assert!(
         recovery::parse_process_inventory(b"410 410 Mon Jan 01 00:00:00 2026\npartial-row\n",)
@@ -19675,6 +19782,247 @@ fn m5_restart_due_capacity_failures_and_recovery_writers_preserve_authority() {
         .unwrap();
     assert_eq!(graceful.next_action.as_ref().unwrap().operation, "continue");
     assert!(graceful.next_action.as_ref().unwrap().enabled);
+
+    // Setup sessions and fresh-only final verifiers are refused at admission, and an admission
+    // that lost its exact authority is refused before any resume reservation, credential or spawn.
+    // Its own proven nondelivery becomes a manual blocked decision; a newer owner is left alone.
+    let parked_candidate: (String, String) = fixture
+        .connection()
+        .query_row(
+            "SELECT state,result_json FROM restart_candidates WHERE session_id='capacity-session-2'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let parked_attempt: (String, String) = fixture
+        .connection()
+        .query_row(
+            "SELECT a.status,t.attention FROM attempts a JOIN tasks t ON t.id=a.task_id
+             WHERE a.id='capacity-attempt-2'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let after_admission = |write: &str| {
+        format!(
+            "CREATE TRIGGER supersede_admission AFTER UPDATE OF state ON restart_candidates
+             WHEN NEW.session_id='capacity-session-2' AND NEW.state='admitting'
+             BEGIN {write} END;"
+        )
+    };
+    let unreserved_stale =
+        "exact restart authority changed before the resume was reserved; nothing was delivered and a human decision is required";
+    for (operation, change, state, reason, after, decision) in [
+        (
+            "setup-session-admission",
+            "UPDATE sessions SET validation_cell='trip_setup_discovery' WHERE id='capacity-session-2';"
+                .to_owned(),
+            "blocked",
+            "isolated validation sessions are never restored",
+            "blocked restart_parked/restart_parked -",
+            None,
+        ),
+        (
+            "final-verifier-admission",
+            "UPDATE role_generations SET role='final_verifier' WHERE id='capacity-generation-2';"
+                .to_owned(),
+            "blocked",
+            "final verifier sessions are always fresh and cannot resume",
+            "blocked restart_parked/restart_parked -",
+            None,
+        ),
+        (
+            "replaced-admission",
+            after_admission(
+                "UPDATE restart_candidates
+                 SET result_json=json_set(result_json,'$.llmrelay_restart_v1.admission.id','newer-admission')
+                 WHERE session_id=NEW.session_id;",
+            ),
+            "stale_outcome_ignored",
+            "newer restart authority replaced this admission",
+            "admitting running/none newer-admission",
+            None,
+        ),
+        (
+            "task-changed-after-admission",
+            after_admission("UPDATE tasks SET version=version+1 WHERE id=NEW.task_id;"),
+            "blocked",
+            unreserved_stale,
+            "blocked restart_parked/restart_parked -",
+            Some(("continue", true)),
+        ),
+    ] {
+        fixture.execute_batch(&change);
+        let refused = reopened
+            .resume_restart_sessions(operation, Some(&["capacity-session-2".to_owned()]))
+            .unwrap();
+        assert_eq!(
+            (&refused["outcomes"][0]["state"], &refused["outcomes"][0]["reason"]),
+            (&serde_json::json!(state), &serde_json::json!(reason)),
+            "{operation}: {refused}"
+        );
+        fixture.assert_scalar::<String>(
+            "SELECT s.status||':'||s.resume_count||':'||rg.status||':'||
+                    (SELECT COUNT(*) FROM resume_invocations ri WHERE ri.session_id=s.id)||':'||
+                    (SELECT COUNT(*) FROM role_credentials rc WHERE rc.role_generation_id=rg.id)
+             FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
+             WHERE s.id='capacity-session-2'",
+            "exited:0:exited:0:0".into(),
+        );
+        assert_eq!(
+            fixture.scalar::<String>(
+                "SELECT rc.state||' '||a.status||'/'||t.attention||' '||
+                        COALESCE(json_extract(rc.result_json,'$.llmrelay_restart_v1.admission.id'),'-')
+                 FROM restart_candidates rc JOIN attempts a ON a.id=rc.attempt_id
+                 JOIN tasks t ON t.id=a.task_id WHERE rc.session_id='capacity-session-2'"
+            ),
+            after,
+            "{operation}"
+        );
+        if let Some((next_operation, enabled)) = decision {
+            let projection = workflow::state(&fixture.store).unwrap();
+            let blocked = projection
+                .decisions
+                .iter()
+                .find(|decision| {
+                    decision.subject.session_id.as_deref() == Some("capacity-session-2")
+                })
+                .unwrap();
+            assert_eq!(
+                blocked.reason_code, "restart.admission_authority_stale",
+                "{operation}"
+            );
+            let next = blocked.next_action.as_ref().unwrap();
+            assert_eq!(
+                (next.operation.as_str(), next.enabled),
+                (next_operation, enabled),
+                "{operation}"
+            );
+        }
+        fixture.execute_batch(
+            "DROP TRIGGER IF EXISTS supersede_admission;
+             UPDATE sessions SET validation_cell=NULL WHERE id='capacity-session-2';
+             UPDATE role_generations SET role='manager' WHERE id='capacity-generation-2';",
+        );
+        fixture.execute(
+            "UPDATE restart_candidates SET state=?1,result_json=?2 WHERE session_id='capacity-session-2'",
+            params![parked_candidate.0, parked_candidate.1],
+        );
+        fixture.execute(
+            "UPDATE attempts SET status=?1 WHERE id='capacity-attempt-2'",
+            params![parked_attempt.0],
+        );
+        fixture.execute(
+            "UPDATE tasks SET attention=?1 WHERE id='capacity-task-2'",
+            params![parked_attempt.1],
+        );
+    }
+
+    // A newer Pause owns this attempt: the stale admission is blocked, the Pause completes with
+    // no restart, and a later Continue releases the hold for a fresh dispatch only. The receipt
+    // is the admission's last write, so this Pause follows the admission's own task writes.
+    fixture.execute_batch(
+        "CREATE TRIGGER supersede_admission AFTER INSERT ON operation_receipts
+         WHEN NEW.operation_id='pause-requested-after-admission'
+         BEGIN
+           INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+           VALUES('pause-after-admission','capacity-attempt-2','pause_now','requested',1,'{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+           UPDATE tasks SET attention='pause_requested',version=version+1 WHERE id='capacity-task-2';
+         END;",
+    );
+    let refused = reopened
+        .resume_restart_sessions(
+            "pause-requested-after-admission",
+            Some(&["capacity-session-2".to_owned()]),
+        )
+        .unwrap();
+    fixture.execute_batch("DROP TRIGGER supersede_admission;");
+    assert_eq!(
+        (
+            &refused["outcomes"][0]["state"],
+            &refused["outcomes"][0]["reason"]
+        ),
+        (
+            &serde_json::json!("blocked"),
+            &serde_json::json!(unreserved_stale)
+        ),
+        "{refused}"
+    );
+    let sessions = fixture.scalar::<i64>("SELECT COUNT(*) FROM sessions");
+    let restart_state = || {
+        fixture.scalar::<String>(
+            "SELECT rc.state||' '||a.status||'/'||t.attention||' '||s.status||':'||s.resume_count
+                    ||':'||s.desired_running||' '||(SELECT COUNT(*) FROM resume_invocations ri
+                      WHERE ri.session_id=s.id)||':'||(SELECT COUNT(*) FROM sessions)
+             FROM restart_candidates rc JOIN attempts a ON a.id=rc.attempt_id
+             JOIN tasks t ON t.id=a.task_id JOIN sessions s ON s.id=rc.session_id
+             WHERE rc.session_id='capacity-session-2'",
+        )
+    };
+    assert_eq!(
+        restart_state(),
+        format!("blocked running/pause_requested exited:0:1 0:{sessions}")
+    );
+    let projection = workflow::state(&fixture.store).unwrap();
+    let blocked = projection
+        .decisions
+        .iter()
+        .find(|decision| decision.subject.session_id.as_deref() == Some("capacity-session-2"))
+        .unwrap();
+    assert_eq!(blocked.reason_code, "restart.admission_authority_stale");
+    let next = blocked.next_action.as_ref().unwrap();
+    assert_eq!(
+        (next.operation.as_str(), next.enabled),
+        ("refresh_and_reconcile", false)
+    );
+    let paused = reopened.coordinator_tick().unwrap();
+    assert_eq!(
+        (paused["action"].as_str(), paused["control_id"].as_str()),
+        (Some("pause_now"), Some("pause-after-admission")),
+        "{paused}"
+    );
+    assert_eq!(
+        restart_state(),
+        format!("blocked held/paused exited:0:1 0:{sessions}")
+    );
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: "continue-after-stale-admission".into(),
+            task_id: "capacity-task-2".into(),
+            expected_version: fixture
+                .scalar::<i64>("SELECT version FROM tasks WHERE id='capacity-task-2'"),
+            action: "continue".into(),
+            payload: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    // The fixture's older startup Continue is applied first, then this one.
+    for _ in 0..2 {
+        let continued = reopened.coordinator_tick().unwrap();
+        assert_eq!(continued["action"], "continued", "{continued}");
+    }
+    assert_eq!(
+        restart_state(),
+        format!("released_fresh_dispatch running/none exited:0:0 0:{sessions}")
+    );
+    fixture.execute(
+        "UPDATE restart_candidates SET state=?1,result_json=?2 WHERE session_id='capacity-session-2'",
+        params![parked_candidate.0, parked_candidate.1],
+    );
+    fixture.execute(
+        "UPDATE sessions SET desired_running=1 WHERE id='capacity-session-2'",
+        [],
+    );
+    fixture.execute(
+        "UPDATE attempts SET status=?1 WHERE id='capacity-attempt-2'",
+        params![parked_attempt.0],
+    );
+    fixture.execute(
+        "UPDATE tasks SET attention=?1 WHERE id='capacity-task-2'",
+        params![parked_attempt.1],
+    );
+
     let resumed = reopened
         .resume_restart_sessions("capacity-success", Some(&["capacity-session-2".to_owned()]))
         .unwrap();
@@ -19683,6 +20031,62 @@ fn m5_restart_due_capacity_failures_and_recovery_writers_preserve_authority() {
         &fixture.database,
         "capacity-session-2",
         "resumed:capacity-batch:completed:0:1:capacity-2",
+    );
+
+    // Only the admitted host-restart turn carries the notice, ahead of the byte-identical
+    // original prompt; a later ordinary resume of the same native session carries none.
+    let host_restart_notice = "LLMRelay restarted while this session was running and interrupted its previous turn. Before repeating any command, edit or report that may already have been in flight, check its actual effect; do not assume it did or did not happen. The task instructions below are unchanged.";
+    let delivered = |ordinal: i64| -> (Vec<String>, String) {
+        let (launch, capability_key): (String, String) = fixture
+            .connection()
+            .query_row(
+                "SELECT launch_config_json,capability_key FROM resume_invocations
+                 WHERE session_id='capacity-session-2' AND resume_ordinal=?1",
+                params![ordinal],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let launch: serde_json::Value = serde_json::from_str(&launch).unwrap();
+        (
+            serde_json::from_value(launch["argv"].clone()).unwrap(),
+            capability_key,
+        )
+    };
+    let (restart_argv, restart_key) = delivered(1);
+    fixture.execute_batch(
+        r#"UPDATE sessions SET status='exited',launch_state='finished',exit_json='{"process_group_quiescent":true}'
+           WHERE id='capacity-session-2';
+         UPDATE role_generations SET status='exited' WHERE id='capacity-generation-2';"#,
+    );
+    reopened
+        .resume_role_session("capacity-session-2", "")
+        .unwrap();
+    let (ordinary_argv, ordinary_key) = delivered(2);
+    let ordinary_turn = ordinary_argv.last().unwrap();
+    assert!(
+        ordinary_turn.starts_with(&format!("{prompt}\n\n")),
+        "{ordinary_turn}"
+    );
+    assert_eq!(
+        restart_argv.last().unwrap(),
+        &format!("{host_restart_notice}\n\n{ordinary_turn}")
+    );
+    let frozen_key: String =
+        fixture.scalar("SELECT capability_key FROM sessions WHERE id='capacity-session-2'");
+    for (argv, capability_key) in [
+        (&restart_argv, &restart_key),
+        (&ordinary_argv, &ordinary_key),
+    ] {
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["resume", "capacity-native-2"]),
+            "{argv:?}"
+        );
+        assert_eq!(capability_key, &frozen_key);
+    }
+    fixture.assert_scalar::<String>(
+        "SELECT invocation_input_json FROM sessions WHERE id='capacity-session-2'",
+        invocation_input.clone(),
     );
     drop(reopened);
     let _ = std::fs::remove_dir_all(paths.socket_dir);
@@ -22506,6 +22910,98 @@ fn t07_input_lease_excludes_guidance_and_rejects_stale_authority() {
         codex.scalar::<String>("SELECT readiness_state FROM sessions"),
         "idle_candidate"
     );
+    // The delivery reservation records the exact submitted form once; only that intact form
+    // proves native submission, and only the same current invocation may acknowledge it.
+    let original = "/compact @notes.txt";
+    let submitted = "LLMRelay task guidance (JSON-encoded string; decode to read):\n\"\\u002fcompact \\u0040notes.txt\"";
+    guidance_connection
+        .execute_batch(
+            "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,reason,created_at)
+               VALUES('enveloped-guidance','a','g','/compact @notes.txt','queued','awaiting_supported_idle_boundary','2026-01-04T00:00:00Z');
+             INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,reason,created_at,written_at,
+                 delivery_session_id,delivery_transcript_epoch,delivery_resume_invocation_id,submitted_text,submitted_digest)
+               VALUES('altered-guidance','a','g','original','written_awaiting_submit','fixture','2026-01-04T00:00:00Z',
+                 '2026-01-04T00:00:00Z','s','codex-resume-epoch','codex-resume-invocation','Altered submission','not-its-digest');",
+        )
+        .unwrap();
+    let reserve = |text: &str| {
+        codex
+            .store
+            .reserve_guidance_delivery(
+                "enveloped-guidance",
+                "s",
+                "codex-resume-epoch",
+                Some("codex-resume-invocation"),
+                text,
+            )
+            .unwrap()
+    };
+    assert!(reserve(submitted));
+    assert!(!reserve(original));
+    assert!(guidance_connection
+        .execute(
+            "UPDATE guidance_messages SET submitted_text=body WHERE id='enveloped-guidance'",
+            []
+        )
+        .is_err());
+    assert_eq!(
+        guidance_connection
+            .query_row(
+                "SELECT body||'|'||submitted_text||'|'||submitted_digest FROM guidance_messages
+                 WHERE id='enveloped-guidance' AND state='delivery_reserved'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        format!(
+            "{original}|{submitted}|{}",
+            agenticjira::store::json_hash(&submitted).unwrap()
+        )
+    );
+    // The terminal write is the one provider I/O seam this fixture lacks.
+    guidance_connection
+        .execute(
+            "UPDATE guidance_messages SET state='written_awaiting_submit',written_at='2026-01-04T00:00:01Z'
+             WHERE id='enveloped-guidance' AND state='delivery_reserved'",
+            [],
+        )
+        .unwrap();
+    submit_codex_prompt(&codex_context, original);
+    assert_eq!(
+        guidance_state("enveloped-guidance"),
+        "written_awaiting_submit"
+    );
+    submit_codex_prompt(&codex_context, "Altered submission");
+    assert_eq!(
+        guidance_state("altered-guidance"),
+        "written_awaiting_submit"
+    );
+    submit_codex_prompt(&codex_context, submitted);
+    assert_eq!(guidance_state("enveloped-guidance"), "submitted");
+    let other_session = RoleContext {
+        session_id: "other-session".into(),
+        ..codex_context.clone()
+    };
+    for (context, guidance) in [
+        (&other_session, "enveloped-guidance"),
+        (&codex_context, "terminal-lf-guidance"),
+    ] {
+        assert!(codex
+            .store
+            .acknowledge_guidance(context, guidance)
+            .unwrap_err()
+            .to_string()
+            .contains("lacks a matching native submit"));
+    }
+    assert_eq!(
+        codex
+            .store
+            .acknowledge_guidance(&codex_context, "enveloped-guidance")
+            .unwrap()["state"],
+        "acknowledged"
+    );
+    submit_codex_prompt(&codex_context, submitted);
+    assert_eq!(guidance_state("enveloped-guidance"), "acknowledged");
 
     let (permission_fixture, _paths, _project, admission) =
         authorized_runtime_fixture("t07-codex-permission-denial-readiness");
@@ -28589,6 +29085,9 @@ fn native_turn_failure_is_bound_to_the_newest_accepted_turn() {
         &item.target,
         Some(AttentionTarget::Session { session_id, .. }) if session_id == "session"
     ));
+    assert!(item
+        .reason
+        .ends_with("Open agent output to see the error and choose the next step."));
 
     // A later Stop shows the turn went on, so the failure no longer stands.
     hook("Stop", json!({"background_tasks":[],"session_crons":[]}));
@@ -28598,6 +29097,24 @@ fn native_turn_failure_is_bound_to_the_newest_accepted_turn() {
         .attention
         .iter()
         .all(|item| item.id != item_id));
+
+    // A known kind names its cause and the person's next step, and still retries nothing.
+    hook("UserPromptSubmit", json!({"prompt":"after sign-in"}));
+    let signed_out = hook("StopFailure", json!({"error":"authentication_failed"}));
+    let signed_out_id = format!(
+        "native_turn_failure:{}",
+        signed_out["hook_event_id"].as_str().unwrap()
+    );
+    let item = workflow::state(&fixture.store)
+        .unwrap()
+        .attention
+        .into_iter()
+        .find(|item| item.id == signed_out_id)
+        .unwrap();
+    assert_eq!(
+        item.reason,
+        "The provider ended the agent's turn (the provider could not authenticate the session). The session is still open, and nothing was retried or switched to another model. Sign this computer in to the provider again, then continue the agent from its output."
+    );
 }
 
 #[test]
@@ -28757,6 +29274,114 @@ fn native_prompt_is_a_current_turn_output_wait_only() {
         ));
     }
     assert_eq!(fixture.scalar::<String>(workflow_facts), before);
+}
+
+#[test]
+fn unaccepted_input_is_shown_after_its_bound_until_its_own_invocation_accepts_it() {
+    use serde_json::json;
+    let (fixture, mut context, native, workspace) =
+        trusted_implementer_hooks_fixture("unaccepted-input", Provider::Claude);
+    let hook = |context: &RoleContext, event: &str, payload: serde_json::Value| {
+        record_trusted_hook(&fixture, context, &native, &workspace, event, payload)
+    };
+    let unaccepted = || {
+        workflow::state(&fixture.store)
+            .unwrap()
+            .attention
+            .into_iter()
+            .filter(|item| {
+                item.id.starts_with("guidance_unaccepted:")
+                    || item.id.starts_with("resume_unaccepted:")
+            })
+            .collect::<Vec<_>>()
+    };
+    let ids = || {
+        unaccepted()
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>()
+    };
+    let inputs = "SELECT (SELECT group_concat(id || ':' || state, ',')
+               FROM (SELECT id,state FROM guidance_messages ORDER BY id))
+             ||'|'||(SELECT COUNT(*) FROM resume_invocations)";
+    hook(&context, "SessionStart", json!({}));
+    hook(&context, "UserPromptSubmit", json!({"prompt":"implement"}));
+    fixture.execute_batch(
+        "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,reason,created_at,written_at,delivery_session_id,delivery_transcript_epoch)
+           VALUES('recent','a','generation','Use the smaller scope','written_awaiting_submit','written_through_verified_input_lease',
+                  strftime('%Y-%m-%dT%H:%M:%SZ','now'),strftime('%Y-%m-%dT%H:%M:%SZ','now'),'session','e'),
+                 ('overdue','a','generation','Keep the public API','written_awaiting_submit','written_through_verified_input_lease',
+                  '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','session','e');",
+    );
+    let written = fixture.scalar::<String>(inputs);
+
+    // Only input past the bound is shown, under its exact guidance id.
+    let shown = unaccepted();
+    assert_eq!(
+        shown
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        ["guidance_unaccepted:overdue"]
+    );
+    assert_eq!(shown[0].action.kind, AttentionActionKind::OpenAgentOutput);
+    assert!(matches!(
+        &shown[0].target,
+        Some(AttentionTarget::Session { session_id, .. }) if session_id == "session"
+    ));
+
+    // Tool activity, another prompt and an untrusted submit are not its
+    // acceptance, and showing it changes no delivery.
+    hook(
+        &context,
+        "PostToolUse",
+        json!({"tool_use_id":"call","tool_name":"Bash","tool_input":{"command":"true"}}),
+    );
+    hook(
+        &context,
+        "UserPromptSubmit",
+        json!({"prompt":"an unrelated prompt"}),
+    );
+    record_trusted_hook(
+        &fixture,
+        &context,
+        &native,
+        "/",
+        "UserPromptSubmit",
+        json!({"prompt":"Keep the public API"}),
+    );
+    assert_eq!(ids(), ["guidance_unaccepted:overdue"]);
+    assert_eq!(fixture.scalar::<String>(inputs), written);
+
+    // Its own trusted current-invocation submit retires it.
+    hook(
+        &context,
+        "UserPromptSubmit",
+        json!({"prompt":"Keep the public API"}),
+    );
+    assert!(ids().is_empty());
+
+    // A resumed invocation is unconfirmed while only hooks from before its
+    // boundary exist, a start is not acceptance, and its own submit retires it.
+    fixture.execute_batch(
+        "UPDATE sessions SET transcript_epoch='resumed-epoch' WHERE id='session';
+         INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,launch_config_json,capability_key,capability_identity_json,state,hook_event_boundary_rowid,created_at,updated_at)
+           SELECT 'resumed','session',1,'resumed-epoch','{}','policy','{}','running',MAX(rowid),
+                  '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'
+           FROM hook_events WHERE session_id='session';",
+    );
+    context.transcript_epoch = "resumed-epoch".into();
+    assert_eq!(ids(), ["resume_unaccepted:resumed"]);
+    hook(&context, "SessionStart", json!({}));
+    assert_eq!(ids(), ["resume_unaccepted:resumed"]);
+    let resumed = fixture.scalar::<String>(inputs);
+    hook(
+        &context,
+        "UserPromptSubmit",
+        json!({"prompt":"continue the task"}),
+    );
+    assert!(ids().is_empty());
+    assert_eq!(fixture.scalar::<String>(inputs), resumed);
 }
 
 #[test]
@@ -31975,7 +32600,14 @@ args = ["--unicode"]
         let released_counts = ordinary_counts();
         let released_authority = restart_authority();
         let routing_after_release = ordinary_application.coordinator_tick().unwrap();
-        assert_eq!(routing_after_release["action"], "idle");
+        assert_eq!(
+            (
+                routing_after_release["action"].as_str(),
+                routing_after_release["reason"].as_str()
+            ),
+            (Some("held"), Some("agent_profile_unverified")),
+            "{routing_after_release}"
+        );
         ordinary.assert_scalar::<String>(
             "SELECT attention FROM tasks WHERE title='c8-k1-k2-ordinary-task'",
             "blocked".into(),
@@ -33001,11 +33633,13 @@ const STATE_UNPROJECTED_TABLES: [&str; 11] = [
     "trip_setup_reads",
 ];
 
-fn state_liveness_columns(table: &str) -> &'static [&'static str] {
+fn state_untracked_columns(table: &str) -> &'static [&'static str] {
     match table {
         "input_leases" => &["expires_at", "updated_at"],
         "session_processes" => &["last_seen_at"],
         "sessions" => &["transcript_last_sequence", "updated_at"],
+        // Delivery correlation that no projection reads, set once beside tracked columns.
+        "guidance_messages" => &["submitted_text", "submitted_digest"],
         _ => &[],
     }
 }
@@ -33048,6 +33682,11 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
     // relaxed on this connection only.
     connection
         .execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON;")
+        .unwrap();
+    // Guidance's submitted form is write-once (exercised in t07); this disposable
+    // database drops only that trigger so each column change tests the cursor alone.
+    connection
+        .execute_batch("DROP TRIGGER guidance_submitted_form_once;")
         .unwrap();
     let mut marker = 1_000_000_i64;
     for table in STATE_PROJECTED_TABLES
@@ -33118,7 +33757,7 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
                 )
                 .unwrap();
             assert_eq!(updated, 1, "{table}.{column}");
-            let semantic = projected && !state_liveness_columns(table).contains(&column.as_str());
+            let semantic = projected && !state_untracked_columns(table).contains(&column.as_str());
             assert_step(before, semantic, &format!("update {column}"));
             rowid = connection
                 .query_row(
@@ -33267,7 +33906,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
     }
     connection
         .execute_batch(&format!(
-            "{DROP_NATIVE_RESOLUTION_TABLES}
+            "{DROP_AFTER_SCHEMA_32}
          DROP TABLE final_repair_rechecks;
          DROP TABLE recipe_schedule_fires;
          DROP TABLE task_recipe_bindings;
@@ -33294,7 +33933,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 33_i64);
+    fixture.assert_scalar("PRAGMA user_version", 34_i64);
     fixture.assert_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%'",
         i64::try_from(triggers.len()).unwrap(),
@@ -33315,7 +33954,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
     fixture
         .connection()
         .execute_batch(&format!(
-            "{DROP_NATIVE_RESOLUTION_TABLES}
+            "{DROP_AFTER_SCHEMA_32}
          DROP TABLE final_repair_rechecks;
          DROP TABLE recipe_schedule_fires;
          DROP TABLE task_recipe_bindings;
@@ -33329,7 +33968,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 33_i64);
+    fixture.assert_scalar("PRAGMA user_version", 34_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -34432,6 +35071,952 @@ fn repeated_coordinator_failures_are_recorded_once_and_closed_on_recovery() {
     assert_eq!(deferrals(), (4, 1));
 }
 
+fn synthetic_coordinator(fixture: &Fixture) -> Application {
+    let mut paths = instance_paths(fixture);
+    paths.role_socket = fixture.root.join("role.sock");
+    Application::new_with_synthetic_dispatch_for_tests(
+        paths,
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+        test_hooks(fixture),
+    )
+    .unwrap()
+}
+
+fn resolve_failed_step(
+    fixture: &Fixture,
+    operation: &str,
+    task: &str,
+    attempt: &str,
+    recovery: &str,
+    decision: &str,
+    expected_version: i64,
+) -> anyhow::Result<OperationResult> {
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::ResolveRecovery {
+            operation_id: operation.into(),
+            task_id: task.into(),
+            attempt_id: attempt.into(),
+            recovery_id: recovery.into(),
+            session_id: None,
+            expected_version,
+            decision: decision.into(),
+            evidence: "checked the task's agents and activity".into(),
+        },
+    )
+}
+
+#[test]
+fn a_failing_preloop_step_holds_only_its_attempt_across_restart() {
+    let fixture = Fixture::new("coordinator-failure-preloop");
+    seed_attempt(&fixture, "planning");
+    // A retired attempt whose recorded agent is not attached to this service:
+    // stopping it fails before any signal, on every tick it is selected. It runs
+    // on another provider, so the later task keeps its own manager slot.
+    fixture.execute_batch(
+        "UPDATE attempts SET status='cancelled' WHERE id='a';
+         UPDATE tasks SET lifecycle='cancelled' WHERE id='t';",
+    );
+    seed_session_for_provider(
+        &fixture,
+        "a",
+        "manager",
+        "g-retired",
+        "s-retired",
+        "running",
+        Provider::Claude,
+    );
+    let later_project = add_project(&fixture, fixture.repository("later"), "later");
+    let later_task = create_task(&fixture, &later_project, "later-task", 1);
+    let holds = || {
+        fixture.scalar::<i64>(
+            "SELECT COUNT(*) FROM recovery_records WHERE attempt_id='a'
+               AND json_extract(detail_json,'$.kind')='coordinator_failure'",
+        )
+    };
+    let app = synthetic_coordinator(&fixture);
+
+    let held = app.coordinator_tick().unwrap();
+    assert_eq!(held["action"], "coordinator_failure_held", "{held}");
+    assert_eq!(held["attempt_id"], "a");
+    assert_eq!(held["operation"], "retired_role_interrupt");
+    assert_eq!(held["effect_certainty"], "possible");
+    assert_eq!(held["recorded"], true);
+    let recovery_id = held["recovery_id"].as_str().unwrap().to_owned();
+    let record_state = || {
+        fixture.scalar::<String>(&format!(
+            "SELECT state FROM recovery_records WHERE id='{recovery_id}'"
+        ))
+    };
+    let (session, causal_session, cause): (Option<String>, String, String) = fixture
+        .connection()
+        .query_row(
+            "SELECT session_id,json_extract(detail_json,'$.causal_identity.session_id'),
+                    json_extract(detail_json,'$.cause')
+             FROM recovery_records WHERE id=?1",
+            params![recovery_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(session, None);
+    assert_eq!(causal_session, "s-retired");
+    assert!(
+        cause.contains("not attached to this service boot"),
+        "{cause}"
+    );
+
+    // The held attempt no longer blocks the next eligible task.
+    let claimed = app.coordinator_tick().unwrap();
+    assert_eq!(claimed["action"], "workspace_created", "{claimed}");
+    assert_eq!(claimed["task_id"], later_task);
+
+    // After a restart the one durable hold still applies and is not repeated.
+    drop(app);
+    let restarted = synthetic_coordinator(&fixture);
+    let dispatched = restarted.coordinator_tick().unwrap();
+    assert_eq!(dispatched["action"], "manager_dispatched", "{dispatched}");
+    assert_eq!(dispatched["attempt_id"], claimed["attempt_id"]);
+    assert_eq!(holds(), 1);
+    assert_eq!(record_state(), "attention_required");
+
+    // Closing a global deferral or proving process quiescence never resolves it.
+    assert!(
+        agenticjira::coordinator::record_tick_deferred(&fixture.store, "transient", None).unwrap()
+    );
+    assert!(agenticjira::coordinator::record_tick_recovered(&fixture.store).unwrap());
+    assert_eq!(record_state(), "attention_required");
+    let version = fixture.scalar::<i64>("SELECT version FROM tasks WHERE id='t'");
+    let refused = restarted
+        .execute_human_command(&HumanCommand::ResolveRecovery {
+            operation_id: "confirm-failed-step".into(),
+            task_id: "t".into(),
+            attempt_id: "a".into(),
+            recovery_id: recovery_id.clone(),
+            session_id: None,
+            expected_version: version,
+            decision: "confirm_quiescent".into(),
+            evidence: "the retired agent looks stopped".into(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("owns no process"), "{refused}");
+    assert_eq!(record_state(), "attention_required");
+
+    // Release uses the exact record and current task version, with a receipt.
+    let release = |operation: &str, expected_version: i64| {
+        resolve_failed_step(
+            &fixture,
+            operation,
+            "t",
+            "a",
+            &recovery_id,
+            "retry_failed_step",
+            expected_version,
+        )
+    };
+    let stale = release("stale-release", version - 1)
+        .unwrap_err()
+        .to_string();
+    assert!(stale.contains("task version is stale"), "{stale}");
+    let released = release("release-failed-step", version).unwrap();
+    assert_eq!(released.state, "failed_step_released");
+    assert_eq!(released.version, Some(version + 1));
+    assert_eq!(
+        release("release-failed-step", version).unwrap().state,
+        "failed_step_released"
+    );
+    assert_eq!(record_state(), "resolved_retry");
+
+    // Release only permits re-evaluation; the same failure is a new incident.
+    let again = restarted.coordinator_tick().unwrap();
+    assert_eq!(again["action"], "coordinator_failure_held", "{again}");
+    assert_eq!(again["recorded"], true);
+    assert_ne!(again["recovery_id"], recovery_id.as_str());
+    assert_eq!(holds(), 2);
+    let second = again["recovery_id"].as_str().unwrap().to_owned();
+    let state_of = |id: &str| {
+        fixture.scalar::<String>(&format!(
+            "SELECT state FROM recovery_records WHERE id='{id}'"
+        ))
+    };
+
+    // Churn on the held subject is not a change in its outcome.
+    fixture.execute_batch(
+        "UPDATE tasks SET version=version+1,updated_at='2099-01-01T00:00:00Z' WHERE id='t';
+         UPDATE sessions SET updated_at='2099-01-01T00:00:00Z' WHERE id='s-retired';
+         INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+           VALUES('retired-churn','retired-churn','service','fixture.unrelated','session','s-retired','{}','2099-01-01T00:00:00Z');",
+    );
+    restarted.coordinator_tick().unwrap();
+    assert_eq!(state_of(&second), "attention_required");
+
+    // The retired agent's proven exit releases the hold only after the
+    // attempt's independent recovery item is resolved too.
+    fixture.execute_batch(
+        "UPDATE sessions SET status='exited',exit_json='{\"process_group_quiescent\":true}'
+           WHERE id='s-retired';
+         INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at)
+           VALUES('retired-recovery','s-retired','a','attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+    );
+    restarted.coordinator_tick().unwrap();
+    assert_eq!(state_of(&second), "attention_required");
+    fixture.execute(
+        "UPDATE recovery_records SET state='resolved_quiescent' WHERE id='retired-recovery'",
+        [],
+    );
+    let settled = restarted.coordinator_tick().unwrap();
+    assert_eq!(
+        settled["action"], "coordinator_failure_released",
+        "{settled}"
+    );
+    assert_eq!(settled["recovery_id"], second.as_str());
+    assert_eq!(settled["outcome"], "session_exited");
+    assert_eq!(state_of(&second), "resolved_retry");
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT json_extract(detail_json,'$.resolution.decision') FROM recovery_records
+             WHERE id='{second}'"
+        ),
+        "subject_outcome".into(),
+    );
+
+    // Re-evaluation finds nothing left to stop, so no new hold follows.
+    restarted.coordinator_tick().unwrap();
+    assert_eq!(holds(), 2);
+}
+
+#[test]
+fn a_held_launch_step_retries_only_after_every_effect_outcome_is_known() {
+    let fixture = Fixture::new("coordinator-failure-launch");
+    let (_, held_task, held) = new_task(&fixture, "held-project", "held-task");
+    let attempt = held.attempt_id.clone();
+    let later_project = add_project(&fixture, fixture.repository("later"), "later");
+    let later_task = create_task(&fixture, &later_project, "later-task", 1);
+    fixture.execute_batch(&format!(
+        "CREATE TRIGGER fail_held_launch BEFORE INSERT ON role_generations
+         WHEN NEW.attempt_id='{attempt}'
+         BEGIN SELECT RAISE(ABORT,'injected launch reservation failure'); END;"
+    ));
+    let app = synthetic_coordinator(&fixture);
+    let generations = || {
+        fixture.scalar::<i64>(&format!(
+            "SELECT COUNT(*) FROM role_generations WHERE attempt_id='{attempt}'"
+        ))
+    };
+
+    let failed = app.coordinator_tick().unwrap();
+    assert_eq!(failed["action"], "coordinator_failure_held", "{failed}");
+    assert_eq!(failed["attempt_id"], attempt.as_str());
+    assert_eq!(failed["operation"], "attempt_advance");
+    assert_eq!(failed["effect_certainty"], "possible");
+    let recovery_id = failed["recovery_id"].as_str().unwrap().to_owned();
+    let record_state = || {
+        fixture.scalar::<String>(&format!(
+            "SELECT state FROM recovery_records WHERE id='{recovery_id}'"
+        ))
+    };
+    // The held attempt is never classified again automatically, so a decision
+    // audit that keeps failing for it cannot starve later work, even after a
+    // restart, and its one failure is not repeated.
+    fixture.execute_batch(&format!(
+        "CREATE TRIGGER fail_held_decision BEFORE INSERT ON audit_events
+         WHEN NEW.event_code='decision.explanation.changed' AND NEW.entity_id='{held_task}'
+         BEGIN SELECT RAISE(ABORT,'injected decision audit failure'); END;"
+    ));
+    let holds = || {
+        fixture.scalar::<i64>(&format!(
+            "SELECT COUNT(*) FROM recovery_records WHERE attempt_id='{attempt}'
+               AND json_extract(detail_json,'$.kind')='coordinator_failure'"
+        ))
+    };
+    let claimed = app.coordinator_tick().unwrap();
+    assert_eq!(claimed["action"], "workspace_created", "{claimed}");
+    assert_eq!(claimed["task_id"], later_task);
+    drop(app);
+    let app = synthetic_coordinator(&fixture);
+    let later = app.coordinator_tick().unwrap();
+    assert_eq!(later["action"], "manager_dispatched", "{later}");
+    assert_eq!(later["attempt_id"], claimed["attempt_id"]);
+    assert_eq!(
+        (holds(), generations(), record_state()),
+        (1, 0, "attention_required".to_owned())
+    );
+
+    // With the injected cause gone, version, time and audit churn alone still
+    // do not release the attempt.
+    fixture.execute_batch(&format!(
+        "DROP TRIGGER fail_held_launch;
+         UPDATE tasks SET version=version+1,updated_at='2099-01-01T00:00:00Z' WHERE id='{held_task}';
+         UPDATE attempts SET updated_at='2099-01-01T00:00:00Z' WHERE id='{attempt}';
+         INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+           VALUES('unrelated-churn','unrelated-churn','service','fixture.unrelated','attempt','{attempt}','{{}}','2099-01-01T00:00:00Z');"
+    ));
+    app.coordinator_tick().unwrap();
+    assert_eq!(generations(), 0);
+    assert_eq!(record_state(), "attention_required");
+    let decision = workflow::state(&fixture.store)
+        .unwrap()
+        .decisions
+        .into_iter()
+        .find(|decision| decision.subject.attempt_id.as_deref() == Some(attempt.as_str()))
+        .unwrap();
+    assert_eq!(decision.reason_code, "workflow.coordinator_failure_hold");
+    assert_eq!(
+        decision
+            .next_action
+            .as_ref()
+            .map(|action| action.operation.as_str()),
+        Some("resolve_recovery")
+    );
+    assert_eq!(
+        decision.next_action.unwrap().binding.recovery_id.as_deref(),
+        Some(recovery_id.as_str())
+    );
+
+    // Outcomes the failed step may have left keep retry unavailable.
+    seed_session(
+        &fixture,
+        &attempt,
+        "explorer",
+        "g-held-explorer",
+        "s-held-explorer",
+        "interrupt_requested",
+    );
+    fixture.execute(
+        "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at)
+         VALUES('held-guidance',?1,'g-held-explorer','Use the smaller scope','delivery_unknown','2026-01-01T00:00:00Z')",
+        params![attempt],
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    let record = state
+        .recovery
+        .iter()
+        .find(|record| record["id"] == recovery_id.as_str())
+        .unwrap();
+    assert_eq!(record["session_id"], serde_json::Value::Null);
+    assert_eq!(record["detail"]["kind"], "coordinator_failure");
+    assert_eq!(record["detail"]["effect_certainty"], "possible");
+    let blocked_by = record["retry_blocked_by"].as_array().unwrap();
+    assert!(blocked_by.contains(&serde_json::json!("guidance whose delivery is unconfirmed")));
+    assert!(blocked_by.contains(&serde_json::json!(
+        "an agent start, resume or stop whose outcome is not recorded"
+    )));
+    let action = state
+        .continuation_actions
+        .iter()
+        .find(|action| action.binding["recovery_id"] == recovery_id.as_str())
+        .unwrap();
+    assert!(matches!(
+        action.kind,
+        agenticjira::domain::ContinuationActionKind::RecoverFailedStep
+    ));
+    assert_eq!(action.operation, "resolve_recovery");
+    assert_eq!(action.binding["retry_enabled"], false);
+    assert_eq!(
+        action.binding["decisions"],
+        serde_json::json!(["retry_failed_step", "cancel"])
+    );
+    let item = state
+        .attention
+        .iter()
+        .find(|item| item.id == format!("recovery_record:{recovery_id}"))
+        .unwrap();
+    assert_eq!(item.title, "An automatic step failed");
+    assert!(matches!(
+        &item.target,
+        Some(AttentionTarget::RecoveryRecord { recovery_id: target, .. }) if *target == recovery_id
+    ));
+    let version =
+        || fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{held_task}'"));
+    let refused = resolve_failed_step(
+        &fixture,
+        "release-while-unknown",
+        &held_task,
+        &attempt,
+        &recovery_id,
+        "retry_failed_step",
+        version(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        refused.contains("until these have a known outcome"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("guidance whose delivery is unconfirmed"),
+        "{refused}"
+    );
+    assert_eq!(record_state(), "attention_required");
+
+    // Startup machine reconciliation resolves only its exact session record.
+    seed_session(
+        &fixture,
+        &attempt,
+        "implementer",
+        "g-held-prior",
+        "s-held-prior",
+        "exited",
+    );
+    fixture.execute(
+        "UPDATE sessions SET launch_boot_identity=?1 WHERE id='s-held-prior'",
+        params![m4a_prior_boot_identity()],
+    );
+    fixture.execute(
+        "INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at)
+         VALUES('prior-recovery','s-held-prior',?1,'attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![attempt],
+    );
+    fixture.execute(
+        "INSERT INTO restart_candidates(session_id,attempt_id,task_id,source,state,reason,result_json,created_at,updated_at)
+         VALUES('s-held-prior',?1,?2,'unclean_shutdown','pending_reconciliation','awaiting verification','{}',
+                '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![attempt, held_task],
+    );
+    let reconciled = recovery::reconcile_restart_candidates(&fixture.store).unwrap();
+    assert_eq!(reconciled.len(), 1, "{reconciled:?}");
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM recovery_records WHERE id='prior-recovery'",
+        "resolved_quiescent".into(),
+    );
+    assert_eq!(record_state(), "attention_required");
+
+    // Another failed step, recorded on its own, is an independent hold.
+    fixture.execute(
+        "INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at)
+         VALUES('independent-hold',NULL,?1,'attention_required',
+                json_object('kind','coordinator_failure','task_id',?2,'operation','attempt_advance',
+                  'effect_certainty','none','failure_key','independent-step'),
+                '2099-01-01T00:00:00Z','2099-01-01T00:00:00Z')",
+        params![attempt, held_task],
+    );
+    let independent = "independent-hold".to_owned();
+
+    // Once every recorded effect has an observed outcome, the exact retry
+    // releases the hold and leaves the other records as they are.
+    fixture.execute_batch(
+        "UPDATE guidance_messages SET state='acknowledged' WHERE id='held-guidance';
+         UPDATE sessions SET status='exited',exit_json='{\"process_group_quiescent\":true}'
+           WHERE id='s-held-explorer';",
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    let action = state
+        .continuation_actions
+        .iter()
+        .find(|action| action.binding["recovery_id"] == recovery_id.as_str())
+        .unwrap();
+    assert_eq!(action.binding["retry_enabled"], true);
+    let released = resolve_failed_step(
+        &fixture,
+        "release-after-outcomes",
+        &held_task,
+        &attempt,
+        &recovery_id,
+        "retry_failed_step",
+        version(),
+    )
+    .unwrap();
+    assert_eq!(released.state, "failed_step_released");
+    assert_eq!(record_state(), "resolved_retry");
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM recovery_records WHERE id='prior-recovery'",
+        "resolved_quiescent".into(),
+    );
+    let independent_state = || {
+        fixture.scalar::<String>(&format!(
+            "SELECT state FROM recovery_records WHERE id='{independent}'"
+        ))
+    };
+    assert_eq!(independent_state(), "attention_required");
+
+    // Machine reconciliation parked the attempt for restart, so the exact cancel
+    // is refused and changes nothing; the ordinary Cancel control applies to a
+    // parked task and disposes the remaining hold without touching another task.
+    let later_attempt = claimed["attempt_id"].as_str().unwrap().to_owned();
+    fixture.execute(
+        "INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at)
+         SELECT 'later-recovery',s.id,rg.attempt_id,'attention_required','{}',
+                '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'
+         FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
+         WHERE rg.attempt_id=?1 LIMIT 1",
+        params![later_attempt],
+    );
+    fixture.assert_scalar::<String>(
+        &format!("SELECT status FROM attempts WHERE id='{attempt}'"),
+        "restart_parked".into(),
+    );
+    let parked_version = version();
+    let refused = app
+        .execute_human_command(&HumanCommand::ResolveRecovery {
+            operation_id: "cancel-parked".into(),
+            task_id: held_task.clone(),
+            attempt_id: attempt.clone(),
+            recovery_id: independent.clone(),
+            session_id: None,
+            expected_version: parked_version,
+            decision: "cancel".into(),
+            evidence: "checked the task's agents and activity".into(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("attempt is not awaiting recovery"),
+        "{refused}"
+    );
+    assert_eq!(version(), parked_version);
+    assert_eq!(independent_state(), "attention_required");
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: "cancel-held".into(),
+            task_id: held_task.clone(),
+            expected_version: parked_version,
+            action: "cancel".into(),
+            payload: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    let cancelled = app.coordinator_tick().unwrap();
+    assert_eq!(cancelled["action"], "cancel", "{cancelled}");
+    fixture.assert_scalar::<String>(
+        &format!("SELECT lifecycle FROM tasks WHERE id='{held_task}'"),
+        "cancelled".into(),
+    );
+    assert_eq!(independent_state(), "resolved_cancelled");
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT (json_extract(r.detail_json,'$.resolution.control_id')=c.id)
+                    || ':' || json_extract(r.detail_json,'$.resolution.decision')
+             FROM recovery_records r JOIN controls c ON c.requested_operation_id='cancel-held'
+             WHERE r.id='{independent}'"
+        ),
+        "1:cancel".into(),
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM recovery_records WHERE id='later-recovery'",
+        "attention_required".into(),
+    );
+}
+
+#[test]
+fn human_controls_stay_reachable_for_a_held_attempt_and_recovery_keeps_independent_holds() {
+    let fixture = Fixture::new("coordinator-failure-controls");
+    seed_attempt(&fixture, "planning");
+    seed_session(
+        &fixture,
+        "a",
+        "manager",
+        "g-manager",
+        "s-manager",
+        "running",
+    );
+    make_effective(&fixture, "manager", "g-manager");
+    fixture.execute_batch(
+        "INSERT INTO claims(id,task_id,attempt_id,repository_identity,state,created_at,updated_at)
+           VALUES('claim-a','t','a','/tmp/identity','running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+         INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at)
+           VALUES('manager-credential','g-manager','manager-token-hash','[]','2026-01-01T00:00:00Z');",
+    );
+    let fail_classification = "CREATE TRIGGER fail_decision_audit BEFORE INSERT ON audit_events
+         WHEN NEW.event_code='decision.explanation.changed' AND NEW.entity_id='t'
+         BEGIN SELECT RAISE(ABORT,'injected decision audit failure'); END;";
+    fixture.execute_batch(fail_classification);
+    let app = synthetic_coordinator(&fixture);
+    let version = || fixture.scalar::<i64>("SELECT version FROM tasks WHERE id='t'");
+    let state_of = |id: &str| {
+        fixture.scalar::<String>(&format!(
+            "SELECT state FROM recovery_records WHERE id='{id}'"
+        ))
+    };
+    let ownership = || {
+        fixture.scalar::<String>(
+            "SELECT (SELECT state FROM claims WHERE id='claim-a') || ' ' ||
+                    (SELECT status FROM sessions WHERE id='s-manager') || ' ' ||
+                    (SELECT CASE WHEN revoked_at IS NULL THEN 'authorized' ELSE 'revoked' END
+                       FROM role_credentials WHERE id='manager-credential')",
+        )
+    };
+    let cancel = |operation: &str, recovery: &str, expected_version: i64| {
+        app.execute_human_command(&HumanCommand::ResolveRecovery {
+            operation_id: operation.into(),
+            task_id: "t".into(),
+            attempt_id: "a".into(),
+            recovery_id: recovery.into(),
+            session_id: None,
+            expected_version,
+            decision: "cancel".into(),
+            evidence: "checked the task's agents and activity".into(),
+        })
+    };
+    let task_and_attempt = || {
+        fixture.scalar::<String>(
+            "SELECT t.lifecycle||'/'||t.attention||' '||a.status||'/'||a.phase
+             FROM tasks t JOIN attempts a ON a.task_id=t.id WHERE t.id='t' AND a.id='a'",
+        )
+    };
+    let control = |operation: &str, action: &str| {
+        workflow::execute(
+            &fixture.store,
+            &HumanCommand::Control {
+                operation_id: operation.into(),
+                task_id: "t".into(),
+                expected_version: version(),
+                action: action.into(),
+                payload: serde_json::json!({}),
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{operation} ({action}) was refused with task/attempt {}: {error:#}",
+                task_and_attempt()
+            )
+        });
+    };
+
+    let failed = app.coordinator_tick().unwrap();
+    assert_eq!(failed["action"], "coordinator_failure_held", "{failed}");
+    assert_eq!(failed["operation"], "attempt_classification");
+    assert_eq!(failed["effect_certainty"], "none");
+    let first = failed["recovery_id"].as_str().unwrap().to_owned();
+    fixture.execute_batch("DROP TRIGGER fail_decision_audit;");
+
+    // Cancelling exactly through the failed step would release the task while
+    // its manager still runs, so the public and direct paths both refuse and
+    // change nothing; the ordinary Cancel, which stops that work, stays offered.
+    let before = version();
+    for refused in [
+        cancel("cancel-running", &first, before),
+        resolve_failed_step(
+            &fixture,
+            "cancel-running-direct",
+            "t",
+            "a",
+            &first,
+            "cancel",
+            before,
+        ),
+    ] {
+        let refused = refused.unwrap_err().to_string();
+        assert!(
+            refused.contains("an agent session that may be running")
+                && refused.contains("use Cancel"),
+            "{refused}"
+        );
+    }
+    assert_eq!(ownership(), "running running authorized");
+    assert_eq!(
+        (state_of(&first), version()),
+        ("attention_required".to_owned(), before)
+    );
+    let held = workflow::state(&fixture.store)
+        .unwrap()
+        .decisions
+        .into_iter()
+        .find(|decision| decision.subject.attempt_id.as_deref() == Some("a"))
+        .unwrap();
+    assert_eq!(held.reason_code, "workflow.coordinator_failure_hold");
+    assert!(
+        held.control_policy
+            .allowed_controls
+            .contains(&"cancel".to_owned()),
+        "{:?}",
+        held.control_policy.allowed_controls
+    );
+
+    // Pause is selected despite the hold, and Continue is refused with the
+    // exact recovery to use.
+    control("pause-held", "pause_after_role");
+    let paused = app.coordinator_tick().unwrap();
+    assert_eq!(paused["action"], "paused", "{paused}");
+    assert_eq!(state_of(&first), "attention_required");
+    control("continue-held", "continue");
+    let refused = app.coordinator_tick().unwrap();
+    assert_eq!(refused["action"], "control_rejected", "{refused}");
+    assert_eq!(refused["recovery_id"], first.as_str());
+    assert_eq!(refused["public_resolution"], "resolve_recovery");
+    fixture.assert_scalar::<String>(
+        "SELECT json_extract(payload_json,'$.recovery_id') FROM controls
+         WHERE requested_operation_id='continue-held'",
+        first.clone(),
+    );
+    assert_eq!(
+        task_and_attempt(),
+        "in_progress/paused held/planning",
+        "a refused Continue leaves the attempt paused"
+    );
+
+    // Releasing a step that changed nothing lets the paused task continue.
+    let released = resolve_failed_step(
+        &fixture,
+        "release-first",
+        "t",
+        "a",
+        &first,
+        "retry_failed_step",
+        version(),
+    )
+    .unwrap();
+    assert_eq!(released.state, "failed_step_released");
+    assert_eq!(state_of(&first), "resolved_retry");
+    control("continue-released", "continue");
+    let continued = app.coordinator_tick().unwrap();
+    assert_eq!(continued["action"], "continued", "{continued}");
+
+    // A later failure is a new hold, and cancelling through it cannot skip an
+    // independent process record's quiescence proof.
+    fixture.execute_batch(fail_classification);
+    let failed_again = app.coordinator_tick().unwrap();
+    assert_eq!(
+        failed_again["action"], "coordinator_failure_held",
+        "{failed_again}"
+    );
+    let second = failed_again["recovery_id"].as_str().unwrap().to_owned();
+    fixture.execute_batch("DROP TRIGGER fail_decision_audit;");
+    seed_session(
+        &fixture,
+        "a",
+        "explorer",
+        "g-explorer",
+        "s-explorer",
+        "recovery_required",
+    );
+    fixture.execute(
+        "UPDATE role_generations SET status='exited' WHERE id='g-explorer'",
+        [],
+    );
+    fixture.execute(
+        "UPDATE sessions SET launch_boot_identity=?1 WHERE id='s-explorer'",
+        params![m4a_prior_boot_identity()],
+    );
+    fixture.execute_batch(
+        "INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at)
+         VALUES('explorer-recovery','s-explorer','a','attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+    );
+    let blocked = cancel("cancel-blocked", &second, version())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        blocked.contains("requires verified quiescence"),
+        "{blocked}"
+    );
+    assert_eq!(state_of(&second), "attention_required");
+
+    // Proving that record quiescent leaves the new hold in place and returns
+    // the attempt to running.
+    let confirmed = workflow::execute(
+        &fixture.store,
+        &HumanCommand::ResolveRecovery {
+            operation_id: "confirm-explorer".into(),
+            task_id: "t".into(),
+            attempt_id: "a".into(),
+            recovery_id: "explorer-recovery".into(),
+            session_id: Some("s-explorer".into()),
+            expected_version: version(),
+            decision: "confirm_quiescent".into(),
+            evidence: "the explorer terminal is closed".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(confirmed.state, "recovery_quiescence_confirmed");
+    assert_eq!(state_of("explorer-recovery"), "resolved_quiescent");
+    assert_eq!(state_of(&second), "attention_required");
+    fixture.assert_scalar::<String>("SELECT status FROM attempts WHERE id='a'", "running".into());
+
+    // Once the manager's exit is recorded nothing the attempt started can still
+    // act, so the exact cancel succeeds once and revokes the attempt's authority.
+    fixture.execute_batch(
+        "UPDATE sessions SET status='exited',exit_json='{\"process_group_quiescent\":true}'
+           WHERE id='s-manager';
+         UPDATE role_generations SET status='exited' WHERE id='g-manager';",
+    );
+    let current = version();
+    let stale = cancel("cancel-stale", &second, current - 1)
+        .unwrap_err()
+        .to_string();
+    assert!(stale.contains("task version is stale"), "{stale}");
+    let cancelled = cancel("cancel-held", &second, current).unwrap();
+    assert_eq!(cancelled.state, "recovery_cancelled");
+    assert_eq!(cancelled.version, Some(current + 1));
+    let replayed = cancel("cancel-held", &second, current).unwrap();
+    assert_eq!(
+        (replayed.state, replayed.version),
+        (cancelled.state, cancelled.version)
+    );
+    assert_eq!(version(), current + 1);
+    fixture.assert_scalar::<String>(
+        "SELECT lifecycle FROM tasks WHERE id='t'",
+        "cancelled".into(),
+    );
+    assert_eq!(state_of(&second), "resolved_cancelled");
+    assert_eq!(state_of("explorer-recovery"), "resolved_quiescent");
+    assert_eq!(ownership(), "cancelled exited revoked");
+}
+
+#[test]
+fn recording_an_attention_hold_ends_the_tick_before_other_work() {
+    let fixture = Fixture::new("recorded-hold-ends-tick");
+    seed_attempt(&fixture, "checks");
+    fixture.execute(
+        "UPDATE attempts SET candidate_hash='recorded-hold-candidate',step_budget=1 WHERE id='a'",
+        [],
+    );
+    let later_project = add_project(&fixture, fixture.repository("later"), "later");
+    let later_task = create_task(&fixture, &later_project, "later-task", 1);
+    let app = synthetic_coordinator(&fixture);
+    let later_work = || {
+        fixture.scalar::<i64>(&format!(
+            "SELECT (SELECT COUNT(*) FROM attempts WHERE task_id='{later_task}')
+                  + (SELECT COUNT(*) FROM claims WHERE task_id='{later_task}')
+                  + (SELECT COUNT(*) FROM role_generations rg JOIN attempts a ON a.id=rg.attempt_id
+                      WHERE a.task_id='{later_task}')"
+        ))
+    };
+
+    let held = app.coordinator_tick().unwrap();
+    assert_eq!(
+        (
+            held["action"].as_str(),
+            held["reason"].as_str(),
+            held["hold_recorded"].as_bool()
+        ),
+        (
+            Some("held"),
+            Some("no_plan_selected_trip_checks"),
+            Some(true)
+        ),
+        "{held}"
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT t.attention || ' ' || a.status FROM tasks t JOIN attempts a ON a.task_id=t.id
+         WHERE a.id='a'",
+        "needs_input needs_input".into(),
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events
+         WHERE event_code='coordinator.action.committed' AND entity_id='a'",
+        1,
+    );
+    fixture.assert_scalar::<i64>("SELECT step_budget FROM attempts WHERE id='a'", 0);
+    assert_eq!(later_work(), 0);
+
+    // The recorded hold is only observed from now on, so the later task proceeds.
+    let claimed = app.coordinator_tick().unwrap();
+    assert_eq!(claimed["action"], "workspace_created", "{claimed}");
+    assert_eq!(claimed["task_id"], later_task);
+}
+
+#[test]
+fn a_refused_continue_leaves_its_held_attempt_paused_with_its_controls() {
+    for cause in ["stale", "failed"] {
+        let fixture = Fixture::new(&format!("refused-continue-{cause}"));
+        seed_attempt(&fixture, "planning");
+        fixture.execute(
+            r#"INSERT INTO tasks(id,project_id,title,description,acceptance_criteria_json,lifecycle,created_at,updated_at)
+               VALUES('t2','p','Other task','Description','["criterion"]','in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')"#,
+            [],
+        );
+        fixture.execute(
+            "INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,scope_hash,configuration_hash,workflow_version,workflow_hash,upstream_source_hash,overlay_hash,legacy_migration_required,created_at,updated_at)
+             SELECT 'a2','t2','context-2',phase,base_revision,configuration_revision,status,scope_hash,configuration_hash,workflow_version,workflow_hash,upstream_source_hash,overlay_hash,0,created_at,updated_at
+             FROM attempts WHERE id='a'",
+            [],
+        );
+        let app = synthetic_coordinator(&fixture);
+        let version = |task: &str| {
+            fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"))
+        };
+        let state = |task: &str| {
+            fixture.scalar::<String>(&format!(
+                "SELECT t.attention||' '||a.status FROM tasks t JOIN attempts a ON a.task_id=t.id
+                 WHERE t.id='{task}'"
+            ))
+        };
+        let control = |operation: &str, task: &str, action: &str| {
+            workflow::execute(
+                &fixture.store,
+                &HumanCommand::Control {
+                    operation_id: operation.into(),
+                    task_id: task.into(),
+                    expected_version: version(task),
+                    action: action.into(),
+                    payload: serde_json::json!({}),
+                },
+            )
+            .unwrap_or_else(|error| panic!("{operation} ({action}) was refused: {error:#}"));
+        };
+        for task in ["t", "t2"] {
+            control(&format!("pause-{task}"), task, "pause_after_role");
+            let paused = app.coordinator_tick().unwrap();
+            assert_eq!(paused["action"], "paused", "{paused}");
+        }
+        control("continue-t", "t", "continue");
+        control("continue-t2", "t2", "continue");
+        match cause {
+            "stale" => fixture.execute("UPDATE tasks SET version=version+1 WHERE id='t'", []),
+            _ => fixture.execute_batch(
+                "CREATE TRIGGER fail_continue BEFORE UPDATE OF status ON attempts
+                 WHEN NEW.id='a' AND NEW.status='running'
+                 BEGIN SELECT RAISE(ABORT,'injected continue failure'); END;",
+            ),
+        }
+        let before = version("t");
+        let refused = app.coordinator_tick().unwrap();
+        let refusal = if cause == "stale" {
+            "continue_rejected"
+        } else {
+            "control_rejected"
+        };
+        assert_eq!(
+            (refused["action"].as_str(), refused["attempt_id"].as_str()),
+            (Some(refusal), Some("a")),
+            "{cause}: {refused}"
+        );
+        fixture.assert_scalar::<String>(
+            "SELECT state FROM controls WHERE requested_operation_id='continue-t'",
+            "rejected".into(),
+        );
+        assert_eq!(
+            (state("t"), version("t")),
+            ("paused held".to_owned(), before + 1),
+            "{cause}"
+        );
+        let projected = workflow::state(&fixture.store).unwrap();
+        let controls = &projected
+            .decisions
+            .iter()
+            .find(|decision| decision.subject.attempt_id.as_deref() == Some("a"))
+            .unwrap()
+            .control_policy
+            .allowed_controls;
+        for available in ["continue", "pause_after_role", "cancel"] {
+            assert!(
+                controls.contains(&available.to_owned()),
+                "{cause}: {controls:?}"
+            );
+        }
+        // The other paused task's own pending Continue is not repaused or refused.
+        assert_eq!(state("t2"), "none held", "{cause}");
+        fixture.assert_scalar::<String>(
+            "SELECT state FROM controls WHERE requested_operation_id='continue-t2'",
+            "requested".into(),
+        );
+        fixture.execute_batch("DROP TRIGGER IF EXISTS fail_continue;");
+        control("continue-t-again", "t", "continue");
+        for attempt in ["a2", "a"] {
+            let continued = app.coordinator_tick().unwrap();
+            assert_eq!(
+                (
+                    continued["action"].as_str(),
+                    continued["attempt_id"].as_str()
+                ),
+                (Some("continued"), Some(attempt)),
+                "{cause}: {continued}"
+            );
+        }
+    }
+}
+
 /// Starts a planning task whose current Codex manager is running under
 /// synthetic dispatch, so the real coordinator, hook, result and guidance
 /// seams can be exercised without a provider process.
@@ -35049,12 +36634,53 @@ fn a_second_candidate_after_an_implementer_question_is_frozen_exactly_once() {
         ),
         format!("duplicate:{second}"),
     );
+    // A pause after the role and a later Continue do not make that candidate
+    // older than the controls.
+    let control = |operation: &str, action: &str| {
+        let version = fixture.scalar::<i64>(&format!(
+            "SELECT version FROM tasks WHERE id='{}'",
+            plan.task_id
+        ));
+        workflow::execute(
+            &fixture.store,
+            &HumanCommand::Control {
+                operation_id: operation.into(),
+                task_id: plan.task_id.clone(),
+                expected_version: version,
+                action: action.into(),
+                payload: serde_json::json!({}),
+            },
+        )
+        .unwrap_or_else(|error| panic!("{operation} ({action}) was refused: {error:#}"));
+    };
+    control("pause-after-candidate", "pause_after_role");
+    let draining = app.coordinator_tick().unwrap();
+    assert_eq!(draining["action"], "draining_control", "{draining}");
+    fixture.execute(
+        "UPDATE sessions SET status='exited',launch_state='finished',exit_json='{\"process_group_quiescent\":true,\"synthetic_fixture\":true}' WHERE id=?1",
+        params![session],
+    );
+    fixture.execute(
+        "UPDATE role_generations SET status='exited' WHERE id=?1",
+        params![implementer.role_generation_id],
+    );
+    let paused = app.coordinator_tick().unwrap();
+    assert_eq!(paused["action"], "paused", "{paused}");
+    control("continue-after-pause", "continue");
+    let continued = app.coordinator_tick().unwrap();
+    assert_eq!(continued["action"], "continued", "{continued}");
+    let mut ticks = Vec::new();
     let mut frozen = 0;
     let mut dispatched_again = 0;
     let mut after_freeze = 0;
     for _ in 0..10 {
         let value = app.coordinator_tick().unwrap();
-        match value["action"].as_str().unwrap_or_default() {
+        let action = value["action"].as_str().unwrap_or_default().to_owned();
+        ticks.push(match value["decision"]["reason_code"].as_str() {
+            Some(reason) => format!("{action} ({reason})"),
+            None => action.clone(),
+        });
+        match action.as_str() {
             "quiescing_completed_role" => {
                 fixture.assert_scalar::<String>(
                     &format!("SELECT status FROM sessions WHERE id='{session}'"),
@@ -35083,13 +36709,17 @@ fn a_second_candidate_after_an_implementer_question_is_frozen_exactly_once() {
             }
         }
     }
+    assert!(
+        ticks[0].starts_with("candidate_frozen"),
+        "the paused implementer was already quiescent, so Continue freezes its candidate first; ticks: {ticks:?}"
+    );
     assert_eq!(
         frozen, 1,
-        "the candidate reported during the hold was not frozen exactly once"
+        "the candidate reported during the hold was not frozen exactly once; ticks: {ticks:?}"
     );
     assert_eq!(
         dispatched_again, 0,
-        "a second paid implementer call was started"
+        "a second paid implementer call was started; ticks: {ticks:?}"
     );
     fixture.assert_scalar::<i64>(
         &format!(
@@ -35251,6 +36881,17 @@ fn restart_makes_in_flight_guidance_uncertain_and_keeps_the_rest() {
             params![id, state],
         );
     }
+    let submitted_form = |id: &str| {
+        fixture.scalar::<String>(&format!(
+            "SELECT submitted_text||'|'||submitted_digest FROM guidance_messages WHERE id='{id}'"
+        ))
+    };
+    fixture.execute(
+        "UPDATE guidance_messages SET submitted_text='exact submitted written',submitted_digest=?1
+         WHERE id='written'",
+        params![agenticjira::store::json_hash(&"exact submitted written").unwrap()],
+    );
+    let written_form = submitted_form("written");
     let results = recovery::reconcile_prior_boot(&fixture.store).unwrap();
     let state = |id: &str| {
         fixture.scalar::<String>(&format!(
@@ -35260,6 +36901,7 @@ fn restart_makes_in_flight_guidance_uncertain_and_keeps_the_rest() {
     assert_eq!(state("queued"), "queued");
     assert_eq!(state("reserved"), "delivery_unknown");
     assert_eq!(state("written"), "delivery_unknown");
+    assert_eq!(submitted_form("written"), written_form);
     assert_eq!(state("submitted"), "submitted");
     assert_eq!(state("acknowledged"), "acknowledged");
     let uncertain = results
@@ -35315,6 +36957,60 @@ fn restart_makes_in_flight_guidance_uncertain_and_keeps_the_rest() {
            AND NOT EXISTS(SELECT 1 FROM guidance_messages g WHERE g.id=e.entity_id
              AND g.state='delivery_unknown' AND g.reason='service restarted before delivery was confirmed')",
         0,
+    );
+}
+
+#[test]
+fn claude_manager_guidance_needs_a_qualified_bounded_submitted_form_and_keeps_its_body() {
+    let fixture = Fixture::new("claude-guidance-submitted-form");
+    seed_attempt(&fixture, "planning");
+    seed_session_for_provider(
+        &fixture,
+        "a",
+        "manager",
+        "g",
+        "s",
+        "running",
+        Provider::Claude,
+    );
+    let guidance = |operation: &str, body: String| {
+        workflow::execute(
+            &fixture.store,
+            &HumanCommand::Guidance {
+                operation_id: operation.into(),
+                task_id: "t".into(),
+                role_generation_id: "g".into(),
+                expected_version: fixture.scalar::<i64>("SELECT version FROM tasks WHERE id='t'"),
+                body,
+            },
+        )
+    };
+    let refusal =
+        |operation: &str, body: String| format!("{:#}", guidance(operation, body).unwrap_err());
+    assert!(refusal("unbound", "/compact".into())
+        .contains("qualified only for the admitted Claude Code 2.1.283 contract"));
+    fixture.execute(
+        "UPDATE sessions SET capability_identity_json=?1 WHERE id='s'",
+        params![serde_json::json!({"compatibility":{
+            "synthetic_origin":false,"provider":"claude","schema":1,
+            "pack_id":"llmrelay-claude-compatibility","predicate_id":"claude-code-2.1.283",
+            "exact_version":"2.1.283 (Claude Code)","contract_id":"claude-manager",
+            "contract_revision":"claude-role-contract-v1","effective_hash":"fixture",
+            "session_class":"retained","required_evidence":[]
+        }})
+        .to_string()],
+    );
+    // Each `/` is six bytes once encoded: within the raw limit, beyond the submitted one.
+    assert!(refusal("oversized", "/".repeat(10_910)).contains("64 KiB input limit"));
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM guidance_messages", 0);
+    let original = "/compact\n@notes.txt\n!ls\n./shot.png";
+    assert_eq!(
+        guidance("literal", original.into()).unwrap().state,
+        "guidance_queued"
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT body||'|'||COALESCE(submitted_text,'prepared at reservation') FROM guidance_messages",
+        format!("{original}|prepared at reservation"),
     );
 }
 
@@ -37577,14 +39273,14 @@ fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordina
 #[test]
 fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
-    fixture.assert_scalar("PRAGMA user_version", 33_i64);
+    fixture.assert_scalar("PRAGMA user_version", 34_i64);
     let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
     fixture.execute_batch(&format!(
-        "{DROP_NATIVE_RESOLUTION_TABLES} DROP TABLE final_repair_rechecks; PRAGMA user_version=30;"
+        "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; PRAGMA user_version=30;"
     ));
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 33_i64);
+    fixture.assert_scalar("PRAGMA user_version", 34_i64);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
@@ -38352,7 +40048,11 @@ fn stale_restart_candidate_cancellation_refuses_live_sessions_and_pending_admiss
 }
 
 const MIGRATION_031_SQL: &str = include_str!("../migrations/031_final_repair_recheck.sql");
-const DROP_NATIVE_RESOLUTION_TABLES: &str = "DROP TABLE permission_native_resolutions;
+const DROP_AFTER_SCHEMA_32: &str = "DROP TRIGGER guidance_submitted_form_paired;
+     DROP TRIGGER guidance_submitted_form_once;
+     ALTER TABLE guidance_messages DROP COLUMN submitted_digest;
+     ALTER TABLE guidance_messages DROP COLUMN submitted_text;
+     DROP TABLE permission_native_resolutions;
      DROP TABLE permission_request_hooks; DROP TABLE role_result_supersessions;";
 
 /// Every column a schema-31 receipt has, quoted so that NULLs compare exactly.
@@ -38374,7 +40074,7 @@ const SCHEMA_31_RECEIPT_ROWS: &str = "SELECT group_concat(
 fn schema_31_receipt_fixture(name: &str) -> Fixture {
     let fixture = final_repair_recheck_fixture(name);
     fixture.execute_batch(&format!(
-        "{DROP_NATIVE_RESOLUTION_TABLES} DROP TABLE final_repair_rechecks; {MIGRATION_031_SQL}
+        "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; {MIGRATION_031_SQL}
          PRAGMA user_version=31;"
     ));
     fixture.execute_batch(
@@ -38450,7 +40150,7 @@ fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
     fixture.assert_scalar("PRAGMA user_version", 31_i64);
 
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 33_i64);
+    fixture.assert_scalar("PRAGMA user_version", 34_i64);
     assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(
@@ -38863,7 +40563,8 @@ fn normal_final_request_changes_refuses_unbound_evidence_without_side_effects() 
         );
     }
 
-    // The coordinator's structured result path applies the same refusal.
+    // The coordinator's structured result path applies the same refusal and holds
+    // only this attempt, with the refusal as the hold's recorded cause.
     let paths = instance_paths(&fixture);
     let app = Application::new(
         paths.clone(),
@@ -38875,12 +40576,40 @@ fn normal_final_request_changes_refuses_unbound_evidence_without_side_effects() 
         "UPDATE trip_attempt_profiles SET settings_revision=2 WHERE role='code_reviewer'",
         [],
     );
-    let error = format!("{:#}", app.coordinator_tick().unwrap_err());
+    let budgets =
+        "SELECT group_concat(id||'='||initial_allowance||'+'||extension_allowance||'/'||spent)
+         FROM (SELECT * FROM review_budgets ORDER BY id)";
+    let budgets_before = fixture.scalar::<String>(budgets);
+    let held = app.coordinator_tick().unwrap();
+    assert_eq!(
+        (
+            held["action"].as_str(),
+            held["attempt_id"].as_str(),
+            held["operation"].as_str()
+        ),
+        (
+            Some("coordinator_failure_held"),
+            Some("a"),
+            Some("attempt_advance")
+        ),
+        "{held}"
+    );
+    let cause = fixture.scalar::<String>(&format!(
+        "SELECT json_extract(detail_json,'$.cause') FROM recovery_records
+         WHERE id='{}' AND attempt_id='a' AND state='attention_required'
+           AND json_extract(detail_json,'$.kind')='coordinator_failure'",
+        held["recovery_id"].as_str().unwrap()
+    ));
     assert!(
-        error.contains("profile changed after the approving review"),
-        "{error}"
+        cause.contains("profile changed after the approving review"),
+        "{cause}"
     );
     assert_eq!(fixture.scalar::<String>(NORMAL_REPAIR_STATE), before);
+    assert_eq!(fixture.scalar::<String>(budgets), budgets_before);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.final_repair_recheck.authorized'",
+        0,
+    );
     drop(app);
     let _ = std::fs::remove_dir_all(paths.socket_dir);
 }
@@ -39409,11 +41138,40 @@ fn second_final_review_requires_the_approved_dedicated_recheck_of_the_candidate(
             assert_eq!(approved["action"], "checks_approved", "{approved}");
             fixture.assert_scalar::<String>(REPAIR_FINAL_GATE, "final_review:1+1/1:none".into());
         } else {
-            // The ordinary approval alone never opens the second final review.
-            let error = format!("{:#}", app.coordinator_tick().unwrap_err());
+            // The ordinary approval alone never opens the second final review: the
+            // gate records its hold, and the refusal then holds only this attempt.
+            let held = app.coordinator_tick().unwrap();
+            assert_eq!(
+                (
+                    held["action"].as_str(),
+                    held["attempt_id"].as_str(),
+                    held["operation"].as_str()
+                ),
+                (
+                    Some("coordinator_failure_held"),
+                    Some("a"),
+                    Some("attempt_advance")
+                ),
+                "{case}: {held}"
+            );
+            let refusal = "no approved dedicated recheck of the repaired candidate";
+            let (cause, gate_hold): (String, String) = fixture
+                .connection()
+                .query_row(
+                    "SELECT json_extract(r.detail_json,'$.cause'),
+                            (SELECT json_extract(e.detail_json,'$.reason') FROM audit_events e
+                              WHERE e.event_code='attempt.final_repair_recheck.held' AND e.entity_id='a'
+                              ORDER BY e.created_at DESC,e.rowid DESC LIMIT 1)
+                     FROM recovery_records r
+                     WHERE r.id=?1 AND r.attempt_id='a' AND r.state='attention_required'
+                       AND json_extract(r.detail_json,'$.kind')='coordinator_failure'",
+                    params![held["recovery_id"].as_str().unwrap()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
             assert!(
-                error.contains("no approved dedicated recheck of the repaired candidate"),
-                "{case}: {error}"
+                cause.contains(refusal) && gate_hold.contains(refusal),
+                "{case}: {cause} / {gate_hold}"
             );
             fixture.assert_scalar::<String>(REPAIR_FINAL_GATE, "checks:1+0/1:needs_input".into());
             fixture.assert_scalar::<i64>(
@@ -40123,19 +41881,22 @@ fn terminal_replan_source_without_exact_provenance_needs_recovery() {
          WHERE event_code='rework.terminal_replan.created'",
         [],
     );
-    let error = format!("{:#}", app.coordinator_tick().unwrap_err());
-    assert!(
-        error.contains("not the exact rejected candidate of a recorded terminal replan"),
-        "{error}"
+    let held = app.coordinator_tick().unwrap();
+    assert_rework_recovery_required(
+        &fixture,
+        &held,
+        &child,
+        "not the exact rejected candidate of a recorded terminal replan",
     );
     fixture.assert_scalar::<String>(
         &format!(
             "SELECT (SELECT state FROM rework_intents)||':'||
                     (SELECT status FROM attempts WHERE id='{child}')||':'||
                     (SELECT attempt_id FROM claims WHERE state='running')||':'||
-                    (SELECT kind FROM snapshots WHERE id='rejected-snapshot')"
+                    (SELECT kind FROM snapshots WHERE id='rejected-snapshot')||':'||
+                    (SELECT state FROM workspaces WHERE attempt_id='{child}')"
         ),
-        format!("recovery_required:needs_recovery:{parent}:candidate"),
+        format!("recovery_required:needs_recovery:{parent}:candidate:reserved"),
     );
     drop(app);
     let _ = std::fs::remove_dir_all(paths.socket_dir);
@@ -40198,6 +41959,48 @@ const HELD_REWORK_CHILD: &str = "SELECT ri.state||':'||child.status||':'||
     (SELECT COUNT(*) FROM role_generations WHERE attempt_id=child.id)||':'||
     (child.plan_hash IS NULL)||(child.plan_approved_at IS NULL)||(child.accepted_snapshot_id IS NULL)
     FROM rework_intents ri JOIN attempts child ON child.id=ri.new_attempt_id";
+
+/// The tick reported the rework lifecycle's own recorded recovery, and nothing else holds the child.
+fn assert_rework_recovery_required(
+    fixture: &Fixture,
+    outcome: &serde_json::Value,
+    child: &str,
+    reason: &str,
+) {
+    let (intent, recorded): (String, String) = fixture
+        .connection()
+        .query_row(
+            "SELECT id,json_extract(result_json,'$.reason') FROM rework_intents
+             WHERE new_attempt_id=?1 AND state='recovery_required'",
+            params![child],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            outcome["action"].as_str(),
+            outcome["attempt_id"].as_str(),
+            outcome["recovery_id"].as_str()
+        ),
+        (
+            Some("rework_recovery_required"),
+            Some(child),
+            Some(intent.as_str())
+        ),
+        "{outcome}"
+    );
+    assert!(
+        recorded.contains(reason)
+            && outcome["reason"]
+                .as_str()
+                .is_some_and(|text| text.contains(reason)),
+        "{reason}: {recorded} / {outcome}"
+    );
+    fixture.assert_scalar::<i64>(
+        &format!("SELECT COUNT(*) FROM recovery_records WHERE attempt_id='{child}'"),
+        0,
+    );
+}
 
 #[test]
 fn terminal_replan_keeps_the_parents_reauthorized_guidance_bytes() {
@@ -40316,17 +42119,19 @@ fn terminal_replan_refuses_unauthorized_guidance_before_claim_transfer() {
             std::env::current_exe().unwrap(),
         )
         .unwrap();
-        app.execute_human_command(&terminal_replan_command(
-            &fixture,
-            &plan,
-            &task,
-            &candidate_hash,
-            "replan",
-            serde_json::json!({}),
-        ))
-        .unwrap();
-        let error = format!("{:#}", app.coordinator_tick().unwrap_err());
-        assert!(error.contains(expected), "{case} {path}: {error}");
+        let child = app
+            .execute_human_command(&terminal_replan_command(
+                &fixture,
+                &plan,
+                &task,
+                &candidate_hash,
+                "replan",
+                serde_json::json!({}),
+            ))
+            .unwrap()
+            .entity_id;
+        let held = app.coordinator_tick().unwrap();
+        assert_rework_recovery_required(&fixture, &held, &child, expected);
         fixture.assert_scalar::<String>(
             HELD_REWORK_CHILD,
             format!("recovery_required:needs_recovery:{}:0:111", plan.attempt_id),
@@ -40368,7 +42173,13 @@ fn failed_guidance_materialization_retries_through_the_existing_recovery_decisio
         ))
         .unwrap()
         .entity_id;
-    assert!(app.coordinator_tick().is_err());
+    let held = app.coordinator_tick().unwrap();
+    assert_rework_recovery_required(
+        &fixture,
+        &held,
+        &child,
+        "configuration that is no longer active",
+    );
     fixture.assert_scalar::<String>(
         HELD_REWORK_CHILD,
         format!("recovery_required:needs_recovery:{}:0:111", plan.attempt_id),
@@ -40420,6 +42231,103 @@ fn failed_guidance_materialization_retries_through_the_existing_recovery_decisio
     let _ = std::fs::remove_dir_all(paths.socket_dir);
 }
 
+#[test]
+fn a_partially_recorded_rework_failure_keeps_the_conservative_hold() {
+    let (fixture, paths, plan, task, candidate_hash) = terminal_replan_fixture_with(
+        "terminal-replan-partial-recovery",
+        &["fixture.txt"],
+        |fixture, plan| {
+            change_parent_guidance(
+                fixture,
+                plan,
+                "fixture.txt",
+                "base\nauthorized guidance\n",
+                "retired_configuration",
+            )
+        },
+    );
+    let app = Application::new(
+        paths.clone(),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    let child = app
+        .execute_human_command(&terminal_replan_command(
+            &fixture,
+            &plan,
+            &task,
+            &candidate_hash,
+            "replan",
+            serde_json::json!({}),
+        ))
+        .unwrap()
+        .entity_id;
+    // The intent records its recovery, then the child's own recovery status fails.
+    fixture.execute_batch(&format!(
+        "CREATE TRIGGER fail_child_recovery_status BEFORE UPDATE OF status ON attempts
+         WHEN NEW.id='{child}' AND NEW.status='needs_recovery'
+         BEGIN SELECT RAISE(ABORT,'injected child recovery status failure'); END;"
+    ));
+    let held = app.coordinator_tick().unwrap();
+    assert_eq!(
+        (
+            held["action"].as_str(),
+            held["operation"].as_str(),
+            held["attempt_id"].as_str()
+        ),
+        (
+            Some("coordinator_failure_held"),
+            Some("rework_materialization"),
+            Some(child.as_str())
+        ),
+        "{held}"
+    );
+    let cause = fixture.scalar::<String>(&format!(
+        "SELECT json_extract(detail_json,'$.cause') FROM recovery_records
+         WHERE id='{}' AND attempt_id='{child}' AND state='attention_required'
+           AND json_extract(detail_json,'$.kind')='coordinator_failure'",
+        held["recovery_id"].as_str().unwrap()
+    ));
+    assert!(
+        cause.contains("injected child recovery status failure"),
+        "{cause}"
+    );
+    // The partial tuple is left as found: no claim transfer, agent or normalization.
+    let partial = format!(
+        "recovery_required:materialization_pending:{}:0:111",
+        plan.attempt_id
+    );
+    fixture.assert_scalar::<String>(HELD_REWORK_CHILD, partial.clone());
+    fixture.assert_scalar::<String>(
+        &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+        "none".into(),
+    );
+
+    // With the write failure gone, the exact lifecycle retry still refuses the tuple.
+    fixture.execute_batch("DROP TRIGGER fail_child_recovery_status;");
+    let intent: String = fixture.scalar("SELECT id FROM rework_intents");
+    let version: i64 = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+    let refused = app
+        .execute_human_command(&HumanCommand::ResolveRecovery {
+            operation_id: "retry-partial-materialization".into(),
+            task_id: task.clone(),
+            attempt_id: child.clone(),
+            recovery_id: intent,
+            session_id: None,
+            expected_version: version,
+            decision: "retry_materialization".into(),
+            evidence: "parent guidance approval binding corrected".into(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("recovery identity is stale"), "{refused}");
+    app.coordinator_tick().unwrap();
+    fixture.assert_scalar::<String>(HELD_REWORK_CHILD, partial);
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
 /// Everything startup reconciliation must leave to the rework lifecycle.
 const UNFINISHED_REWORK_STATE: &str = "SELECT ri.state||'|'||ri.result_json||'|'||child.status
     ||'|'||w.state||'|'||w.policy_json||'|'||(SELECT group_concat(attempt_id||'='||state) FROM claims)
@@ -40461,7 +42369,13 @@ fn startup_reconciliation_leaves_an_unfinished_rework_workspace_to_its_lifecycle
         ))
         .unwrap()
         .entity_id;
-    assert!(app.coordinator_tick().is_err());
+    let outcome = app.coordinator_tick().unwrap();
+    assert_rework_recovery_required(
+        &fixture,
+        &outcome,
+        &child,
+        "configuration that is no longer active",
+    );
     let held = fixture.scalar::<String>(UNFINISHED_REWORK_STATE);
     assert!(
         held.starts_with("recovery_required|") && held.contains("|needs_recovery|reserved|"),

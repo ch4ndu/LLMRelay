@@ -19,6 +19,38 @@ will defer personal hands-on acceptance until the selected features are present.
 Engineering verification continues at each checkpoint. The earlier implementation
 is a verified foundation, not acceptance of the complete desired product.
 
+## Current engineering task — October 1 hardening
+
+The user selected the H1–H16 hardening findings in
+[the Jinn comparison](MILESTONES.md#september-30-hardening-first-jinn-comparison-latest-release)
+and approved the reviewed implementation plan. The approved hardening scope is
+now implemented and verified: independent code review and fresh final verification
+approved it, and all 343 automated tests passed along with the build checks. H2
+is the accepted follow-up below; evidence-gated dispositions and verification
+limits remain recorded in MILESTONES. No release is included.
+The older milestone proposals below retain their historical scope and do not
+authorize additional work.
+
+Existing LLMRelay data may be purged under the user's explicit instruction;
+backup and restoration of that data are not prerequisites for this task. This
+does not remove the existing offline backup/restore features or authorize
+unrelated deletion. Automatic pre-migration restore-point orchestration remains
+outside the approved hardening scope.
+
+### Accepted follow-up: H2 failed-turn automatic readiness
+
+On October 1, the user accepted completing the current hardening task with
+conservative failed-turn recovery preserved. Automatic readiness remains
+unimplemented and is a separate follow-up, not a completion blocker for this task.
+Before enabling it, establish trustworthy evidence from the application's
+admitted CLI version that the exact failed turn has ended and no background work
+remains. Readiness must remain separate from authority to start another call;
+authentication, billing, rate-limit and unknown failures must not trigger automatic
+new work. Process liveness, elapsed time, normal completion observations and a
+different CLI version do not establish that evidence. Further investigation and
+implementation need their own scoped plan; no compatibility upgrade or new
+provider probe is authorized by this disposition.
+
 ## Scope and delivery policy
 
 ### Initial v1 scope decision — September 23, 2026

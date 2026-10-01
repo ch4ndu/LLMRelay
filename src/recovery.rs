@@ -1,9 +1,9 @@
 use crate::domain::{
-    DecisionActionBinding, DecisionControlPolicy, DecisionDisposition, DecisionEvidenceState,
-    DecisionExplanation, DecisionNextAction, DecisionObservedRevision, DecisionOwner,
-    DecisionOwnership, DecisionPrerequisite, DecisionSubject, ProcessGenerationAnchor,
-    ProcessIdentity, RestartBatchMembership, RestartCandidateResult, RestartPreview,
-    RestartPreviewClassification, RestartPreviewSession, RestartPreviewSnapshot,
+    same_process_start, DecisionActionBinding, DecisionControlPolicy, DecisionDisposition,
+    DecisionEvidenceState, DecisionExplanation, DecisionNextAction, DecisionObservedRevision,
+    DecisionOwner, DecisionOwnership, DecisionPrerequisite, DecisionSubject,
+    ProcessGenerationAnchor, ProcessIdentity, RestartBatchMembership, RestartCandidateResult,
+    RestartPreview, RestartPreviewClassification, RestartPreviewSession, RestartPreviewSnapshot,
     DECISION_SCHEMA_V1,
 };
 use crate::store::Store;
@@ -1240,7 +1240,7 @@ pub fn reconcile_prior_boot(store: &Store) -> Result<Vec<serde_json::Value>> {
             .filter(|(pid, start, _)| {
                 inventory
                     .iter()
-                    .any(|item| item.0 == *pid && item.2 == *start)
+                    .any(|item| item.0 == *pid && same_process_start(&item.2, start))
             })
             .map(|(pid, _, _)| *pid)
             .collect::<Vec<_>>();
@@ -1303,7 +1303,10 @@ fn process_state(identity: &crate::domain::ProcessIdentity) -> Result<&'static s
         .args(["-o", "lstart=", "-p", &identity.pid.to_string()])
         .output()?;
     if output.status.success()
-        && String::from_utf8(output.stdout)?.trim() == identity.native_start_marker
+        && same_process_start(
+            &String::from_utf8(output.stdout)?,
+            &identity.native_start_marker,
+        )
     {
         Ok("survivor_unattached")
     } else {
@@ -1577,7 +1580,7 @@ fn observe_processes(
         match serde_json::from_str::<ProcessIdentity>(process_json) {
             Ok(process)
                 if !recorded.iter().any(|(pid, start, _)| {
-                    *pid == process.pid && start == &process.native_start_marker
+                    *pid == process.pid && same_process_start(start, &process.native_start_marker)
                 }) =>
             {
                 recorded.push((
@@ -1648,7 +1651,7 @@ fn observe_processes(
             recorded
                 .iter()
                 .any(|(recorded_pid, recorded_start, _)| {
-                    pid == recorded_pid && start == recorded_start
+                    pid == recorded_pid && same_process_start(start, recorded_start)
                 })
         })
         .map(|(pid, pgid, start)| {
@@ -2842,12 +2845,18 @@ pub fn verify_generation_absent_evidence(
             serde_json::json!({"source":"operating_system_boot_changed","recorded_boot":recorded_boot,"current_boot":current_boot,"recorded_identities":recorded.len()}),
         );
     }
+    if recorded
+        .iter()
+        .any(|item| item.1.trim().is_empty() && inventory.iter().any(|current| current.0 == item.0))
+    {
+        bail!("a recorded {kind} process identity has no start marker while its PID is present; absence is unknown")
+    }
     let matching = inventory
         .iter()
         .filter(|(pid, _, start)| {
             recorded
                 .iter()
-                .any(|item| item.0 == *pid && item.1 == *start)
+                .any(|item| item.0 == *pid && same_process_start(&item.1, start))
         })
         .collect::<Vec<_>>();
     if !matching.is_empty() {
@@ -2860,8 +2869,11 @@ pub fn verify_generation_absent_evidence(
         if anchor.process_group_id <= 0 || anchor.pid as i32 != anchor.process_group_id {
             bail!("the recorded {kind} generation anchor is not a process-group leader; same-boot absence is unknown")
         }
+        if anchor.native_start_marker.trim().is_empty() {
+            bail!("the recorded {kind} generation anchor has no start marker; same-boot absence is unknown")
+        }
         if let Some(current) = inventory.iter().find(|item| item.0 == anchor.pid) {
-            if current.2 == anchor.native_start_marker {
+            if same_process_start(&current.2, &anchor.native_start_marker) {
                 bail!("the original {kind} generation anchor remains live, including any process-group drift")
             }
             if current.1 == anchor.process_group_id {

@@ -83,7 +83,7 @@ Startup prints the selected data and log paths. Use the dashboard's **Diagnostic
 
 ## Support and documentation
 
-LLMRelay currently hosts standalone TRIP Explorer **v0.9.0**. Provider support is validated locally for the exact executable, role, model, effort, and policy; proofs are not transferable between installations. The current Codex adapter has a narrow compatibility envelope, including Codex CLI **0.155.1** and supported personal ChatGPT credentials. You can leave global Codex memories enabled: LLMRelay disables the memory feature only for its own fresh and resumed agent processes, without rewriting your preference or deleting memory files. Unsupported configurations are reported rather than silently modified. Review the [provider restrictions](docs/SECURITY.md) before onboarding.
+LLMRelay currently hosts standalone TRIP Explorer **v0.9.0**. Provider support is validated locally for the exact executable, role, model, effort, and policy; proofs are not transferable between installations. The current Codex adapter has a narrow compatibility envelope, including Codex CLI **0.157.1** and supported personal ChatGPT credentials. You can leave global Codex memories enabled: LLMRelay disables the memory feature only for its own fresh and resumed agent processes, without rewriting your preference or deleting memory files. Unsupported configurations are reported rather than silently modified. Review the [provider restrictions](docs/SECURITY.md) before onboarding.
 
 - [Building, verification, and local packaging](docs/BUILDING.md)
 - [Project setup and capability checks](docs/PROJECT_SETUP.md)

@@ -686,8 +686,32 @@ provider and dashboard verification.
 
 ### September 30 hardening-first Jinn comparison (latest release)
 
-**Status: research-backed candidates agreed by two independent reviewers; not
-selected, scheduled, or authorized for implementation.**
+**Status: approved October 1 hardening scope implemented and verified. Independent
+code review and fresh final verification approved the delivered candidate. H2
+automatic readiness is an accepted separate follow-up; the evidence-gated
+limitations below remain explicit. No release is included.**
+
+Final verification passed 58 frontend tests, 96 Rust library tests, 187 Rust
+contract tests and 2 runtime tests (343 total), plus frontend type-check/build
+and Rust formatting/compilation. The final Explorer found no missing traceability
+in the exact-recovery, guidance-delivery or restart-authority paths. Browser-cookie
+isolation was checked in two live instances; admitted Claude guidance observations
+characterize transport and do not qualify the entire automatic delivery pipeline.
+
+The list below preserves the September 30 findings. The approved implementation
+narrows several proposed mechanisms: missing-input acceptance is reported through
+existing projections, without a new anomaly sweeper; original guidance remains
+verbatim with any transformed submitted text recorded separately; failure reset
+times do not authorize automatic retries; and focused tests reuse existing seams
+without a new fake-provider framework. H2 requires trustworthy admitted-version
+failure/quiescence evidence before changing automatic readiness. On October 1, the
+user accepted H2 automatic readiness as a separate follow-up: conservative
+failed-turn recovery remains in place, and H2 does not block completion of this
+hardening task. H11, H12 and H15
+require evidence for delayed attention, unique notice correlation or a repeated
+automatic loop respectively. H16 was accepted as characterization with an
+explicit limitation: no runtime Codex session-history reader is added. These
+constraints do not mean that the original requested behaviors are all complete.
 
 This pass compared the latest Jinn release, `main` at
 `3ae6465715b6195db057d4c23156b696c71dc179` (v0.33.4, September 27, 2026), with
@@ -764,7 +788,13 @@ describe current Jinn source.
   session history records it as a structured event; attention text only. Codex
   registers no failure hook (`src/providers/codex.rs:163-173`).
 
-#### User decision required
+#### Current-data decision
+
+The user authorized purging the existing LLMRelay data and explicitly waived
+backup or restoration of that data for this work. No purge is required by the
+hardening implementation. Automatic pre-migration restore points remain outside
+this program; the recommendation below is retained for a future upgrade-policy
+decision, not as an outstanding permission request for the current task.
 
 - **Fail-closed restore point and free-space preflight before the serve-path
   schema upgrade.** `upgrade_supported_service_schema` (`src/store.rs:8955-8972`)
