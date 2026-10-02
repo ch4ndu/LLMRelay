@@ -8852,6 +8852,96 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
   }
 });
 
+Deno.test("H3/H15 attention opens the exact old exited session beyond 200 and refreshes a stale target", async () => {
+  const priorEnvironment = { ...liveEnvironment };
+  const commands: unknown[] = [];
+  const old: Session = {
+    ...managerSession,
+    id: "old-exited",
+    role_generation_id: "old-generation",
+    transcript_epoch: "old-epoch",
+    status: "exited",
+  };
+  const newest: Session[] = Array.from({ length: 200 }, (_, index) => ({
+    ...managerSession,
+    id: `newest-${index}`,
+    role_generation_id: `generation-${index}`,
+    status: "exited",
+  }));
+  const observation: AttentionItem = {
+    id: "attention_observation:old",
+    category: "blocked",
+    title: "Manager exited while still recorded as working",
+    reason: "The session exited without a report explaining its readiness. Open agent output to check.",
+    task_title: task.title,
+    role: "manager",
+    action: { kind: "open_agent_output", label: "Open agent output" },
+    target: {
+      kind: "session", project_id: "p1", task_id: "AJ-1", attempt_id: "a1",
+      session_id: old.id, role_generation_id: old.role_generation_id,
+    },
+    held_tasks: [],
+    details: "Two observations; exact invocation old-epoch.",
+  };
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input) === "/api/command") commands.push(JSON.parse(String(init?.body)));
+    return new Response("[]");
+  }) as typeof fetch;
+  try {
+    for (const mode of ["current", "missing", "epoch"] as const) {
+      const live = liveHarness();
+      liveEnvironment.transport = live.environment.transport;
+      liveEnvironment.scheduler = live.environment.scheduler;
+      localStorage.clear();
+      localStorage.setItem("agenticjira.page", "workspace");
+      const state = snapshotAt("service-a", mode === "current" ? "71" : mode === "missing" ? "72" : "73", {
+        tasks: [task],
+        active_sessions: mode === "missing" ? newest : [...newest,
+          mode === "epoch" ? { ...old, status: "running", transcript_epoch: "resumed-epoch" } : old],
+        attention: [mode === "epoch" ? { ...observation, target: null,
+          reason: "The original agent invocation is no longer available. Refresh to check its current state." } : observation,
+          railItem("independent", "blocked", "Independent hold", null)],
+      });
+      mount(<App />);
+      await settle();
+      live.reads[0].resolve(state);
+      await settle();
+      const reads = live.reads.length;
+      act(() => document.querySelector<HTMLButtonElement>('[data-attention-id="attention_observation:old"] button')!.click());
+      await settle();
+      if (mode === "missing") {
+        check(!document.querySelector('[role="dialog"]'), "a stale observation opened a replacement session");
+        check(live.reads.length > reads && document.body.textContent?.includes("changed before it could open"),
+          "a stale exact session was not explained and refreshed");
+      } else if (mode === "epoch") {
+        check(state.active_sessions[200].id === old.id &&
+          state.active_sessions[200].role_generation_id === old.role_generation_id &&
+          state.active_sessions[200].transcript_epoch !== old.transcript_epoch,
+          "the invocation replacement changed the session or generation instead of its epoch");
+        check(!document.querySelector('[role="dialog"]') && live.reads.length > reads,
+          "Refresh for a replaced invocation opened the resumed session or failed to refresh");
+        check(document.querySelector('[data-attention-id="attention_observation:old"]')?.textContent?.includes("Refresh"),
+          "the replaced invocation did not retain its nonactionable observation");
+      } else {
+        check(state.active_sessions.length === 201 && state.active_sessions[200].id === old.id,
+          "the old session fixture did not exercise the merged page");
+        check(document.activeElement?.getAttribute("data-attention-target") === `session:${old.id}` &&
+          !!document.activeElement?.closest('[role="dialog"]'), "the observation did not focus its exact exited session");
+        check(document.querySelector('[data-attention-id="independent"]'), "routing dropped an independent reason");
+      }
+      check(document.querySelector('[data-attention-id="independent"]'), "refresh dropped an independent reason");
+      check(commands.length === 0, "opening classification attention submitted a command");
+      unmount();
+    }
+  } finally {
+    unmount();
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
 Deno.test("A provider hold's attention item opens its exited session, whose Release provider hold posts the exact binding", async () => {
   const live = liveHarness();
   const priorEnvironment = { ...liveEnvironment };

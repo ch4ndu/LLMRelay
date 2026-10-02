@@ -15,7 +15,7 @@ use rusqlite::{
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -227,6 +227,7 @@ const MIGRATION_032: &str = include_str!("../migrations/032_normal_final_repair.
 const MIGRATION_033: &str = include_str!("../migrations/033_native_resolution.sql");
 const MIGRATION_034: &str = include_str!("../migrations/034_guidance_submitted_text.sql");
 const MIGRATION_035: &str = include_str!("../migrations/035_provider_failure_holds.sql");
+const MIGRATION_036: &str = include_str!("../migrations/036_attention_observations.sql");
 // Same value rusqlite installs at open; set explicitly before any pragma or DDL can contend.
 const STATE_DATABASE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -3316,12 +3317,40 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prior_stop: Option<(String, Option<String>)> = transaction
+            .query_row(
+                "SELECT status,interrupt_requested_at FROM sessions
+                 WHERE id=?1 AND transcript_epoch=?2 AND process_identity_json=?3
+                   AND status IN ('running','interrupt_requested','recovery_required')",
+                params![session_id, transcript_epoch, process_json],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((prior_status, interrupt_requested_at)) = prior_stop else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        let mut exit = serde_json::from_str::<serde_json::Value>(exit_json)?;
+        // Preserve general stop intent before clearing the interrupt marker.
+        exit.as_object_mut()
+            .ok_or_else(|| anyhow!("session exit record must be a JSON object"))?
+            .insert(
+                "app_stop_requested".into(),
+                (prior_status == "interrupt_requested" || interrupt_requested_at.is_some()).into(),
+            );
+        let recorded_exit = exit.to_string();
         let changed = transaction.execute(
             "UPDATE sessions SET status='exited',launch_state='finished',exit_json=?1,
                     interrupt_requested_at=NULL,updated_at=?2
              WHERE id=?3 AND transcript_epoch=?4 AND process_identity_json=?5
                AND status IN ('running','interrupt_requested','recovery_required')",
-            params![exit_json, now, session_id, transcript_epoch, process_json],
+            params![
+                recorded_exit,
+                now,
+                session_id,
+                transcript_epoch,
+                process_json
+            ],
         )?;
         if changed == 0 {
             transaction.commit()?;
@@ -3353,7 +3382,7 @@ impl Store {
             session_id,
             transcript_epoch,
             process_json,
-            exit_json,
+            &recorded_exit,
             &now,
         )?;
         transaction.commit()?;
@@ -9169,7 +9198,7 @@ impl Store {
     }
 }
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 35;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 36;
 
 /// Reads the durable state cursor. It is committed state only when the
 /// connection is in autocommit mode.
@@ -9181,7 +9210,7 @@ pub(crate) fn read_state_revision(connection: &Connection) -> rusqlite::Result<i
 
 /// The prior schemas an existing database may be migrated from at service
 /// start. Every other non-current version is left unchanged and refused.
-const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 4] = [31, 32, 33, 34];
+const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 5] = [31, 32, 33, 34, 35];
 
 fn upgrade_supported_service_schema(path: &Path) -> Result<()> {
     let mut connection = Connection::open_with_flags(
@@ -9671,6 +9700,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .commit()
             .context("commit provider failure hold migration")?;
     }
+    if version <= 35 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_036)?;
+        transaction.pragma_update(None, "user_version", 36)?;
+        transaction
+            .commit()
+            .context("commit attention observation migration")?;
+    }
     Ok(())
 }
 
@@ -9993,6 +10030,2126 @@ pub(crate) fn retire_replaced_role_holds(
             now
         ],
     )?;
+    Ok(())
+}
+
+/// App observation thresholds, never provider promises.
+const QUIET_TURN_AGE_SECONDS: i64 = 600;
+const QUIET_TURN_UNCHANGED_SECONDS: i64 = 300;
+const NO_LIVE_SESSION_SECONDS: i64 = 60;
+const CONFIRMATION_SPACING_SECONDS: i64 = 1;
+const RECURRENCE_CAP: i64 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ObservationKind {
+    ProcessWithoutAcceptedTurn,
+    QuietTurn,
+    AttemptWithoutLiveSession,
+    GuidanceUnaccepted,
+    PermissionOnExitedSession,
+    ResumeFailureAfterAcceptance,
+    BusyAfterExit,
+    RecurringBlock,
+}
+
+impl ObservationKind {
+    const ALL: [Self; 8] = [
+        Self::ProcessWithoutAcceptedTurn,
+        Self::QuietTurn,
+        Self::AttemptWithoutLiveSession,
+        Self::GuidanceUnaccepted,
+        Self::PermissionOnExitedSession,
+        Self::ResumeFailureAfterAcceptance,
+        Self::BusyAfterExit,
+        Self::RecurringBlock,
+    ];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessWithoutAcceptedTurn => "process_without_accepted_turn",
+            Self::QuietTurn => "quiet_turn",
+            Self::AttemptWithoutLiveSession => "attempt_without_live_session",
+            Self::GuidanceUnaccepted => "guidance_unaccepted",
+            Self::PermissionOnExitedSession => "permission_on_exited_session",
+            Self::ResumeFailureAfterAcceptance => "resume_failure_after_acceptance",
+            Self::BusyAfterExit => "busy_after_exit",
+            Self::RecurringBlock => "recurring_block",
+        }
+    }
+
+    fn entity_kind(self) -> &'static str {
+        match self {
+            Self::ProcessWithoutAcceptedTurn | Self::QuietTurn | Self::BusyAfterExit => "session",
+            Self::AttemptWithoutLiveSession => "attempt",
+            Self::GuidanceUnaccepted => "guidance_message",
+            Self::PermissionOnExitedSession => "permission_request",
+            Self::ResumeFailureAfterAcceptance => "resume_rejection",
+            Self::RecurringBlock => "role_lane",
+        }
+    }
+
+    fn confirmations_required(self) -> i64 {
+        match self {
+            Self::GuidanceUnaccepted | Self::PermissionOnExitedSession => 1,
+            Self::ProcessWithoutAcceptedTurn
+            | Self::QuietTurn
+            | Self::AttemptWithoutLiveSession
+            | Self::ResumeFailureAfterAcceptance
+            | Self::BusyAfterExit
+            | Self::RecurringBlock => 2,
+        }
+    }
+}
+
+pub(crate) struct OpenObservation {
+    pub(crate) id: String,
+    pub(crate) kind: ObservationKind,
+    pub(crate) task_id: Option<String>,
+    pub(crate) attempt_id: Option<String>,
+    pub(crate) role: Option<RoleKind>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) role_generation_id: Option<String>,
+    pub(crate) transcript_epoch: Option<String>,
+    pub(crate) source_id: Option<String>,
+    pub(crate) evidence: serde_json::Value,
+    pub(crate) uncertain: bool,
+    pub(crate) recurrence_count: i64,
+    pub(crate) last_counted_result_id: Option<String>,
+    pub(crate) opened_at: String,
+    pub(crate) current_block: bool,
+}
+
+pub(crate) fn open_attention_observations(connection: &Connection) -> Result<Vec<OpenObservation>> {
+    let mut statement = connection.prepare(
+        "SELECT id,kind,task_id,attempt_id,role,session_id,role_generation_id,source_id,
+                evidence_json,uncertain,recurrence_count,last_counted_result_id,opened_at,lane_id,transcript_epoch
+         FROM attention_observations WHERE state='open'
+           AND (kind!='recurring_block' OR recurrence_count=2) ORDER BY opened_at,id",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, bool>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|row| {
+            let kind = ObservationKind::ALL
+                .into_iter()
+                .find(|kind| kind.as_str() == row.1)
+                .ok_or_else(|| anyhow!("unknown attention observation kind {}", row.1))?;
+            let evidence: serde_json::Value = serde_json::from_str(&row.8)?;
+            let current_block = if kind == ObservationKind::RecurringBlock {
+                match (
+                    row.3.as_deref(),
+                    row.4.as_deref(),
+                    row.13.as_deref(),
+                    evidence["outcome"].as_str(),
+                ) {
+                    (Some(attempt), Some(role), Some(lane), Some(outcome)) => {
+                        current_block(connection, attempt, role, lane, outcome)?.unwrap_or(false)
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            Ok(OpenObservation {
+                id: row.0,
+                kind,
+                task_id: row.2,
+                attempt_id: row.3,
+                role: row.4.and_then(|role| role.parse().ok()),
+                session_id: row.5,
+                role_generation_id: row.6,
+                transcript_epoch: row.14,
+                source_id: row.7,
+                evidence,
+                uncertain: row.9,
+                recurrence_count: row.10,
+                last_counted_result_id: row.11,
+                opened_at: row.12,
+                current_block,
+            })
+        })
+        .collect()
+}
+
+/// Task `t`'s attempt `a` is its newest one and the task is still live.
+const OBSERVED_CURRENT_ATTEMPT_SQL: &str = "COALESCE(t.archived_at IS NULL
+    AND t.lifecycle IN ('in_progress','validation','awaiting_review')
+    AND a.status NOT IN ('done','completed','cancelled','failed')
+    AND a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=t.id
+              ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1),0)";
+
+const OBSERVED_EFFECTIVE_GENERATION_SQL: &str = "COALESCE(rg.status NOT IN ('replaced','revoked')
+    AND (EXISTS(SELECT 1 FROM role_settings rs WHERE rs.task_id=t.id AND rs.role=rg.role
+                  AND rs.revision=(SELECT MAX(current.revision) FROM role_settings current
+                                   WHERE current.task_id=t.id AND current.role=rg.role)
+                  AND rs.effective_generation_id=rg.id)
+      OR (rg.role='implementer' AND rg.lane_id!='default' AND EXISTS(
+            SELECT 1 FROM lane_generations lg WHERE lg.lane_id=rg.lane_id
+              AND lg.effective_generation_id=rg.id))),0)";
+
+/// Session `s` waits on a person through a persisted gate; `?2` is the pass time.
+const OBSERVED_PERSON_GATE_SQL: &str = "(EXISTS(SELECT 1 FROM permission_requests request
+       WHERE request.session_id=s.id AND request.state='pending'
+         AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+                        WHERE native.permission_request_id=request.id))
+     OR EXISTS(SELECT 1 FROM input_leases lease WHERE lease.session_id=s.id
+         AND lease.revoked_at IS NULL AND julianday(lease.expires_at)>julianday(?2)))";
+
+#[derive(Default)]
+struct ObservationBinding {
+    task_id: Option<String>,
+    attempt_id: Option<String>,
+    role: Option<String>,
+    lane_id: Option<String>,
+    role_generation_id: Option<String>,
+    session_id: Option<String>,
+    transcript_epoch: Option<String>,
+    source_id: Option<String>,
+}
+
+struct ObservationSubject {
+    kind: ObservationKind,
+    entity_key: String,
+    binding: ObservationBinding,
+}
+
+impl ObservationSubject {
+    fn new(kind: ObservationKind, entity_key: String) -> Self {
+        Self {
+            kind,
+            entity_key,
+            binding: ObservationBinding::default(),
+        }
+    }
+
+    fn bound(mut self, binding: ObservationBinding) -> Self {
+        self.binding = binding;
+        self
+    }
+}
+
+enum Finding {
+    Holds {
+        fingerprint: String,
+        evidence: serde_json::Value,
+        /// Thresholds measured from persisted facts are met.
+        ready: bool,
+        /// The same fingerprint must also have been observed this long.
+        unchanged_seconds: Option<i64>,
+    },
+    /// Facts are unavailable or a person's gate suppresses classification.
+    Suspended { uncertain: bool },
+    /// Positive evidence that the condition ended.
+    Ended(String),
+}
+
+impl Finding {
+    fn ended(reason: &str) -> Self {
+        Self::Ended(reason.to_owned())
+    }
+}
+
+struct StoredObservation {
+    id: String,
+    state: String,
+    fingerprint: String,
+    uncertain: bool,
+    observed_since: String,
+    last_eligible_at: Option<String>,
+    confirmations: i64,
+}
+
+struct UnresolvedObservation {
+    attempt_id: Option<String>,
+    session_id: Option<String>,
+    transcript_epoch: Option<String>,
+    source_id: Option<String>,
+}
+
+/// False for an unparseable time or one after `now`, which only a clock moved back can produce.
+fn at_least(earlier: &str, now: chrono::DateTime<Utc>, seconds: i64) -> bool {
+    chrono::DateTime::parse_from_rfc3339(earlier).is_ok_and(|earlier| {
+        now - earlier.with_timezone(&Utc) >= chrono::Duration::seconds(seconds)
+    })
+}
+
+struct ObservationPass<'a> {
+    transaction: &'a Transaction<'a>,
+    now: chrono::DateTime<Utc>,
+    now_text: String,
+    processes: &'a crate::supervisor::ProcessSnapshot,
+}
+
+impl Store {
+    /// One classification pass. It writes only attention observations and their
+    /// transition audits; it never holds, retries, signals or settles work.
+    pub(crate) fn observe_attention(
+        &self,
+        now: chrono::DateTime<Utc>,
+        processes: &crate::supervisor::ProcessSnapshot,
+        fresh_boot: bool,
+    ) -> Result<()> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if fresh_boot {
+            // Time before this boot is neither quiet nor waiting history.
+            transaction.execute(
+                "DELETE FROM attention_observations
+                 WHERE state='candidate' AND kind!='recurring_block'",
+                [],
+            )?;
+        }
+        let pass = ObservationPass {
+            transaction: &transaction,
+            now,
+            now_text: now.to_rfc3339(),
+            processes,
+        };
+        pass.observe_unaccepted_processes()?;
+        pass.observe_quiet_turns()?;
+        pass.observe_attempts_without_live_session()?;
+        pass.observe_unaccepted_guidance()?;
+        pass.observe_permissions_on_exited_sessions()?;
+        pass.observe_resume_failures_after_acceptance()?;
+        pass.observe_busy_after_exit()?;
+        pass.reconcile_blocking_episodes()?;
+        pass.observe_recurring_blocks()?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+impl ObservationPass<'_> {
+    fn stored(&self, kind: ObservationKind, entity_key: &str) -> Result<Option<StoredObservation>> {
+        Ok(self
+            .transaction
+            .query_row(
+                "SELECT id,state,evidence_fingerprint,uncertain,observed_since,last_eligible_at,
+                        confirmations
+                 FROM attention_observations WHERE entity_kind=?1 AND entity_key=?2 AND kind=?3",
+                params![kind.entity_kind(), entity_key, kind.as_str()],
+                |row| {
+                    Ok(StoredObservation {
+                        id: row.get(0)?,
+                        state: row.get(1)?,
+                        fingerprint: row.get(2)?,
+                        uncertain: row.get(3)?,
+                        observed_since: row.get(4)?,
+                        last_eligible_at: row.get(5)?,
+                        confirmations: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    fn unresolved(&self, kind: ObservationKind) -> Result<Vec<UnresolvedObservation>> {
+        let mut statement = self.transaction.prepare(
+            "SELECT attempt_id,session_id,transcript_epoch,source_id FROM attention_observations
+             WHERE kind=?1 AND state IN ('candidate','open') ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![kind.as_str()], |row| {
+                Ok(UnresolvedObservation {
+                    attempt_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    transcript_epoch: row.get(2)?,
+                    source_id: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// `None` while the process table is unknown; otherwise whether that exact
+    /// invocation's recorded root process was alive.
+    fn invocation_live(
+        &self,
+        session_id: &str,
+        generation_id: &str,
+        epoch: &str,
+        process_json: Option<&str>,
+    ) -> Option<bool> {
+        match self.processes {
+            crate::supervisor::ProcessSnapshot::Unavailable => None,
+            crate::supervisor::ProcessSnapshot::Read(live) => Some(live.iter().any(|invocation| {
+                invocation.session_id == session_id
+                    && invocation.role_generation_id == generation_id
+                    && invocation.transcript_epoch == epoch
+                    && Some(invocation.process_identity_json.as_str()) == process_json
+            })),
+        }
+    }
+
+    fn native_prompt_waiting(&self, session_id: &str) -> Result<bool> {
+        Ok(crate::workflow::native_prompt(self.transaction, session_id)?.is_some())
+    }
+
+    fn audit(
+        &self,
+        observation_id: &str,
+        event_code: &str,
+        detail: serde_json::Value,
+    ) -> Result<()> {
+        self.transaction.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES(?1,?2,'service',?3,'attention_observation',?4,?5,?6)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+                event_code,
+                observation_id,
+                detail.to_string(),
+                self.now_text
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Candidates confirm on distinct sweeps and are discarded the moment their
+    /// evidence is interrupted; an open record ends only on positive evidence.
+    fn advance(&self, subject: ObservationSubject, finding: Finding) -> Result<()> {
+        let kind = subject.kind;
+        let stored = self.stored(kind, &subject.entity_key)?;
+        match (stored, finding) {
+            (
+                stored,
+                Finding::Holds {
+                    fingerprint,
+                    mut evidence,
+                    ready,
+                    unchanged_seconds,
+                },
+            ) => {
+                if let Some(stored) = stored.as_ref().filter(|stored| stored.state == "open") {
+                    if stored.uncertain || stored.fingerprint != fingerprint {
+                        self.transaction.execute(
+                            "UPDATE attention_observations SET uncertain=0,evidence_fingerprint=?1,
+                                    evidence_json=CASE WHEN evidence_fingerprint=?1 THEN evidence_json ELSE ?2 END,
+                                    last_seen_at=?3
+                             WHERE id=?4",
+                            params![fingerprint, evidence.to_string(), self.now_text, stored.id],
+                        )?;
+                    }
+                    return Ok(());
+                }
+                let continuing = stored.as_ref().filter(|stored| {
+                    stored.state == "candidate"
+                        && stored.fingerprint == fingerprint
+                        && at_least(&stored.observed_since, self.now, 0)
+                        && stored
+                            .last_eligible_at
+                            .as_deref()
+                            .is_none_or(|last| at_least(last, self.now, 0))
+                });
+                let observed_since = continuing.map_or(self.now_text.clone(), |stored| {
+                    stored.observed_since.clone()
+                });
+                let eligible = ready
+                    && unchanged_seconds
+                        .is_none_or(|required| at_least(&observed_since, self.now, required));
+                let (confirmations, last_eligible_at) = match (continuing, eligible) {
+                    (_, false) => (0, None),
+                    (Some(stored), true) => match stored.last_eligible_at.as_deref() {
+                        Some(last) if !at_least(last, self.now, CONFIRMATION_SPACING_SECONDS) => {
+                            (stored.confirmations, Some(last.to_owned()))
+                        }
+                        _ => (
+                            (stored.confirmations + 1).min(kind.confirmations_required()),
+                            Some(self.now_text.clone()),
+                        ),
+                    },
+                    (None, true) => (1, Some(self.now_text.clone())),
+                };
+                let opens = confirmations >= kind.confirmations_required();
+                if let Some(stored) = continuing {
+                    if !opens
+                        && stored.confirmations == confirmations
+                        && stored.last_eligible_at == last_eligible_at
+                    {
+                        return Ok(());
+                    }
+                }
+                if unchanged_seconds.is_some() {
+                    evidence["observed_since"] = observed_since.clone().into();
+                }
+                let state = if opens { "open" } else { "candidate" };
+                let binding = &subject.binding;
+                let id = match stored {
+                    Some(stored) => {
+                        self.transaction.execute(
+                            "UPDATE attention_observations SET state=?1,evidence_fingerprint=?2,
+                                    evidence_json=?3,uncertain=0,last_seen_at=?4,observed_since=?5,
+                                    last_eligible_at=?6,confirmations=?7,
+                                    opened_at=CASE WHEN ?1='open' THEN ?4 ELSE NULL END,
+                                    resolved_at=NULL,resolution_reason=NULL,task_id=?8,attempt_id=?9,
+                                    role=?10,lane_id=?11,role_generation_id=?12,session_id=?13,
+                                    transcript_epoch=?14,source_id=?15
+                             WHERE id=?16",
+                            params![
+                                state,
+                                fingerprint,
+                                evidence.to_string(),
+                                self.now_text,
+                                observed_since,
+                                last_eligible_at,
+                                confirmations,
+                                binding.task_id,
+                                binding.attempt_id,
+                                binding.role,
+                                binding.lane_id,
+                                binding.role_generation_id,
+                                binding.session_id,
+                                binding.transcript_epoch,
+                                binding.source_id,
+                                stored.id
+                            ],
+                        )?;
+                        stored.id
+                    }
+                    None => {
+                        let id = uuid::Uuid::new_v4().to_string();
+                        self.transaction.execute(
+                            "INSERT INTO attention_observations(id,entity_kind,entity_key,kind,task_id,
+                                attempt_id,role,lane_id,role_generation_id,session_id,transcript_epoch,
+                                source_id,state,evidence_fingerprint,evidence_json,first_seen_at,
+                                last_seen_at,observed_since,last_eligible_at,confirmations,opened_at)
+                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?16,?16,?17,?18,
+                                    CASE WHEN ?13='open' THEN ?16 ELSE NULL END)",
+                            params![
+                                id,
+                                kind.entity_kind(),
+                                subject.entity_key,
+                                kind.as_str(),
+                                binding.task_id,
+                                binding.attempt_id,
+                                binding.role,
+                                binding.lane_id,
+                                binding.role_generation_id,
+                                binding.session_id,
+                                binding.transcript_epoch,
+                                binding.source_id,
+                                state,
+                                fingerprint,
+                                evidence.to_string(),
+                                self.now_text,
+                                last_eligible_at,
+                                confirmations
+                            ],
+                        )?;
+                        id
+                    }
+                };
+                if opens {
+                    self.audit(
+                        &id,
+                        "attention.observation.opened",
+                        serde_json::json!({"kind":kind.as_str(),"entity_key":subject.entity_key}),
+                    )?;
+                }
+                Ok(())
+            }
+            (None, Finding::Suspended { .. } | Finding::Ended(_)) => Ok(()),
+            (Some(stored), Finding::Suspended { uncertain }) => {
+                match stored.state.as_str() {
+                    "candidate" => {
+                        self.transaction.execute(
+                            "DELETE FROM attention_observations WHERE id=?1",
+                            params![stored.id],
+                        )?;
+                    }
+                    "open" if uncertain && !stored.uncertain => {
+                        self.transaction.execute(
+                            "UPDATE attention_observations SET uncertain=1,last_seen_at=?1 WHERE id=?2",
+                            params![self.now_text, stored.id],
+                        )?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            (Some(stored), Finding::Ended(reason)) => {
+                match stored.state.as_str() {
+                    "candidate" => {
+                        self.transaction.execute(
+                            "DELETE FROM attention_observations WHERE id=?1",
+                            params![stored.id],
+                        )?;
+                    }
+                    "open" => {
+                        self.transaction.execute(
+                            "UPDATE attention_observations SET state='resolved',uncertain=0,
+                                    resolved_at=?1,resolution_reason=?2,last_seen_at=?1
+                             WHERE id=?3",
+                            params![self.now_text, reason, stored.id],
+                        )?;
+                        self.audit(
+                            &stored.id,
+                            "attention.observation.resolved",
+                            serde_json::json!({"kind":kind.as_str(),"entity_key":subject.entity_key,"reason":reason}),
+                        )?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn running_current_sessions(&self) -> Result<BTreeSet<(String, String)>> {
+        let mut statement = self.transaction.prepare(&format!(
+            "SELECT s.id,s.transcript_epoch FROM sessions s
+             JOIN role_generations rg ON rg.id=s.role_generation_id
+             JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
+             WHERE s.status='running' AND {OBSERVED_CURRENT_ATTEMPT_SQL}"
+        ))?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        Ok(rows)
+    }
+
+    fn observe_unaccepted_processes(&self) -> Result<()> {
+        let kind = ObservationKind::ProcessWithoutAcceptedTurn;
+        let mut subjects = self.running_current_sessions()?;
+        subjects.extend(
+            self.unresolved(kind)?
+                .into_iter()
+                .filter_map(|row| Some((row.session_id?, row.transcript_epoch?))),
+        );
+        for (session_id, epoch) in subjects {
+            let (subject, finding) = self.unaccepted_process(&session_id, &epoch)?;
+            self.advance(subject, finding)?;
+        }
+        Ok(())
+    }
+
+    fn unaccepted_process(
+        &self,
+        session_id: &str,
+        epoch: &str,
+    ) -> Result<(ObservationSubject, Finding)> {
+        type Row = (
+            ObservationBinding,
+            String,
+            String,
+            bool,
+            Option<String>,
+            bool,
+            bool,
+            Option<String>,
+            Option<String>,
+            bool,
+            bool,
+        );
+        let subject = ObservationSubject::new(
+            ObservationKind::ProcessWithoutAcceptedTurn,
+            format!("{session_id}:{epoch}"),
+        );
+        let row: Option<Row> = self
+            .transaction
+            .query_row(
+                &format!(
+                    "WITH {}
+                     SELECT t.id,a.id,rg.role,rg.lane_id,rg.id,
+                            (SELECT ri.id FROM resume_invocations ri WHERE ri.session_id=s.id
+                               AND ri.transcript_epoch=s.transcript_epoch
+                             ORDER BY ri.resume_ordinal DESC LIMIT 1),
+                            s.transcript_epoch,s.status,s.exit_json IS NOT NULL,s.process_identity_json,
+                            {OBSERVED_CURRENT_ATTEMPT_SQL},{OBSERVED_EFFECTIVE_GENERATION_SQL},
+                            (SELECT start.id FROM hook_events start
+                             WHERE start.rowid=(SELECT hook_rowid FROM invocation_start)),
+                            (SELECT start.received_at FROM hook_events start
+                             WHERE start.rowid=(SELECT hook_rowid FROM invocation_start)),
+                            EXISTS(SELECT 1 FROM accepted),{OBSERVED_PERSON_GATE_SQL}
+                     FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
+                     JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
+                     WHERE s.id=?1",
+                    crate::workflow::CURRENT_TURN_HOOKS_SQL
+                ),
+                params![session_id, self.now_text],
+                |row| {
+                    Ok((
+                        ObservationBinding {
+                            task_id: row.get(0)?,
+                            attempt_id: row.get(1)?,
+                            role: row.get(2)?,
+                            lane_id: row.get(3)?,
+                            role_generation_id: row.get(4)?,
+                            session_id: Some(session_id.to_owned()),
+                            transcript_epoch: Some(epoch.to_owned()),
+                            source_id: row.get(5)?,
+                        },
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                        row.get(15)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            binding,
+            current_epoch,
+            status,
+            exit_recorded,
+            process_json,
+            current_attempt,
+            effective,
+            start_id,
+            started_at,
+            accepted,
+            gated,
+        )) = row
+        else {
+            return Ok((subject, Finding::Suspended { uncertain: false }));
+        };
+        let finding = if !current_attempt {
+            Finding::ended("attempt_retired")
+        } else if !effective {
+            Finding::ended("role_replaced")
+        } else if current_epoch != epoch {
+            Finding::ended("invocation_replaced")
+        } else if accepted {
+            Finding::ended("turn_accepted")
+        } else if status == "exited" && exit_recorded {
+            Finding::ended("process_exited")
+        } else if status != "running" {
+            Finding::Suspended { uncertain: false }
+        } else if let (Some(start_id), Some(started_at)) = (start_id, started_at) {
+            let generation = binding.role_generation_id.as_deref().unwrap_or_default();
+            match self.invocation_live(session_id, generation, epoch, process_json.as_deref()) {
+                None | Some(false) => Finding::Suspended { uncertain: true },
+                Some(true) if gated || self.native_prompt_waiting(session_id)? => {
+                    Finding::Suspended { uncertain: false }
+                }
+                Some(true) => Finding::Holds {
+                    ready: at_least(
+                        &started_at,
+                        self.now,
+                        crate::workflow::ACCEPTANCE_OBSERVATION_SECONDS,
+                    ),
+                    evidence: serde_json::json!({
+                        "session_start_hook_event_id":start_id,
+                        "session_started_at":started_at,
+                        "threshold_seconds":crate::workflow::ACCEPTANCE_OBSERVATION_SECONDS,
+                    }),
+                    fingerprint: start_id,
+                    unchanged_seconds: None,
+                },
+            }
+        } else {
+            // Without this invocation's trusted start, absence of acceptance means nothing.
+            Finding::Suspended { uncertain: false }
+        };
+        Ok((subject.bound(binding), finding))
+    }
+
+    fn observe_quiet_turns(&self) -> Result<()> {
+        let kind = ObservationKind::QuietTurn;
+        let mut subjects = BTreeSet::new();
+        for (session_id, epoch) in self.running_current_sessions()? {
+            let accepted: Option<String> = self
+                .transaction
+                .query_row(
+                    &format!(
+                        "WITH {} SELECT id FROM accepted",
+                        crate::workflow::CURRENT_TURN_HOOKS_SQL
+                    ),
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(accepted) = accepted {
+                subjects.insert((session_id, epoch, accepted));
+            }
+        }
+        subjects.extend(
+            self.unresolved(kind)?
+                .into_iter()
+                .filter_map(|row| Some((row.session_id?, row.transcript_epoch?, row.source_id?))),
+        );
+        for (session_id, epoch, accepted) in subjects {
+            let (subject, finding) = self.quiet_turn(&session_id, &epoch, &accepted)?;
+            self.advance(subject, finding)?;
+        }
+        Ok(())
+    }
+
+    fn quiet_turn(
+        &self,
+        session_id: &str,
+        epoch: &str,
+        accepted_hook_id: &str,
+    ) -> Result<(ObservationSubject, Finding)> {
+        type Row = (
+            ObservationBinding,
+            String,
+            String,
+            bool,
+            Option<String>,
+            bool,
+            bool,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            i64,
+            String,
+            bool,
+            bool,
+            bool,
+        );
+        let kind = ObservationKind::QuietTurn;
+        let subject =
+            ObservationSubject::new(kind, format!("{session_id}:{epoch}:{accepted_hook_id}"));
+        let row: Option<Row> = self
+            .transaction
+            .query_row(
+                &format!(
+                    "WITH {}
+                     SELECT t.id,a.id,rg.role,rg.lane_id,rg.id,s.transcript_epoch,s.status,
+                            s.exit_json IS NOT NULL,s.process_identity_json,
+                            {OBSERVED_CURRENT_ATTEMPT_SQL},{OBSERVED_EFFECTIVE_GENERATION_SQL},
+                            (SELECT id FROM accepted),(SELECT received_at FROM accepted),
+                            (SELECT MAX(hook_rowid) FROM current_hooks),s.transcript_last_sequence,
+                            s.capture_state,
+                            EXISTS(SELECT 1 FROM current_hooks later WHERE later.event_name='Stop'
+                              AND later.hook_rowid>(SELECT hook_rowid FROM accepted)
+                              AND {}),
+                            EXISTS(SELECT 1 FROM role_results report WHERE report.session_id=s.id
+                              AND report.role_generation_id=s.role_generation_id
+                              AND julianday(report.created_at)>=julianday((SELECT received_at FROM accepted))
+                              AND NOT EXISTS(SELECT 1 FROM role_result_supersessions retired WHERE retired.role_result_id=report.id)
+                              AND NOT EXISTS(SELECT 1 FROM audit_events retired WHERE retired.event_code='role_result.superseded'
+                                AND retired.entity_kind='role_result' AND retired.entity_id=report.id)),
+                            {OBSERVED_PERSON_GATE_SQL}
+                     FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
+                     JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
+                     WHERE s.id=?1",
+                    crate::workflow::CURRENT_TURN_HOOKS_SQL,
+                    crate::workflow::belongs_to_accepted_turn("later")
+                ),
+                params![session_id, self.now_text],
+                |row| {
+                    Ok((
+                        ObservationBinding {
+                            task_id: row.get(0)?,
+                            attempt_id: row.get(1)?,
+                            role: row.get(2)?,
+                            lane_id: row.get(3)?,
+                            role_generation_id: row.get(4)?,
+                            session_id: Some(session_id.to_owned()),
+                            transcript_epoch: Some(epoch.to_owned()),
+                            source_id: Some(accepted_hook_id.to_owned()),
+                        },
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                        row.get(15)?,
+                        row.get(16)?,
+                        row.get(17)?,
+                        row.get(18)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            binding,
+            current_epoch,
+            status,
+            exit_recorded,
+            process_json,
+            current_attempt,
+            effective,
+            current_accepted,
+            accepted_at,
+            hook_watermark,
+            sequence,
+            capture_state,
+            stopped,
+            reported,
+            gated,
+        )) = row
+        else {
+            return Ok((subject, Finding::Suspended { uncertain: false }));
+        };
+        let fingerprint = format!("{}:{sequence}", hook_watermark.unwrap_or_default());
+        let finding = if !current_attempt {
+            Finding::ended("attempt_retired")
+        } else if !effective {
+            Finding::ended("role_replaced")
+        } else if current_epoch != epoch {
+            Finding::ended("invocation_replaced")
+        } else if status == "exited" && exit_recorded {
+            Finding::ended("process_exited")
+        } else if let (Some(current_accepted), Some(accepted_at)) = (current_accepted, accepted_at)
+        {
+            let generation = binding.role_generation_id.as_deref().unwrap_or_default();
+            if current_accepted != accepted_hook_id {
+                Finding::ended("superseded_by_newer_turn")
+            } else if stopped || reported {
+                Finding::ended("turn_completed")
+            } else if status != "running" {
+                Finding::Suspended { uncertain: false }
+            } else if capture_state != "capturing" {
+                Finding::Suspended { uncertain: true }
+            } else if self.invocation_live(session_id, generation, epoch, process_json.as_deref())
+                != Some(true)
+            {
+                Finding::Suspended { uncertain: true }
+            } else if self
+                .stored(kind, &subject.entity_key)?
+                .is_some_and(|stored| stored.state == "open" && stored.fingerprint != fingerprint)
+            {
+                Finding::ended("activity_resumed")
+            } else if gated || self.native_prompt_waiting(session_id)? {
+                Finding::Suspended { uncertain: false }
+            } else {
+                Finding::Holds {
+                    ready: at_least(&accepted_at, self.now, QUIET_TURN_AGE_SECONDS),
+                    evidence: serde_json::json!({
+                        "accepted_hook_event_id":accepted_hook_id,
+                        "accepted_at":accepted_at,
+                        "turn_age_threshold_seconds":QUIET_TURN_AGE_SECONDS,
+                        "quiet_threshold_seconds":QUIET_TURN_UNCHANGED_SECONDS,
+                    }),
+                    fingerprint,
+                    unchanged_seconds: Some(QUIET_TURN_UNCHANGED_SECONDS),
+                }
+            }
+        } else {
+            Finding::Suspended { uncertain: false }
+        };
+        Ok((subject.bound(binding), finding))
+    }
+
+    fn observe_attempts_without_live_session(&self) -> Result<()> {
+        let kind = ObservationKind::AttemptWithoutLiveSession;
+        let waiting = crate::coordinator::attempts_waiting_on_manager_turn(self.transaction)?;
+        let mut subjects = waiting.iter().cloned().collect::<BTreeSet<_>>();
+        subjects.extend(
+            self.unresolved(kind)?
+                .into_iter()
+                .filter_map(|row| row.attempt_id),
+        );
+        for attempt_id in subjects {
+            let (subject, finding) =
+                self.attempt_without_live_session(&attempt_id, waiting.contains(&attempt_id))?;
+            self.advance(subject, finding)?;
+        }
+        Ok(())
+    }
+
+    fn attempt_without_live_session(
+        &self,
+        attempt_id: &str,
+        waiting_on_manager: bool,
+    ) -> Result<(ObservationSubject, Finding)> {
+        let subject = ObservationSubject::new(
+            ObservationKind::AttemptWithoutLiveSession,
+            attempt_id.to_owned(),
+        );
+        let attempt: Option<(String, String, String, bool, bool)> = self
+            .transaction
+            .query_row(
+                &format!(
+                    "SELECT t.id,a.status,a.phase,{OBSERVED_CURRENT_ATTEMPT_SQL},
+                            EXISTS(SELECT 1 FROM role_generations reserved WHERE reserved.attempt_id=a.id
+                              AND reserved.role='manager' AND reserved.status='launch_reserved')
+                     FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1"
+                ),
+                params![attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()?;
+        let Some((task_id, status, phase, current_attempt, manager_reserved)) = attempt else {
+            return Ok((subject, Finding::Suspended { uncertain: false }));
+        };
+        let binding = ObservationBinding {
+            task_id: Some(task_id),
+            attempt_id: Some(attempt_id.to_owned()),
+            role: Some(RoleKind::Manager.to_string()),
+            ..ObservationBinding::default()
+        };
+        if !current_attempt {
+            return Ok((subject.bound(binding), Finding::ended("attempt_retired")));
+        }
+        if status != "running" {
+            return Ok((
+                subject.bound(binding),
+                Finding::ended("attempt_not_running"),
+            ));
+        }
+        if !waiting_on_manager {
+            return Ok((
+                subject.bound(binding),
+                Finding::ended("session_not_required"),
+            ));
+        }
+        if matches!(
+            self.processes,
+            crate::supervisor::ProcessSnapshot::Unavailable
+        ) {
+            return Ok((
+                subject.bound(binding),
+                Finding::Suspended { uncertain: true },
+            ));
+        }
+        let sessions: Vec<(String, String, String, Option<String>, String, bool)> = {
+            let mut statement = self.transaction.prepare(&format!(
+                "SELECT s.id,s.role_generation_id,s.transcript_epoch,s.process_identity_json,s.status,
+                        s.exit_json IS NOT NULL
+                 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
+                 JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
+                 WHERE rg.attempt_id=?1 AND {OBSERVED_EFFECTIVE_GENERATION_SQL} ORDER BY s.id"
+            ))?;
+            let rows = statement
+                .query_map(params![attempt_id], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut uncertain = false;
+        for (session_id, generation_id, epoch, process_json, session_status, exit_recorded) in
+            &sessions
+        {
+            let live =
+                self.invocation_live(session_id, generation_id, epoch, process_json.as_deref());
+            if live == Some(true) {
+                return Ok((
+                    subject.bound(binding),
+                    Finding::ended("effective_session_live"),
+                ));
+            }
+            let confirmed_ended =
+                (session_status == "exited" && *exit_recorded) || session_status == "launch_failed";
+            uncertain |= !confirmed_ended;
+        }
+        let finding = if uncertain {
+            Finding::Suspended { uncertain: true }
+        } else if manager_reserved {
+            Finding::Suspended { uncertain: false }
+        } else {
+            Finding::Holds {
+                fingerprint: phase.clone(),
+                evidence: serde_json::json!({
+                    "phase":phase,
+                    "threshold_seconds":NO_LIVE_SESSION_SECONDS,
+                }),
+                ready: true,
+                unchanged_seconds: Some(NO_LIVE_SESSION_SECONDS),
+            }
+        };
+        Ok((subject.bound(binding), finding))
+    }
+
+    fn observe_unaccepted_guidance(&self) -> Result<()> {
+        let kind = ObservationKind::GuidanceUnaccepted;
+        let mut subjects: BTreeSet<(String, String, String)> = {
+            let mut statement = self.transaction.prepare(&format!(
+                "SELECT g.id,g.delivery_session_id,g.delivery_transcript_epoch
+                 FROM guidance_messages g JOIN attempts a ON a.id=g.attempt_id
+                 JOIN tasks t ON t.id=a.task_id
+                 WHERE g.state='written_awaiting_submit' AND g.delivery_session_id IS NOT NULL
+                   AND g.delivery_transcript_epoch IS NOT NULL AND {OBSERVED_CURRENT_ATTEMPT_SQL}"
+            ))?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+            rows
+        };
+        subjects.extend(
+            self.unresolved(kind)?
+                .into_iter()
+                .filter_map(|row| Some((row.source_id?, row.session_id?, row.transcript_epoch?))),
+        );
+        for (guidance_id, session_id, epoch) in subjects {
+            let (subject, finding) = self.unaccepted_guidance(&guidance_id, &session_id, &epoch)?;
+            self.advance(subject, finding)?;
+        }
+        Ok(())
+    }
+
+    fn unaccepted_guidance(
+        &self,
+        guidance_id: &str,
+        session_id: &str,
+        epoch: &str,
+    ) -> Result<(ObservationSubject, Finding)> {
+        type Row = (
+            ObservationBinding,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            bool,
+            Option<String>,
+        );
+        let subject = ObservationSubject::new(
+            ObservationKind::GuidanceUnaccepted,
+            format!("{guidance_id}:{session_id}:{epoch}"),
+        );
+        let row: Option<Row> = self
+            .transaction
+            .query_row(
+                &format!(
+                    "SELECT t.id,a.id,rg.role,rg.lane_id,rg.id,g.state,g.written_at,
+                            g.delivery_session_id,g.delivery_transcript_epoch,rg.status,
+                            {OBSERVED_CURRENT_ATTEMPT_SQL},s.transcript_epoch
+                     FROM guidance_messages g JOIN role_generations rg ON rg.id=g.role_generation_id
+                     JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id
+                     LEFT JOIN sessions s ON s.id=g.delivery_session_id
+                     WHERE g.id=?1"
+                ),
+                params![guidance_id],
+                |row| {
+                    Ok((
+                        ObservationBinding {
+                            task_id: row.get(0)?,
+                            attempt_id: row.get(1)?,
+                            role: row.get(2)?,
+                            lane_id: row.get(3)?,
+                            role_generation_id: row.get(4)?,
+                            session_id: Some(session_id.to_owned()),
+                            transcript_epoch: Some(epoch.to_owned()),
+                            source_id: Some(guidance_id.to_owned()),
+                        },
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            binding,
+            state,
+            written_at,
+            delivery_session,
+            delivery_epoch,
+            generation_status,
+            current_attempt,
+            current_epoch,
+        )) = row
+        else {
+            return Ok((subject, Finding::Suspended { uncertain: false }));
+        };
+        let finding = if !current_attempt {
+            Finding::ended("attempt_retired")
+        } else if matches!(
+            state.as_str(),
+            "submitted" | "acknowledged" | "cancelled" | "abandoned"
+        ) {
+            Finding::Ended(format!("guidance_{state}"))
+        } else if matches!(generation_status.as_str(), "replaced" | "revoked") {
+            Finding::ended("invocation_retired")
+        } else if current_epoch
+            .as_deref()
+            .is_some_and(|current| current != epoch)
+        {
+            Finding::ended("invocation_retired")
+        } else if delivery_session
+            .as_deref()
+            .is_some_and(|delivery| delivery != session_id)
+            || delivery_epoch
+                .as_deref()
+                .is_some_and(|delivery| delivery != epoch)
+        {
+            Finding::ended("delivery_replaced")
+        } else if state != "written_awaiting_submit"
+            || current_epoch.is_none()
+            || delivery_session.is_none()
+            || delivery_epoch.is_none()
+        {
+            Finding::Suspended { uncertain: true }
+        } else if let Some(written_at) = written_at {
+            Finding::Holds {
+                ready: at_least(
+                    &written_at,
+                    self.now,
+                    crate::workflow::ACCEPTANCE_OBSERVATION_SECONDS,
+                ),
+                evidence: serde_json::json!({
+                    "written_at":written_at,
+                    "threshold_seconds":crate::workflow::ACCEPTANCE_OBSERVATION_SECONDS,
+                }),
+                fingerprint: written_at,
+                unchanged_seconds: None,
+            }
+        } else {
+            Finding::Suspended { uncertain: false }
+        };
+        Ok((subject.bound(binding), finding))
+    }
+
+    fn observe_permissions_on_exited_sessions(&self) -> Result<()> {
+        let kind = ObservationKind::PermissionOnExitedSession;
+        let mut subjects: BTreeSet<String> = {
+            let mut statement = self.transaction.prepare(&format!(
+                "SELECT p.id FROM permission_requests p JOIN sessions s ON s.id=p.session_id
+                 JOIN attempts a ON a.id=p.attempt_id JOIN tasks t ON t.id=a.task_id
+                 WHERE p.state='pending' AND s.status='exited'
+                   AND {OBSERVED_CURRENT_ATTEMPT_SQL}
+                   AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions native
+                                  WHERE native.permission_request_id=p.id)"
+            ))?;
+            let rows = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+            rows
+        };
+        subjects.extend(
+            self.unresolved(kind)?
+                .into_iter()
+                .filter_map(|row| row.source_id),
+        );
+        for request_id in subjects {
+            let (subject, finding) = self.permission_on_exited_session(&request_id)?;
+            self.advance(subject, finding)?;
+        }
+        Ok(())
+    }
+
+    fn permission_on_exited_session(
+        &self,
+        request_id: &str,
+    ) -> Result<(ObservationSubject, Finding)> {
+        type Row = (ObservationBinding, String, bool, String, bool, bool, bool);
+        let subject = ObservationSubject::new(
+            ObservationKind::PermissionOnExitedSession,
+            request_id.to_owned(),
+        );
+        let row: Option<Row> = self
+            .transaction
+            .query_row(
+                &format!(
+                    "SELECT t.id,a.id,p.role,rg.lane_id,p.role_generation_id,p.session_id,
+                            s.transcript_epoch,p.state,
+                            EXISTS(SELECT 1 FROM permission_native_resolutions native
+                                   WHERE native.permission_request_id=p.id),
+                            s.status,s.exit_json IS NOT NULL,
+                            s.role_generation_id=p.role_generation_id AND {OBSERVED_EFFECTIVE_GENERATION_SQL},
+                            {OBSERVED_CURRENT_ATTEMPT_SQL}
+                     FROM permission_requests p JOIN sessions s ON s.id=p.session_id
+                     JOIN role_generations rg ON rg.id=p.role_generation_id
+                     JOIN attempts a ON a.id=p.attempt_id JOIN tasks t ON t.id=a.task_id
+                     WHERE p.id=?1"
+                ),
+                params![request_id],
+                |row| {
+                    Ok((
+                        ObservationBinding {
+                            task_id: row.get(0)?,
+                            attempt_id: row.get(1)?,
+                            role: row.get(2)?,
+                            lane_id: row.get(3)?,
+                            role_generation_id: row.get(4)?,
+                            session_id: row.get(5)?,
+                            transcript_epoch: row.get(6)?,
+                            source_id: Some(request_id.to_owned()),
+                        },
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            binding,
+            state,
+            natively_resolved,
+            session_status,
+            exit_recorded,
+            same_binding,
+            current_attempt,
+        )) = row
+        else {
+            return Ok((subject, Finding::Suspended { uncertain: false }));
+        };
+        let prior_epoch: Option<String> = self.transaction.query_row(
+            "SELECT transcript_epoch FROM attention_observations WHERE kind='permission_on_exited_session'
+               AND entity_key=?1 AND state IN ('candidate','open')", params![request_id], |row| row.get(0),
+        ).optional()?.flatten();
+        let finding = if !current_attempt {
+            Finding::ended("attempt_retired")
+        } else if state != "pending" || natively_resolved {
+            Finding::ended("request_settled")
+        } else if !same_binding
+            || prior_epoch
+                .as_deref()
+                .is_some_and(|prior| binding.transcript_epoch.as_deref() != Some(prior))
+        {
+            Finding::ended("binding_superseded")
+        } else if session_status != "exited" || !exit_recorded {
+            Finding::Suspended { uncertain: false }
+        } else {
+            Finding::Holds {
+                fingerprint: request_id.to_owned(),
+                evidence: serde_json::json!({"session_status":session_status}),
+                ready: true,
+                unchanged_seconds: None,
+            }
+        };
+        Ok((subject.bound(binding), finding))
+    }
+
+    fn observe_resume_failures_after_acceptance(&self) -> Result<()> {
+        let kind = ObservationKind::ResumeFailureAfterAcceptance;
+        let mut subjects: BTreeSet<String> = {
+            let mut statement = self.transaction.prepare(&format!(
+                "SELECT rejection.id FROM tasks t JOIN attempts a ON a.task_id=t.id
+                 JOIN role_generations rg ON rg.attempt_id=a.id
+                 JOIN sessions s ON s.role_generation_id=rg.id
+                 JOIN audit_events rejection ON rejection.entity_kind='session'
+                   AND rejection.entity_id=s.id AND rejection.event_code='session.resume.rejected'
+                   AND json_extract(rejection.detail_json,'$.attempt_id')=a.id
+                 WHERE t.attention='resume_failed' AND {OBSERVED_CURRENT_ATTEMPT_SQL}"
+            ))?;
+            let rows = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+            rows
+        };
+        subjects.extend(
+            self.unresolved(kind)?
+                .into_iter()
+                .filter_map(|row| row.source_id),
+        );
+        for rejection_id in subjects {
+            let (subject, finding) = self.resume_failure_after_acceptance(&rejection_id)?;
+            self.advance(subject, finding)?;
+        }
+        Ok(())
+    }
+
+    /// The causal conditions of `reconcile_accepted_resume_turn`, read without its mutations.
+    fn resume_failure_after_acceptance(
+        &self,
+        rejection_id: &str,
+    ) -> Result<(ObservationSubject, Finding)> {
+        type Row = (
+            ObservationBinding,
+            String,
+            String,
+            bool,
+            Option<String>,
+            bool,
+            bool,
+            bool,
+        );
+        let subject = ObservationSubject::new(
+            ObservationKind::ResumeFailureAfterAcceptance,
+            rejection_id.to_owned(),
+        );
+        let row: Option<Row> = self
+            .transaction
+            .query_row(
+                &format!(
+                    "SELECT t.id,a.id,json_extract(e.detail_json,'$.role'),
+                            json_extract(e.detail_json,'$.lane_id'),
+                            json_extract(e.detail_json,'$.role_generation_id'),e.entity_id,
+                            s.transcript_epoch,
+                            t.attention,a.status,{OBSERVED_CURRENT_ATTEMPT_SQL},
+                            (SELECT reconciled.id FROM audit_events reconciled,
+                                    json_each(reconciled.detail_json,'$.rejection_event_ids') listed
+                             JOIN resume_invocations ri ON ri.id=json_extract(reconciled.detail_json,'$.resume_invocation_id')
+                             JOIN hook_events accepted ON accepted.id=json_extract(reconciled.detail_json,'$.superseding_hook_event_id')
+                             WHERE reconciled.event_code='session.resume.turn_reconciled'
+                               AND reconciled.entity_kind='session' AND reconciled.entity_id=s.id
+                               AND json_extract(reconciled.detail_json,'$.role_generation_id')=rg.id
+                               AND json_extract(reconciled.detail_json,'$.transcript_epoch')=s.transcript_epoch
+                               AND ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
+                               AND ri.prior_transcript_epoch=json_extract(e.detail_json,'$.transcript_epoch')
+                               AND ri.resume_ordinal-1=CAST(json_extract(e.detail_json,'$.resume_count') AS INTEGER)
+                               AND julianday(e.created_at)<=julianday(ri.created_at)
+                               AND accepted.session_id=s.id AND accepted.role_generation_id=rg.id
+                               AND accepted.event_name='UserPromptSubmit'
+                               AND listed.value=e.id ORDER BY reconciled.rowid DESC LIMIT 1),
+                            (EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=a.id
+                               AND c.kind!='transition_proposal'
+                               AND c.state NOT IN ('finished','cancelled','superseded','rejected','failed','abandoned'))
+                             OR EXISTS(SELECT 1 FROM restart_candidates rc WHERE rc.attempt_id=a.id
+                               AND rc.state NOT IN ('resumed','released_fresh_dispatch','cancelled'))
+                             OR EXISTS(SELECT 1 FROM recovery_records r WHERE r.attempt_id=a.id
+                               AND r.state='attention_required')
+                             OR EXISTS(SELECT 1 FROM rework_intents rw WHERE rw.new_attempt_id=a.id
+                               AND rw.state NOT IN ('completed','cancelled','failed'))
+                             OR EXISTS(SELECT 1 FROM switch_intents si WHERE si.attempt_id=a.id
+                               AND si.state NOT IN ('completed','cancelled','superseded'))),
+                            EXISTS(SELECT 1 FROM audit_events other JOIN sessions other_session ON other_session.id=other.entity_id
+                              WHERE other.event_code='session.resume.rejected' AND other.entity_kind='session'
+                                AND json_extract(other.detail_json,'$.attempt_id')=a.id AND other.id!=e.id
+                                AND other_session.transcript_epoch=json_extract(other.detail_json,'$.transcript_epoch')
+                                AND other_session.resume_count=CAST(json_extract(other.detail_json,'$.resume_count') AS INTEGER)
+                                AND NOT EXISTS(SELECT 1 FROM audit_events route
+                                  WHERE route.event_code='session.resume.fresh_route.reserved'
+                                    AND json_extract(route.detail_json,'$.rejection_event_id')=other.id)
+                                AND NOT EXISTS(SELECT 1 FROM audit_events reconciled,
+                                    json_each(reconciled.detail_json,'$.rejection_event_ids') listed
+                                  WHERE reconciled.event_code='session.resume.turn_reconciled'
+                                    AND listed.value=other.id)),({OBSERVED_EFFECTIVE_GENERATION_SQL}
+                                      AND s.role_generation_id=json_extract(e.detail_json,'$.role_generation_id'))
+                     FROM audit_events e
+                     JOIN attempts a ON a.id=json_extract(e.detail_json,'$.attempt_id')
+                     JOIN tasks t ON t.id=a.task_id
+                     JOIN sessions s ON s.id=e.entity_id
+                     JOIN role_generations rg ON rg.id=s.role_generation_id
+                     WHERE e.id=?1 AND e.event_code='session.resume.rejected'"
+                ),
+                params![rejection_id],
+                |row| {
+                    Ok((
+                        ObservationBinding {
+                            task_id: row.get(0)?,
+                            attempt_id: row.get(1)?,
+                            role: row.get(2)?,
+                            lane_id: row.get(3)?,
+                            role_generation_id: row.get(4)?,
+                            session_id: row.get(5)?,
+                            transcript_epoch: row.get(6)?,
+                            source_id: Some(rejection_id.to_owned()),
+                        },
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            binding,
+            attention,
+            attempt_status,
+            current_attempt,
+            reconciled,
+            independent_hold,
+            other_rejection,
+            effective,
+        )) = row
+        else {
+            return Ok((subject, Finding::Suspended { uncertain: false }));
+        };
+        let prior_epoch: Option<String> = self.transaction.query_row(
+            "SELECT transcript_epoch FROM attention_observations WHERE kind='resume_failure_after_acceptance'
+               AND entity_key=?1 AND state IN ('candidate','open')", params![rejection_id], |row| row.get(0),
+        ).optional()?.flatten();
+        let provider_hold = match binding.session_id.as_deref() {
+            Some(session_id) => {
+                provider_failure_hold_for_session(self.transaction, session_id)?.is_some()
+            }
+            None => false,
+        };
+        let finding = if !current_attempt {
+            Finding::ended("attempt_retired")
+        } else if !effective {
+            Finding::ended("role_replaced")
+        } else if prior_epoch
+            .as_deref()
+            .is_some_and(|prior| binding.transcript_epoch.as_deref() != Some(prior))
+        {
+            Finding::ended("invocation_replaced")
+        } else if attention != "resume_failed" {
+            Finding::ended("hold_reconciled")
+        } else if independent_hold {
+            Finding::ended("independent_hold")
+        } else if provider_hold {
+            if self
+                .stored(subject.kind, &subject.entity_key)?
+                .is_some_and(|stored| stored.state == "open")
+            {
+                Finding::ended("provider_failure_hold")
+            } else {
+                Finding::Suspended { uncertain: false }
+            }
+        } else if other_rejection {
+            Finding::ended("other_rejection_binds")
+        } else if attempt_status != "needs_input" {
+            Finding::ended("attempt_not_waiting_on_resume")
+        } else if let Some(reconciled) = reconciled {
+            let accepted_current: bool = self.transaction.query_row(
+                &format!("WITH {} SELECT EXISTS(SELECT 1 FROM current_hooks current
+                    JOIN audit_events reconciled ON reconciled.id=?2
+                    WHERE current.id=json_extract(reconciled.detail_json,'$.superseding_hook_event_id')
+                      AND current.event_name='UserPromptSubmit')", crate::workflow::CURRENT_TURN_HOOKS_SQL),
+                params![binding.session_id, reconciled], |row| row.get(0),
+            )?;
+            if accepted_current {
+                Finding::Holds {
+                    evidence: serde_json::json!({"turn_reconciled_event_id":reconciled}),
+                    fingerprint: reconciled,
+                    ready: true,
+                    unchanged_seconds: None,
+                }
+            } else {
+                Finding::Suspended { uncertain: false }
+            }
+        } else {
+            Finding::Suspended { uncertain: false }
+        };
+        Ok((subject.bound(binding), finding))
+    }
+
+    fn observe_busy_after_exit(&self) -> Result<()> {
+        let kind = ObservationKind::BusyAfterExit;
+        let mut subjects: BTreeSet<(String, String)> = {
+            let mut statement = self.transaction.prepare(&format!(
+                "SELECT s.id,s.transcript_epoch FROM sessions s
+                 JOIN role_generations rg ON rg.id=s.role_generation_id
+                 JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
+                 WHERE s.status='exited' AND s.readiness_state IN ('busy','busy_unresolved_hook_work')
+                   AND json_type(s.exit_json,'$.app_stop_requested') IN ('true','false')
+                   AND {OBSERVED_CURRENT_ATTEMPT_SQL}"
+            ))?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+            rows
+        };
+        subjects.extend(
+            self.unresolved(kind)?
+                .into_iter()
+                .filter_map(|row| Some((row.session_id?, row.transcript_epoch?))),
+        );
+        for (session_id, epoch) in subjects {
+            let (subject, finding) = self.busy_after_exit(&session_id, &epoch)?;
+            self.advance(subject, finding)?;
+        }
+        Ok(())
+    }
+
+    fn busy_after_exit(
+        &self,
+        session_id: &str,
+        epoch: &str,
+    ) -> Result<(ObservationSubject, Finding)> {
+        type Row = (
+            ObservationBinding,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            bool,
+            bool,
+            Option<String>,
+            bool,
+            bool,
+            bool,
+        );
+        let subject = ObservationSubject::new(
+            ObservationKind::BusyAfterExit,
+            format!("{session_id}:{epoch}"),
+        );
+        let row: Option<Row> = self
+            .transaction
+            .query_row(
+                &format!(
+                    "WITH {}
+                     SELECT t.id,a.id,rg.role,rg.lane_id,rg.id,s.transcript_epoch,s.status,
+                            s.readiness_state,json_type(s.exit_json,'$.app_stop_requested'),
+                            json_extract(s.exit_json,'$.observed_at'),
+                            {OBSERVED_CURRENT_ATTEMPT_SQL},{OBSERVED_EFFECTIVE_GENERATION_SQL},
+                            (SELECT id FROM accepted),
+                            EXISTS(SELECT 1 FROM role_results report WHERE report.session_id=s.id
+                              AND report.role_generation_id=s.role_generation_id
+                              AND julianday(report.created_at)>=julianday((SELECT received_at FROM accepted))
+                              AND NOT EXISTS(SELECT 1 FROM role_result_supersessions retired WHERE retired.role_result_id=report.id)
+                              AND NOT EXISTS(SELECT 1 FROM audit_events retired WHERE retired.event_code='role_result.superseded'
+                                AND retired.entity_kind='role_result' AND retired.entity_id=report.id)),
+                            EXISTS(SELECT 1 FROM audit_events stop
+                              WHERE stop.event_code='manager.service_stop.claimed'
+                                AND stop.entity_kind='session' AND stop.entity_id=s.id
+                                AND json_extract(stop.detail_json,'$.role_generation_id')=s.role_generation_id
+                                AND json_extract(stop.detail_json,'$.transcript_epoch')=s.transcript_epoch),
+                            EXISTS(SELECT 1 FROM recovery_records recovery WHERE recovery.session_id=s.id
+                              AND json_extract(recovery.detail_json,'$.kind')='graceful_stop_deadline'
+                              AND json_extract(recovery.detail_json,'$.role_generation_id')=rg.id
+                              AND json_extract(recovery.detail_json,'$.transcript_epoch')=s.transcript_epoch
+                              AND recovery.process_identity_json=s.process_identity_json)
+                              OR EXISTS(SELECT 1 FROM restart_candidates restart WHERE restart.session_id=s.id
+                                AND restart.attempt_id=a.id
+                                AND json_extract(restart.result_json,'$.restart.admission.role_generation_id')=rg.id
+                                AND json_extract(restart.result_json,'$.restart.admission.prior_transcript_epoch')=s.transcript_epoch)
+                     FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
+                     JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
+                     WHERE s.id=?1",
+                    crate::workflow::CURRENT_TURN_HOOKS_SQL
+                ),
+                params![session_id],
+                |row| {
+                    Ok((
+                        ObservationBinding {
+                            task_id: row.get(0)?,
+                            attempt_id: row.get(1)?,
+                            role: row.get(2)?,
+                            lane_id: row.get(3)?,
+                            role_generation_id: row.get(4)?,
+                            session_id: Some(session_id.to_owned()),
+                            transcript_epoch: Some(epoch.to_owned()),
+                            source_id: None,
+                        },
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                        row.get(15)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            binding,
+            current_epoch,
+            status,
+            readiness,
+            stop_flag,
+            exited_at,
+            current_attempt,
+            effective,
+            accepted,
+            reported,
+            service_stop_claimed,
+            recovery_bound,
+        )) = row
+        else {
+            return Ok((subject, Finding::Suspended { uncertain: false }));
+        };
+        let finding = if !current_attempt {
+            Finding::ended("attempt_retired")
+        } else if !effective {
+            Finding::ended("role_replaced")
+        } else if current_epoch != epoch {
+            Finding::ended("invocation_replaced")
+        } else if status != "exited" {
+            Finding::Suspended { uncertain: false }
+        } else if !matches!(readiness.as_str(), "busy" | "busy_unresolved_hook_work") {
+            Finding::ended("readiness_corrected")
+        } else if recovery_bound {
+            Finding::ended("recovery_explains_exit")
+        } else if reported {
+            Finding::ended("report_recorded")
+        } else if stop_flag.as_deref() == Some("true") || service_stop_claimed {
+            Finding::ended("app_stop_requested")
+        } else if stop_flag.as_deref() != Some("false") || accepted.is_none() {
+            // Historical exits lost stop intent and cannot establish this disagreement.
+            Finding::Suspended { uncertain: false }
+        } else {
+            Finding::Holds {
+                fingerprint: epoch.to_owned(),
+                evidence: serde_json::json!({"readiness":readiness,"exited_at":exited_at}),
+                ready: true,
+                unchanged_seconds: None,
+            }
+        };
+        Ok((subject.bound(binding), finding))
+    }
+
+    fn reconcile_blocking_episodes(&self) -> Result<()> {
+        let attempts: Vec<String> = {
+            let mut statement = self.transaction.prepare(&format!(
+                "SELECT a.id FROM attempts a JOIN tasks t ON t.id=a.task_id
+                 WHERE {OBSERVED_CURRENT_ATTEMPT_SQL}
+                   OR EXISTS(SELECT 1 FROM attention_observations observation
+                     WHERE observation.attempt_id=a.id AND observation.kind='recurring_block'
+                       AND observation.state='open') ORDER BY a.id"
+            ))?;
+            let rows = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for attempt_id in attempts {
+            reconcile_audited_blocking_episodes(
+                self.transaction,
+                &attempt_id,
+                None,
+                None,
+                &self.now_text,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn observe_recurring_blocks(&self) -> Result<()> {
+        type Row = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            Option<i64>,
+            Option<i64>,
+        );
+        let rows: Vec<Row> = {
+            let mut statement = self.transaction.prepare(&format!(
+                "SELECT observation.id,observation.state,observation.attempt_id,observation.role,
+                        observation.lane_id,observation.entity_key,observation.recurrence_count,
+                        observation.last_counted_result_rowid,observation.reset_watermark_rowid
+                 FROM attention_observations observation
+                 LEFT JOIN attempts a ON a.id=observation.attempt_id LEFT JOIN tasks t ON t.id=a.task_id
+                 WHERE observation.kind='recurring_block'
+                   AND (observation.state='open' OR
+                        (observation.recurrence_count>0 AND {OBSERVED_CURRENT_ATTEMPT_SQL}))
+                   AND observation.attempt_id IS NOT NULL AND observation.role IS NOT NULL
+                   AND observation.lane_id IS NOT NULL ORDER BY observation.id"
+            ))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (id, state, attempt_id, role, lane_id, entity_key, count, counted_rowid, reset_rowid) in
+            rows
+        {
+            let outcome = entity_key.rsplit(':').next().unwrap_or_default().to_owned();
+            let mut count = count;
+            let mut reset = false;
+            if count > 0 {
+                let after = counted_rowid.max(reset_rowid).unwrap_or_default();
+                if let Some(progress) =
+                    published_progress(self.transaction, &attempt_id, &role, &lane_id, after, None)?
+                {
+                    record_progress_reset(self.transaction, &id, &progress, &self.now_text)?;
+                    count = 0;
+                    reset = true;
+                }
+            }
+            let current_attempt: Option<bool> = self
+                .transaction
+                .query_row(
+                    &format!(
+                        "SELECT {OBSERVED_CURRENT_ATTEMPT_SQL} FROM attempts a
+                         JOIN tasks t ON t.id=a.task_id WHERE a.id=?1"
+                    ),
+                    params![attempt_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(current_attempt) = current_attempt else {
+                continue;
+            };
+            let retired = !current_attempt;
+            let binding = if retired {
+                Some(false)
+            } else {
+                current_block(self.transaction, &attempt_id, &role, &lane_id, &outcome)?
+            };
+            if count == RECURRENCE_CAP && binding.is_none() {
+                continue;
+            }
+            let visible = !retired && count == RECURRENCE_CAP && binding == Some(true);
+            match (state.as_str(), visible) {
+                ("open", false) => {
+                    let reason = if retired {
+                        "attempt_retired"
+                    } else if reset {
+                        "progress_published"
+                    } else {
+                        "block_ended"
+                    };
+                    self.transaction.execute(
+                        "UPDATE attention_observations SET state='resolved',resolved_at=?1,
+                                resolution_reason=?2,last_seen_at=?1
+                         WHERE id=?3",
+                        params![self.now_text, reason, id],
+                    )?;
+                    self.audit(
+                        &id,
+                        "attention.observation.resolved",
+                        serde_json::json!({"kind":"recurring_block","entity_key":entity_key,"reason":reason}),
+                    )?;
+                }
+                ("candidate" | "resolved", true) => {
+                    self.transaction.execute(
+                        "UPDATE attention_observations SET state='open',opened_at=?1,resolved_at=NULL,
+                                resolution_reason=NULL,last_seen_at=?1
+                         WHERE id=?2",
+                        params![self.now_text, id],
+                    )?;
+                    self.audit(
+                        &id,
+                        "attention.observation.opened",
+                        serde_json::json!({"kind":"recurring_block","entity_key":entity_key}),
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A consumed plan or candidate report of this exact attempt, role and lane after
+/// `after` (and before `before`), proven by the freeze that published it. Duplicate
+/// and role-switch retirement also set `consumed_at` but complete no freeze.
+fn published_progress(
+    connection: &Connection,
+    attempt_id: &str,
+    role: &str,
+    lane_id: &str,
+    after: i64,
+    before: Option<i64>,
+) -> Result<Option<(String, i64, String)>> {
+    Ok(connection
+        .query_row(
+            "SELECT progress.id,progress.rowid,freeze.id FROM role_results progress
+             JOIN role_generations rg ON rg.id=progress.role_generation_id
+             JOIN freeze_intents freeze ON freeze.attempt_id=rg.attempt_id
+               AND freeze.source_role_generation_id=progress.role_generation_id
+               AND freeze.kind=CASE progress.outcome WHEN 'plan_ready' THEN 'plan' ELSE 'candidate' END
+               AND freeze.state='complete' AND freeze.updated_at=progress.consumed_at
+             JOIN snapshots published ON published.id=freeze.result_snapshot_id
+               AND published.attempt_id=freeze.attempt_id AND published.kind=freeze.kind
+               AND published.complete=1
+             WHERE rg.attempt_id=?1 AND rg.role=?2 AND rg.lane_id=?3
+               AND progress.outcome IN ('plan_ready','candidate_ready')
+               AND progress.consumed_at IS NOT NULL AND progress.rowid>?4
+               AND (?5 IS NULL OR progress.rowid<?5)
+               AND NOT EXISTS(SELECT 1 FROM role_result_supersessions superseded
+                              WHERE superseded.role_result_id=progress.id)
+               AND NOT EXISTS(SELECT 1 FROM audit_events retired
+                 WHERE retired.event_code='role_result.superseded'
+                   AND retired.entity_kind='role_result' AND retired.entity_id=progress.id)
+             ORDER BY progress.rowid DESC LIMIT 1",
+            params![attempt_id, role, lane_id, after, before],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?)
+}
+
+fn record_progress_reset(
+    transaction: &Transaction<'_>,
+    observation_id: &str,
+    (result_id, result_rowid, freeze_intent_id): &(String, i64, String),
+    now: &str,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE attention_observations SET recurrence_count=0,reset_watermark_rowid=?1,
+                reset_evidence_json=?2,last_seen_at=?3
+         WHERE id=?4",
+        params![
+            result_rowid,
+            serde_json::json!({
+                "progress_result_id":result_id,
+                "progress_result_rowid":result_rowid,
+                "freeze_intent_id":freeze_intent_id,
+            })
+            .to_string(),
+            now,
+            observation_id
+        ],
+    )?;
+    Ok(())
+}
+
+/// Whether the attempt is still held by a report of this exact role, lane and
+/// outcome from that role's current binding; missing source evidence is unknown.
+fn current_block(
+    connection: &Connection,
+    attempt_id: &str,
+    role: &str,
+    lane_id: &str,
+    outcome: &str,
+) -> Result<Option<bool>> {
+    let reason = if outcome == "needs_input" {
+        "role_needs_input"
+    } else {
+        "role_blocked"
+    };
+    let source: Option<(String, String, Option<String>, Option<String>)> = connection
+        .query_row(
+            "SELECT t.attention,a.status,json_extract(hold.detail_json,'$.reason'),held.id
+         FROM attempts a JOIN tasks t ON t.id=a.task_id
+         LEFT JOIN audit_events hold ON hold.id=(SELECT latest.id FROM audit_events latest
+             WHERE latest.event_code='attempt.attention.changed' AND latest.entity_kind='attempt'
+               AND latest.entity_id=a.id ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)
+         LEFT JOIN role_results held ON held.id=json_extract(hold.detail_json,'$.result_id')
+         WHERE a.id=?1",
+            params![attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((attention, status, hold_reason, held_result)) = source else {
+        return Ok(None);
+    };
+    if attention != "needs_input" || status != "needs_input" {
+        return Ok(Some(false));
+    }
+    if hold_reason.is_none() || (hold_reason.as_deref() == Some(reason) && held_result.is_none()) {
+        return Ok(None);
+    }
+    Ok(Some(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
+           JOIN audit_events hold ON hold.id=(
+             SELECT latest.id FROM audit_events latest
+             WHERE latest.event_code='attempt.attention.changed' AND latest.entity_kind='attempt'
+               AND latest.entity_id=a.id
+             ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)
+           JOIN role_results held ON held.id=json_extract(hold.detail_json,'$.result_id')
+             AND held.role_generation_id=json_extract(hold.detail_json,'$.role_generation_id')
+           JOIN role_generations rg ON rg.id=held.role_generation_id AND rg.attempt_id=a.id
+           WHERE a.id=?1 AND t.attention='needs_input' AND a.status='needs_input'
+             AND hold.created_at>=a.updated_at
+             AND json_extract(hold.detail_json,'$.attention')='needs_input'
+             AND json_extract(hold.detail_json,'$.reason')=?5
+             AND rg.role=?2 AND rg.lane_id=?3 AND held.outcome=?4
+             AND rg.status NOT IN ('replaced','revoked')
+             AND NOT EXISTS(SELECT 1 FROM role_generations newer
+               WHERE newer.attempt_id=rg.attempt_id AND newer.role=rg.role
+                 AND newer.lane_id=rg.lane_id AND newer.generation>rg.generation))",
+        params![attempt_id, role, lane_id, outcome, reason],
+        |row| row.get(0),
+    )?))
+}
+
+/// Counts this effective hold and earlier uncounted holds inside the transaction
+/// consuming `result_id`; source watermarks prevent replays from counting again.
+pub(crate) fn count_blocking_episode(
+    connection: &Connection,
+    result_id: &str,
+    now: &str,
+) -> Result<()> {
+    if connection.is_autocommit() {
+        bail!("blocking observations require the effective hold transaction")
+    }
+    let (attempt_id, role, lane_id, outcome, result_rowid): (String, String, String, String, i64) =
+        connection.query_row(
+            "SELECT rg.attempt_id,rg.role,rg.lane_id,rr.outcome,rr.rowid
+         FROM role_results rr JOIN role_generations rg ON rg.id=rr.role_generation_id
+         WHERE rr.id=?1",
+            params![result_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+    reconcile_audited_blocking_episodes(
+        connection,
+        &attempt_id,
+        Some((&role, &lane_id, &outcome)),
+        Some(result_rowid),
+        now,
+    )
+}
+
+/// The hold audit, not consumption alone, proves an effective episode. A later
+/// successful count folds older pending episodes before advancing its watermark.
+fn reconcile_audited_blocking_episodes(
+    connection: &Connection,
+    attempt_id: &str,
+    key: Option<(&str, &str, &str)>,
+    through: Option<i64>,
+    now: &str,
+) -> Result<()> {
+    type Episode = (String, i64, String);
+    let mut by_key: BTreeMap<(String, String, String), Vec<Episode>> = BTreeMap::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT rg.role,rg.lane_id,rr.outcome,rr.id,rr.rowid,rg.id
+             FROM audit_events hold INDEXED BY audit_events_entity
+             JOIN role_results rr ON rr.id=json_extract(hold.detail_json,'$.result_id')
+             JOIN role_generations rg ON rg.id=rr.role_generation_id
+             LEFT JOIN attention_observations observation
+               ON observation.entity_kind='role_lane' AND observation.kind='recurring_block'
+               AND observation.entity_key=rg.attempt_id||':'||rg.role||':'||rg.lane_id||':'||rr.outcome
+             WHERE hold.entity_kind='attempt' AND hold.entity_id=?1
+               AND hold.event_code='attempt.attention.changed'
+               AND json_extract(hold.detail_json,'$.attention')='needs_input'
+               AND json_extract(hold.detail_json,'$.role_generation_id')=rg.id
+               AND json_extract(hold.detail_json,'$.reason')=
+                   CASE rr.outcome WHEN 'blocked' THEN 'role_blocked' ELSE 'role_needs_input' END
+               AND rg.attempt_id=?1 AND rr.outcome IN ('blocked','needs_input')
+               AND rr.consumed_at IS NOT NULL AND hold.created_at=rr.consumed_at
+               AND (?2 IS NULL OR (rg.role=?2 AND rg.lane_id=?3 AND rr.outcome=?4))
+               AND rr.rowid>MAX(COALESCE(observation.last_counted_result_rowid,0),
+                               COALESCE(observation.reset_watermark_rowid,0))
+               AND (?5 IS NULL OR rr.rowid<=?5)
+             ORDER BY rr.rowid",
+        )?;
+        let rows = statement.query_map(
+            params![
+                attempt_id,
+                key.map(|key| key.0),
+                key.map(|key| key.1),
+                key.map(|key| key.2),
+                through
+            ],
+            |row| {
+                Ok((
+                    (
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ),
+                    (
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                    ),
+                ))
+            },
+        )?;
+        for row in rows {
+            let (key, episode) = row?;
+            by_key.entry(key).or_default().push(episode);
+        }
+    }
+    for ((role, lane_id, outcome), episodes) in by_key {
+        let entity_key = format!("{attempt_id}:{role}:{lane_id}:{outcome}");
+        let stored: Option<(String, i64, Option<i64>, Option<i64>)> = connection
+            .query_row(
+                "SELECT id,recurrence_count,last_counted_result_rowid,reset_watermark_rowid
+             FROM attention_observations WHERE entity_kind='role_lane'
+               AND entity_key=?1 AND kind='recurring_block'",
+                params![entity_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let mut count = stored.as_ref().map_or(0, |row| row.1);
+        let mut watermark = stored
+            .as_ref()
+            .and_then(|row| row.2.max(row.3))
+            .unwrap_or_default();
+        let mut reset: Option<(String, i64, String)> = None;
+        for (_, rowid, _) in &episodes {
+            if let Some(progress) = published_progress(
+                connection,
+                attempt_id,
+                &role,
+                &lane_id,
+                watermark,
+                Some(*rowid),
+            )? {
+                count = 0;
+                reset = Some(progress);
+            }
+            count = (count + 1).min(RECURRENCE_CAP);
+            watermark = *rowid;
+        }
+        let (result_id, result_rowid, generation_id) = episodes
+            .last()
+            .ok_or_else(|| anyhow!("audited episode group is empty"))?;
+        let reset_rowid = reset.as_ref().map(|progress| progress.1);
+        let reset_evidence = reset.as_ref().map(|(id, rowid, freeze)| {
+            serde_json::json!({
+                "progress_result_id":id,"progress_result_rowid":rowid,"freeze_intent_id":freeze,
+            })
+            .to_string()
+        });
+        if let Some((id, _, _, _)) = stored {
+            connection.execute(
+                "UPDATE attention_observations SET recurrence_count=?1,last_counted_result_id=?2,
+                    last_counted_result_rowid=?3,evidence_fingerprint=?2,role_generation_id=?4,
+                    last_seen_at=?5,reset_watermark_rowid=COALESCE(?7,reset_watermark_rowid),
+                    reset_evidence_json=CASE WHEN ?7 IS NULL THEN reset_evidence_json ELSE ?8 END
+                 WHERE id=?6",
+                params![
+                    count,
+                    result_id,
+                    result_rowid,
+                    generation_id,
+                    now,
+                    id,
+                    reset_rowid,
+                    reset_evidence
+                ],
+            )?;
+        } else {
+            let task_id: String = connection.query_row(
+                "SELECT task_id FROM attempts WHERE id=?1",
+                params![attempt_id],
+                |row| row.get(0),
+            )?;
+            connection.execute(
+                "INSERT INTO attention_observations(id,entity_kind,entity_key,kind,task_id,attempt_id,
+                    role,lane_id,role_generation_id,state,evidence_fingerprint,evidence_json,
+                    first_seen_at,last_seen_at,observed_since,recurrence_count,last_counted_result_id,
+                    last_counted_result_rowid,reset_watermark_rowid,reset_evidence_json)
+                 VALUES(?1,'role_lane',?2,'recurring_block',?3,?4,?5,?6,?7,'candidate',?8,?9,?10,?10,?10,
+                        ?11,?8,?12,?13,?14)", params![uuid::Uuid::new_v4().to_string(),entity_key,task_id,
+                    attempt_id,role,lane_id,generation_id,result_id,serde_json::json!({"outcome":outcome}).to_string(),
+                    now,count,result_rowid,reset_rowid,reset_evidence],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -12039,7 +14196,7 @@ mod interruption_tests {
     }
 
     #[test]
-    fn service_start_upgrades_only_schemas_thirty_one_to_thirty_four_and_preserves_receipts() {
+    fn service_start_upgrades_only_schemas_thirty_one_to_thirty_five_and_preserves_receipts() {
         let root =
             std::env::temp_dir().join(format!("llmrelay-service-upgrade-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -12062,7 +14219,9 @@ mod interruption_tests {
              FROM (SELECT name, sql FROM sqlite_master ORDER BY name)";
         let version = "PRAGMA user_version";
         let current_schema = scalar(schema);
-        let drop_schema_35 = "DROP TABLE provider_failure_holds;";
+        let drop_schema_36 =
+            "DROP TABLE attention_observations; DROP INDEX role_results_session_generation;";
+        let drop_schema_35 = format!("{drop_schema_36} DROP TABLE provider_failure_holds;");
         let drop_schema_34 = format!(
             "{drop_schema_35} DROP TRIGGER guidance_submitted_form_paired;
              DROP TRIGGER guidance_submitted_form_once;
@@ -12156,7 +14315,7 @@ mod interruption_tests {
 
         for _ in 0..2 {
             drop(Store::open_service(&database).unwrap());
-            assert_eq!(scalar(version), "Integer(35)");
+            assert_eq!(scalar(version), "Integer(36)");
             assert_eq!(scalar(history), expected_history);
             assert_eq!(scalar(schema), current_schema);
             assert_eq!(
@@ -12167,51 +14326,57 @@ mod interruption_tests {
                 "Text(\"historical_sixth_review_recovery:none\")"
             );
         }
-        // The released schema 32 upgrades by adding only the native-resolution
-        // provenance tables, the guidance submitted form and provider failure holds.
+        // Schema 32 gains only native-resolution provenance and the later migrations.
         Connection::open(&database)
             .unwrap()
             .execute_batch(&format!("{drop_after_schema_32} PRAGMA user_version=32;"))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(35)");
+        assert_eq!(scalar(version), "Integer(36)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
-        // Schema 33 upgrades by adding only the guidance submitted form and provider holds.
+        // Schema 33 gains only the guidance submitted form and the later migrations.
         Connection::open(&database)
             .unwrap()
             .execute_batch(&format!("{drop_schema_34} PRAGMA user_version=33;"))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(35)");
+        assert_eq!(scalar(version), "Integer(36)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
-        // The released schema 34 upgrades by adding only provider failure holds.
         Connection::open(&database)
             .unwrap()
             .execute_batch(&format!("{drop_schema_35} PRAGMA user_version=34;"))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(35)");
+        assert_eq!(scalar(version), "Integer(36)");
+        assert_eq!(scalar(history), expected_history);
+        assert_eq!(scalar(schema), current_schema);
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(&format!("{drop_schema_36} PRAGMA user_version=35;"))
+            .unwrap();
+        drop(Store::open_service(&database).unwrap());
+        assert_eq!(scalar(version), "Integer(36)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         // An ordinary open of the current schema reopens it without migrating;
         // only a newer schema is refused as unknown.
         drop(Store::open(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(35)");
+        assert_eq!(scalar(version), "Integer(36)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         set_version(CURRENT_SCHEMA_VERSION + 1);
         let error = Store::open(&database).err().unwrap();
         assert!(
-            error.to_string().contains("database schema 36 is newer"),
+            error.to_string().contains("database schema 37 is newer"),
             "{error:#}"
         );
-        assert_eq!(scalar(version), "Integer(36)");
+        assert_eq!(scalar(version), "Integer(37)");
         assert_eq!(scalar(history), expected_history);
         set_version(CURRENT_SCHEMA_VERSION);
 
-        for unsupported in [0, 14, 29, 30, 36] {
+        for unsupported in [0, 14, 29, 30, 37] {
             set_version(unsupported);
             let error = Store::open_service(&database).err().unwrap();
             assert!(
@@ -12488,5 +14653,878 @@ mod interruption_tests {
         );
         drop((store, writer, readonly));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod attention_observation_tests {
+    use super::*;
+    use crate::supervisor::{LiveInvocation, ProcessSnapshot};
+
+    const PROCESS: &str = "{\"pid\":4242}";
+
+    struct ObservedSession {
+        root: std::path::PathBuf,
+        store: Store,
+        base: chrono::DateTime<Utc>,
+    }
+
+    impl ObservedSession {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "llmrelay-attention-{name}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let store = Store::open(&root.join("state.sqlite3")).unwrap();
+            store.lock().unwrap().execute_batch(&format!(
+                "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+                   VALUES('p','p','/tmp/llmrelay-attention','attention-fixture','base','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO tasks(id,project_id,title,lifecycle,created_at,updated_at)
+                   VALUES('t','p','t','in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+                   VALUES('a','t','context','implementation','base',1,'running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+                   VALUES('g','a','implementer','claude',1,1,'running','f','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+                   VALUES('rs','t','implementer',1,'{{}}','g','2026-01-01T00:00:00Z');
+                 INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,
+                     native_session_id,process_identity_json,readiness_state,created_at,updated_at)
+                   VALUES('s','g','claude','running','{{}}','fixture','e','native','{PROCESS}','busy',
+                     '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');"
+            ))
+            .unwrap();
+            let base = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc);
+            Self { root, store, base }
+        }
+
+        fn at(&self, milliseconds: i64) -> chrono::DateTime<Utc> {
+            self.base + chrono::Duration::milliseconds(milliseconds)
+        }
+
+        fn hook(&self, id: &str, event: &str, payload: &str, milliseconds: i64) {
+            self.store
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,
+                         payload_json,peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+                     VALUES(?1,'s','g','claude',?2,'native',?3,42,42,'peer','managed_process_group_untrusted_payload',?4)",
+                    params![id, event, payload, self.at(milliseconds).to_rfc3339()],
+                )
+                .unwrap();
+        }
+
+        fn observe(&self, milliseconds: i64, processes: &ProcessSnapshot, fresh_boot: bool) {
+            self.store
+                .observe_attention(self.at(milliseconds), processes, fresh_boot)
+                .unwrap();
+        }
+
+        fn state(&self, kind: &str) -> String {
+            self.store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COALESCE((SELECT state||':'||confirmations||':'||uncertain||':'
+                              ||COALESCE(resolution_reason,'-')
+                            FROM attention_observations WHERE kind=?1),'none')",
+                    params![kind],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+
+        fn revision(&self) -> i64 {
+            read_state_revision(&self.store.lock().unwrap()).unwrap()
+        }
+
+        fn execute(&self, sql: &str) {
+            self.store.lock().unwrap().execute_batch(sql).unwrap();
+        }
+
+        fn scalar<T: rusqlite::types::FromSql>(&self, sql: &str) -> T {
+            self.store
+                .lock()
+                .unwrap()
+                .query_row(sql, [], |row| row.get(0))
+                .unwrap()
+        }
+
+        fn permission(&self) {
+            self.execute("INSERT INTO permission_requests(id,hook_invocation_nonce,connection_nonce,provider,
+                project_id,task_id,attempt_id,session_id,role_generation_id,role,service_boot_id,
+                native_session_id,cwd,policy_fingerprint,tool_name,input_digest,input_json,
+                created_at,deadline_at,state,updated_at)
+                VALUES('permission','nonce','connection','claude','p','t','a','s','g','implementer',
+                'boot','native','/tmp','policy','Read','digest','{}','2026-03-01T00:00:00Z',
+                '2999-01-01T00:00:00Z','pending','2026-03-01T00:00:00Z');");
+        }
+
+        fn business_rows(&self) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+            let connection = self.store.lock().unwrap();
+            let tables = connection
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table'
+                AND name NOT IN ('attention_observations','audit_events','state_revision')
+                AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                )
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            tables
+                .into_iter()
+                .map(|table| {
+                    let mut statement = connection
+                        .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                        .unwrap();
+                    let columns = statement.column_count();
+                    let rows = statement
+                        .query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    (table, rows)
+                })
+                .collect()
+        }
+    }
+
+    impl Drop for ObservedSession {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn live() -> ProcessSnapshot {
+        ProcessSnapshot::Read(vec![LiveInvocation {
+            session_id: "s".into(),
+            role_generation_id: "g".into(),
+            transcript_epoch: "e".into(),
+            process_identity_json: PROCESS.into(),
+        }])
+    }
+
+    #[test]
+    fn an_unaccepted_live_invocation_opens_on_two_spaced_checks_and_ends_on_its_acceptance() {
+        let session = ObservedSession::new("unaccepted");
+        let kind = "process_without_accepted_turn";
+        // Without its own trusted start, absent acceptance proves nothing.
+        session.observe(5_000, &live(), true);
+        assert_eq!(session.state(kind), "none");
+        session.hook("start", "SessionStart", "{}", 0);
+        session.observe(10_000, &live(), false);
+        assert_eq!(session.state(kind), "candidate:0:0:-");
+        let quiet = session.revision();
+        // An unreadable process table discards the candidate; it confirms nothing.
+        session.observe(31_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "none");
+        session.observe(32_000, &live(), false);
+        assert_eq!(session.state(kind), "candidate:1:0:-");
+        // A second check needs a later, distinct time at least a second on.
+        session.observe(32_500, &live(), false);
+        session.observe(31_500, &live(), false);
+        assert_eq!(session.state(kind), "candidate:1:0:-");
+        assert_eq!(
+            session.revision(),
+            quiet,
+            "candidate bookkeeping moved the cursor"
+        );
+        session.observe(32_500, &live(), false);
+        assert_eq!(session.state(kind), "open:2:0:-");
+        assert!(session.revision() > quiet);
+        // Keyboard control suppresses classification; it is not acceptance.
+        session.execute(&format!(
+            "INSERT INTO input_leases(session_id,lease_id_hash,owner_kind,owner_id,role_generation_id,
+                 process_identity_json,expires_at,revoked_at,created_at,updated_at)
+               VALUES('s','hash','human','person','g','{PROCESS}','2999-01-01T00:00:00Z',NULL,
+                 '2026-03-01T00:00:00Z','2026-03-01T00:00:00Z');"
+        ));
+        let gated = session.revision();
+        session.observe(36_000, &live(), false);
+        assert_eq!(session.state(kind), "open:2:0:-");
+        assert_eq!(session.revision(), gated);
+        session.execute("DELETE FROM input_leases;");
+        // Unknown inventory keeps the open record, marked uncertain.
+        session.observe(37_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "open:2:1:-");
+        session.hook("accepted", "UserPromptSubmit", r#"{"prompt":"go"}"#, 38_000);
+        session.observe(39_000, &live(), false);
+        assert_eq!(session.state(kind), "resolved:2:0:turn_accepted");
+        assert_eq!(
+            session
+                .store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT group_concat(event_code) FROM (SELECT event_code FROM audit_events
+                       WHERE entity_kind='attention_observation' ORDER BY rowid)",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "attention.observation.opened,attention.observation.resolved"
+        );
+        // Classification never touched the work it describes.
+        assert_eq!(
+            session
+                .store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT t.attention||':'||t.version||':'||a.status||':'||s.status||':'||s.readiness_state
+                     FROM tasks t JOIN attempts a ON a.task_id=t.id
+                     JOIN role_generations rg ON rg.attempt_id=a.id JOIN sessions s ON s.role_generation_id=rg.id",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "none:1:running:running:busy"
+        );
+    }
+
+    #[test]
+    fn a_quiet_turn_starts_its_own_clock_and_ends_on_activity() {
+        let session = ObservedSession::new("quiet");
+        let kind = "quiet_turn";
+        session.hook("start", "SessionStart", "{}", -1_200_000);
+        session.hook(
+            "accepted",
+            "UserPromptSubmit",
+            r#"{"prompt":"go"}"#,
+            -660_000,
+        );
+        session.execute("UPDATE sessions SET transcript_last_sequence=7;");
+        // The old session timestamp is not quiet history; the first look starts the clock.
+        session.observe(0, &live(), true);
+        assert_eq!(session.state(kind), "candidate:0:0:-");
+        session.observe(299_000, &live(), false);
+        assert_eq!(session.state(kind), "candidate:0:0:-");
+        // A restart forgets the candidate, so its quiet time starts over.
+        session.observe(299_500, &live(), true);
+        session.observe(300_000, &live(), false);
+        assert_eq!(session.state(kind), "candidate:0:0:-");
+        session.observe(599_500, &live(), false);
+        assert_eq!(session.state(kind), "candidate:1:0:-");
+        session.observe(600_500, &live(), false);
+        assert_eq!(session.state(kind), "open:2:0:-");
+        let opened = session.revision();
+        // Lost capture keeps the last confirmed evidence, marked uncertain.
+        session.execute("UPDATE sessions SET capture_state='failed';");
+        session.observe(601_500, &live(), false);
+        assert_eq!(session.state(kind), "open:2:1:-");
+        assert!(session.revision() > opened);
+        session.execute("UPDATE sessions SET capture_state='capturing';");
+        session.observe(602_500, &live(), false);
+        assert_eq!(session.state(kind), "open:2:0:-");
+        session.execute(&format!("UPDATE sessions SET transcript_last_sequence=8;
+            INSERT INTO input_leases(session_id,lease_id_hash,owner_kind,owner_id,role_generation_id,
+                process_identity_json,expires_at,created_at,updated_at)
+            VALUES('s','quiet-control','human','person','g','{PROCESS}','2999-01-01T00:00:00Z',
+                '2026-03-01T00:10:03Z','2026-03-01T00:10:03Z');"));
+        session.observe(603_500, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "open:2:1:-");
+        let before = session.business_rows();
+        session.observe(604_500, &live(), false);
+        assert_eq!(session.state(kind), "resolved:2:0:activity_resumed");
+        assert_eq!(session.business_rows(), before);
+    }
+
+    #[test]
+    fn observation_identity_survives_reopen_and_retirement_has_no_workflow_effects() {
+        let session = ObservedSession::new("identity");
+        session.hook("start", "SessionStart", "{}", 0);
+        let before = session.business_rows();
+        session.observe(30_000, &live(), true);
+        session.observe(31_000, &live(), false);
+        let id: String = session.scalar("SELECT id FROM attention_observations WHERE state='open'");
+        let revision = session.revision();
+        session.observe(32_000, &live(), false);
+        assert_eq!(session.revision(), revision);
+        assert_eq!(session.business_rows(), before);
+        let reopened = Store::open(&session.root.join("state.sqlite3")).unwrap();
+        reopened
+            .observe_attention(session.at(33_000), &ProcessSnapshot::Unavailable, true)
+            .unwrap();
+        assert_eq!(
+            session.scalar::<String>("SELECT id FROM attention_observations WHERE state='open'"),
+            id
+        );
+        assert_eq!(session.state("process_without_accepted_turn"), "open:2:1:-");
+        session.execute(
+            "UPDATE tasks SET lifecycle='cancelled'; UPDATE attempts SET status='cancelled';",
+        );
+        session.observe(34_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(
+            session.state("process_without_accepted_turn"),
+            "resolved:2:0:attempt_retired"
+        );
+        session.execute(
+            "UPDATE tasks SET lifecycle='in_progress'; UPDATE attempts SET status='running';",
+        );
+        session.observe(35_000, &live(), false);
+        session.observe(36_000, &live(), false);
+        assert_eq!(
+            session.scalar::<String>("SELECT id FROM attention_observations WHERE state='open'"),
+            id
+        );
+        session.execute("UPDATE sessions SET transcript_epoch='replacement';");
+        session.observe(37_000, &live(), false);
+        assert_eq!(session.scalar::<String>("SELECT resolution_reason FROM attention_observations WHERE id=(SELECT id FROM attention_observations WHERE entity_key='s:e')"), "invocation_replaced");
+    }
+
+    #[test]
+    fn quiet_candidates_require_uninterrupted_capture_activity_and_person_gates() {
+        let session = ObservedSession::new("quiet-gates");
+        let kind = "quiet_turn";
+        session.hook("start", "SessionStart", "{}", -1_000_000);
+        session.hook(
+            "accepted",
+            "UserPromptSubmit",
+            r#"{"prompt_id":"turn"}"#,
+            -700_000,
+        );
+        session.observe(0, &live(), true);
+        session.observe(300_000, &live(), false);
+        session.permission();
+        session.observe(301_000, &live(), false);
+        assert_eq!(session.state(kind), "none");
+        session.execute("UPDATE permission_requests SET state='expired';");
+        session.observe(302_000, &live(), false);
+        session.observe(602_000, &live(), false);
+        session.observe(602_500, &ProcessSnapshot::Read(vec![]), false);
+        assert_eq!(
+            session.state(kind),
+            "none",
+            "an unattached process is unknown"
+        );
+        session.observe(603_000, &live(), false);
+        session.execute("UPDATE sessions SET transcript_last_sequence=1;");
+        session.observe(903_000, &live(), false);
+        assert_eq!(session.state(kind), "candidate:0:0:-");
+        session.observe(1_203_000, &live(), false);
+        session.observe(1_204_000, &live(), false);
+        assert_eq!(session.state(kind), "open:2:0:-");
+        session.hook("stop", "Stop", r#"{"prompt_id":"turn"}"#, 1_205_000);
+        session.observe(1_206_000, &live(), false);
+        assert_eq!(session.state(kind), "resolved:2:0:turn_completed");
+    }
+
+    #[test]
+    fn a_failed_observation_transaction_rolls_back_classification_only() {
+        let session = ObservedSession::new("rollback");
+        session.hook("start", "SessionStart", "{}", 0);
+        session.observe(30_000, &live(), true);
+        session.execute("INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,
+            created_at,written_at,delivery_session_id,delivery_transcript_epoch)
+            VALUES('guidance','a','g','private','written_awaiting_submit','2026-03-01T00:00:00Z',
+                '2026-03-01T00:00:00Z','s','e');
+            CREATE TRIGGER fail_guidance_observation BEFORE INSERT ON attention_observations
+            WHEN NEW.kind='guidance_unaccepted' BEGIN SELECT RAISE(ABORT,'observation write fault'); END;");
+        let before = session.business_rows();
+        let revision = session.revision();
+        let error = session
+            .store
+            .observe_attention(session.at(31_000), &live(), false)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("observation write fault"),
+            "{error}"
+        );
+        assert_eq!(
+            session.state("process_without_accepted_turn"),
+            "candidate:1:0:-"
+        );
+        assert_eq!(session.state("guidance_unaccepted"), "none");
+        assert_eq!(session.business_rows(), before);
+        assert_eq!(session.revision(), revision);
+        assert_eq!(
+            session.scalar::<i64>(
+                "SELECT COUNT(*) FROM audit_events WHERE entity_kind='attention_observation'"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn no_session_requires_complete_effective_inventory_and_a_session_required_decision() {
+        let session = ObservedSession::new("no-session");
+        let kind = "attempt_without_live_session";
+        let classify = |milliseconds, processes: &ProcessSnapshot, required| {
+            let mut connection = session.store.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let pass = ObservationPass {
+                transaction: &transaction,
+                now: session.at(milliseconds),
+                now_text: session.at(milliseconds).to_rfc3339(),
+                processes,
+            };
+            let (subject, finding) = pass.attempt_without_live_session("a", required).unwrap();
+            pass.advance(subject, finding).unwrap();
+            transaction.commit().unwrap();
+        };
+        classify(0, &ProcessSnapshot::Read(vec![]), true);
+        assert_eq!(
+            session.state(kind),
+            "none",
+            "missing handle alone is unknown"
+        );
+        session.execute("UPDATE sessions SET status='exited',exit_json='{}';");
+        classify(0, &ProcessSnapshot::Read(vec![]), true);
+        classify(60_000, &ProcessSnapshot::Read(vec![]), true);
+        classify(60_500, &ProcessSnapshot::Unavailable, true);
+        assert_eq!(session.state(kind), "none");
+        classify(61_000, &ProcessSnapshot::Read(vec![]), true);
+        classify(121_000, &ProcessSnapshot::Read(vec![]), true);
+        classify(122_000, &ProcessSnapshot::Read(vec![]), true);
+        assert_eq!(session.state(kind), "open:2:0:-");
+        classify(123_000, &live(), true);
+        assert_eq!(session.state(kind), "resolved:2:0:effective_session_live");
+        classify(124_000, &ProcessSnapshot::Read(vec![]), false);
+        assert_eq!(session.state(kind), "resolved:2:0:effective_session_live");
+    }
+
+    #[test]
+    fn no_session_helper_uses_only_the_four_reviewed_manager_waits() {
+        let session = ObservedSession::new("manager-waits");
+        {
+            let connection = session.store.lock().unwrap();
+            connection.execute("INSERT INTO trip_project_state(project_id,readiness,reason,detected_installation,
+                detected_json,workflow_id,package_version,upstream_source_hash,overlay_hash,updated_at)
+                VALUES('p','ready','fixture','compatible','{}',?1,?2,?3,?4,'2026-01-01T00:00:00Z')",
+                params![crate::trip::WORKFLOW_ID, crate::trip::PACKAGE_VERSION, crate::trip::source_hash(), crate::trip::overlay_hash()]).unwrap();
+            connection.execute("UPDATE attempts SET workflow_version=?1,workflow_hash=?2,legacy_migration_required=0",
+                params![crate::trip::WORKFLOW_ID, crate::workflow_resources::workflow_hash()]).unwrap();
+        }
+        session.execute(
+            "UPDATE role_generations SET role='manager'; UPDATE role_settings SET role='manager';",
+        );
+        let required = || {
+            crate::coordinator::attempts_waiting_on_manager_turn(&session.store.lock().unwrap())
+                .unwrap()
+                .contains("a")
+        };
+        for (phase, plan_hash, candidate_hash) in [
+            ("planning", None, None),
+            ("planning", Some("plan"), None),
+            ("implementation", Some("plan"), Some("candidate")),
+            ("manager_handoff", Some("plan"), Some("candidate")),
+        ] {
+            session
+                .store
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE attempts SET phase=?1,plan_hash=?2,candidate_hash=?3",
+                    params![phase, plan_hash, candidate_hash],
+                )
+                .unwrap();
+            assert!(required(), "{phase} must use the reviewed manager wait");
+        }
+        session.execute("UPDATE tasks SET attention='paused';");
+        assert!(
+            !required(),
+            "a persisted hold is not a missing-session wait"
+        );
+        session.execute("UPDATE tasks SET attention='none'; UPDATE sessions SET status='exited',exit_json='{}'; UPDATE role_generations SET status='exited';");
+        assert!(
+            !required(),
+            "dispatching a manager is outside the reviewed set"
+        );
+    }
+
+    #[test]
+    fn guidance_requires_its_delivery_and_exit_or_an_unrelated_prompt_never_clears_it() {
+        let session = ObservedSession::new("guidance");
+        let kind = "guidance_unaccepted";
+        session.execute("INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,
+            created_at,written_at,delivery_session_id,delivery_transcript_epoch)
+            VALUES('guidance','a','g','private body','written_awaiting_submit','2026-03-01T00:00:00Z',
+            '2026-03-01T00:00:00Z','s','e');");
+        session.observe(29_999, &ProcessSnapshot::Unavailable, true);
+        assert_eq!(session.state(kind), "candidate:0:0:-");
+        session.observe(30_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "open:1:0:-");
+        session.hook("start", "SessionStart", "{}", 31_000);
+        session.hook(
+            "unrelated",
+            "UserPromptSubmit",
+            r#"{"prompt":"another instruction"}"#,
+            32_000,
+        );
+        session.execute("UPDATE sessions SET status='exited',exit_json='{}';");
+        session.observe(33_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "open:1:0:-");
+        session.execute("UPDATE guidance_messages SET state='delivery_unknown';");
+        session.observe(33_500, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(
+            session.state(kind),
+            "open:1:1:-",
+            "uncertain delivery is not disposition"
+        );
+        session.execute("UPDATE guidance_messages SET state='written_awaiting_submit';");
+        assert!(!session
+            .scalar::<String>(
+                "SELECT evidence_json FROM attention_observations WHERE kind='guidance_unaccepted'"
+            )
+            .contains("private body"));
+        session.execute("UPDATE guidance_messages SET state='submitted';");
+        session.observe(34_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "resolved:1:0:guidance_submitted");
+    }
+
+    #[test]
+    fn permission_observes_only_a_residual_native_unresolved_request_and_never_answers_it() {
+        let session = ObservedSession::new("permission");
+        let kind = "permission_on_exited_session";
+        session.permission();
+        session.observe(0, &ProcessSnapshot::Unavailable, true);
+        assert_eq!(session.state(kind), "none");
+        session.execute("UPDATE sessions SET status='exited';");
+        session.observe(1_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(
+            session.state(kind),
+            "none",
+            "status alone is not matched exit evidence"
+        );
+        session.execute("UPDATE sessions SET exit_json='{}';");
+        let before = session.business_rows();
+        session.observe(2_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "open:1:0:-");
+        assert_eq!(session.business_rows(), before);
+        session.execute("UPDATE permission_requests SET state='expired';");
+        session.observe(3_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "resolved:1:0:request_settled");
+    }
+
+    #[test]
+    fn resume_contradiction_requires_exact_supersession_and_keeps_independent_holds() {
+        let session = ObservedSession::new("resume");
+        let kind = "resume_failure_after_acceptance";
+        session.execute(r#"UPDATE tasks SET attention='resume_failed'; UPDATE attempts SET status='needs_input';
+            UPDATE sessions SET resume_count=1,capability_key='key';
+            INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,prior_transcript_epoch,
+                launch_config_json,capability_key,capability_identity_json,state,hook_event_boundary_rowid,created_at,updated_at)
+            VALUES('resume','s',1,'e','prior','{}','key','{}','running',
+                (SELECT COALESCE(MAX(rowid),0) FROM hook_events WHERE session_id='s'),'2026-03-01T00:00:00Z','2026-03-01T00:00:00Z');
+            INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+            VALUES('rejection','rejection','service','session.resume.rejected','session','s',
+                '{"attempt_id":"a","role":"implementer","lane_id":"default","role_generation_id":"g","transcript_epoch":"prior","resume_count":0}',
+                '2026-02-28T23:59:00Z');"#);
+        session.hook("start", "SessionStart", "{}", 0);
+        session.hook("accepted", "UserPromptSubmit", "{}", 1_000);
+        session.observe(2_000, &ProcessSnapshot::Unavailable, true);
+        assert_eq!(
+            session.state(kind),
+            "none",
+            "a submit alone is not supersession"
+        );
+        session.execute(r#"INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+            VALUES('reconciled','reconciled','hook','session.resume.turn_reconciled','session','s',
+            '{"role_generation_id":"g","transcript_epoch":"e","resume_invocation_id":"resume","superseding_hook_event_id":"accepted","rejection_event_ids":["rejection"]}',
+            '2026-03-01T00:00:01Z');"#);
+        session.hook("gated-failure", "StopFailure", "{}", 2_500);
+        session.execute("INSERT INTO provider_failure_holds(id,attempt_id,role_generation_id,session_id,
+            transcript_epoch,accepted_hook_event_id,failure_hook_event_id,failure_kind,attribution,created_at,state)
+            VALUES('candidate-hold','a','g','s','e','accepted','gated-failure','authentication_failed',
+                'arrival_order','2026-03-01T00:00:02.500Z','active');");
+        let before = session.business_rows();
+        session.observe(3_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(
+            session.state(kind),
+            "none",
+            "an H4 hold suppresses a candidate"
+        );
+        assert_eq!(session.business_rows(), before);
+        session.execute("UPDATE provider_failure_holds SET state='human_released',resolved_at='2026-03-01T00:00:03.500Z',
+                resolution_kind='human_release',resolution_ref='fixture-release' WHERE id='candidate-hold';
+            INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+                VALUES('g-manager','a','manager','claude',1,1,'running','f','2026-03-01T00:00:00Z','2026-03-01T00:00:00Z');
+            INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+                VALUES('s-manager','g-manager','claude','exited','{}','fixture','manager-epoch','2026-03-01T00:00:00Z','2026-03-01T00:00:00Z');
+            INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,payload_json,peer_pid,peer_process_group_id,
+                peer_start_marker,provenance_state,received_at) VALUES('manager-failure','s-manager','g-manager','claude','StopFailure',
+                '{}',42,42,'peer','managed_process_group_untrusted_payload','2026-03-01T00:00:03.500Z');
+            INSERT INTO provider_failure_holds(id,attempt_id,role_generation_id,session_id,transcript_epoch,
+                failure_hook_event_id,failure_kind,attribution,created_at,state)
+                VALUES('unrelated-hold','a','g-manager','s-manager','manager-epoch','manager-failure','authentication_failed',
+                    'startup_invocation','2026-03-01T00:00:03.500Z','active');");
+        let before = session.business_rows();
+        session.observe(4_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "candidate:1:0:-");
+        session.observe(5_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "open:2:0:-");
+        assert_eq!(session.business_rows(), before);
+        session.hook("standing-failure", "StopFailure", "{}", 5_500);
+        session.execute("INSERT INTO provider_failure_holds(id,attempt_id,role_generation_id,session_id,transcript_epoch,
+            accepted_hook_event_id,failure_hook_event_id,failure_kind,attribution,created_at,state)
+            VALUES('standing-hold','a','g','s','e','accepted','standing-failure','authentication_failed','arrival_order',
+                '2026-03-01T00:00:05.500Z','active');");
+        let before = session.business_rows();
+        session.observe(6_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "resolved:2:0:provider_failure_hold");
+        assert_eq!(session.business_rows(), before);
+        let projected = crate::workflow::state(&session.store).unwrap();
+        assert!(projected
+            .attention
+            .iter()
+            .any(|item| item.id == "provider_failure_hold:standing-hold"));
+        assert!(!projected
+            .attention
+            .iter()
+            .any(|item| item.reason.contains("nothing else explains the hold")));
+        session.execute("UPDATE provider_failure_holds SET state='human_released',resolved_at='2026-03-01T00:00:06.500Z',
+            resolution_kind='human_release',resolution_ref='fixture-release' WHERE id='standing-hold';");
+        session.observe(7_000, &ProcessSnapshot::Unavailable, false);
+        session.observe(8_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "open:2:0:-");
+        session.execute("INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at)
+            VALUES('independent',NULL,'a','attention_required','{}','2026-03-01T00:00:09Z','2026-03-01T00:00:09Z');");
+        session.observe(9_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "resolved:2:0:independent_hold");
+    }
+
+    #[test]
+    fn busy_exit_preserves_app_stop_intent_and_excludes_history_and_completed_turns() {
+        let session = ObservedSession::new("busy-exit");
+        let kind = "busy_after_exit";
+        session.hook("start", "SessionStart", "{}", 0);
+        session.hook("accepted", "UserPromptSubmit", "{}", 1_000);
+        session.execute("UPDATE sessions SET status='exited',exit_json='{}';");
+        session.observe(2_000, &ProcessSnapshot::Unavailable, true);
+        assert_eq!(session.state(kind), "none");
+        session.execute("UPDATE sessions SET status='interrupt_requested',interrupt_requested_at='2026-03-01T00:00:02Z';");
+        assert!(session
+            .store
+            .update_session_exit(
+                "s",
+                "e",
+                PROCESS,
+                r#"{"app_stop_requested":false,"observed_at":"2026-03-01T00:00:03Z","exit_code":0}"#
+            )
+            .unwrap());
+        assert_eq!(
+            session.scalar::<i64>(
+                "SELECT json_extract(exit_json,'$.app_stop_requested') FROM sessions"
+            ),
+            1
+        );
+        assert_eq!(
+            session.scalar::<i64>("SELECT json_extract(exit_json,'$.exit_code') FROM sessions"),
+            0
+        );
+        assert!(session
+            .scalar::<Option<String>>("SELECT interrupt_requested_at FROM sessions")
+            .is_none());
+        session.observe(3_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "none");
+        session.execute("UPDATE sessions SET status='running';");
+        assert!(session
+            .store
+            .update_session_exit(
+                "s",
+                "e",
+                PROCESS,
+                r#"{"app_stop_requested":true,"observed_at":"2026-03-01T00:00:04Z","exit_code":1}"#
+            )
+            .unwrap());
+        assert_eq!(
+            session.scalar::<i64>(
+                "SELECT json_extract(exit_json,'$.app_stop_requested') FROM sessions"
+            ),
+            0
+        );
+        session.observe(4_000, &ProcessSnapshot::Unavailable, false);
+        session.observe(5_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "open:2:0:-");
+        session.execute("INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,
+            summary,evidence_json,metadata_json,created_at) VALUES('report','report','s','g','candidate_ready',
+            'completed','[]','{}','2026-03-01T00:00:06Z');");
+        session.observe(7_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state(kind), "resolved:2:0:report_recorded");
+    }
+
+    #[test]
+    fn recurring_episodes_reset_only_at_published_progress_in_source_order() {
+        let session = ObservedSession::new("recurrence");
+        let consume = |id: &str, milliseconds: i64| {
+            let now = session.at(milliseconds).to_rfc3339();
+            let mut connection = session.store.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            transaction.execute("INSERT OR IGNORE INTO role_results(id,operation_id,session_id,role_generation_id,
+                outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
+                VALUES(?1,?1,'s','g','blocked','same wording','[]','{}',?2,?2)", params![id, now]).unwrap();
+            transaction
+                .execute("UPDATE tasks SET attention='needs_input'", [])
+                .unwrap();
+            transaction
+                .execute(
+                    "UPDATE attempts SET status='needs_input',updated_at=?1",
+                    params![now],
+                )
+                .unwrap();
+            transaction.execute("INSERT OR IGNORE INTO audit_events(id,operation_id,actor_kind,event_code,
+                entity_kind,entity_id,detail_json,created_at) VALUES(?1,?1,'service','attempt.attention.changed',
+                'attempt','a',?2,?3)", params![format!("hold-{id}"), serde_json::json!({"attention":"needs_input",
+                "reason":"role_blocked","result_id":id,"role_generation_id":"g"}).to_string(), now]).unwrap();
+            count_blocking_episode(&transaction, id, &now).unwrap();
+            transaction.commit().unwrap();
+        };
+        let count = || {
+            session.scalar::<i64>(
+                "SELECT recurrence_count FROM attention_observations WHERE kind='recurring_block'",
+            )
+        };
+        consume("block-1", 0);
+        assert_eq!(count(), 1);
+        consume("block-1", 0);
+        assert_eq!(count(), 1);
+        session.observe(1_000, &ProcessSnapshot::Unavailable, true);
+        assert_eq!(session.state("recurring_block"), "candidate:0:0:-");
+        consume("block-2", 2_000);
+        session.observe(3_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(session.state("recurring_block"), "open:0:0:-");
+        let id: String =
+            session.scalar("SELECT id FROM attention_observations WHERE kind='recurring_block'");
+        consume("block-3", 4_000);
+        assert_eq!(count(), 2);
+        session.execute("UPDATE tasks SET attention='none'; UPDATE attempts SET status='running';");
+        session.hook("start", "SessionStart", "{}", 5_000);
+        session.hook("prompt", "UserPromptSubmit", "{}", 6_000);
+        session.observe(7_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(
+            count(),
+            2,
+            "Continue and a new prompt preserve episode history"
+        );
+        assert_eq!(session.state("recurring_block"), "resolved:0:0:block_ended");
+        session.execute("INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,
+            summary,evidence_json,metadata_json,created_at,consumed_at) VALUES('retired-progress','retired-progress',
+            's','g','candidate_ready','retired','[]','{}','2026-03-01T00:00:08Z','2026-03-01T00:00:08Z');
+            UPDATE role_generations SET status='replaced';");
+        session.observe(9_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(count(), 2, "switch retirement completed no freeze");
+        session.execute("UPDATE role_generations SET status='running';
+            INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,
+                metadata_json,created_at,consumed_at) VALUES('duplicate-progress','duplicate-progress','s','g',
+                'candidate_ready','duplicate','[]','{}','2026-03-01T00:00:10Z','2026-03-01T00:00:10Z');
+            INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+                VALUES('duplicate-retirement','duplicate-retirement','service','role_result.superseded',
+                'role_result','duplicate-progress','{}','2026-03-01T00:00:10Z');");
+        session.observe(11_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(count(), 2);
+        session.execute("INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at)
+            VALUES('reused','a','candidate','base','same-content','{}',1,'2026-01-01T00:00:00Z');
+            INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,
+                metadata_json,created_at,consumed_at) VALUES('published','published','s','g','candidate_ready',
+                'published','[]','{}','2026-03-01T00:00:12Z','2026-03-01T00:00:12Z');
+            INSERT INTO freeze_intents(id,attempt_id,kind,source_role_generation_id,state,result_snapshot_id,created_at,updated_at)
+                VALUES('new-freeze','a','candidate','g','complete','reused','2026-03-01T00:00:12Z','2026-03-01T00:00:12Z');");
+        consume("block-after-publication", 13_000);
+        assert_eq!(
+            count(),
+            1,
+            "an older publication resets before the later episode, not after it"
+        );
+        session.observe(14_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(count(), 1);
+        assert_eq!(session.scalar::<String>("SELECT json_extract(reset_evidence_json,'$.freeze_intent_id') FROM attention_observations WHERE kind='recurring_block'"), "new-freeze");
+        consume("second-after-publication", 15_000);
+        session.observe(16_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(count(), 2);
+        assert_eq!(
+            session.scalar::<String>(
+                "SELECT id FROM attention_observations WHERE kind='recurring_block'"
+            ),
+            id
+        );
+        session.execute("INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,
+            authority_generation,created_at,updated_at) VALUES('manager','a','manager','claude',1,1,'exited','f',
+            '2026-03-01T00:00:17Z','2026-03-01T00:00:17Z');
+            INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+            VALUES('manager-session','manager','claude','exited','{}','fixture','manager-epoch','2026-03-01T00:00:17Z','2026-03-01T00:00:17Z');
+            INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
+            VALUES('other-role-progress','other-role-progress','manager-session','manager','plan_ready','published','[]','{}',
+                '2026-03-01T00:00:17Z','2026-03-01T00:00:17Z');
+            INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at)
+            VALUES('manager-plan','a','plan','base','plan-content','{}',1,'2026-03-01T00:00:17Z');
+            INSERT INTO freeze_intents(id,attempt_id,kind,source_role_generation_id,state,result_snapshot_id,created_at,updated_at)
+            VALUES('manager-freeze','a','plan','manager','complete','manager-plan','2026-03-01T00:00:17Z','2026-03-01T00:00:17Z');");
+        session.observe(18_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(
+            count(),
+            2,
+            "another role's published progress does not reset this role"
+        );
+        session.execute(r#"INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,
+                evidence_json,metadata_json,created_at,consumed_at)
+            VALUES('pending-before-freeze','pending-before-freeze','s','g','blocked','blocked','[]','{}',
+                '2026-03-01T00:00:19Z','2026-03-01T00:00:19Z');
+            INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+            VALUES('pending-hold-before','pending-hold-before','service','attempt.attention.changed','attempt','a',
+                '{"attention":"needs_input","reason":"role_blocked","result_id":"pending-before-freeze","role_generation_id":"g"}',
+                '2026-03-01T00:00:19Z');
+            INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,
+                metadata_json,created_at,consumed_at)
+            VALUES('pending-publication','pending-publication','s','g','candidate_ready','same content','[]','{}',
+                '2026-03-01T00:00:22Z','2026-03-01T00:00:22Z');
+            INSERT INTO freeze_intents(id,attempt_id,kind,source_role_generation_id,state,result_snapshot_id,created_at,updated_at)
+            VALUES('pending-freeze','a','candidate','g','complete','reused','2026-03-01T00:00:22Z','2026-03-01T00:00:22Z');
+            INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,
+                metadata_json,created_at,consumed_at)
+            VALUES('pending-after-freeze','pending-after-freeze','s','g','blocked','blocked','[]','{}',
+                '2026-03-01T00:00:23Z','2026-03-01T00:00:23Z');
+            INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+            VALUES('pending-hold-after','pending-hold-after','service','attempt.attention.changed','attempt','a',
+                '{"attention":"needs_input","reason":"role_blocked","result_id":"pending-after-freeze","role_generation_id":"g"}',
+                '2026-03-01T00:00:23Z');
+            UPDATE attempts SET status='needs_input',updated_at='2026-03-01T00:00:23Z' WHERE id='a';
+            UPDATE tasks SET attention='needs_input';"#);
+        let before = session.business_rows();
+        session.observe(24_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(
+            count(),
+            1,
+            "catch-up orders the publication between pending episodes"
+        );
+        assert_eq!(session.business_rows(), before);
+        assert_eq!(session.scalar::<String>("SELECT last_counted_result_id FROM attention_observations WHERE kind='recurring_block'"), "pending-after-freeze");
+        assert_eq!(session.scalar::<String>("SELECT json_extract(reset_evidence_json,'$.freeze_intent_id') FROM attention_observations WHERE kind='recurring_block'"), "pending-freeze");
+        session.observe(24_500, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(count(), 1);
+        consume("second-after-deferred-publication", 25_000);
+        session.observe(26_000, &ProcessSnapshot::Unavailable, false);
+        assert_eq!(count(), 2);
+        session.execute(r#"INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+            VALUES('other-attempt','t','context','implementation','base',1,'running','2026-03-02T00:00:00Z','2026-03-02T00:00:00Z');
+            INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,lane_id,created_at,updated_at)
+            VALUES('lane-generation','other-attempt','implementer','claude',1,1,'running','f','other-lane','2026-03-02T00:00:00Z','2026-03-02T00:00:00Z');
+            INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+            VALUES('lane-session','lane-generation','claude','exited','{}','fixture','lane-epoch','2026-03-02T00:00:00Z','2026-03-02T00:00:00Z');
+            INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
+            VALUES('retired-lane-result','retired-lane-result','lane-session','lane-generation','needs_input','retired','[]','{}','2026-03-02T00:00:01Z','2026-03-02T00:00:01Z'),
+                ('lane-result','lane-result','lane-session','lane-generation','needs_input','same wording','[]','{}','2026-03-02T00:00:01Z','2026-03-02T00:00:01Z');
+            UPDATE tasks SET attention='needs_input'; UPDATE attempts SET status='needs_input',updated_at='2026-03-02T00:00:01Z' WHERE id='other-attempt';
+            INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+            VALUES('lane-hold','lane-hold','service','attempt.attention.changed','attempt','other-attempt',
+                '{"attention":"needs_input","reason":"role_needs_input","result_id":"lane-result","role_generation_id":"lane-generation"}',
+                '2026-03-02T00:00:01Z');"#);
+        {
+            let mut connection = session.store.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            count_blocking_episode(&transaction, "lane-result", "2026-03-02T00:00:01Z").unwrap();
+            transaction.commit().unwrap();
+        }
+        assert_eq!(
+            session.scalar::<i64>(
+                "SELECT recurrence_count FROM attention_observations WHERE attempt_id='a'"
+            ),
+            2
+        );
+        assert_eq!(session.scalar::<i64>("SELECT recurrence_count FROM attention_observations WHERE attempt_id='other-attempt' AND lane_id='other-lane' AND entity_key LIKE '%:needs_input'"), 1);
     }
 }

@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-10-01T03:45:24.130753+00:00",
+  "observed_at": "2026-10-01T19:59:17.882797+00:00",
   "receipts": [
     {
       "adapter": "direct-claude-cli",
@@ -95,6 +95,28 @@
       "service_tier": null,
       "session": "fresh",
       "session_evidence": "Independent fresh native session; no resume."
+    },
+    {
+      "adapter": "direct-codex-cli",
+      "authority": "workspace-write",
+      "effort": "xhigh",
+      "model": "gpt-6.1-sol",
+      "provider": "codex",
+      "session": "retained",
+      "result": "pass",
+      "service_tier": null,
+      "profile_ids": [
+        "session-sol61-xhigh-write"
+      ],
+      "nonce": "H3H15_SOL61_WRITE_20261001_8e213b",
+      "nonce_matched": true,
+      "native_session_id": "01a0f90b-e2c8-70b3-92c5-22c6582b5054",
+      "model_evidence": "Installed Codex ordinary console gpt-6.1-sol/xhigh/workspace-write header, successful initial and explicit resume. No fallback configured.",
+      "authority_evidence": "Initial and resumed invocations wrote only the authorized task-local nonce file; independently checked both lines.",
+      "session_evidence": "Explicit UUID resume recalled nonce without prompt restating it and appended it to isolated probe.",
+      "started_at": "2026-10-01T19:58:20.813597+00:00",
+      "ended_at": "2026-10-01T19:58:44.758205+00:00",
+      "seconds": 23.944
     }
   ]
 }

@@ -419,14 +419,15 @@ reuse old qualification evidence to bypass these checks.
 The database commands operate on the instance selected by `--data-dir`. Current
 schema only is supported: they do not upgrade an earlier installation. Fresh
 service initialization still creates the current schema. Service start, under
-the instance lock, upgrades supported existing schemas 31, 32, 33 and 34 to schema
-35 through the existing migration transactions. Unsupported existing schemas,
+the instance lock, upgrades supported existing schemas 31, 32, 33, 34 and 35 to schema
+36 through the existing migration transactions. Unsupported existing schemas,
 including schema 30 and newer unknown schemas, are refused. Each failed
 migration rolls back its own transaction. Schema 32 records final-repair receipt
 provenance; schema 33 records native-resolution provenance; schema 34 adds the
 exact submitted guidance text and digest while preserving the original body.
-Schema 35 adds durable provider failure holds. Existing receipts retain their
-recorded values. A schema-34 backup cannot be restored by the schema-35 build:
+Schema 35 adds durable provider failure holds; schema 36 adds durable attention
+observations. Existing receipts retain their recorded values. A schema-35 or
+earlier backup cannot be restored by the schema-36 build:
 backup verification and restore still require the executable's exact current
 schema. Automatic pre-upgrade restore points and backward-schema recovery remain
 pending in the deferred hardening program; this migration does not provide them.
@@ -595,3 +596,29 @@ Choose **Enable browser notifications** to enable alerts for this dashboard visi
 Session Access keeps **Session open**, native accepted-turn evidence and report submission separate. An implementation report awaits processing or verification; neither label means the task is accepted. A later accepted turn can make that report historical. For native dialogs without a supported signal, use **View output** and explicit keyboard control; the app does not guess from terminal text. See the [signal matrix](PERMISSION_SIGNAL_MATRIX.md).
 
 The sidebar **Appearance** selector offers System, Light and Dark. An explicit choice overrides the operating-system preference and is stored for this browser origin. System follows the operating-system preference; unavailable or invalid preference storage falls back to System.
+
+### Durable attention observations
+
+The existing coordinator cycle classifies observations after its workflow step.
+An observation failure rolls back its own writes and is logged separately; it
+does not replace the workflow step's result or create another workflow action.
+Recurrence counting uses a savepoint within the effective-hold transaction. A
+recoverable observation error rolls back that savepoint while preserving the
+ordinary hold, consumed report and exact source audit. The existing observation
+pass later counts any missing effective episodes from those audits, without
+replaying workflow actions. A lost transaction or failed rollback, savepoint
+release or commit remains a workflow failure.
+
+Candidate observations are private. Opening, resolving or changing a visible
+observation advances the dashboard revision; unchanged sweep timestamps do not.
+Read-only process snapshots retain unknown ownership as unknown.
+
+The [workflow guide](WORKFLOWS.md) lists thresholds and recurrence rules. The
+missing-session predicate covers only the reviewed manager waits for a plan,
+plan proposal, implementation transition or handoff. Checks-phase and lane-yield
+waits are excluded. Busy-after-exit classification requires current-build,
+identity-bound exit evidence with the app's recorded stop-intent flag; historical,
+restart-reconciled and cancellation exits without that flag are excluded.
+Intentional stops do not create this notice. No observation repairs those states
+or authorizes a retry. Notices resolve only from positive evidence for their exact
+subject, not absence from a page or activity from another role.

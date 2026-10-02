@@ -9,7 +9,7 @@ use crate::domain::{
     TaskAttentionTarget, TaskDto, UnacceptedInputDto, UnacceptedInputKind,
     UnconfirmedGuidanceAbandonment,
 };
-use crate::store::{json_hash, Store};
+use crate::store::{json_hash, ObservationKind, OpenObservation, Store};
 use crate::supervisor::GRACEFUL_STOP_SECONDS;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -4555,7 +4555,16 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         )
         FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
         JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
-        ORDER BY s.created_at DESC LIMIT 200
+        -- Sessions an open observation names stay reachable beyond the newest 200.
+        WHERE s.id IN (SELECT newest.id FROM sessions newest
+                         JOIN role_generations newest_generation
+                           ON newest_generation.id=newest.role_generation_id
+                         JOIN attempts newest_attempt ON newest_attempt.id=newest_generation.attempt_id
+                         JOIN tasks newest_task ON newest_task.id=newest_attempt.task_id
+                         ORDER BY newest.created_at DESC,newest.id LIMIT 200)
+           OR s.id IN (SELECT observation.session_id FROM attention_observations observation
+                       WHERE observation.state='open' AND observation.session_id IS NOT NULL)
+        ORDER BY s.created_at DESC,s.id
     "#,
     )?;
     let mut active_sessions = active_sessions;
@@ -4921,6 +4930,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             );
         }
     }
+    let observations = crate::store::open_attention_observations(&connection)?;
     let attention = AttentionSources {
         projects: &projects,
         tasks: &tasks,
@@ -4931,6 +4941,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         decisions: &decisions,
         continuation_actions: &continuation_actions,
         coordinator_deferral: crate::coordinator::open_tick_deferral(&connection)?,
+        observations: &observations,
     }
     .items();
     let task_actions = crate::domain::task_actions(&attention);
@@ -5693,7 +5704,10 @@ fn latest_invocation_report(
 /// other tool or subagent activity never retires it; later reminders keep the
 /// first one's identity, and an unsupported notification type announces
 /// nothing.
-fn native_prompt(connection: &Connection, session_id: &str) -> Result<Option<NativePromptDto>> {
+pub(crate) fn native_prompt(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<NativePromptDto>> {
     let prompt: Option<(String, String, String)> = connection
         .query_row(
             &format!(
@@ -5779,7 +5793,7 @@ pub(crate) fn provider_failure_hold_message(
 /// How long after LLMRelay writes guidance or reserves a resumed turn the
 /// dashboard waits for a trusted acceptance before saying it is unconfirmed.
 /// It times presentation only; nothing is resent, submitted or relaunched.
-const ACCEPTANCE_OBSERVATION_SECONDS: i64 = 30;
+pub(crate) const ACCEPTANCE_OBSERVATION_SECONDS: i64 = 30;
 
 /// Guidance written into the session's current invocation and its current
 /// resumed invocation, when no trusted `UserPromptSubmit` of that invocation
@@ -7025,6 +7039,7 @@ struct AttentionSources<'a> {
     continuation_actions: &'a [ContinuationAction],
     /// Set while the coordinator keeps failing the same step.
     coordinator_deferral: Option<crate::coordinator::TickDeferral>,
+    observations: &'a [crate::store::OpenObservation],
 }
 
 impl AttentionSources<'_> {
@@ -7041,6 +7056,7 @@ impl AttentionSources<'_> {
         items.extend(self.recovery_items());
         items.extend(self.native_turn_failure_items());
         items.extend(self.provider_failure_hold_items());
+        items.extend(self.observation_items());
         items.extend(self.native_prompt_items());
         items.extend(self.unaccepted_input_items());
         items.extend(self.setup_items());
@@ -7061,28 +7077,59 @@ impl AttentionSources<'_> {
         self.permission_requests
             .iter()
             .filter(|request| request.actionable)
-            .map(|request| AttentionItem {
-                id: format!("permission_request:{}", request.id),
-                category: AttentionCategory::Permission,
-                title: format!(
-                    "{} is asking to use {}",
-                    request.role.label(),
-                    request.tool_name
-                ),
-                reason: "The agent is waiting for you to approve or deny this request. Nothing runs until you decide.".into(),
-                task_title: self.task(&request.task_id).map(|task| task.title.clone()),
-                role: Some(request.role),
-                action: AttentionActionKind::ReviewRequest.into(),
-                target: Some(AttentionTarget::PermissionRequest {
-                    project_id: request.project_id.clone(),
-                    task_id: request.task_id.clone(),
-                    attempt_id: request.attempt_id.clone(),
-                    session_id: request.session_id.clone(),
-                    request_id: request.id.clone(),
-                    request_revision: request.revision,
-                }),
-                held_tasks: Vec::new(),
-                details: None,
+            .map(|request| match self.observation(
+                ObservationKind::PermissionOnExitedSession,
+                &request.id,
+            ) {
+                // An answer can no longer reach an exited process, so none is offered.
+                Some(observation) => AttentionItem {
+                    id: format!("permission_request:{}", request.id),
+                    category: AttentionCategory::Blocked,
+                    title: format!(
+                        "{}'s permission request outlived its session",
+                        request.role.label()
+                    ),
+                    reason: "The agent's session exited while this request was still waiting for an answer, so no answer can reach the agent now. Open agent output to see where it stopped.".into(),
+                    task_title: self.task(&request.task_id).map(|task| task.title.clone()),
+                    role: Some(request.role),
+                    action: AttentionActionKind::OpenAgentOutput.into(),
+                    target: self.observed_session_target(observation),
+                    held_tasks: Vec::new(),
+                    details: Some(format!(
+                        "Request {} to use {} · its session exited · native correlation {} · observed {}",
+                        request.id,
+                        request.tool_name,
+                        if request.native_correlation_available {
+                            "available"
+                        } else {
+                            "unavailable"
+                        },
+                        observation.opened_at
+                    )),
+                },
+                None => AttentionItem {
+                    id: format!("permission_request:{}", request.id),
+                    category: AttentionCategory::Permission,
+                    title: format!(
+                        "{} is asking to use {}",
+                        request.role.label(),
+                        request.tool_name
+                    ),
+                    reason: "The agent is waiting for you to approve or deny this request. Nothing runs until you decide.".into(),
+                    task_title: self.task(&request.task_id).map(|task| task.title.clone()),
+                    role: Some(request.role),
+                    action: AttentionActionKind::ReviewRequest.into(),
+                    target: Some(AttentionTarget::PermissionRequest {
+                        project_id: request.project_id.clone(),
+                        task_id: request.task_id.clone(),
+                        attempt_id: request.attempt_id.clone(),
+                        session_id: request.session_id.clone(),
+                        request_id: request.id.clone(),
+                        request_revision: request.revision,
+                    }),
+                    held_tasks: Vec::new(),
+                    details: None,
+                },
             })
     }
 
@@ -7429,6 +7476,7 @@ impl AttentionSources<'_> {
             .and_then(|attempt| json_text(attempt, "phase"))
             .filter(|_| !terminal);
         let task_scope = || Some(AttentionTarget::Task(task_target(task)));
+        let mut details = None;
         let (id, category, title, reason, action, target) = match (phase, task.attention.as_str()) {
             (Some(phase @ "awaiting_plan_approval"), _) => (
                 format!("attempt:{}:{phase}", attempt_id?),
@@ -7540,6 +7588,11 @@ impl AttentionSources<'_> {
                 let answer = (attention == "needs_input")
                     .then(|| self.question_target(task))
                     .flatten();
+                let mut reason = self.task_reason(task);
+                if let Some((addition, observed)) = self.observed_hold(task) {
+                    reason = format!("{reason} {addition}");
+                    details = Some(observed);
+                }
                 (
                     format!("task:{}:{attention}", task.id),
                     match attention {
@@ -7548,7 +7601,7 @@ impl AttentionSources<'_> {
                         _ => AttentionCategory::Blocked,
                     },
                     task_attention_title(attention),
-                    self.task_reason(task),
+                    reason,
                     match attention {
                         "needs_human_review" => AttentionActionKind::ReviewResult,
                         _ if answer.is_some() => AttentionActionKind::AnswerQuestion,
@@ -7568,8 +7621,234 @@ impl AttentionSources<'_> {
             action: action.into(),
             target,
             held_tasks: Vec::new(),
-            details: None,
+            details,
         })
+    }
+
+    /// A recurrence or a superseded resume failure folds into the hold it explains.
+    fn observed_hold(&self, task: &TaskDto) -> Option<(String, String)> {
+        let attempt_id = active_attempt_id(task)?;
+        self.observations
+            .iter()
+            .filter(|observation| observation.attempt_id.as_deref() == Some(attempt_id))
+            .find_map(|observation| match (observation.kind, task.attention.as_str()) {
+                (ObservationKind::RecurringBlock, "needs_input") if observation.current_block => Some((
+                    format!(
+                        "{} has now stopped this way at least twice in this attempt.",
+                        observation.role.map_or("The agent", RoleKind::label)
+                    ),
+                    format!(
+                        "Recurring {} reports from {}: {} effective holds in this attempt (counted up to 2) · latest report {} · observed {}",
+                        json_text(&observation.evidence, "outcome").unwrap_or("blocked"),
+                        observation.role.map_or("the agent", RoleKind::label),
+                        observation.recurrence_count,
+                        observation.last_counted_result_id.as_deref().unwrap_or("unknown"),
+                        observation.opened_at
+                    ),
+                )),
+                (ObservationKind::ResumeFailureAfterAcceptance, "resume_failed")
+                    if self.observed_session_target(observation).is_some() => Some((
+                    "LLMRelay later saw the agent accept a turn in the resumed session, which superseded this failure, and nothing else explains the hold. Check the agent's output before choosing Continue.".to_owned(),
+                    format!(
+                        "Superseded resume rejection {} · reconciled turn {} · confirmed on two checks · observed {}",
+                        observation.source_id.as_deref().unwrap_or("unknown"),
+                        json_text(&observation.evidence, "turn_reconciled_event_id").unwrap_or("unknown"),
+                        observation.opened_at
+                    ),
+                )),
+                _ => None,
+            })
+    }
+
+    fn observation(&self, kind: ObservationKind, source_id: &str) -> Option<&OpenObservation> {
+        self.observations.iter().find(|observation| {
+            observation.kind == kind
+                && observation.source_id.as_deref() == Some(source_id)
+                && self.observed_session_target(observation).is_some()
+        })
+    }
+
+    /// Only the recorded generation and invocation remain a target while the
+    /// task still shows that attempt; a resumed invocation is never substituted.
+    fn observed_session_target(&self, observation: &OpenObservation) -> Option<AttentionTarget> {
+        let session_id = observation.session_id.as_deref()?;
+        let session = self
+            .sessions
+            .iter()
+            .find(|session| json_text(session, "id") == Some(session_id))?;
+        let attempt_id = json_text(session, "attempt_id")?;
+        let role_generation_id = json_text(session, "role_generation_id")?;
+        if observation.attempt_id.as_deref() != Some(attempt_id)
+            || observation.role_generation_id.as_deref() != Some(role_generation_id)
+            || observation.transcript_epoch.as_deref() != json_text(session, "transcript_epoch")
+            || observation.transcript_epoch.is_none()
+        {
+            return None;
+        }
+        let task = self.task_with_active_attempt(attempt_id)?;
+        Some(AttentionTarget::Session {
+            project_id: task.project_id.clone(),
+            task_id: task.id.clone(),
+            attempt_id: attempt_id.to_owned(),
+            session_id: session_id.to_owned(),
+            role_generation_id: role_generation_id.to_owned(),
+        })
+    }
+
+    /// Classification-only items; permission, recurrence and resume observations
+    /// are folded into the items for the hold or request they explain instead.
+    fn observation_items(&self) -> Vec<AttentionItem> {
+        self.observations
+            .iter()
+            .filter_map(|observation| {
+                if !matches!(observation.kind, ObservationKind::AttemptWithoutLiveSession | ObservationKind::RecurringBlock)
+                    && self.observed_session_target(observation).is_none() {
+                    return Some(AttentionItem {
+                        id: format!("attention_observation:{}", observation.id),
+                        category: AttentionCategory::Blocked,
+                        title: "An earlier observation needs a refresh".into(),
+                        reason: "The original agent invocation is no longer available for this observation. Refresh to check its current state.".into(),
+                        task_title: observation.task_id.as_deref().and_then(|id| self.task(id)).map(|task| task.title.clone()),
+                        role: observation.role,
+                        action: AttentionActionKind::OpenAgentOutput.into(),
+                        target: None,
+                        held_tasks: Vec::new(),
+                        details: Some(format!("Kind {} · original session {} · invocation {} · observed {}",
+                            observation.kind.as_str(), observation.session_id.as_deref().unwrap_or("unknown"),
+                            observation.transcript_epoch.as_deref().unwrap_or("unknown"), observation.opened_at)),
+                    });
+                }
+                let who = observation.role.map_or("The agent", RoleKind::label);
+                let session = observation.session_id.as_deref().unwrap_or("unknown");
+                let (id, title, reason, target, details) = match observation.kind {
+                    ObservationKind::ProcessWithoutAcceptedTurn => (
+                        format!("attention_observation:{}", observation.id),
+                        format!("{who}'s acceptance has not been observed"),
+                        format!("{who}'s session has been running for more than {ACCEPTANCE_OBSERVATION_SECONDS} seconds, but LLMRelay has not seen it accept its instructions. This is an observation, not proof that anything failed. Open agent output to see what the agent shows."),
+                        self.observed_session_target(observation),
+                        format!(
+                            "Session started {} · no accepted prompt after {ACCEPTANCE_OBSERVATION_SECONDS} seconds, confirmed on two checks · session {session} · invocation {} · observed {}",
+                            observed_fact(observation, "session_started_at"),
+                            observation.source_id.as_deref().unwrap_or("initial launch"),
+                            observation.opened_at
+                        ),
+                    ),
+                    ObservationKind::QuietTurn => (
+                        format!("attention_observation:{}", observation.id),
+                        format!("{who} has been quiet for a while"),
+                        format!(
+                            "{who}'s current turn started more than 10 minutes ago, and LLMRelay has seen no new output or activity from it for 5 minutes. This does not prove the agent is stuck; it may be working quietly. Open agent output to check.{}",
+                            if observation.uncertain {
+                                " LLMRelay cannot currently confirm the agent's process or output, so this may be out of date."
+                            } else {
+                                ""
+                            }
+                        ),
+                        self.observed_session_target(observation),
+                        format!(
+                            "Turn accepted {} · no new output or hook activity since {} · thresholds: turn older than 10 minutes, quiet for 5 minutes, two checks · session {session} · observed {}",
+                            observed_fact(observation, "accepted_at"),
+                            observed_fact(observation, "observed_since"),
+                            observation.opened_at
+                        ),
+                    ),
+                    ObservationKind::AttemptWithoutLiveSession => (
+                        format!("attention_observation:{}", observation.id),
+                        "No agent session is running for this task".to_owned(),
+                        "This task is waiting on its manager, but LLMRelay has not seen any running agent session for more than a minute. Open the task's Activity to check its agents.".to_owned(),
+                        observation
+                            .attempt_id
+                            .as_deref()
+                            .and_then(|attempt_id| self.task_with_active_attempt(attempt_id))
+                            .map(|task| AttentionTarget::Task(task_target(task))),
+                        format!(
+                            "No live effective session observed since {} · phase {} · threshold 60 seconds, two checks with a complete process inventory · observed {}",
+                            observed_fact(observation, "observed_since"),
+                            observed_fact(observation, "phase"),
+                            observation.opened_at
+                        ),
+                    ),
+                    ObservationKind::GuidanceUnaccepted => (
+                        format!(
+                            "guidance_unaccepted:{}",
+                            observation.source_id.as_deref().unwrap_or(&observation.id)
+                        ),
+                        format!("{who} has not confirmed your guidance yet"),
+                        "LLMRelay typed the guidance into the agent's terminal and pressed Enter once, but the agent has not reported receiving it. This does not mean the agent is stuck. Open agent output to check whether the text is still in its input box; LLMRelay will not press Enter again or resend it.".to_owned(),
+                        self.observed_session_target(observation),
+                        format!(
+                            "Guidance written at {}; no acceptance from the agent was recorded within {ACCEPTANCE_OBSERVATION_SECONDS} seconds · session {session} · observed {}",
+                            observed_fact(observation, "written_at"),
+                            observation.opened_at
+                        ),
+                    ),
+                    ObservationKind::BusyAfterExit => (
+                        format!("attention_observation:{}", observation.id),
+                        format!("{who} exited while still recorded as working"),
+                        format!("{who}'s session exited while LLMRelay still recorded it as working, and no report or stop request explains it. Its last turn may not have finished. Open agent output to see where it stopped."),
+                        self.observed_session_target(observation),
+                        format!(
+                            "Exited {} with readiness {} · confirmed on two checks · session {session} · observed {}",
+                            observed_fact(observation, "exited_at"),
+                            observed_fact(observation, "readiness"),
+                            observation.opened_at
+                        ),
+                    ),
+                    ObservationKind::PermissionOnExitedSession => {
+                        if self.permission_requests.iter().any(|request| request.actionable
+                            && observation.source_id.as_deref() == Some(request.id.as_str())) {
+                            return None;
+                        }
+                        (
+                            format!("attention_observation:{}", observation.id),
+                            "A permission request outlived its session".to_owned(),
+                            "LLMRelay previously observed an unanswered request after the agent exited. The original request is unavailable now. Refresh to check its current state.".to_owned(),
+                            None,
+                            format!("Request {} · observed {}", observation.source_id.as_deref().unwrap_or("unknown"), observation.opened_at),
+                        )
+                    }
+                    ObservationKind::ResumeFailureAfterAcceptance | ObservationKind::RecurringBlock => {
+                        if observation.task_id.as_deref().and_then(|id| self.task(id))
+                            .is_some_and(|task| active_attempt_id(task) == observation.attempt_id.as_deref()
+                                && match observation.kind {
+                                    ObservationKind::RecurringBlock => task.attention == "needs_input" && observation.current_block,
+                                    ObservationKind::ResumeFailureAfterAcceptance => task.attention == "resume_failed",
+                                    _ => false,
+                                }) {
+                            return None;
+                        }
+                        (
+                            format!("attention_observation:{}", observation.id),
+                            "An earlier observation needs a refresh".to_owned(),
+                            "LLMRelay cannot currently show the original hold this observation described. Refresh to check its current state.".to_owned(),
+                            None,
+                            format!("Kind {} · source {} · observed {}", observation.kind.as_str(), observation.source_id.as_deref().unwrap_or("unknown"), observation.opened_at),
+                        )
+                    }
+                };
+                let reason = if observation.uncertain && observation.kind != ObservationKind::QuietTurn {
+                    format!("{reason} LLMRelay cannot currently confirm the latest evidence, so this observation may be out of date.")
+                } else {
+                    reason
+                };
+                Some(AttentionItem {
+                    id,
+                    category: AttentionCategory::Blocked,
+                    title,
+                    reason,
+                    task_title: observation
+                        .task_id
+                        .as_deref()
+                        .and_then(|task_id| self.task(task_id))
+                        .map(|task| task.title.clone()),
+                    role: observation.role,
+                    action: AttentionActionKind::OpenAgentOutput.into(),
+                    target,
+                    held_tasks: Vec::new(),
+                    details: Some(details),
+                })
+            })
+            .collect()
     }
 
     /// A running manager of the active attempt that is waiting on a reported
@@ -7814,6 +8093,17 @@ impl AttentionSources<'_> {
                 let Ok(input) = serde_json::from_value::<UnacceptedInputDto>(input.clone()) else {
                     continue;
                 };
+                let observed = match input.kind {
+                    UnacceptedInputKind::Guidance => {
+                        self.observation(ObservationKind::GuidanceUnaccepted, &input.id)
+                    }
+                    UnacceptedInputKind::Resume => {
+                        self.observation(ObservationKind::ProcessWithoutAcceptedTurn, &input.id)
+                    }
+                };
+                if observed.is_some() {
+                    continue;
+                }
                 let (prefix, title, reason, sent) = match input.kind {
                     UnacceptedInputKind::Guidance => (
                         "guidance_unaccepted",
@@ -8151,6 +8441,10 @@ fn native_turn_failure_explanation(kind: &str) -> (&'static str, &'static str) {
 
 fn json_text<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn observed_fact<'a>(observation: &'a OpenObservation, key: &str) -> &'a str {
+    json_text(&observation.evidence, key).unwrap_or("unknown")
 }
 
 fn capacity_status(connection: &rusqlite::Connection) -> Result<serde_json::Value> {

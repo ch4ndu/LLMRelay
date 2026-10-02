@@ -143,6 +143,37 @@ activity alone do not clear them. Failure attribution and identifiers appear in
 **Technical details**. The cooldown is LLMRelay's own restriction, not a claimed
 provider reset time.
 
+The attention inbox also records observations that may need investigation. These
+notices describe missing acceptance, a quiet turn, a task waiting without a live
+session, unaccepted guidance, a permission request left on an exited session,
+a resume hold inconsistent with accepted input, or busy state after an unexpected
+exit. They do not pause work, retry it, send input, change readiness or settle a
+result. Open the linked task or session to inspect the evidence and decide what
+to do. An unavailable original target, including a replaced invocation of the same
+session, offers **Refresh**, not a replacement agent.
+
+Acceptance and guidance observations use a 30-second bound. A quiet-turn notice
+requires a turn at least 10 minutes old and 5 observed minutes without activity;
+a missing-session notice requires 60 seconds. Possible stalls and state
+inconsistencies require two qualifying observations at least one second apart.
+These are app observation thresholds, not provider failure or completion claims.
+Permission waits suppress new quiet-turn detection; confirmed new activity can
+still clear an open quiet notice while you control the terminal. A provider
+failure hold for the same role and lane remains an independent restriction and
+prevents a notice claiming that nothing explains a resume hold.
+Unavailable process inventory or
+capture cannot establish a stall or clear an existing notice. Restarting the
+service resets candidate quiet history while preserving open observations.
+
+Repeated blocking attention appears after two effective **blocked** or **needs
+input** episodes from the same role and lane within an attempt. Duplicate reports,
+**Continue**, a new prompt and changing models do not reset the count. A positively
+published plan or candidate from that role resets it; visibility still follows
+the current blocking reason. Matching existing notices are combined, while
+independent permission and recovery reasons remain visible. Older sessions named
+by an open observation are included beyond the usual newest-200 list and can also
+appear in Workspace's past sessions.
+
 A Codex manager turn sometimes ends without a completion hook for every tool it started. LLMRelay then treats the turn as finished only after the service has checked, for the manager's exact current session, credential, invocation and hooks, that nothing else is pending (permission, keyboard control, uncertain guidance, control, switch, restart, recovery, capture or check) and the process inventory shows the manager idle. A completion hook that arrives late for a tool from that turn counts as bookkeeping; any new work keeps the turn busy. Elapsed time or a quiet terminal is never used. Queued guidance, such as your answer, is delivered only after that boundary, and it counts as submitted only when the manager's own prompt-submit event carries exactly its text.
 
 Each task card on the Board and in Workspace, and the task's header, shows the same next step as the Workspace inbox, for example **Review plan**, **Review request**, **Answer question**, **Open agent output**, **Open agent settings** or **Resolve issue**, and opens the same exact item. When a task has more than one waiting item, the card shows how many more there are and the task header lists each of them with its own button. If an item changed before it could open, nothing is opened or run and the latest state is requested. An item with no current page to open offers **Refresh**.

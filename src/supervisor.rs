@@ -63,6 +63,20 @@ pub(crate) enum SessionInventory {
     },
 }
 
+/// One process table read that reconciles, records, reaps and signals nothing.
+pub(crate) enum ProcessSnapshot {
+    /// Invocations whose exact recorded root process the table showed alive.
+    Read(Vec<LiveInvocation>),
+    Unavailable,
+}
+
+pub(crate) struct LiveInvocation {
+    pub(crate) session_id: String,
+    pub(crate) role_generation_id: String,
+    pub(crate) transcript_epoch: String,
+    pub(crate) process_identity_json: String,
+}
+
 /// The operating-system process table could not be read. This is never a
 /// fact about one session, so callers keep it apart from subject failures.
 #[derive(Debug)]
@@ -1106,6 +1120,30 @@ impl Supervisor {
             }
         }
         Ok(Ok(active))
+    }
+
+    /// A session without a handle in this boot is absent here, which is unknown, not exited.
+    pub(crate) fn process_snapshot(&self) -> Result<ProcessSnapshot> {
+        let Ok(inventory) = self.process_inventory() else {
+            return Ok(ProcessSnapshot::Unavailable);
+        };
+        let mut live = Vec::new();
+        for handle in self.handles()? {
+            let root_alive = inventory.iter().any(|process| {
+                process.pid == handle.process.pid
+                    && process.pgid == handle.process.process_group_id
+                    && same_process_start(&process.start, &handle.process.native_start_marker)
+            });
+            if root_alive {
+                live.push(LiveInvocation {
+                    session_id: handle.session_id.clone(),
+                    role_generation_id: handle.role_generation_id.clone(),
+                    transcript_epoch: handle.transcript_epoch.clone(),
+                    process_identity_json: serde_json::to_string(&handle.process)?,
+                });
+            }
+        }
+        Ok(ProcessSnapshot::Read(live))
     }
 
     /// Sessions this boot holds handles for, read without process inventory.
@@ -2651,6 +2689,35 @@ fn newly_spawned_service_descendants(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attention_process_snapshot_inventory_failure_writes_nothing() {
+        let root = std::env::temp_dir().join(format!(
+            "llmrelay-attention-inventory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&root.join("state.sqlite3")).unwrap();
+        let supervisor = Supervisor::new(store.clone(), root.join("transcripts"));
+        let revision = store.state_revision().unwrap();
+        supervisor.fail_process_inventory_for_tests(Some("injected inventory failure"));
+        assert!(matches!(
+            supervisor.process_snapshot().unwrap(),
+            ProcessSnapshot::Unavailable
+        ));
+        assert_eq!(store.state_revision().unwrap(), revision);
+        assert!(supervisor.handles().unwrap().is_empty());
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM audit_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn synthetic_compatibility_cannot_reach_spawn_side_effects() {

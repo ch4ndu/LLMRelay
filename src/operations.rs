@@ -56,6 +56,9 @@ pub struct Application {
     pub(crate) blocking_operations: Arc<tokio::sync::Semaphore>,
     cmux_host_ancestry: Option<Arc<crate::supervisor::CmuxHostAncestry>>,
     synthetic_dispatch_for_tests: bool,
+    /// Set once this boot's first observation pass has discarded earlier candidates.
+    attention_baseline_reset: Arc<AtomicBool>,
+    attention_failure_reported: Arc<Mutex<Option<String>>>,
 }
 
 enum BrowserLaunchDispatch {
@@ -344,6 +347,8 @@ impl Application {
             blocking_operations: Arc::new(tokio::sync::Semaphore::new(MAX_BLOCKING_OPERATIONS)),
             cmux_host_ancestry,
             synthetic_dispatch_for_tests,
+            attention_baseline_reset: Arc::new(AtomicBool::new(false)),
+            attention_failure_reported: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -723,7 +728,48 @@ impl Application {
             .coordinator_lock
             .lock()
             .map_err(|_| anyhow!("coordinator mutex is poisoned"))?;
-        crate::coordinator::tick(self)
+        let ticked = crate::coordinator::tick(self);
+        self.observe_attention();
+        ticked
+    }
+
+    /// Classification bookkeeping outside the tick's one workflow action; its
+    /// failure is reported once per cause and never alters the tick's outcome.
+    fn observe_attention(&self) {
+        let fresh_boot = !self.attention_baseline_reset.load(Ordering::SeqCst);
+        let observed = self
+            .store
+            .require_execution_unheld("attention observation")
+            .and_then(|()| self.supervisor.process_snapshot())
+            .and_then(|processes| {
+                self.store
+                    .observe_attention(Utc::now(), &processes, fresh_boot)
+            });
+        let Ok(mut reported) = self.attention_failure_reported.lock() else {
+            tracing::warn!("attention observation failure state is poisoned");
+            return;
+        };
+        match observed {
+            Ok(()) => {
+                self.attention_baseline_reset.store(true, Ordering::SeqCst);
+                *reported = None;
+            }
+            Err(error) => {
+                let cause = format!("{error:#}");
+                if reported.as_deref() != Some(cause.as_str()) {
+                    tracing::warn!(error = %error, "attention observation deferred");
+                    let _ = self.diagnostics.record(
+                        "warn",
+                        "attention.observation",
+                        "attention_observation",
+                        "deferred",
+                        None,
+                        serde_json::json!({"cause":cause}),
+                    );
+                    *reported = Some(cause);
+                }
+            }
+        }
     }
 
     pub fn scheduled_intake_tick(

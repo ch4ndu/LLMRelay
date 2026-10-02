@@ -91,6 +91,15 @@
       "provider": "codex",
       "service_tier": null,
       "session": "retained"
+    },
+    "session-sol61-xhigh-write": {
+      "adapter": "direct-codex-cli",
+      "authority": "workspace-write",
+      "effort": "xhigh",
+      "model": "gpt-6.1-sol",
+      "provider": "codex",
+      "service_tier": null,
+      "session": "retained"
     }
   },
   "project_name": "LLMRelay",
@@ -105,7 +114,7 @@
       "profile": "session-fable-medium-fresh"
     },
     "implementer": {
-      "profile": "codex-terra-write-retained"
+      "profile": "session-sol61-xhigh-write"
     },
     "plan_reviewer": {
       "profile": "session-fable-high-read"

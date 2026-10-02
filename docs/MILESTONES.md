@@ -759,7 +759,11 @@ bounded app-owned H4 increment is complete. This is not completion of
 slice 1 or the full program. H2 automatic readiness, H11 attention timing, H12
 notification correlation and H4 provider-stated reset deadlines remain open;
 the local failure characterization did not produce qualifying runtime evidence.
-The H3/H15, H9/H16 and restore-point slices remain pending.
+H3/H15 durable anomaly and recurring-block attention is complete within the
+approved scope: focused checks, independent review, the full verification matrix
+and fresh final verification passed. Its conservative
+phase/exit limits are documented in [Operations](OPERATIONS.md#durable-attention-observations).
+The H9/H16 and restore-point slices remain pending.
 
 #### Agreed hardening list
 
@@ -807,17 +811,17 @@ The H3/H15, H9/H16 and restore-point slices remain pending.
 
 The user authorized purging the existing LLMRelay data and explicitly waived
 backup or restoration of that data for this work. No purge is required by the
-hardening implementation. Automatic pre-migration restore points remain outside
-this program; the recommendation below is retained for a future upgrade-policy
-decision, not as an outstanding permission request for the current task.
+hardening implementation. Verified pre-upgrade restore points, free-space checks
+and recovery were subsequently approved as the fourth deferred hardening slice. They remain pending;
+the current H3/H15 increment does not implement them or require a data purge.
 
 - **Fail-closed restore point and free-space preflight before the serve-path
-  schema upgrade.** `upgrade_supported_service_schema` (`src/store.rs:8955-8972`)
-  migrates the live database from schema 31 or 32 without a restore point;
+  schema upgrade.** `upgrade_supported_service_schema` in `src/store.rs`
+  migrates supported earlier schemas without a restore point;
   `require_capacity` is used only by backup and restore (`src/database.rs`).
   [Next milestone plan](NEXT_MILESTONE_PLAN.md) records that automatic
-  pre-migration backup orchestration was removed from scope. Both reviewers
-  recommend approving it: it reuses the existing verified online backup
+  pre-migration backup orchestration was removed from scope. This is now selected
+  for the fourth deferred slice: it reuses the existing verified online backup
   (`src/database.rs:203-270`) and, unlike Jinn's warn-only copy
   (`shared/db.ts:29-96`), must fail closed.
 
@@ -874,3 +878,9 @@ that any agent holding the service credential can pass.
 - [Operations, shutdown, and recovery](OPERATIONS.md)
 - [Project setup](PROJECT_SETUP.md)
 - [Research and implementation history](../RESEARCH_AND_PLAN.md)
+
+The H3/H15 review repairs preserve exact invocation targets, positive activity
+clearing and independent provider holds, isolate recoverable recurrence errors,
+and index report lookups. Focused verification, retained review recheck, the full
+matrix and fresh final verification passed. The matrix includes 61 frontend and
+311 Rust tests, with zero failures or ignored tests.

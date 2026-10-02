@@ -34108,8 +34108,9 @@ fn mb14_stale_exit_cannot_mutate_reserved_or_running_replacement_generation() {
 }
 
 /// Tables read directly or through helper decisions by `workflow::state`.
-const STATE_PROJECTED_TABLES: [&str; 69] = [
+const STATE_PROJECTED_TABLES: [&str; 70] = [
     "attempts",
+    "attention_observations",
     "audit_events",
     "capabilities",
     "check_runs",
@@ -34254,6 +34255,10 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
         .iter()
         .chain(STATE_UNPROJECTED_TABLES.iter())
     {
+        // Only open observations are projected; their cursor has its own test.
+        if *table == "attention_observations" {
+            continue;
+        }
         let projected = STATE_PROJECTED_TABLES.contains(table);
         let columns = connection
             .prepare(&format!("PRAGMA table_info({table})"))
@@ -34494,7 +34499,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 35_i64);
+    fixture.assert_scalar("PRAGMA user_version", 36_i64);
     fixture.assert_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%'",
         i64::try_from(triggers.len()).unwrap(),
@@ -34529,7 +34534,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 35_i64);
+    fixture.assert_scalar("PRAGMA user_version", 36_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -37488,6 +37493,10 @@ fn a_second_candidate_after_an_implementer_question_is_frozen_exactly_once() {
         &format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id),
         "needs_input".into(),
     );
+    fixture.assert_scalar::<i64>(
+        "SELECT recurrence_count FROM attention_observations WHERE kind='recurring_block'",
+        1,
+    );
     // Answered, the implementer reports its candidate twice (a replayed report).
     manager_report(
         &fixture,
@@ -37520,6 +37529,10 @@ fn a_second_candidate_after_an_implementer_question_is_frozen_exactly_once() {
     }
     let released = released.expect("the answered hold is released");
     assert_eq!(released["result_id"], second.as_str());
+    fixture.assert_scalar::<i64>(
+        "SELECT recurrence_count FROM attention_observations WHERE kind='recurring_block'",
+        1,
+    );
     fixture.assert_scalar::<String>(
         &format!(
             "SELECT json_extract(detail_json,'$.kind') || ':' || json_extract(detail_json,'$.superseded_by')
@@ -37635,6 +37648,44 @@ fn a_second_candidate_after_an_implementer_question_is_frozen_exactly_once() {
         "SELECT COUNT(*) FROM role_generations WHERE role='implementer'",
         1,
     );
+    fixture.assert_scalar::<i64>(
+        "SELECT recurrence_count FROM attention_observations WHERE kind='recurring_block'",
+        0,
+    );
+    fixture.assert_scalar::<String>("SELECT json_extract(reset_evidence_json,'$.progress_result_id') FROM attention_observations WHERE kind='recurring_block'", second.clone());
+    let original_snapshot =
+        fixture.scalar::<String>("SELECT id FROM snapshots WHERE kind='candidate'");
+    fixture.execute("UPDATE attempts SET phase='implementation',candidate_hash=NULL,status='running' WHERE id=?1", params![plan.attempt_id]);
+    fixture.execute("INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+        VALUES('question-again','question-again',?1,?2,'needs_input','same question','[]','{}',?3)",
+        params![session, implementer.role_generation_id, chrono::Utc::now().to_rfc3339()]);
+    assert_eq!(app.coordinator_tick().unwrap()["action"], "held");
+    fixture.assert_scalar::<i64>(
+        "SELECT recurrence_count FROM attention_observations WHERE kind='recurring_block'",
+        1,
+    );
+    fixture.execute("INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+        VALUES('same-content','same-content',?1,?2,'candidate_ready','same content','[]','{}',?3)",
+        params![session, implementer.role_generation_id, chrono::Utc::now().to_rfc3339()]);
+    assert_eq!(app.coordinator_tick().unwrap()["action"], "hold_superseded");
+    let reused = ReviewService::new(fixture.store.clone(), fixture.root.join("artifacts"))
+        .freeze(&plan.attempt_id, "candidate")
+        .unwrap();
+    assert_eq!(
+        reused["snapshot_id"].as_str(),
+        Some(original_snapshot.as_str())
+    );
+    app.coordinator_tick().unwrap();
+    fixture.assert_scalar::<i64>(
+        "SELECT recurrence_count FROM attention_observations WHERE kind='recurring_block'",
+        0,
+    );
+    fixture.assert_scalar::<String>("SELECT json_extract(reset_evidence_json,'$.progress_result_id') FROM attention_observations WHERE kind='recurring_block'", "same-content".into());
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM freeze_intents WHERE kind='candidate' AND state='complete'",
+        2,
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM snapshots WHERE kind='candidate'", 1);
     drop(app);
     let _ = std::fs::remove_dir_all(paths.socket_dir);
 }
@@ -37733,6 +37784,608 @@ fn only_the_newest_report_of_an_agent_can_hold_its_task() {
         .decisions
         .iter()
         .any(|decision| decision.reason_code == "workflow.blocked_result_available"));
+}
+
+#[test]
+fn h3h15_effective_block_consumption_counts_once_and_continue_preserves_history() {
+    let fixture = Fixture::new("attention-effective-episodes");
+    seed_attempt(&fixture, "planning");
+    seed_session(&fixture, "a", "manager", "g-manager", "s-manager", "exited");
+    make_effective(&fixture, "manager", "g-manager");
+    let app = synthetic_coordinator(&fixture);
+    let report = |id: &str| {
+        fixture.execute(
+            "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,
+            summary,evidence_json,metadata_json,created_at) VALUES(?1,?1,'s-manager','g-manager',
+            'blocked','same problem','[]','{}',?2)",
+            params![id, chrono::Utc::now().to_rfc3339()],
+        );
+    };
+    let count = || {
+        fixture.scalar::<i64>(
+            "SELECT recurrence_count FROM attention_observations WHERE kind='recurring_block'",
+        )
+    };
+    report("episode-1");
+    let first = app.coordinator_tick().unwrap();
+    assert_eq!(first["action"], "held", "{first}");
+    assert_eq!(count(), 1);
+    let observation_id = fixture
+        .scalar::<String>("SELECT id FROM attention_observations WHERE kind='recurring_block'");
+    assert!(fixture
+        .scalar::<Option<String>>("SELECT consumed_at FROM role_results WHERE id='episode-1'")
+        .is_some());
+    app.coordinator_tick().unwrap();
+    assert_eq!(count(), 1);
+    let continue_after_pause = |operation: &str| {
+        let episodes = count();
+        fixture.assert_scalar::<String>(
+            "SELECT a.status||':'||t.attention FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id='a'",
+            "needs_input:needs_input".into(),
+        );
+        for (action, response, state) in [
+            ("pause_now", "pause_now", "held:paused"),
+            ("continue", "continued", "running:none"),
+        ] {
+            let version = fixture.scalar::<i64>("SELECT version FROM tasks WHERE id='t'");
+            workflow::execute(
+                &fixture.store,
+                &HumanCommand::Control {
+                    operation_id: format!("{operation}-{action}"),
+                    task_id: "t".into(),
+                    expected_version: version,
+                    action: action.into(),
+                    payload: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+            let result = app.coordinator_tick().unwrap();
+            assert_eq!(result["action"], response, "{result}");
+            fixture.assert_scalar::<String>(
+                "SELECT a.status||':'||t.attention FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id='a'",
+                state.into(),
+            );
+            assert_eq!(count(), episodes, "{action} preserves episode history");
+        }
+    };
+    continue_after_pause("release-first");
+    assert_eq!(count(), 1);
+    report("episode-2");
+    assert_eq!(app.coordinator_tick().unwrap()["action"], "held");
+    assert_eq!(count(), 2);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM attention_observations WHERE kind='recurring_block' AND state='open'",
+        1,
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    let item = state
+        .attention
+        .iter()
+        .find(|item| item.id == "task:t:needs_input")
+        .unwrap();
+    assert!(item.reason.contains("at least twice"), "{}", item.reason);
+    assert!(matches!(&item.target, Some(AttentionTarget::Task(target)) if target.task_id == "t"));
+    assert_eq!(
+        state
+            .attention
+            .iter()
+            .filter(|item| item
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("Recurring blocked")))
+            .count(),
+        1
+    );
+    let observation_rows = || {
+        let connection = fixture.connection();
+        let mut statement = connection
+            .prepare("SELECT * FROM attention_observations ORDER BY id")
+            .unwrap();
+        let columns = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|column| row.get(column))
+                    .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows
+    };
+    fixture.assert_scalar::<String>(
+        "SELECT id||':'||state||':'||last_counted_result_id FROM attention_observations WHERE kind='recurring_block'",
+        format!("{observation_id}:open:episode-2"),
+    );
+    let observations = observation_rows();
+    let audits = fixture.scalar::<i64>("SELECT COUNT(*) FROM audit_events");
+    let decision_audits = fixture.scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='decision.explanation.changed'",
+    );
+    let revision = fixture.scalar::<i64>("SELECT revision FROM state_revision WHERE singleton=1");
+    // The new held decision's first audit advances the shared revision,
+    // independently of observation state.
+    app.coordinator_tick().unwrap();
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='decision.explanation.changed'",
+        decision_audits + 1,
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events", audits + 1);
+    fixture.assert_scalar::<i64>(
+        "SELECT revision FROM state_revision WHERE singleton=1",
+        revision + 1,
+    );
+    assert_eq!(count(), 2);
+    assert_eq!(observation_rows(), observations);
+    let settled_revision =
+        fixture.scalar::<i64>("SELECT revision FROM state_revision WHERE singleton=1");
+    for _ in 0..2 {
+        app.coordinator_tick().unwrap();
+        assert_eq!(count(), 2);
+        assert_eq!(observation_rows(), observations);
+        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events", audits + 1);
+        fixture.assert_scalar::<i64>(
+            "SELECT revision FROM state_revision WHERE singleton=1",
+            settled_revision,
+        );
+    }
+    continue_after_pause("release-second");
+    assert_eq!(count(), 2);
+    fixture.assert_scalar::<String>(
+        "SELECT id||':'||state||':'||last_counted_result_id||':'||resolution_reason FROM attention_observations WHERE kind='recurring_block'",
+        format!("{observation_id}:resolved:episode-2:block_ended"),
+    );
+    report("episode-3");
+    assert_eq!(app.coordinator_tick().unwrap()["action"], "held");
+    assert_eq!(count(), 2);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM attention_observations WHERE kind='recurring_block'",
+        1,
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT id||':'||state||':'||last_counted_result_id FROM attention_observations WHERE kind='recurring_block'",
+        format!("{observation_id}:open:episode-3"),
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM role_results WHERE outcome='blocked' AND consumed_at IS NOT NULL",
+        3,
+    );
+}
+
+#[test]
+fn h3h15_auxiliary_count_failure_preserves_effective_hold_and_catches_up_once() {
+    for (catchup, timing, fault) in [
+        ("observer", "BEFORE", "ABORT"),
+        ("observer_after_write", "AFTER", "FAIL"),
+        ("next_consumption", "BEFORE", "ABORT"),
+    ] {
+        let fixture = Fixture::new(&format!("attention-count-fault-{catchup}"));
+        seed_attempt(&fixture, "planning");
+        seed_session(&fixture, "a", "manager", "g-manager", "s-manager", "exited");
+        make_effective(&fixture, "manager", "g-manager");
+        let app = synthetic_coordinator(&fixture);
+        let report = |id: &str| {
+            fixture.execute(
+                "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,
+                summary,evidence_json,metadata_json,created_at)
+             VALUES(?1,?1,'s-manager','g-manager','blocked','same issue','[]','{}',?2)",
+                params![id, chrono::Utc::now().to_rfc3339()],
+            )
+        };
+        fixture.execute_batch(&format!("CREATE TRIGGER fail_attention_count {timing} INSERT ON attention_observations
+            WHEN NEW.kind='recurring_block' BEGIN SELECT RAISE({fault},'observation-only count fault'); END;"));
+        report("failed-count");
+        let first = app.coordinator_tick().unwrap();
+        assert_eq!(first["action"], "held", "{catchup}: {first}");
+        fixture.assert_scalar::<String>(
+            "SELECT a.status||':'||t.attention FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id='a'",
+            "needs_input:needs_input".into(),
+        );
+        fixture.assert_scalar::<i64>(
+            "SELECT COUNT(*) FROM audit_events hold JOIN role_results rr
+               ON rr.id=json_extract(hold.detail_json,'$.result_id')
+             WHERE hold.entity_kind='attempt' AND hold.entity_id='a' AND hold.event_code='attempt.attention.changed'
+               AND json_extract(hold.detail_json,'$.role_generation_id')=rr.role_generation_id
+               AND json_extract(hold.detail_json,'$.attention')='needs_input'
+               AND json_extract(hold.detail_json,'$.reason')='role_blocked'
+               AND rr.id='failed-count' AND rr.consumed_at=hold.created_at", 1,
+        );
+        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM role_generations", 1);
+        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM controls", 0);
+        fixture.assert_scalar::<i64>(
+            "SELECT COUNT(*) FROM attention_observations WHERE kind='recurring_block'",
+            0,
+        );
+        let expected_count = if catchup == "next_consumption" {
+            for (action, response) in [("pause_now", "pause_now"), ("continue", "continued")] {
+                workflow::execute(
+                    &fixture.store,
+                    &HumanCommand::Control {
+                        operation_id: format!("prepare-{action}"),
+                        task_id: "t".into(),
+                        expected_version: fixture
+                            .scalar::<i64>("SELECT version FROM tasks WHERE id='t'"),
+                        action: action.into(),
+                        payload: serde_json::json!({}),
+                    },
+                )
+                .unwrap();
+                let result = app.coordinator_tick().unwrap();
+                assert_eq!(result["action"], response, "{result}");
+                fixture.assert_scalar::<i64>(
+                    "SELECT COUNT(*) FROM attention_observations WHERE kind='recurring_block'",
+                    0,
+                );
+            }
+            fixture.execute_batch("DROP TRIGGER fail_attention_count;");
+            report("next-count");
+            let second = app.coordinator_tick().unwrap();
+            assert_eq!(second["action"], "held", "{second}");
+            fixture.assert_scalar::<String>(
+                "SELECT last_counted_result_id||':'||state FROM attention_observations WHERE kind='recurring_block'",
+                "next-count:open".into(),
+            );
+            2
+        } else {
+            fixture.execute_batch("DROP TRIGGER fail_attention_count;");
+            app.coordinator_tick().unwrap();
+            fixture.assert_scalar::<String>(
+                "SELECT last_counted_result_id||':'||state FROM attention_observations WHERE kind='recurring_block'",
+                "failed-count:candidate".into(),
+            );
+            1
+        };
+        fixture.assert_scalar::<i64>(
+            "SELECT recurrence_count FROM attention_observations WHERE kind='recurring_block'",
+            expected_count,
+        );
+        fixture.assert_scalar::<i64>(
+            "SELECT COUNT(*) FROM role_results WHERE outcome='blocked' AND consumed_at IS NOT NULL",
+            expected_count,
+        );
+        fixture.assert_scalar::<i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.attention.changed'
+               AND json_extract(detail_json,'$.reason')='role_blocked'
+               AND json_type(detail_json,'$.result_id')='text'",
+            expected_count,
+        );
+        let observation_rows = || {
+            let connection = fixture.connection();
+            let mut statement = connection
+                .prepare("SELECT * FROM attention_observations ORDER BY id")
+                .unwrap();
+            let columns = statement.column_count();
+            let rows = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get(column))
+                        .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        };
+        // The next classification can publish its changed decision; subsequent ticks are settled.
+        app.coordinator_tick().unwrap();
+        let observations = observation_rows();
+        let audits = fixture.scalar::<i64>("SELECT COUNT(*) FROM audit_events");
+        let revision =
+            fixture.scalar::<i64>("SELECT revision FROM state_revision WHERE singleton=1");
+        for _ in 0..2 {
+            app.coordinator_tick().unwrap();
+            assert_eq!(observation_rows(), observations);
+            fixture.assert_scalar::<i64>(
+                "SELECT recurrence_count FROM attention_observations WHERE kind='recurring_block'",
+                expected_count,
+            );
+            fixture.assert_scalar::<i64>(
+                "SELECT COUNT(*) FROM attention_observations WHERE kind='recurring_block'",
+                1,
+            );
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events", audits);
+            fixture.assert_scalar::<i64>(
+                "SELECT revision FROM state_revision WHERE singleton=1",
+                revision,
+            );
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM role_generations", 1);
+        }
+    }
+}
+
+#[test]
+fn h3h15_transaction_loss_is_not_treated_as_auxiliary_count_failure() {
+    let fixture = Fixture::new("attention-count-transaction-loss");
+    seed_attempt(&fixture, "planning");
+    seed_session(&fixture, "a", "manager", "g-manager", "s-manager", "exited");
+    make_effective(&fixture, "manager", "g-manager");
+    fixture.execute_batch("CREATE TRIGGER lose_attention_transaction BEFORE INSERT ON attention_observations
+        WHEN NEW.kind='recurring_block' BEGIN SELECT RAISE(ROLLBACK,'outer transaction lost'); END;
+        INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+        VALUES('lost-count','lost-count','s-manager','g-manager','blocked','blocked','[]','{}','2026-01-01T00:00:01Z');");
+    let app = synthetic_coordinator(&fixture);
+    let result = app.coordinator_tick().unwrap();
+    assert_eq!(result["action"], "coordinator_failure_held", "{result}");
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM recovery_records WHERE state='attention_required'",
+        1,
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM role_results WHERE consumed_at IS NOT NULL",
+        0,
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.attention.changed'
+           AND json_extract(detail_json,'$.result_id')='lost-count'",
+        0,
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM attention_observations WHERE kind='recurring_block'",
+        0,
+    );
+}
+
+#[test]
+fn h3h15_observer_failure_preserves_one_workflow_action_and_original_errors() {
+    let fixture = Fixture::new("attention-observer-fault");
+    seed_attempt(&fixture, "planning");
+    fixture.execute_batch("INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+        VALUES('cancel','a','cancel','requested',1,'{}','2026-01-01T00:00:01Z','2026-01-01T00:00:01Z');
+        ALTER TABLE attention_observations RENAME TO unavailable_observations;");
+    let app = synthetic_coordinator(&fixture);
+    let result = app.coordinator_tick().unwrap();
+    assert_eq!(result["action"], "cancel", "{result}");
+    assert_eq!(result["quiescent"], true, "{result}");
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='control.applied'",
+        1,
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM role_generations", 0);
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM controls WHERE id='cancel'",
+        "finished".into(),
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT a.status||':'||t.lifecycle FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id='a'",
+        "cancelled:cancelled".into(),
+    );
+    fixture.execute_batch("ALTER TABLE unavailable_observations RENAME TO attention_observations;");
+    app.coordinator_tick().unwrap();
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+    // A DB read failure in the tick also fails the observer. Its original error remains the result.
+    fixture.execute_batch("ALTER TABLE tasks RENAME TO unavailable_tasks;");
+    let original = agenticjira::coordinator::tick(&app)
+        .unwrap_err()
+        .to_string();
+    let observed = app.coordinator_tick().unwrap_err().to_string();
+    assert_eq!(observed, original);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='control.applied'",
+        1,
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM controls", 1);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM role_generations", 0);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+}
+
+#[test]
+fn h3h15_projection_merges_exact_old_sessions_and_folds_only_matching_sources() {
+    let fixture = Fixture::new("attention-old-session-projection");
+    seed_attempt(&fixture, "planning");
+    seed_session(
+        &fixture,
+        "a",
+        "manager",
+        "g-manager",
+        "old-exited",
+        "exited",
+    );
+    make_effective(&fixture, "manager", "g-manager");
+    fixture.execute_batch(r#"INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at,
+            written_at,delivery_session_id,delivery_transcript_epoch)
+        VALUES('old-guidance','a','g-manager','private guidance','written_awaiting_submit',
+            '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','old-exited','e');
+        INSERT INTO permission_requests(id,hook_invocation_nonce,connection_nonce,provider,project_id,task_id,
+            attempt_id,session_id,role_generation_id,role,service_boot_id,native_session_id,cwd,policy_fingerprint,
+            tool_name,input_digest,input_json,created_at,deadline_at,state,updated_at)
+        VALUES('old-permission','nonce','connection','codex','p','t','a','old-exited','g-manager','manager',
+            'boot','native','/tmp','policy','Read','digest','{}','2026-01-01T00:00:00Z','2999-01-01T00:00:00Z',
+            'pending','2026-01-01T00:00:00Z');
+        UPDATE tasks SET attention='needs_input'; UPDATE attempts SET status='needs_input';
+        INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
+        VALUES('blocked-report','blocked-report','old-exited','g-manager','blocked','blocked','[]','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+        INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+        VALUES('source-hold','source-hold','service','attempt.attention.changed','attempt','a',
+            '{"attention":"needs_input","reason":"role_blocked","result_id":"blocked-report","role_generation_id":"g-manager"}',
+            '2026-01-01T00:00:00Z');
+        INSERT INTO recovery_records(id,attempt_id,state,detail_json,created_at,updated_at)
+        VALUES('independent','a','attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');"#);
+    for index in 0..201 {
+        fixture.execute("INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,
+            transcript_epoch,created_at,updated_at) VALUES(?1,'g-manager','codex','exited','{}','fixture',?1,
+            '2026-10-01T00:00:00Z','2026-10-01T00:00:00Z')", params![format!("new-{index:03}")]);
+    }
+    let observe = |id: &str, kind: &str, entity: &str, source: &str| {
+        fixture.execute("INSERT INTO attention_observations(id,entity_kind,entity_key,kind,task_id,attempt_id,role,
+            lane_id,role_generation_id,session_id,transcript_epoch,source_id,state,evidence_fingerprint,evidence_json,
+            first_seen_at,last_seen_at,observed_since,opened_at,recurrence_count)
+            VALUES(?1,?2,?1,?3,'t','a','manager','default','g-manager','old-exited','e',?4,'open',?1,
+            ?5,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',2)",
+            params![id, entity, kind, source, serde_json::json!({"outcome":"blocked","written_at":"2026-01-01T00:00:00Z"}).to_string()]);
+    };
+    observe(
+        "guidance-observation",
+        "guidance_unaccepted",
+        "guidance_message",
+        "old-guidance",
+    );
+    observe(
+        "permission-observation",
+        "permission_on_exited_session",
+        "permission_request",
+        "old-permission",
+    );
+    observe(
+        "recurrence-observation",
+        "recurring_block",
+        "role_lane",
+        "blocked-report",
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    assert_eq!(state.active_sessions.len(), 201);
+    assert_eq!(state.active_sessions.last().unwrap()["id"], "old-exited");
+    assert_eq!(state.active_sessions[0]["id"], "new-000");
+    assert_eq!(
+        state
+            .active_sessions
+            .iter()
+            .filter(|session| session["id"] == "old-exited")
+            .count(),
+        1
+    );
+    let guidance = state
+        .attention
+        .iter()
+        .find(|item| item.id == "guidance_unaccepted:old-guidance")
+        .unwrap();
+    assert!(
+        matches!(&guidance.target, Some(AttentionTarget::Session { session_id, .. }) if session_id == "old-exited")
+    );
+    assert_eq!(
+        state
+            .attention
+            .iter()
+            .filter(|item| item.id.contains("old-guidance"))
+            .count(),
+        1
+    );
+    let permission = state
+        .attention
+        .iter()
+        .find(|item| item.id == "permission_request:old-permission")
+        .unwrap();
+    assert_eq!(permission.action.kind, AttentionActionKind::OpenAgentOutput);
+    assert!(
+        matches!(&permission.target, Some(AttentionTarget::Session { session_id, .. }) if session_id == "old-exited")
+    );
+    assert!(state
+        .attention
+        .iter()
+        .any(|item| item.id == "recovery_record:independent"));
+    assert!(state
+        .attention
+        .iter()
+        .find(|item| item.id == "task:t:needs_input")
+        .unwrap()
+        .reason
+        .contains("at least twice"));
+    assert!(!state
+        .attention
+        .iter()
+        .any(|item| item.id == "attention_observation:recurrence-observation"));
+    fixture.execute("UPDATE sessions SET transcript_epoch='resumed-epoch',status='running',exit_json=NULL WHERE id='old-exited'", []);
+    let replaced = workflow::state(&fixture.store).unwrap();
+    for id in ["guidance-observation", "permission-observation"] {
+        let item = replaced
+            .attention
+            .iter()
+            .find(|item| item.id == format!("attention_observation:{id}"))
+            .unwrap();
+        assert!(item.target.is_none());
+        assert!(item.reason.contains("Refresh"));
+    }
+    let replaced_permission = replaced
+        .attention
+        .iter()
+        .find(|item| item.id == "permission_request:old-permission")
+        .unwrap();
+    assert_eq!(
+        replaced_permission.action.kind,
+        AttentionActionKind::ReviewRequest
+    );
+    assert!(replaced
+        .attention
+        .iter()
+        .any(|item| item.id == "recovery_record:independent"));
+    fixture.execute("UPDATE sessions SET transcript_epoch='e',status='exited',exit_json='{}' WHERE id='old-exited'", []);
+    fixture.execute(
+        "DELETE FROM permission_requests WHERE id='old-permission'",
+        [],
+    );
+    let inaccessible = workflow::state(&fixture.store).unwrap();
+    let diagnostic = inaccessible
+        .attention
+        .iter()
+        .find(|item| item.id == "attention_observation:permission-observation")
+        .unwrap();
+    assert!(diagnostic.target.is_none());
+    assert!(diagnostic.reason.contains("Refresh"));
+    fixture.execute_batch("INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,
+        native_session_id,transcript_epoch,resume_count,capability_key,created_at,updated_at) VALUES('old-running','g-manager','codex','running',
+        '{}','fixture','native','e',1,'key','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z');
+        INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,launch_config_json,capability_key,
+            capability_identity_json,state,hook_event_boundary_rowid,created_at,updated_at)
+        VALUES('old-resume','old-running',1,'e','{}','key','{}','running',0,'2026-01-02T00:00:00Z','2026-01-02T00:00:00Z');
+        UPDATE guidance_messages SET delivery_session_id='old-running' WHERE id='old-guidance';
+        UPDATE attention_observations SET session_id='old-running' WHERE id='guidance-observation';");
+    observe(
+        "resume-observation",
+        "process_without_accepted_turn",
+        "session",
+        "old-resume",
+    );
+    fixture.execute(
+        "UPDATE attention_observations SET session_id='old-running' WHERE id='resume-observation'",
+        [],
+    );
+    let folded = workflow::state(&fixture.store).unwrap();
+    assert_eq!(folded.active_sessions.len(), 202);
+    assert_eq!(
+        folded
+            .attention
+            .iter()
+            .filter(|item| item.id == "guidance_unaccepted:old-guidance")
+            .count(),
+        1
+    );
+    assert!(!folded
+        .attention
+        .iter()
+        .any(|item| item.id == "resume_unaccepted:old-resume"));
+    let resumed = folded
+        .attention
+        .iter()
+        .find(|item| item.id == "attention_observation:resume-observation")
+        .unwrap();
+    assert!(
+        matches!(&resumed.target, Some(AttentionTarget::Session { session_id, .. }) if session_id == "old-running")
+    );
+    fixture.execute_batch("UPDATE sessions SET transcript_epoch='new-epoch',resume_count=2 WHERE id='old-running';
+        INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,prior_transcript_epoch,
+            launch_config_json,capability_key,capability_identity_json,state,hook_event_boundary_rowid,created_at,updated_at)
+        VALUES('new-resume','old-running',2,'new-epoch','e','{}','key','{}','running',0,
+            '2026-01-03T00:00:00Z','2026-01-03T00:00:00Z');");
+    let replaced = workflow::state(&fixture.store).unwrap();
+    for id in ["resume-observation", "guidance-observation"] {
+        let item = replaced
+            .attention
+            .iter()
+            .find(|item| item.id == format!("attention_observation:{id}"))
+            .unwrap();
+        assert!(item.target.is_none());
+        assert!(item.reason.contains("Refresh"));
+    }
+    assert!(replaced
+        .attention
+        .iter()
+        .any(|item| item.id == "resume_unaccepted:new-resume"));
+    assert!(replaced
+        .attention
+        .iter()
+        .any(|item| item.id == "recovery_record:independent"));
 }
 
 #[test]
@@ -40166,14 +40819,14 @@ fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordina
 #[test]
 fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
-    fixture.assert_scalar("PRAGMA user_version", 35_i64);
+    fixture.assert_scalar("PRAGMA user_version", 36_i64);
     let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
     fixture.execute_batch(&format!(
         "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; PRAGMA user_version=30;"
     ));
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 35_i64);
+    fixture.assert_scalar("PRAGMA user_version", 36_i64);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
@@ -40941,7 +41594,9 @@ fn stale_restart_candidate_cancellation_refuses_live_sessions_and_pending_admiss
 }
 
 const MIGRATION_031_SQL: &str = include_str!("../migrations/031_final_repair_recheck.sql");
-const DROP_AFTER_SCHEMA_32: &str = "DROP TABLE provider_failure_holds;
+const DROP_AFTER_SCHEMA_32: &str =
+    "DROP TABLE attention_observations; DROP INDEX role_results_session_generation;
+     DROP TABLE provider_failure_holds;
      DROP TRIGGER guidance_submitted_form_paired;
      DROP TRIGGER guidance_submitted_form_once;
      ALTER TABLE guidance_messages DROP COLUMN submitted_digest;
@@ -41044,7 +41699,7 @@ fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
     fixture.assert_scalar("PRAGMA user_version", 31_i64);
 
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 35_i64);
+    fixture.assert_scalar("PRAGMA user_version", 36_i64);
     assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(

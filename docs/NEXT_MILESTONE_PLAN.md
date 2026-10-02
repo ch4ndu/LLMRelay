@@ -341,3 +341,18 @@ increment is complete. The default cooldown does not implement
 provider reset parsing, and release never grants idle readiness. H2/H11/H12 and
 the remaining slices stay open. See [Milestones](MILESTONES.md#deferred-hardening-continuation-october-1)
 and the current [workflow behavior](WORKFLOWS.md).
+
+H3/H15 now delivers verified classify-only durable observations and bounded
+recurring-block attention. Focused checks, independent code review, the full
+verification matrix and fresh final verification passed. It uses the existing cycle and attention routes, with no automatic
+recovery, retry, readiness or lifecycle change. The approved thresholds and exact
+conservative scope are in [Workflows](WORKFLOWS.md) and
+[Operations](OPERATIONS.md#durable-attention-observations). H9/H16 and the verified
+pre-upgrade restore-point slice remain pending; the earlier removal of automatic
+backup orchestration described above is historical, superseded by the user's
+selection of that fourth slice.
+
+The H3/H15 review repairs preserve exact invocation targets, positive activity
+clearing and independent provider holds, isolate recoverable recurrence errors,
+and index report lookups. All verification gates for this increment passed;
+the broader deferred hardening program remains incomplete.

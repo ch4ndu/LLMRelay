@@ -5,7 +5,7 @@ use crate::domain::{
 };
 use crate::operations::Application;
 use crate::store::ProviderFailureHeld;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -666,6 +666,38 @@ struct AttemptDecision {
     explanation: DecisionExplanation,
     flow: AttemptDecisionFlow,
     advance: AttemptAdvance,
+}
+
+/// Running attempts whose current decision waits on a manager turn, which
+/// presupposes a live manager session. Every other selection is excluded.
+pub(crate) fn attempts_waiting_on_manager_turn(
+    connection: &Connection,
+) -> Result<std::collections::HashSet<String>> {
+    let mut statement = connection.prepare(
+        "SELECT a.id FROM attempts a JOIN tasks t ON t.id=a.task_id
+         WHERE a.status='running' AND t.archived_at IS NULL
+           AND a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=t.id
+                     ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)",
+    )?;
+    let current = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    let mut waiting = std::collections::HashSet::new();
+    for attempt in attempts_from_connection(connection, true)? {
+        if !current.contains(&attempt.id) {
+            continue;
+        }
+        if matches!(
+            evaluate_attempt(connection, &attempt)?.advance,
+            AttemptAdvance::Planning(
+                PlanningSelection::WaitForManagerPlan | PlanningSelection::WaitForManagerProposal
+            ) | AttemptAdvance::Implementation(ImplementationSelection::WaitForManagerTransition)
+                | AttemptAdvance::Handoff(HandoffSelection::WaitForManagerHandoff)
+        ) {
+            waiting.insert(attempt.id);
+        }
+    }
+    Ok(waiting)
 }
 
 pub(crate) fn read_only_decisions(connection: &Connection) -> Result<Vec<DecisionExplanation>> {
@@ -7751,7 +7783,7 @@ fn dispose_coordinator_failures(
 
 fn consume_blocked_result(app: &Application, attempt: &str) -> Result<Option<serde_json::Value>> {
     let mut connection = app.store.lock()?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let row = eligible_blocked_result(&transaction, attempt)?;
     if let Some((result_id, outcome, summary)) = row {
         let now = Utc::now().to_rfc3339();
@@ -7794,7 +7826,44 @@ fn consume_blocked_result(app: &Application, attempt: &str) -> Result<Option<ser
             "UPDATE role_results SET consumed_at=?1 WHERE id=?2",
             params![now, result_id],
         )?;
+        // Only recoverable auxiliary failures are isolated; transaction loss remains a workflow failure.
+        let count_error = {
+            let mut savepoint = transaction.savepoint_with_name("attention_episode")?;
+            savepoint.set_drop_behavior(rusqlite::DropBehavior::Ignore);
+            match crate::store::count_blocking_episode(&savepoint, &result_id, &now) {
+                Ok(()) => {
+                    savepoint
+                        .commit()
+                        .context("release attention episode savepoint")?;
+                    None
+                }
+                Err(error) => {
+                    if savepoint.is_autocommit() {
+                        return Err(error
+                            .context("attention episode failure lost the workflow transaction"));
+                    }
+                    savepoint
+                        .rollback()
+                        .with_context(|| format!("roll back attention episode after {error:#}"))?;
+                    savepoint.commit().with_context(|| {
+                        format!("release rolled back attention episode after {error:#}")
+                    })?;
+                    Some(error)
+                }
+            }
+        };
         transaction.commit()?;
+        if let Some(error) = count_error {
+            tracing::warn!(error = %error, result_id = %result_id, "attention episode count deferred after effective hold commit");
+            let _ = app.diagnostics.record(
+                "warn",
+                "attention.episode_count",
+                "attention_observation",
+                "deferred",
+                None,
+                serde_json::json!({"result_id":result_id,"cause":format!("{error:#}")}),
+            );
+        }
         return Ok(Some(
             serde_json::json!({"action":"held","hold_recorded":true,"reason":outcome,"summary":summary}),
         ));
