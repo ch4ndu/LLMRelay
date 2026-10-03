@@ -29217,7 +29217,7 @@ fn native_turn_failure_is_bound_to_the_newest_accepted_turn() {
         .unwrap();
     assert_eq!(
         item.reason,
-        "The provider ended the agent's turn (the provider could not authenticate the session). The session is still open, and nothing was retried or switched to another model. Sign this computer in to the provider again, then continue the agent from its output."
+        "The provider ended the agent's turn (the provider could not authenticate the session). The session is still open. LLMRelay does not retry or switch models in response to this notice. Sign this computer in to the provider again, then continue the agent from its output."
     );
 }
 
@@ -29378,6 +29378,181 @@ fn native_prompt_is_a_current_turn_output_wait_only() {
         ));
     }
     assert_eq!(fixture.scalar::<String>(workflow_facts), before);
+}
+
+#[test]
+fn native_prompt_dismissal_is_durable_frontier_bound_and_presentation_only() {
+    use agenticjira::domain::NativePromptDismissal;
+    use serde_json::json;
+    let (fixture, context, native, workspace) =
+        trusted_implementer_hooks_fixture("native-prompt-dismissal", Provider::Claude);
+    fixture.execute("INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+        VALUES('setting','t','implementer',1,'{}','generation','2026-01-01T00:00:00Z')", []);
+    let hook = |event: &str, payload: serde_json::Value| {
+        record_trusted_hook(&fixture, &context, &native, &workspace, event, payload)
+    };
+    let notify = |turn: &str| {
+        hook(
+            "Notification",
+            json!({"notification_type":"agent_needs_input","prompt_id":turn}),
+        )
+    };
+    let prompt = |store: &Store| {
+        workflow::state(store)
+            .unwrap()
+            .active_sessions
+            .into_iter()
+            .find(|s| s["id"] == "session")
+            .unwrap()["native_prompt"]
+            .clone()
+    };
+    let command = |id: &str, binding: NativePromptDismissal| HumanCommand::DismissNativePrompt {
+        operation_id: id.into(),
+        binding,
+    };
+    let binding = || {
+        serde_json::from_value::<NativePromptDismissal>(prompt(&fixture.store)["dismissal"].clone())
+            .unwrap()
+    };
+    hook("SessionStart", json!({}));
+    hook(
+        "UserPromptSubmit",
+        json!({"prompt":"implement","prompt_id":"turn-1"}),
+    );
+    let mut permission_request = permission_payload(
+        &native,
+        "dismiss-permission",
+        json!({"command":"true"}),
+        Some(json!(workspace)),
+    );
+    permission_request["tool_name"] = json!("Bash");
+    let permission = match agenticjira::permissions::begin_request(
+        &fixture.store,
+        &context,
+        &permission_request,
+        "boot",
+        "dismiss-connection",
+    )
+    .unwrap()
+    {
+        agenticjira::permissions::BridgeStart::Pending { request_id } => request_id,
+        agenticjira::permissions::BridgeStart::Immediate(response) => {
+            panic!("expected pending permission request, got {response}")
+        }
+    };
+    let first = notify("turn-1");
+    let second = notify("turn-1");
+    let displayed = binding();
+    assert_eq!(
+        displayed.displayed_boundary_hook_event_id,
+        second["hook_event_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        prompt(&fixture.store)["hook_event_id"],
+        first["hook_event_id"]
+    );
+    let effects = "SELECT
+        (SELECT lifecycle||':'||attention||':'||version FROM tasks WHERE id='t')||'|'||
+        (SELECT phase||':'||status FROM attempts WHERE id='a')||'|'||
+        (SELECT status||':'||readiness_state||':'||COALESCE(interrupt_requested_at,'')||':'||resume_count FROM sessions WHERE id='session')||'|'||
+        (SELECT COUNT(*) FROM role_results)||'|'||(SELECT COUNT(*) FROM controls)||'|'||
+        (SELECT COUNT(*) FROM input_leases)||'|'||(SELECT COUNT(*) FROM launch_permits)||'|'||
+        (SELECT COUNT(*)||':'||COALESCE(SUM(spent),0) FROM review_budgets)||'|'||
+        (SELECT COUNT(*) FROM review_requests)||'|'||(SELECT COUNT(*) FROM permission_native_resolutions)||'|'||
+        (SELECT group_concat(state||':'||delivery_state||':'||COALESCE(decision_kind,'')) FROM permission_requests)";
+    let before = fixture.scalar::<String>(effects);
+    let mut stale = displayed.clone();
+    stale.transcript_epoch = "different-epoch".into();
+    assert!(workflow::execute(&fixture.store, &command("stale-epoch", stale)).is_err());
+    let mut wrong_boundary = displayed.clone();
+    wrong_boundary.displayed_boundary_hook_event_id =
+        displayed.accepted_hook_event_id.clone().unwrap();
+    assert!(workflow::execute(&fixture.store, &command("wrong-boundary", wrong_boundary)).is_err());
+    let untrusted = record_trusted_hook(
+        &fixture,
+        &context,
+        &native,
+        "/",
+        "Notification",
+        json!({"notification_type":"agent_needs_input","prompt_id":"turn-1"}),
+    );
+    let mut untrusted_boundary = displayed.clone();
+    untrusted_boundary.displayed_boundary_hook_event_id =
+        untrusted["hook_event_id"].as_str().unwrap().into();
+    assert!(workflow::execute(
+        &fixture.store,
+        &command("untrusted-boundary", untrusted_boundary)
+    )
+    .is_err());
+    let concurrent = notify("turn-1");
+    let dismiss_displayed = command("dismiss-displayed", displayed.clone());
+    assert_eq!(
+        workflow::execute(&fixture.store, &dismiss_displayed)
+            .unwrap()
+            .state,
+        "native_prompt_dismissed"
+    );
+    assert_eq!(
+        prompt(&fixture.store)["hook_event_id"],
+        concurrent["hook_event_id"]
+    );
+    assert_eq!(prompt(&fixture.store)["dismissed"], false);
+    let current = binding();
+    assert!(workflow::execute(
+        &fixture.store,
+        &command("dismiss-displayed", current.clone())
+    )
+    .is_err());
+    let dismiss_all = command("dismiss-current", current.clone());
+    workflow::execute(&fixture.store, &dismiss_all).unwrap();
+    workflow::execute(&fixture.store, &dismiss_all).unwrap();
+    assert_eq!(prompt(&fixture.store)["dismissed"], true);
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='session.native_prompt.dismissed'",
+        2_i64,
+    );
+    assert_eq!(fixture.scalar::<String>(effects), before);
+    fixture.execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<501)
+        INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+        SELECT 'unrelated-dismiss-'||x,'unrelated-dismiss-'||x,'service','unrelated','task','t','{}','2999-01-01T00:00:00Z' FROM n;");
+    let reopened = Store::open(&fixture.database).unwrap();
+    let state = workflow::state(&reopened).unwrap();
+    assert_eq!(prompt(&reopened)["dismissed"], true);
+    assert!(state
+        .attention
+        .iter()
+        .all(|item| !item.id.starts_with("native_prompt:")));
+    assert!(state
+        .permission_requests
+        .iter()
+        .any(|request| request.id == permission
+            && request.actionable
+            && request.native_resolution.is_none()));
+    assert!(
+        state
+            .tasks
+            .iter()
+            .find(|task| task.id == "t")
+            .unwrap()
+            .permission_waiting
+    );
+    assert_eq!(
+        workflow::execute(&reopened, &dismiss_all).unwrap().state,
+        "native_prompt_dismissed"
+    );
+    let later = notify("turn-1");
+    assert_eq!(prompt(&reopened)["hook_event_id"], later["hook_event_id"]);
+    assert_eq!(prompt(&reopened)["dismissed"], false);
+    workflow::execute(&fixture.store, &dismiss_all).unwrap();
+    assert_eq!(prompt(&reopened)["hook_event_id"], later["hook_event_id"]);
+    hook(
+        "UserPromptSubmit",
+        json!({"prompt":"continue","prompt_id":"turn-2"}),
+    );
+    let newest = notify("turn-2");
+    assert!(workflow::execute(&fixture.store, &command("stale-turn", current)).is_err());
+    assert_eq!(prompt(&reopened)["hook_event_id"], newest["hook_event_id"]);
+    assert_eq!(prompt(&reopened)["dismissed"], false);
 }
 
 fn provider_hold_id(response: &serde_json::Value) -> Option<String> {
@@ -33999,10 +34174,22 @@ fn mb14_stale_exit_cannot_mutate_reserved_or_running_replacement_generation() {
     let old_process = serde_json::json!({
         "pid":101,"process_group_id":101,"native_start_marker":"old-start","observed_started_at":"2026-01-01T00:00:01Z"
     }).to_string();
+    fixture.execute_batch(
+        "UPDATE tasks SET lifecycle='validation',attention='paused' WHERE id='t';
+         UPDATE attempts SET status='held' WHERE id='a';",
+    );
     fixture
         .store
         .reserve_role_resume("mb14-session", "mb14-new-epoch", &launch, "mb14-new-token")
         .unwrap();
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM resume_invocations WHERE session_id='mb14-session'",
+        1,
+    );
+    fixture.execute_batch(
+        "UPDATE tasks SET lifecycle='in_progress',attention='none' WHERE id='t';
+         UPDATE attempts SET status='running' WHERE id='a';",
+    );
     assert!(!fixture
         .store
         .update_session_exit(

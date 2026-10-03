@@ -1787,6 +1787,96 @@ impl Supervisor {
         Ok(InterruptOutcome::Requested)
     }
 
+    pub(crate) fn stop_failed_session(
+        &self,
+        command: &crate::domain::HumanCommand,
+    ) -> Result<crate::domain::OperationResult> {
+        let crate::domain::HumanCommand::StopFailedSession { binding, .. } = command else {
+            bail!("expected a failed-session stop command")
+        };
+        let request_hash = crate::store::json_hash(command)?;
+        if let Some(receipt) = self.store.operation_receipt(
+            command.operation_id(),
+            "human_control",
+            "human_command",
+            &request_hash,
+        )? {
+            return Ok(serde_json::from_value(receipt)?);
+        }
+        let handle = match self.handle(&binding.session_id) {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some(receipt) = self.store.operation_receipt(
+                    command.operation_id(),
+                    "human_control",
+                    "human_command",
+                    &request_hash,
+                )? {
+                    return Ok(serde_json::from_value(receipt)?);
+                }
+                return Err(error);
+            }
+        };
+        let mut first_stop = handle
+            .first_stop_requested_at
+            .lock()
+            .map_err(|_| anyhow!("session stop-state lock poisoned"))?;
+        if let Some(receipt) = self.store.operation_receipt(
+            command.operation_id(),
+            "human_control",
+            "human_command",
+            &request_hash,
+        )? {
+            return Ok(serde_json::from_value(receipt)?);
+        }
+        if handle.role_generation_id != binding.role_generation_id
+            || handle.transcript_epoch != binding.transcript_epoch
+            || handle.process != binding.process_identity
+        {
+            bail!("The managed session changed. Refresh before choosing how to continue.")
+        }
+        self.verify_process(&handle)?;
+        let (mut result, reserved) = self.store.reserve_failed_session_stop(command)?;
+        if !reserved {
+            return Ok(result);
+        }
+        let mut reserved_result = result.clone();
+        if first_stop.is_some() {
+            result.state = "stop_already_requested".into();
+            result.detail["message"] = serde_json::json!("A stop was already requested. Checking its exit; task advancement stays paused until Continue or Run next.");
+        } else {
+            // A durable reservation is never replayed into another signal, even if delivery is uncertain.
+            *first_stop = Some(std::time::Instant::now());
+            let delivered = self.verify_process(&handle).and_then(|()| {
+                if unsafe { libc::kill(-handle.process.process_group_id, libc::SIGINT) } != 0 {
+                    return Err(std::io::Error::last_os_error()).context("signal failed session");
+                }
+                Ok(())
+            });
+            match delivered {
+                Ok(()) => {
+                    result.state = "stop_requested".into();
+                    result.detail["message"] = serde_json::json!("Stop requested for this session. Checking its exit; other active agents may finish. Task advancement stays paused until Continue or Run next.");
+                }
+                Err(error) => {
+                    result.detail["technical_details"] = serde_json::json!(format!("{error:#}")
+                        .chars()
+                        .take(2048)
+                        .collect::<String>());
+                }
+            }
+        }
+        if let Err(error) = self.store.finish_failed_session_stop(&result) {
+            reserved_result.detail["technical_details"] =
+                serde_json::json!(format!("Could not record the stop outcome: {error:#}")
+                    .chars()
+                    .take(2048)
+                    .collect::<String>());
+            return Ok(reserved_result);
+        }
+        Ok(result)
+    }
+
     pub(crate) fn retry_graceful_stop_exact(&self, session_id: &str) -> Result<()> {
         self.store.mark_interrupt_requested(session_id)?;
         if let Ok(handle) = self.handle(session_id) {
@@ -3483,6 +3573,688 @@ mod tests {
         assert_eq!(kill_count.load(std::sync::atomic::Ordering::SeqCst), 0);
         drop(app);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_session_stop_signals_once_and_requires_applied_continuation() {
+        use crate::domain::HumanCommand;
+        use rusqlite::params;
+        use serde_json::json;
+        use std::sync::mpsc;
+        thread_local! {
+            static RESERVATION_GATE: std::cell::RefCell<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+        }
+        struct ProcessGroups(Vec<i32>);
+        impl Drop for ProcessGroups {
+            fn drop(&mut self) {
+                for group in &self.0 {
+                    unsafe {
+                        libc::kill(-*group, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        for mode in [
+            "clean",
+            "deadline",
+            "validation",
+            "reserved_only",
+            "finalization_failure",
+            "concurrent_exit",
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "llmrelay-failure-stop-{mode}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let paths = crate::config::InstancePaths::resolve(Some(root.clone())).unwrap();
+            paths.create().unwrap();
+            let store = Store::open(&paths.database).unwrap();
+            let app = crate::operations::Application::new(
+                paths,
+                store.clone(),
+                std::env::current_exe().unwrap(),
+            )
+            .unwrap();
+            store.lock().unwrap().execute_batch(
+                "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+                   VALUES('p','Project','/tmp/project','identity','base','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO tasks(id,project_id,title,description,acceptance_criteria_json,lifecycle,attention,created_at,updated_at)
+                   VALUES('t','p','Task','Task','[]','in_progress','none','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+                   VALUES('a','t','context','implementation','base',1,'running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO claims(id,task_id,attempt_id,repository_identity,state,created_at,updated_at)
+                   VALUES('claim','t','a','identity','running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');"
+            ).unwrap();
+            if mode == "validation" {
+                store
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE tasks SET lifecycle='validation'", [])
+                    .unwrap();
+            }
+            let mut groups = ProcessGroups(Vec::new());
+            for (session, generation, role) in
+                [("s", "g", "manager"), ("other", "g-other", "implementer")]
+            {
+                let pty = native_pty_system().openpty(PtySize::default()).unwrap();
+                let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+                command.args(["-c", "trap 'printf x >> \"$1\"' INT; : > \"$3\"; while [ ! -e \"$2\" ]; do :; done; exit 0", "fixture"]);
+                command.arg(root.join(format!("{session}.signals")));
+                command.arg(root.join(format!("{session}.exit")));
+                command.arg(root.join(format!("{session}.ready")));
+                let child = pty.slave.spawn_command(command).unwrap();
+                let pid = child.process_id().unwrap();
+                let group = unsafe { libc::getpgid(pid as libc::pid_t) };
+                assert_eq!(group, pid as i32);
+                groups.0.push(group);
+                let process = ProcessIdentity {
+                    pid,
+                    process_group_id: group,
+                    native_start_marker: native_start_marker(pid).unwrap(),
+                    observed_started_at: Utc::now().to_rfc3339(),
+                };
+                let anchor = ProcessGenerationAnchor {
+                    pid,
+                    process_group_id: group,
+                    native_start_marker: process.native_start_marker.clone(),
+                    boot_identity: system_boot_identity().unwrap(),
+                };
+                let connection = store.lock().unwrap();
+                connection.execute("INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+                     VALUES(?1,'a',?2,'claude',1,1,'running','authority','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", params![generation, role]).unwrap();
+                connection.execute("INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+                     VALUES(?1,'t',?2,1,'{}',?1,'2026-01-01T00:00:00Z')", params![generation, role]).unwrap();
+                connection.execute("INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at)
+                     VALUES(?1,?1,?2,'[]','2026-01-01T00:00:00Z')", params![generation, crate::auth::hash_secret(generation)]).unwrap();
+                connection.execute("INSERT INTO sessions(id,role_generation_id,provider,status,launch_state,launch_config_json,executable_version,
+                     native_session_id,transcript_epoch,readiness_state,process_identity_json,recovery_anchor_json,launch_boot_identity,
+                     recovery_root_pid,recovery_process_group_id,created_at,updated_at)
+                     VALUES(?1,?2,'claude','running','started','{}','fixture',?1,'epoch','busy',?3,?4,?5,?6,?7,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                     params![session, generation, serde_json::to_string(&process).unwrap(), serde_json::to_string(&anchor).unwrap(),anchor.boot_identity,pid,group]).unwrap();
+                connection.execute("INSERT INTO permission_requests(id,hook_invocation_nonce,connection_nonce,provider,
+                     project_id,task_id,attempt_id,session_id,role_generation_id,role,service_boot_id,native_session_id,
+                     cwd,policy_fingerprint,tool_name,input_digest,input_json,created_at,deadline_at,state,updated_at)
+                     VALUES(?1,?1,?1,'claude','p','t','a',?1,?2,?3,'boot',?1,'/tmp/project','policy','Read','digest','{}',
+                       '2026-01-01T00:00:00Z','2999-01-01T00:00:00Z','pending','2026-01-01T00:00:00Z')",
+                     params![session, generation, role]).unwrap();
+                drop(connection);
+                app.supervisor.sessions.write().unwrap().insert(
+                    session.into(),
+                    Arc::new(SessionHandle {
+                        session_id: session.into(),
+                        role_generation_id: generation.into(),
+                        transcript_epoch: "epoch".into(),
+                        process: process.clone(),
+                        group_leader: anchor,
+                        child: Mutex::new(child),
+                        input: Mutex::new(pty.master.take_writer().unwrap()),
+                        io_boundary: Mutex::new(()),
+                        known_members: Mutex::new(HashMap::from([(
+                            pid,
+                            process.native_start_marker,
+                        )])),
+                        first_stop_requested_at: Mutex::new(None),
+                        codex_helper_image: None,
+                        codex_helper_identity: Mutex::new(None),
+                        _master: Mutex::new(pty.master),
+                    }),
+                );
+                for _ in 0..200 {
+                    if root.join(format!("{session}.ready")).exists() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert!(root.join(format!("{session}.ready")).exists());
+            }
+            let hook = |id: &str, event: &str| {
+                store.lock().unwrap().execute(
+                    "INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,payload_json,
+                       peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+                     VALUES(?1,'s','g','claude',?2,'s','{\"error\":\"overloaded\"}',1,1,'fixture','managed_process_group_untrusted_payload',?3)",
+                    params![id,event,Utc::now().to_rfc3339()],
+                ).unwrap();
+            };
+            hook("start", "SessionStart");
+            hook("turn", "UserPromptSubmit");
+            hook("failed", "StopFailure");
+            let binding = || {
+                let connection = store.lock().unwrap();
+                crate::workflow::failed_session_stop_binding(&connection, "s")
+                    .unwrap()
+                    .unwrap()
+            };
+            let stale = binding();
+            hook("new-turn", "UserPromptSubmit");
+            let stale_command = HumanCommand::StopFailedSession {
+                operation_id: "stale".into(),
+                binding: stale,
+            };
+            assert!(app.execute_human_command(&stale_command).is_err());
+            hook("new-failure", "StopFailure");
+            let mut wrong = binding();
+            wrong
+                .process_identity
+                .native_start_marker
+                .push_str("-wrong");
+            assert!(app
+                .execute_human_command(&HumanCommand::StopFailedSession {
+                    operation_id: "wrong".into(),
+                    binding: wrong
+                })
+                .is_err());
+            store.lock().unwrap().execute("INSERT INTO provider_failure_holds(id,attempt_id,role_generation_id,session_id,transcript_epoch,
+                 accepted_hook_event_id,failure_hook_event_id,failure_kind,attribution,created_at,expires_at,state)
+                 VALUES('hold','a','g','s','epoch','new-turn','new-failure','overloaded','arrival_order','2026-01-01T00:00:00Z','9999-01-01','active')", []).unwrap();
+            let command = HumanCommand::StopFailedSession {
+                operation_id: "stop".into(),
+                binding: binding(),
+            };
+            assert!(crate::workflow::execute(&store, &command).is_err());
+            assert!(!root.join("s.signals").exists());
+            let count = |sql: &str| {
+                store
+                    .lock()
+                    .unwrap()
+                    .query_row(sql, [], |row| row.get::<_, i64>(0))
+                    .unwrap()
+            };
+            assert_eq!(count("SELECT COUNT(*) FROM controls"), 0);
+            let other_process =
+                serde_json::to_string(&app.supervisor.handle("other").unwrap().process).unwrap();
+            store.lock().unwrap().execute("INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,
+                 delivery_session_id,delivery_transcript_epoch,created_at)
+                 VALUES('pending-guidance','a','g-other','current input','delivery_reserved','other','epoch','2026-01-01T00:00:00Z')", []).unwrap();
+            store
+                .acquire_input_lease_for(
+                    InputLeasePurpose::AutomatedGuidance,
+                    "other",
+                    "prior-lease",
+                    "guidance:pending-guidance",
+                    &other_process,
+                    "g-other",
+                    "2999-01-01T00:00:00Z",
+                )
+                .unwrap();
+            store
+                .verify_input_lease("other", "prior-lease", &other_process, "g-other")
+                .unwrap();
+            if mode == "clean" {
+                store.lock().unwrap().execute_batch("CREATE TEMP TRIGGER refuse_failure_stop BEFORE INSERT ON operation_receipts
+                    WHEN NEW.operation_id='stop' BEGIN SELECT RAISE(ABORT,'fixture receipt failure'); END;").unwrap();
+                assert!(app.execute_human_command(&command).is_err());
+                assert_eq!(count("SELECT COUNT(*) FROM controls"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM sessions WHERE id='s' AND status='running' AND interrupt_requested_at IS NULL"), 1);
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM role_credentials WHERE id='g' AND revoked_at IS NULL"
+                    ),
+                    1
+                );
+                assert_eq!(count("SELECT COUNT(*) FROM permission_requests WHERE id='s' AND state='pending' AND delivery_state='not_reserved'"), 1);
+                assert!(!root.join("s.signals").exists());
+                store
+                    .lock()
+                    .unwrap()
+                    .execute_batch("DROP TRIGGER refuse_failure_stop;")
+                    .unwrap();
+            }
+            if mode == "concurrent_exit" {
+                let duplicate = Supervisor {
+                    store: Store::open(&app.paths.database).unwrap(),
+                    ..app.supervisor.clone()
+                };
+                let blocker = rusqlite::Connection::open(&app.paths.database).unwrap();
+                blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+                store
+                    .lock()
+                    .unwrap()
+                    .busy_handler(Some(|_| {
+                        RESERVATION_GATE.with(|gate| match gate.borrow_mut().take() {
+                            Some((blocked, release)) => {
+                                blocked.send(()).is_ok()
+                                    && release
+                                        .recv_timeout(std::time::Duration::from_secs(10))
+                                        .is_ok()
+                            }
+                            None => false,
+                        })
+                    }))
+                    .unwrap();
+                let handle = app.supervisor.handle("s").unwrap();
+                let (winning, losing) = std::thread::scope(|scope| {
+                    let (blocked_tx, blocked_rx) = mpsc::sync_channel(0);
+                    let (release_tx, release_rx) = mpsc::sync_channel(0);
+                    let application = &app;
+                    let request = &command;
+                    let winner = scope.spawn(move || {
+                        RESERVATION_GATE
+                            .with(|gate| *gate.borrow_mut() = Some((blocked_tx, release_rx)));
+                        application.execute_human_command(request)
+                    });
+                    blocked_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                    assert!(handle.first_stop_requested_at.try_lock().is_err());
+                    assert!(duplicate
+                        .store
+                        .operation_receipt(
+                            command.operation_id(),
+                            "human_control",
+                            "human_command",
+                            &crate::store::json_hash(&command).unwrap(),
+                        )
+                        .unwrap()
+                        .is_none());
+                    let references = Arc::strong_count(&handle);
+                    let loser = scope.spawn(|| duplicate.stop_failed_session(&command));
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    // The extra handle reference proves the duplicate finished its first receipt read before reservation.
+                    while Arc::strong_count(&handle) == references {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "duplicate never passed its initial receipt lookup"
+                        );
+                        std::thread::yield_now();
+                    }
+                    assert_eq!(Arc::strong_count(&handle), references + 1);
+                    std::fs::write(root.join("s.exit"), b"").unwrap();
+                    handle.child.lock().unwrap().wait().unwrap();
+                    assert!(app.supervisor.verify_process(&handle).is_err());
+                    blocker.execute_batch("ROLLBACK;").unwrap();
+                    release_tx.send(()).unwrap();
+                    (
+                        winner.join().unwrap().unwrap(),
+                        loser.join().unwrap().unwrap(),
+                    )
+                });
+                store.lock().unwrap().busy_handler(None).unwrap();
+                assert_eq!(winning.state, "stop_recovery_required");
+                assert_eq!(
+                    serde_json::to_value(&losing).unwrap(),
+                    serde_json::to_value(&winning).unwrap()
+                );
+                assert_eq!(
+                    count("SELECT COUNT(*) FROM operation_receipts WHERE operation_id='stop'"),
+                    1
+                );
+                assert_eq!(count("SELECT COUNT(*) FROM controls WHERE kind='pause_after_role' AND state='requested'"), 1);
+                assert_eq!(
+                    count("SELECT COUNT(*) FROM tasks WHERE attention='pause_requested'"),
+                    1
+                );
+                app.supervisor.sessions.write().unwrap().remove("s");
+                assert_eq!(
+                    serde_json::to_value(app.execute_human_command(&command).unwrap()).unwrap(),
+                    serde_json::to_value(&winning).unwrap()
+                );
+                let mut changed_request = command.clone();
+                if let HumanCommand::StopFailedSession { binding, .. } = &mut changed_request {
+                    binding.failure_hook_event_id = "different-failure".into();
+                }
+                assert!(app.execute_human_command(&changed_request).is_err());
+                assert!(!root.join("s.signals").exists());
+                assert!(!root.join("other.signals").exists());
+                drop(app);
+                drop(groups);
+                std::fs::remove_dir_all(root).unwrap();
+                continue;
+            }
+            if mode == "finalization_failure" {
+                let diagnostic = "fixture finalization failure ".repeat(100);
+                store.lock().unwrap().execute_batch(&format!(
+                    "CREATE TEMP TRIGGER refuse_failure_stop_finalization BEFORE INSERT ON audit_events
+                     WHEN NEW.event_code='session.failure_stop.signal_outcome'
+                     BEGIN SELECT RAISE(ABORT,'{diagnostic}'); END;"
+                )).unwrap();
+            }
+            if mode == "reserved_only" {
+                assert!(store.reserve_failed_session_stop(&command).unwrap().1);
+            }
+            let stopped = app.execute_human_command(&command).unwrap();
+            assert_eq!(
+                stopped.state,
+                if matches!(mode, "reserved_only" | "finalization_failure") {
+                    "stop_recovery_required"
+                } else {
+                    "stop_requested"
+                }
+            );
+            let conservative_receipt = if mode == "finalization_failure" {
+                let diagnostic = stopped.detail["technical_details"].as_str().unwrap();
+                assert!(diagnostic.contains("fixture finalization failure"));
+                assert_eq!(diagnostic.chars().count(), 2048);
+                let receipt = store
+                    .operation_receipt(
+                        command.operation_id(),
+                        "human_control",
+                        "human_command",
+                        &crate::store::json_hash(&command).unwrap(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let mut original = serde_json::to_value(&stopped).unwrap();
+                original["detail"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("technical_details");
+                assert_eq!(receipt, original);
+                assert_eq!(count("SELECT COUNT(*) FROM audit_events WHERE event_code='session.failure_stop.signal_outcome'"), 0);
+                assert_eq!(
+                    count("SELECT COUNT(*) FROM tasks WHERE attention='pause_requested'"),
+                    1
+                );
+                store
+                    .lock()
+                    .unwrap()
+                    .execute_batch("DROP TRIGGER refuse_failure_stop_finalization;")
+                    .unwrap();
+                Some(receipt)
+            } else {
+                None
+            };
+            for _ in 0..200 {
+                if mode == "reserved_only" || root.join("s.signals").exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            app.supervisor
+                .fail_process_inventory_for_tests(Some("replay must not inventory"));
+            assert_eq!(
+                app.execute_human_command(&command).unwrap().state,
+                stopped.state
+            );
+            app.supervisor.fail_process_inventory_for_tests(None);
+            if let Some(receipt) = conservative_receipt {
+                assert_eq!(
+                    store
+                        .operation_receipt(
+                            command.operation_id(),
+                            "human_control",
+                            "human_command",
+                            &crate::store::json_hash(&command).unwrap(),
+                        )
+                        .unwrap()
+                        .unwrap(),
+                    receipt
+                );
+                assert_eq!(count("SELECT COUNT(*) FROM audit_events WHERE event_code='session.failure_stop.signal_outcome'"), 0);
+            }
+            let mut changed_request = command.clone();
+            if let HumanCommand::StopFailedSession { binding, .. } = &mut changed_request {
+                binding.failure_hook_event_id = "different-failure".into();
+            }
+            assert!(app.execute_human_command(&changed_request).is_err());
+            assert!(crate::workflow::execute(&store, &command).is_err());
+            assert_eq!(
+                std::fs::read(root.join("s.signals")).unwrap_or_default(),
+                if mode == "reserved_only" {
+                    vec![]
+                } else {
+                    b"x".to_vec()
+                }
+            );
+            assert!(!root.join("other.signals").exists());
+            assert_eq!(
+                count("SELECT COUNT(*) FROM controls WHERE kind='pause_after_role'"),
+                1
+            );
+            assert_eq!(
+                count(
+                    "SELECT COUNT(*) FROM role_credentials WHERE id='g' AND revoked_at IS NOT NULL"
+                ),
+                1
+            );
+            assert_eq!(count("SELECT COUNT(*) FROM role_credentials WHERE id='g-other' AND revoked_at IS NULL"), 1);
+            assert_eq!(count("SELECT COUNT(*) FROM permission_requests WHERE id='s' AND state='expired' AND delivery_state='deny_required'"), 1);
+            assert_eq!(count("SELECT COUNT(*) FROM permission_requests WHERE id='other' AND state='pending' AND delivery_state='not_reserved'"), 1);
+            assert!(format!(
+                "{:#}",
+                store
+                    .verify_input_lease("other", "prior-lease", &other_process, "g-other")
+                    .unwrap_err()
+            )
+            .contains("keeps this task paused"));
+            store.release_input_lease("other", "prior-lease").unwrap();
+            assert!(format!(
+                "{:#}",
+                store
+                    .acquire_input_lease_for(
+                        InputLeasePurpose::AutomatedGuidance,
+                        "other",
+                        "unused-lease",
+                        "guidance",
+                        &other_process,
+                        "g-other",
+                        "2999-01-01T00:00:00Z",
+                    )
+                    .unwrap_err()
+            )
+            .contains("keeps this task paused"));
+            assert_eq!(
+                count("SELECT COUNT(*) FROM input_leases WHERE revoked_at IS NULL"),
+                0
+            );
+            let control = |operation: &str, action: &str| HumanCommand::Control {
+                operation_id: operation.into(),
+                task_id: "t".into(),
+                expected_version: count("SELECT version FROM tasks WHERE id='t'"),
+                action: action.into(),
+                payload: json!({}),
+            };
+            let fenced = || {
+                assert!(
+                    format!("{:#}", app.resume_role_session("s", "").unwrap_err())
+                        .contains("keeps this task paused")
+                );
+                let launch = fixture_launch(&root).config;
+                assert!(format!(
+                    "{:#}",
+                    store
+                        .reserve_role_resume("s", "forbidden", &launch, "unused")
+                        .unwrap_err()
+                )
+                .contains("keeps this task paused"));
+                assert!(format!(
+                    "{:#}",
+                    store
+                        .reserve_session_resume("s", "forbidden", &launch, "unused")
+                        .unwrap_err()
+                )
+                .contains("keeps this task paused"));
+                assert!(format!(
+                    "{:#}",
+                    app.dispatch_attempt_role("a", crate::domain::RoleKind::Manager, "no input")
+                        .unwrap_err()
+                )
+                .contains("keeps this task paused"));
+                let state = crate::workflow::state(&store).unwrap();
+                assert_eq!(
+                    state
+                        .active_sessions
+                        .iter()
+                        .find(|s| s["id"] == "s")
+                        .unwrap()["failure_stop_fenced"],
+                    true
+                );
+                assert!(state
+                    .continuation_actions
+                    .iter()
+                    .all(|a| a.binding["session_id"] != "s"
+                        || !matches!(
+                            a.operation.as_str(),
+                            "role_resume" | "validation_resume" | "restart_resume"
+                        )));
+            };
+            assert_eq!(
+                app.coordinator_tick().unwrap()["for"],
+                "failed_session_quiescence"
+            );
+            for action in ["continue", "run_next"] {
+                assert!(app
+                    .execute_human_command(&control("premature", action))
+                    .is_err());
+            }
+            fenced();
+            if matches!(mode, "deadline" | "reserved_only") {
+                let elapsed = Utc::now() - Duration::seconds(GRACEFUL_STOP_SECONDS + 1);
+                store
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE sessions SET interrupt_requested_at=?1 WHERE id='s'",
+                        params![elapsed.to_rfc3339()],
+                    )
+                    .unwrap();
+                *app.supervisor
+                    .handle("s")
+                    .unwrap()
+                    .first_stop_requested_at
+                    .lock()
+                    .unwrap() = Some(
+                    std::time::Instant::now()
+                        - std::time::Duration::from_secs(GRACEFUL_STOP_SECONDS as u64 + 1),
+                );
+                app.supervisor.reconcile().unwrap();
+                assert_eq!(count("SELECT COUNT(*) FROM recovery_records WHERE session_id='s' AND state='attention_required'"), 1);
+            }
+            std::fs::write(root.join("s.exit"), b"").unwrap();
+            for _ in 0..200 {
+                app.supervisor.reconcile().unwrap();
+                if count("SELECT COUNT(*) FROM sessions WHERE id='s' AND status='exited'") == 1 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(count("SELECT COUNT(*) FROM sessions WHERE id='s' AND status='exited' AND json_extract(exit_json,'$.process_group_quiescent')=1"), 1);
+            assert_eq!(
+                count("SELECT COUNT(*) FROM tasks WHERE attention='pause_requested'"),
+                1
+            );
+            assert!(
+                crate::workflow::execute(&store, &control("before-pause", "continue")).is_err()
+            );
+            fenced();
+            assert_eq!(
+                app.coordinator_tick().unwrap()["action"],
+                "draining_control"
+            );
+            assert!(!root.join("other.signals").exists());
+            std::fs::write(root.join("other.exit"), b"").unwrap();
+            for _ in 0..200 {
+                app.supervisor.reconcile().unwrap();
+                if count("SELECT COUNT(*) FROM sessions WHERE status='exited'") == 2 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(app.coordinator_tick().unwrap()["action"], "paused");
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE provider_failure_holds SET expires_at='2000-01-01'",
+                    [],
+                )
+                .unwrap();
+            let before_work = count("SELECT (SELECT COUNT(*) FROM sessions)+(SELECT COUNT(*) FROM launch_permits)+(SELECT COUNT(*) FROM guidance_messages)+(SELECT SUM(resume_count) FROM sessions)");
+            app.coordinator_tick().unwrap();
+            fenced();
+            assert_eq!(count("SELECT COUNT(*) FROM tasks t JOIN attempts a ON a.task_id=t.id WHERE t.attention='paused' AND a.status='held'"), 1);
+            assert_eq!(count("SELECT (SELECT COUNT(*) FROM sessions)+(SELECT COUNT(*) FROM launch_permits)+(SELECT COUNT(*) FROM guidance_messages)+(SELECT SUM(resume_count) FROM sessions)"), before_work);
+            let reopened = Store::open(&app.paths.database).unwrap();
+            assert_eq!(
+                crate::store::failure_stop_fence(&reopened.lock().unwrap(), "a").unwrap(),
+                Some(true)
+            );
+            drop(reopened);
+            crate::workflow::execute(&store, &control("stale-continue", "continue")).unwrap();
+            store
+                .lock()
+                .unwrap()
+                .execute("UPDATE tasks SET version=version+1", [])
+                .unwrap();
+            assert_eq!(
+                app.coordinator_tick().unwrap()["action"],
+                "continue_rejected"
+            );
+            fenced();
+            if mode == "clean" {
+                crate::workflow::execute(&store, &control("failed-continue", "continue")).unwrap();
+                store.lock().unwrap().execute_batch("CREATE TEMP TRIGGER refuse_continuation BEFORE UPDATE OF status ON attempts
+                    WHEN NEW.status='running' BEGIN SELECT RAISE(ABORT,'fixture continuation failure'); END;").unwrap();
+                assert_eq!(
+                    app.coordinator_tick().unwrap()["action"],
+                    "control_rejected"
+                );
+                fenced();
+                store
+                    .lock()
+                    .unwrap()
+                    .execute_batch("DROP TRIGGER refuse_continuation;")
+                    .unwrap();
+            }
+            if mode == "validation" {
+                crate::workflow::execute(&store, &control("changed-run-next", "run_next")).unwrap();
+                store
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE attempts SET phase='pending' WHERE id='a'", [])
+                    .unwrap();
+                assert_eq!(
+                    app.coordinator_tick().unwrap()["action"],
+                    "control_rejected"
+                );
+                fenced();
+                store
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE attempts SET phase='implementation' WHERE id='a'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            let action = if mode == "validation" {
+                "run_next"
+            } else {
+                "continue"
+            };
+            crate::workflow::execute(&store, &control("continue", action)).unwrap();
+            fenced();
+            assert_eq!(
+                app.coordinator_tick().unwrap()["action"],
+                if action == "continue" {
+                    "continued"
+                } else {
+                    "one_step_enabled"
+                }
+            );
+            let connection = store.lock().unwrap();
+            assert_eq!(
+                crate::store::failure_stop_fence(&connection, "a").unwrap(),
+                None
+            );
+            drop(connection);
+            assert!(crate::workflow::state(&store)
+                .unwrap()
+                .active_sessions
+                .iter()
+                .all(|s| s["failure_stop_fenced"] == false));
+            assert_eq!(
+                std::fs::read(root.join("s.signals")).unwrap_or_default(),
+                if mode == "reserved_only" {
+                    vec![]
+                } else {
+                    b"x".to_vec()
+                }
+            );
+            assert!(!root.join("other.signals").exists());
+            drop(app);
+            drop(groups);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

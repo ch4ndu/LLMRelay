@@ -651,6 +651,34 @@ export interface NativePrompt {
   hook_event_id: string;
   kind: "permission_prompt" | "elicitation_dialog" | "elicitation_url_dialog" | "agent_needs_input";
   observed_at: string;
+  dismissed?: boolean;
+  dismissal?: NativePromptDismissal | null;
+}
+export interface NativePromptDismissal {
+  task_id: string;
+  attempt_id: string;
+  session_id: string;
+  role_generation_id: string;
+  transcript_epoch: string;
+  accepted_hook_event_id: string | null;
+  raw_wait_start_hook_event_id: string | null;
+  displayed_boundary_hook_event_id: string;
+}
+export interface FailedSessionStopBinding {
+  task_id: string;
+  attempt_id: string;
+  expected_task_version: number;
+  session_id: string;
+  role_generation_id: string;
+  transcript_epoch: string;
+  process_identity: {
+    pid: number;
+    process_group_id: number;
+    native_start_marker: string;
+    observed_started_at: string;
+  };
+  accepted_hook_event_id: string | null;
+  failure_hook_event_id: string;
 }
 export type ProviderFailureAttribution =
   | "prompt_id_matched"
@@ -728,6 +756,9 @@ export interface Session {
   } | null;
   native_turn?: NativeTurn | null;
   native_prompt?: NativePrompt | null;
+  failed_session_stop?: FailedSessionStopBinding | null;
+  failure_stop_fenced?: boolean;
+  failure_stop_pause?: { control_id: string; state: string } | null;
   /** Holds that still restrict this role, whether or not the session runs. */
   provider_failure_holds?: ProviderFailureHold[];
   cmux_surface?: CmuxSessionSurface | null;

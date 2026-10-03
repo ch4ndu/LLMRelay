@@ -15,7 +15,9 @@ import {
   type CmuxKeyboardControlOutcome,
   type CmuxSessionSurface,
   type CmuxViewOutcome,
+  type FailedSessionStopBinding,
   type NativePrompt,
+  type NativePromptDismissal,
   type NativeTurnFailureKind,
   type PermissionRequest,
   type ProviderFailureHold,
@@ -307,6 +309,130 @@ const releaseOutcomes: ProviderFailureHoldRelease[] = [
   "superseded",
 ];
 
+function FailedSessionStopNotice({ session, onChanged }: { session: Session; onChanged: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [details, setDetails] = useState("");
+  const [uncertain, setUncertain] = useState(false);
+  const [finished, setFinished] = useState(false);
+  const request = useRef<({ operation_id: string } & FailedSessionStopBinding) | undefined>(undefined);
+  const bindingKey = JSON.stringify(session.failed_session_stop);
+  useEffect(() => {
+    if (!request.current) setFinished(false);
+  }, [bindingKey]);
+  const stop = async () => {
+    if (busy) return;
+    const captured = request.current ?? (session.failed_session_stop
+      ? { ...session.failed_session_stop, operation_id: operationId() }
+      : undefined);
+    if (!captured) return;
+    request.current = captured;
+    setBusy(true);
+    setMessage("Checking the stop request and the session's exit…");
+    setDetails("");
+    try {
+      const response = await command({ kind: "stop_failed_session", ...captured });
+      const state = response.result.state;
+      if (typeof state !== "string" || !["stop_requested", "stop_already_requested", "stop_recovery_required"].includes(state)) {
+        throw new Error("Unexpected stop receipt; refresh and check the same request.");
+      }
+      setMessage(state === "stop_recovery_required"
+        ? "The task pause is reserved, but signal delivery is unconfirmed. Refresh to check the exit and use the task's recovery controls if it still needs attention."
+        : "Stop requested. Checking the session's exit; task advancement stays paused until Continue or Run next.");
+      setDetails(JSON.stringify(response.result.detail ?? null));
+      setUncertain(false);
+      setFinished(true);
+      request.current = undefined;
+    } catch (cause) {
+      const ambiguous = !(cause instanceof ApiError) || cause.ambiguous;
+      setMessage(ambiguous
+        ? "The stop request's outcome is uncertain. Refresh, then check this same request before choosing another action."
+        : "The stop request was refused because its session or task is no longer eligible. Refresh and use the current task or session controls.");
+      setDetails(cause instanceof Error ? cause.message : String(cause));
+      setUncertain(ambiguous);
+      if (!ambiguous) {
+        request.current = undefined;
+        setFinished(true);
+      }
+    } finally {
+      setBusy(false);
+      onChanged();
+    }
+  };
+  const pause = session.failure_stop_pause;
+  const currentMessage = pause?.state === "finished"
+    ? "The failed session has stopped and the task is paused. Choose Continue or Run next in the task's workflow controls when ready. Any provider hold still applies."
+    : session.status === "recovery_required"
+    ? "The stop still needs a recovery check. Open this task's recovery controls; automatic advancement stays paused."
+    : pause
+    ? "Checking the failed session's exit and waiting for other active agents to finish. Task advancement stays paused until Continue or Run next."
+    : message;
+  return (
+    <div className="session-failure-stop" role="status">
+      <p>Stop signals only this failed session and pauses automatic task advancement until Continue or Run next. Other active agents may finish their current work.</p>
+      {currentMessage && <p>{currentMessage}</p>}
+      {uncertain && currentMessage !== message && <p>{message}</p>}
+      {(uncertain || (!finished && session.failed_session_stop)) && (
+        <button disabled={busy} onClick={() => void stop()}>
+          {busy ? "Checking stop and exit…" : uncertain ? "Check previous stop request" : "Stop failed session and pause task"}
+        </button>
+      )}
+      <button disabled={busy} onClick={onChanged}>Refresh session state</button>
+      {details && <TechnicalDetails><pre>{details}</pre></TechnicalDetails>}
+    </div>
+  );
+}
+
+function NativePromptNotice({ prompt, onChanged }: { prompt: NativePrompt; onChanged: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [uncertain, setUncertain] = useState(false);
+  const request = useRef<({ operation_id: string } & NativePromptDismissal) | undefined>(undefined);
+  const bindingKey = JSON.stringify(prompt.dismissal);
+  useEffect(() => {
+    if (!request.current) setError("");
+  }, [bindingKey]);
+  const dismiss = async () => {
+    if (busy) return;
+    const captured = request.current ?? (prompt.dismissal
+      ? { ...prompt.dismissal, operation_id: operationId() }
+      : undefined);
+    if (!captured) return;
+    request.current = captured;
+    setBusy(true);
+    setError("");
+    try {
+      const response = await command({ kind: "dismiss_native_prompt", ...captured });
+      if (response.result.state !== "native_prompt_dismissed") {
+        throw new Error("Unexpected dismissal receipt; refresh and check the same request.");
+      }
+      request.current = undefined;
+      setUncertain(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      const ambiguous = !(cause instanceof ApiError) || cause.ambiguous;
+      setUncertain(ambiguous);
+      if (!ambiguous) request.current = undefined;
+    } finally {
+      setBusy(false);
+      onChanged();
+    }
+  };
+  return (
+    <div className="session-native-prompt warning" role="status">
+      <strong>{prompt.dismissed ? "Notice dismissed; native status unknown" : `The agent is ${nativePromptLabel[prompt.kind]}`}</strong>
+      <p>Choose View output, then Take control to inspect or answer the prompt in the agent's terminal, and Release control when you are done.</p>
+      {!prompt.dismissed && <><p>LLMRelay cannot answer this prompt.</p><p>Hides this notice in LLMRelay. It does not answer the prompt or confirm it was resolved.</p></>}
+      {(!prompt.dismissed || uncertain) && prompt.dismissal && (
+        <button disabled={busy || (!!error && !uncertain)} onClick={() => void dismiss()}>
+          {busy ? "Dismissing notice…" : uncertain ? "Check previous dismissal" : "Dismiss notice"}
+        </button>
+      )}
+      {error && <><p>{uncertain ? "The dismissal outcome is uncertain. Refresh and check the same request." : "This notice changed before it could be dismissed. Refresh to see the current notice."}</p><button disabled={busy} onClick={onChanged}>Refresh notice</button><TechnicalDetails><pre>{error}</pre></TechnicalDetails></>}
+    </div>
+  );
+}
+
 function ProviderFailureHoldNotice(
   { hold, role, onReleased }: {
     hold: ProviderFailureHold;
@@ -435,7 +561,9 @@ export function sessionStateLabel(
     if (session.readiness === "unknown") return "Waiting for startup";
     if (awaitingApproval) return "Waiting for your approval";
     if (session.native_turn?.failure) return "Turn stopped with an error";
-    if (session.native_prompt) return "Waiting in its own terminal";
+    if (session.native_prompt) return session.native_prompt.dismissed
+      ? "Notice dismissed; native status unknown"
+      : "Waiting in its own terminal";
     if (session.input_control) return "You have keyboard control";
     return currentReportLabel(session) ?? "Running";
   }
@@ -644,14 +772,13 @@ export function SessionTree(
                   <strong>
                     Its latest turn stopped: {nativeTurnFailureLabel[failure.kind]}
                   </strong>
-                  <p>{failure.provider_error}</p>
                   <p>
                     {running ? "The session is still open. " : ""}Choose View
                     output to see the agent's terminal and decide how to
-                    continue. LLMRelay does not retry the turn or switch models
-                    automatically.
+                    continue. LLMRelay does not retry or switch models in response to this notice.
                   </p>
                   <TechnicalDetails>
+                    <p>{failure.provider_error}</p>
                     <p>
                       {failure.kind} · observed{" "}
                       {new Date(failure.observed_at).toLocaleString()} · hook
@@ -660,6 +787,9 @@ export function SessionTree(
                     {failure.details && <pre>{failure.details}</pre>}
                   </TechnicalDetails>
                 </div>
+              )}
+              {(session.failed_session_stop || session.failure_stop_pause) && (
+                <FailedSessionStopNotice session={session} onChanged={access.refresh} />
               )}
               {session.provider_failure_holds?.map((hold) => (
                 <ProviderFailureHoldNotice
@@ -670,17 +800,7 @@ export function SessionTree(
                 />
               ))}
               {running && session.native_prompt && (
-                <div className="session-native-prompt warning" role="status">
-                  <strong>
-                    The agent is{" "}
-                    {nativePromptLabel[session.native_prompt.kind]}
-                  </strong>
-                  <p>
-                    LLMRelay cannot answer this prompt. Choose View output, then
-                    Take control to answer it in the agent's terminal, and
-                    Release control when you are done.
-                  </p>
-                </div>
+                <NativePromptNotice prompt={session.native_prompt} onChanged={access.refresh} />
               )}
               {waitingForStartup && (
                 <div className="session-startup-notice warning" role="status">

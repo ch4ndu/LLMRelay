@@ -230,7 +230,7 @@ export function taskStatus(
   const running = (context.sessions ?? []).filter((session) =>
     session.attempt_id === attempt?.id && session.status === "running"
   );
-  const prompted = running.find((session) => session.native_prompt);
+  const prompted = running.find((session) => session.native_prompt && !session.native_prompt.dismissed);
   const promptDetail = prompted?.native_prompt &&
     `The ${roleLabel(prompted.role)} is ${
       nativePromptLabel[prompted.native_prompt.kind]
@@ -243,7 +243,7 @@ export function taskStatus(
       tone: "danger",
       detail: `The ${roleLabel(failed.role)}'s latest turn stopped because ${
         nativeTurnFailureLabel[failed.native_turn.failure.kind]
-      }. Its session is still open. Open the agent's output to decide how to continue; nothing is retried automatically.${
+      }. Its session is still open. Open the agent's output to decide how to continue. LLMRelay does not retry or switch models in response to this notice.${
         promptDetail ? ` ${promptDetail}` : ""
       }`,
       completed,

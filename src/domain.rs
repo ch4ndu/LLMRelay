@@ -1652,10 +1652,37 @@ pub struct NativeTurnFailureDto {
 /// own output and never becomes an application approval.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NativePromptDto {
-    /// The wait's first notification, stable across repeated reminders.
+    /// The first unacknowledged notification, or the raw wait's first when dismissed.
     pub hook_event_id: String,
     pub kind: NativePromptKind,
     pub observed_at: String,
+    pub dismissed: bool,
+    pub dismissal: Option<NativePromptDismissal>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativePromptDismissal {
+    pub task_id: String,
+    pub attempt_id: String,
+    pub session_id: String,
+    pub role_generation_id: String,
+    pub transcript_epoch: String,
+    pub accepted_hook_event_id: Option<String>,
+    pub raw_wait_start_hook_event_id: Option<String>,
+    pub displayed_boundary_hook_event_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FailedSessionStopBinding {
+    pub task_id: String,
+    pub attempt_id: String,
+    pub expected_task_version: i64,
+    pub session_id: String,
+    pub role_generation_id: String,
+    pub transcript_epoch: String,
+    pub process_identity: ProcessIdentity,
+    pub accepted_hook_event_id: Option<String>,
+    pub failure_hook_event_id: String,
 }
 
 /// Notification types of the admitted Claude Code release that announce a
@@ -2547,6 +2574,16 @@ pub enum HumanCommand {
         #[serde(default)]
         reason: String,
     },
+    StopFailedSession {
+        operation_id: String,
+        #[serde(flatten)]
+        binding: FailedSessionStopBinding,
+    },
+    DismissNativePrompt {
+        operation_id: String,
+        #[serde(flatten)]
+        binding: NativePromptDismissal,
+    },
     /// Starts, resumes or sends nothing; already-allowed automatic work may continue later.
     ReleaseProviderFailureHold {
         operation_id: String,
@@ -2606,6 +2643,8 @@ impl HumanCommand {
             | Self::SetAutoResume { operation_id, .. }
             | Self::DecidePermission { operation_id, .. }
             | Self::RevokePermissionRule { operation_id, .. }
+            | Self::StopFailedSession { operation_id, .. }
+            | Self::DismissNativePrompt { operation_id, .. }
             | Self::ReleaseProviderFailureHold { operation_id, .. } => operation_id,
         }
     }

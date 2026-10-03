@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-10-01T19:59:17.882797+00:00",
+  "observed_at": "2026-10-02T03:33:01.752114+00:00",
   "receipts": [
     {
       "adapter": "direct-claude-cli",
@@ -99,24 +99,84 @@
     {
       "adapter": "direct-codex-cli",
       "authority": "workspace-write",
+      "authority_evidence": "Initial and resumed invocations wrote only the authorized task-local nonce file; independently checked both lines.",
       "effort": "xhigh",
+      "ended_at": "2026-10-01T19:58:44.758205+00:00",
       "model": "gpt-6.1-sol",
-      "provider": "codex",
-      "session": "retained",
-      "result": "pass",
-      "service_tier": null,
+      "model_evidence": "Installed Codex ordinary console gpt-6.1-sol/xhigh/workspace-write header, successful initial and explicit resume. No fallback configured.",
+      "native_session_id": "01a0f90b-e2c8-70b3-92c5-22c6582b5054",
+      "nonce": "H3H15_SOL61_WRITE_20261001_8e213b",
+      "nonce_matched": true,
       "profile_ids": [
         "session-sol61-xhigh-write"
       ],
-      "nonce": "H3H15_SOL61_WRITE_20261001_8e213b",
-      "nonce_matched": true,
-      "native_session_id": "01a0f90b-e2c8-70b3-92c5-22c6582b5054",
-      "model_evidence": "Installed Codex ordinary console gpt-6.1-sol/xhigh/workspace-write header, successful initial and explicit resume. No fallback configured.",
-      "authority_evidence": "Initial and resumed invocations wrote only the authorized task-local nonce file; independently checked both lines.",
+      "provider": "codex",
+      "result": "pass",
+      "seconds": 23.944,
+      "service_tier": null,
+      "session": "retained",
       "session_evidence": "Explicit UUID resume recalled nonce without prompt restating it and appended it to isolated probe.",
-      "started_at": "2026-10-01T19:58:20.813597+00:00",
-      "ended_at": "2026-10-01T19:58:44.758205+00:00",
-      "seconds": 23.944
+      "started_at": "2026-10-01T19:58:20.813597+00:00"
+    },
+    {
+      "adapter": "direct-codex-cli",
+      "authority": "read-only",
+      "authority_evidence": "Read-only sandbox explicitly configured; no tools requested.",
+      "effort": "max",
+      "model": "gpt-6-astra",
+      "model_evidence": "Installed Codex 0.159.2 ordinary console header reports gpt-6-astra/max; successful exact nonce response, no fallback configured. Provider-exposed identity only.",
+      "native_session_id": "01a0faaa-5158-7a10-8de9-014f250c426b",
+      "nonce": "ASTRA_MAX_e337a28ceb5443d6",
+      "nonce_matched": true,
+      "profile_ids": [
+        "session-astra-max-read"
+      ],
+      "provider": "codex",
+      "result": "pass",
+      "seconds": 19.877,
+      "service_tier": null,
+      "session": "retained",
+      "session_evidence": "Explicit native UUID resume recalled the nonce without restatement."
+    },
+    {
+      "adapter": "direct-codex-cli",
+      "authority": "workspace-write",
+      "authority_evidence": "Workspace-write sandbox explicitly configured; only the task-local nonce file was written and independently checked.",
+      "effort": "max",
+      "model": "gpt-6-astra",
+      "model_evidence": "Installed Codex 0.159.2 ordinary console header reports gpt-6-astra/max; successful exact nonce response, no fallback configured. Provider-exposed identity only.",
+      "native_session_id": "01a0faaa-9efb-72d1-887a-b96b2f50993b",
+      "nonce": "ASTRA_MAX_904fb829fbec4d21",
+      "nonce_matched": true,
+      "profile_ids": [
+        "session-astra-max-write"
+      ],
+      "provider": "codex",
+      "result": "pass",
+      "seconds": 90.222,
+      "service_tier": null,
+      "session": "retained",
+      "session_evidence": "Explicit native UUID resume recalled the nonce without restatement."
+    },
+    {
+      "adapter": "direct-codex-cli",
+      "authority": "read-only",
+      "authority_evidence": "Read-only sandbox explicitly configured; no tools requested.",
+      "effort": "max",
+      "model": "gpt-6-astra",
+      "model_evidence": "Installed Codex 0.159.2 ordinary console header reports gpt-6-astra/max; successful exact nonce response, no fallback configured. Provider-exposed identity only.",
+      "native_session_id": "01a0faab-ff73-71f2-a766-e717061474af",
+      "nonce": "ASTRA_MAX_71aa1834566a46b0",
+      "nonce_matched": true,
+      "profile_ids": [
+        "session-astra-max-fresh"
+      ],
+      "provider": "codex",
+      "result": "pass",
+      "seconds": 10.631,
+      "service_tier": null,
+      "session": "fresh",
+      "session_evidence": "Independent fresh native session without resume."
     }
   ]
 }

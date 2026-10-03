@@ -3,8 +3,12 @@ use crate::domain::{CapabilityIdentity, CapabilityStatus, LaunchConfig, Provider
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use std::collections::BTreeSet;
+use std::ffi::{CStr, CString};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 pub const IMPLEMENTER_NATIVE_POLICY_STATUS: &str = "unknown_unattested";
@@ -807,9 +811,440 @@ fn require_local_executor_home(codex_home: &Path) -> Result<()> {
     Ok(())
 }
 
+const CAPACITY_RECORD_BYTES: usize = 256 * 1024;
+const CAPACITY_TAIL_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CapacityFileIdentity {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    modified_seconds: i64,
+    modified_nanos: i64,
+    changed_seconds: i64,
+    changed_nanos: i64,
+}
+
+impl CapacityFileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Option<Self> {
+        metadata.is_file().then(|| Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanos: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanos: metadata.ctime_nsec(),
+        })
+    }
+}
+
+pub(crate) fn capacity_history_root() -> Option<PathBuf> {
+    if std::env::var_os("CODEX_HOME").is_some() {
+        return None;
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .map(|home| home.join(".codex/sessions"))
+}
+
+fn capacity_history_parent(root: &Path, path: &Path) -> Option<(fs::File, CString)> {
+    use std::path::Component;
+    let normal = |path: &Path| {
+        path.is_absolute()
+            && path
+                .components()
+                .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+            && path.components().collect::<PathBuf>().as_os_str() == path.as_os_str()
+    };
+    if !normal(root) || !normal(path) || !path.starts_with(root) || path == root {
+        return None;
+    }
+    let mut directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open("/")
+        .ok()?;
+    for part in path.parent()?.components().skip(1) {
+        let name = CString::new(part.as_os_str().as_bytes()).ok()?;
+        directory = capacity_openat(&directory, &name, libc::O_DIRECTORY)?;
+    }
+    Some((directory, CString::new(path.file_name()?.as_bytes()).ok()?))
+}
+
+fn capacity_openat(directory: &fs::File, name: &CStr, flags: i32) -> Option<fs::File> {
+    // The directory FD and NUL-terminated name stay alive through openat; only
+    // a successful, newly owned FD is transferred to File.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | flags,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    Some(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+fn capacity_history_unchanged(
+    root: &Path,
+    path: &Path,
+    file: &fs::File,
+    before: &CapacityFileIdentity,
+) -> Option<()> {
+    if CapacityFileIdentity::from_metadata(&file.metadata().ok()?).as_ref() != Some(before) {
+        return None;
+    }
+    let (directory, name) = capacity_history_parent(root, path)?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // fstatat initializes the buffer only on success. Rewalk without following
+    // symlinks before comparing the named file to the original descriptor.
+    let status = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let metadata = unsafe { metadata.assume_init() };
+    (metadata.st_mode & libc::S_IFMT == libc::S_IFREG
+        && metadata.st_dev as u64 == before.device
+        && metadata.st_ino == before.inode
+        && metadata.st_size as u64 == before.bytes
+        && metadata.st_mtime == before.modified_seconds
+        && metadata.st_mtime_nsec == before.modified_nanos
+        && metadata.st_ctime == before.changed_seconds
+        && metadata.st_ctime_nsec == before.changed_nanos)
+        .then_some(())
+}
+
+pub(crate) fn read_capacity_history(
+    root: &Path,
+    path: &Path,
+    native_id: &str,
+    turn_id: &str,
+    cwd: &Path,
+) -> Option<CapacityFileIdentity> {
+    let (directory, name) = capacity_history_parent(root, path)?;
+    let mut file = capacity_openat(&directory, &name, 0)?;
+    let identity = CapacityFileIdentity::from_metadata(&file.metadata().ok()?)?;
+    let mut head = Vec::new();
+    (&mut file)
+        .take(CAPACITY_RECORD_BYTES as u64)
+        .read_to_end(&mut head)
+        .ok()?;
+    let end = head.iter().position(|byte| *byte == b'\n')?;
+    let meta: serde_json::Value = serde_json::from_slice(&head[..end]).ok()?;
+    let payload = meta.get("payload")?;
+    if meta.get("type")?.as_str()? != "session_meta"
+        || payload.get("id")?.as_str()? != native_id
+        || payload.get("session_id")?.as_str()? != native_id
+        || payload.get("cli_version")?.as_str()? != "0.157.1"
+        || payload.get("source")?.as_str()? != "cli"
+        || payload.get("originator")?.as_str()? != "codex-tui"
+        || payload.get("thread_source")?.as_str()? != "user"
+        || fs::canonicalize(payload.get("cwd")?.as_str()?).ok()? != cwd
+    {
+        return None;
+    }
+    let tail_start = identity.bytes.saturating_sub(CAPACITY_TAIL_BYTES - 1);
+    file.seek(SeekFrom::Start(tail_start.saturating_sub(1)))
+        .ok()?;
+    let mut tail = Vec::new();
+    (&mut file)
+        .take(CAPACITY_TAIL_BYTES)
+        .read_to_end(&mut tail)
+        .ok()?;
+    if tail.last() != Some(&b'\n') {
+        return None;
+    }
+    // The first byte is lookbehind when clipped, keeping the entire tail read
+    // within 1 MiB without mistaking a fragment for a complete record.
+    let tail = if tail_start > 0 {
+        let complete_start = if tail.first() == Some(&b'\n') {
+            1
+        } else {
+            tail.iter().position(|byte| *byte == b'\n')? + 1
+        };
+        &tail[complete_start..]
+    } else {
+        tail.as_slice()
+    };
+    capacity_turn_complete(tail, turn_id)?;
+    capacity_history_unchanged(root, path, &file, &identity)?;
+    Some(identity)
+}
+
+fn capacity_turn_complete(tail: &[u8], turn_id: &str) -> Option<()> {
+    let mut started = false;
+    let mut completed = false;
+    for line in tail.strip_suffix(b"\n")?.split(|byte| *byte == b'\n') {
+        if line.len() > CAPACITY_RECORD_BYTES {
+            return None;
+        }
+        let record: serde_json::Value = serde_json::from_slice(line).ok()?;
+        if record.get("type")?.as_str()? != "event_msg" {
+            continue;
+        }
+        let event = record.get("payload")?;
+        let kind = event.get("type")?.as_str()?;
+        if !matches!(kind, "task_started" | "task_complete" | "turn_aborted") {
+            continue;
+        }
+        if event.get("turn_id")?.as_str()? != turn_id {
+            if started {
+                return None;
+            }
+            continue;
+        }
+        match kind {
+            "task_started" if !started => started = true,
+            "task_complete"
+                if started
+                    && !completed
+                    && event.pointer("/error/codex_error_info")?.as_str()?
+                        == "server_overloaded" =>
+            {
+                completed = true;
+            }
+            _ => return None,
+        }
+    }
+    completed.then_some(())
+}
+
 #[cfg(test)]
 mod executor_environment_tests {
     use super::*;
+
+    const CAPACITY_NATIVE: &str = "01a0fad1-a051-7941-84b4-e64979f74d26";
+    const CAPACITY_TURN: &str = "01a0fad1-a06e-7da3-8bfc-1a96b443ad5d";
+
+    fn capacity_fixture() -> (PathBuf, PathBuf, Vec<serde_json::Value>) {
+        let root = std::env::temp_dir().join(format!("llmrelay-capacity-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("sessions/day")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("sessions/day/rollout.jsonl");
+        let records = vec![
+            serde_json::json!({"type":"session_meta","payload":{"id":CAPACITY_NATIVE,
+                "session_id":CAPACITY_NATIVE,"cwd":root,"cli_version":"0.157.1",
+                "source":"cli","originator":"codex-tui","thread_source":"user","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":CAPACITY_TURN}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":CAPACITY_TURN,
+                "error":{"codex_error_info":"server_overloaded","message":"Selected model is at capacity."}}}),
+        ];
+        (root, path, records)
+    }
+
+    fn write_capacity_records(path: &Path, records: &[serde_json::Value]) {
+        fs::write(
+            path,
+            records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn codex_capacity_reader_requires_exact_identity_and_structured_overload() {
+        let (root, path, records) = capacity_fixture();
+        let read = || {
+            read_capacity_history(
+                &root.join("sessions"),
+                &path,
+                CAPACITY_NATIVE,
+                CAPACITY_TURN,
+                &root,
+            )
+        };
+        write_capacity_records(&path, &records);
+        assert!(read().is_some());
+        for (index, pointer, value) in [
+            (0, "/payload/id", serde_json::json!("another-root")),
+            (
+                0,
+                "/payload/session_id",
+                serde_json::json!("another-session"),
+            ),
+            (0, "/payload/cwd", serde_json::json!(root.join("sessions"))),
+            (0, "/payload/cli_version", serde_json::json!("0.159.2")),
+            (0, "/payload/source", serde_json::json!("subagent")),
+            (0, "/payload/originator", serde_json::json!("other")),
+            (0, "/payload/thread_source", serde_json::json!("subagent")),
+            (1, "/payload/turn_id", serde_json::json!("other-turn")),
+            (2, "/payload/turn_id", serde_json::Value::Null),
+            (
+                2,
+                "/payload/error/codex_error_info",
+                serde_json::json!("rate_limit_exceeded"),
+            ),
+            (
+                2,
+                "/payload/error/codex_error_info",
+                serde_json::json!({"server_overloaded":true}),
+            ),
+            (
+                2,
+                "/payload/error/codex_error_info",
+                serde_json::Value::Null,
+            ),
+        ] {
+            let mut changed = records.clone();
+            *changed[index].pointer_mut(pointer).unwrap() = value;
+            write_capacity_records(&path, &changed);
+            assert!(read().is_none(), "{index}:{pointer}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_capacity_reader_defers_ambiguous_sequences_and_bounded_partial_records() {
+        let (root, path, records) = capacity_fixture();
+        let read = || {
+            read_capacity_history(
+                &root.join("sessions"),
+                &path,
+                CAPACITY_NATIVE,
+                CAPACITY_TURN,
+                &root,
+            )
+        };
+        let mut later = records[1].clone();
+        later["payload"]["turn_id"] = serde_json::json!("later-turn");
+        let mut aborted = records[1].clone();
+        aborted["payload"]["type"] = serde_json::json!("turn_aborted");
+        let mut conflict = records[2].clone();
+        conflict["payload"]["error"]["codex_error_info"] = serde_json::json!("rate_limit_exceeded");
+        for sequence in [
+            vec![records[0].clone(), records[2].clone()],
+            vec![records[0].clone(), records[2].clone(), records[1].clone()],
+            vec![
+                records[0].clone(),
+                records[1].clone(),
+                records[1].clone(),
+                records[2].clone(),
+            ],
+            [records.clone(), vec![records[2].clone()]].concat(),
+            [records.clone(), vec![conflict]].concat(),
+            [records.clone(), vec![later.clone()]].concat(),
+            [records.clone(), vec![aborted]].concat(),
+        ] {
+            write_capacity_records(&path, &sequence);
+            assert!(read().is_none());
+        }
+        later["payload"]["type"] = serde_json::json!("task_complete");
+        write_capacity_records(&path, &[records.clone(), vec![later]].concat());
+        assert!(read().is_none());
+        write_capacity_records(&path, &records);
+        let complete = fs::read(&path).unwrap();
+        fs::write(&path, &complete[..complete.len() - 1]).unwrap();
+        assert!(read().is_none());
+        fs::write(&path, [complete.as_slice(), b"{broken}\n"].concat()).unwrap();
+        assert!(read().is_none());
+        let mut huge_meta = records.clone();
+        huge_meta[0]["padding"] = serde_json::json!("x".repeat(CAPACITY_RECORD_BYTES));
+        write_capacity_records(&path, &huge_meta);
+        assert!(read().is_none());
+        let huge =
+            serde_json::json!({"type":"response_item","payload":"x".repeat(CAPACITY_RECORD_BYTES)});
+        write_capacity_records(&path, &[records.clone(), vec![huge]].concat());
+        assert!(read().is_none());
+        let padding =
+            vec![serde_json::json!({"type":"response_item","payload":"x".repeat(128 * 1024)}); 9];
+        write_capacity_records(
+            &path,
+            &[
+                records[..1].to_vec(),
+                padding.clone(),
+                records[1..].to_vec(),
+            ]
+            .concat(),
+        );
+        assert!(
+            read().is_some(),
+            "a clipped unrelated prefix must not hide the complete current turn"
+        );
+        write_capacity_records(
+            &path,
+            &[records[..2].to_vec(), padding, records[2..].to_vec()].concat(),
+        );
+        assert!(read().is_none(), "start outside the tail is not inferred");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_capacity_reader_rejects_nonregular_paths_and_changed_file_identity() {
+        let (root, path, records) = capacity_fixture();
+        let sessions = root.join("sessions");
+        write_capacity_records(&path, &records);
+        write_capacity_records(&root.join("outside.jsonl"), &records);
+        for bad in [
+            root.join("outside.jsonl"),
+            sessions.join("day"),
+            root.join("sessions/../sessions/day/rollout.jsonl"),
+            root.join("sessions/./day/rollout.jsonl"),
+            root.join("sessions/day/missing"),
+            root.join("sessions/day/nul\0"),
+        ] {
+            assert!(
+                read_capacity_history(&sessions, &bad, CAPACITY_NATIVE, CAPACITY_TURN, &root)
+                    .is_none()
+            );
+        }
+        let link = sessions.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(
+            read_capacity_history(&sessions, &link, CAPACITY_NATIVE, CAPACITY_TURN, &root)
+                .is_none()
+        );
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(sessions.join("day"), &link).unwrap();
+        assert!(read_capacity_history(
+            &sessions,
+            &link.join("rollout.jsonl"),
+            CAPACITY_NATIVE,
+            CAPACITY_TURN,
+            &root
+        )
+        .is_none());
+        let root_link = root.join("root-link");
+        std::os::unix::fs::symlink(&sessions, &root_link).unwrap();
+        assert!(read_capacity_history(
+            &root_link,
+            &root_link.join("day/rollout.jsonl"),
+            CAPACITY_NATIVE,
+            CAPACITY_TURN,
+            &root
+        )
+        .is_none());
+        for mutation in ["truncate", "replace", "mtime"] {
+            write_capacity_records(&path, &records);
+            let (parent, name) = capacity_history_parent(&sessions, &path).unwrap();
+            let file = capacity_openat(&parent, &name, 0).unwrap();
+            let before = CapacityFileIdentity::from_metadata(&file.metadata().unwrap()).unwrap();
+            match mutation {
+                "replace" => {
+                    fs::rename(&path, sessions.join("old.jsonl")).unwrap();
+                    write_capacity_records(&path, &records);
+                }
+                "mtime" => file
+                    .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+                    .unwrap(),
+                _ => fs::write(&path, b"truncated\n").unwrap(),
+            }
+            assert!(capacity_history_unchanged(&sessions, &path, &file, &before).is_none());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn configured_executor_is_rejected_without_reading_or_modifying_it() {

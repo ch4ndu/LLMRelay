@@ -3,11 +3,11 @@ use crate::domain::{
     ContinuationAction, ContinuationActionKind, DecisionActionBinding, DecisionControlPolicy,
     DecisionDisposition, DecisionEvidenceState, DecisionExplanation, DecisionNextAction,
     DecisionObservedRevision, DecisionOwner, DecisionOwnership, DecisionPrerequisite,
-    DecisionSubject, HumanCommand, NativePromptDto, NativePromptKind, NativeTurnDto,
-    NativeTurnFailureDto, NativeTurnFailureKind, OperationResult, PermissionRequestDto, ProjectDto,
-    ProviderFailureHoldDto, RestartCandidateResult, RoleKind, StaleRestartCandidateCancellation,
-    TaskAttentionTarget, TaskDto, UnacceptedInputDto, UnacceptedInputKind,
-    UnconfirmedGuidanceAbandonment,
+    DecisionSubject, FailedSessionStopBinding, HumanCommand, NativePromptDismissal,
+    NativePromptDto, NativePromptKind, NativeTurnDto, NativeTurnFailureDto, NativeTurnFailureKind,
+    OperationResult, PermissionRequestDto, ProjectDto, ProviderFailureHoldDto,
+    RestartCandidateResult, RoleKind, StaleRestartCandidateCancellation, TaskAttentionTarget,
+    TaskDto, UnacceptedInputDto, UnacceptedInputKind, UnconfirmedGuidanceAbandonment,
 };
 use crate::store::{json_hash, ObservationKind, OpenObservation, Store};
 use crate::supervisor::GRACEFUL_STOP_SECONDS;
@@ -400,6 +400,9 @@ pub(crate) fn ordinary_control_policy(
         }
     }
     if let Some(attempt_id) = attempt_id {
+        if crate::store::failure_stop_fence(connection, attempt_id)? == Some(false) {
+            controls.retain(|control| !matches!(control.as_str(), "continue" | "run_next"));
+        }
         if pending_continue(connection, attempt_id, None)? {
             controls.retain(|control| control != "continue");
         }
@@ -1503,6 +1506,9 @@ pub fn execute_with_runtime(
     command: &HumanCommand,
     runtime: Option<&crate::trip::CapabilityRuntime>,
 ) -> Result<OperationResult> {
+    if matches!(command, HumanCommand::StopFailedSession { .. }) {
+        bail!("failed-session stop requires the application runtime authority")
+    }
     let request_hash = json_hash(command)?;
     let operation_id = command.operation_id();
     if operation_id.trim().is_empty() {
@@ -2255,6 +2261,9 @@ pub fn execute_with_runtime(
                     .optional()?;
                 let attempt =
                     attempt.ok_or_else(|| anyhow!("task has no attempt for control {action}"))?;
+                if matches!(action.as_str(), "continue" | "run_next") {
+                    crate::store::require_failure_stop_continuation_ready(&transaction, &attempt)?;
+                }
                 if action == "continue" && pending_continue(&transaction, &attempt, None)? {
                     bail!("a Continue control is already pending for this attempt")
                 }
@@ -3660,6 +3669,31 @@ pub fn execute_with_runtime(
             applied.detail = detail;
             applied
         }
+        HumanCommand::DismissNativePrompt { binding, .. } => {
+            let current = native_prompt_presentation(
+                &transaction,
+                &binding.session_id,
+                Some(&binding.displayed_boundary_hook_event_id),
+            )?;
+            if current.and_then(|prompt| prompt.dismissal).as_ref() != Some(binding) {
+                bail!(
+                    "This notice or session changed. Refresh before dismissing the current notice."
+                )
+            }
+            transaction.execute(
+                "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+                 VALUES(?1,?2,'human','session.native_prompt.dismissed','session',?3,?4,?5)",
+                params![uuid::Uuid::new_v4().to_string(), operation_id, binding.session_id,
+                    serde_json::to_string(binding)?, now],
+            )?;
+            result(
+                operation_id,
+                "session",
+                binding.session_id.clone(),
+                None,
+                "native_prompt_dismissed",
+            )
+        }
         HumanCommand::ReleaseProviderFailureHold {
             task_id,
             attempt_id,
@@ -3695,6 +3729,7 @@ pub fn execute_with_runtime(
         HumanCommand::RetryWorkspaceReservation { .. }
         | HumanCommand::CancelWorkspaceReservation { .. }
         | HumanCommand::RetryGracefulStop { .. }
+        | HumanCommand::StopFailedSession { .. }
         | HumanCommand::ForceStopExactProcess { .. } => {
             bail!("this exact recovery command requires the application runtime authority")
         }
@@ -4458,7 +4493,12 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         }
         capability["compatibility"] = serde_json::to_value(explanation)?;
     }
-    let active_sessions = json_rows_no_param(
+    let codex_capacity = crate::store::current_codex_capacity(&connection)?;
+    let capacity_sessions = codex_capacity
+        .iter()
+        .map(|binding| &binding.session_id)
+        .collect::<Vec<_>>();
+    let active_sessions = json_rows(
         &connection,
         r#"
         SELECT json_object(
@@ -4564,8 +4604,10 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
                          ORDER BY newest.created_at DESC,newest.id LIMIT 200)
            OR s.id IN (SELECT observation.session_id FROM attention_observations observation
                        WHERE observation.state='open' AND observation.session_id IS NOT NULL)
+           OR s.id IN (SELECT value FROM json_each(?1))
         ORDER BY s.created_at DESC,s.id
     "#,
+        &serde_json::to_string(&capacity_sessions)?,
     )?;
     let mut active_sessions = active_sessions;
     for session in &mut active_sessions {
@@ -4585,7 +4627,34 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             session["latest_invocation_report"] = report.unwrap_or(serde_json::Value::Null);
             session["native_turn"] = serde_json::to_value(native_turn(&connection, &session_id)?)?;
             session["native_prompt"] =
-                serde_json::to_value(native_prompt(&connection, &session_id)?)?;
+                serde_json::to_value(native_prompt_presentation(&connection, &session_id, None)?)?;
+            session["failed_session_stop"] =
+                serde_json::to_value(failed_session_stop_binding(&connection, &session_id)?)?;
+            let attempt_id = session
+                .get("attempt_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("session projection has no attempt"))?
+                .to_owned();
+            session["failure_stop_fenced"] =
+                serde_json::json!(
+                    crate::store::failure_stop_fence(&connection, &attempt_id)?.is_some()
+                );
+            let pause: Option<String> = connection
+                .query_row(
+                    "SELECT json_object('control_id',id,'state',state) FROM controls
+                 WHERE attempt_id=?1 AND kind='pause_after_role'
+                   AND json_extract(payload_json,'$.session_id')=?2
+                   AND json_type(payload_json,'$.failure_stop_operation_id')='text'
+                   AND json_type(payload_json,'$.failure_stop_released_by') IS NULL
+                 ORDER BY created_at DESC LIMIT 1",
+                    params![attempt_id, session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            session["failure_stop_pause"] = pause
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?
+                .unwrap_or(serde_json::Value::Null);
             session["unaccepted_inputs"] =
                 serde_json::to_value(unaccepted_inputs(&connection, &session_id)?)?;
             session["provider_failure_holds"] =
@@ -4942,6 +5011,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         continuation_actions: &continuation_actions,
         coordinator_deferral: crate::coordinator::open_tick_deferral(&connection)?,
         observations: &observations,
+        codex_capacity: &codex_capacity,
     }
     .items();
     let task_actions = crate::domain::task_actions(&attention);
@@ -5243,6 +5313,13 @@ fn native_resume_is_fenced(
     switches: &[serde_json::Value],
     session: &serde_json::Value,
 ) -> bool {
+    if session
+        .get("failure_stop_fenced")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
     let (Some(session_id), Some(attempt_id), Some(generation_id)) = (
         session.get("id").and_then(serde_json::Value::as_str),
         session
@@ -5577,6 +5654,67 @@ pub(crate) fn belongs_to_accepted_turn(alias: &str) -> String {
     )
 }
 
+pub(crate) fn failed_session_stop_binding(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<FailedSessionStopBinding>> {
+    let row: Option<(String, String, i64, String, String, String)> = connection.query_row(
+        "SELECT t.id,a.id,t.version,g.id,s.transcript_epoch,s.process_identity_json
+         FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+         JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id
+         WHERE s.id=?1 AND s.status='running' AND s.launch_state='started'
+           AND s.setup_permit_id IS NULL AND a.setup_operation_id IS NULL
+           AND s.process_identity_json IS NOT NULL AND g.status='running'
+           AND t.archived_at IS NULL AND t.lifecycle IN ('in_progress','validation')
+           AND t.attention='none' AND a.status='running'
+           AND a.phase IN ('planning','plan_review','awaiting_plan_approval',
+               'awaiting_implementation_authorization','implementation','code_review',
+               'checks','final_review','manager_handoff')
+           AND a.id=(SELECT id FROM attempts WHERE task_id=t.id ORDER BY created_at DESC LIMIT 1)
+           AND (EXISTS(SELECT 1 FROM role_settings rs WHERE rs.task_id=t.id AND rs.role=g.role
+                  AND rs.effective_generation_id=g.id AND rs.revision=g.config_revision)
+             OR (g.role='implementer' AND g.lane_id!='default' AND EXISTS(
+                  SELECT 1 FROM lane_generations lane WHERE lane.lane_id=g.lane_id AND lane.effective_generation_id=g.id)))
+           AND NOT EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=a.id
+                 AND c.state NOT IN ('finished','cancelled','superseded','rejected'))
+           AND NOT EXISTS(SELECT 1 FROM recovery_records r WHERE r.attempt_id=a.id AND r.state='attention_required')
+           AND NOT EXISTS(SELECT 1 FROM switch_intents sw WHERE sw.attempt_id=a.id
+                 AND sw.state NOT IN ('completed','cancelled','rejected'))",
+        params![session_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+    ).optional()?;
+    let Some((
+        task_id,
+        attempt_id,
+        expected_task_version,
+        role_generation_id,
+        transcript_epoch,
+        process,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    if crate::store::failure_stop_fence(connection, &attempt_id)?.is_some() {
+        return Ok(None);
+    }
+    let Some(turn) = native_turn(connection, session_id)? else {
+        return Ok(None);
+    };
+    let Some(failure) = turn.failure else {
+        return Ok(None);
+    };
+    Ok(Some(FailedSessionStopBinding {
+        task_id,
+        attempt_id,
+        expected_task_version,
+        session_id: session_id.to_owned(),
+        role_generation_id,
+        transcript_epoch,
+        process_identity: serde_json::from_str(&process)?,
+        accepted_hook_event_id: turn.accepted_hook_event_id,
+        failure_hook_event_id: failure.hook_event_id,
+    }))
+}
+
 /// The session's newest native turn in its current invocation. A failure is
 /// reported only after the newest UserPromptSubmit and while no later Stop or
 /// tool activity shows the turn went on.
@@ -5741,7 +5879,92 @@ pub(crate) fn native_prompt(
         hook_event_id,
         kind: kind.parse().map_err(|error: String| anyhow!(error))?,
         observed_at,
+        dismissed: false,
+        dismissal: None,
     }))
+}
+
+fn native_prompt_presentation(
+    connection: &Connection,
+    session_id: &str,
+    displayed_boundary: Option<&str>,
+) -> Result<Option<NativePromptDto>> {
+    let Some(mut prompt) = native_prompt(connection, session_id)? else {
+        return Ok(None);
+    };
+    let row: Option<(String, String, String, String, Option<String>, Option<String>, Option<String>, String, String, String, bool)> = connection.query_row(
+        &format!("WITH {CURRENT_TURN_HOOKS_SQL},
+         wait_start AS (
+           SELECT ending.hook_rowid,ending.id FROM current_hooks ending
+           WHERE ending.event_name IN ('UserPromptSubmit','Stop','StopFailure','SessionEnd')
+             AND {} ORDER BY ending.hook_rowid DESC LIMIT 1
+         ),
+         prompts AS (
+           SELECT p.* FROM current_hooks p WHERE p.event_name='Notification'
+             AND json_valid(p.payload_json) AND json_extract(p.payload_json,'$.notification_type') IN
+               ('permission_prompt','elicitation_dialog','elicitation_url_dialog','agent_needs_input')
+             AND p.hook_rowid>COALESCE((SELECT hook_rowid FROM wait_start),0) AND {}
+         ),
+         acknowledged AS (
+           SELECT COALESCE(MAX(p.hook_rowid),0) AS frontier FROM prompts p
+           JOIN audit_events e ON p.id=json_extract(e.detail_json,'$.displayed_boundary_hook_event_id')
+           JOIN sessions s ON s.id=e.entity_id
+           WHERE e.entity_kind='session' AND e.entity_id=?1 AND e.actor_kind='human'
+             AND e.event_code='session.native_prompt.dismissed'
+             AND json_extract(e.detail_json,'$.role_generation_id')=s.role_generation_id
+             AND json_extract(e.detail_json,'$.transcript_epoch')=s.transcript_epoch
+             AND json_extract(e.detail_json,'$.accepted_hook_event_id') IS (SELECT id FROM accepted)
+             AND json_extract(e.detail_json,'$.raw_wait_start_hook_event_id') IS (SELECT id FROM wait_start)
+         )
+         SELECT a.task_id,a.id,s.role_generation_id,s.transcript_epoch,
+                (SELECT id FROM accepted),(SELECT id FROM wait_start),
+                (SELECT id FROM prompts WHERE ?2 IS NULL OR id=?2 ORDER BY hook_rowid DESC LIMIT 1),
+                p.id,json_extract(p.payload_json,'$.notification_type'),p.received_at,
+                p.hook_rowid<=(SELECT frontier FROM acknowledged)
+         FROM prompts p JOIN sessions s ON s.id=?1
+         JOIN role_generations g ON g.id=s.role_generation_id JOIN attempts a ON a.id=g.attempt_id
+         JOIN tasks t ON t.id=a.task_id
+         WHERE a.id=(SELECT id FROM attempts WHERE task_id=t.id ORDER BY created_at DESC LIMIT 1)
+           AND t.archived_at IS NULL AND t.lifecycle NOT IN ('done','cancelled')
+           AND (EXISTS(SELECT 1 FROM role_settings rs WHERE rs.task_id=t.id AND rs.role=g.role
+                  AND rs.effective_generation_id=g.id AND rs.revision=g.config_revision)
+             OR (g.role='implementer' AND g.lane_id!='default' AND EXISTS(
+                  SELECT 1 FROM lane_generations lane WHERE lane.lane_id=g.lane_id AND lane.effective_generation_id=g.id)))
+         ORDER BY CASE WHEN p.hook_rowid>(SELECT frontier FROM acknowledged) THEN 0 ELSE 1 END,p.hook_rowid LIMIT 1",
+            belongs_to_accepted_turn("ending"), belongs_to_accepted_turn("p")),
+        params![session_id, displayed_boundary],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?)),
+    ).optional()?;
+    if let Some((
+        task_id,
+        attempt_id,
+        role_generation_id,
+        transcript_epoch,
+        accepted_hook_event_id,
+        raw_wait_start_hook_event_id,
+        boundary,
+        hook_event_id,
+        kind,
+        observed_at,
+        dismissed,
+    )) = row
+    {
+        prompt.hook_event_id = hook_event_id;
+        prompt.kind = kind.parse().map_err(|error: String| anyhow!(error))?;
+        prompt.observed_at = observed_at;
+        prompt.dismissed = dismissed;
+        prompt.dismissal = boundary.map(|displayed_boundary_hook_event_id| NativePromptDismissal {
+            task_id,
+            attempt_id,
+            session_id: session_id.to_owned(),
+            role_generation_id,
+            transcript_epoch,
+            accepted_hook_event_id,
+            raw_wait_start_hook_event_id,
+            displayed_boundary_hook_event_id,
+        });
+    }
+    Ok(Some(prompt))
 }
 
 /// Includes exited sessions: a hold outlives the session that recorded it.
@@ -7040,6 +7263,7 @@ struct AttentionSources<'a> {
     /// Set while the coordinator keeps failing the same step.
     coordinator_deferral: Option<crate::coordinator::TickDeferral>,
     observations: &'a [crate::store::OpenObservation],
+    codex_capacity: &'a [crate::store::CodexCapacityBinding],
 }
 
 impl AttentionSources<'_> {
@@ -7055,6 +7279,7 @@ impl AttentionSources<'_> {
         items.extend(self.coordinator_deferral_item());
         items.extend(self.recovery_items());
         items.extend(self.native_turn_failure_items());
+        items.extend(self.codex_capacity_items());
         items.extend(self.provider_failure_hold_items());
         items.extend(self.observation_items());
         items.extend(self.native_prompt_items());
@@ -7923,7 +8148,7 @@ impl AttentionSources<'_> {
                     role.map_or("The agent", RoleKind::label)
                 ),
                 reason: format!(
-                    "The provider ended the agent's turn ({cause}). The session is still open, and nothing was retried or switched to another model. {next_step}"
+                    "The provider ended the agent's turn ({cause}). The session is still open. LLMRelay does not retry or switch models in response to this notice. {next_step}"
                 ),
                 task_title: Some(task.title.clone()),
                 role,
@@ -7938,6 +8163,30 @@ impl AttentionSources<'_> {
                 held_tasks: Vec::new(),
                 details: json_text(failure, "provider_error")
                     .map(|error| format!("Provider error: {error}")),
+            })
+        })
+    }
+
+    fn codex_capacity_items(&self) -> impl Iterator<Item = AttentionItem> + '_ {
+        self.codex_capacity.iter().filter_map(|binding| {
+            let task = self.task_with_active_attempt(&binding.attempt_id)?;
+            Some(AttentionItem {
+                id: format!("codex_capacity:{}", binding.accepted_hook_id),
+                category: AttentionCategory::Blocked,
+                title: "Codex reported model capacity".into(),
+                reason: "Codex reported that the selected model is at capacity; open agent output to inspect it and choose the next action.".into(),
+                task_title: Some(task.title.clone()),
+                role: self.session_role(&binding.session_id),
+                action: AttentionActionKind::OpenAgentOutput.into(),
+                target: Some(AttentionTarget::Session {
+                    project_id: task.project_id.clone(),
+                    task_id: task.id.clone(),
+                    attempt_id: binding.attempt_id.clone(),
+                    session_id: binding.session_id.clone(),
+                    role_generation_id: binding.role_generation_id.clone(),
+                }),
+                held_tasks: Vec::new(),
+                details: None,
             })
         })
     }
@@ -8015,6 +8264,9 @@ impl AttentionSources<'_> {
     fn native_prompt_items(&self) -> impl Iterator<Item = AttentionItem> + '_ {
         self.sessions.iter().filter_map(|session| {
             let prompt = session.get("native_prompt")?;
+            if prompt.get("dismissed").and_then(serde_json::Value::as_bool) == Some(true) {
+                return None;
+            }
             let hook_event_id = json_text(prompt, "hook_event_id")?;
             let kind = json_text(prompt, "kind")?.parse::<NativePromptKind>().ok()?;
             let session_id = json_text(session, "id")?;

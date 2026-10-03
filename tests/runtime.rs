@@ -3,8 +3,8 @@ use agenticjira::{
     config::InstancePaths,
     control::{self, ControlRequest},
     domain::{
-        CapabilityStatus, HookEnvelope, HumanCommand, LaunchConfig, Provider, RoleKind,
-        RoleOverride, RoleResultReport, ValidationLaunchRequest,
+        AttentionActionKind, AttentionTarget, CapabilityStatus, HookEnvelope, HumanCommand,
+        LaunchConfig, Provider, RoleKind, RoleOverride, RoleResultReport, ValidationLaunchRequest,
     },
     operations::Application,
     providers::{self, PreparedLaunch},
@@ -203,6 +203,7 @@ fn t10_manual_terminal_size() -> Option<(u16, u16)> {
 struct T10ManualTerminalInput {
     file: std::fs::File,
     original_flags: libc::c_int,
+    original_termios: Option<libc::termios>,
 }
 
 impl T10ManualTerminalInput {
@@ -237,7 +238,26 @@ impl T10ManualTerminalInput {
         Ok(Self {
             file,
             original_flags,
+            original_termios: None,
         })
+    }
+
+    fn raw_child() -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        let mut terminal = Self::open()?;
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(terminal.file.as_raw_fd(), &mut original) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        terminal.original_termios = Some(original);
+        let mut raw = original;
+        // Canonical mode translates CR and buffers paste; only the fixture child changes it.
+        unsafe { libc::cfmakeraw(&mut raw) };
+        if unsafe { libc::tcsetattr(terminal.file.as_raw_fd(), libc::TCSANOW, &raw) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(terminal)
     }
 }
 
@@ -245,7 +265,561 @@ impl Drop for T10ManualTerminalInput {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd;
 
+        if let Some(original) = &self.original_termios {
+            let _ = unsafe { libc::tcsetattr(self.file.as_raw_fd(), libc::TCSANOW, original) };
+        }
         let _ = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_SETFL, self.original_flags) };
+    }
+}
+
+struct T10Cleanup {
+    root: std::path::PathBuf,
+    socket_dir: Option<std::path::PathBuf>,
+    original_home: Option<std::ffi::OsString>,
+    original_codex_home: Option<std::ffi::OsString>,
+    supervisor: Option<Supervisor>,
+    sessions: Vec<String>,
+    releases: Vec<std::path::PathBuf>,
+    shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    listeners: Vec<tokio::task::AbortHandle>,
+    retain_files: bool,
+}
+
+impl Drop for T10Cleanup {
+    fn drop(&mut self) {
+        for release in &self.releases {
+            let _ = std::fs::write(release, b"release");
+        }
+        if let Some(supervisor) = &self.supervisor {
+            for check in 0..200 {
+                let _ = supervisor.reconcile();
+                if supervisor.active_session_ids().is_ok_and(|active| {
+                    self.sessions
+                        .iter()
+                        .all(|session| !active.contains(session))
+                }) {
+                    break;
+                }
+                if check == 100 {
+                    for session in &self.sessions {
+                        let _ = supervisor.interrupt(session);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        if let Some(shutdown) = &self.shutdown {
+            let _ = shutdown.send(true);
+        }
+        for listener in &self.listeners {
+            listener.abort();
+        }
+        for (key, original) in [
+            ("HOME", &self.original_home),
+            ("CODEX_HOME", &self.original_codex_home),
+        ] {
+            match original {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        if !self.retain_files {
+            let _ = std::fs::remove_dir_all(&self.root);
+            if let Some(socket_dir) = &self.socket_dir {
+                let _ = std::fs::remove_dir_all(socket_dir);
+            }
+        }
+    }
+}
+
+async fn t10_wait_for_marker(path: &std::path::Path) {
+    for _ in 0..500 {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("T10 marker was not observed: {}", path.display());
+}
+
+async fn t10_pty_failure_child(mode: &str) {
+    use std::io::Read;
+
+    let provider = match mode {
+        "dropped_enter" | "never_stop" => Provider::Codex,
+        "failure_without_stop" | "permission_prompt" => Provider::Claude,
+        _ => panic!("unknown fixed T10 child mode"),
+    };
+    let directory = std::path::PathBuf::from(environment("AJ_T10_CASE_DIR"));
+    let mut terminal = T10ManualTerminalInput::raw_child().unwrap();
+    let mut events = vec!["SessionStart", "UserPromptSubmit"];
+    match mode {
+        "dropped_enter" => events.push("Stop"),
+        "failure_without_stop" => events.push("StopFailure"),
+        "permission_prompt" => events.push("Notification"),
+        "never_stop" => {}
+        _ => unreachable!(),
+    }
+    let mut receipts = Vec::new();
+    for event in events {
+        if directory.join("release").exists() {
+            return;
+        }
+        let mut payload = serde_json::json!({"hook_event_name":event,
+            "session_id":environment("AJ_T10_NATIVE_ID"),"cwd":environment("AJ_T10_CWD")});
+        match event {
+            "UserPromptSubmit" => payload["prompt"] = "initial fixture turn".into(),
+            "StopFailure" => payload["error"] = "authentication_failed".into(),
+            "Notification" => payload["notification_type"] = "permission_prompt".into(),
+            _ => {}
+        }
+        let receipt = role(RoleOperation::Hook {
+            envelope: HookEnvelope { provider, payload },
+        })
+        .await
+        .unwrap();
+        assert_eq!(receipt["recorded"], true);
+        assert_eq!(receipt["native_identity_candidate"], true);
+        assert_eq!(receipt["event_name"], event);
+        assert_eq!(
+            receipt["provenance"],
+            "managed_process_group_untrusted_payload"
+        );
+        if event == "Stop" {
+            assert_eq!(receipt["safe_idle_boundary"], true);
+        }
+        receipts.push(receipt);
+    }
+    std::fs::write(
+        directory.join("ready.tmp"),
+        serde_json::to_vec(&receipts).unwrap(),
+    )
+    .unwrap();
+    std::fs::rename(directory.join("ready.tmp"), directory.join("ready")).unwrap();
+    let mut buffer = [0_u8; 4096];
+    if mode == "dropped_enter" {
+        let mut input = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !input.contains(&b'\r') {
+            if directory.join("release").exists() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "guidance Enter was not received"
+            );
+            match terminal.file.read(&mut buffer) {
+                Ok(0) => panic!("fixture PTY closed before guidance"),
+                Ok(count) => input.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("fixture input failed: {error}"),
+            }
+            assert!(input.len() < 64 * 1024);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        std::fs::write(directory.join("input.tmp"), &input).unwrap();
+        std::fs::rename(directory.join("input.tmp"), directory.join("input")).unwrap();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !directory.join("pass-complete").exists() {
+        if directory.join("release").exists() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parent step did not complete"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // The acknowledgment follows the completed app step and a bounded input drain.
+    let mut extra = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut quiet_since = std::time::Instant::now();
+    while quiet_since.elapsed() < std::time::Duration::from_millis(200) {
+        if directory.join("release").exists() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture input never became quiet"
+        );
+        match terminal.file.read(&mut buffer) {
+            Ok(0) => panic!("fixture PTY closed before acknowledgment"),
+            Ok(count) => {
+                extra.extend_from_slice(&buffer[..count]);
+                quiet_since = std::time::Instant::now();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("fixture input drain failed: {error}"),
+        }
+        assert!(extra.len() < 64 * 1024);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    std::fs::write(directory.join("extra.tmp"), &extra).unwrap();
+    std::fs::rename(directory.join("extra.tmp"), directory.join("extra")).unwrap();
+    t10_wait_for_marker(&directory.join("release")).await;
+}
+
+async fn t10_pty_failure_cases(
+    app: &Application,
+    paths: &InstancePaths,
+    store: &Store,
+    codex_config: &LaunchConfig,
+    cleanup: &mut T10Cleanup,
+) {
+    let database = rusqlite::Connection::open(&paths.database).unwrap();
+    database.pragma_update(None, "foreign_keys", true).unwrap();
+    for mode in [
+        "dropped_enter",
+        "failure_without_stop",
+        "never_stop",
+        "permission_prompt",
+    ] {
+        let directory = cleanup.root.join(mode);
+        std::fs::create_dir_all(&directory).unwrap();
+        cleanup.releases.push(directory.join("release"));
+        let session = uuid::Uuid::new_v4().to_string();
+        let generation = uuid::Uuid::new_v4().to_string();
+        let epoch = uuid::Uuid::new_v4().to_string();
+        let native = uuid::Uuid::new_v4().to_string();
+        let token = auth::issue_secret();
+        let task = format!("t10-{mode}");
+        let attempt = format!("{task}-attempt");
+        let config_id = format!("{task}-config");
+        let credential = format!("{task}-credential");
+        let guidance = format!("{task}-guidance");
+        let executable = std::env::current_exe().unwrap();
+        let provider = if matches!(mode, "failure_without_stop" | "permission_prompt") {
+            Provider::Claude
+        } else {
+            Provider::Codex
+        };
+        let mut config = codex_config.clone();
+        if provider == Provider::Claude {
+            config = LaunchConfig {
+                compatibility: None,
+                provider,
+                role: RoleKind::PlanReviewer,
+                executable: executable.clone(),
+                executable_version: "t10-pty-child".into(),
+                model: "local-child".into(),
+                effort: "none".into(),
+                cwd: codex_config.cwd.clone(),
+                argv: vec![],
+                environment_keys: vec![],
+                permission_policy: "fixture hook transport".into(),
+                security_policy: serde_json::json!({}),
+                hook_revision: "fixture".into(),
+                capability_status: CapabilityStatus::Unverified,
+            };
+            let now = chrono::Utc::now().to_rfc3339();
+            database.execute("INSERT INTO tasks(id,project_id,title,lifecycle,created_at,updated_at) VALUES(?1,'t10-project',?1,'in_progress',?2,?2)", rusqlite::params![task,now]).unwrap();
+            database.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at) VALUES(?1,?2,?1,'plan_review','t10-base',1,'capability_validation',?3,?3)", rusqlite::params![attempt,task,now]).unwrap();
+            database.execute("INSERT INTO config_revisions(id,attempt_id,revision,config_json,created_at) VALUES(?1,?2,1,?3,?4)", rusqlite::params![config_id,attempt,serde_json::to_string(&config).unwrap(),now]).unwrap();
+            database.execute("INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at) VALUES(?1,?2,'plan_reviewer','claude',1,1,'launch_reserved',?1,?3,?3)", rusqlite::params![generation,attempt,now]).unwrap();
+            database.execute("INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at) VALUES(?1,?2,?3,'[\"report_hook\"]',?4)", rusqlite::params![credential,generation,auth::hash_secret(&token),now]).unwrap();
+            database.execute("INSERT INTO sessions(id,role_generation_id,provider,validation_cell,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at) VALUES(?1,?2,'claude','T10','launch_reserved',?3,'t10-pty-child',?4,?5,?5)", rusqlite::params![session,generation,serde_json::to_string(&config).unwrap(),epoch,now]).unwrap();
+        } else {
+            let request = ValidationLaunchRequest {
+                operation_id: format!("{task}-launch"),
+                cell: "T10".into(),
+                provider,
+                role: RoleKind::PlanReviewer,
+                project_path: config.cwd.clone(),
+                model: config.model.clone(),
+                effort: config.effort.clone(),
+                prompt: "fixture IPC only".into(),
+            };
+            store
+                .reserve_validation(
+                    &request,
+                    &json_hash(&request).unwrap(),
+                    "t10-project",
+                    &config.cwd.to_string_lossy(),
+                    &config.cwd.to_string_lossy(),
+                    "t10-base",
+                    &task,
+                    &attempt,
+                    &format!("{task}-context"),
+                    &config_id,
+                    &generation,
+                    &credential,
+                    &auth::hash_secret(&token),
+                    &session,
+                    &epoch,
+                    &config,
+                )
+                .unwrap();
+        }
+        assert_eq!(database.query_row("SELECT status||':'||(SELECT lifecycle FROM tasks WHERE id=task_id) FROM attempts WHERE id=?1", rusqlite::params![attempt], |row| row.get::<_,String>(0)).unwrap(), "capability_validation:in_progress");
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT queue_paused FROM projects WHERE id='t10-project'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        database.execute("INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at) VALUES(?1,?2,?3,'Literal dropped Enter fixture','queued',?4)", rusqlite::params![guidance,attempt,generation,chrono::Utc::now().to_rfc3339()]).unwrap();
+        let launch = PreparedLaunch {
+            config,
+            executable: executable.clone(),
+            arguments: vec![
+                "--exact".into(),
+                "t10_role_auth_hook_and_human_boundary".into(),
+                "--nocapture".into(),
+            ],
+            environment: vec![
+                ("AJ_T10_ROOT".into(), "1".into()),
+                ("AJ_T10_FAILURE_MODE".into(), mode.into()),
+                (
+                    "AJ_T10_CASE_DIR".into(),
+                    directory.to_string_lossy().into_owned(),
+                ),
+                ("AJ_T10_NATIVE_ID".into(), native.clone()),
+                (
+                    "AJ_T10_CWD".into(),
+                    codex_config.cwd.to_string_lossy().into_owned(),
+                ),
+                (
+                    "AGENTICJIRA_ROLE_SOCKET".into(),
+                    paths.role_socket.to_string_lossy().into_owned(),
+                ),
+                ("AGENTICJIRA_ROLE_TOKEN".into(), token.clone()),
+                ("AGENTICJIRA_SESSION_ID".into(), session.clone()),
+            ],
+            supervision_executable: std::path::PathBuf::from(env!("CARGO_BIN_EXE_agenticjira")),
+        };
+        assert_eq!(launch.executable, executable);
+        cleanup.sessions.push(session.clone());
+        let identity = app
+            .supervisor
+            .spawn(&session, &generation, &epoch, &launch)
+            .unwrap();
+        store
+            .update_session_running(&session, &epoch, &serde_json::to_string(&identity).unwrap())
+            .unwrap();
+        t10_wait_for_marker(&directory.join("ready")).await;
+        let receipts: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(directory.join("ready")).unwrap()).unwrap();
+        let expected_events = match mode {
+            "dropped_enter" => "SessionStart,UserPromptSubmit,Stop",
+            "failure_without_stop" => "SessionStart,UserPromptSubmit,StopFailure",
+            "never_stop" => "SessionStart,UserPromptSubmit",
+            "permission_prompt" => "SessionStart,UserPromptSubmit,Notification",
+            _ => unreachable!(),
+        };
+        assert_eq!(database.query_row("SELECT group_concat(event_name,',') FROM (SELECT event_name FROM hook_events WHERE session_id=?1 ORDER BY rowid)", rusqlite::params![session], |row| row.get::<_,String>(0)).unwrap(), expected_events);
+        assert_eq!(database.query_row("SELECT COUNT(*) FROM hook_events WHERE session_id=?1 AND role_generation_id=?2 AND native_session_id=?3 AND peer_pid=?4 AND provenance_state='managed_process_group_untrusted_payload' AND peer_start_marker!=''", rusqlite::params![session,generation,native,identity.pid], |row| row.get::<_,i64>(0)).unwrap(), receipts.len() as i64);
+        if mode == "dropped_enter" {
+            assert_eq!(
+                database
+                    .query_row(
+                        "SELECT readiness_state FROM sessions WHERE id=?1",
+                        rusqlite::params![session],
+                        |row| row.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                "idle_candidate"
+            );
+            let delivered = app.roles.deliver_guidance(&guidance).unwrap();
+            assert_eq!(delivered["action"], "guidance_delivered");
+            assert_eq!(delivered["state"], "written_awaiting_submit");
+            assert_eq!(delivered["acknowledged"], false);
+            t10_wait_for_marker(&directory.join("input")).await;
+            let bytes = std::fs::read(directory.join("input")).unwrap();
+            assert_eq!(bytes, b"\x1b[200~Literal dropped Enter fixture\x1b[201~\r");
+            assert_eq!(bytes.iter().filter(|byte| **byte == b'\r').count(), 1);
+        }
+        let inventory = || {
+            let mut inventories = Vec::new();
+            // Compare every session's ownership/launch state without racing PTY capture timestamps.
+            for sql in [
+                "SELECT id,role_generation_id,provider,status,launch_state,transcript_epoch,native_session_id,launch_config_json,process_identity_json,recovery_anchor_json,readiness_state,validation_cell FROM sessions ORDER BY id",
+                "SELECT * FROM role_generations ORDER BY id", "SELECT * FROM launch_permits ORDER BY id",
+            ] {
+                let mut statement = database.prepare(sql).unwrap();
+                let columns = statement.column_count();
+                let rows = statement.query_map([], |row| (0..columns).map(|column| row.get(column)).collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                inventories.push(rows);
+            }
+            inventories
+        };
+        let before = inventory();
+        app.supervisor.reconcile().unwrap();
+        assert!(app
+            .roles
+            .deliver_next_for_session(&session)
+            .unwrap()
+            .is_none());
+        let tick = app.coordinator_tick().unwrap();
+        assert_eq!(tick["action"], "idle", "{mode}: {tick}");
+        assert_eq!(
+            inventory(),
+            before,
+            "{mode} changed a process/authority/reservation inventory"
+        );
+        std::fs::write(directory.join("pass-complete"), b"complete").unwrap();
+        t10_wait_for_marker(&directory.join("extra")).await;
+        assert!(
+            std::fs::read(directory.join("extra")).unwrap().is_empty(),
+            "{mode} sent extra input during the completed step"
+        );
+        let state = workflow::state(store).unwrap();
+        let current = state
+            .active_sessions
+            .iter()
+            .find(|row| row["id"] == session)
+            .unwrap();
+        assert_eq!(current["status"], "running");
+        assert_eq!(current["role_generation_id"], generation);
+        assert_eq!(current["transcript_epoch"], epoch);
+        assert_eq!(current["native_session_id"], native);
+        assert_eq!(
+            current["readiness"],
+            if mode == "dropped_enter" {
+                "idle_verified"
+            } else {
+                "busy"
+            }
+        );
+        assert_eq!(
+            current["native_turn"]["accepted_hook_event_id"],
+            receipts[1]["hook_event_id"]
+        );
+        assert_eq!(database.query_row("SELECT group_concat(event_name,',') FROM (SELECT event_name FROM hook_events WHERE session_id=?1 ORDER BY rowid)", rusqlite::params![session], |row| row.get::<_,String>(0)).unwrap(), expected_events);
+        assert_eq!(database.query_row("SELECT status||':'||(SELECT lifecycle FROM tasks WHERE id=task_id) FROM attempts WHERE id=?1", rusqlite::params![attempt], |row| row.get::<_,String>(0)).unwrap(), "capability_validation:in_progress");
+        assert!(app
+            .supervisor
+            .process_group_members(&session)
+            .unwrap()
+            .iter()
+            .any(|member| member["pid"] == identity.pid));
+        assert_eq!(store.role_context(&token).unwrap().session_id, session);
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM role_results WHERE session_id=?1",
+                    rusqlite::params![session],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM recovery_records WHERE session_id=?1",
+                    rusqlite::params![session],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM permission_requests", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM permission_rules", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM input_leases WHERE session_id=?1 AND revoked_at IS NULL",
+                    rusqlite::params![session],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM input_leases WHERE session_id=?1",
+                    rusqlite::params![session],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            if mode == "dropped_enter" { 1 } else { 0 }
+        );
+        if mode == "dropped_enter" {
+            assert_eq!(database.query_row("SELECT COUNT(*) FROM input_leases WHERE session_id=?1 AND owner_id=?2 AND role_generation_id=?3 AND revoked_at IS NOT NULL AND process_identity_json=(SELECT process_identity_json FROM sessions WHERE id=?1)", rusqlite::params![session,format!("guidance:{guidance}"),generation], |row| row.get::<_,i64>(0)).unwrap(), 1);
+        }
+        let guidance_state: (String,bool,bool) = database.query_row("SELECT state,submitted_at IS NULL,acknowledged_at IS NULL FROM guidance_messages WHERE id=?1", rusqlite::params![guidance], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(
+            guidance_state,
+            (
+                if mode == "dropped_enter" {
+                    "written_awaiting_submit"
+                } else {
+                    "queued"
+                }
+                .into(),
+                true,
+                true
+            )
+        );
+        if mode == "failure_without_stop" {
+            assert_eq!(
+                current["native_turn"]["failure"]["hook_event_id"],
+                receipts[2]["hook_event_id"]
+            );
+            assert_eq!(
+                current["native_turn"]["failure"]["kind"],
+                "authentication_failed"
+            );
+            let hold_id = receipts[2]["provider_failure_hold_id"].as_str().unwrap();
+            let held: String = database.query_row("SELECT state||':'||attribution FROM provider_failure_holds WHERE id=?1 AND session_id=?2 AND role_generation_id=?3 AND transcript_epoch=?4 AND failure_hook_event_id=?5 AND accepted_hook_event_id=?6", rusqlite::params![hold_id,session,generation,epoch,receipts[2]["hook_event_id"].as_str().unwrap(),receipts[1]["hook_event_id"].as_str().unwrap()], |row| row.get(0)).unwrap();
+            assert_eq!(held, "active:arrival_order");
+            assert!(state
+                .attention
+                .iter()
+                .any(|item| item.id == format!("provider_failure_hold:{hold_id}")));
+        } else if mode == "permission_prompt" {
+            assert_eq!(current["native_prompt"]["kind"], "permission_prompt");
+            let notification = receipts[2]["hook_event_id"].as_str().unwrap();
+            assert_eq!(current["native_prompt"]["hook_event_id"], notification);
+            let item = state
+                .attention
+                .iter()
+                .find(|item| item.id == format!("native_prompt:{notification}"))
+                .unwrap();
+            assert_eq!(item.action.kind, AttentionActionKind::OpenAgentOutput);
+            assert!(matches!(&item.target, Some(AttentionTarget::Session {
+                project_id, task_id, attempt_id, session_id, role_generation_id,
+            }) if project_id == "t10-project" && task_id == &task && attempt_id == &attempt
+                && session_id == &session && role_generation_id == &generation));
+        }
+        std::fs::write(directory.join("release"), b"release").unwrap();
+        for _ in 0..500 {
+            app.supervisor.reconcile().unwrap();
+            if store.session_json(&session).unwrap()["status"] == "exited" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(store.session_json(&session).unwrap()["status"], "exited");
+        let exit: (bool,bool) = database.query_row("SELECT json_extract(exit_json,'$.success'),json_extract(exit_json,'$.process_group_quiescent') FROM sessions WHERE id=?1", rusqlite::params![session], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(
+            exit,
+            (true, true),
+            "{mode} did not exit cleanly after fixture release"
+        );
+        assert!(app
+            .supervisor
+            .process_group_members(&session)
+            .unwrap()
+            .is_empty());
     }
 }
 
@@ -793,6 +1367,10 @@ async fn t10_role_auth_hook_and_human_boundary() {
         return;
     }
     if std::env::var("AJ_T10_ROOT").as_deref() == Ok("1") {
+        if let Ok(mode) = std::env::var("AJ_T10_FAILURE_MODE") {
+            t10_pty_failure_child(&mode).await;
+            return;
+        }
         if std::env::var("AJ_T10_MANUAL_ATTACH").as_deref() == Ok("1") {
             t10_manual_attachment_root().await;
             return;
@@ -846,15 +1424,29 @@ async fn t10_role_auth_hook_and_human_boundary() {
     ));
     let original_home = std::env::var_os("HOME");
     let original_codex_home = std::env::var_os("CODEX_HOME");
+    let mut cleanup = T10Cleanup {
+        root: root.clone(),
+        socket_dir: None,
+        original_home,
+        original_codex_home,
+        supervisor: None,
+        sessions: Vec::new(),
+        releases: vec![root.join("root-release"), root.join("descendant-release")],
+        shutdown: None,
+        listeners: Vec::new(),
+        retain_files: manual_attachment,
+    };
     install_synthetic_codex_home(&root);
     let project = root.join("project");
     std::fs::create_dir_all(&project).unwrap();
     let project = std::fs::canonicalize(project).unwrap();
     let paths = InstancePaths::resolve(Some(root.join("instance"))).unwrap();
     paths.create().unwrap();
+    cleanup.socket_dir = Some(paths.socket_dir.clone());
     let store = Store::open(&paths.database).unwrap();
     let executable = std::env::current_exe().unwrap();
     let app = Application::new(paths.clone(), store.clone(), executable.clone()).unwrap();
+    cleanup.supervisor = Some(app.supervisor.clone());
     let claude_reviewer: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&app.hooks.claude_settings).unwrap()).unwrap();
     let claude_implementer: serde_json::Value =
@@ -1109,6 +1701,7 @@ async fn t10_role_auth_hook_and_human_boundary() {
         prompt: "no inference".into(),
     };
     let config = codex_plan_reviewer.config;
+    let failure_config = config.clone();
     store
         .reserve_validation(
             &request,
@@ -1133,6 +1726,7 @@ async fn t10_role_auth_hook_and_human_boundary() {
     let control_listener = control::bind(&app).unwrap();
     let role_listener = task_cli::bind(&app).unwrap();
     let (shutdown, _) = tokio::sync::watch::channel(false);
+    cleanup.shutdown = Some(shutdown.clone());
     let control_task = tokio::spawn(control::serve_bound(
         app.clone(),
         shutdown.clone(),
@@ -1144,12 +1738,14 @@ async fn t10_role_auth_hook_and_human_boundary() {
         role_listener,
         shutdown.subscribe(),
     ));
+    cleanup.listeners = vec![control_task.abort_handle(), role_task.abort_handle()];
     let manual_duration_seconds = if manual_attachment {
         t10_manual_duration_seconds()
     } else {
         0
     };
     let manual_stop = paths.runtime.join("t10-manual-stop");
+    cleanup.releases.push(manual_stop.clone());
     let manual_deadline_millis =
         t10_manual_timestamp_millis() + u128::from(manual_duration_seconds) * 1000;
     let child = PreparedLaunch {
@@ -1202,6 +1798,7 @@ async fn t10_role_auth_hook_and_human_boundary() {
         ],
         supervision_executable: std::path::PathBuf::from(env!("CARGO_BIN_EXE_agenticjira")),
     };
+    cleanup.sessions.push(session.clone());
     let identity = app
         .supervisor
         .spawn(
@@ -1414,28 +2011,17 @@ async fn t10_role_auth_hook_and_human_boundary() {
             .active_session_ids()
             .unwrap()
             .contains(&session));
+        t10_pty_failure_cases(&app, &paths, &store, &failure_config, &mut cleanup).await;
     }
     let _ = shutdown.send(true);
     control_task.await.unwrap().unwrap();
     role_task.await.unwrap().unwrap();
-    let socket_dir = paths.socket_dir.clone();
     drop(app);
     drop(store);
-    match original_home {
-        Some(value) => std::env::set_var("HOME", value),
-        None => std::env::remove_var("HOME"),
-    }
-    match original_codex_home {
-        Some(value) => std::env::set_var("CODEX_HOME", value),
-        None => std::env::remove_var("CODEX_HOME"),
-    }
     if manual_attachment {
         println!(
             "AJ_T10_MANUAL_EVIDENCE_RETAINED data_dir={}",
             paths.root.display()
         );
-    } else {
-        std::fs::remove_dir_all(root).unwrap();
-        std::fs::remove_dir_all(socket_dir).unwrap();
     }
 }

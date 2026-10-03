@@ -109,6 +109,46 @@ The suite does not launch providers or install workflow files. Exercise native
 TRIP onboarding separately through [Project setup](PROJECT_SETUP.md), using an
 explicitly authorized target repository and preserving its original files.
 
+## PTY failure regression checks
+
+The existing `tests/runtime.rs` recursive child fixture exercises dropped Enter,
+`StopFailure` without a later `Stop`, an accepted turn that never completes,
+and a `permission_prompt` notification through a real managed PTY and role IPC.
+Run it with `cargo test --locked --test runtime` using the admitted provider CLI
+versions required by the existing fixture setup. The fixture launches its own
+test executable, not a model session. It checks exact input bytes, accepted hook
+identity, unchanged launch inventories, attention routing and owned-process cleanup.
+These host-boundary tests do not establish native provider compatibility or
+Claude's handling of a bare image path. The corresponding signal boundaries are
+in [Permission and provider signals](PERMISSION_SIGNAL_MATRIX.md).
+
+## Codex capacity observation checks
+
+Run `cargo test --locked --lib codex_capacity_` for the bounded reader and its
+managed-session attribution, audit and attention projection. These existing
+provider/store unit fixtures exercise structured overload versus other failures,
+file and turn boundaries, a FIFO with no writer, stale observations, immutable
+deduplication, business-state preservation and targets beyond display windows.
+They use disposable files and stored hooks; they do not launch a model session
+or establish a real upstream outage.
+
+## Pre-upgrade restore-point checks
+
+Run `cargo test --locked --lib database::tests::` and
+`cargo test --locked --lib store::interruption_tests::restorepoint_` for capacity,
+publication, retention and older-schema recovery. The existing inline fixtures
+use genuine schema differences for versions 31–35 and committed WAL data. They
+exercise backup, upgrade, restore, authority revocation and held startup, plus
+capacity, corruption, contention, manifest mismatch and interruption refusals.
+An intermediate migration failure checks that earlier recovery points survive
+retries and that the restore journal remains usable.
+
+Use `cargo test --locked --test contracts m4a_` for the existing lock, snapshot,
+quarantine and restore-journal contracts. These checks use disposable instances;
+they do not migrate or restore the user's instance. The final Rust matrix also
+includes the library, contract and runtime suites. Native provider and unchanged
+frontend evidence remain separate from these storage checks.
+
 ## Package contents
 
 The package includes `bin/llmrelay`, the compatibility executable `bin/agenticjira`, and documentation under `share/llmrelay/`. The `docs/` subdirectory keeps the same relative layout as this source tree so the README links work after extraction. Packaging also includes the research plan and third-party notices. Local packaging does not grant release or publication authority.

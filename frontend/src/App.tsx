@@ -163,12 +163,12 @@ function currentWaits(state: AppState): WaitNotice[] {
             nativeTurnFailureLabel[failure.kind]
           }`,
           detail:
-            `${owner} · ${failure.provider_error} · The session is still open; nothing is retried automatically.`,
+            `${owner} · The session is still open. LLMRelay does not retry or switch models in response to this notice.`,
           action: "Open agent output",
           target,
         });
       }
-      if (session.native_prompt) {
+      if (session.native_prompt && !session.native_prompt.dismissed) {
         waits.push({
           key: `native_prompt:${session.id}:${session.native_prompt.hook_event_id}`,
           title: `${roleLabel(session.role)} is ${
@@ -600,7 +600,7 @@ export function App() {
     if (!current) {
       void refresh();
       setNavigationNotice(
-        `${wait.title}: this is no longer waiting. The latest state was requested; nothing was executed.`,
+        `${wait.title}: this notice changed or was dismissed. The latest state was requested; nothing was executed.`,
       );
       return;
     }

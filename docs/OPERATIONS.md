@@ -210,6 +210,26 @@ authorize a replacement or bypass an approval.
 | Graceful stop exceeds 30 seconds | The service records recovery for the exact managed process. Choose **Ask it to stop again** or explicitly **Force stop this process** when offered. |
 | Browser request times out | Refresh and reconcile. The operation may have succeeded; retain its operation ID until a definitive result rather than submit a new operation blindly. |
 
+For an eligible failed task session, **Stop failed session and pause task** in
+Session Access requests a graceful stop for that exact session and reserves a
+durable task pause. Other active agents may finish their current work. The
+button does not mark the provider ready, resend input or switch models. A setup
+session uses its existing setup controls instead.
+
+The task remains paused while the service checks that the captured process
+group has exited and other active work has drained. If the stop needs recovery,
+use the task's existing recovery controls. After the pause settles, choose
+**Continue** or **Run next** in the task's workflow controls when ready. Only a
+successfully applied current continuation releases this pause; service restart,
+cooldown expiry, an exited process or an unrelated validation pause cannot
+release it. Independent provider holds still apply.
+
+If the request outcome is uncertain, choose **Refresh session state**, then
+**Check previous stop request**. That action checks the original operation; it
+does not issue a second stop. An unconfirmed signal remains a recovery concern
+even though the task pause was reserved. A refusal requires refreshed controls,
+not a new request against the old session details.
+
 Only frozen-runtime identity drift becomes stale when the original frozen
 runtime is current again; an unchanged capability key does not erase a permanent
 hook-trust, history, provenance or authority rejection.
@@ -416,22 +436,27 @@ reuse old qualification evidence to bypass these checks.
 
 ## Database restore points
 
-The database commands operate on the instance selected by `--data-dir`. Current
-schema only is supported: they do not upgrade an earlier installation. Fresh
-service initialization still creates the current schema. Service start, under
-the instance lock, upgrades supported existing schemas 31, 32, 33, 34 and 35 to schema
-36 through the existing migration transactions. Unsupported existing schemas,
-including schema 30 and newer unknown schemas, are refused. Each failed
-migration rolls back its own transaction. Schema 32 records final-repair receipt
-provenance; schema 33 records native-resolution provenance; schema 34 adds the
-exact submitted guidance text and digest while preserving the original body.
-Schema 35 adds durable provider failure holds; schema 36 adds durable attention
-observations. Existing receipts retain their recorded values. A schema-35 or
-earlier backup cannot be restored by the schema-36 build:
-backup verification and restore still require the executable's exact current
-schema. Automatic pre-upgrade restore points and backward-schema recovery remain
-pending in the deferred hardening program; this migration does not provide them.
-Database observation and backup commands do not grant upgrade authority.
+The database commands operate on the instance selected by `--data-dir` and never
+migrate it. Inspect, check and manual backup require current schema 36. Verify
+and restore accept schema 36 and the supported prior schemas 31–35, requiring the
+manifest version to match the actual SQLite version. Unknown versions are refused.
+
+Service start holds the exclusive instance lock, reconciles an interrupted
+restore, and checks an older database read-only, including committed WAL state.
+Before opening it for migration, startup requires successful integrity and
+foreign-key checks, sufficient space, and a verified restore point published to
+the default backup directory. It checks migration space again after publication.
+A failed preflight or backup prevents migration. Missing and already-current
+databases do not require this extra snapshot.
+
+Supported schemas 31–35 then upgrade to 36 through the existing migration
+transactions. Each failed migration rolls back its own transaction; earlier
+successful steps may remain committed. The failure identifies the verified
+restore point and offline recovery command. Startup never automatically restores
+or retries it. Existing receipts retain their recorded values. Schema 32 records
+final-repair receipt provenance; 33 records native-resolution provenance; 34 adds
+the submitted guidance text and digest; 35 adds provider failure holds; 36 adds
+durable attention observations.
 
 ```sh
 llmrelay database --data-dir <ABSOLUTE_INSTANCE_PATH> inspect
@@ -451,10 +476,25 @@ Backup defaults to a private sibling directory named `<instance-directory>.backu
 `backup --backup-dir <ABSOLUTE_DIRECTORY>` selects another private location outside
 the instance and registered repositories. A restore point includes SQLite state
 and a versioned manifest with length, schema and SHA-256. SQLite's backup API
-includes committed WAL data. Only successfully published restore points are usable.
-Retention targets ten backups, thirty days and five GiB, always preserving the
-newest verified restore point. Incomplete evidence and displaced-state quarantine
-are not automatically removed.
+includes committed WAL data. The staged database and manifest are reread and
+verified before atomic publication. Only successfully published restore points
+are usable.
+
+For capacity checks, the database size is the larger of its main-file length and
+the logical page count times page size, including committed WAL growth. Backup
+requires twice that size; migration requires another twice that size, the live
+WAL length and 64 MiB of reserve. When both locations share a filesystem, startup
+checks the combined amount. Otherwise it checks each location separately.
+Sizing failures and insufficient space refuse the operation. These allowances
+cannot prevent another process from consuming disk space afterward.
+
+Retention targets ten backups, thirty days and five GiB. It always preserves the
+newest verified restore point and the newest verified point for each supported
+prior schema 31–35. These bounded schema anchors survive the ordinary limits so
+retries after a partial upgrade cannot erase the earlier recovery point. If
+protected points alone exceed a limit, they remain; later capacity checks may
+refuse another backup or upgrade. Unrecognized or unverified content, incomplete
+staging and displaced-state quarantine are not automatically removed.
 
 Restore replaces database state, not repository files, native provider history,
 worktrees, transcripts or external effects. The displaced database and sidecars
@@ -471,6 +511,13 @@ to overwrite it. Later replacement phases are reconciled from the journal.
 A restored instance is held for reconciliation. Old credentials, reusable
 permission rules and automatic resume authority are invalidated. The dashboard
 may be available for inspection and safe recovery, but execution remains fenced.
+Restoring an older snapshot first installs its original schema and commits this
+hold. A later service start makes a new verified snapshot and attempts the
+supported forward upgrade while retaining the hold. This build serves schema 36;
+a persistent migration defect still requires a corrected build or operator
+repair. Restoring the data does not promise that a failing migration will succeed
+or launch a compatible older executable.
+
 Resolve the reported process, claim, check and external-reference prerequisites,
 stop the host, and run `release-hold` offline. Success leaves projects and work
 paused: resuming normal work is a separate explicit action and requires current
@@ -489,6 +536,8 @@ verified machine reboot after that point before release, in addition to the
 other prerequisites. A reboot performed before restore does not satisfy this
 condition. The command never reboots the machine, and acknowledgment alone cannot
 release the hold. Unavailable boot evidence refuses unsafe replacement/release.
+Readable older state must pass inventory and repository-overlap checks; a failed
+inventory query cannot use the unreadable-data fallback.
 
 ## Provider compatibility explanations
 
@@ -576,6 +625,21 @@ inventory is unknown.
 
 The dashboard lists current waits in **Waiting for you now**. A managed approval opens the exact request in Approvals; a provider-native prompt or turn failure opens the exact agent output. An independent task hold remains visible alongside an approval. A failed or uncertain approval response requests fresh state and is never automatically resent.
 
+For a generic native prompt, **Dismiss notice** in Session Access hides the
+currently displayed notice throughout LLMRelay. This acknowledgement is shared
+across dashboards and survives reconnect and service restart. It does not answer
+the prompt, resolve a permission request, change readiness or grant permission.
+The session retains **Notice dismissed; native status unknown**, and **View
+output** and keyboard control remain available. Exact managed approvals remain
+visible and actionable independently.
+
+Dismissal covers only notifications already included in that displayed notice.
+Any later notification appears again, including one in the same turn: the
+provider does not identify whether it is a reminder or a different request.
+An uncertain dismissal can be checked using its original request after refresh.
+An existing operating-system notification may remain visible; clicking a stale
+or dismissed alert refreshes current state without taking an action.
+
 Guidance written to a current running session, or a current resumed invocation,
 appears in attention when trusted input acceptance has not been observed for
 30 seconds. The notice opens that agent's output. It is an observation, not a
@@ -596,6 +660,24 @@ Choose **Enable browser notifications** to enable alerts for this dashboard visi
 Session Access keeps **Session open**, native accepted-turn evidence and report submission separate. An implementation report awaits processing or verification; neither label means the task is accepted. A later accepted turn can make that report historical. For native dialogs without a supported signal, use **View output** and explicit keyboard control; the app does not guess from terminal text. See the [signal matrix](PERMISSION_SIGNAL_MATRIX.md).
 
 The sidebar **Appearance** selector offers System, Light and Dark. An explicit choice overrides the operating-system preference and is stored for this browser origin. System follows the operating-system preference; unavailable or invalid preference storage falls back to System.
+
+A **Codex reported model capacity** notice opens the affected agent output.
+For an attached, admitted Codex 0.157.1 session, the existing observation cycle
+reads only the history path named by its current accepted turn. It requires
+matching session and turn identities and the structured `server_overloaded`
+completion value. The notice records an observation only: it does not change
+readiness, create or release a provider hold, retry input or switch models.
+Later matching activity, a new accepted turn or invocation, session exit or
+replacement, or an obsolete attempt removes the current notice. Its historical
+audit remains; repeated cycles do not insert another observation for that binding.
+
+The reader rejects symlinks and nonregular files without waiting for a FIFO
+writer. It reads at most 256 KiB for metadata and 1 MiB of complete tail records,
+with a 256 KiB record limit. Missing, changing, malformed or unsupported history,
+or a turn start outside that tail, yields no specific capacity notice. Ordinary
+agent output remains available. These limits avoid inferring a failure from
+terminal text or unrelated history; the [signal matrix](PERMISSION_SIGNAL_MATRIX.md)
+separates native characterization from managed integration evidence.
 
 ### Durable attention observations
 

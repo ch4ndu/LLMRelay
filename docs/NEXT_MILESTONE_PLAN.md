@@ -19,7 +19,7 @@ will defer personal hands-on acceptance until the selected features are present.
 Engineering verification continues at each checkpoint. The earlier implementation
 is a verified foundation, not acceptance of the complete desired product.
 
-## Current engineering task — October 1 hardening
+## Completed engineering work — October 1–2 hardening
 
 The user selected the H1–H16 hardening findings in
 [the Jinn comparison](MILESTONES.md#september-30-hardening-first-jinn-comparison-latest-release)
@@ -28,14 +28,22 @@ now implemented and verified: independent code review and fresh final verificati
 approved it, and all 343 automated tests passed along with the build checks. H2
 is the accepted follow-up below; evidence-gated dispositions and verification
 limits remain recorded in MILESTONES. No release is included.
+The subsequent continuation is verified complete within the selected boundaries,
+including the October 2 local H2/H12 alternatives. Its delivery state is recorded
+[below](#october-1-deferred-hardening-continuation). The original automatic H2/H12
+outcomes remain provider-dependent; the local alternatives do not claim them.
+The final integrated suite passed 62 frontend and 335 Rust tests, with independent
+code review and fresh final verification approved. Local delivery is next; the
+separate features-after-hardening list requires its own scoped plans.
 The older milestone proposals below retain their historical scope and do not
 authorize additional work.
 
 Existing LLMRelay data may be purged under the user's explicit instruction;
 backup and restoration of that data are not prerequisites for this task. This
 does not remove the existing offline backup/restore features or authorize
-unrelated deletion. Automatic pre-migration restore-point orchestration remains
-outside the approved hardening scope.
+unrelated deletion. Automatic pre-migration restore-point orchestration was
+subsequently selected as the fourth continuation slice and is now verified
+complete within its documented recovery and retention boundaries.
 
 ### Accepted follow-up: H2 failed-turn automatic readiness
 
@@ -337,9 +345,17 @@ count the later feature list as part of these slices.
 The independently approved H4 plan delivers durable role/lane failure holds and
 an exact human release action. Its implementation passed integration checks,
 independent code review and fresh final verification. This bounded app-owned H4
-increment is complete. The default cooldown does not implement
-provider reset parsing, and release never grants idle readiness. H2/H11/H12 and
-the remaining slices stay open. See [Milestones](MILESTONES.md#deferred-hardening-continuation-october-1)
+increment satisfies H4 through its bounded-default branch. It does not implement
+provider reset parsing, and release never grants idle readiness. Pinned Claude
+2.1.283 lacks failed-turn registry snapshots and unique notification/request
+correlation, leaving H2 and H12 open; its cached quota windows also cannot supply
+an attributable failure deadline. H11's ordinary retry-delay premise is not
+supported by pinned source: query retries precede the failure hook. The resulting
+notice-wording correction passed focused checks, independent code review and
+fresh final verification, with timing and execution authority unchanged. The
+confined native observation remains inconclusive and is not proof of retry
+ordering. These are evidence boundaries, not pending user permissions.
+See [Milestones](MILESTONES.md#deferred-hardening-continuation-october-1)
 and the current [workflow behavior](WORKFLOWS.md).
 
 H3/H15 now delivers verified classify-only durable observations and bounded
@@ -347,12 +363,53 @@ recurring-block attention. Focused checks, independent code review, the full
 verification matrix and fresh final verification passed. It uses the existing cycle and attention routes, with no automatic
 recovery, retry, readiness or lifecycle change. The approved thresholds and exact
 conservative scope are in [Workflows](WORKFLOWS.md) and
-[Operations](OPERATIONS.md#durable-attention-observations). H9/H16 and the verified
-pre-upgrade restore-point slice remain pending; the earlier removal of automatic
-backup orchestration described above is historical, superseded by the user's
-selection of that fourth slice.
+[Operations](OPERATIONS.md#durable-attention-observations). H9's four existing-PTY fixture cases are complete, with focused checks, the
+post-review runtime suite, independent code review and fresh final verification
+passed. Corrected native characterization now reproduces Claude 2.1.283
+attachment conversion with a stranded Enter; the separate encoded-guidance
+observation also shows that encoding does not guarantee acceptance. H16's
+structured-history prerequisite is demonstrated by pinned Codex 0.157.1 local
+capacity and noncapacity faults. Its managed-session attribution and
+attention-only reader passed focused checks, independent code review, the final
+Rust matrix and fresh final verification. The H9/H16 slice is complete within
+these finite characterization and observation-only boundaries. Exact evidence and cleanup are in
+[Permission and provider signals](PERMISSION_SIGNAL_MATRIX.md). The pre-upgrade
+restore-point slice is complete: focused checks, independent code review, the
+final Rust matrix and fresh final verification passed. Verified publication and capacity checks precede migration, and
+older snapshots can be restored under the existing execution hold. Its recovery
+limits and bounded retention exceptions are in
+[Operations](OPERATIONS.md#database-restore-points). The earlier removal of
+automatic backup orchestration described above is historical, superseded by the
+user's selection of this fourth slice.
 
 The H3/H15 review repairs preserve exact invocation targets, positive activity
 clearing and independent provider holds, isolate recoverable recurrence errors,
-and index report lookups. All verification gates for this increment passed;
-the broader deferred hardening program remains incomplete.
+and index report lookups. All verification gates for that increment passed.
+The subsequent H9/H16, restore-point and local H2/H12 slices are also verified
+complete within the boundaries recorded here. Original automatic H2/H12
+capabilities remain dependent on provider contracts.
+
+### H2/H12 local recovery and notice dismissal (October 2)
+
+The user selected local controls: an exact graceful stop with a durable task
+pause, and shared durable dismissal of generic native notices. Independent code
+review, the configured verification suite and fresh final verification passed;
+all six acceptance criteria for these local alternatives are complete. The task
+pause requires verified exit and a
+successfully applied explicit Continue or Run next. Dismissal covers only the
+displayed notifications, preserves raw wait and exact approval evidence, and
+shows any later notification again, including in the same turn.
+
+Publication of the two provider enhancement requests is cancelled; drafts remain
+local and not submitted. These controls do not implement automatic failed-turn
+readiness or exact permission-notice resolution. Related research and the
+provider contracts needed for those original outcomes are maintained in
+[Permission and provider signals](PERMISSION_SIGNAL_MATRIX.md#h2-and-h12-local-controls-and-provider-contract-dependencies).
+
+After a supported provider contract becomes available, verify its documented
+semantics and exact version, qualify it through the existing focused runtime
+and contract seams, then plan the bounded adapter/state changes. Keep H2 and H12
+independent so qualifying one does not imply the other. Conservative native
+state remains in place until each passes admission and acceptance. No further probe
+of unchanged payloads, speculative parser, polling daemon or execution-transport
+replacement is selected.

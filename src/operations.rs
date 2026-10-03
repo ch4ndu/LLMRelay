@@ -742,8 +742,27 @@ impl Application {
             .require_execution_unheld("attention observation")
             .and_then(|()| self.supervisor.process_snapshot())
             .and_then(|processes| {
-                self.store
-                    .observe_attention(Utc::now(), &processes, fresh_boot)
+                let attention = self
+                    .store
+                    .observe_attention(Utc::now(), &processes, fresh_boot);
+                if attention.is_ok() {
+                    self.attention_baseline_reset.store(true, Ordering::SeqCst);
+                }
+                let capacity = (|| {
+                    let Some(root) = crate::providers::codex::capacity_history_root() else {
+                        return Ok(());
+                    };
+                    let observations = self.store.read_codex_capacity(&root, &processes)?;
+                    if !observations.is_empty() {
+                        let current = self.supervisor.process_snapshot()?;
+                        for (candidate, source) in observations {
+                            self.store
+                                .record_codex_capacity(&candidate, &source, &current)?;
+                        }
+                    }
+                    Ok(())
+                })();
+                attention.and(capacity)
             });
         let Ok(mut reported) = self.attention_failure_reported.lock() else {
             tracing::warn!("attention observation failure state is poisoned");
@@ -751,7 +770,6 @@ impl Application {
         };
         match observed {
             Ok(()) => {
-                self.attention_baseline_reset.store(true, Ordering::SeqCst);
                 *reported = None;
             }
             Err(error) => {
@@ -853,6 +871,12 @@ impl Application {
         let mut due_human = None;
         let mut due_automatic = None;
         for (session, requested_by, state, result_json, attempt, held, own_failure) in candidates {
+            {
+                let connection = self.store.lock()?;
+                if crate::store::failure_stop_fence(&connection, &attempt)?.is_some() {
+                    continue;
+                }
+            }
             if own_failure {
                 continue;
             }
@@ -1269,6 +1293,7 @@ impl Application {
         let facts = facts
             .pop()
             .ok_or_else(|| anyhow!("session is not a durable restart candidate"))?;
+        crate::store::require_failure_stop_released(&tx, &facts.attempt_id)?;
         let refusal = facts
             .admission_gate(automatic)
             .map(|gate| (gate.reason_code().to_owned(), gate.message().to_owned()))
@@ -2551,6 +2576,10 @@ impl Application {
         if !self.dispatch_enabled() {
             bail!("service is draining; validation resume is disabled")
         }
+        {
+            let connection = self.store.lock()?;
+            crate::store::require_session_failure_stop_released(&connection, session_id)?;
+        }
         let record = self.store.session_json(session_id)?;
         let is_runtime_probe = record["validation_cell"].as_str() == Some("trip_runtime_probe");
         if is_runtime_probe && !runtime_probe {
@@ -3147,6 +3176,10 @@ impl Application {
         if !self.dispatch_enabled() {
             bail!("service is draining; role resume is disabled")
         }
+        {
+            let connection = self.store.lock()?;
+            crate::store::require_session_failure_stop_released(&connection, session_id)?;
+        }
         let record = self.store.session_json(session_id)?;
         if record["validation_cell"].as_str() == Some("trip_runtime_probe") {
             bail!("ordinary runtime probe sessions resume only through resume_runtime_probe")
@@ -3346,6 +3379,10 @@ impl Application {
         role: crate::domain::RoleKind,
         prompt: &str,
     ) -> Result<ValidationLaunchResult> {
+        {
+            let connection = self.store.lock()?;
+            crate::store::require_failure_stop_released(&connection, attempt_id)?;
+        }
         if matches!(
             role,
             crate::domain::RoleKind::PlanReviewer
@@ -3835,6 +3872,10 @@ impl Application {
         fresh_resume_rejection: Option<&serde_json::Value>,
     ) -> Result<BrowserLaunchDispatch> {
         self.store.require_execution_unheld("role launches")?;
+        {
+            let connection = self.store.lock()?;
+            crate::store::require_failure_stop_released(&connection, attempt_id)?;
+        }
         let release_permit = |error: anyhow::Error, reason: &str| match self
             .store
             .release_unconsumed_launch_permits(Some(&context.permit_id), reason)
@@ -4151,6 +4192,9 @@ impl Application {
     }
 
     pub fn execute_human_command(&self, command: &HumanCommand) -> Result<OperationResult> {
+        if matches!(command, HumanCommand::StopFailedSession { .. }) {
+            return self.supervisor.stop_failed_session(command);
+        }
         if let HumanCommand::ResolveRecovery {
             operation_id,
             recovery_id,

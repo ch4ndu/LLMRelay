@@ -65,6 +65,33 @@
       "service_tier": null,
       "session": "retained"
     },
+    "session-astra-max-fresh": {
+      "adapter": "direct-codex-cli",
+      "authority": "read-only",
+      "effort": "max",
+      "model": "gpt-6-astra",
+      "provider": "codex",
+      "service_tier": null,
+      "session": "fresh"
+    },
+    "session-astra-max-read": {
+      "adapter": "direct-codex-cli",
+      "authority": "read-only",
+      "effort": "max",
+      "model": "gpt-6-astra",
+      "provider": "codex",
+      "service_tier": null,
+      "session": "retained"
+    },
+    "session-astra-max-write": {
+      "adapter": "direct-codex-cli",
+      "authority": "workspace-write",
+      "effort": "max",
+      "model": "gpt-6-astra",
+      "provider": "codex",
+      "service_tier": null,
+      "session": "retained"
+    },
     "session-fable-high-read": {
       "adapter": "direct-claude-cli",
       "authority": "read-only",
@@ -105,19 +132,19 @@
   "project_name": "LLMRelay",
   "roles": {
     "code_reviewer": {
-      "profile": "session-sol61-xhigh-read"
+      "profile": "session-astra-max-read"
     },
     "explorer": {
-      "profile": "session-astra-high-read"
+      "profile": "session-astra-max-read"
     },
     "final_verifier": {
-      "profile": "session-fable-medium-fresh"
+      "profile": "session-astra-max-fresh"
     },
     "implementer": {
-      "profile": "session-sol61-xhigh-write"
+      "profile": "session-astra-max-write"
     },
     "plan_reviewer": {
-      "profile": "session-fable-high-read"
+      "profile": "session-astra-max-read"
     }
   },
   "testing": {

@@ -732,6 +732,16 @@ fn evaluate_attempt(connection: &Connection, attempt: &Attempt) -> Result<Attemp
 
 fn evaluate_attempt_owner(connection: &Connection, attempt: &Attempt) -> Result<AttemptDecision> {
     let mut prerequisites = Vec::new();
+    if crate::store::failure_stop_fence(connection, &attempt.id)?.is_some() {
+        return Ok(blocked_attempt_decision(
+            attempt, "workflow.failure_stop_pause", DecisionDisposition::Held,
+            DecisionEvidenceState::Pending, DecisionOwner::Human, serde_json::json!({}),
+            Some("This task stays paused after stopping its failed session. Wait for the verified exit and finished pause, then choose Continue or Run next.".into()),
+            prerequisites,
+            serde_json::json!({"action":"held","for":"failure_stop_pause","attempt_id":attempt.id}),
+            AttemptDecisionFlow::Skip, None, Vec::new(),
+        ));
+    }
     if let Some((recovery_id, operation, effect)) =
         open_coordinator_failure(connection, &attempt.id)?
     {
@@ -5775,6 +5785,19 @@ fn process_one_control(
         controlled_attempts.push(parent.as_str());
     }
     let active = active_sessions(app, &controlled_attempts, kind != "cancel")?;
+    if kind == "pause_after_role"
+        && serde_json::from_str::<serde_json::Value>(&payload)?
+            .get("failure_stop_operation_id")
+            .is_some()
+    {
+        let connection = app.store.lock()?;
+        if !crate::store::failure_stop_target_quiescent(&connection, &id)? {
+            return Ok(Some(serde_json::json!({
+                "action":"draining_control","control_id":id,"attempt_id":attempt,
+                "for":"failed_session_quiescence","active":active,
+            })));
+        }
+    }
     match kind.as_str() {
         "continue" => {
             let outcome = finish_continue_with_restart_hold(app, &id, &task, &attempt);
@@ -7502,6 +7525,7 @@ fn finish_continue_with_restart_hold(
         && !archived
         && latest_attempt
         && !crate::workflow::pending_continue(&tx, attempt, Some(id))?
+        && crate::store::failure_stop_fence(&tx, attempt)? != Some(false)
         && (ordinary
             || parked
             || (reserved_fresh_route
@@ -7571,6 +7595,65 @@ fn finish_control_in_transaction(
     cancel_ownership: Option<&ReworkCancelOwnership>,
     now: &str,
 ) -> Result<()> {
+    let (kind, expected_version): (String, i64) = tx.query_row(
+        "SELECT kind,expected_version FROM controls WHERE id=?1 AND attempt_id=?2",
+        params![id, attempt],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let failure_fence = crate::store::failure_stop_fence(tx, attempt)?;
+    if matches!(kind.as_str(), "continue" | "run_next") && failure_fence.is_some() {
+        crate::store::require_failure_stop_continuation_ready(tx, attempt)?;
+        let current: Option<(String, String, String)> = tx.query_row(
+            "SELECT t.lifecycle,t.attention,a.phase FROM tasks t JOIN attempts a ON a.task_id=t.id
+             WHERE t.id=?1 AND a.id=?2 AND t.version=?3 AND t.archived_at IS NULL
+               AND t.lifecycle IN ('in_progress','validation') AND a.status='held'
+               AND a.id=(SELECT id FROM attempts WHERE task_id=t.id ORDER BY created_at DESC LIMIT 1)",
+            params![task, attempt, expected_version + 1], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?;
+        let Some((lifecycle, task_attention, phase)) = current else {
+            bail!("The continuation changed before the failed-session pause could be released.")
+        };
+        let rework: Option<(String, bool)> = tx.query_row(
+            "SELECT state,COALESCE(json_extract(result_json,'$.cancellation_pending'),0)
+             FROM rework_intents WHERE new_attempt_id=?1 AND state NOT IN ('completed','cancelled')",
+            params![attempt], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let manager_control_active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
+             AND kind IN ('manager_stop','manager_change')
+             AND state NOT IN ('finished','cancelled','superseded','rejected'))",
+            params![attempt],
+            |row| row.get(0),
+        )?;
+        let original_attention = if task_attention == "none" {
+            "paused"
+        } else {
+            &task_attention
+        };
+        if !crate::workflow::ordinary_control_allowed(
+            &lifecycle,
+            original_attention,
+            Some("held"),
+            Some(&phase),
+            rework
+                .as_ref()
+                .map(|(state, pending)| (state.as_str(), *pending)),
+            manager_control_active,
+            &kind,
+        ) {
+            bail!("The continuation is no longer eligible to release the failed-session pause.")
+        }
+        require_continue_ownership(tx, attempt)?;
+    }
+    if kind == "pause_after_role" {
+        let failure_origin: bool = tx.query_row(
+            "SELECT json_type(payload_json,'$.failure_stop_operation_id')='text' FROM controls WHERE id=?1",
+            params![id], |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
+        )?;
+        if failure_origin && !crate::store::failure_stop_target_quiescent(tx, id)? {
+            bail!("The captured failed process has not been verified stopped.")
+        }
+    }
     let rework: Option<(String, String)> = tx
         .query_row(
             "SELECT parent_attempt_id,state FROM rework_intents
@@ -7598,6 +7681,15 @@ fn finish_control_in_transaction(
     let changed = tx.execute("UPDATE controls SET state='finished',updated_at=?1 WHERE id=?2 AND state IN ('requested','draining')",params![now,id])?;
     if changed != 1 {
         bail!("control changed before its atomic application")
+    }
+    if matches!(kind.as_str(), "continue" | "run_next") && failure_fence.is_some() {
+        tx.execute(
+            "UPDATE controls SET payload_json=json_set(payload_json,'$.failure_stop_released_by',?1),updated_at=?2
+             WHERE attempt_id=?3 AND kind='pause_after_role'
+               AND json_type(payload_json,'$.failure_stop_operation_id')='text'
+               AND json_type(payload_json,'$.failure_stop_released_by') IS NULL",
+            params![id, now, attempt],
+        )?;
     }
     let parent_claim_quiescent = cancel_ownership.map(|ownership| ownership.ordinary_claim_only);
     if let Some((parent, rework_state)) = rework {

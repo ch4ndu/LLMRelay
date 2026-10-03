@@ -8407,8 +8407,8 @@ Deno.test("Browser notifications need this page's opt-in, announce each new wait
     check(
       shown.length === 2 && shown[1].title.includes("latest turn stopped") &&
         shown[1].options?.tag === "llmrelay:service-a:turn_failure:s-fail:hook-fail-1" &&
-        listed().includes("Selected model is at capacity."),
-      "a failed turn was not announced once with its provider error",
+        listed().includes("model is overloaded or at capacity"),
+      "a failed turn was not announced once with its plain failure explanation",
     );
     act(() => shown[0].onclick?.());
     await settle();
@@ -8442,11 +8442,30 @@ Deno.test("Browser notifications need this page's opt-in, announce each new wait
         !listed().includes("wants to use npm"),
       `the new incarnation's alert lost its identity or an answered wait stayed: ${shown[2]?.options?.tag}`,
     );
+    const prompted: Session = { ...managerSession, native_prompt: {
+      hook_event_id: "displayed-notice", kind: "agent_needs_input", observed_at: "2026-10-01T00:00:00Z", dismissed: false,
+    } };
+    await next(at("service-b", "3", [request("pr6", "gradle")], [prompted]));
+    const noticeAlert = shown.at(-1)!;
+    check(noticeAlert.options?.tag?.endsWith(":displayed-notice") && listed().includes("waiting for your input"), "a generic notice did not surface");
+    const dismissed: Session = { ...prompted, native_prompt: { ...prompted.native_prompt!, dismissed: true } };
+    const dismissedSnapshot = at("service-b", "4", [request("pr6", "gradle")], [dismissed]);
+    await next(dismissedSnapshot);
+    check(!listed().includes("waiting for your input") && listed().includes("wants to use gradle"), "dismissal hid an exact approval or kept the generic notification");
+    const readsBeforeDismissedClick = live.reads.length;
+    act(() => noticeAlert.onclick?.());
+    await settle();
+    check(live.reads.length === readsBeforeDismissedClick + 1 && document.body.textContent?.includes("this notice changed or was dismissed"), "a dismissed browser alert acted on stale presentation");
+    live.reads.at(-1)!.resolve(dismissedSnapshot);
+    await settle();
+    const countBeforeLaterNotice = shown.length;
+    await next(at("service-b", "5", [request("pr6", "gradle")], [{ ...prompted, native_prompt: { ...prompted.native_prompt!, hook_event_id: "later-same-turn-notice" } }]));
+    check(shown.length === countBeforeLaterNotice + 1 && shown.at(-1)?.options?.tag?.endsWith(":later-same-turn-notice"), "a later same-turn notification was swallowed by dismissal");
     const reads = live.reads.length;
     act(() => shown[0].onclick?.());
     await settle();
     check(
-      document.body.textContent?.includes("this is no longer waiting") &&
+      document.body.textContent?.includes("this notice changed or was dismissed") &&
         live.reads.length === reads + 1 && focused() !== "permission_request:pr3",
       "a stale notification opened a resolved request or did not refresh",
     );
@@ -8576,7 +8595,7 @@ Deno.test("Session Access keeps the open process apart from reports, accepted tu
       label("s-fail") === "Turn stopped with an error" && text("s-fail").includes("Session open") &&
         text("s-fail").includes("the model is overloaded or at capacity") &&
         text("s-fail").includes("Selected model is at capacity. Please try a different model.") &&
-        text("s-fail").includes("does not retry the turn or switch models"),
+        text("s-fail").includes("does not retry or switch models in response to this notice"),
       `a failed turn was not explained apart from its open process: ${text("s-fail")}`,
     );
     const promptButtons = [...article("s-prompt").querySelectorAll("button")]
@@ -8611,7 +8630,7 @@ Deno.test("Session Access keeps the open process apart from reports, accepted tu
     check(
       label("s-fail-prompt") === "Turn stopped with an error" &&
         text("s-fail-prompt").includes("Session open") &&
-        text("s-fail-prompt").includes("does not retry the turn or switch models") &&
+        text("s-fail-prompt").includes("does not retry or switch models in response to this notice") &&
         text("s-fail-prompt").includes("LLMRelay cannot answer this prompt") &&
         !text("s-fail-prompt").includes("Implementation submitted") &&
         !text("s-fail-prompt").includes("Finished its turn") &&
@@ -8634,7 +8653,7 @@ Deno.test("Session Access keeps the open process apart from reports, accepted tu
     const stoppedThenPrompted = taskStatus(verifying, { sessions: [failedThenPrompted] });
     check(
       stoppedThenPrompted.label === "Agent turn stopped" && stoppedThenPrompted.tone === "danger" &&
-        stoppedThenPrompted.detail.includes("nothing is retried automatically") &&
+        stoppedThenPrompted.detail.includes("LLMRelay does not retry or switch models in response to this notice.") &&
         stoppedThenPrompted.detail.includes("asking for permission in its own terminal") &&
         !stoppedThenPrompted.completed,
       `a later prompt hid the failed turn on the task: ${stoppedThenPrompted.label}`,
@@ -8648,6 +8667,97 @@ Deno.test("Session Access keeps the open process apart from reports, accepted tu
     );
   } finally {
     unmount();
+  }
+});
+
+Deno.test("Failed session stop and native notice dismissal keep exact requests and honest refreshed state", async () => {
+  const requests: Record<string, unknown>[] = [];
+  let refreshes = 0;
+  let output = "";
+  let fail: (error: Error) => void = noop;
+  let respond: () => Response | Promise<Response> = () => new Promise((_resolve, reject) => { fail = reject; });
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return respond();
+  }) as typeof fetch;
+  const stopped: Session = {
+    ...managerSession, readiness: "busy",
+    native_turn: { accepted_hook_event_id: "accepted", accepted_at: "2026-10-01T00:00:00Z",
+      failure: { hook_event_id: "failure", kind: "overloaded", provider_error: "raw-provider-error",
+        details: null, observed_at: "2026-10-01T00:00:01Z" } },
+    failed_session_stop: {
+      task_id: "AJ-1", attempt_id: "a1", expected_task_version: 7, session_id: managerSession.id,
+      role_generation_id: managerSession.role_generation_id, transcript_epoch: "epoch",
+      process_identity: { pid: 42, process_group_id: 42, native_start_marker: "start", observed_started_at: "2026-10-01T00:00:00Z" },
+      accepted_hook_event_id: "accepted", failure_hook_event_id: "failure",
+    },
+  };
+  const prompted: Session = {
+    ...managerSession, id: "prompt-session", role_generation_id: "prompt-generation",
+    native_prompt: { hook_event_id: "notice-1", kind: "agent_needs_input", observed_at: "2026-10-01T00:00:00Z",
+      dismissed: false, dismissal: { task_id: "AJ-1", attempt_id: "a1", session_id: "prompt-session",
+        role_generation_id: "prompt-generation", transcript_epoch: "prompt-epoch", accepted_hook_event_id: "prompt-turn",
+        raw_wait_start_hook_event_id: "prompt-turn", displayed_boundary_hook_event_id: "notice-2" } },
+  };
+  const access = {
+    routes: {}, discarding: {}, routeFor: () => undefined,
+    view: (id: string) => { output = id; return Promise.resolve<CmuxViewOutcome>({ state: "pending", message: "", retry_available: false }); },
+    take: () => Promise.resolve(), release: () => Promise.resolve(), discard: () => Promise.resolve(),
+    close: noop, refresh: () => { refreshes += 1; },
+  };
+  const render = (failed: Session, notice: Session) => <SessionTree sessions={[failed, notice]} access={access}
+    permissionRequests={[{ ...pendingPermission, session_id: notice.id }]} setupProjectId={() => undefined} onOpenSetup={noop} />;
+  const article = (id: string) => document.querySelector(`[data-attention-target="session:${id}"]`)!;
+  const receipt = (state: string) => new Response(JSON.stringify({ result: {
+    operation_id: requests.at(-1)?.operation_id, entity_kind: "session", entity_id: requests.at(-1)?.session_id,
+    version: null, state, detail: {},
+  } }));
+  try {
+    mount(render(stopped, prompted));
+    click("Stop failed session and pause task");
+    await settle();
+    const pending = [...article(stopped.id).querySelectorAll("button")].find((button) => button.textContent === "Checking stop and exit…");
+    check(pending?.disabled && requests.length === 1, "the pending stop allowed a second click");
+    const { operation_id: stopId, kind, ...binding } = requests[0];
+    check(kind === "stop_failed_session" && typeof stopId === "string" && JSON.stringify(binding) === JSON.stringify(stopped.failed_session_stop), "the stop did not submit its projected exact binding");
+    fail(new TypeError("connection ended after dispatch"));
+    await settle();
+    check(article(stopped.id).textContent?.includes("outcome is uncertain") && refreshes > 0, "unknown stop delivery was presented as success");
+    const stopping = { ...stopped, status: "interrupt_requested", failed_session_stop: null,
+      failure_stop_pause: { control_id: "pause", state: "requested" } };
+    rerender(render(stopping, prompted));
+    respond = () => receipt("stop_recovery_required");
+    click("Check previous stop request");
+    await settle();
+    check(JSON.stringify(requests[1]) === JSON.stringify(requests[0]), "stop reconciliation invented new authority or an operation ID");
+    const paused = { ...stopping, status: "exited", failure_stop_pause: { control_id: "pause", state: "finished" } };
+    rerender(render(paused, prompted));
+    check(article(stopped.id).textContent?.includes("task is paused") && article(stopped.id).textContent?.includes("Continue or Run next"), "verified exit lost the persistent task pause");
+    check(![...article(stopped.id).querySelectorAll("button")].some((button) => button.textContent?.includes("Stop failed")), "a paused exited session offered another stop");
+    respond = () => receipt("native_prompt_dismissed");
+    click("Dismiss notice");
+    await settle();
+    const { operation_id: dismissId, kind: dismissKind, ...dismissal } = requests[2];
+    check(dismissKind === "dismiss_native_prompt" && dismissId !== stopId && JSON.stringify(dismissal) === JSON.stringify(prompted.native_prompt?.dismissal), "dismissal did not bind the displayed frontier");
+    const dismissed = { ...prompted, native_prompt: { ...prompted.native_prompt!, dismissed: true } };
+    rerender(render(paused, dismissed));
+    check(article(prompted.id).textContent?.includes("Notice dismissed; native status unknown") &&
+      article(prompted.id).textContent?.includes("Waiting for your approval"), "dismissal claimed resolution or hid an actionable approval");
+    const view = [...article(prompted.id).querySelectorAll("button")].find((button) => button.textContent === "View output")!;
+    act(() => view.click());
+    await settle();
+    check(output === prompted.id, "dismissal lost the exact session output action");
+    check(taskStatus(task, { sessions: [dismissed] }).label !== "Waiting in the agent's terminal", "board still promoted the dismissed wait");
+    const later = { ...dismissed, native_prompt: { ...dismissed.native_prompt, dismissed: false, hook_event_id: "notice-3",
+      dismissal: { ...prompted.native_prompt!.dismissal!, displayed_boundary_hook_event_id: "notice-3" } } };
+    rerender(render(paused, later));
+    click("Dismiss notice");
+    await settle();
+    check(requests[3].displayed_boundary_hook_event_id === "notice-3" && requests[3].operation_id !== dismissId, "a later same-turn notice reused the old dismissal frontier");
+    check(requests.every((request) => ["stop_failed_session", "dismiss_native_prompt"].includes(String(request.kind))), "a presentation control issued downstream work");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
   }
 });
 

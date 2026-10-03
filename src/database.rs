@@ -2,7 +2,10 @@ use crate::config::InstancePaths;
 use crate::domain::{
     DecisionEvidenceState, DecisionOwner, DecisionPrerequisite, RestartCandidateResult,
 };
-use crate::store::{require_current_schema, Store, CURRENT_SCHEMA_VERSION};
+use crate::store::{
+    require_current_schema, require_maintenance_schema, Store, CURRENT_SCHEMA_VERSION,
+    SERVICE_UPGRADABLE_SCHEMA_VERSIONS, STATE_DATABASE_BUSY_TIMEOUT,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
@@ -25,10 +28,12 @@ const HOLD_ID: &str = "database-restore-hold";
 const MAX_BACKUPS: usize = 10;
 const MAX_BACKUP_AGE_DAYS: i64 = 30;
 const MAX_BACKUP_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const MIGRATION_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[cfg(test)]
 thread_local! {
-    static TEST_INTERRUPT_BACKUP_BEFORE_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static TEST_INTERRUPT_BACKUP_BEFORE_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static TEST_AVAILABLE_CAPACITY: std::cell::RefCell<std::collections::VecDeque<u64>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
 pub struct InstanceLock {
@@ -200,6 +205,53 @@ pub fn check(paths: &InstancePaths) -> Result<serde_json::Value> {
     }))
 }
 
+pub(crate) fn open_service_locked(paths: &InstancePaths, lock: &InstanceLock) -> Result<Store> {
+    validate_lock_file(&lock.file, &paths.lock_file)?;
+    validate_live_database_family(paths)?;
+    if !paths.database.exists() {
+        return Store::open_service(&paths.database);
+    }
+    let source = Store::open_maintenance_readonly(&paths.database)
+        .context("inspect service database before upgrade")?;
+    let connection = source.lock()?;
+    let transaction = connection
+        .unchecked_transaction()
+        .context("begin pre-upgrade source read")?;
+    let version = require_maintenance_schema(&transaction)?;
+    if version == CURRENT_SCHEMA_VERSION {
+        drop(transaction);
+        drop(connection);
+        drop(source);
+        return Store::open_service(&paths.database);
+    }
+    let (integrity, foreign_keys) =
+        sqlite_checks(&transaction).context("check source database before upgrade")?;
+    if integrity != "ok" || foreign_keys != 0 {
+        bail!("source database cannot be upgraded: integrity={integrity}, foreign_key_violations={foreign_keys}")
+    }
+    let destination = backup_root(paths, None)?;
+    validate_backup_destination(paths, &destination)?;
+    let (backup_budget, migration_budget) = source_storage_budgets(paths, &transaction)?;
+    require_upgrade_capacity(&destination, &paths.state, backup_budget, migration_budget)?;
+    create_private_directory(&destination)?;
+    let snapshot = publish_backup_locked(&destination, &transaction)
+        .context("publish verified pre-upgrade restore point")?;
+    drop(transaction);
+    drop(connection);
+    drop(source);
+    let backup = snapshot["backup"]
+        .as_str()
+        .context("published backup path missing")?;
+    // No writable source open is permitted until publication and this second space check.
+    require_capacity(&paths.state, migration_budget)
+        .with_context(|| format!("migration capacity after verified restore point {backup}"))?;
+    Store::open_service(&paths.database).with_context(|| {
+        format!(
+            "database upgrade from schema {version} failed; verified restore point: {backup}; offline recovery uses `llmrelay database --data-dir <instance> restore <backup>` with this point"
+        )
+    })
+}
+
 pub fn backup(paths: &InstancePaths, configured: Option<&Path>) -> Result<serde_json::Value> {
     paths.create()?;
     let _lock = InstanceLock::acquire(paths)?;
@@ -207,11 +259,17 @@ pub fn backup(paths: &InstancePaths, configured: Option<&Path>) -> Result<serde_
     let destination = backup_root(paths, configured)?;
     validate_live_database_family(paths)?;
     validate_backup_destination(paths, &destination)?;
-    create_private_directory(&destination)?;
-
     let source = Store::open_current_readonly(&paths.database)?;
-    let source_size = fs::metadata(&paths.database)?.len();
-    require_capacity(&destination, source_size.saturating_mul(2))?;
+    let connection = source.lock()?;
+    let transaction = connection.unchecked_transaction()?;
+    require_current_schema(&transaction)?;
+    let (backup_budget, _) = source_storage_budgets(paths, &transaction)?;
+    require_capacity(&destination, backup_budget).context("backup destination capacity")?;
+    create_private_directory(&destination)?;
+    publish_backup_locked(&destination, &transaction)
+}
+
+fn publish_backup_locked(destination: &Path, source: &Connection) -> Result<serde_json::Value> {
     let operation_id = uuid::Uuid::new_v4().to_string();
     let staging = destination.join(format!(".{operation_id}.staging"));
     let published = destination.join(format!(
@@ -223,12 +281,11 @@ pub fn backup(paths: &InstancePaths, configured: Option<&Path>) -> Result<serde_
     let mut target = Connection::open(&database)
         .with_context(|| format!("create backup database {}", database.display()))?;
     {
-        let source = source.lock()?;
-        let backup = Backup::new(&source, &mut target)?;
+        let backup = Backup::new(source, &mut target)?;
         backup.run_to_completion(128, Duration::from_millis(5), None)?;
     }
     target.pragma_update(None, "query_only", "ON")?;
-    require_current_schema(&target)?;
+    let sqlite_schema_version = require_maintenance_schema(&target)?;
     let (integrity, foreign_keys) = sqlite_checks(&target)?;
     if integrity != "ok" || foreign_keys != 0 {
         bail!(
@@ -248,20 +305,21 @@ pub fn backup(paths: &InstancePaths, configured: Option<&Path>) -> Result<serde_
         database_file: "database.sqlite3".to_owned(),
         database_bytes,
         database_sha256,
-        sqlite_schema_version: CURRENT_SCHEMA_VERSION,
+        sqlite_schema_version,
         integrity_check: integrity,
         foreign_key_violations: foreign_keys,
     };
     write_private_json(&staging.join("manifest.json"), &manifest)?;
     sync_directory(&staging)?;
+    verify(&staging).context("reread staged backup before publication")?;
     #[cfg(test)]
     if TEST_INTERRUPT_BACKUP_BEFORE_PUBLISH.with(|armed| armed.replace(false)) {
         bail!("injected interruption before backup publication")
     }
     fs::rename(&staging, &published)
         .with_context(|| format!("publish backup {}", published.display()))?;
-    sync_directory(&destination)?;
-    prune_backups(&destination, &published)?;
+    sync_directory(destination)?;
+    prune_backups(destination, &published)?;
     Ok(serde_json::json!({
         "operation_id":operation_id,
         "backup":published,
@@ -287,7 +345,13 @@ pub fn verify(backup: &Path) -> Result<serde_json::Value> {
     }
     let connection = open_sqlite_for_verification(&database)?;
     connection.pragma_update(None, "query_only", "ON")?;
-    require_current_schema(&connection)?;
+    let actual_schema = require_maintenance_schema(&connection)?;
+    if actual_schema != manifest.sqlite_schema_version {
+        bail!(
+            "backup manifest schema {} does not match actual SQLite schema {actual_schema}",
+            manifest.sqlite_schema_version
+        )
+    }
     let (integrity, foreign_keys) = sqlite_checks(&connection)?;
     if integrity != "ok" || foreign_keys != 0 {
         bail!(
@@ -450,7 +514,7 @@ pub fn release_hold(paths: &InstancePaths) -> Result<serde_json::Value> {
     if journal.phase != RestorePhase::Completed {
         bail!("database restore {} is not complete", journal.operation_id)
     }
-    let store = Store::open_current_writable(&paths.database)?;
+    let store = Store::open_maintenance_writable(&paths.database)?;
     let hold = store
         .restore_hold()?
         .ok_or_else(|| anyhow!("restore journal exists but its durable hold is missing"))?;
@@ -604,7 +668,7 @@ fn finish_release(paths: &InstancePaths, journal: &mut RestoreJournal) -> Result
         bail!("restore release journal is missing verified reconciliation evidence")
     }
     validate_restore_file_bindings(paths, journal)?;
-    let store = Store::open_current_writable(&paths.database)?;
+    let store = Store::open_maintenance_writable(&paths.database)?;
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let now = Utc::now().to_rfc3339();
@@ -696,7 +760,7 @@ fn complete_replacement(paths: &InstancePaths, journal: &mut RestoreJournal) -> 
 
 fn establish_restore_hold(paths: &InstancePaths, journal: &RestoreJournal) -> Result<()> {
     validate_restore_file_bindings(paths, journal)?;
-    let store = Store::open_current_writable(&paths.database)?;
+    let store = Store::open_maintenance_writable(&paths.database)?;
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let now = Utc::now().to_rfc3339();
@@ -842,6 +906,31 @@ fn establish_restore_hold(paths: &InstancePaths, journal: &RestoreJournal) -> Re
     Ok(())
 }
 
+fn open_displaced_readonly(path: &Path) -> Result<Connection> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open displaced database read-only {}", path.display()))?;
+    connection.busy_timeout(STATE_DATABASE_BUSY_TIMEOUT)?;
+    connection.pragma_update(None, "query_only", "ON")?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    // SQLite opens lazily; this read separates unreadable data from incompatible inventory SQL.
+    connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    Ok(connection)
+}
+
+fn displaced_data_is_unreadable(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(failure, _))
+            if matches!(failure.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                | rusqlite::ErrorCode::SystemIoFailure | rusqlite::ErrorCode::CannotOpen
+                | rusqlite::ErrorCode::PermissionDenied)
+    )
+}
+
 fn displaced_inventory(paths: &InstancePaths) -> Result<DisplacedInventory> {
     if !paths.database.exists() {
         return Ok(DisplacedInventory::Available {
@@ -857,26 +946,9 @@ fn displaced_inventory(paths: &InstancePaths) -> Result<DisplacedInventory> {
             recorded_boot: None,
         });
     }
-    let readable = (|| -> Result<(Connection, i64)> {
-        let connection = Connection::open_with_flags(
-            &paths.database,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .with_context(|| {
-            format!(
-                "open displaced database read-only {}",
-                paths.database.display()
-            )
-        })?;
-        // SQLite opens lazily; this query is the readability boundary and includes committed WAL.
-        let schema_version = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .context("read displaced database schema version")?;
-        Ok((connection, schema_version))
-    })();
-    let (connection, schema_version) = match readable {
-        Ok(readable) => readable,
-        Err(error) => {
+    let connection = match open_displaced_readonly(&paths.database) {
+        Ok(connection) => connection,
+        Err(error) if displaced_data_is_unreadable(&error) => {
             let recorded_boot = crate::supervisor::system_boot_identity().context(
                 "displaced database is unreadable and a valid OS boot identity could not be recorded before displacement",
             )?;
@@ -885,15 +957,9 @@ fn displaced_inventory(paths: &InstancePaths) -> Result<DisplacedInventory> {
                 recorded_boot,
             });
         }
+        Err(error) => return Err(error).context("read displaced database before restore"),
     };
-    if schema_version != CURRENT_SCHEMA_VERSION {
-        bail!(
-            "unsupported database schema version {schema_version}; current schema version {} is required and restore will not migrate or replace the existing database",
-            CURRENT_SCHEMA_VERSION
-        )
-    }
-    connection.pragma_update(None, "query_only", "ON")?;
-    connection.pragma_update(None, "foreign_keys", "ON")?;
+    require_maintenance_schema(&connection)?;
     Ok(DisplacedInventory::Available {
         evidence: capture_inventory(&connection)
             .context("capture inventory from readable displaced database")?,
@@ -1084,7 +1150,7 @@ fn open_sqlite_for_verification(path: &Path) -> Result<Connection> {
 fn verify_sqlite_file(path: &Path) -> Result<()> {
     let connection = open_sqlite_for_verification(path)?;
     connection.pragma_update(None, "query_only", "ON")?;
-    require_current_schema(&connection)?;
+    require_maintenance_schema(&connection)?;
     let (integrity, foreign_keys) = sqlite_checks(&connection)?;
     if integrity != "ok" || foreign_keys != 0 {
         bail!(
@@ -1102,7 +1168,8 @@ fn load_manifest(backup: &Path) -> Result<(PathBuf, BackupManifest, PathBuf)> {
     let manifest: BackupManifest = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse backup manifest {}", manifest_path.display()))?;
     if manifest.schema != MANIFEST_SCHEMA
-        || manifest.sqlite_schema_version != CURRENT_SCHEMA_VERSION
+        || (manifest.sqlite_schema_version != CURRENT_SCHEMA_VERSION
+            && !SERVICE_UPGRADABLE_SCHEMA_VERSIONS.contains(&manifest.sqlite_schema_version))
         || manifest.database_file != "database.sqlite3"
         || manifest.integrity_check != "ok"
         || manifest.foreign_key_violations != 0
@@ -1150,7 +1217,7 @@ fn validate_backup_destination(paths: &InstancePaths, destination: &Path) -> Res
         bail!("backup destination must not overlap the live instance tree")
     }
     if paths.database.exists() {
-        let store = Store::open_current_readonly(&paths.database)?;
+        let store = Store::open_maintenance_readonly(&paths.database)?;
         let connection = store.lock()?;
         let mut statement = connection.prepare("SELECT repository_path FROM projects")?;
         let repositories = statement
@@ -1175,8 +1242,15 @@ fn validate_restore_source(paths: &InstancePaths, database: &Path) -> Result<()>
     if source.starts_with(&root) {
         bail!("restore source must not be inside the live instance tree")
     }
-    if let Ok(store) = Store::open_current_readonly(&paths.database) {
-        let connection = store.lock()?;
+    if paths.database.exists() {
+        let connection = match open_displaced_readonly(&paths.database) {
+            Ok(connection) => connection,
+            Err(error) if displaced_data_is_unreadable(&error) => return Ok(()),
+            Err(error) => return Err(error).context("inspect restore source repository overlap"),
+        };
+        require_maintenance_schema(&connection).map_err(|error| {
+            anyhow!("{error}; restore will not migrate or replace the existing database")
+        })?;
         let mut statement = connection.prepare("SELECT repository_path FROM projects")?;
         let repositories = statement
             .query_map([], |row| row.get::<_, String>(0))?
@@ -1600,7 +1674,7 @@ fn matching_restore_hold_state(
     paths: &InstancePaths,
     journal: &RestoreJournal,
 ) -> Result<Option<String>> {
-    let store = Store::open_current_readonly(&paths.database)
+    let store = Store::open_maintenance_readonly(&paths.database)
         .context("open installed database to verify restore hold operation binding")?;
     let connection = store.lock()?;
     let quarantine_text = journal.quarantine.to_string_lossy();
@@ -1848,21 +1922,105 @@ fn resolve_missing(path: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-fn require_capacity(path: &Path, required: u64) -> Result<()> {
+fn source_storage_budgets(paths: &InstancePaths, source: &Connection) -> Result<(u64, u64)> {
+    let pages: i64 = source.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: i64 = source.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    validate_live_database_family(paths)?;
+    let main_bytes = fs::metadata(&paths.database)
+        .context("read main database size for capacity preflight")?
+        .len();
+    let wal = database_family(paths)[1].clone();
+    let wal_bytes = match fs::symlink_metadata(&wal) {
+        Ok(metadata) => {
+            validate_owned_regular_file(&wal, &metadata, "live WAL for capacity sizing")?;
+            metadata.len()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error).context("read live WAL size for capacity preflight"),
+    };
+    storage_budgets(pages, page_size, main_bytes, wal_bytes)
+}
+
+fn storage_budgets(
+    pages: i64,
+    page_size: i64,
+    main_bytes: u64,
+    wal_bytes: u64,
+) -> Result<(u64, u64)> {
+    if pages <= 0 || page_size <= 0 {
+        bail!("database capacity sizing requires positive page count and page size")
+    }
+    let logical_bytes = (pages as u64)
+        .checked_mul(page_size as u64)
+        .context("logical database size overflow")?;
+    let backup_budget = logical_bytes
+        .max(main_bytes)
+        .checked_mul(2)
+        .context("backup capacity budget overflow")?;
+    let migration_budget = backup_budget
+        .checked_add(wal_bytes)
+        .and_then(|bytes| bytes.checked_add(MIGRATION_RESERVE_BYTES))
+        .context("migration capacity budget overflow")?;
+    Ok((backup_budget, migration_budget))
+}
+
+fn existing_capacity_ancestor(path: &Path) -> Result<PathBuf> {
     let resolved = resolve_missing(path)?;
-    let existing = resolved
+    resolved
         .ancestors()
         .find(|item| item.exists())
-        .unwrap_or(path);
+        .map(Path::to_owned)
+        .context("capacity path has no existing ancestor")
+}
+
+fn require_upgrade_capacity(
+    destination: &Path,
+    state: &Path,
+    backup_budget: u64,
+    migration_budget: u64,
+) -> Result<()> {
+    let backup_device = fs::metadata(existing_capacity_ancestor(destination)?)?.dev();
+    let state_device = fs::metadata(existing_capacity_ancestor(state)?)?.dev();
+    if backup_device == state_device {
+        let combined = backup_budget
+            .checked_add(migration_budget)
+            .context("combined upgrade capacity budget overflow")?;
+        require_capacity(state, combined).context("shared filesystem backup and migration capacity")
+    } else {
+        require_capacity(destination, backup_budget)
+            .context("backup destination capacity before upgrade")?;
+        require_capacity(state, migration_budget)
+            .context("state filesystem migration capacity before backup")
+    }
+}
+
+fn available_capacity(path: &Path) -> Result<u64> {
+    #[cfg(test)]
+    if let Some(available) = TEST_AVAILABLE_CAPACITY.with(|values| values.borrow_mut().pop_front())
+    {
+        return Ok(available);
+    }
+    let existing = existing_capacity_ancestor(path)?;
     let c_path = std::ffi::CString::new(existing.as_os_str().as_encoded_bytes())?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // statvfs initializes the output only on success; the C path lives through the call.
     if unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("inspect available backup capacity");
+        return Err(std::io::Error::last_os_error()).context("inspect available database capacity");
     }
     let stats = unsafe { stats.assume_init() };
-    let available = (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64);
+    (stats.f_bavail as u64)
+        .checked_mul(stats.f_frsize as u64)
+        .context("available database capacity overflow")
+}
+
+fn require_capacity(path: &Path, required: u64) -> Result<()> {
+    let available = available_capacity(path)
+        .with_context(|| format!("inspect capacity at {}", path.display()))?;
     if available < required {
-        bail!("insufficient capacity: {available} bytes available, {required} required")
+        bail!(
+            "insufficient capacity at {}: {available} bytes available, {required} required",
+            path.display()
+        )
     }
     Ok(())
 }
@@ -1872,30 +2030,46 @@ fn prune_backups(root: &Path, newest: &Path) -> Result<()> {
     let mut snapshots = Vec::new();
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
-        if path == newest || !path.is_dir() {
+        if !path.is_dir()
+            || path
+                .file_name()
+                .is_some_and(|name| name.as_bytes().starts_with(b"."))
+        {
             continue;
         }
-        let Ok((_, manifest, database)) = load_manifest(&path) else {
+        let Ok((_, manifest, _)) = load_manifest(&path) else {
             continue;
         };
-        if !app_owned_snapshot(&path)?
-            || validate_private_backup(&path.join("manifest.json"), &database).is_err()
-            || fs::metadata(&database).map(|value| value.len()).ok()
-                != Some(manifest.database_bytes)
-            || sha256_file(&database).ok().as_deref() != Some(&manifest.database_sha256)
-        {
+        if !app_owned_snapshot(&path)? || verify(&path).is_err() {
             continue;
         }
         let Ok(created) = DateTime::parse_from_rfc3339(&manifest.created_at) else {
             continue;
         };
-        snapshots.push((path, created.with_timezone(&Utc), manifest.database_bytes));
+        snapshots.push((
+            path,
+            created.with_timezone(&Utc),
+            manifest.database_bytes,
+            manifest.sqlite_schema_version,
+        ));
     }
-    snapshots.sort_by_key(|(_, created, _)| *created);
-    let newest_size = fs::metadata(newest.join("database.sqlite3"))?.len();
-    let mut total = newest_size + snapshots.iter().map(|(_, _, size)| size).sum::<u64>();
-    let mut count = snapshots.len() + 1;
-    for (path, created, size) in snapshots {
+    snapshots.sort_by(|left, right| (&left.1, &left.0).cmp(&(&right.1, &right.0)));
+    let mut anchors = std::collections::BTreeMap::new();
+    for (path, _, _, version) in &snapshots {
+        if SERVICE_UPGRADABLE_SCHEMA_VERSIONS.contains(version) {
+            anchors.insert(*version, path.clone());
+        }
+    }
+    let mut total = snapshots.iter().try_fold(0_u64, |sum, (_, _, size, _)| {
+        sum.checked_add(*size)
+            .context("retention snapshot size overflow")
+    })?;
+    let mut count = snapshots.len();
+    for (path, created, size, version) in snapshots {
+        // Schema anchors survive the ordinary limits so intermediate upgrade retries retain recovery.
+        if path == newest || anchors.get(&version) == Some(&path) {
+            continue;
+        }
         let expired = now.signed_duration_since(created).num_days() > MAX_BACKUP_AGE_DAYS;
         if count > MAX_BACKUPS || total > MAX_BACKUP_BYTES || expired {
             fs::remove_dir_all(&path)
@@ -1932,6 +2106,92 @@ mod tests {
         create_private_directory(&path).unwrap();
         let error = require_capacity(&path, u64::MAX).unwrap_err().to_string();
         assert!(error.contains("insufficient capacity"));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn restorepoint_capacity_counts_committed_wal_growth_and_rejects_overflow() {
+        let root = std::env::temp_dir().join(format!("llmrelay-sizing-{}", uuid::Uuid::new_v4()));
+        let paths = InstancePaths::resolve(Some(root)).unwrap();
+        paths.create().unwrap();
+        let store = Store::open(&paths.database).unwrap();
+        let connection = store.lock().unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        connection.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES('sizing','sizing','service','fixture','fixture','fixture',json_object('payload',?1),'2026-01-01T00:00:00Z')",
+            ["x".repeat(1024 * 1024)],
+        ).unwrap();
+        let pages: u64 = connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        let page_size: u64 = connection
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .unwrap();
+        let logical = pages * page_size;
+        let main = fs::metadata(&paths.database).unwrap().len();
+        let wal = fs::metadata(&database_family(&paths)[1]).unwrap().len();
+        assert!(logical > main);
+        assert!(wal > 0);
+        assert_eq!(
+            source_storage_budgets(&paths, &connection).unwrap(),
+            (2 * logical, 2 * logical + wal + 64 * 1024 * 1024)
+        );
+        assert_eq!(
+            storage_budgets(1, 4096, 8192, 123).unwrap(),
+            (16384, 16384 + 123 + MIGRATION_RESERVE_BYTES)
+        );
+        for (pages, size, main, wal) in [
+            (0, 4096, 1, 0),
+            (1, -1, 1, 0),
+            (i64::MAX, i64::MAX, 0, 0),
+            (1, 1, u64::MAX, 0),
+            (1, 1, 0, u64::MAX),
+        ] {
+            assert!(storage_budgets(pages, size, main, wal).is_err());
+        }
+        drop(connection);
+        drop(store);
+        fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[test]
+    fn restorepoint_capacity_combines_shared_filesystems_and_separates_other_devices() {
+        let root = std::env::temp_dir().join(format!("llmrelay-capacity-{}", uuid::Uuid::new_v4()));
+        create_private_directory(&root).unwrap();
+        let destination = root.join("missing-backups");
+        TEST_AVAILABLE_CAPACITY.with(|values| *values.borrow_mut() = [79].into());
+        let error = require_upgrade_capacity(&destination, &root, 30, 50).unwrap_err();
+        assert!(format!("{error:#}").contains("80 required"));
+        assert!(!destination.exists());
+        TEST_AVAILABLE_CAPACITY.with(|values| *values.borrow_mut() = [80].into());
+        require_upgrade_capacity(&destination, &root, 30, 50).unwrap();
+        assert!(require_upgrade_capacity(&destination, &root, u64::MAX, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("overflow"));
+        let other_device = Path::new("/dev");
+        if fs::metadata(other_device).unwrap().dev() != fs::metadata(&root).unwrap().dev() {
+            for available in [[29, 50], [30, 49], [30, 50]] {
+                TEST_AVAILABLE_CAPACITY.with(|values| *values.borrow_mut() = available.into());
+                let result = require_upgrade_capacity(other_device, &root, 30, 50);
+                match available {
+                    [29, 50] => assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("backup destination capacity")),
+                    [30, 49] => assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("state filesystem migration capacity")),
+                    _ => assert!(result.is_ok()),
+                }
+                TEST_AVAILABLE_CAPACITY.with(|values| values.borrow_mut().clear());
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

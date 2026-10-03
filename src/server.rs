@@ -302,7 +302,7 @@ pub async fn serve(paths: InstancePaths, requested_port: u16, open_browser: bool
     let lock = crate::database::InstanceLock::acquire(&paths)?;
     crate::database::recover_interrupted_restore_locked(&paths)?;
     crate::database::validate_live_database_family(&paths)?;
-    let store = Store::open_service(&paths.database)?;
+    let store = crate::database::open_service_locked(&paths, &lock)?;
     let executable = std::env::current_exe().context("resolve LLMRelay executable")?;
     let app = Application::new(paths.clone(), store, executable)?;
     let restore_held = crate::database::hold_active(&app.store)?;

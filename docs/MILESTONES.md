@@ -748,6 +748,12 @@ describe current Jinn source.
 
 #### Deferred hardening continuation (October 1)
 
+**Current disposition (October 2): the selected continuation is verified complete,
+including the local H2/H12 alternatives. The original automatic H2/H12 outcomes
+remain provider-dependent. Final integrated verification passed 62 frontend and
+335 Rust tests; independent code review and fresh final verification approved.
+Local commit and packaging are authorized; no external publication is selected.**
+
 The user selected all remaining original proposal outcomes in four sequential
 slices: H2/H4/H11/H12; H3/H15; H9/H16; and verified pre-upgrade restore points,
 free-space checks and recovery. These are separate from the later feature list.
@@ -755,15 +761,93 @@ free-space checks and recovery. These are separate from the later feature list.
 The H4 increment now implements app-owned provider failure holds, a bounded
 rate-limit/overload cooldown, and an explicit session release action. Integration
 checks, independent code review and fresh final verification passed. This
-bounded app-owned H4 increment is complete. This is not completion of
-slice 1 or the full program. H2 automatic readiness, H11 attention timing, H12
-notification correlation and H4 provider-stated reset deadlines remain open;
-the local failure characterization did not produce qualifying runtime evidence.
+bounded app-owned H4 increment satisfies the original provider-reset-or-default
+requirement through its 60-second default; no attributable provider deadline is
+available. This is not completion of slice 1 or the full program. H2 automatic
+readiness and H12 notification correlation remain open. H11's delay proposal
+has been revised on pinned-source evidence. Its presentation correction passed
+focused checks, independent code review and fresh final verification. The
+provider-contract limits are recorded below.
 H3/H15 durable anomaly and recurring-block attention is complete within the
 approved scope: focused checks, independent review, the full verification matrix
 and fresh final verification passed. Its conservative
 phase/exit limits are documented in [Operations](OPERATIONS.md#durable-attention-observations).
-The H9/H16 and restore-point slices remain pending.
+The bounded H9 existing-PTY fixture extension is complete: focused checks, the
+post-review runtime suite, independent code review and fresh final verification
+passed. Corrected native characterization reproduced the Claude 2.1.283 image
+condition: a valid 5.28 MB PNG became an attachment, while one Enter at roughly
+105–117 ms produced no submit during the 75-second observation. Separate encoded
+guidance also remained unsubmitted, so encoding is not an acceptance guarantee.
+No retry was added. H16 now has pinned Codex 0.157.1 evidence of a persisted
+structured capacity discriminator, distinct from a rate-limit control, produced
+by confined local faults. Managed-session attribution and the attention-only
+reader passed focused checks, independent code review, the final Rust matrix
+and fresh final verification. The H9/H16 slice is complete within these stated
+boundaries; the native Enter behavior was characterized, with no automatic retry
+or delivery guarantee added. These observations do not establish a real upstream outage.
+See [Permission and provider signals](PERMISSION_SIGNAL_MATRIX.md) for exact
+boundaries. The restore-point slice now implements verified snapshots and
+capacity checks before supported upgrades, bounded preservation of prior-schema
+recovery points, and older-schema restoration through the existing execution
+hold. Focused checks, independent code review, the final Rust matrix and fresh
+final verification passed. This fourth slice is complete; see
+[Operations](OPERATIONS.md#database-restore-points) for the recovery limits.
+
+The October 2 inspection of the pinned Claude 2.1.283 executable establishes
+three distinct provider-contract limits:
+
+- **H2:** `StopFailure` does not export the background-task and scheduled-work
+  registries that the existing safe-idle predicate requires. A confined native
+  failure observation also omitted both fields. Missing fields are not empty
+  registries, and a failed turn does not establish that background work ended.
+- **H12:** `Notification` identifies the session and may identify the turn,
+  but exports no unique tool-permission request identifier. Several requests can
+  belong to one turn. Exact request resolution therefore cannot safely retire
+  a generic notice using turn identity alone.
+- **H4 reset attribution:** structured status-line quota windows are cached
+  usage data. They omit the rejecting limit, originating response and quota
+  observation time. Their reset values cannot safely replace the app's bounded
+  cooldown for a particular failure. Adding an advisory quota display would not
+  supply the missing attribution and is not part of this implementation.
+
+For **H11**, pinned-source tracing places ordinary query retries and recovery
+before terminal `StopFailure` emission. A later native `/goal` follow-up is a
+separate prompt, not a pending retry of the failed query. The proposed attention
+delay therefore does not address the admitted version's ordinary retry path.
+Failure notices now describe LLMRelay's own behavior without claiming that the
+provider made no retries. This presentation correction passed focused checks,
+independent code review and fresh final verification. Failure timing, holds,
+readiness and supersession are unchanged.
+
+The local-only onboarding fixture reached native session, prompt and failure
+hooks, but two API requests failed the experiment's exact prompt-attribution
+check. It stopped without admitting an experimental retry sequence; that result
+remains inconclusive and is not runtime proof of the source-derived retry order.
+The owned process group and local endpoints were stopped and temporary private
+keys removed. See [Permission and provider signals](PERMISSION_SIGNAL_MATRIX.md)
+for the distinction between source, observed transport and workflow authority.
+
+Closing the remaining original outcomes requires a qualified provider contract:
+H2 needs trustworthy failed-turn completion plus background-work quiescence;
+H12 needs a unique link from the generic notice to the exact permission request.
+Neither elapsed silence, a turn identifier alone, nor additional user permission
+supplies those missing facts. Conservative failed-turn recovery and generic
+output attention remain in place.
+
+On October 2, the user selected local alternatives after the bounded provider
+contract investigation. The failed-session action couples an exact graceful
+stop with a durable task pause until a successful explicit Continue or Run next.
+The generic-notice action acknowledges the displayed notifications across
+dashboards without changing native permission or readiness evidence; later
+notifications reappear. These local changes passed independent code review,
+the configured verification suite and fresh final verification. All six
+acceptance criteria for the selected local alternatives are complete.
+
+Upstream publication is cancelled; the two prepared drafts remain **not
+submitted**. The original automatic outcomes still require provider support
+and are not claimed by the local alternatives. Their contract requirements and
+the local presentation boundary are tracked in
+[Permission and provider signals](PERMISSION_SIGNAL_MATRIX.md#h2-and-h12-local-controls-and-provider-contract-dependencies).
 
 #### Agreed hardening list
 
@@ -812,18 +896,18 @@ The H9/H16 and restore-point slices remain pending.
 The user authorized purging the existing LLMRelay data and explicitly waived
 backup or restoration of that data for this work. No purge is required by the
 hardening implementation. Verified pre-upgrade restore points, free-space checks
-and recovery were subsequently approved as the fourth deferred hardening slice. They remain pending;
-the current H3/H15 increment does not implement them or require a data purge.
+and recovery were subsequently approved as the fourth deferred hardening slice.
+That slice is implemented and independently verified. Its tests used disposable
+instances; no existing user data was purged, upgraded or restored.
 
 - **Fail-closed restore point and free-space preflight before the serve-path
-  schema upgrade.** `upgrade_supported_service_schema` in `src/store.rs`
-  migrates supported earlier schemas without a restore point;
-  `require_capacity` is used only by backup and restore (`src/database.rs`).
-  [Next milestone plan](NEXT_MILESTONE_PLAN.md) records that automatic
-  pre-migration backup orchestration was removed from scope. This is now selected
-  for the fourth deferred slice: it reuses the existing verified online backup
-  (`src/database.rs:203-270`) and, unlike Jinn's warn-only copy
-  (`shared/db.ts:29-96`), must fail closed.
+  schema upgrade.** Service startup now calls `database::open_service_locked`
+  before the Store migration opener. Supported older schemas receive verified
+  snapshots and capacity checks before migration. Older snapshots use the
+  existing offline restore and execution-hold path. The historical removal of
+  automatic backup orchestration in [Next milestone plan](NEXT_MILESTONE_PLAN.md)
+  was superseded by this selected and completed slice. Recovery and retention
+  limits are described in [Operations](OPERATIONS.md#database-restore-points).
 
 #### Documentation corrections
 

@@ -37,6 +37,85 @@ impl std::fmt::Display for RoleResumeCapacityError {
 
 impl std::error::Error for RoleResumeCapacityError {}
 
+pub(crate) fn failure_stop_target_quiescent(
+    connection: &Connection,
+    control_id: &str,
+) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM controls c JOIN sessions s
+           ON s.id=json_extract(c.payload_json,'$.session_id')
+         JOIN role_generations g ON g.id=s.role_generation_id
+         WHERE c.id=?1 AND c.kind='pause_after_role'
+           AND json_type(c.payload_json,'$.failure_stop_operation_id')='text'
+           AND s.role_generation_id=json_extract(c.payload_json,'$.role_generation_id')
+           AND g.attempt_id=c.attempt_id
+           AND s.transcript_epoch=json_extract(c.payload_json,'$.transcript_epoch')
+           AND json_extract(s.process_identity_json,'$.pid')=json_extract(c.payload_json,'$.process_identity.pid')
+           AND json_extract(s.process_identity_json,'$.process_group_id')=json_extract(c.payload_json,'$.process_identity.process_group_id')
+           AND json_extract(s.process_identity_json,'$.native_start_marker')=json_extract(c.payload_json,'$.process_identity.native_start_marker')
+           AND json_extract(s.process_identity_json,'$.observed_started_at')=json_extract(c.payload_json,'$.process_identity.observed_started_at')
+           AND s.status='exited' AND json_extract(s.exit_json,'$.process_group_quiescent')=1)",
+        params![control_id], |row| row.get(0),
+    )?)
+}
+
+// Finished controls remain authoritative until an applied human continuation releases them.
+pub(crate) fn failure_stop_fence(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<Option<bool>> {
+    let mut statement = connection.prepare(
+        "SELECT id,state FROM controls WHERE attempt_id=?1 AND kind='pause_after_role'
+           AND json_type(payload_json,'$.failure_stop_operation_id')='text'
+           AND json_type(payload_json,'$.failure_stop_released_by') IS NULL",
+    )?;
+    let controls = statement
+        .query_map(params![attempt_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if controls.is_empty() {
+        return Ok(None);
+    }
+    for (id, state) in controls {
+        if state != "finished" || !failure_stop_target_quiescent(connection, &id)? {
+            return Ok(Some(false));
+        }
+    }
+    Ok(Some(true))
+}
+
+pub(crate) fn require_failure_stop_released(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<()> {
+    if failure_stop_fence(connection, attempt_id)?.is_some() {
+        bail!("The failed-session stop keeps this task paused. Wait for its verified exit and finished pause, then choose Continue or Run next.")
+    }
+    Ok(())
+}
+
+pub(crate) fn require_session_failure_stop_released(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<()> {
+    let attempt: String = connection.query_row(
+        "SELECT g.attempt_id FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE s.id=?1",
+        params![session_id], |row| row.get(0),
+    )?;
+    require_failure_stop_released(connection, &attempt)
+}
+
+pub(crate) fn require_failure_stop_continuation_ready(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<()> {
+    if failure_stop_fence(connection, attempt_id)? == Some(false) {
+        bail!("The failed-session pause is not finished or its captured process has not been verified stopped.")
+    }
+    Ok(())
+}
+
 // Raised only before issuing a launch permit or creating a native session.
 #[derive(Debug)]
 pub(crate) struct RoleLaunchCapacityError;
@@ -229,7 +308,8 @@ const MIGRATION_034: &str = include_str!("../migrations/034_guidance_submitted_t
 const MIGRATION_035: &str = include_str!("../migrations/035_provider_failure_holds.sql");
 const MIGRATION_036: &str = include_str!("../migrations/036_attention_observations.sql");
 // Same value rusqlite installs at open; set explicitly before any pragma or DDL can contend.
-const STATE_DATABASE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const STATE_DATABASE_BUSY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 type CmuxRouteRow = (
     String,
@@ -980,8 +1060,8 @@ impl Store {
         Ok(Self::from_connection(connection))
     }
 
-    /// The caller holds the instance lock. Service start is the only upgrade path
-    /// for an existing database, and only from the explicitly supported schema.
+    /// The caller holds the instance lock and has passed the database startup gate,
+    /// which publishes a verified restore point before a prior-schema writable open.
     pub(crate) fn open_service(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Self::open(path);
@@ -1018,6 +1098,32 @@ impl Store {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         require_current_schema(&connection)?;
+        Ok(Self::from_connection(connection))
+    }
+
+    pub(crate) fn open_maintenance_readonly(path: &Path) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("open maintenance database read-only {}", path.display()))?;
+        connection.busy_timeout(STATE_DATABASE_BUSY_TIMEOUT)?;
+        connection.pragma_update(None, "query_only", "ON")?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        require_maintenance_schema(&connection)?;
+        Ok(Self::from_connection(connection))
+    }
+
+    pub(crate) fn open_maintenance_writable(path: &Path) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("open maintenance database {}", path.display()))?;
+        connection.busy_timeout(STATE_DATABASE_BUSY_TIMEOUT)?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        require_maintenance_schema(&connection)?;
         Ok(Self::from_connection(connection))
     }
 
@@ -2243,6 +2349,7 @@ impl Store {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_no_session_provider_failure_hold(&transaction, session_id)?;
+        require_session_failure_stop_released(&transaction, session_id)?;
         let reserved = transaction.execute(
             "UPDATE guidance_messages SET state='delivery_reserved',reason='automatic_post_hook_idle_verified',
                delivery_session_id=?2,delivery_transcript_epoch=?3,delivery_resume_invocation_id=?4,
@@ -3094,7 +3201,9 @@ impl Store {
                 "UPDATE tasks SET attention=?1,version=version+CASE WHEN attention=?1 THEN 0 ELSE 1 END,
                         updated_at=?2 WHERE id=?3",
                 params![
-                    if matches!(kind, "pause_now" | "cancel") {
+                    if matches!(kind, "pause_now" | "cancel")
+                        || failure_stop_fence(transaction, &attempt_id)?.is_some()
+                    {
                         "pause_requested"
                     } else {
                         "none"
@@ -4151,6 +4260,7 @@ impl Store {
             bail!("role launch conflicts with a durably owned running check")
         }
         require_no_provider_failure_hold(&transaction, attempt_id, role, &lane_id)?;
+        require_failure_stop_released(&transaction, attempt_id)?;
         if !role_capacity_available(&transaction, &provider, role, None, None)? {
             return Err(RoleLaunchCapacityError.into());
         }
@@ -4285,6 +4395,7 @@ impl Store {
             bail!("switched role conflicts with a durably owned running check")
         }
         require_no_provider_failure_hold(&transaction, &attempt_id, role, &old_lane)?;
+        require_failure_stop_released(&transaction, &attempt_id)?;
         let provider = config.provider.to_string();
         if !role_capacity_available(&transaction, &provider, role, None, None)? {
             bail!("role capacity is full")
@@ -4562,6 +4673,7 @@ impl Store {
             params![context.workspace.to_string_lossy()],
             |row| row.get(0),
         )?;
+        require_failure_stop_released(&transaction, &attempt_id)?;
         let permit:Option<(bool,Option<String>,String,Option<String>)>=transaction.query_row("SELECT validation_dispatch,setup_permit_id,lane_id,switch_intent_id FROM launch_permits WHERE id=?1 AND attempt_id=?2 AND role=?3 AND settings_revision=?4 AND state='issued'",params![context.permit_id,attempt_id,config.role.to_string(),context.settings_revision],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
         let (validation_dispatch, setup_permit_id, permit_lane_id, switch_intent) =
             permit.ok_or_else(|| anyhow!("role launch permit is stale or already consumed"))?;
@@ -7234,6 +7346,16 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::mark_interrupt_requested_in(&transaction, session_id, &now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn mark_interrupt_requested_in(
+        transaction: &Transaction<'_>,
+        session_id: &str,
+        now: &str,
+    ) -> Result<()> {
         let changed = transaction.execute(
             "UPDATE sessions SET status = 'interrupt_requested',
                     interrupt_requested_at=COALESCE(interrupt_requested_at,?1),updated_at = ?1
@@ -7249,11 +7371,112 @@ impl Store {
             params![now, session_id],
         )?;
         crate::permissions::expire_session_in_transaction(
-            &transaction,
+            transaction,
             session_id,
             "session interrupt invalidated permission response delivery",
         )?;
-        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn reserve_failed_session_stop(
+        &self,
+        command: &crate::domain::HumanCommand,
+    ) -> Result<(crate::domain::OperationResult, bool)> {
+        let crate::domain::HumanCommand::StopFailedSession {
+            operation_id,
+            binding,
+        } = command
+        else {
+            bail!("expected a failed-session stop command")
+        };
+        if operation_id.trim().is_empty() {
+            bail!("operation_id must not be empty")
+        }
+        let request_hash = json_hash(command)?;
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((hash, result)) = tx.query_row(
+            "SELECT request_hash,result_json FROM operation_receipts
+             WHERE operation_id=?1 AND actor_key='human_control' AND operation_kind='human_command'",
+            params![operation_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ).optional()? {
+            if hash != request_hash {
+                bail!("operation_id was already used for another request")
+            }
+            return Ok((serde_json::from_str(&result)?, false));
+        }
+        let current = crate::workflow::failed_session_stop_binding(&tx, &binding.session_id)?;
+        if current.as_ref() != Some(binding) {
+            bail!("The failed session or task changed. Refresh before choosing how to continue.")
+        }
+        let control_id = uuid::Uuid::new_v4().to_string();
+        let mut payload = serde_json::to_value(binding)?;
+        payload["failure_stop_operation_id"] = serde_json::json!(operation_id);
+        tx.execute(
+            "INSERT INTO controls(id,attempt_id,role_generation_id,kind,state,expected_version,
+               payload_json,created_at,updated_at,requested_operation_id)
+             VALUES(?1,?2,?3,'pause_after_role','requested',?4,?5,?6,?6,?7)",
+            params![
+                control_id,
+                binding.attempt_id,
+                binding.role_generation_id,
+                binding.expected_task_version,
+                payload.to_string(),
+                now,
+                operation_id
+            ],
+        )?;
+        tx.execute(
+            "UPDATE tasks SET attention='pause_requested',version=version+1,updated_at=?1
+             WHERE id=?2 AND version=?3",
+            params![now, binding.task_id, binding.expected_task_version],
+        )?;
+        Self::mark_interrupt_requested_in(&tx, &binding.session_id, &now)?;
+        let result = crate::domain::OperationResult {
+            operation_id: operation_id.clone(),
+            entity_kind: "session".into(),
+            entity_id: binding.session_id.clone(),
+            version: Some(binding.expected_task_version + 1),
+            state: "stop_recovery_required".into(),
+            detail: serde_json::json!({
+                "control_id":control_id,
+                "message":"The task pause is reserved. Signal delivery is not confirmed; refresh to check the exit or use the task's recovery controls.",
+            }),
+        };
+        tx.execute(
+            "INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at)
+             VALUES(?1,'human_control','human_command',?2,?3,?4)",
+            params![operation_id, request_hash, serde_json::to_string(&result)?, now],
+        )?;
+        tx.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES(?1,?2,'human','session.failure_stop.reserved','session',?3,?4,?5)",
+            params![uuid::Uuid::new_v4().to_string(), operation_id, binding.session_id, payload.to_string(), now],
+        )?;
+        tx.commit()?;
+        Ok((result, true))
+    }
+
+    pub(crate) fn finish_failed_session_stop(
+        &self,
+        result: &crate::domain::OperationResult,
+    ) -> Result<()> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE operation_receipts SET result_json=?1 WHERE operation_id=?2
+             AND actor_key='human_control' AND operation_kind='human_command'",
+            params![serde_json::to_string(result)?, result.operation_id],
+        )?;
+        tx.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES(?1,?2,'service','session.failure_stop.signal_outcome','session',?3,?4,?5)",
+            params![uuid::Uuid::new_v4().to_string(), result.operation_id, result.entity_id,
+                serde_json::to_string(result)?, now],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -8165,6 +8388,10 @@ impl Store {
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
     ) -> Result<BrowserLaunchReservation> {
         self.require_execution_unheld("session resume reservations")?;
+        {
+            let connection = self.lock()?;
+            require_session_failure_stop_released(&connection, session_id)?;
+        }
         let capability_identity = crate::providers::capability_identity(launch)?;
         crate::providers::require_current_capability_identity_with_bundles(
             &capability_identity,
@@ -8190,6 +8417,7 @@ impl Store {
             "SELECT rg.attempt_id,s.setup_permit_id,a.status FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id JOIN attempts a ON a.id=rg.attempt_id WHERE s.id=?1",
             params![session_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
         )?;
+        require_failure_stop_released(&transaction, &admission_attempt)?;
         validate_frozen_capability(
             &transaction,
             session_id,
@@ -8672,6 +8900,7 @@ impl Store {
         if let Some(admission) = restart_admission {
             require_current_restart_admission(&tx, session_id, admission)?;
         }
+        require_session_failure_stop_released(&tx, session_id)?;
         if let Some(receipt) = browser_receipt {
             if let Some(existing) = browser_launch_receipt_in(
                 &tx,
@@ -8957,6 +9186,7 @@ impl Store {
             bail!("input lease requires a running session")
         }
         if purpose == InputLeasePurpose::AutomatedGuidance {
+            require_session_failure_stop_released(&transaction, session_id)?;
             require_no_session_provider_failure_hold(&transaction, session_id)?;
         }
         let active: Option<(String, Option<String>)> = transaction
@@ -9170,6 +9400,17 @@ impl Store {
         if status != "running" {
             bail!("session is no longer running")
         }
+        let guidance_delivery: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM input_leases lease JOIN guidance_messages guidance
+               ON lease.owner_id='guidance:'||guidance.id
+             WHERE lease.session_id=?1 AND guidance.delivery_session_id=lease.session_id
+               AND guidance.role_generation_id=lease.role_generation_id)",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if guidance_delivery {
+            require_session_failure_stop_released(&connection, session_id)?;
+        }
         Ok(())
     }
 
@@ -9210,7 +9451,15 @@ pub(crate) fn read_state_revision(connection: &Connection) -> rusqlite::Result<i
 
 /// The prior schemas an existing database may be migrated from at service
 /// start. Every other non-current version is left unchanged and refused.
-const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 5] = [31, 32, 33, 34, 35];
+pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 5] = [31, 32, 33, 34, 35];
+
+pub(crate) fn require_maintenance_schema(connection: &Connection) -> Result<i64> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != CURRENT_SCHEMA_VERSION && !SERVICE_UPGRADABLE_SCHEMA_VERSIONS.contains(&version) {
+        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–36")
+    }
+    Ok(version)
+}
 
 fn upgrade_supported_service_schema(path: &Path) -> Result<()> {
     let mut connection = Connection::open_with_flags(
@@ -10205,6 +10454,296 @@ const OBSERVED_EFFECTIVE_GENERATION_SQL: &str = "COALESCE(rg.status NOT IN ('rep
       OR (rg.role='implementer' AND rg.lane_id!='default' AND EXISTS(
             SELECT 1 FROM lane_generations lg WHERE lg.lane_id=rg.lane_id
               AND lg.effective_generation_id=rg.id))),0)";
+
+const CODEX_CAPACITY_EVENT: &str = "provider.codex_capacity_observed";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+pub(crate) struct CodexCapacityBinding {
+    pub(crate) session_id: String,
+    pub(crate) role_generation_id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) accepted_hook_id: String,
+    transcript_epoch: String,
+    native_session_id: String,
+    process_identity_json: String,
+    cwd: String,
+    launch_cwd: String,
+    hook_cwd: String,
+    turn_id: String,
+    invocation_start: i64,
+}
+
+impl CodexCapacityBinding {
+    fn audit_id(&self) -> Result<String> {
+        Ok(format!(
+            "codex-capacity:{}",
+            hex::encode(Sha256::digest(serde_json::to_vec(self)?))
+        ))
+    }
+
+    fn is_live(&self, processes: &crate::supervisor::ProcessSnapshot) -> bool {
+        matches!(processes, crate::supervisor::ProcessSnapshot::Read(live) if live.iter().any(|process|
+            process.session_id == self.session_id
+                && process.role_generation_id == self.role_generation_id
+                && process.transcript_epoch == self.transcript_epoch
+                && process.process_identity_json == self.process_identity_json))
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct CodexCapacityCandidate {
+    binding: CodexCapacityBinding,
+    hook_frontier: i64,
+    transcript_path: std::path::PathBuf,
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct CodexCapacityObservation {
+    binding: CodexCapacityBinding,
+    hook_frontier: i64,
+    source: crate::providers::codex::CapacityFileIdentity,
+    error_kind: String,
+}
+
+fn codex_capacity_candidate(
+    connection: &Connection,
+    session_id: &str,
+    frontier: Option<i64>,
+) -> Result<Option<CodexCapacityCandidate>> {
+    let candidate = connection.query_row(
+        &format!("WITH {}, frontier AS (
+           SELECT COALESCE(?2,MAX(hook_rowid)) AS hook_rowid FROM current_hooks)
+         SELECT s.role_generation_id,a.id,s.transcript_epoch,s.native_session_id,s.process_identity_json,
+                COALESCE((SELECT path FROM workspaces WHERE attempt_id=a.id),p.repository_path),
+                accepted.id,json_extract(accepted.payload_json,'$.cwd'),
+                json_extract(accepted.payload_json,'$.turn_id'),
+                json_extract(accepted.payload_json,'$.transcript_path'),
+                (SELECT hook_rowid FROM invocation_start),frontier.hook_rowid,s.launch_config_json,rg.role
+         FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
+         JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
+         JOIN projects p ON p.id=t.project_id CROSS JOIN accepted CROSS JOIN frontier
+         WHERE s.id=?1 AND s.provider='codex' AND rg.provider='codex'
+           AND s.status='running' AND rg.status='running' AND s.exit_json IS NULL
+           AND s.executable_version='codex-cli 0.157.1' AND s.process_identity_json IS NOT NULL
+           AND {OBSERVED_CURRENT_ATTEMPT_SQL} AND {OBSERVED_EFFECTIVE_GENERATION_SQL}
+           AND json_type(accepted.payload_json,'$.session_id')='text'
+           AND json_extract(accepted.payload_json,'$.session_id')=s.native_session_id
+           AND json_type(accepted.payload_json,'$.cwd')='text'
+           AND json_type(accepted.payload_json,'$.turn_id')='text'
+           AND length(json_extract(accepted.payload_json,'$.turn_id')) BETWEEN 1 AND 128
+           AND json_type(accepted.payload_json,'$.transcript_path')='text'
+           AND frontier.hook_rowid>=accepted.hook_rowid
+           AND NOT EXISTS(SELECT 1 FROM current_hooks h WHERE
+             h.event_name IN ('SessionStart','SessionEnd')
+             OR (h.hook_rowid>accepted.hook_rowid
+                 AND json_type(h.payload_json,'$.turn_id')='text'
+                 AND json_extract(h.payload_json,'$.turn_id')=json_extract(accepted.payload_json,'$.turn_id')
+                 AND (h.event_name IN ('Stop','Interrupt')
+                   OR (h.hook_rowid>frontier.hook_rowid AND h.event_name IN
+                       ('PreToolUse','PostToolUse','PermissionRequest','SubagentStart','SubagentStop')))))",
+            crate::workflow::CURRENT_TURN_HOOKS_SQL),
+        params![session_id, frontier],
+        |row| {
+            Ok((
+                CodexCapacityCandidate {
+                    binding: CodexCapacityBinding {
+                        session_id: session_id.to_owned(),
+                        role_generation_id: row.get(0)?,
+                        attempt_id: row.get(1)?,
+                        transcript_epoch: row.get(2)?,
+                        native_session_id: row.get(3)?,
+                        process_identity_json: row.get(4)?,
+                        cwd: row.get(5)?,
+                        accepted_hook_id: row.get(6)?,
+                        hook_cwd: row.get(7)?,
+                        turn_id: row.get(8)?,
+                        invocation_start: row.get(10)?,
+                        launch_cwd: String::new(),
+                    },
+                    transcript_path: std::path::PathBuf::from(row.get::<_, String>(9)?),
+                    hook_frontier: row.get(11)?,
+                },
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+            ))
+        },
+    ).optional()?;
+    let Some((mut candidate, launch, role)) = candidate else {
+        return Ok(None);
+    };
+    let Ok(launch) = serde_json::from_str::<LaunchConfig>(&launch) else {
+        return Ok(None);
+    };
+    let Some(binding) = launch.compatibility.as_ref() else {
+        return Ok(None);
+    };
+    let Ok(admitted) = crate::provider_compatibility::BundleSet::embedded().resolve(
+        crate::domain::Provider::Codex,
+        crate::providers::codex::EXACT_CODEX_VERSION,
+        launch.role,
+    ) else {
+        return Ok(None);
+    };
+    if launch.provider != crate::domain::Provider::Codex
+        || launch.role.to_string() != role
+        || launch.executable_version != crate::providers::codex::EXACT_CODEX_VERSION
+        || crate::provider_compatibility::AuthorityBinding::from(binding)
+            != crate::provider_compatibility::AuthorityBinding::from(&admitted)
+        || uuid::Uuid::parse_str(&candidate.binding.native_session_id).is_err()
+    {
+        return Ok(None);
+    }
+    candidate.binding.launch_cwd = launch.cwd.to_string_lossy().into_owned();
+    if [
+        &candidate.binding.cwd,
+        &candidate.binding.launch_cwd,
+        &candidate.binding.hook_cwd,
+        &candidate.binding.process_identity_json,
+        &candidate.binding.turn_id,
+    ]
+    .iter()
+    .any(|text| text.trim().is_empty() || text.len() > 4096 || text.contains('\0'))
+        || candidate.transcript_path.as_os_str().len() > 4096
+    {
+        return Ok(None);
+    }
+    Ok(Some(candidate))
+}
+
+impl Store {
+    pub(crate) fn read_codex_capacity(
+        &self,
+        root: &Path,
+        processes: &crate::supervisor::ProcessSnapshot,
+    ) -> Result<
+        Vec<(
+            CodexCapacityCandidate,
+            crate::providers::codex::CapacityFileIdentity,
+        )>,
+    > {
+        let crate::supervisor::ProcessSnapshot::Read(live) = processes else {
+            return Ok(Vec::new());
+        };
+        let candidates = {
+            let connection = self.lock()?;
+            let mut candidates = Vec::new();
+            for process in live {
+                let Some(candidate) =
+                    codex_capacity_candidate(&connection, &process.session_id, None)?
+                else {
+                    continue;
+                };
+                let recorded: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM audit_events WHERE id=?1)",
+                    params![candidate.binding.audit_id()?],
+                    |row| row.get(0),
+                )?;
+                if candidate.binding.is_live(processes) && !recorded {
+                    candidates.push(candidate);
+                }
+            }
+            candidates
+        };
+        Ok(candidates
+            .into_iter()
+            .filter_map(|candidate| {
+                let binding = &candidate.binding;
+                let cwd = std::fs::canonicalize(&binding.cwd).ok()?;
+                if std::fs::canonicalize(&binding.launch_cwd).ok()? != cwd
+                    || std::fs::canonicalize(&binding.hook_cwd).ok()? != cwd
+                {
+                    return None;
+                }
+                let source = crate::providers::codex::read_capacity_history(
+                    root,
+                    &candidate.transcript_path,
+                    &binding.native_session_id,
+                    &binding.turn_id,
+                    &cwd,
+                )?;
+                Some((candidate, source))
+            })
+            .collect())
+    }
+
+    pub(crate) fn record_codex_capacity(
+        &self,
+        candidate: &CodexCapacityCandidate,
+        source: &crate::providers::codex::CapacityFileIdentity,
+        processes: &crate::supervisor::ProcessSnapshot,
+    ) -> Result<()> {
+        if !candidate.binding.is_live(processes) {
+            return Ok(());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = codex_capacity_candidate(
+            &transaction,
+            &candidate.binding.session_id,
+            Some(candidate.hook_frontier),
+        )?;
+        if current.as_ref() == Some(candidate) {
+            let id = candidate.binding.audit_id()?;
+            let observation = CodexCapacityObservation {
+                binding: candidate.binding.clone(),
+                hook_frontier: candidate.hook_frontier,
+                source: source.clone(),
+                error_kind: "server_overloaded".into(),
+            };
+            // The frontier orders activity, but is excluded from identity so a
+            // retired binding can never acquire a fresh observation frontier.
+            transaction.execute(
+                "INSERT OR IGNORE INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+                 VALUES(?1,?1,'service',?2,'session',?3,?4,?5)",
+                params![
+                    id, CODEX_CAPACITY_EVENT, candidate.binding.session_id,
+                    serde_json::to_string(&observation)?, Utc::now().to_rfc3339()
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+const CODEX_CAPACITY_AUDITS_SQL: &str =
+    "SELECT id,detail_json FROM audit_events INDEXED BY audit_events_entity
+    WHERE entity_kind='session' AND entity_id=?1 AND actor_kind='service'
+      AND event_code='provider.codex_capacity_observed' AND length(detail_json)<=32768";
+
+pub(crate) fn current_codex_capacity(connection: &Connection) -> Result<Vec<CodexCapacityBinding>> {
+    let mut sessions = connection
+        .prepare("SELECT id FROM sessions WHERE provider='codex' AND status='running'")?;
+    let sessions = sessions
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut current = Vec::new();
+    let mut audits = connection.prepare(CODEX_CAPACITY_AUDITS_SQL)?;
+    for session in sessions {
+        let rows = audits.query_map(params![session], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, detail) = row?;
+            let Ok(observation) = serde_json::from_str::<CodexCapacityObservation>(&detail) else {
+                continue;
+            };
+            if observation.error_kind != "server_overloaded"
+                || observation.binding.audit_id()? != id
+            {
+                continue;
+            }
+            if let Some(candidate) =
+                codex_capacity_candidate(connection, &session, Some(observation.hook_frontier))?
+            {
+                if candidate.binding == observation.binding {
+                    current.push(observation.binding);
+                }
+            }
+        }
+    }
+    Ok(current)
+}
 
 /// Session `s` waits on a person through a persisted gate; `?2` is the pass time.
 const OBSERVED_PERSON_GATE_SQL: &str = "(EXISTS(SELECT 1 FROM permission_requests request
@@ -14106,6 +14645,8 @@ pub fn role_permissions(role: RoleKind) -> Vec<String> {
 mod interruption_tests {
     use super::*;
     use crate::domain::Provider;
+    use crate::{config::InstancePaths, database};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn committed_role_report_replays_receipt_without_duplicate_result_or_audit() {
@@ -14195,30 +14736,7 @@ mod interruption_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn service_start_upgrades_only_schemas_thirty_one_to_thirty_five_and_preserves_receipts() {
-        let root =
-            std::env::temp_dir().join(format!("llmrelay-service-upgrade-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let database = root.join("state.sqlite3");
-        let store = Store::open(&database).unwrap();
-        let scalar = |sql: &str| -> String {
-            Connection::open(&database)
-                .unwrap()
-                .query_row(sql, [], |row| row.get::<_, rusqlite::types::Value>(0))
-                .map(|value| format!("{value:?}"))
-                .unwrap()
-        };
-        let set_version = |version: i64| {
-            Connection::open(&database)
-                .unwrap()
-                .pragma_update(None, "user_version", version)
-                .unwrap()
-        };
-        let schema = "SELECT group_concat(name||':'||COALESCE(sql,''), char(10))
-             FROM (SELECT name, sql FROM sqlite_master ORDER BY name)";
-        let version = "PRAGMA user_version";
-        let current_schema = scalar(schema);
+    fn prior_service_schema_sql(version: i64) -> String {
         let drop_schema_36 =
             "DROP TABLE attention_observations; DROP INDEX role_results_session_generation;";
         let drop_schema_35 = format!("{drop_schema_36} DROP TABLE provider_failure_holds;");
@@ -14232,14 +14750,24 @@ mod interruption_tests {
             "{drop_schema_34} DROP TABLE permission_native_resolutions;
              DROP TABLE permission_request_hooks; DROP TABLE role_result_supersessions;"
         );
-        // The applied schema-31 receipt table, holding one historical receipt.
+        let drop_later = match version {
+            31 => {
+                format!("{drop_after_schema_32} DROP TABLE final_repair_rechecks; {MIGRATION_031}")
+            }
+            32 => drop_after_schema_32,
+            33 => drop_schema_34,
+            34 => drop_schema_35,
+            35 => drop_schema_36.to_owned(),
+            _ => panic!("unsupported fixture schema {version}"),
+        };
+        format!("{drop_later} PRAGMA user_version={version};")
+    }
+
+    fn schema_31_service_fixture(store: &Store) {
         store
             .lock()
             .unwrap()
-            .execute_batch(&format!(
-                "{drop_after_schema_32} DROP TABLE final_repair_rechecks; {MIGRATION_031}
-                 PRAGMA user_version=31;"
-            ))
+            .execute_batch(&prior_service_schema_sql(31))
             .unwrap();
         store.lock().unwrap().execute_batch(
             "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
@@ -14266,14 +14794,779 @@ mod interruption_tests {
                VALUES('a','t','recover','hash',7,'plan',NULL,'approved','c1','final','sixth','sixth-result','g','s',1,'profile','{}','authorized',
                  '2026-01-01T00:00:04Z','2026-01-01T00:00:04Z');"
         ).unwrap();
+    }
+
+    const SERVICE_FIXTURE_HISTORY: &str = "SELECT (SELECT group_concat(id||':'||lifecycle) FROM tasks)
+         ||'|'||(SELECT group_concat(id||':'||phase||':'||status) FROM attempts)
+         ||'|'||(SELECT group_concat(review_kind||':'||(initial_allowance+extension_allowance)||':'||spent) FROM review_budgets)
+         ||'|'||(SELECT group_concat(id||':'||delivery_state||':'||verdict) FROM review_requests)
+         ||'|'||(SELECT group_concat(attempt_id||':'||operation_id||':'||state||':'||reviewer_session_id
+              ||':'||rejected_code_request_id||':'||rejected_code_result_id) FROM final_repair_rechecks)
+         ||'|'||(SELECT revision FROM state_revision WHERE singleton=1)";
+
+    fn restorepoint_paths() -> InstancePaths {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-restorepoint-{}", uuid::Uuid::new_v4()));
+        let paths = InstancePaths::resolve(Some(root)).unwrap();
+        paths.create().unwrap();
+        paths
+    }
+
+    fn restorepoint_fixture(version: i64) -> (InstancePaths, Store) {
+        let paths = restorepoint_paths();
+        let mut store = Store::open(&paths.database).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        schema_31_service_fixture(&store);
+        if version != 31 {
+            drop(store);
+            store = Store::open_service(&paths.database).unwrap();
+            store
+                .lock()
+                .unwrap()
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA wal_autocheckpoint=0;")
+                .unwrap();
+            store
+                .lock()
+                .unwrap()
+                .execute_batch(&prior_service_schema_sql(version))
+                .unwrap();
+        }
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE projects SET repository_path=?1",
+                [paths.root.to_str().unwrap()],
+            )
+            .unwrap();
+        (paths, store)
+    }
+
+    fn restorepoint_root(paths: &InstancePaths) -> std::path::PathBuf {
+        paths.root.parent().unwrap().join(format!(
+            "{}.backups",
+            paths.root.file_name().unwrap().to_str().unwrap()
+        ))
+    }
+
+    fn restorepoint_snapshots(paths: &InstancePaths) -> Vec<std::path::PathBuf> {
+        let root = restorepoint_root(paths);
+        if !root.exists() {
+            return Vec::new();
+        }
+        let mut snapshots: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                !path.file_name().unwrap().to_str().unwrap().starts_with('.')
+                    && path.join("manifest.json").is_file()
+            })
+            .collect();
+        snapshots.sort();
+        snapshots
+    }
+
+    #[test]
+    fn restorepoint_upgrade_restore_and_held_restart_preserve_each_prior_schema() {
+        for version in SERVICE_UPGRADABLE_SCHEMA_VERSIONS {
+            let (paths, old) = restorepoint_fixture(version);
+            old.lock().unwrap().execute_batch(
+                "INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at)
+                   VALUES('credential','g','old-hash','[]','2026-01-01T00:00:00Z');
+                 INSERT INTO permission_rules(id,provider,project_id,role,lifetime,registered_root,repository_identity,
+                   executable_kind,executable_value,display_family,policy_fingerprint,created_by,created_at)
+                   VALUES('rule','codex','p','code_reviewer','project','/tmp','fixture','exact','true','shell','policy','human','2026-01-01T00:00:00Z');
+                 INSERT INTO input_leases(session_id,lease_id_hash,owner_kind,owner_id,role_generation_id,process_identity_json,expires_at,created_at,updated_at)
+                   VALUES('s','lease','human','human','g','{}','2099-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO launch_permits(id,attempt_id,role,settings_revision,state,created_at)
+                   VALUES('permit','a','code_reviewer',1,'issued','2026-01-01T00:00:00Z');
+                 INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+                   VALUES('control','a','resume','requested',1,'{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 UPDATE instance_settings SET auto_resume_eligible=1;
+                 UPDATE tasks SET title='committed WAL history' WHERE id='t';"
+            ).unwrap();
+            let main_bytes = std::fs::read(&paths.database).unwrap();
+            assert_eq!(
+                u32::from_be_bytes(main_bytes[60..64].try_into().unwrap()),
+                36
+            );
+            assert!(
+                std::fs::metadata(format!("{}-wal", paths.database.display()))
+                    .unwrap()
+                    .len()
+                    > 0
+            );
+            let history: String = old
+                .lock()
+                .unwrap()
+                .query_row(SERVICE_FIXTURE_HISTORY, [], |row| row.get(0))
+                .unwrap();
+            assert!(Store::open_current_readonly(&paths.database).is_err());
+            assert!(Store::open_current_writable(&paths.database).is_err());
+            assert!(database::inspect(&paths).is_err());
+            assert!(database::backup(&paths, None).is_err());
+            assert!(restorepoint_snapshots(&paths).is_empty());
+
+            let lock = database::InstanceLock::acquire(&paths).unwrap();
+            let upgraded = database::open_service_locked(&paths, &lock).unwrap();
+            assert_eq!(
+                require_maintenance_schema(&upgraded.lock().unwrap()).unwrap(),
+                36
+            );
+            assert_eq!(
+                upgraded
+                    .lock()
+                    .unwrap()
+                    .query_row(SERVICE_FIXTURE_HISTORY, [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                history
+            );
+            assert!(upgraded.restore_hold().unwrap().is_none());
+            let snapshots = restorepoint_snapshots(&paths);
+            assert_eq!(snapshots.len(), 1);
+            let snapshot = &snapshots[0];
+            let verified = database::verify(snapshot).unwrap();
+            assert_eq!(verified["schema_version"], version);
+            let snapshot_connection = Connection::open_with_flags(
+                format!(
+                    "file:{}?immutable=1",
+                    snapshot.join("database.sqlite3").display()
+                ),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )
+            .unwrap();
+            assert_eq!(
+                snapshot_connection
+                    .query_row(SERVICE_FIXTURE_HISTORY, [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                history
+            );
+            assert_eq!(
+                snapshot_connection
+                    .query_row("SELECT title FROM tasks", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "committed WAL history"
+            );
+            drop(snapshot_connection);
+            drop(upgraded);
+            drop(old);
+            drop(lock);
+
+            let restored = database::restore(&paths, snapshot).unwrap();
+            assert_eq!(restored["automatic_resume"], false);
+            let held = Store::open_maintenance_readonly(&paths.database).unwrap();
+            assert_eq!(
+                require_maintenance_schema(&held.lock().unwrap()).unwrap(),
+                version
+            );
+            assert_eq!(
+                held.restore_hold().unwrap().unwrap()["operation_id"],
+                restored["operation_id"]
+            );
+            assert!(held.require_execution_unheld("dispatch").is_err());
+            let authority: String = held.lock().unwrap().query_row(
+                "SELECT (SELECT revoked_at IS NOT NULL FROM role_credentials WHERE id='credential')||':'||
+                   (SELECT revoked_at IS NOT NULL FROM permission_rules WHERE id='rule')||':'||
+                   (SELECT revoked_at IS NOT NULL FROM input_leases WHERE session_id='s')||':'||
+                   (SELECT state FROM launch_permits WHERE id='permit')||':'||
+                   (SELECT state FROM controls WHERE id='control')||':'||
+                   (SELECT auto_resume_eligible FROM instance_settings)||':'||
+                   (SELECT queue_paused FROM projects WHERE id='p')", [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(authority, "1:1:1:released:cancelled:0:1");
+            let held_history: String = held
+                .lock()
+                .unwrap()
+                .query_row(SERVICE_FIXTURE_HISTORY, [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                held_history.rsplit_once('|').unwrap().0,
+                history.rsplit_once('|').unwrap().0
+            );
+            let inode = std::fs::metadata(&paths.database).unwrap().ino();
+            drop(held);
+
+            let lock = database::InstanceLock::acquire(&paths).unwrap();
+            database::recover_interrupted_restore_locked(&paths).unwrap();
+            let next = database::open_service_locked(&paths, &lock).unwrap();
+            assert_eq!(
+                require_maintenance_schema(&next.lock().unwrap()).unwrap(),
+                36
+            );
+            assert_eq!(std::fs::metadata(&paths.database).unwrap().ino(), inode);
+            assert_eq!(
+                next.restore_hold().unwrap().unwrap()["operation_id"],
+                restored["operation_id"]
+            );
+            assert!(next.require_execution_unheld("resume").is_err());
+            assert_eq!(
+                next.lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT auto_resume_eligible FROM instance_settings",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            drop(next);
+            database::recover_interrupted_restore_locked(&paths).unwrap();
+            drop(lock);
+            assert_eq!(database::verify(snapshot).unwrap(), verified);
+            std::fs::remove_dir_all(restorepoint_root(&paths)).unwrap();
+            std::fs::remove_dir_all(paths.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn restorepoint_new_current_and_unlocked_maintenance_do_not_gain_upgrade_authority() {
+        let paths = restorepoint_paths();
+        assert!(Store::open_maintenance_readonly(&paths.database).is_err());
+        assert!(Store::open_maintenance_writable(&paths.database).is_err());
+        assert!(!paths.database.exists());
+        let lock = database::InstanceLock::acquire(&paths).unwrap();
+        for _ in 0..2 {
+            drop(database::open_service_locked(&paths, &lock).unwrap());
+            assert!(!restorepoint_root(&paths).exists());
+        }
+        assert!(database::InstanceLock::acquire(&paths).is_err());
+        assert!(database::backup(&paths, None)
+            .unwrap_err()
+            .to_string()
+            .contains("another LLMRelay instance owns"));
+        let other = restorepoint_paths();
+        assert!(database::open_service_locked(&other, &lock).is_err());
+        assert!(!other.database.exists());
+        drop(lock);
+        std::fs::remove_dir_all(paths.root).unwrap();
+        std::fs::remove_dir_all(other.root).unwrap();
+    }
+
+    #[test]
+    fn restorepoint_capacity_and_prepublication_refusals_leave_source_and_points_unchanged() {
+        let (paths, source) = restorepoint_fixture(35);
+        let lock = database::InstanceLock::acquire(&paths).unwrap();
+        let main = std::fs::read(&paths.database).unwrap();
+        let wal_path = format!("{}-wal", paths.database.display());
+        let wal = std::fs::read(&wal_path).unwrap();
+        database::TEST_AVAILABLE_CAPACITY
+            .with(|values| *values.borrow_mut() = [u64::MAX, 0].into());
+        let error = database::open_service_locked(&paths, &lock).err().unwrap();
+        assert!(format!("{error:#}").contains("migration capacity after verified restore point"));
+        let prior = restorepoint_snapshots(&paths);
+        assert_eq!(prior.len(), 1);
+        let verified = database::verify(&prior[0]).unwrap();
+        for interrupt in [false, true] {
+            database::TEST_AVAILABLE_CAPACITY.with(|values| {
+                *values.borrow_mut() = [if interrupt { u64::MAX } else { 0 }].into()
+            });
+            database::TEST_INTERRUPT_BACKUP_BEFORE_PUBLISH.with(|armed| armed.set(interrupt));
+            let error = database::open_service_locked(&paths, &lock).err().unwrap();
+            let expected = if interrupt {
+                "injected interruption before backup publication"
+            } else {
+                "shared filesystem backup and migration capacity"
+            };
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            database::TEST_AVAILABLE_CAPACITY.with(|values| assert!(values.borrow().is_empty()));
+            assert_eq!(
+                require_maintenance_schema(&source.lock().unwrap()).unwrap(),
+                35
+            );
+            assert_eq!(std::fs::read(&paths.database).unwrap(), main);
+            assert_eq!(std::fs::read(&wal_path).unwrap(), wal);
+            assert_eq!(restorepoint_snapshots(&paths), prior);
+            assert_eq!(database::verify(&prior[0]).unwrap(), verified);
+        }
+        assert_eq!(
+            std::fs::read_dir(restorepoint_root(&paths))
+                .unwrap()
+                .count(),
+            2
+        );
+        drop(source);
+        drop(lock);
+        std::fs::remove_dir_all(restorepoint_root(&paths)).unwrap();
+        std::fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[test]
+    fn restorepoint_invalid_sources_refuse_before_upgrade_and_preserve_verified_points() {
+        for fault in [
+            "corrupt",
+            "foreign_keys",
+            "schema_0",
+            "schema_30",
+            "schema_37",
+        ] {
+            let (paths, source) = restorepoint_fixture(31);
+            let lock = database::InstanceLock::acquire(&paths).unwrap();
+            database::TEST_AVAILABLE_CAPACITY
+                .with(|values| *values.borrow_mut() = [u64::MAX, 0].into());
+            assert!(database::open_service_locked(&paths, &lock).is_err());
+            let points = restorepoint_snapshots(&paths);
+            let verified = database::verify(&points[0]).unwrap();
+            match fault {
+                "corrupt" => {}
+                "foreign_keys" => source
+                    .lock()
+                    .unwrap()
+                    .execute_batch(
+                        "PRAGMA foreign_keys=OFF; UPDATE tasks SET project_id='missing';",
+                    )
+                    .unwrap(),
+                _ => source
+                    .lock()
+                    .unwrap()
+                    .pragma_update(
+                        None,
+                        "user_version",
+                        fault
+                            .strip_prefix("schema_")
+                            .unwrap()
+                            .parse::<i64>()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+            }
+            drop(source);
+            if fault == "corrupt" {
+                std::fs::write(&paths.database, b"not a SQLite database").unwrap();
+            }
+            let before = std::fs::read(&paths.database).unwrap();
+            let error = database::open_service_locked(&paths, &lock).err().unwrap();
+            let expected = match fault {
+                "corrupt" => "not a database",
+                "foreign_keys" => "foreign_key_violations=1",
+                _ => "unsupported database schema version",
+            };
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{fault}: {error:#}"
+            );
+            assert_eq!(std::fs::read(&paths.database).unwrap(), before);
+            assert_eq!(restorepoint_snapshots(&paths), points);
+            assert_eq!(database::verify(&points[0]).unwrap(), verified);
+            assert!(!paths.state.join("database-restore-journal.json").exists());
+            drop(lock);
+            std::fs::remove_dir_all(restorepoint_root(&paths)).unwrap();
+            std::fs::remove_dir_all(paths.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn restorepoint_contention_and_prepublication_failure_do_not_enable_wal() {
+        let (paths, source) = restorepoint_fixture(31);
+        drop(source);
+        let writer = Connection::open(&paths.database).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let before = std::fs::read(&paths.database).unwrap();
+        let lock = database::InstanceLock::acquire(&paths).unwrap();
+        let error = database::open_service_locked(&paths, &lock).err().unwrap();
+        assert!(
+            format!("{error:#}").contains("database is locked"),
+            "{error:#}"
+        );
+        assert!(restorepoint_snapshots(&paths).is_empty());
+        writer.execute_batch("ROLLBACK;").unwrap();
+        database::TEST_INTERRUPT_BACKUP_BEFORE_PUBLISH.with(|armed| armed.set(true));
+        let error = database::open_service_locked(&paths, &lock).err().unwrap();
+        assert!(format!("{error:#}").contains("injected interruption"));
+        assert!(restorepoint_snapshots(&paths).is_empty());
+        assert_eq!(
+            writer
+                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+        assert_eq!(require_maintenance_schema(&writer).unwrap(), 31);
+        assert_eq!(std::fs::read(&paths.database).unwrap(), before);
+        assert!(!std::path::PathBuf::from(format!("{}-wal", paths.database.display())).exists());
+        drop(writer);
+        drop(lock);
+        std::fs::remove_dir_all(restorepoint_root(&paths)).unwrap();
+        std::fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[test]
+    fn restorepoint_old_repository_and_inventory_errors_cannot_bypass_restore_guards() {
+        let (paths, source) = restorepoint_fixture(31);
+        let lock = database::InstanceLock::acquire(&paths).unwrap();
+        database::TEST_AVAILABLE_CAPACITY
+            .with(|values| *values.borrow_mut() = [u64::MAX, 0].into());
+        assert!(database::open_service_locked(&paths, &lock).is_err());
+        let points = restorepoint_snapshots(&paths);
+        source
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE projects SET repository_path=?1",
+                [paths.root.parent().unwrap().to_str().unwrap()],
+            )
+            .unwrap();
+        let error = database::open_service_locked(&paths, &lock).err().unwrap();
+        assert!(format!("{error:#}").contains("overlaps registered repository"));
+        assert_eq!(
+            require_maintenance_schema(&source.lock().unwrap()).unwrap(),
+            31
+        );
+        drop(lock);
+        let error = database::restore(&paths, &points[0]).unwrap_err();
+        assert!(format!("{error:#}").contains("inside a registered repository"));
+        source
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE projects SET repository_path=?1",
+                [paths.root.to_str().unwrap()],
+            )
+            .unwrap();
+        source
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE cmux_session_surfaces;")
+            .unwrap();
+        drop(source);
+        let before = std::fs::read(&paths.database).unwrap();
+        let error = database::restore(&paths, &points[0]).unwrap_err();
+        assert!(format!("{error:#}").contains("capture inventory from readable displaced database"));
+        assert_eq!(std::fs::read(&paths.database).unwrap(), before);
+        assert_eq!(restorepoint_snapshots(&paths), points);
+        assert!(!paths.state.join("database-restore-journal.json").exists());
+        assert!(!paths.state.join("database-quarantine").exists());
+        std::fs::remove_dir_all(restorepoint_root(&paths)).unwrap();
+        std::fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[test]
+    fn restorepoint_manifest_must_match_the_actual_admitted_schema() {
+        let (paths, source) = restorepoint_fixture(31);
+        let lock = database::InstanceLock::acquire(&paths).unwrap();
+        drop(database::open_service_locked(&paths, &lock).unwrap());
+        drop(source);
+        drop(lock);
+        let point = restorepoint_snapshots(&paths).remove(0);
+        let manifest_path = point.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["sqlite_schema_version"] = 32.into();
+        std::fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(database::verify(&point)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match actual SQLite schema 31"));
+        let before = std::fs::read(&paths.database).unwrap();
+        assert!(database::restore(&paths, &point)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match actual SQLite schema 31"));
+        assert_eq!(std::fs::read(&paths.database).unwrap(), before);
+        assert!(!paths.state.join("database-restore-journal.json").exists());
+        std::fs::remove_dir_all(restorepoint_root(&paths)).unwrap();
+        std::fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[test]
+    fn restorepoint_intermediate_failure_retains_original_recovery_and_held_journal() {
+        let (paths, source) = restorepoint_fixture(31);
+        source
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE VIEW provider_failure_holds AS SELECT 1 AS marker;")
+            .unwrap();
+        let history: String = source
+            .lock()
+            .unwrap()
+            .query_row(SERVICE_FIXTURE_HISTORY, [], |row| row.get(0))
+            .unwrap();
+        let lock = database::InstanceLock::acquire(&paths).unwrap();
+        let error = database::open_service_locked(&paths, &lock).err().unwrap();
+        assert!(
+            format!("{error:#}").contains("provider_failure_holds already exists"),
+            "{error:#}"
+        );
+        let original = restorepoint_snapshots(&paths).remove(0);
+        assert!(error.to_string().contains(original.to_str().unwrap()));
+        assert!(error.to_string().contains("offline recovery"));
+        assert_eq!(database::verify(&original).unwrap()["schema_version"], 31);
+        assert_eq!(
+            require_maintenance_schema(&source.lock().unwrap()).unwrap(),
+            34
+        );
+        assert_eq!(
+            source
+                .lock()
+                .unwrap()
+                .query_row(SERVICE_FIXTURE_HISTORY, [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            history
+        );
+        for _ in 0..11 {
+            assert!(database::open_service_locked(&paths, &lock).is_err());
+        }
+        assert!(original.exists());
+        assert_eq!(restorepoint_snapshots(&paths).len(), 10);
+        assert_eq!(database::verify(&original).unwrap()["schema_version"], 31);
+        assert!(!paths.state.join("database-restore-journal.json").exists());
+        drop(source);
+        drop(lock);
+
+        let restored = database::restore(&paths, &original).unwrap();
+        let lock = database::InstanceLock::acquire(&paths).unwrap();
+        database::recover_interrupted_restore_locked(&paths).unwrap();
+        assert!(database::open_service_locked(&paths, &lock).is_err());
+        database::recover_interrupted_restore_locked(&paths).unwrap();
+        let intermediate = Store::open_maintenance_writable(&paths.database).unwrap();
+        assert_eq!(
+            require_maintenance_schema(&intermediate.lock().unwrap()).unwrap(),
+            34
+        );
+        assert_eq!(
+            intermediate.restore_hold().unwrap().unwrap()["operation_id"],
+            restored["operation_id"]
+        );
+        assert!(intermediate.require_execution_unheld("dispatch").is_err());
+        intermediate
+            .lock()
+            .unwrap()
+            .execute_batch("DROP VIEW provider_failure_holds;")
+            .unwrap();
+        drop(intermediate);
+        database::recover_interrupted_restore_locked(&paths).unwrap();
+        let repaired = database::open_service_locked(&paths, &lock).unwrap();
+        assert_eq!(
+            require_maintenance_schema(&repaired.lock().unwrap()).unwrap(),
+            36
+        );
+        assert_eq!(
+            repaired.restore_hold().unwrap().unwrap()["operation_id"],
+            restored["operation_id"]
+        );
+        drop(repaired);
+        database::recover_interrupted_restore_locked(&paths).unwrap();
+        drop(lock);
+        std::fs::remove_dir_all(restorepoint_root(&paths)).unwrap();
+        std::fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[test]
+    fn restorepoint_old_hold_pending_restarts_and_offline_release_preserve_bindings() {
+        for version in SERVICE_UPGRADABLE_SCHEMA_VERSIONS {
+            let (paths, source) = restorepoint_fixture(version);
+            let lock = database::InstanceLock::acquire(&paths).unwrap();
+            drop(database::open_service_locked(&paths, &lock).unwrap());
+            drop(lock);
+            drop(source);
+            let point = restorepoint_snapshots(&paths).remove(0);
+            for committed in [false, true] {
+                let restored = database::restore(&paths, &point).unwrap();
+                let journal_path = paths.state.join("database-restore-journal.json");
+                let mut journal: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+                if !committed {
+                    // Reconstruct the existing pre-hold boundary without replacing its bound inode.
+                    std::fs::write(
+                        &paths.database,
+                        std::fs::read(point.join("database.sqlite3")).unwrap(),
+                    )
+                    .unwrap();
+                    for suffix in ["-wal", "-shm"] {
+                        let sidecar = std::path::PathBuf::from(format!(
+                            "{}{suffix}",
+                            paths.database.display()
+                        ));
+                        if sidecar.exists() {
+                            std::fs::remove_file(sidecar).unwrap();
+                        }
+                    }
+                }
+                journal["phase"] = "hold_pending".into();
+                std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+                let lock = database::InstanceLock::acquire(&paths).unwrap();
+                database::recover_interrupted_restore_locked(&paths).unwrap();
+                let held = Store::open_maintenance_readonly(&paths.database).unwrap();
+                assert_eq!(
+                    require_maintenance_schema(&held.lock().unwrap()).unwrap(),
+                    version
+                );
+                assert_eq!(
+                    held.restore_hold().unwrap().unwrap()["operation_id"],
+                    restored["operation_id"]
+                );
+                assert_eq!(
+                    std::fs::metadata(&paths.database).unwrap().ino(),
+                    journal["staged_binding"]["inode"].as_u64().unwrap()
+                );
+                assert_eq!(journal["inventory"]["state"], "available");
+                drop(held);
+                if committed {
+                    let journal_before = std::fs::read(&journal_path).unwrap();
+                    let quarantine = std::path::PathBuf::from(
+                        journal["moves"][0]["quarantine"].as_str().unwrap(),
+                    );
+                    let original = std::fs::read(&quarantine).unwrap();
+                    let mut changed = original.clone();
+                    changed.push(1);
+                    std::fs::write(&quarantine, &changed).unwrap();
+                    let error = database::recover_interrupted_restore_locked(&paths).unwrap_err();
+                    assert!(format!("{error:#}").contains("recorded binding"));
+                    assert_eq!(std::fs::read(&quarantine).unwrap(), changed);
+                    assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+                    std::fs::write(&quarantine, original).unwrap();
+                    let bound = paths.state.join("bound-old.sqlite3");
+                    std::fs::rename(&paths.database, &bound).unwrap();
+                    std::fs::copy(&bound, &paths.database).unwrap();
+                    let error = database::recover_interrupted_restore_locked(&paths).unwrap_err();
+                    assert!(format!("{error:#}").contains("staged-file identity"));
+                    assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+                    std::fs::remove_file(&paths.database).unwrap();
+                    std::fs::rename(bound, &paths.database).unwrap();
+                }
+                drop(lock);
+                assert_eq!(
+                    database::release_hold(&paths).unwrap()["automatic_resume"],
+                    false
+                );
+                let released = Store::open_maintenance_readonly(&paths.database).unwrap();
+                assert_eq!(
+                    require_maintenance_schema(&released.lock().unwrap()).unwrap(),
+                    version
+                );
+                assert!(released.restore_hold().unwrap().is_none());
+                let paused: String = released.lock().unwrap().query_row(
+                    "SELECT (SELECT queue_paused FROM projects)||':'||(SELECT attention FROM tasks)||':'||
+                       (SELECT auto_resume_eligible FROM instance_settings)||':'||(SELECT desired_running FROM sessions)", [], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(paused, "1:paused:0:0");
+            }
+            std::fs::remove_dir_all(restorepoint_root(&paths)).unwrap();
+            std::fs::remove_dir_all(paths.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn restorepoint_retention_keeps_each_schema_anchor_and_ignores_unverified_content() {
+        let mut host = None;
+        let mut anchors = Vec::new();
+        for version in SERVICE_UPGRADABLE_SCHEMA_VERSIONS {
+            let (paths, source) = restorepoint_fixture(version);
+            let lock = database::InstanceLock::acquire(&paths).unwrap();
+            drop(database::open_service_locked(&paths, &lock).unwrap());
+            drop(lock);
+            drop(source);
+            let point = restorepoint_snapshots(&paths).remove(0);
+            let manifest_path = point.join("manifest.json");
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            manifest["created_at"] = "2000-01-01T00:00:00Z".into();
+            std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            if let Some(host_paths) = &host {
+                let moved = restorepoint_root(host_paths).join(point.file_name().unwrap());
+                std::fs::rename(&point, &moved).unwrap();
+                anchors.push(moved);
+                std::fs::remove_dir_all(restorepoint_root(&paths)).unwrap();
+                std::fs::remove_dir_all(paths.root).unwrap();
+            } else {
+                anchors.push(point);
+                host = Some(paths);
+            }
+        }
+        let host = host.unwrap();
+        let root = restorepoint_root(&host);
+        let copy = |name: &str| {
+            let path = root.join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            for file in ["database.sqlite3", "manifest.json"] {
+                std::fs::copy(anchors[0].join(file), path.join(file)).unwrap();
+            }
+            path
+        };
+        let tied_anchor = copy("zzz-schema31-tie");
+        let mismatched = copy("mismatched-schema");
+        let corrupted = copy("unverified-hash");
+        let unowned = copy("operator-owned");
+        let manifest_path = mismatched.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["sqlite_schema_version"] = 32.into();
+        manifest["created_at"] = "2999-01-01T00:00:00Z".into();
+        std::fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        std::fs::write(
+            corrupted.join("database.sqlite3"),
+            b"unverified operator evidence",
+        )
+        .unwrap();
+        std::fs::write(unowned.join("operator-notes.txt"), b"retain").unwrap();
+        let mut newest = serde_json::Value::Null;
+        for _ in 0..12 {
+            newest = database::backup(&host, None).unwrap();
+        }
+        assert!(
+            !anchors[0].exists(),
+            "the deterministic newer tie supersedes the expired schema-31 point"
+        );
+        assert!(tied_anchor.exists());
+        for point in &anchors[1..] {
+            assert!(point.exists());
+        }
+        assert_eq!(
+            database::verify(&tied_anchor).unwrap()["schema_version"],
+            31
+        );
+        assert!(Path::new(newest["backup"].as_str().unwrap()).exists());
+        assert_eq!(
+            restorepoint_snapshots(&host).len(),
+            13,
+            "ten eligible points plus three unrecognized points"
+        );
+        assert!(database::verify(&mismatched).is_err());
+        assert_eq!(
+            std::fs::read(corrupted.join("database.sqlite3")).unwrap(),
+            b"unverified operator evidence"
+        );
+        assert_eq!(
+            std::fs::read(unowned.join("operator-notes.txt")).unwrap(),
+            b"retain"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(host.root).unwrap();
+    }
+
+    #[test]
+    fn service_start_upgrades_only_schemas_thirty_one_to_thirty_five_and_preserves_receipts() {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-service-upgrade-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("state.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let scalar = |sql: &str| -> String {
+            Connection::open(&database)
+                .unwrap()
+                .query_row(sql, [], |row| row.get::<_, rusqlite::types::Value>(0))
+                .map(|value| format!("{value:?}"))
+                .unwrap()
+        };
+        let set_version = |version: i64| {
+            Connection::open(&database)
+                .unwrap()
+                .pragma_update(None, "user_version", version)
+                .unwrap()
+        };
+        let schema = "SELECT group_concat(name||':'||COALESCE(sql,''), char(10))
+             FROM (SELECT name, sql FROM sqlite_master ORDER BY name)";
+        let version = "PRAGMA user_version";
+        let current_schema = scalar(schema);
+        schema_31_service_fixture(&store);
         drop(store);
-        let history = "SELECT (SELECT group_concat(id||':'||lifecycle) FROM tasks)
-             ||'|'||(SELECT group_concat(id||':'||phase||':'||status) FROM attempts)
-             ||'|'||(SELECT group_concat(review_kind||':'||(initial_allowance+extension_allowance)||':'||spent) FROM review_budgets)
-             ||'|'||(SELECT group_concat(id||':'||delivery_state||':'||verdict) FROM review_requests)
-             ||'|'||(SELECT group_concat(attempt_id||':'||operation_id||':'||state||':'||reviewer_session_id
-                  ||':'||rejected_code_request_id||':'||rejected_code_result_id) FROM final_repair_rechecks)
-             ||'|'||(SELECT revision FROM state_revision WHERE singleton=1)";
+        let history = SERVICE_FIXTURE_HISTORY;
         let schema_31 = scalar(schema);
         for refused in [
             Store::open_current_readonly(&database).err(),
@@ -14329,7 +15622,7 @@ mod interruption_tests {
         // Schema 32 gains only native-resolution provenance and the later migrations.
         Connection::open(&database)
             .unwrap()
-            .execute_batch(&format!("{drop_after_schema_32} PRAGMA user_version=32;"))
+            .execute_batch(&prior_service_schema_sql(32))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
         assert_eq!(scalar(version), "Integer(36)");
@@ -14338,7 +15631,7 @@ mod interruption_tests {
         // Schema 33 gains only the guidance submitted form and the later migrations.
         Connection::open(&database)
             .unwrap()
-            .execute_batch(&format!("{drop_schema_34} PRAGMA user_version=33;"))
+            .execute_batch(&prior_service_schema_sql(33))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
         assert_eq!(scalar(version), "Integer(36)");
@@ -14346,7 +15639,7 @@ mod interruption_tests {
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
             .unwrap()
-            .execute_batch(&format!("{drop_schema_35} PRAGMA user_version=34;"))
+            .execute_batch(&prior_service_schema_sql(34))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
         assert_eq!(scalar(version), "Integer(36)");
@@ -14354,7 +15647,7 @@ mod interruption_tests {
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
             .unwrap()
-            .execute_batch(&format!("{drop_schema_36} PRAGMA user_version=35;"))
+            .execute_batch(&prior_service_schema_sql(35))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
         assert_eq!(scalar(version), "Integer(36)");
@@ -14662,6 +15955,8 @@ mod attention_observation_tests {
     use crate::supervisor::{LiveInvocation, ProcessSnapshot};
 
     const PROCESS: &str = "{\"pid\":4242}";
+    const CAPACITY_NATIVE: &str = "01a0fad1-a051-7941-84b4-e64979f74d26";
+    const CAPACITY_TURN: &str = "01a0fad1-a06e-7da3-8bfc-1a96b443ad5d";
 
     struct ObservedSession {
         root: std::path::PathBuf,
@@ -14670,6 +15965,121 @@ mod attention_observation_tests {
     }
 
     impl ObservedSession {
+        fn codex_capacity() -> Self {
+            use crate::domain::{CapabilityStatus, Provider};
+            let mut session = Self::new("codex-capacity");
+            session.root = session.root.canonicalize().unwrap();
+            session.base = Utc::now();
+            let launch = LaunchConfig {
+                provider: Provider::Codex,
+                role: RoleKind::Implementer,
+                executable: "/unused/codex".into(),
+                executable_version: crate::providers::codex::EXACT_CODEX_VERSION.into(),
+                model: "fixture".into(),
+                effort: "max".into(),
+                cwd: session.root.clone(),
+                argv: Vec::new(),
+                environment_keys: Vec::new(),
+                permission_policy: "workspace-write".into(),
+                security_policy: serde_json::json!({}),
+                hook_revision: crate::providers::CODEX_HOOK_REVISION.into(),
+                capability_status: CapabilityStatus::Supported,
+                compatibility: Some(
+                    crate::provider_compatibility::BundleSet::embedded()
+                        .resolve(
+                            Provider::Codex,
+                            crate::providers::codex::EXACT_CODEX_VERSION,
+                            RoleKind::Implementer,
+                        )
+                        .unwrap(),
+                ),
+            };
+            {
+                let connection = session.store.lock().unwrap();
+                connection
+                    .execute(
+                        "UPDATE projects SET repository_path=?1",
+                        params![session.root.to_str().unwrap()],
+                    )
+                    .unwrap();
+                connection
+                    .execute("UPDATE role_generations SET provider='codex'", [])
+                    .unwrap();
+                connection.execute("UPDATE sessions SET provider='codex',native_session_id=NULL,launch_config_json=?1,executable_version=?2",
+                    params![serde_json::to_string(&launch).unwrap(), launch.executable_version]).unwrap();
+                connection.execute("INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at)
+                    VALUES('capacity-credential','g',?1,'[\"report_hook\"]','2026-01-01T00:00:00Z')",
+                    params![auth::hash_secret("capacity-token")]).unwrap();
+            }
+            std::fs::create_dir_all(session.root.join("sessions/day")).unwrap();
+            let records = [
+                serde_json::json!({"type":"session_meta","payload":{"id":CAPACITY_NATIVE,"session_id":CAPACITY_NATIVE,
+                    "cwd":session.root,"cli_version":"0.157.1","source":"cli","originator":"codex-tui","thread_source":"user"}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":CAPACITY_TURN}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":CAPACITY_TURN,
+                    "error":{"codex_error_info":"server_overloaded","message":"private provider text"}}}),
+            ];
+            std::fs::write(
+                session.root.join("sessions/day/turn.jsonl"),
+                records
+                    .iter()
+                    .map(|record| format!("{record}\n"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+            session.capacity_hook("SessionStart", serde_json::json!({}));
+            session.capacity_hook(
+                "UserPromptSubmit",
+                serde_json::json!({"turn_id":CAPACITY_TURN,
+                "transcript_path":session.root.join("sessions/day/turn.jsonl")}),
+            );
+            session
+        }
+
+        fn capacity_hook(&self, event: &str, mut payload: serde_json::Value) {
+            let context = self.store.role_context("capacity-token").unwrap();
+            payload["hook_event_name"] = serde_json::json!(event);
+            payload["session_id"] = serde_json::json!(CAPACITY_NATIVE);
+            payload["cwd"] = serde_json::json!(self.root);
+            self.store
+                .save_hook_event(
+                    &context,
+                    &HookEnvelope {
+                        provider: context.provider,
+                        payload,
+                    },
+                    &RolePeerProvenance {
+                        peer_pid: 4242,
+                        peer_process_group_id: 4242,
+                        peer_start_marker: "peer".into(),
+                        managed_root_pid: 4242,
+                        managed_root_start_marker: "root".into(),
+                        state: "managed_process_group_untrusted_payload".into(),
+                    },
+                )
+                .unwrap();
+        }
+
+        fn read_capacity(
+            &self,
+        ) -> Vec<(
+            CodexCapacityCandidate,
+            crate::providers::codex::CapacityFileIdentity,
+        )> {
+            self.store
+                .read_codex_capacity(&self.root.join("sessions"), &live())
+                .unwrap()
+        }
+
+        fn capacity_items(&self) -> Vec<crate::domain::AttentionItem> {
+            crate::workflow::state(&self.store)
+                .unwrap()
+                .attention
+                .into_iter()
+                .filter(|item| item.id.starts_with("codex_capacity:"))
+                .collect()
+        }
+
         fn new(name: &str) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "llmrelay-attention-{name}-{}",
@@ -14807,6 +16217,412 @@ mod attention_observation_tests {
             transcript_epoch: "e".into(),
             process_identity_json: PROCESS.into(),
         }])
+    }
+
+    #[test]
+    fn codex_capacity_pipeline_preserves_authority_and_immutable_frontier() {
+        let session = ObservedSession::codex_capacity();
+        session.capacity_hook(
+            "PreToolUse",
+            serde_json::json!({"turn_id":CAPACITY_TURN,"tool_use_id":"before"}),
+        );
+        let observations = session.read_capacity();
+        assert_eq!(
+            observations.len(),
+            1,
+            "activity before capture does not mask a later native completion"
+        );
+        let (candidate, source) = &observations[0];
+        for event in ["PostToolUse", "Stop", "Interrupt"] {
+            for payload in [
+                serde_json::json!({"turn_id":"other"}),
+                serde_json::json!({}),
+                serde_json::json!({"turn_id":12}),
+                serde_json::json!({"prompt_id":CAPACITY_TURN}),
+            ] {
+                session.capacity_hook(event, payload);
+            }
+        }
+        let before = session.business_rows();
+        let revision = session.revision();
+        session
+            .store
+            .record_codex_capacity(candidate, source, &live())
+            .unwrap();
+        assert_eq!(session.business_rows(), before);
+        assert_eq!(session.revision(), revision + 1);
+        let items = session.capacity_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].reason, "Codex reported that the selected model is at capacity; open agent output to inspect it and choose the next action.");
+        assert_eq!(
+            serde_json::to_value(&items[0].target).unwrap(),
+            serde_json::json!({"kind":"session",
+            "project_id":"p","task_id":"t","attempt_id":"a","session_id":"s","role_generation_id":"g"})
+        );
+        assert_eq!(
+            serde_json::to_value(&items[0].action).unwrap()["kind"],
+            "open_agent_output"
+        );
+        let detail: String = session.scalar("SELECT detail_json FROM audit_events WHERE event_code='provider.codex_capacity_observed'");
+        assert!(!detail.contains("private provider text") && !detail.contains("turn.jsonl"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&detail).unwrap()["hook_frontier"],
+            candidate.hook_frontier
+        );
+        session
+            .store
+            .record_codex_capacity(candidate, source, &live())
+            .unwrap();
+        assert!(session.read_capacity().is_empty());
+        assert_eq!(session.revision(), revision + 1);
+        session.capacity_hook(
+            "PostToolUse",
+            serde_json::json!({"turn_id":CAPACITY_TURN,"tool_use_id":"after"}),
+        );
+        let retired_revision = session.revision();
+        assert!(session.capacity_items().is_empty());
+        assert!(session.read_capacity().is_empty());
+        session
+            .store
+            .record_codex_capacity(candidate, source, &live())
+            .unwrap();
+        assert_eq!(session.revision(), retired_revision);
+        assert_eq!(session.scalar::<String>("SELECT detail_json FROM audit_events WHERE event_code='provider.codex_capacity_observed'"), detail);
+        assert_eq!(session.scalar::<i64>("SELECT COUNT(*) FROM audit_events WHERE event_code='provider.codex_capacity_observed'"), 1);
+    }
+
+    #[test]
+    fn codex_capacity_commit_revalidates_identity_attempt_and_activity() {
+        for mutation in [
+            "UPDATE sessions SET transcript_epoch='new'",
+            "UPDATE sessions SET native_session_id='01a0fad3-1e45-71e2-8686-83184958e2c9'",
+            "UPDATE sessions SET process_identity_json='{\"pid\":9999}'",
+            "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+             SELECT 'replacement',attempt_id,role,provider,2,config_revision,status,authority_generation,created_at,updated_at FROM role_generations WHERE id='g';
+             UPDATE sessions SET role_generation_id='replacement'; UPDATE role_settings SET effective_generation_id='replacement'",
+            "UPDATE role_settings SET effective_generation_id=NULL",
+            "UPDATE role_generations SET status='replaced'",
+            "UPDATE projects SET repository_path='/changed'",
+            "UPDATE sessions SET launch_config_json=json_set(launch_config_json,'$.cwd','/changed')",
+            "UPDATE hook_events SET payload_json=json_set(payload_json,'$.cwd','/changed') WHERE event_name='UserPromptSubmit'",
+            "UPDATE hook_events SET payload_json=json_set(payload_json,'$.transcript_path','/changed') WHERE event_name='UserPromptSubmit'",
+            "UPDATE attempts SET status='completed'",
+            "UPDATE sessions SET status='recovery_required'",
+            "UPDATE sessions SET status='exited',exit_json='{}'",
+        ] {
+            let session = ObservedSession::codex_capacity();
+            let observations = session.read_capacity();
+            assert_eq!(observations.len(), 1);
+            session.execute(mutation);
+            let before = session.business_rows();
+            let revision = session.revision();
+            session.store.record_codex_capacity(&observations[0].0, &observations[0].1, &live()).unwrap();
+            assert!(session.capacity_items().is_empty(), "{mutation}");
+            assert_eq!(session.scalar::<i64>("SELECT COUNT(*) FROM audit_events WHERE event_code='provider.codex_capacity_observed'"), 0);
+            assert_eq!(session.business_rows(), before);
+            assert_eq!(session.revision(), revision);
+        }
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "PermissionRequest",
+            "SubagentStart",
+            "SubagentStop",
+            "Stop",
+            "Interrupt",
+            "SessionEnd",
+            "SessionStart",
+            "UserPromptSubmit",
+        ] {
+            let session = ObservedSession::codex_capacity();
+            let observations = session.read_capacity();
+            let payload = if matches!(event, "SessionEnd" | "SessionStart") {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({"turn_id":CAPACITY_TURN,
+                    "transcript_path":session.root.join("sessions/day/turn.jsonl")})
+            };
+            session.capacity_hook(event, payload);
+            let revision = session.revision();
+            session
+                .store
+                .record_codex_capacity(&observations[0].0, &observations[0].1, &live())
+                .unwrap();
+            assert_eq!(session.revision(), revision, "{event}");
+            assert!(session.capacity_items().is_empty(), "{event}");
+        }
+        let session = ObservedSession::codex_capacity();
+        let observations = session.read_capacity();
+        for processes in [
+            ProcessSnapshot::Unavailable,
+            ProcessSnapshot::Read(vec![]),
+            ProcessSnapshot::Read(vec![LiveInvocation {
+                session_id: "s".into(),
+                role_generation_id: "g".into(),
+                transcript_epoch: "old".into(),
+                process_identity_json: PROCESS.into(),
+            }]),
+            ProcessSnapshot::Read(vec![LiveInvocation {
+                session_id: "s".into(),
+                role_generation_id: "other".into(),
+                transcript_epoch: "e".into(),
+                process_identity_json: PROCESS.into(),
+            }]),
+            ProcessSnapshot::Read(vec![LiveInvocation {
+                session_id: "s".into(),
+                role_generation_id: "g".into(),
+                transcript_epoch: "e".into(),
+                process_identity_json: "{\"pid\":99}".into(),
+            }]),
+            ProcessSnapshot::Read(vec![LiveInvocation {
+                session_id: "other".into(),
+                role_generation_id: "g".into(),
+                transcript_epoch: "e".into(),
+                process_identity_json: PROCESS.into(),
+            }]),
+        ] {
+            session
+                .store
+                .record_codex_capacity(&observations[0].0, &observations[0].1, &processes)
+                .unwrap();
+            assert!(session.capacity_items().is_empty());
+            assert!(session
+                .store
+                .read_codex_capacity(&session.root.join("sessions"), &processes)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn codex_capacity_selection_requires_admitted_explicit_current_turn() {
+        for mutation in [
+            "UPDATE sessions SET executable_version='codex-cli 0.159.2'",
+            "UPDATE sessions SET launch_config_json=json_set(launch_config_json,'$.compatibility.synthetic_origin',json('true'))",
+            "UPDATE sessions SET launch_config_json=json_remove(launch_config_json,'$.compatibility')",
+            "UPDATE sessions SET launch_config_json=json_set(launch_config_json,'$.compatibility.effective_hash','wrong')",
+            "UPDATE hook_events SET event_name='UntrustedNativeEvent' WHERE event_name='UserPromptSubmit'",
+            "DELETE FROM hook_events WHERE event_name='SessionStart'",
+        ] {
+            let session = ObservedSession::codex_capacity();
+            session.execute(mutation);
+            assert!(session.read_capacity().is_empty(), "{mutation}");
+        }
+        for turn in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!(4),
+            serde_json::json!("wrong-turn"),
+        ] {
+            let session = ObservedSession::codex_capacity();
+            session.capacity_hook(
+                "UserPromptSubmit",
+                serde_json::json!({"turn_id":turn,"prompt_id":CAPACITY_TURN,
+                "transcript_path":session.root.join("sessions/day/turn.jsonl")}),
+            );
+            assert!(session.read_capacity().is_empty());
+        }
+        for event in ["Stop", "Interrupt", "SessionEnd"] {
+            let session = ObservedSession::codex_capacity();
+            session.capacity_hook(
+                event,
+                if event == "SessionEnd" {
+                    serde_json::json!({})
+                } else {
+                    serde_json::json!({"turn_id":CAPACITY_TURN})
+                },
+            );
+            assert!(
+                session.read_capacity().is_empty(),
+                "{event} before snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_capacity_projection_retires_current_binding_without_new_audits() {
+        for event in [
+            "UserPromptSubmit",
+            "SessionStart",
+            "SessionEnd",
+            "Stop",
+            "Interrupt",
+            "PreToolUse",
+            "PostToolUse",
+            "PermissionRequest",
+            "SubagentStart",
+            "SubagentStop",
+        ] {
+            let session = ObservedSession::codex_capacity();
+            let observations = session.read_capacity();
+            session
+                .store
+                .record_codex_capacity(&observations[0].0, &observations[0].1, &live())
+                .unwrap();
+            assert_eq!(session.capacity_items().len(), 1);
+            session.capacity_hook(event, if matches!(event, "SessionStart" | "SessionEnd") { serde_json::json!({}) }
+                else { serde_json::json!({"turn_id":if event == "UserPromptSubmit" { "new-turn" } else { CAPACITY_TURN },
+                    "transcript_path":session.root.join("sessions/day/turn.jsonl")}) });
+            let revision = session.revision();
+            assert!(session.capacity_items().is_empty(), "{event}");
+            assert!(session.read_capacity().is_empty(), "{event}");
+            assert_eq!(session.revision(), revision);
+            assert_eq!(session.scalar::<i64>("SELECT COUNT(*) FROM audit_events WHERE event_code='provider.codex_capacity_observed'"), 1);
+        }
+        for mutation in ["UPDATE sessions SET status='exited',exit_json='{}'", "UPDATE sessions SET status='recovery_required'",
+            "UPDATE sessions SET transcript_epoch='new'", "UPDATE role_generations SET status='replaced'",
+            "UPDATE audit_events SET actor_kind='hook' WHERE event_code='provider.codex_capacity_observed'",
+            "INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+             VALUES('new-attempt','t','context','implementation','base',1,'running','2999-01-01','2999-01-01')"]
+        {
+            let session = ObservedSession::codex_capacity();
+            let observations = session.read_capacity();
+            session.store.record_codex_capacity(&observations[0].0, &observations[0].1, &live()).unwrap();
+            session.execute(mutation);
+            let revision = session.revision();
+            assert!(session.capacity_items().is_empty(), "{mutation}");
+            assert!(session.read_capacity().is_empty());
+            assert_eq!(session.revision(), revision);
+        }
+    }
+
+    #[test]
+    fn codex_capacity_fifo_does_not_starve_later_candidate_or_h3() {
+        use std::os::unix::ffi::OsStrExt;
+        let mut session = ObservedSession::codex_capacity();
+        let fifo = session.root.join("sessions/day/fifo");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // mkfifo receives a live NUL-terminated path; no writer ever opens it.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        session.execute("INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,
+            transcript_epoch,native_session_id,process_identity_json,created_at,updated_at)
+            SELECT 's-bad',role_generation_id,provider,status,launch_config_json,executable_version,
+                transcript_epoch,native_session_id,process_identity_json,created_at,updated_at FROM sessions WHERE id='s'");
+        let mut context = session.store.role_context("capacity-token").unwrap();
+        context.session_id = "s-bad".into();
+        for event in ["SessionStart", "UserPromptSubmit"] {
+            session.store.save_hook_event(&context, &HookEnvelope { provider: context.provider,
+                payload: serde_json::json!({"hook_event_name":event,"session_id":CAPACITY_NATIVE,"cwd":session.root,
+                    "turn_id":CAPACITY_TURN,"transcript_path":fifo}) },
+                &RolePeerProvenance { peer_pid:4242, peer_process_group_id:4242, peer_start_marker:"peer".into(),
+                    managed_root_pid:4242, managed_root_start_marker:"root".into(), state:"managed_process_group_untrusted_payload".into() }).unwrap();
+        }
+        let processes = ProcessSnapshot::Read(
+            ["s-bad", "s"]
+                .into_iter()
+                .map(|id| LiveInvocation {
+                    session_id: id.into(),
+                    role_generation_id: "g".into(),
+                    transcript_epoch: "e".into(),
+                    process_identity_json: PROCESS.into(),
+                })
+                .collect(),
+        );
+        session.base = Utc::now();
+        let before = session.business_rows();
+        let observed = session
+            .store
+            .read_codex_capacity(&session.root.join("sessions"), &processes)
+            .unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].0.binding.session_id, "s");
+        session
+            .store
+            .record_codex_capacity(&observed[0].0, &observed[0].1, &processes)
+            .unwrap();
+        session.observe(1_000, &processes, true);
+        session.observe(601_000, &processes, false);
+        session.observe(602_000, &processes, false);
+        assert!(session.scalar::<i64>("SELECT COUNT(*) FROM attention_observations WHERE kind='quiet_turn' AND state='open'") > 0);
+        assert_eq!(session.business_rows(), before);
+        assert_eq!(session.capacity_items().len(), 1);
+    }
+
+    #[test]
+    fn codex_capacity_projection_uses_entity_index_beyond_display_windows() {
+        let session = ObservedSession::codex_capacity();
+        let observed = session.read_capacity();
+        session
+            .store
+            .record_codex_capacity(&observed[0].0, &observed[0].1, &live())
+            .unwrap();
+        session.execute("WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<205)
+            INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+            SELECT 'history-'||n,'g','codex','exited','{}','fixture','old','2999-01-01','2999-01-01' FROM numbers;
+            WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<505)
+            INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+            SELECT 'noise-'||n,'noise','service','unrelated','session','unrelated','{}','2999-01-01' FROM numbers;");
+        let revision = session.revision();
+        let state = crate::workflow::state(&session.store).unwrap();
+        assert!(state
+            .attention
+            .iter()
+            .any(|item| item.id.starts_with("codex_capacity:")));
+        assert!(state.active_sessions.iter().any(|value| value["id"] == "s"
+            && value["role_generation_id"] == "g"
+            && value["attempt_id"] == "a"
+            && value["status"] == "running"));
+        assert_eq!(session.revision(), revision);
+        let connection = session.store.lock().unwrap();
+        let plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {CODEX_CAPACITY_AUDITS_SQL}"))
+            .unwrap()
+            .query_map(params!["s"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" ");
+        assert!(
+            plan.contains("SEARCH audit_events USING INDEX audit_events_entity"),
+            "{plan}"
+        );
+        assert!(!plan.contains("SCAN audit_events"), "{plan}");
+    }
+
+    #[test]
+    fn dismissed_native_prompt_still_suppresses_raw_wait_observations() {
+        let session = ObservedSession::new("dismissed-native-wait");
+        session.hook("start", "SessionStart", "{}", 0);
+        session.hook(
+            "notice",
+            "Notification",
+            r#"{"notification_type":"agent_needs_input"}"#,
+            1_000,
+        );
+        session.observe(5_000, &live(), true);
+        let projected = crate::workflow::state(&session.store).unwrap();
+        let binding = serde_json::from_value(
+            projected.active_sessions[0]["native_prompt"]["dismissal"].clone(),
+        )
+        .unwrap();
+        crate::workflow::execute(
+            &session.store,
+            &crate::domain::HumanCommand::DismissNativePrompt {
+                operation_id: "dismiss".into(),
+                binding,
+            },
+        )
+        .unwrap();
+        let revision = session.revision();
+        session.observe(31_000, &live(), false);
+        session.observe(33_000, &live(), false);
+        assert_eq!(session.state("process_without_accepted_turn"), "none");
+        assert_eq!(session.revision(), revision);
+        assert!(
+            crate::workflow::native_prompt(&session.store.lock().unwrap(), "s")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            crate::workflow::state(&session.store)
+                .unwrap()
+                .active_sessions[0]["native_prompt"]["dismissed"],
+            true
+        );
+        assert_eq!(
+            session.scalar::<String>("SELECT readiness_state FROM sessions WHERE id='s'"),
+            "busy"
+        );
     }
 
     #[test]
