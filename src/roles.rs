@@ -935,6 +935,9 @@ impl RoleService {
     }
 
     pub fn deliver_guidance(&self, guidance_id: &str) -> Result<serde_json::Value> {
+        if let Some(cancelled) = self.store.cancel_stale_report_reminder(guidance_id)? {
+            return Ok(cancelled);
+        }
         self.store.require_execution_unheld("guidance delivery")?;
         let (
             session,
@@ -958,7 +961,7 @@ impl RoleService {
             Option<String>,
         ) = {
             let connection = self.store.lock()?;
-            connection
+            let delivery = connection
                 .query_row(
                     "SELECT s.id,s.provider,s.capability_identity_json,g.body,g.reason,t.attention,a.id,
                        s.transcript_epoch,
@@ -986,16 +989,34 @@ impl RoleService {
                         ))
                     },
                 )
-                .optional()?
-                .ok_or_else(|| {
-                    anyhow!("guidance awaits a live role with a native Stop idle boundary")
-                })?
+                .optional()?;
+            if delivery.is_none() && crate::store::is_report_reminder(&connection, guidance_id)? {
+                let current: Option<String> = connection.query_row(
+                    "SELECT json_object('action','guidance_delivery_already_claimed',
+                        'guidance_id',id,'attempt_id',attempt_id,'session_id',delivery_session_id,
+                        'state',state,'engine_generated',json('true'),'report_reminder',json('true'))
+                     FROM guidance_messages WHERE id=?1 AND state!='queued'",
+                    params![guidance_id],
+                    |row| row.get(0),
+                ).optional()?;
+                if let Some(current) = current {
+                    return Ok(serde_json::from_str(&current)?);
+                }
+            }
+            delivery.ok_or_else(|| {
+                anyhow!("guidance awaits a live role with a native Stop idle boundary")
+            })?
         };
-        let engine_generated = matches!(
-            reason.as_deref(),
-            Some("engine_plan_rejection_notice")
-                | Some("engine_plan_rejection_notice_blocked_hold")
-        );
+        let report_reminder = {
+            let connection = self.store.lock()?;
+            crate::store::is_report_reminder(&connection, guidance_id)?
+        };
+        let engine_generated = report_reminder
+            || matches!(
+                reason.as_deref(),
+                Some("engine_plan_rejection_notice")
+                    | Some("engine_plan_rejection_notice_blocked_hold")
+            );
         if engine_generated
             && matches!(
                 attention.as_str(),
@@ -1056,6 +1077,7 @@ impl RoleService {
         };
         // All work after acquisition stays in this scope so the exact lease is released on every exit.
         let mut reserved = false;
+        let mut pasted = false;
         let delivery = (|| -> Result<Option<serde_json::Value>> {
             reserved = match self.store.reserve_guidance_delivery(
                 guidance_id,
@@ -1107,7 +1129,9 @@ impl RoleService {
             bytes.extend_from_slice(BRACKETED_PASTE_START);
             bytes.extend_from_slice(submitted.as_bytes());
             bytes.extend_from_slice(BRACKETED_PASTE_END);
-            self.supervisor.write_input(&session, &lease, &bytes)?;
+            self.supervisor
+                .write_guidance_input(&session, &lease, guidance_id, &bytes)?;
+            pasted = true;
             {
                 let connection = self.store.lock()?;
                 let changed = connection.execute(
@@ -1120,12 +1144,26 @@ impl RoleService {
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
-            self.supervisor.write_input(&session, &lease, b"\r")?;
+            self.supervisor
+                .write_guidance_input(&session, &lease, guidance_id, b"\r")?;
             Ok(None)
         })();
-        let release = self.supervisor.release_input(&session, &lease);
-        // Only a reserved delivery can have reached the terminal; otherwise the guidance stays queued.
+        let release = if report_reminder {
+            self.store
+                .release_report_reminder_input(&session, &lease, guidance_id)
+        } else {
+            self.supervisor.release_input(&session, &lease)
+        };
         let delivery = match delivery {
+            Err(error)
+                if report_reminder
+                    && !pasted
+                    && error.is::<crate::store::ReportReminderRefused>() =>
+            {
+                self.store
+                    .cancel_report_reminder_before_write(guidance_id, &error.to_string())
+                    .map(Some)
+            }
             Err(error) if reserved => {
                 let recorded = self.store.lock().and_then(|connection| {
                     connection.execute(
@@ -1153,7 +1191,7 @@ impl RoleService {
                 )?;
                 let acknowledged = state == "acknowledged";
                 Ok(
-                    serde_json::json!({"action":"guidance_delivered","guidance_id":guidance_id,"session_id":session,"attempt_id":attempt,"state":state,"acknowledged":acknowledged,"engine_generated":engine_generated}),
+                    serde_json::json!({"action":"guidance_delivered","guidance_id":guidance_id,"session_id":session,"attempt_id":attempt,"state":state,"acknowledged":acknowledged,"engine_generated":engine_generated,"report_reminder":report_reminder}),
                 )
             }
             (Ok(_), Err(release_error)) => {

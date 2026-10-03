@@ -375,7 +375,7 @@ export function AttentionInbox(
         )}
         <TechnicalDetails>
           <p>
-            Guidance waits for a safe pause between the manager's steps. If
+            Guidance waits for a safe pause between the agent's steps. If
             delivery cannot be confirmed it is not sent again automatically.
           </p>
         </TechnicalDetails>
@@ -388,15 +388,15 @@ export function guidanceState(state: string): string {
   switch (state) {
     case "queued":
     case "delivery_reserved":
-      return "Waiting for the manager to pause";
+      return "Waiting for the agent to pause";
     case "written_awaiting_submit":
-      return "Typed into the manager's input; not submitted yet";
+      return "Typed into the agent's input; waiting for native submission";
     case "submitted":
-      return "Sent to the manager; not yet confirmed as accepted";
+      return "Accepted as a native turn";
     case "acknowledged":
-      return "Received by the manager";
+      return "Explicitly acknowledged";
     case "delivery_unknown":
-      return "Delivery not confirmed — check the manager's output before sending again";
+      return "Delivery not confirmed; view the agent's output before deciding what to do next";
     default:
       return state.replaceAll("_", " ");
   }

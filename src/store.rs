@@ -183,6 +183,205 @@ pub(crate) enum InputLeasePurpose {
     AutomatedGuidance,
 }
 
+const REPORT_REMINDER_ACTOR: &str = "service:role_report_reminders";
+const REPORT_REMINDER_OPERATION: &str = "role_report_reminder";
+const REPORT_REMINDER_EVENT: &str = "role.report_reminder.reserved";
+const REPORT_REMINDER_LIMIT: usize = 2;
+const REPORT_REMINDER_PROMPT: &str = "Inspect your current role context. If your assigned work is finished or blocked, submit the required allowed structured role report with the actual outcome and evidence. Do not repeat prior commands, invent success, expand permissions, or treat this reminder as approval.";
+
+#[derive(Debug)]
+pub(crate) struct ReportReminderRefused(pub(crate) String);
+
+impl std::fmt::Display for ReportReminderRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReportReminderRefused {}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct ReportReminderReservation {
+    binding: crate::workflow::ReportReminderBinding,
+    guidance_id: String,
+    ordinal: usize,
+}
+
+fn report_reminder_operation_id(generation: &str, ordinal: usize) -> String {
+    format!("role-report-reminder:{generation}:{ordinal}")
+}
+
+fn report_reminder_reservations(
+    connection: &Connection,
+    generation: &str,
+) -> Result<Vec<ReportReminderReservation>> {
+    let mut statement = connection.prepare(
+        "SELECT operation_id,request_hash,result_json FROM operation_receipts
+         WHERE actor_key=?1 AND operation_kind=?2
+           AND (operation_id=?3 OR operation_id=?4
+             OR json_extract(result_json,'$.binding.role_generation_id')=?5)",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                REPORT_REMINDER_ACTOR,
+                REPORT_REMINDER_OPERATION,
+                report_reminder_operation_id(generation, 1),
+                report_reminder_operation_id(generation, 2),
+                generation,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut reservations = Vec::new();
+    for (operation, hash, result) in rows {
+        let reservation: ReportReminderReservation =
+            serde_json::from_str(&result).context("parse canonical report reminder reservation")?;
+        if reservation.binding.role_generation_id != generation
+            || !(1..=REPORT_REMINDER_LIMIT).contains(&reservation.ordinal)
+            || operation != report_reminder_operation_id(generation, reservation.ordinal)
+            || json_hash(&reservation)? != hash
+        {
+            bail!("canonical report reminder provenance is invalid")
+        }
+        let audit: Option<String> = connection
+            .query_row(
+                "SELECT detail_json FROM audit_events WHERE id=?1 AND operation_id=?1
+               AND actor_kind='service' AND event_code=?2 AND entity_kind='role_generation'
+               AND entity_id=?3",
+                params![operation, REPORT_REMINDER_EVENT, generation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if audit.as_deref() != Some(result.as_str()) {
+            bail!("canonical report reminder audit is missing or changed")
+        }
+        reservations.push(reservation);
+    }
+    reservations.sort_by_key(|reservation| reservation.ordinal);
+    if reservations.len() > REPORT_REMINDER_LIMIT
+        || reservations
+            .iter()
+            .enumerate()
+            .any(|(index, reservation)| reservation.ordinal != index + 1)
+    {
+        bail!("canonical report reminder ordinals are invalid")
+    }
+    let audits: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM audit_events WHERE actor_kind='service' AND event_code=?1
+           AND entity_kind='role_generation' AND entity_id=?2",
+        params![REPORT_REMINDER_EVENT, generation],
+        |row| row.get(0),
+    )?;
+    if audits != reservations.len() as i64 {
+        bail!("canonical report reminder receipt is missing")
+    }
+    Ok(reservations)
+}
+
+fn report_reminder_for_guidance(
+    connection: &Connection,
+    guidance_id: &str,
+) -> Result<Option<ReportReminderReservation>> {
+    let generation: String = connection.query_row(
+        "SELECT COALESCE(
+           (SELECT entity_id FROM audit_events WHERE actor_kind='service'
+             AND event_code=?2 AND entity_kind='role_generation'
+             AND json_extract(detail_json,'$.guidance_id')=?1 LIMIT 1),
+           (SELECT json_extract(result_json,'$.binding.role_generation_id') FROM operation_receipts
+             WHERE actor_key=?3 AND operation_kind=?4
+               AND json_extract(result_json,'$.guidance_id')=?1 LIMIT 1),
+           role_generation_id) FROM guidance_messages WHERE id=?1",
+        params![
+            guidance_id,
+            REPORT_REMINDER_EVENT,
+            REPORT_REMINDER_ACTOR,
+            REPORT_REMINDER_OPERATION
+        ],
+        |row| row.get(0),
+    )?;
+    let reservations = report_reminder_reservations(connection, &generation)?;
+    Ok(reservations
+        .into_iter()
+        .find(|reservation| reservation.guidance_id == guidance_id))
+}
+
+pub(crate) fn is_report_reminder(connection: &Connection, guidance_id: &str) -> Result<bool> {
+    Ok(report_reminder_for_guidance(connection, guidance_id)?.is_some())
+}
+
+pub(crate) fn report_reminder_display(
+    connection: &Connection,
+    guidance_id: &str,
+) -> Result<Option<serde_json::Value>> {
+    let Some(reservation) = report_reminder_for_guidance(connection, guidance_id)? else {
+        return Ok(None);
+    };
+    let reservations =
+        report_reminder_reservations(connection, &reservation.binding.role_generation_id)?;
+    Ok(Some(serde_json::json!({
+        "ordinal": reservation.ordinal,
+        "reservations_spent": reservations.len(),
+        "generation_limit": REPORT_REMINDER_LIMIT,
+        "required_report": reservation.binding.requirement,
+    })))
+}
+
+pub(crate) fn require_current_report_reminder(
+    connection: &Connection,
+    guidance_id: &str,
+) -> Result<bool> {
+    let Some(reservation) = report_reminder_for_guidance(connection, guidance_id)? else {
+        return Ok(false);
+    };
+    let current = crate::workflow::report_reminder_binding(
+        connection,
+        &reservation.binding.session_id,
+        Some(guidance_id),
+    )?;
+    let intact: bool = connection.query_row(
+        "SELECT body=?2 AND attempt_id=?3 AND role_generation_id=?4
+           AND state IN ('queued','delivery_reserved','written_awaiting_submit')
+         FROM guidance_messages WHERE id=?1",
+        params![
+            guidance_id,
+            REPORT_REMINDER_PROMPT,
+            reservation.binding.attempt_id,
+            reservation.binding.role_generation_id
+        ],
+        |row| row.get(0),
+    )?;
+    let input_owned: bool = connection.query_row(
+        "SELECT state='queued' OR EXISTS(SELECT 1 FROM input_leases lease
+           JOIN sessions s ON s.id=lease.session_id
+           WHERE lease.session_id=guidance_messages.delivery_session_id
+             AND lease.owner_id='guidance:'||guidance_messages.id
+             AND lease.role_generation_id=guidance_messages.role_generation_id
+             AND lease.process_identity_json=s.process_identity_json AND lease.revoked_at IS NULL
+             AND julianday(lease.expires_at)>julianday('now'))
+         FROM guidance_messages WHERE id=?1",
+        params![guidance_id],
+        |row| row.get(0),
+    )?;
+    if !intact
+        || !input_owned
+        || current.as_ref() != Some(&reservation.binding)
+        || reservation.binding.role == RoleKind::FinalReviewer
+    {
+        return Err(ReportReminderRefused(
+            "The reminder was cancelled because its settings, report, turn or input authority changed.".into(),
+        ).into());
+    }
+    Ok(true)
+}
+
 #[derive(Clone, Debug)]
 pub struct RoleLaunchContext {
     pub task_id: String,
@@ -2201,7 +2400,7 @@ impl Store {
         transaction.execute(
             "INSERT INTO audit_events(id, operation_id, actor_kind, actor_id, event_code, entity_kind, entity_id, detail_json, created_at)
              VALUES(?1, ?2, 'hook', ?3, 'provider.hook.received', 'session', ?4, ?5, ?6)",
-            params![uuid::Uuid::new_v4().to_string(), uuid::Uuid::new_v4().to_string(), context.role_generation_id, context.session_id, serde_json::json!({"event_name": event_name}).to_string(), now],
+            params![uuid::Uuid::new_v4().to_string(), uuid::Uuid::new_v4().to_string(), context.role_generation_id, context.session_id, serde_json::json!({"event_name": event_name,"hook_event_id":hook_event_id,"safe_idle_boundary":safe_idle_boundary}).to_string(), now],
         )?;
         transaction.commit()?;
         Ok(serde_json::json!({
@@ -2348,6 +2547,7 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_current_report_reminder(&transaction, guidance_id)?;
         require_no_session_provider_failure_hold(&transaction, session_id)?;
         require_session_failure_stop_released(&transaction, session_id)?;
         let reserved = transaction.execute(
@@ -2384,6 +2584,187 @@ impl Store {
         }
         transaction.commit()?;
         Ok(reserved)
+    }
+
+    pub(crate) fn reserve_report_reminder(
+        &self,
+        binding: &crate::workflow::ReportReminderBinding,
+    ) -> Result<Option<serde_json::Value>> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if binding.role == RoleKind::FinalReviewer
+            || crate::workflow::report_reminder_binding(&transaction, &binding.session_id, None)?
+                .as_ref()
+                != Some(binding)
+        {
+            return Ok(None);
+        }
+        let reservations = report_reminder_reservations(&transaction, &binding.role_generation_id)?;
+        if reservations.len() >= REPORT_REMINDER_LIMIT {
+            return Ok(None);
+        }
+        for prior in &reservations {
+            // Canonical receipts own the spent turn and ordinal.
+            let later_turn: bool = transaction
+                .query_row(
+                    "SELECT current.rowid>prior.rowid AND prior_stop.rowid>prior.rowid
+                   AND prior_stop.session_id=?4 AND prior_stop.event_name='Stop'
+                 FROM hook_events current JOIN hook_events prior ON prior.id=?2
+                 JOIN hook_events prior_stop ON prior_stop.id=?3 WHERE current.id=?1",
+                    params![
+                        binding.accepted_hook_event_id,
+                        prior.binding.accepted_hook_event_id,
+                        prior.binding.stop_hook_event_id,
+                        prior.binding.session_id
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !later_turn {
+                return Ok(None);
+            }
+        }
+        let reservation = ReportReminderReservation {
+            binding: binding.clone(),
+            guidance_id: uuid::Uuid::new_v4().to_string(),
+            ordinal: reservations.len() + 1,
+        };
+        let operation =
+            report_reminder_operation_id(&binding.role_generation_id, reservation.ordinal);
+        let now = Utc::now().to_rfc3339();
+        let provenance = serde_json::to_string(&reservation)?;
+        transaction.execute(
+            "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,reason,created_at)
+             VALUES(?1,?2,?3,?4,'queued','engine_role_report_reminder',?5)",
+            params![reservation.guidance_id,binding.attempt_id,binding.role_generation_id,REPORT_REMINDER_PROMPT,now],
+        )?;
+        transaction.execute(
+            "INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![operation,REPORT_REMINDER_ACTOR,REPORT_REMINDER_OPERATION,json_hash(&reservation)?,provenance,now],
+        )?;
+        transaction.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES(?1,?1,'service',?2,'role_generation',?3,?4,?5)",
+            params![operation,REPORT_REMINDER_EVENT,binding.role_generation_id,provenance,now],
+        )?;
+        transaction.execute(
+            "UPDATE attempts SET last_coordinator_at=?1 WHERE id=?2",
+            params![now, binding.attempt_id],
+        )?;
+        transaction.commit()?;
+        Ok(Some(
+            serde_json::json!({"action":"report_reminder_reserved","attempt_id":binding.attempt_id,
+            "session_id":binding.session_id,"guidance_id":reservation.guidance_id,
+            "ordinal":reservation.ordinal,"generation_limit":REPORT_REMINDER_LIMIT,"state":"queued"}),
+        ))
+    }
+
+    pub(crate) fn cancel_stale_report_reminder(
+        &self,
+        guidance_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let queued: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guidance_messages WHERE id=?1 AND state='queued')",
+            params![guidance_id],
+            |row| row.get(0),
+        )?;
+        if !queued {
+            return Ok(None);
+        }
+        let refusal = match require_current_report_reminder(&transaction, guidance_id) {
+            Ok(_) => return Ok(None),
+            Err(error) if error.is::<ReportReminderRefused>() => error.to_string(),
+            Err(error) => return Err(error),
+        };
+        let cancelled =
+            Self::cancel_report_reminder_in(&transaction, guidance_id, &refusal, false)?;
+        transaction.commit()?;
+        Ok(cancelled)
+    }
+
+    pub(crate) fn cancel_report_reminder_before_write(
+        &self,
+        guidance_id: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cancelled = Self::cancel_report_reminder_in(&transaction, guidance_id, reason, true)?
+            .ok_or_else(|| {
+            anyhow!("reminder cancellation no longer owns an unwritten reservation")
+        })?;
+        transaction.commit()?;
+        Ok(cancelled)
+    }
+
+    fn cancel_report_reminder_in(
+        transaction: &Transaction<'_>,
+        guidance_id: &str,
+        reason: &str,
+        before_first_write: bool,
+    ) -> Result<Option<serde_json::Value>> {
+        let reservation = report_reminder_for_guidance(transaction, guidance_id)?
+            .ok_or_else(|| anyhow!("guidance has no canonical reminder reservation"))?;
+        let binding = &reservation.binding;
+        let unchanged_turn =
+            crate::workflow::report_reminder_turn(transaction, &binding.session_id)?
+                == Some((
+                    binding.accepted_hook_event_id.clone(),
+                    binding.stop_hook_event_id.clone(),
+                ));
+        // Only the delivery owner can prove that a reserved paste has not started.
+        let restored = if before_first_write && unchanged_turn {
+            transaction.execute(
+                "UPDATE sessions SET readiness_state='idle_candidate',updated_at=?1
+                 WHERE id=?2 AND role_generation_id=?3 AND transcript_epoch=?4
+                   AND status='running' AND readiness_state='idle_verified'
+                   AND process_identity_json=?7
+                   AND EXISTS(SELECT 1 FROM role_generations generation JOIN role_settings settings
+                     ON settings.effective_generation_id=generation.id AND settings.role=generation.role
+                     WHERE generation.id=?3 AND generation.status='running'
+                       AND generation.role=?8 AND settings.revision=generation.config_revision)
+                   AND (SELECT ri.id FROM resume_invocations ri WHERE ri.session_id=sessions.id
+                     AND ri.transcript_epoch=sessions.transcript_epoch
+                     ORDER BY ri.resume_ordinal DESC LIMIT 1) IS ?5
+                   AND EXISTS(SELECT 1 FROM guidance_messages g WHERE g.id=?6
+                     AND g.state='delivery_reserved' AND g.written_at IS NULL
+                     AND g.role_generation_id=?3 AND g.delivery_session_id=?2
+                     AND g.delivery_transcript_epoch=?4 AND g.delivery_resume_invocation_id IS ?5)",
+                params![Utc::now().to_rfc3339(),binding.session_id,binding.role_generation_id,
+                    binding.transcript_epoch,binding.resume_invocation_id,guidance_id,
+                    binding.authority["process_identity"].as_str(),binding.role.to_string()],
+            )? == 1
+        } else {
+            false
+        };
+        let changed = transaction.execute(
+            "UPDATE guidance_messages SET state='cancelled',reason=?1
+             WHERE id=?2 AND (state='queued' OR (?3 AND state='delivery_reserved')) AND written_at IS NULL",
+            params![reason, guidance_id, before_first_write],
+        )?;
+        if changed != 1 {
+            return Ok(None);
+        }
+        transaction.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES(?1,?1,'service','role.report_reminder.cancelled','guidance',?2,?3,?4)",
+            params![uuid::Uuid::new_v4().to_string(),guidance_id,
+                serde_json::json!({"reason":reason,"ordinal":reservation.ordinal,"readiness_restored":restored}).to_string(),
+                Utc::now().to_rfc3339()],
+        )?;
+        transaction.execute(
+            "UPDATE attempts SET last_coordinator_at=?1 WHERE id=?2",
+            params![Utc::now().to_rfc3339(), binding.attempt_id],
+        )?;
+        Ok(Some(
+            serde_json::json!({"action":"report_reminder_cancelled","guidance_id":guidance_id,
+            "attempt_id":binding.attempt_id,"session_id":binding.session_id,"state":"cancelled",
+            "reason":reason,"ordinal":reservation.ordinal,"readiness_restored":restored,"engine_generated":true}),
+        ))
     }
 
     pub fn mark_session_spawning(
@@ -4974,6 +5355,14 @@ impl Store {
     }
 
     pub fn verify_attachment_binding(&self, binding: &AttachmentBinding) -> Result<()> {
+        self.verify_attachment_binding_for_guidance(binding, None)
+    }
+
+    pub(crate) fn verify_attachment_binding_for_guidance(
+        &self,
+        binding: &AttachmentBinding,
+        guidance_id: Option<&str>,
+    ) -> Result<()> {
         binding
             .validate_route_identifiers()
             .map_err(|error| anyhow!(error))?;
@@ -4995,6 +5384,14 @@ impl Store {
             |row| row.get(0),
         )?;
         if !current {
+            if let Some(guidance) = guidance_id {
+                if is_report_reminder(&connection, guidance)? {
+                    return Err(ReportReminderRefused(
+                        "terminal attachment is stale, revoked, or no longer running".into(),
+                    )
+                    .into());
+                }
+            }
             bail!("terminal attachment is stale, revoked, or no longer running")
         }
         Ok(())
@@ -9378,40 +9775,33 @@ impl Store {
         role_generation_id: &str,
     ) -> Result<()> {
         let connection = self.lock()?;
-        let row: Option<(String, String, String, String, Option<String>, String)> = connection.query_row(
-            "SELECT lease_id_hash, role_generation_id, process_identity_json, expires_at, revoked_at,
-                    (SELECT status FROM sessions WHERE id = input_leases.session_id)
-             FROM input_leases WHERE session_id = ?1",
-            params![session_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
-        ).optional()?;
-        let Some((hash, generation, process, expiry, revoked, status)) = row else {
-            bail!("no input lease exists")
-        };
-        auth::verify_secret(lease_secret, &hash)?;
-        if revoked.is_some() {
-            bail!("input lease is revoked")
+        verify_input_lease_in(
+            &connection,
+            session_id,
+            lease_secret,
+            process_json,
+            role_generation_id,
+        )
+    }
+
+    pub(crate) fn reminder_guidance_for_lease(
+        connection: &Connection,
+        session_id: &str,
+    ) -> Result<Option<String>> {
+        let guidance: Option<String> = connection
+            .query_row(
+                "SELECT g.id FROM input_leases lease JOIN guidance_messages g
+               ON lease.owner_id='guidance:'||g.id WHERE lease.session_id=?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match guidance {
+            Some(guidance) if report_reminder_for_guidance(connection, &guidance)?.is_some() => {
+                Ok(Some(guidance))
+            }
+            _ => Ok(None),
         }
-        if expiry <= Utc::now().to_rfc3339() {
-            bail!("input lease is expired")
-        }
-        if generation != role_generation_id || process != process_json {
-            bail!("input lease does not match the live generation/process")
-        }
-        if status != "running" {
-            bail!("session is no longer running")
-        }
-        let guidance_delivery: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM input_leases lease JOIN guidance_messages guidance
-               ON lease.owner_id='guidance:'||guidance.id
-             WHERE lease.session_id=?1 AND guidance.delivery_session_id=lease.session_id
-               AND guidance.role_generation_id=lease.role_generation_id)",
-            params![session_id],
-            |row| row.get(0),
-        )?;
-        if guidance_delivery {
-            require_session_failure_stop_released(&connection, session_id)?;
-        }
-        Ok(())
     }
 
     pub fn release_input_lease(&self, session_id: &str, lease_secret: &str) -> Result<()> {
@@ -9429,6 +9819,30 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn release_report_reminder_input(
+        &self,
+        session_id: &str,
+        lease_secret: &str,
+        guidance_id: &str,
+    ) -> Result<()> {
+        let connection = self.lock()?;
+        if !is_report_reminder(&connection, guidance_id)? {
+            bail!("input cleanup requires a canonical report reminder")
+        }
+        // A replacement lease owns its own cleanup, even when the reminder lost authority.
+        connection.execute(
+            "UPDATE input_leases SET revoked_at=COALESCE(revoked_at,?1),updated_at=?1
+             WHERE session_id=?2 AND lease_id_hash=?3 AND owner_id='guidance:'||?4",
+            params![
+                Utc::now().to_rfc3339(),
+                session_id,
+                auth::hash_secret(lease_secret),
+                guidance_id
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn revoke_input_lease_for_session(&self, session_id: &str) -> Result<()> {
         let connection = self.lock()?;
         connection.execute(
@@ -9437,6 +9851,50 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+pub(crate) fn verify_input_lease_in(
+    connection: &Connection,
+    session_id: &str,
+    lease_secret: &str,
+    process_json: &str,
+    role_generation_id: &str,
+) -> Result<()> {
+    let row: Option<(String, String, String, String, Option<String>, String)> = connection.query_row(
+        "SELECT lease_id_hash, role_generation_id, process_identity_json, expires_at, revoked_at,
+                    (SELECT status FROM sessions WHERE id = input_leases.session_id)
+             FROM input_leases WHERE session_id = ?1",
+        params![session_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+    ).optional()?;
+    let Some((hash, generation, process, expiry, revoked, status)) = row else {
+        bail!("no input lease exists")
+    };
+    auth::verify_secret(lease_secret, &hash)?;
+    if revoked.is_some() {
+        bail!("input lease is revoked")
+    }
+    if expiry <= Utc::now().to_rfc3339() {
+        bail!("input lease is expired")
+    }
+    if generation != role_generation_id || process != process_json {
+        bail!("input lease does not match the live generation/process")
+    }
+    if status != "running" {
+        bail!("session is no longer running")
+    }
+    let guidance_delivery: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM input_leases lease JOIN guidance_messages guidance
+               ON lease.owner_id='guidance:'||guidance.id
+             WHERE lease.session_id=?1 AND guidance.delivery_session_id=lease.session_id
+               AND guidance.role_generation_id=lease.role_generation_id)",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    if guidance_delivery {
+        require_session_failure_stop_released(connection, session_id)?;
+    }
+    Ok(())
 }
 
 pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 36;
@@ -16060,6 +16518,34 @@ mod attention_observation_tests {
                 .unwrap();
         }
 
+        fn enable_report_reminders(&self) {
+            {
+                let connection = self.store.lock().unwrap();
+                connection.execute("INSERT INTO trip_project_state(project_id,readiness,reason,detected_installation,
+                    detected_json,workflow_id,package_version,upstream_source_hash,overlay_hash,updated_at)
+                    VALUES('p','ready','fixture','compatible','{}',?1,?2,?3,?4,'2026-01-01T00:00:00Z')",
+                    params![crate::trip::WORKFLOW_ID, crate::trip::PACKAGE_VERSION,
+                        crate::trip::source_hash(), crate::trip::overlay_hash()]).unwrap();
+                connection
+                    .execute(
+                        "UPDATE attempts SET workflow_version=?1,workflow_hash=?2",
+                        params![
+                            crate::trip::WORKFLOW_ID,
+                            crate::workflow_resources::workflow_hash()
+                        ],
+                    )
+                    .unwrap();
+            }
+            self.execute("UPDATE projects SET settings_json=json_set(settings_json,'$.role_report_reminders',json('true'));
+                UPDATE attempts SET plan_hash='approved-plan',plan_approved_at='2026-01-01T00:00:00Z',legacy_migration_required=0;
+                UPDATE sessions SET launch_state='started';
+                UPDATE role_credentials SET permissions_json='[\"report_hook\",\"report_result\"]';");
+            self.capacity_hook(
+                "Stop",
+                serde_json::json!({"background_tasks":[],"session_crons":[]}),
+            );
+        }
+
         fn read_capacity(
             &self,
         ) -> Vec<(
@@ -16207,6 +16693,607 @@ mod attention_observation_tests {
     impl Drop for ObservedSession {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn report_reminder_requirements_follow_each_role_and_admitted_report() {
+        use crate::workflow::ReportRequirement;
+
+        for (role, phase) in [
+            (RoleKind::Manager, "planning"),
+            (RoleKind::Explorer, "implementation"),
+            (RoleKind::Implementer, "implementation"),
+            (RoleKind::PlanReviewer, "plan_review"),
+            (RoleKind::CodeReviewer, "code_review"),
+        ] {
+            let session = ObservedSession::codex_capacity();
+            session.enable_report_reminders();
+            {
+                let connection = session.store.lock().unwrap();
+                connection
+                    .execute(
+                        "UPDATE role_generations SET role=?1",
+                        params![role.to_string()],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "UPDATE role_settings SET role=?1",
+                        params![role.to_string()],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "UPDATE attempts SET phase=?1,candidate_hash='candidate'",
+                        params![phase],
+                    )
+                    .unwrap();
+            }
+            let (expected, invalidate, restore, metadata, outcome) = match role {
+                RoleKind::Manager => {
+                    session.execute("UPDATE attempts SET plan_hash=NULL,plan_approved_at=NULL");
+                    (
+                        ReportRequirement::ManagerPlan,
+                        "UPDATE attempts SET phase='manager_handoff'",
+                        "UPDATE attempts SET phase='planning'",
+                        serde_json::json!({}),
+                        "blocked",
+                    )
+                }
+                RoleKind::Explorer => {
+                    session.execute("INSERT INTO trip_explorer_decisions(id,attempt_id,stage,census_json,trigger,
+                        activated,limits_json,role_generation_id,candidate_hash,created_at)
+                        VALUES('decision','a','implementation','{}','complexity',1,'{}','g','candidate','2026-01-01T00:00:00Z')");
+                    (
+                        ReportRequirement::Explorer {
+                            decision_id: "decision".into(),
+                        },
+                        "UPDATE trip_explorer_decisions SET activated=0",
+                        "UPDATE trip_explorer_decisions SET activated=1",
+                        serde_json::json!({"explorer_decision_id":"decision"}),
+                        "needs_input",
+                    )
+                }
+                RoleKind::Implementer => (
+                    ReportRequirement::ImplementerCandidate {
+                        plan_hash: "approved-plan".into(),
+                    },
+                    "UPDATE attempts SET plan_approved_at=NULL",
+                    "UPDATE attempts SET plan_approved_at='2026-01-01T00:00:00Z'",
+                    serde_json::json!({}),
+                    "blocked",
+                ),
+                RoleKind::PlanReviewer | RoleKind::CodeReviewer => {
+                    let (kind, hash) = if role == RoleKind::PlanReviewer {
+                        ("plan", "approved-plan")
+                    } else {
+                        ("code", "candidate")
+                    };
+                    session.store.lock().unwrap().execute(
+                        "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,
+                         session_id,prompt_hash,handoff_hash,delivery_state,created_at,updated_at)
+                         VALUES('review','a',?1,?2,'g','s','prompt','handoff','delivered','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                        params![kind,hash],
+                    ).unwrap();
+                    (
+                        ReportRequirement::Review {
+                            request_id: "review".into(),
+                            kind: kind.into(),
+                            candidate_hash: hash.into(),
+                        },
+                        "UPDATE review_requests SET session_id=NULL",
+                        "UPDATE review_requests SET session_id='s'",
+                        serde_json::json!({"review_request_id":"review","review_kind":kind,"candidate_hash":hash}),
+                        "needs_rework",
+                    )
+                }
+                RoleKind::FinalReviewer => unreachable!(),
+            };
+            let selected =
+                crate::workflow::report_reminder_binding(&session.store.lock().unwrap(), "s", None)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(selected.role, role);
+            assert_eq!(selected.requirement, expected);
+            session.execute(invalidate);
+            assert!(crate::workflow::report_reminder_binding(
+                &session.store.lock().unwrap(),
+                "s",
+                None
+            )
+            .unwrap()
+            .is_none());
+            assert!(session
+                .store
+                .reserve_report_reminder(&selected)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                session.scalar::<i64>("SELECT COUNT(*) FROM guidance_messages"),
+                0
+            );
+            session.execute(restore);
+            let reminder = session
+                .store
+                .reserve_report_reminder(&selected)
+                .unwrap()
+                .unwrap();
+            let context = session.store.role_context("capacity-token").unwrap();
+            let report = session
+                .store
+                .save_role_result(
+                    &context,
+                    &RoleResultReport {
+                        operation_id: uuid::Uuid::new_v4().to_string(),
+                        outcome: outcome.into(),
+                        summary: "The assigned work needs a decision.".into(),
+                        evidence: vec![],
+                        metadata,
+                    },
+                )
+                .unwrap();
+            assert_eq!(report["accepted"], true);
+            session.execute("UPDATE role_results SET consumed_at='2999-01-01T00:00:00Z'");
+            let id = reminder["guidance_id"].as_str().unwrap();
+            assert!(crate::workflow::report_reminder_binding(
+                &session.store.lock().unwrap(),
+                "s",
+                Some(id)
+            )
+            .unwrap()
+            .is_none());
+            assert_eq!(
+                session
+                    .store
+                    .cancel_stale_report_reminder(id)
+                    .unwrap()
+                    .unwrap()["state"],
+                "cancelled"
+            );
+            assert_eq!(
+                session.scalar::<i64>(
+                    "SELECT COUNT(*) FROM guidance_messages WHERE written_at IS NOT NULL"
+                ),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn report_reminder_old_turn_invocation_and_review_reports_do_not_satisfy_new_work() {
+        let session = ObservedSession::codex_capacity();
+        session.enable_report_reminders();
+        let context = session.store.role_context("capacity-token").unwrap();
+        session
+            .store
+            .save_role_result(
+                &context,
+                &RoleResultReport {
+                    operation_id: "old-report".into(),
+                    outcome: "blocked".into(),
+                    summary: "An earlier turn was blocked.".into(),
+                    evidence: vec![],
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+        assert!(crate::workflow::report_reminder_binding(
+            &session.store.lock().unwrap(),
+            "s",
+            None
+        )
+        .unwrap()
+        .is_none());
+        session.capacity_hook(
+            "UserPromptSubmit",
+            serde_json::json!({"prompt":"new obligation"}),
+        );
+        session.capacity_hook(
+            "Stop",
+            serde_json::json!({"background_tasks":[],"session_crons":[]}),
+        );
+        assert!(crate::workflow::report_reminder_binding(
+            &session.store.lock().unwrap(),
+            "s",
+            None
+        )
+        .unwrap()
+        .is_some());
+        session.store.lock().unwrap().execute(
+            "INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,launch_config_json,
+             capability_key,capability_identity_json,state,hook_event_boundary_rowid,created_at,updated_at)
+             VALUES('resume','s',1,'resumed','{}','fixture','{}','running',(SELECT MAX(rowid) FROM hook_events),?1,?1)",
+            params![Utc::now().to_rfc3339()],
+        ).unwrap();
+        session.execute("UPDATE sessions SET transcript_epoch='resumed',readiness_state='unknown'");
+        session.capacity_hook("SessionStart", serde_json::json!({}));
+        session.capacity_hook(
+            "UserPromptSubmit",
+            serde_json::json!({"prompt":"resumed obligation"}),
+        );
+        session.capacity_hook(
+            "Stop",
+            serde_json::json!({"background_tasks":[],"session_crons":[]}),
+        );
+        assert!(crate::workflow::report_reminder_binding(
+            &session.store.lock().unwrap(),
+            "s",
+            None
+        )
+        .unwrap()
+        .is_some());
+
+        for (role, phase, kind, hash) in [
+            ("plan_reviewer", "plan_review", "plan", "approved-plan"),
+            ("code_reviewer", "code_review", "code", "candidate"),
+        ] {
+            let session = ObservedSession::codex_capacity();
+            session.enable_report_reminders();
+            {
+                let connection = session.store.lock().unwrap();
+                connection
+                    .execute("UPDATE role_generations SET role=?1", params![role])
+                    .unwrap();
+                connection
+                    .execute("UPDATE role_settings SET role=?1", params![role])
+                    .unwrap();
+                connection
+                    .execute(
+                        "UPDATE attempts SET phase=?1,candidate_hash='candidate'",
+                        params![phase],
+                    )
+                    .unwrap();
+                connection.execute(
+                    "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,
+                     session_id,prompt_hash,handoff_hash,delivery_state,created_at,updated_at)
+                     VALUES('old-review','a',?1,?2,'g','s','prompt','handoff','delivered','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                    params![kind,hash],
+                ).unwrap();
+            }
+            let context = session.store.role_context("capacity-token").unwrap();
+            session.store.save_role_result(&context,&RoleResultReport {
+                operation_id:"old-review-report".into(),outcome:"approved".into(),summary:"Earlier review complete.".into(),
+                evidence:vec![],metadata:serde_json::json!({"review_request_id":"old-review","review_kind":kind,"candidate_hash":hash}),
+            }).unwrap();
+            assert!(crate::workflow::report_reminder_binding(
+                &session.store.lock().unwrap(),
+                "s",
+                None
+            )
+            .unwrap()
+            .is_none());
+            session.execute("UPDATE review_requests SET delivery_state='finished';
+                INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,session_id,
+                    prompt_hash,handoff_hash,delivery_state,created_at,updated_at)
+                    SELECT 'current-review',attempt_id,review_kind,candidate_hash,role_generation_id,session_id,
+                        prompt_hash,handoff_hash,'delivered',created_at,updated_at FROM review_requests WHERE id='old-review';");
+            let selected =
+                crate::workflow::report_reminder_binding(&session.store.lock().unwrap(), "s", None)
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                matches!(selected.requirement,crate::workflow::ReportRequirement::Review { ref request_id,.. } if request_id=="current-review")
+            );
+            session.execute("UPDATE review_requests SET candidate_hash='stale-candidate'");
+            assert!(session
+                .store
+                .reserve_report_reminder(&selected)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                session.scalar::<i64>("SELECT COUNT(*) FROM guidance_messages"),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn report_reminder_setup_probe_final_and_unsafe_sessions_cannot_reserve() {
+        for mutation in [
+            "UPDATE sessions SET setup_permit_id='setup'",
+            "UPDATE attempts SET setup_operation_id='setup'",
+            "UPDATE sessions SET validation_cell='trip_runtime_probe'",
+            "UPDATE attempts SET status='capability_validation'",
+            "UPDATE projects SET internal_purpose='capability_validation'",
+            "UPDATE trip_project_state SET readiness='needs_attention'",
+            "UPDATE attempts SET workflow_hash='obsolete-workflow'",
+            "UPDATE role_generations SET role='final_verifier'; UPDATE role_settings SET role='final_verifier'",
+            "UPDATE role_generations SET role='final_reviewer'; UPDATE role_settings SET role='final_reviewer'",
+            "UPDATE role_generations SET lane_id='worker-lane'; UPDATE sessions SET lane_id='worker-lane'",
+        ] {
+            let session = ObservedSession::codex_capacity();
+            session.enable_report_reminders();
+            let selected = crate::workflow::report_reminder_binding(&session.store.lock().unwrap(),"s",None).unwrap().unwrap();
+            session.execute(mutation);
+            assert!(crate::workflow::report_reminder_binding(&session.store.lock().unwrap(),"s",None).unwrap().is_none(),"{mutation}");
+            assert!(session.store.reserve_report_reminder(&selected).unwrap().is_none(),"{mutation}");
+            assert_eq!(session.scalar::<i64>("SELECT COUNT(*) FROM guidance_messages"),0);
+        }
+        for (provider, event, payload) in [
+            (
+                "codex",
+                "UserPromptSubmit",
+                serde_json::json!({"prompt":"still working"}),
+            ),
+            ("claude", "Stop", serde_json::json!({})),
+            (
+                "claude",
+                "Stop",
+                serde_json::json!({"background_tasks":[{"id":"active"}],"session_crons":[]}),
+            ),
+            (
+                "codex",
+                "StopFailure",
+                serde_json::json!({"error":"turn failed"}),
+            ),
+        ] {
+            let session = ObservedSession::codex_capacity();
+            session.enable_report_reminders();
+            let selected =
+                crate::workflow::report_reminder_binding(&session.store.lock().unwrap(), "s", None)
+                    .unwrap()
+                    .unwrap();
+            {
+                let connection = session.store.lock().unwrap();
+                connection
+                    .execute("UPDATE role_generations SET provider=?1", params![provider])
+                    .unwrap();
+                connection
+                    .execute("UPDATE sessions SET provider=?1", params![provider])
+                    .unwrap();
+            }
+            session.capacity_hook("UserPromptSubmit", serde_json::json!({"prompt":"new work"}));
+            session.capacity_hook(event, payload);
+            assert!(
+                crate::workflow::report_reminder_binding(&session.store.lock().unwrap(), "s", None)
+                    .unwrap()
+                    .is_none(),
+                "{event}"
+            );
+            assert!(session
+                .store
+                .reserve_report_reminder(&selected)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                session.scalar::<i64>("SELECT COUNT(*) FROM guidance_messages"),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn report_reminder_cap_survives_concurrent_reservation_noise_reopen_and_resume() {
+        let session = ObservedSession::codex_capacity();
+        session.enable_report_reminders();
+        let selected =
+            crate::workflow::report_reminder_binding(&session.store.lock().unwrap(), "s", None)
+                .unwrap()
+                .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let first = std::thread::scope(|scope| {
+            let workers = (0..2)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let selected = &selected;
+                    let path = session.root.join("state.sqlite3");
+                    scope.spawn(move || {
+                        let store = Store::open(&path).unwrap();
+                        barrier.wait();
+                        store.reserve_report_reminder(selected).unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let reservations = workers
+                .into_iter()
+                .filter_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(reservations.len(), 1);
+            reservations.into_iter().next().unwrap()
+        });
+        let first_id = first["guidance_id"].as_str().unwrap();
+        session.execute("UPDATE projects SET settings_json=json_set(settings_json,'$.role_report_reminders',json('false')); ");
+        session
+            .store
+            .cancel_stale_report_reminder(first_id)
+            .unwrap()
+            .unwrap();
+        session.execute("UPDATE projects SET settings_json=json_set(settings_json,'$.role_report_reminders',json('true'));");
+        assert!(session
+            .store
+            .reserve_report_reminder(&selected)
+            .unwrap()
+            .is_none());
+        session.capacity_hook(
+            "Stop",
+            serde_json::json!({"background_tasks":[],"session_crons":[]}),
+        );
+        let same_turn =
+            crate::workflow::report_reminder_binding(&session.store.lock().unwrap(), "s", None)
+                .unwrap()
+                .unwrap();
+        assert!(session
+            .store
+            .reserve_report_reminder(&same_turn)
+            .unwrap()
+            .is_none());
+        {
+            let connection = session.store.lock().unwrap();
+            for index in 0..510 {
+                connection.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+                    VALUES(?1,?1,'service','fixture.noise','session','s','{}',?2)",params![format!("noise-{index}"),Utc::now().to_rfc3339()]).unwrap();
+            }
+            connection.execute_batch("INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,launch_config_json,
+                capability_key,capability_identity_json,state,hook_event_boundary_rowid,created_at,updated_at)
+                VALUES('resume','s',1,'resumed','{}','fixture','{}','running',(SELECT MAX(rowid) FROM hook_events),'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                UPDATE sessions SET transcript_epoch='resumed',readiness_state='unknown';").unwrap();
+        }
+        session.capacity_hook("SessionStart", serde_json::json!({}));
+        session.capacity_hook(
+            "UserPromptSubmit",
+            serde_json::json!({"prompt":"report if finished"}),
+        );
+        session.capacity_hook(
+            "Stop",
+            serde_json::json!({"background_tasks":[],"session_crons":[]}),
+        );
+        let resumed = Store::open(&session.root.join("state.sqlite3")).unwrap();
+        let selected =
+            crate::workflow::report_reminder_binding(&resumed.lock().unwrap(), "s", None)
+                .unwrap()
+                .unwrap();
+        let second = resumed.reserve_report_reminder(&selected).unwrap().unwrap();
+        assert_eq!(second["ordinal"], 2);
+        session.execute("UPDATE guidance_messages SET state='delivery_unknown',reason='uncertain write' WHERE state='queued';");
+        assert_eq!(
+            report_reminder_reservations(&resumed.lock().unwrap(), "g")
+                .unwrap()
+                .len(),
+            2
+        );
+        session.execute(
+            "UPDATE guidance_messages SET state='abandoned' WHERE state='delivery_unknown';",
+        );
+        session.capacity_hook(
+            "UserPromptSubmit",
+            serde_json::json!({"prompt":"new obligation"}),
+        );
+        session.capacity_hook(
+            "Stop",
+            serde_json::json!({"background_tasks":[],"session_crons":[]}),
+        );
+        let latest = crate::workflow::report_reminder_binding(&resumed.lock().unwrap(), "s", None)
+            .unwrap()
+            .unwrap();
+        assert!(resumed.reserve_report_reminder(&latest).unwrap().is_none());
+        session.execute("UPDATE role_generations SET status='replaced' WHERE id='g';
+            INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+              SELECT 'g-new',attempt_id,role,provider,2,config_revision,'running','new',created_at,updated_at FROM role_generations WHERE id='g';
+            UPDATE role_settings SET effective_generation_id='g-new'; UPDATE role_credentials SET role_generation_id='g-new';
+            UPDATE sessions SET role_generation_id='g-new',transcript_epoch='new-generation',initial_hook_event_boundary_rowid=(SELECT MAX(rowid) FROM hook_events);");
+        session.capacity_hook("SessionStart", serde_json::json!({}));
+        session.capacity_hook(
+            "UserPromptSubmit",
+            serde_json::json!({"prompt":"new generation"}),
+        );
+        session.capacity_hook(
+            "Stop",
+            serde_json::json!({"background_tasks":[],"session_crons":[]}),
+        );
+        let replacement =
+            crate::workflow::report_reminder_binding(&resumed.lock().unwrap(), "s", None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            resumed
+                .reserve_report_reminder(&replacement)
+                .unwrap()
+                .unwrap()["ordinal"],
+            1
+        );
+    }
+
+    #[test]
+    fn report_reminder_selection_rechecks_policy_report_turn_and_permission() {
+        for mutation in [
+            "UPDATE projects SET settings_json=json_set(settings_json,'$.role_report_reminders',json('false'))",
+            "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+             VALUES('report','report','s','g','blocked','blocked','[]','{}','2999-01-01T00:00:00Z')",
+            "UPDATE tasks SET attention='paused'",
+            "UPDATE role_settings SET effective_generation_id=NULL",
+        ] {
+            let session = ObservedSession::codex_capacity();
+            session.enable_report_reminders();
+            let selected = crate::workflow::report_reminder_binding(&session.store.lock().unwrap(),"s",None).unwrap().unwrap();
+            session.execute(mutation);
+            assert!(session.store.reserve_report_reminder(&selected).unwrap().is_none(),"{mutation}");
+            assert_eq!(session.scalar::<i64>("SELECT COUNT(*) FROM guidance_messages"),0);
+        }
+        let session = ObservedSession::codex_capacity();
+        session.enable_report_reminders();
+        let selected =
+            crate::workflow::report_reminder_binding(&session.store.lock().unwrap(), "s", None)
+                .unwrap()
+                .unwrap();
+        session.capacity_hook("UserPromptSubmit", serde_json::json!({"prompt":"new turn"}));
+        assert!(session
+            .store
+            .reserve_report_reminder(&selected)
+            .unwrap()
+            .is_none());
+        session.capacity_hook(
+            "Stop",
+            serde_json::json!({"background_tasks":[],"session_crons":[]}),
+        );
+        let selected =
+            crate::workflow::report_reminder_binding(&session.store.lock().unwrap(), "s", None)
+                .unwrap()
+                .unwrap();
+        session.permission();
+        assert!(session
+            .store
+            .reserve_report_reminder(&selected)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn report_reminder_cancellation_never_overwrites_a_new_turn_or_invocation() {
+        for changed in ["turn", "invocation", "uncertain"] {
+            let session = ObservedSession::codex_capacity();
+            session.enable_report_reminders();
+            let selected =
+                crate::workflow::report_reminder_binding(&session.store.lock().unwrap(), "s", None)
+                    .unwrap()
+                    .unwrap();
+            let reminder = session
+                .store
+                .reserve_report_reminder(&selected)
+                .unwrap()
+                .unwrap();
+            let id = reminder["guidance_id"].as_str().unwrap();
+            assert!(session
+                .store
+                .reserve_guidance_delivery(id, "s", "e", None, REPORT_REMINDER_PROMPT)
+                .unwrap());
+            match changed {
+                "turn" => {
+                    session
+                        .capacity_hook("UserPromptSubmit", serde_json::json!({"prompt":"later"}));
+                    session.capacity_hook(
+                        "Stop",
+                        serde_json::json!({"background_tasks":[],"session_crons":[]}),
+                    );
+                }
+                "invocation" => session.execute(
+                    "UPDATE sessions SET transcript_epoch='replaced',readiness_state='unknown'",
+                ),
+                "uncertain" => {
+                    session.execute("UPDATE guidance_messages SET state='delivery_unknown'")
+                }
+                _ => unreachable!(),
+            }
+            let before: String =
+                session.scalar("SELECT readiness_state FROM sessions WHERE id='s'");
+            let cancellation = session
+                .store
+                .cancel_report_reminder_before_write(id, "stale reservation");
+            if changed == "uncertain" {
+                assert!(cancellation.is_err());
+            } else {
+                assert_eq!(cancellation.unwrap()["readiness_restored"], false);
+            }
+            assert_eq!(
+                session.scalar::<String>("SELECT readiness_state FROM sessions WHERE id='s'"),
+                before
+            );
+            assert_eq!(
+                report_reminder_reservations(&session.store.lock().unwrap(), "g")
+                    .unwrap()
+                    .len(),
+                1
+            );
         }
     }
 

@@ -35,7 +35,33 @@ export function ProjectSettings(
   const [legacyPath, setLegacyPath] = useState("");
   const [legacyPreview, setLegacyPreview] = useState<Record<string, unknown>>();
   const [error, setError] = useState("");
+  const [reportReminders, setReportReminders] = useState(
+    project.settings.role_report_reminders === true,
+  );
+  const [savingReminders, setSavingReminders] = useState(false);
   useEffect(() => setPath(project.repository_path), [project.repository_path]);
+  useEffect(() => {
+    setReportReminders(project.settings.role_report_reminders === true);
+  }, [project.id, project.version, project.settings.role_report_reminders]);
+
+  const saveReportReminders = async () => {
+    setSavingReminders(true);
+    try {
+      await command({
+        kind: "update_project_settings",
+        operation_id: operationId(),
+        project_id: project.id,
+        expected_version: project.version,
+        settings: { ...project.settings, role_report_reminders: reportReminders },
+      });
+      setError("");
+      await onChanged();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSavingReminders(false);
+    }
+  };
 
   const apply = async (body: Record<string, unknown>) => {
     try {
@@ -120,6 +146,30 @@ export function ProjectSettings(
         onChanged={onChanged}
         onViewSession={onViewSession}
       />
+      <div>
+        <label>
+          <input
+            type="checkbox"
+            checked={reportReminders}
+            disabled={savingReminders}
+            onChange={(event) => setReportReminders(event.target.checked)}
+          />
+          Remind agents to submit reports
+        </label>
+        <p className="hint">
+          Off by default. After an eligible agent finishes a turn without its
+          required report, LLMRelay may send an additional prompt and use provider
+          quota. Final verification is excluded. Each agent generation has two
+          reminder reservations for its entire lifetime, including resumed
+          sessions. A reservation stays spent even if it is cancelled or delivery
+          is uncertain. Turning this off prevents future writes; prompts already
+          written cannot be retracted, and turning it back on does not reset the
+          allowance.
+        </p>
+        <button disabled={savingReminders} onClick={saveReportReminders}>
+          {savingReminders ? "Saving reminders…" : "Save report reminders"}
+        </button>
+      </div>
       <details>
         <summary>Verification checks ({tripChecks.length})</summary>
         <p className="hint">

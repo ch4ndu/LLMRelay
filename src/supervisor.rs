@@ -1488,7 +1488,7 @@ impl Supervisor {
             .io_boundary
             .lock()
             .map_err(|_| anyhow!("session I/O boundary poisoned"))?;
-        let binding = self.live_attachment_binding_locked(&handle)?;
+        let binding = self.live_attachment_binding_locked(&handle, None)?;
         let secret = crate::auth::issue_secret();
         let process_json = serde_json::to_string(&binding.process)?;
         let expires_at = (Utc::now() + Duration::seconds(seconds)).to_rfc3339();
@@ -1505,6 +1505,14 @@ impl Supervisor {
     }
 
     pub fn establish_attachment(&self, session_id: &str) -> Result<AttachmentBinding> {
+        self.establish_attachment_for_guidance(session_id, None)
+    }
+
+    fn establish_attachment_for_guidance(
+        &self,
+        session_id: &str,
+        guidance_id: Option<&str>,
+    ) -> Result<AttachmentBinding> {
         #[cfg(test)]
         if let Some(binding) = self
             .synthetic_attachments
@@ -1513,7 +1521,8 @@ impl Supervisor {
             .get(session_id)
             .cloned()
         {
-            self.store.verify_attachment_binding(&binding)?;
+            self.store
+                .verify_attachment_binding_for_guidance(&binding, guidance_id)?;
             return Ok(binding);
         }
         let handle = self.handle(session_id)?;
@@ -1521,7 +1530,7 @@ impl Supervisor {
             .io_boundary
             .lock()
             .map_err(|_| anyhow!("session I/O boundary poisoned"))?;
-        self.live_attachment_binding_locked(&handle)
+        self.live_attachment_binding_locked(&handle, guidance_id)
     }
 
     pub fn renew_input(
@@ -1533,12 +1542,12 @@ impl Supervisor {
         if !(1..=300).contains(&seconds) {
             bail!("input lease duration must be between 1 and 300 seconds")
         }
-        let handle = self.attachment_handle(binding)?;
+        let handle = self.attachment_handle(binding, None)?;
         let _boundary = handle
             .io_boundary
             .lock()
             .map_err(|_| anyhow!("session I/O boundary poisoned"))?;
-        self.verify_attachment_binding_locked(&handle, binding)?;
+        self.verify_attachment_binding_locked(&handle, binding, None)?;
         let expires_at = (Utc::now() + Duration::seconds(seconds)).to_rfc3339();
         self.store.renew_input_lease(
             &binding.session_id,
@@ -1559,12 +1568,12 @@ impl Supervisor {
         if !(1..=300).contains(&seconds) {
             bail!("input lease duration must be between 1 and 300 seconds")
         }
-        let handle = self.attachment_handle(binding)?;
+        let handle = self.attachment_handle(binding, None)?;
         let _boundary = handle
             .io_boundary
             .lock()
             .map_err(|_| anyhow!("session I/O boundary poisoned"))?;
-        self.verify_attachment_binding_locked(&handle, binding)?;
+        self.verify_attachment_binding_locked(&handle, binding, None)?;
         let secret = crate::auth::issue_secret();
         let expires_at = (Utc::now() + Duration::seconds(seconds)).to_rfc3339();
         self.store.takeover_input_lease(
@@ -1586,7 +1595,7 @@ impl Supervisor {
         after_sequence: u64,
         limit_bytes: usize,
     ) -> Result<crate::domain::TranscriptPage> {
-        let handle = self.attachment_handle(binding)?;
+        let handle = self.attachment_handle(binding, None)?;
         let _boundary = handle
             .io_boundary
             .lock()
@@ -1643,22 +1652,95 @@ impl Supervisor {
         self.write_attachment_input(&binding, lease_secret, bytes)
     }
 
+    pub(crate) fn write_guidance_input(
+        &self,
+        session_id: &str,
+        lease_secret: &str,
+        guidance_id: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        {
+            let connection = self.store.lock()?;
+            crate::store::require_current_report_reminder(&connection, guidance_id)?;
+        }
+        let binding = self.establish_attachment_for_guidance(session_id, Some(guidance_id))?;
+        self.write_attachment_input_for_guidance(&binding, lease_secret, bytes, Some(guidance_id))
+    }
+
     pub fn write_attachment_input(
         &self,
         binding: &AttachmentBinding,
         lease_secret: &str,
         bytes: &[u8],
     ) -> Result<()> {
+        self.write_attachment_input_for_guidance(binding, lease_secret, bytes, None)
+    }
+
+    fn write_attachment_input_for_guidance(
+        &self,
+        binding: &AttachmentBinding,
+        lease_secret: &str,
+        bytes: &[u8],
+        guidance_id: Option<&str>,
+    ) -> Result<()> {
         if bytes.len() > 64 * 1024 {
             bail!("one input write is limited to 64 KiB")
         }
-        let handle = self.attachment_handle(binding)?;
+        let reminder = {
+            let connection = self.store.lock()?;
+            match guidance_id {
+                Some(id) if crate::store::is_report_reminder(&connection, id)? => {
+                    Some(id.to_owned())
+                }
+                _ => Store::reminder_guidance_for_lease(&connection, &binding.session_id)?,
+            }
+        };
+        let handle = self.attachment_handle(binding, reminder.as_deref())?;
         let _boundary = handle
             .io_boundary
             .lock()
             .map_err(|_| anyhow!("session I/O boundary poisoned"))?;
-        self.verify_attachment_binding_locked(&handle, binding)?;
+        self.verify_attachment_binding_locked(&handle, binding, reminder.as_deref())?;
         let process_json = serde_json::to_string(&binding.process)?;
+        if let Some(guidance) = reminder {
+            if !self.native_idle_ready(&binding.session_id)? {
+                return Err(crate::store::ReportReminderRefused(
+                    "The reminder was cancelled because native work is still active.".into(),
+                )
+                .into());
+            }
+            let mut connection = self.store.lock()?;
+            // Keep the I/O boundary and IMMEDIATE transaction through the write decision and bytes.
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::store::require_current_report_reminder(&transaction, &guidance)?;
+            let exact_lease: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM input_leases WHERE session_id=?1 AND lease_id_hash=?2)",
+                rusqlite::params![binding.session_id, crate::auth::hash_secret(lease_secret)],
+                |row| row.get(0),
+            )?;
+            if !exact_lease {
+                return Err(crate::store::ReportReminderRefused(
+                    "The reminder was cancelled because its input lease was replaced.".into(),
+                )
+                .into());
+            }
+            crate::store::verify_input_lease_in(
+                &transaction,
+                &binding.session_id,
+                lease_secret,
+                &process_json,
+                &binding.role_generation_id,
+            )?;
+            let mut input = handle
+                .input
+                .lock()
+                .map_err(|_| anyhow!("PTY input lock poisoned"))?;
+            input.write_all(bytes)?;
+            input.flush()?;
+            transaction.commit()?;
+            return Ok(());
+        }
         self.store.verify_input_lease(
             &binding.session_id,
             lease_secret,
@@ -1684,12 +1766,12 @@ impl Supervisor {
         binding: &AttachmentBinding,
         lease_secret: &str,
     ) -> Result<()> {
-        let handle = self.attachment_handle(binding)?;
+        let handle = self.attachment_handle(binding, None)?;
         let _boundary = handle
             .io_boundary
             .lock()
             .map_err(|_| anyhow!("session I/O boundary poisoned"))?;
-        self.verify_attachment_binding_locked(&handle, binding)?;
+        self.verify_attachment_binding_locked(&handle, binding, None)?;
         self.store
             .release_input_lease(&binding.session_id, lease_secret)
     }
@@ -1709,12 +1791,12 @@ impl Supervisor {
         if !(10..=300).contains(&rows) || !(20..=500).contains(&cols) {
             bail!("terminal size must be 10..300 rows and 20..500 columns")
         }
-        let handle = self.attachment_handle(binding)?;
+        let handle = self.attachment_handle(binding, None)?;
         let _boundary = handle
             .io_boundary
             .lock()
             .map_err(|_| anyhow!("session I/O boundary poisoned"))?;
-        self.verify_attachment_binding_locked(&handle, binding)?;
+        self.verify_attachment_binding_locked(&handle, binding, None)?;
         self.store.verify_input_lease(
             &binding.session_id,
             lease_secret,
@@ -2210,18 +2292,35 @@ impl Supervisor {
             .ok_or_else(|| anyhow!("session {session_id} is not attached to this service boot"))
     }
 
-    fn attachment_handle(&self, binding: &AttachmentBinding) -> Result<Arc<SessionHandle>> {
+    fn attachment_handle(
+        &self,
+        binding: &AttachmentBinding,
+        guidance_id: Option<&str>,
+    ) -> Result<Arc<SessionHandle>> {
         let handle = self.handle(&binding.session_id)?;
         if handle.role_generation_id != binding.role_generation_id
             || handle.transcript_epoch != binding.transcript_epoch
             || handle.process != binding.process
         {
+            if let Some(guidance) = guidance_id {
+                let connection = self.store.lock()?;
+                if crate::store::is_report_reminder(&connection, guidance)? {
+                    return Err(crate::store::ReportReminderRefused(
+                        "terminal attachment binding no longer matches this service session".into(),
+                    )
+                    .into());
+                }
+            }
             bail!("terminal attachment binding no longer matches this service session")
         }
         Ok(handle)
     }
 
-    fn live_attachment_binding_locked(&self, handle: &SessionHandle) -> Result<AttachmentBinding> {
+    fn live_attachment_binding_locked(
+        &self,
+        handle: &SessionHandle,
+        guidance_id: Option<&str>,
+    ) -> Result<AttachmentBinding> {
         self.verify_process(handle)?;
         let binding = AttachmentBinding {
             session_id: handle.session_id.clone(),
@@ -2229,7 +2328,8 @@ impl Supervisor {
             transcript_epoch: handle.transcript_epoch.clone(),
             process: handle.process.clone(),
         };
-        self.store.verify_attachment_binding(&binding)?;
+        self.store
+            .verify_attachment_binding_for_guidance(&binding, guidance_id)?;
         Ok(binding)
     }
 
@@ -2237,16 +2337,27 @@ impl Supervisor {
         &self,
         handle: &SessionHandle,
         binding: &AttachmentBinding,
+        guidance_id: Option<&str>,
     ) -> Result<()> {
         if handle.session_id != binding.session_id
             || handle.role_generation_id != binding.role_generation_id
             || handle.transcript_epoch != binding.transcript_epoch
             || handle.process != binding.process
         {
+            if let Some(guidance) = guidance_id {
+                let connection = self.store.lock()?;
+                if crate::store::is_report_reminder(&connection, guidance)? {
+                    return Err(crate::store::ReportReminderRefused(
+                        "terminal attachment binding no longer matches the live generation".into(),
+                    )
+                    .into());
+                }
+            }
             bail!("terminal attachment binding no longer matches the live generation")
         }
         self.verify_process(handle)?;
-        self.store.verify_attachment_binding(binding)
+        self.store
+            .verify_attachment_binding_for_guidance(binding, guidance_id)
     }
 
     /// Resolves the small window between a provider's exit and the periodic
@@ -5033,34 +5144,48 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_guidance_reservation_releases_its_input_lease_without_writing() {
+    fn report_reminder_write_boundaries_preserve_ordinary_guidance_and_lease_cleanup() {
         use std::os::unix::process::CommandExt;
-        let root = std::env::temp_dir().join(format!(
-            "agenticjira-guidance-lease-cleanup-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let store = Store::open(&root.join("state.sqlite3")).unwrap();
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        let process = ProcessIdentity {
-            pid,
-            process_group_id: pid as i32,
-            native_start_marker: native_start_marker(pid).unwrap(),
-            observed_started_at: "2026-01-01T00:00:00Z".into(),
-        };
-        let (session, generation, epoch) = (
-            "6f1c2b9e-3a4d-4e5f-8a7b-1c2d3e4f5a60",
-            "6f1c2b9e-3a4d-4e5f-8a7b-1c2d3e4f5a61",
-            "6f1c2b9e-3a4d-4e5f-8a7b-1c2d3e4f5a62",
-        );
-        {
-            let connection = store.lock().unwrap();
-            connection.execute_batch(&format!(
+        for refusal in [
+            "policy",
+            "report",
+            "turn",
+            "control",
+            "permission",
+            "lease",
+            "final_verifier",
+            "final_reviewer",
+            "post_paste_claim",
+            "revoked_attachment",
+            "revoked_locked_attachment",
+            "write_failure",
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "agenticjira-guidance-lease-cleanup-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let store = Store::open(&root.join("state.sqlite3")).unwrap();
+            let mut child = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let process = ProcessIdentity {
+                pid,
+                process_group_id: pid as i32,
+                native_start_marker: native_start_marker(pid).unwrap(),
+                observed_started_at: "2026-01-01T00:00:00Z".into(),
+            };
+            let (session, generation, epoch) = (
+                "6f1c2b9e-3a4d-4e5f-8a7b-1c2d3e4f5a60",
+                "6f1c2b9e-3a4d-4e5f-8a7b-1c2d3e4f5a61",
+                "6f1c2b9e-3a4d-4e5f-8a7b-1c2d3e4f5a62",
+            );
+            {
+                let connection = store.lock().unwrap();
+                connection.execute_batch(&format!(
                 "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
                    VALUES('p','Project','/tmp/project','identity','base','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
                  INSERT INTO tasks(id,project_id,title,description,acceptance_criteria_json,lifecycle,attention,created_at,updated_at)
@@ -5080,53 +5205,53 @@ mod tests {
                    BEGIN SELECT RAISE(ABORT,'injected guidance reservation failure'); END;"
             ))
             .unwrap();
-            connection
-                .execute(
-                    "UPDATE sessions SET process_identity_json=?1 WHERE id=?2",
-                    rusqlite::params![serde_json::to_string(&process).unwrap(), session],
-                )
-                .unwrap();
-        }
-        let supervisor = Supervisor::new(store.clone(), root.join("transcripts"));
-        let terminal_input = root.join("terminal-input");
-        let pty = native_pty_system().openpty(PtySize::default()).unwrap();
-        supervisor.sessions.write().unwrap().insert(
-            session.into(),
-            Arc::new(SessionHandle {
-                session_id: session.into(),
-                role_generation_id: generation.into(),
-                transcript_epoch: epoch.into(),
-                process: process.clone(),
-                group_leader: ProcessGenerationAnchor {
-                    pid,
-                    process_group_id: process.process_group_id,
-                    native_start_marker: process.native_start_marker.clone(),
-                    boot_identity: system_boot_identity().unwrap(),
-                },
-                child: Mutex::new(Box::new(RunningChild {
-                    kill_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                })),
-                input: Mutex::new(Box::new(std::fs::File::create(&terminal_input).unwrap())),
-                io_boundary: Mutex::new(()),
-                known_members: Mutex::new(HashMap::from([(
-                    pid,
-                    process.native_start_marker.clone(),
-                )])),
-                first_stop_requested_at: Mutex::new(None),
-                codex_helper_image: None,
-                codex_helper_identity: Mutex::new(None),
-                _master: Mutex::new(pty.master),
-            }),
-        );
+                connection
+                    .execute(
+                        "UPDATE sessions SET process_identity_json=?1 WHERE id=?2",
+                        rusqlite::params![serde_json::to_string(&process).unwrap(), session],
+                    )
+                    .unwrap();
+            }
+            let supervisor = Supervisor::new(store.clone(), root.join("transcripts"));
+            let terminal_input = root.join("terminal-input");
+            let pty = native_pty_system().openpty(PtySize::default()).unwrap();
+            supervisor.sessions.write().unwrap().insert(
+                session.into(),
+                Arc::new(SessionHandle {
+                    session_id: session.into(),
+                    role_generation_id: generation.into(),
+                    transcript_epoch: epoch.into(),
+                    process: process.clone(),
+                    group_leader: ProcessGenerationAnchor {
+                        pid,
+                        process_group_id: process.process_group_id,
+                        native_start_marker: process.native_start_marker.clone(),
+                        boot_identity: system_boot_identity().unwrap(),
+                    },
+                    child: Mutex::new(Box::new(RunningChild {
+                        kill_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    })),
+                    input: Mutex::new(Box::new(std::fs::File::create(&terminal_input).unwrap())),
+                    io_boundary: Mutex::new(()),
+                    known_members: Mutex::new(HashMap::from([(
+                        pid,
+                        process.native_start_marker.clone(),
+                    )])),
+                    first_stop_requested_at: Mutex::new(None),
+                    codex_helper_image: None,
+                    codex_helper_identity: Mutex::new(None),
+                    _master: Mutex::new(pty.master),
+                }),
+            );
 
-        let failed = crate::roles::RoleService::new(store.clone(), supervisor.clone())
-            .deliver_guidance("guidance")
-            .unwrap_err();
-        assert!(
-            format!("{failed:#}").contains("injected guidance reservation failure"),
-            "{failed:#}"
-        );
-        assert_eq!(
+            let failed = crate::roles::RoleService::new(store.clone(), supervisor.clone())
+                .deliver_guidance("guidance")
+                .unwrap_err();
+            assert!(
+                format!("{failed:#}").contains("injected guidance reservation failure"),
+                "{failed:#}"
+            );
+            assert_eq!(
             store
                 .lock()
                 .unwrap()
@@ -5140,12 +5265,480 @@ mod tests {
                 .unwrap(),
             "queued guidance:guidance 1"
         );
-        assert!(std::fs::read(&terminal_input).unwrap().is_empty());
-        // Nothing still owns the terminal, so a person can take input at once.
-        supervisor.acquire_input(session, "human", 30).unwrap();
-        child.kill().unwrap();
-        child.wait().unwrap();
-        let _ = std::fs::remove_dir_all(root);
+            assert!(std::fs::read(&terminal_input).unwrap().is_empty());
+            // Nothing still owns the terminal, so a person can take input at once.
+            let (human_lease, _) = supervisor.acquire_input(session, "human", 30).unwrap();
+            supervisor.release_input(session, &human_lease).unwrap();
+            {
+                let connection = store.lock().unwrap();
+                connection.execute_batch(
+                r#"DROP TRIGGER fail_guidance_reservation;
+                 UPDATE guidance_messages SET state='cancelled' WHERE id='guidance';
+                 UPDATE projects SET settings_json='{"role_report_reminders":true}';
+                 UPDATE attempts SET plan_hash='approved-plan',plan_approved_at='2026-01-01T00:00:00Z',legacy_migration_required=0;"#,
+            ).unwrap();
+                connection
+                    .execute(
+                        "UPDATE projects SET repository_path=?1",
+                        rusqlite::params![root.to_str().unwrap()],
+                    )
+                    .unwrap();
+                connection.execute("UPDATE sessions SET launch_state='started',native_session_id=?1 WHERE id=?2",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(),session]).unwrap();
+                connection.execute("INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+                VALUES('settings','t','implementer',1,'{}',?1,'2026-01-01T00:00:00Z')",rusqlite::params![generation]).unwrap();
+                connection.execute("INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at)
+                VALUES('credential',?1,?2,'[\"report_hook\",\"report_result\"]','2026-01-01T00:00:00Z')",
+                rusqlite::params![generation,crate::auth::hash_secret("reminder-token")]).unwrap();
+                connection.execute("INSERT INTO trip_project_state(project_id,readiness,reason,detected_installation,
+                detected_json,workflow_id,package_version,upstream_source_hash,overlay_hash,updated_at)
+                VALUES('p','ready','fixture','compatible','{}',?1,?2,?3,?4,'2026-01-01T00:00:00Z')",
+                rusqlite::params![crate::trip::WORKFLOW_ID, crate::trip::PACKAGE_VERSION,
+                    crate::trip::source_hash(), crate::trip::overlay_hash()]).unwrap();
+                connection
+                    .execute(
+                        "UPDATE attempts SET workflow_version=?1,workflow_hash=?2",
+                        rusqlite::params![
+                            crate::trip::WORKFLOW_ID,
+                            crate::workflow_resources::workflow_hash()
+                        ],
+                    )
+                    .unwrap();
+            }
+            let context = store.role_context("reminder-token").unwrap();
+            let native = store.native_session_id(session).unwrap().unwrap();
+            let hook = |event: &str, payload: serde_json::Value| {
+                let mut payload = payload;
+                payload["hook_event_name"] = event.into();
+                payload["session_id"] = native.clone().into();
+                payload["cwd"] = root.to_str().unwrap().into();
+                store
+                    .save_hook_event(
+                        &context,
+                        &crate::domain::HookEnvelope {
+                            provider: context.provider,
+                            payload,
+                        },
+                        &crate::domain::RolePeerProvenance {
+                            peer_pid: pid,
+                            peer_process_group_id: pid as i32,
+                            peer_start_marker: process.native_start_marker.clone(),
+                            managed_root_pid: pid,
+                            managed_root_start_marker: process.native_start_marker.clone(),
+                            state: "managed_process_group_untrusted_payload".into(),
+                        },
+                    )
+                    .unwrap()
+            };
+            hook("SessionStart", serde_json::json!({}));
+            hook(
+                "UserPromptSubmit",
+                serde_json::json!({"prompt":"implement"}),
+            );
+            assert_eq!(
+                hook(
+                    "Stop",
+                    serde_json::json!({"background_tasks":[],"session_crons":[]})
+                )["safe_idle_boundary"],
+                true
+            );
+            let selected = {
+                let connection = store.lock().unwrap();
+                crate::workflow::report_reminder_binding(&connection, session, None)
+                    .unwrap()
+                    .unwrap()
+            };
+            let first = store.reserve_report_reminder(&selected).unwrap().unwrap();
+            let first_id = first["guidance_id"].as_str().unwrap();
+            let roles = crate::roles::RoleService::new(store.clone(), supervisor.clone());
+            if matches!(
+                refusal,
+                "post_paste_claim" | "revoked_attachment" | "revoked_locked_attachment"
+            ) {
+                let body: String = store
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT body FROM guidance_messages WHERE id=?1",
+                        rusqlite::params![first_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let submitted = crate::roles::guidance_submission("codex", None, &body).unwrap();
+                let (lease, _) = supervisor
+                    .acquire_input_for(
+                        InputLeasePurpose::AutomatedGuidance,
+                        session,
+                        &format!("guidance:{first_id}"),
+                        30,
+                    )
+                    .unwrap();
+                assert!(store
+                    .reserve_guidance_delivery(first_id, session, epoch, None, &submitted)
+                    .unwrap());
+                let paste = format!("\x1b[200~{submitted}\x1b[201~");
+                if refusal == "post_paste_claim" {
+                    supervisor
+                        .write_guidance_input(session, &lease, first_id, paste.as_bytes())
+                        .unwrap();
+                    store.lock().unwrap().execute_batch(
+                        "UPDATE projects SET settings_json=json_set(settings_json,'$.role_report_reminders',json('false'));",
+                    ).unwrap();
+                    assert!(store
+                        .cancel_stale_report_reminder(first_id)
+                        .unwrap()
+                        .is_none());
+                    let second_request = roles.deliver_guidance(first_id).unwrap();
+                    assert_eq!(
+                        second_request["action"],
+                        "guidance_delivery_already_claimed"
+                    );
+                    assert_eq!(second_request["state"], "delivery_reserved");
+                    let connection = store.lock().unwrap();
+                    assert_eq!(connection.query_row(
+                        "SELECT state || ':' || (written_at IS NULL) FROM guidance_messages WHERE id=?1",
+                        rusqlite::params![first_id], |row| row.get::<_, String>(0),
+                    ).unwrap(), "delivery_reserved:1");
+                    assert_eq!(
+                        connection
+                            .query_row(
+                                "SELECT readiness_state FROM sessions WHERE id=?1",
+                                rusqlite::params![session],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .unwrap(),
+                        "idle_verified"
+                    );
+                    assert_eq!(connection.query_row(
+                        "SELECT COUNT(*) FROM audit_events WHERE event_code='role.report_reminder.cancelled'",
+                        [], |row| row.get::<_, i64>(0),
+                    ).unwrap(), 0);
+                    assert_eq!(connection.query_row(
+                        "SELECT owner_id || ':' || (revoked_at IS NULL) FROM input_leases WHERE session_id=?1",
+                        rusqlite::params![session], |row| row.get::<_, String>(0),
+                    ).unwrap(), format!("guidance:{first_id}:1"));
+                    drop(connection);
+                    assert!(supervisor
+                        .write_guidance_input(session, &lease, first_id, b"\r")
+                        .unwrap_err()
+                        .is::<crate::store::ReportReminderRefused>());
+                    assert_eq!(std::fs::read(&terminal_input).unwrap(), paste.as_bytes());
+                    assert!(roles.retry_ready_guidance().unwrap().is_empty());
+                } else {
+                    let binding = supervisor.establish_attachment(session).unwrap();
+                    assert!(crate::store::require_current_report_reminder(
+                        &store.lock().unwrap(),
+                        first_id
+                    )
+                    .unwrap());
+                    store
+                        .lock()
+                        .unwrap()
+                        .execute(
+                            "UPDATE role_generations SET status='stopping' WHERE id=?1",
+                            rusqlite::params![generation],
+                        )
+                        .unwrap();
+                    let refused = if refusal == "revoked_attachment" {
+                        supervisor
+                            .establish_attachment_for_guidance(session, Some(first_id))
+                            .unwrap_err()
+                    } else {
+                        supervisor
+                            .write_attachment_input_for_guidance(
+                                &binding,
+                                &lease,
+                                paste.as_bytes(),
+                                Some(first_id),
+                            )
+                            .unwrap_err()
+                    };
+                    assert!(
+                        refused.is::<crate::store::ReportReminderRefused>(),
+                        "{refused:#}"
+                    );
+                    assert!(refused.to_string().contains("terminal attachment is stale"));
+                    assert!(!supervisor
+                        .establish_attachment(session)
+                        .unwrap_err()
+                        .is::<crate::store::ReportReminderRefused>());
+                    let cancelled = store
+                        .cancel_report_reminder_before_write(first_id, &refused.to_string())
+                        .unwrap();
+                    assert_eq!(cancelled["state"], "cancelled");
+                    assert_eq!(cancelled["readiness_restored"], false);
+                    let connection = store.lock().unwrap();
+                    assert_eq!(
+                        connection
+                            .query_row(
+                                "SELECT readiness_state FROM sessions WHERE id=?1",
+                                rusqlite::params![session],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .unwrap(),
+                        "idle_verified"
+                    );
+                    assert_eq!(
+                        connection
+                            .query_row("SELECT COUNT(*) FROM recovery_records", [], |row| row
+                                .get::<_, i64>(0),)
+                            .unwrap(),
+                        0
+                    );
+                    assert_eq!(connection.query_row(
+                        "SELECT a.status || ':' || t.attention FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id='a'",
+                        [], |row| row.get::<_, String>(0),
+                    ).unwrap(), "running:none");
+                    assert!(std::fs::read(&terminal_input).unwrap().is_empty());
+                }
+                store
+                    .release_report_reminder_input(session, &lease, first_id)
+                    .unwrap();
+                child.kill().unwrap();
+                child.wait().unwrap();
+                let _ = std::fs::remove_dir_all(root);
+                continue;
+            }
+            if refusal == "write_failure" {
+                let handle = supervisor.handle(session).unwrap();
+                *handle.input.lock().unwrap() =
+                    Box::new(std::fs::File::open(&terminal_input).unwrap());
+                let uncertain = roles.deliver_guidance(first_id).unwrap_err();
+                assert!(!uncertain.is::<crate::store::ReportReminderRefused>());
+                assert!(format!("{uncertain:#}").contains("not confirmed"));
+                let connection = store.lock().unwrap();
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT state FROM guidance_messages WHERE id=?1",
+                            rusqlite::params![first_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap(),
+                    "delivery_unknown"
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT readiness_state FROM sessions WHERE id=?1",
+                            rusqlite::params![session],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap(),
+                    "idle_verified"
+                );
+                drop(connection);
+                assert!(roles.retry_ready_guidance().unwrap().is_empty());
+                assert!(std::fs::read(&terminal_input).unwrap().is_empty());
+                child.kill().unwrap();
+                child.wait().unwrap();
+                let _ = std::fs::remove_dir_all(root);
+                continue;
+            }
+            let mutation = match refusal {
+            "policy" => "UPDATE projects SET settings_json=json_set(settings_json,'$.role_report_reminders',json('false'));".to_owned(),
+            "report" => format!("INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+                VALUES('arrived-report','arrived-report','{session}','{generation}','blocked','Needs a decision','[]','{{}}','{}');",Utc::now().to_rfc3339()),
+            "turn" => format!("INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,payload_json,
+                peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+                VALUES('new-turn','{session}','{generation}','codex','UserPromptSubmit','{native}','{{}}',42,42,'peer','managed_process_group_untrusted_payload','{}');
+                UPDATE sessions SET readiness_state='busy';",Utc::now().to_rfc3339()),
+            "control" => "UPDATE tasks SET attention='paused';".to_owned(),
+            "permission" => format!("INSERT INTO permission_requests(id,hook_invocation_nonce,connection_nonce,provider,
+                project_id,task_id,attempt_id,session_id,role_generation_id,role,service_boot_id,
+                native_session_id,cwd,policy_fingerprint,tool_name,input_digest,input_json,
+                created_at,deadline_at,state,updated_at)
+                VALUES('permission','nonce','connection','codex','p','t','a','{session}','{generation}',
+                'implementer','boot','{native}','/tmp','policy','Read','digest','{{}}',
+                '2026-03-01T00:00:00Z','2999-01-01T00:00:00Z','pending','2026-03-01T00:00:00Z');"),
+            "lease" => format!("UPDATE input_leases SET owner_id='human',lease_id_hash='{}' WHERE session_id='{session}';",
+                crate::auth::hash_secret("replacement-human-lease")),
+            "final_verifier" | "final_reviewer" => format!(
+                "UPDATE role_generations SET role='{refusal}' WHERE id='{generation}';
+                 UPDATE role_settings SET role='{refusal}' WHERE id='settings';"),
+            _ => unreachable!(),
+        };
+            store.lock().unwrap().execute_batch(&format!(
+            "CREATE TEMP TRIGGER change_before_reminder_paste AFTER UPDATE OF readiness_state ON sessions
+             WHEN NEW.readiness_state='idle_verified'
+             BEGIN {mutation} END;",
+        )).unwrap();
+            let cancelled = roles.deliver_guidance(first_id).unwrap();
+            assert_eq!(cancelled["state"], "cancelled");
+            let restored = !matches!(refusal, "turn" | "final_verifier" | "final_reviewer");
+            assert_eq!(cancelled["readiness_restored"], restored);
+            assert!(std::fs::read(&terminal_input).unwrap().is_empty());
+            {
+                let connection = store.lock().unwrap();
+                let readiness = match refusal {
+                    "turn" => "busy",
+                    "final_verifier" | "final_reviewer" => "idle_verified",
+                    _ => "idle_candidate",
+                };
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT readiness_state FROM sessions WHERE id=?1",
+                            rusqlite::params![session],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    readiness
+                );
+                assert_eq!(
+                    connection
+                        .query_row("SELECT COUNT(*) FROM recovery_records", [], |row| row
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM input_leases WHERE revoked_at IS NULL",
+                            [],
+                            |row| row.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                    if refusal == "lease" { 1 } else { 0 }
+                );
+                if refusal == "lease" {
+                    assert_eq!(
+                        connection
+                            .query_row(
+                                "SELECT owner_id FROM input_leases WHERE session_id=?1",
+                                rusqlite::params![session],
+                                |row| row.get::<_, String>(0)
+                            )
+                            .unwrap(),
+                        "human"
+                    );
+                }
+                connection
+                    .execute_batch(
+                        "DROP TRIGGER change_before_reminder_paste;
+                UPDATE tasks SET attention='none';
+                UPDATE permission_requests SET state='denied';
+                UPDATE role_generations SET role='implementer';
+                UPDATE role_settings SET role='implementer';
+                UPDATE guidance_messages SET state='queued' WHERE id='guidance';",
+                    )
+                    .unwrap();
+            }
+            if refusal == "lease" {
+                supervisor
+                    .release_input(session, "replacement-human-lease")
+                    .unwrap();
+            }
+            if !restored {
+                hook(
+                    "Stop",
+                    serde_json::json!({"background_tasks":[],"session_crons":[]}),
+                );
+            }
+            let ordinary = roles.deliver_guidance("guidance").unwrap();
+            assert_eq!(ordinary["state"], "written_awaiting_submit");
+            let ordinary_bytes = std::fs::read(&terminal_input).unwrap();
+            assert!(ordinary_bytes.ends_with(b"\r"));
+            hook(
+                "UserPromptSubmit",
+                serde_json::json!({"prompt":"Use the smaller scope"}),
+            );
+            hook(
+                "Stop",
+                serde_json::json!({"background_tasks":[],"session_crons":[]}),
+            );
+            store.lock().unwrap().execute_batch("UPDATE projects SET settings_json=json_set(settings_json,'$.role_report_reminders',json('true')); ").unwrap();
+            let second = {
+                let connection = store.lock().unwrap();
+                crate::workflow::report_reminder_binding(&connection, session, None)
+                    .unwrap()
+                    .unwrap()
+            };
+            let second = store.reserve_report_reminder(&second).unwrap().unwrap();
+            assert_eq!(second["ordinal"], 2);
+            if refusal != "policy" {
+                let delivered = roles
+                    .deliver_guidance(second["guidance_id"].as_str().unwrap())
+                    .unwrap();
+                assert_eq!(delivered["state"], "written_awaiting_submit");
+                assert_eq!(delivered["acknowledged"], false);
+                assert_eq!(delivered["report_reminder"], true);
+                let bytes = std::fs::read(&terminal_input).unwrap();
+                assert!(bytes[ordinary_bytes.len()..].ends_with(b"\x1b[201~\r"));
+                let submitted: String = store
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT submitted_text FROM guidance_messages WHERE id=?1",
+                        rusqlite::params![second["guidance_id"].as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                hook("UserPromptSubmit", serde_json::json!({"prompt":submitted}));
+                assert_eq!(
+                    store
+                        .lock()
+                        .unwrap()
+                        .query_row(
+                            "SELECT state FROM guidance_messages WHERE id=?1",
+                            rusqlite::params![second["guidance_id"].as_str()],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "submitted"
+                );
+                let acknowledgement = store
+                    .acknowledge_guidance(&context, second["guidance_id"].as_str().unwrap())
+                    .unwrap_err();
+                assert!(acknowledgement
+                    .to_string()
+                    .contains("only the current manager"));
+            } else {
+                store.lock().unwrap().execute_batch(
+            "CREATE TEMP TRIGGER disable_before_reminder_enter AFTER UPDATE OF state ON guidance_messages
+             WHEN NEW.state='written_awaiting_submit'
+             BEGIN UPDATE projects SET settings_json=json_set(settings_json,'$.role_report_reminders',json('false')); END;",
+        ).unwrap();
+                let uncertain = roles
+                    .deliver_guidance(second["guidance_id"].as_str().unwrap())
+                    .unwrap_err();
+                assert!(format!("{uncertain:#}").contains("not confirmed"));
+                let bytes = std::fs::read(&terminal_input).unwrap();
+                let reminder_bytes = &bytes[ordinary_bytes.len()..];
+                assert!(reminder_bytes.starts_with(b"\x1b[200~Inspect your current role context."));
+                assert!(reminder_bytes.ends_with(b"\x1b[201~"));
+                assert!(!reminder_bytes.contains(&b'\r'));
+                {
+                    let connection = store.lock().unwrap();
+                    assert_eq!(
+                        connection
+                            .query_row(
+                                "SELECT state FROM guidance_messages WHERE id=?1",
+                                rusqlite::params![second["guidance_id"].as_str()],
+                                |row| row.get::<_, String>(0)
+                            )
+                            .unwrap(),
+                        "delivery_unknown"
+                    );
+                    assert_eq!(
+                        connection
+                            .query_row(
+                                "SELECT readiness_state FROM sessions WHERE id=?1",
+                                rusqlite::params![session],
+                                |row| row.get::<_, String>(0)
+                            )
+                            .unwrap(),
+                        "idle_verified"
+                    );
+                }
+                assert!(roles.retry_ready_guidance().unwrap().is_empty());
+                assert_eq!(std::fs::read(&terminal_input).unwrap(), bytes);
+            }
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]

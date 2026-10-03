@@ -26,6 +26,15 @@ A first, then D. Both are deferred while the user validates the current service
 flow. This document records the roadmap; it does not authorize starting either
 implementation now or claim that the user has accepted the everyday flow.
 
+## Current next task — TRIP process update
+
+On October 3, the user selected updating this repository's installed TRIP process
+from `/Users/murali/Private/GitHub/trip-explorer-workflow` as the next task,
+ahead of the remaining product-feature candidates. The reminder feature is
+verified. See [the current next-task scope](NEXT_MILESTONE_PLAN.md#next-task--update-the-installed-trip-process-from-upstream).
+The upgrade has not started; preserve local workflow adaptations and validate
+changed adapters and their evidence when applying it.
+
 ## Milestone 1 — Validate the current service flow
 
 **Status: integration delivered; user acceptance of the everyday service flow pending.**
@@ -279,7 +288,7 @@ decision or authorizing milestone 4 work.
 **Implementation verified on September 22, 2026.** The approved scope in
 [Milestone 5 plan](MILESTONE_5_PLAN.md) passed independent ordinary and fresh final
 reviews, the Rust/DOM verification matrix, and focused repair checks. Personal
-hands-on acceptance remains deferred. Next is milestone 4B crash-boundary planning;
+hands-on acceptance remains deferred. The historical next step was milestone 4B crash-boundary planning;
 this result does not establish recovery at every crash boundary.
 
 Capability path-boundary follow-up, September 25: the bounded repair now replaces
@@ -922,8 +931,9 @@ instances; no existing user data was purged, upgraded or restored.
 
 #### Features after hardening
 
-- Opt-in, audited reminder (at most two, never for the final verifier) when a
-  role's turn ends without a role report (Jinn `sessions/stop-nudge.ts`).
+- **Verified:** opt-in, audited reminders (at most two per role generation, never
+  for the final verifier) when a role's safely ended turn lacks its required
+  report. See [completion](#opt-in-missing-report-reminders--verified).
 - Scheduled in-service verified backup; restore remains offline CLI-only.
 - Usage and limit display plus per-turn token accounting, presentation only.
 - Per-attempt handoff fields in role reports (changed files, verification,
@@ -968,3 +978,7 @@ clearing and independent provider holds, isolate recoverable recurrence errors,
 and index report lookups. Focused verification, retained review recheck, the full
 matrix and fresh final verification passed. The matrix includes 61 frontend and
 311 Rust tests, with zero failures or ignored tests.
+
+## Opt-in missing-report reminders — verified
+
+The approved follow-up adds a default-off project setting, a durable lifetime limit of two reservations per role generation, exact missing-report/native-idle eligibility and guarded delivery through existing guidance. Final verification and setup/probe sessions are excluded. Current source and focused tests cover cancellation, later ordinary guidance, uncertain delivery, report arrival, permissions, input leases and settings preservation. Independent code review and its focused repair recheck passed. The reconciled full verification matrix passed (63 frontend tests and 342 Rust tests), and fresh Fable Medium final verification approved the candidate. The selected feature is verified; no commit or release is implied. Original provider-dependent automatic readiness remains outside this feature.

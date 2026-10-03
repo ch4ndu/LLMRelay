@@ -62,12 +62,22 @@ fn tick_steps(app: &Application) -> Result<serde_json::Value> {
     if let Some(value) = advance_one_switch(app)? {
         return Ok(value);
     }
+    if let Some(value) = reserve_one_report_reminder(app)? {
+        return Ok(value);
+    }
     if let Some(value) = retry_one_guidance(app)? {
         if value
             .get("engine_generated")
             .and_then(|value| value.as_bool())
             == Some(true)
-            && value.get("state").and_then(|value| value.as_str()) != Some("queued")
+            && value
+                .get("report_reminder")
+                .and_then(|value| value.as_bool())
+                != Some(true)
+            && !matches!(
+                value.get("state").and_then(|value| value.as_str()),
+                Some("queued" | "cancelled")
+            )
         {
             if let Some(attempt) = value.get("attempt_id").and_then(|value| value.as_str()) {
                 mark_attempt_served_for(app, attempt, &value)?;
@@ -4266,6 +4276,88 @@ fn current_manager_transition(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?)
+}
+
+fn reserve_one_report_reminder(app: &Application) -> Result<Option<serde_json::Value>> {
+    let queued = {
+        let connection = app.store.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT g.id,g.attempt_id FROM guidance_messages g JOIN audit_events audit
+               ON json_extract(audit.detail_json,'$.guidance_id')=g.id
+             WHERE g.state='queued' AND audit.event_code='role.report_reminder.reserved'
+               AND audit.actor_kind='service' ORDER BY g.created_at,g.rowid",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (guidance, attempt) in queued {
+        let cancelled = app
+            .store
+            .cancel_stale_report_reminder(&guidance)
+            .map_err(|error| {
+                subject_failure(
+                    error,
+                    &attempt,
+                    SubjectStep::GuidanceDelivery,
+                    StepEffect::None,
+                    serde_json::json!({"guidance_id":guidance,"report_reminder":true}),
+                )
+            })?;
+        if let Some(cancelled) = cancelled {
+            return Ok(Some(cancelled));
+        }
+    }
+    let sessions = {
+        let connection = app.store.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT s.id,a.id FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+             JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id
+             JOIN projects p ON p.id=t.project_id
+             WHERE s.status='running' AND s.readiness_state='idle_candidate'
+               AND g.role IN ('manager','explorer','implementer','plan_reviewer','code_reviewer')
+               AND s.setup_permit_id IS NULL AND a.setup_operation_id IS NULL
+               AND json_type(p.settings_json,'$.role_report_reminders')='true'
+             ORDER BY COALESCE(a.last_coordinator_at,''),a.created_at,s.created_at,s.id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (session, attempt) in sessions {
+        let outcome = (|| -> Result<Option<serde_json::Value>> {
+            let binding = {
+                let connection = app.store.lock()?;
+                crate::workflow::report_reminder_binding(&connection, &session, None)?
+            };
+            let Some(binding) = binding else {
+                return Ok(None);
+            };
+            if !app.supervisor.native_idle_ready(&session)? {
+                return Ok(None);
+            }
+            app.store.reserve_report_reminder(&binding)
+        })()
+        .map_err(|error| {
+            subject_failure(
+                error,
+                &attempt,
+                SubjectStep::GuidanceDelivery,
+                StepEffect::None,
+                serde_json::json!({"session_id":session,"report_reminder":true}),
+            )
+        })?;
+        if outcome.is_some() {
+            return Ok(outcome);
+        }
+    }
+    Ok(None)
 }
 
 fn retry_one_guidance(app: &Application) -> Result<Option<serde_json::Value>> {

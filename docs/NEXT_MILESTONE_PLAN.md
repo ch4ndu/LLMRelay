@@ -1,15 +1,14 @@
-# Herdr/Jinn roadmap and next implementation task
+# LLMRelay roadmap and next task
 
 Planning baseline: `f8c7e29` (initial LLMRelay implementation).
 Status: M4A, M5, approved M4B and the M6 live-state/attention slice completed;
 M7 engineering implementation passed ordinary and fresh final review plus integrated
 verification; its engineering slice is locally packaged. M8A passed ordinary and
 fresh final review and the integrated verification matrix; local packaging is complete. M9 passed ordinary and fresh final review; local packaging is complete.
-M6 native notifications are being addressed in ledger task AJ-1701EE4D,
-alongside exact resume/status reconciliation and review access/theme consistency.
-This consolidated task is in engineering review; browser/provider verification
-and the final completion gate remain pending. It does not change the historical
-managed TaskFocus attempt's acceptance state.
+The AJ-1701EE4D permission visibility, recovery and dashboard-consistency work
+was delivered in commit `350555c`. Later hardening and local H2/H12 alternatives
+were delivered in `923f9c3`. These engineering deliveries do not change the
+historical managed TaskFocus attempt's acceptance state or imply personal acceptance.
 Fresh-install scope supersedes historical migration work. On 2026-09-23 the user
 authorized autonomous completion of finalized in-scope plans and necessary review
 and test increases, then deferred milestones and checks requiring their intervention.
@@ -18,6 +17,33 @@ The user selected the Herdr/Jinn milestone work as the next product scope and
 will defer personal hands-on acceptance until the selected features are present.
 Engineering verification continues at each checkpoint. The earlier implementation
 is a verified foundation, not acceptance of the complete desired product.
+
+## Next task — update the installed TRIP process from upstream
+
+Selected by the user on October 3, after verification of the report-reminder
+feature. Update this repository's installed TRIP Explorer workflow from the local
+upstream checkout `/Users/murali/Private/GitHub/trip-explorer-workflow`.
+First inspect upstream upgrade instructions and compare the installed package,
+local adaptations, role configuration and preflight evidence. Preserve deliberate
+project overrides, reconcile changes through the supported upgrade path, and
+validate the resulting installation and affected CLI behavior. Do not silently
+replace selected models or claim stale preflight evidence applies to changed
+adapters. The upstream update itself has not started.
+
+This tooling task precedes scheduled in-service backups and the other
+features-after-hardening candidates. LaunchAgent, menu-bar, installed updates,
+provider qualification and personal acceptance retain their existing deferrals.
+
+## Latest completed feature — missing-report reminders
+
+The default-off reminder feature passed independent code review, its focused
+repair recheck, final traceability and fresh final verification. The reconciled
+matrix passed 63 frontend and 342 Rust tests. Contract/runtime checks used the
+retained reviewed provider binaries; host socket/process access was required.
+No live provider acceptance or live authenticated browser execution is claimed.
+See [verified behavior](MILESTONES.md#opt-in-missing-report-reminders--verified),
+[workflow semantics](WORKFLOWS.md) and [operation](OPERATIONS.md#missing-report-reminders).
+Packaging this feature is separate from its verified source delivery.
 
 ## Completed engineering work — October 1–2 hardening
 
@@ -33,8 +59,10 @@ including the October 2 local H2/H12 alternatives. Its delivery state is recorde
 [below](#october-1-deferred-hardening-continuation). The original automatic H2/H12
 outcomes remain provider-dependent; the local alternatives do not claim them.
 The final integrated suite passed 62 frontend and 335 Rust tests, with independent
-code review and fresh final verification approved. Local delivery is next; the
-separate features-after-hardening list requires its own scoped plans.
+code review and fresh final verification approved. That hardening work was committed
+as `923f9c3` and locally packaged; 31 packaged-browser checks plus a separate
+light-mode board/sidebar check passed. That package predates report reminders.
+The separate features-after-hardening list requires its own scoped plans.
 The older milestone proposals below retain their historical scope and do not
 authorize additional work.
 
@@ -95,7 +123,7 @@ integration boundaries. Do not reopen closed areas without a concrete regression
 or changed dependency. No user click-testing is required between checkpoints.
 Final user acceptance remains explicitly pending; absence of testing is not approval.
 
-## Recommended sequence
+## Historical milestone sequence
 
 | Step | Milestone mapping | Deliverable and exit evidence |
 | --- | --- | --- |
@@ -125,7 +153,9 @@ Track these conditional decisions explicitly rather than silently marking them d
 
 ### Unattended sequence and deferred intervention (2026-09-23)
 
-The current execution order is **finish M4B → M6 → M7 → M8A → M9**.
+The September 23 execution order was **finish M4B → M6 → M7 → M8A → M9**.
+Those selected engineering slices are complete; this section preserves their
+authority and deferral decisions, not the current next task.
 Finalize and independently review each in-scope plan under the user's standing
 authorization; routine plan confirmation and review/test budget increases do not
 require another user prompt. Preserve engineering gates and record any increases.
@@ -146,7 +176,7 @@ remain deferred while dashboard/event behavior is verified. M9 scheduled intake
 can be verified while the foreground service runs; execution after Terminal closes
 depends on deferred M2. Do not widen host access or silently substitute models.
 
-## Next task: milestone 4A — protect durable state
+## Historical completed plan: milestone 4A — protect durable state
 
 ### Why first
 
@@ -291,7 +321,8 @@ convergence. No new test framework and no computer-use requirement.
 Complete only when the commands are documented, read-only paths cannot migrate,
 a verified current-schema backup/restore rehearsal passes, all named interruption states have
 safe actions, independent review approves, and the checkpoint is committed.
-Then proceed to milestone 5 planning; personal acceptance remains deferred.
+The historical next step was milestone 5 planning, now completed. Personal
+acceptance remains deferred.
 The complete milestone 4 crash matrix is step 3 above, not silently included in
 the storage task or dropped from the roadmap.
 

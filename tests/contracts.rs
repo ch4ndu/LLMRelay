@@ -28918,6 +28918,89 @@ fn trusted_implementer_hooks_fixture(
     (fixture, context, native, workspace)
 }
 
+#[test]
+fn report_reminders_settings_validate_boolean_and_project_version() {
+    let fixture = Fixture::new("report-reminder-settings");
+    seed_attempt(&fixture, "planning");
+    let original: serde_json::Value = serde_json::from_str(
+        &fixture.scalar::<String>("SELECT settings_json FROM projects WHERE id='p'"),
+    )
+    .unwrap();
+    assert!(original.get("role_report_reminders").is_none());
+    for (index, value) in [
+        serde_json::json!("true"),
+        serde_json::json!(1),
+        serde_json::Value::Null,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut settings = original.clone();
+        settings["role_report_reminders"] = value;
+        let error = workflow::execute(
+            &fixture.store,
+            &HumanCommand::UpdateProjectSettings {
+                operation_id: format!("invalid-reminders-{index}"),
+                project_id: "p".into(),
+                expected_version: 1,
+                settings,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must be a boolean"), "{error:#}");
+    }
+    fixture.assert_scalar("SELECT version FROM projects WHERE id='p'", 1_i64);
+    let mut settings = original.clone();
+    settings["role_report_reminders"] = serde_json::json!(true);
+    let enabled = workflow::execute(
+        &fixture.store,
+        &HumanCommand::UpdateProjectSettings {
+            operation_id: "enable-reminders".into(),
+            project_id: "p".into(),
+            expected_version: 1,
+            settings: settings.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(enabled.state, "settings_updated");
+    let stored: serde_json::Value = serde_json::from_str(
+        &fixture.scalar::<String>("SELECT settings_json FROM projects WHERE id='p'"),
+    )
+    .unwrap();
+    assert_eq!(stored, settings);
+    assert_eq!(stored["roles"], original["roles"]);
+    assert_eq!(
+        stored["trip_config_revision_id"],
+        original["trip_config_revision_id"]
+    );
+    let stale = workflow::execute(
+        &fixture.store,
+        &HumanCommand::UpdateProjectSettings {
+            operation_id: "stale-reminders".into(),
+            project_id: "p".into(),
+            expected_version: 1,
+            settings: original,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        stale.to_string().contains("project version is stale"),
+        "{stale:#}"
+    );
+    settings["role_report_reminders"] = serde_json::json!(false);
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::UpdateProjectSettings {
+            operation_id: "disable-reminders".into(),
+            project_id: "p".into(),
+            expected_version: 2,
+            settings,
+        },
+    )
+    .unwrap();
+    fixture.assert_scalar("SELECT version FROM projects WHERE id='p'", 3_i64);
+}
+
 fn try_record_trusted_hook(
     fixture: &Fixture,
     context: &RoleContext,

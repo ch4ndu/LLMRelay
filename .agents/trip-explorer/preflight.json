@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-10-02T03:33:01.752114+00:00",
+  "observed_at": "2026-10-03T03:27:16.802803+00:00",
   "receipts": [
     {
       "adapter": "direct-claude-cli",
@@ -40,25 +40,6 @@
       "session_evidence": "Explicit UUID resume returned retained nonce."
     },
     {
-      "adapter": "direct-claude-cli",
-      "authority": "read-only",
-      "authority_evidence": "Restricted safe-mode tool allowlist Read/Grep/Glob only, no Bash/Edit/Write/Agent or MCP. Matching enforcement applied to role runner.",
-      "effort": "high",
-      "model": "claude-fable-5-1",
-      "model_evidence": "Claude2.1.286 successful result modelUsage canonicalModel claude-fable-5-1; explicit --effort high; no fallback configured. Provider-exposed identity only.",
-      "native_session_id": "8aeb671c-fbe9-43a3-b274-1a04cc95d4d1",
-      "nonce": "PREFLIGHT_FABLE_HIGH_20261001_912b",
-      "nonce_matched": true,
-      "profile_ids": [
-        "session-fable-high-read"
-      ],
-      "provider": "claude",
-      "result": "pass",
-      "service_tier": null,
-      "session": "retained",
-      "session_evidence": "Explicit UUID resume returned retained nonce."
-    },
-    {
       "adapter": "direct-codex-cli",
       "authority": "read-only",
       "authority_evidence": "Codex read-only sandbox configured on initial launch and explicit resume.",
@@ -76,25 +57,6 @@
       "service_tier": null,
       "session": "retained",
       "session_evidence": "Explicit UUID resume returned retained nonce."
-    },
-    {
-      "adapter": "direct-claude-cli",
-      "authority": "read-only",
-      "authority_evidence": "Restricted safe-mode tool allowlist Read/Grep/Glob only, no Bash/Edit/Write/Agent or MCP. Matching enforcement applied to role runner.",
-      "effort": "medium",
-      "model": "claude-fable-5-1",
-      "model_evidence": "Claude2.1.286 successful result modelUsage canonicalModel claude-fable-5-1; explicit --effort medium; no fallback configured. Provider-exposed identity only.",
-      "native_session_id": "c00f211f-73db-485b-b6e6-d89d2f9ee39e",
-      "nonce": "PREFLIGHT_FABLE_MEDIUM_20261001_280a",
-      "nonce_matched": true,
-      "profile_ids": [
-        "session-fable-medium-fresh"
-      ],
-      "provider": "claude",
-      "result": "pass",
-      "service_tier": null,
-      "session": "fresh",
-      "session_evidence": "Independent fresh native session; no resume."
     },
     {
       "adapter": "direct-codex-cli",
@@ -177,6 +139,44 @@
       "service_tier": null,
       "session": "fresh",
       "session_evidence": "Independent fresh native session without resume."
+    },
+    {
+      "adapter": "direct-claude-cli",
+      "provider": "claude",
+      "model": "claude-fable-5-1",
+      "effort": "high",
+      "authority": "read-only",
+      "session": "retained",
+      "service_tier": null,
+      "profile_ids": [
+        "session-fable-high-read"
+      ],
+      "result": "pass",
+      "native_session_id": "213c29df-84ec-409c-aba7-78bb5222616e",
+      "nonce_matched": true,
+      "seconds": 8.058,
+      "model_evidence": "2.1.287 (Claude Code) exact modelUsage canonicalModel claude-fable-5-1; explicit effort high; no fallback configured.",
+      "authority_evidence": "Same installed safe-mode/restricted Read,Grep,Glob-only adapter; no Bash/Edit/Write/Agent or MCP. No tools requested.",
+      "session_evidence": "Explicit UUID resume recalled nonce without restatement."
+    },
+    {
+      "adapter": "direct-claude-cli",
+      "provider": "claude",
+      "model": "claude-fable-5-1",
+      "effort": "medium",
+      "authority": "read-only",
+      "session": "fresh",
+      "service_tier": null,
+      "profile_ids": [
+        "session-fable-medium-fresh"
+      ],
+      "result": "pass",
+      "native_session_id": "c0e9b8ed-a336-49c2-81c5-ea281a0c5bfa",
+      "nonce_matched": true,
+      "seconds": 4.312,
+      "model_evidence": "2.1.287 (Claude Code) exact modelUsage canonicalModel claude-fable-5-1; explicit effort medium; no fallback configured.",
+      "authority_evidence": "Same installed safe-mode/restricted Read,Grep,Glob-only adapter; no Bash/Edit/Write/Agent or MCP. No tools requested.",
+      "session_evidence": "Fresh independent native UUID; no resume."
     }
   ]
 }

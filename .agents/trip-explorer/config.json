@@ -132,19 +132,19 @@
   "project_name": "LLMRelay",
   "roles": {
     "code_reviewer": {
-      "profile": "session-astra-max-read"
+      "profile": "session-sol61-xhigh-read"
     },
     "explorer": {
-      "profile": "session-astra-max-read"
+      "profile": "session-astra-high-read"
     },
     "final_verifier": {
-      "profile": "session-astra-max-fresh"
+      "profile": "session-fable-medium-fresh"
     },
     "implementer": {
-      "profile": "session-astra-max-write"
+      "profile": "session-sol61-xhigh-write"
     },
     "plan_reviewer": {
-      "profile": "session-astra-max-read"
+      "profile": "session-fable-high-read"
     }
   },
   "testing": {

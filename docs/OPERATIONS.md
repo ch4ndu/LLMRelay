@@ -704,3 +704,11 @@ restart-reconciled and cancellation exits without that flag are excluded.
 Intentional stops do not create this notice. No observation repairs those states
 or authorizes a retry. Notices resolve only from positive evidence for their exact
 subject, not absence from a page or activity from another role.
+
+## Missing-report reminders
+
+In project settings, enable **Remind agents to submit reports**, then choose **Save report reminders**. The setting is off by default and applies to eligible current and future sessions. Additional prompts may use provider quota. Each role generation can spend at most two reservations across its lifetime; cancellation, restart, resume and toggling the setting do not refund them. A replacement generation has its own allowance.
+
+The existing guidance display records the reservation count and delivery state. Queued or typed text is not proof of submission; matching native prompt evidence establishes submission, and explicit acknowledgement is separate. Worker reminders do not require a manager acknowledgement. If delivery is uncertain, inspect the agent output before deciding what to do next; LLMRelay does not resend the reminder or Enter automatically.
+
+Disabling and saving prevents future writes, including Enter if it has not been written yet. Text already pasted cannot be retracted. Pauses, permission requests, recovery holds and manual input ownership continue to take precedence. Missing trustworthy safe-stop evidence leaves the session ineligible: reminders do not resolve the provider-dependent automatic-readiness limitation.

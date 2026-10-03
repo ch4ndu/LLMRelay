@@ -56,6 +56,7 @@ const { RoleSettings } = await import("./components/RoleSettings");
 const { DiagnosticsPanel } = await import("./components/DiagnosticsPanel");
 const { RecoveryPanel } = await import("./components/RecoveryPanel");
 const { ProjectSetup } = await import("./components/ProjectSetup");
+const { ProjectSettings } = await import("./components/ProjectSettings");
 const { ProjectPicker } = await import("./components/ProjectPicker");
 const { TaskForm } = await import("./components/TaskForm");
 const { TaskDetail } = await import("./components/TaskDetail");
@@ -1170,6 +1171,69 @@ const project: Project = {
   version: 1,
   settings: {},
 };
+
+Deno.test("report reminders settings preserve all keys and refresh after save", async () => {
+  const requests: Record<string, unknown>[] = [];
+  const originalSettings = {
+    roles: { manager: { model: "fixture" } },
+    trip_config_revision_id: "config-1",
+    custom: { keep: true },
+  };
+  let current: Project = {
+    ...project,
+    settings: originalSettings,
+  };
+  let stale = false;
+  let refreshes = 0;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    requests.push(body);
+    if (stale) {
+      return new Response(JSON.stringify({ error: "project version is stale" }), { status: 409 });
+    }
+    return new Response(JSON.stringify({ result: { state: "settings_updated" } }), { status: 200 });
+  }) as typeof fetch;
+  const refreshed = () => {
+    refreshes += 1;
+    current = { ...current, version: current.version + 1, settings: requests.at(-1)!.settings as Record<string, unknown> };
+    rerender(<ProjectSettings project={current} onChanged={refreshed} />);
+  };
+  try {
+    mount(<ProjectSettings project={current} onChanged={refreshed} />);
+    const checkbox = () => [...document.querySelectorAll<HTMLLabelElement>("label")]
+      .find((label) => label.textContent?.includes("Remind agents to submit reports"))!
+      .querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+    check(!checkbox().checked, "reminders did not default off");
+    check(document.body.textContent?.includes("provider quota"), "quota cost missing");
+    check(document.body.textContent?.includes("two reminder reservations"), "lifetime cap missing");
+    check(document.body.textContent?.includes("already written cannot be retracted"), "disable boundary missing");
+    await act(async () => checkbox().click());
+    await click("Save report reminders");
+    await settle();
+    check(requests.length === 1 && requests[0].kind === "update_project_settings", "wrong save route");
+    check(requests[0].expected_version === 1 && requests[0].project_id === "p1", "save lost project version");
+    const settings = requests[0].settings as Record<string, unknown>;
+    check(settings.role_report_reminders === true, "enabled value missing");
+    check(JSON.stringify(settings.roles) === JSON.stringify(originalSettings.roles), "role settings lost");
+    check(settings.trip_config_revision_id === "config-1" && JSON.stringify(settings.custom) === '{"keep":true}', "unrelated keys lost");
+    check(refreshes === 1 && checkbox().checked, "saved settings did not refresh");
+    stale = true;
+    await act(async () => checkbox().click());
+    await click("Save report reminders");
+    await settle();
+    check(requests.length === 2 && requests[1].expected_version === 2, "refreshed version not used");
+    check(refreshes === 1 && current.settings.role_report_reminders === true, "stale save changed current settings");
+    check(document.body.textContent?.includes("Refresh"), "stale failure has no recovery step");
+    const details = [...document.querySelectorAll("details")].find((item) => item.textContent?.includes("project version is stale"));
+    check(details && !details.open, "diagnostics were not collapsed");
+    current = { ...current, version: 3, settings: { ...current.settings, role_report_reminders: false } };
+    rerender(<ProjectSettings project={current} onChanged={refreshed} />);
+    check(!checkbox().checked, "new project snapshot did not refresh the toggle");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
 const inheritedRoles = Object.fromEntries(
   ROLES.map((role) => [
     role,
@@ -4168,15 +4232,57 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     );
     for (
       const label of [
-        "Waiting for the manager to pause",
-        "Sent to the manager",
-        "Received by the manager",
+        "Waiting for the agent to pause",
+        "Accepted as a native turn",
+        "Explicitly acknowledged",
       ]
     ) {
       if (!document.body.textContent?.includes(label)) {
         throw new Error(`${label} guidance state hidden`);
       }
     }
+    rerender(
+      <AttentionInbox
+        state={{
+          ...state,
+          guidance: [{
+            id: "worker-reminder",
+            role_generation_id: "implementer-generation",
+            body: "Report reminder 1 of 2. 1 of 2 reservations spent for this agent generation.",
+            state: "written_awaiting_submit",
+          }],
+        }}
+        onNavigate={() => undefined}
+        onChanged={() => {}}
+      />,
+    );
+    check(
+      document.querySelector(".guidance ul")?.textContent?.includes(
+        "Typed into the agent's input; waiting for native submission",
+      ) && document.body.textContent?.includes("1 of 2 reservations spent"),
+      "the worker reminder hid its spent reservation or implied native submission before acceptance",
+    );
+    rerender(
+      <AttentionInbox
+        state={{
+          ...state,
+          guidance: [{
+            id: "worker-reminder",
+            role_generation_id: "implementer-generation",
+            body: "Report reminder 1 of 2. 1 of 2 reservations spent for this agent generation.",
+            state: "submitted",
+          }],
+        }}
+        onNavigate={() => undefined}
+        onChanged={() => {}}
+      />,
+    );
+    check(
+      document.body.textContent?.includes("Accepted as a native turn") &&
+        !document.body.textContent?.includes("Explicitly acknowledged") &&
+        !document.body.textContent?.includes("not yet confirmed as accepted"),
+      "an accepted worker turn still asked for manager acknowledgement or hid native acceptance",
+    );
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;

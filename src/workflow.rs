@@ -1971,6 +1971,12 @@ pub fn execute_with_runtime(
             if !settings.is_object() {
                 bail!("project settings must be a JSON object")
             }
+            if settings
+                .get("role_report_reminders")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                bail!("role_report_reminders must be a boolean")
+            }
             let changed=transaction.execute("UPDATE projects SET settings_json=?1,version=version+1,updated_at=?2 WHERE id=?3 AND version=?4",params![settings.to_string(),now,project_id,expected_version])?;
             if changed != 1 {
                 bail!("project version is stale")
@@ -4662,7 +4668,23 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         }
     }
     let controls = json_rows_no_param(&connection, "SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,'kind',kind,'state',state,'payload',json(payload_json),'updated_at',updated_at) FROM controls WHERE state NOT IN ('finished','cancelled') ORDER BY created_at")?;
-    let guidance=json_rows_no_param(&connection,"SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,'body',body,'state',state,'reason',reason,'created_at',created_at,'acknowledged_at',acknowledged_at) FROM guidance_messages ORDER BY created_at DESC LIMIT 200")?;
+    let mut guidance=json_rows_no_param(&connection,"SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,'body',body,'state',state,'reason',reason,'created_at',created_at,'acknowledged_at',acknowledged_at) FROM guidance_messages ORDER BY created_at DESC LIMIT 200")?;
+    for message in &mut guidance {
+        if let Some(id) = message.get("id").and_then(serde_json::Value::as_str) {
+            if let Some(reminder) = crate::store::report_reminder_display(&connection, id)? {
+                let body = message
+                    .get("body")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                message["body"] = serde_json::Value::String(format!(
+                    "Report reminder {} of {}. {} of {} reservations spent for this agent generation. {body}",
+                    reminder["ordinal"], reminder["generation_limit"],
+                    reminder["reservations_spent"], reminder["generation_limit"],
+                ));
+                message["report_reminder"] = reminder;
+            }
+        }
+    }
     let check_suites=json_rows_no_param(&connection,"SELECT json_object('id',id,'project_id',project_id,'name',name,'position',position,'executable',executable,'arguments',json(arguments_json),'timeout_seconds',timeout_seconds,'enabled',enabled,'version',version) FROM check_suites ORDER BY project_id,position,name")?;
     let checks=json_rows_no_param(&connection,"SELECT json_object('id',id,'attempt_id',attempt_id,'candidate_hash',candidate_hash,'check_id',check_id,'selected_check_revision',selected_check_revision,'suite_name',suite_name,'suite_version',check_suite_version,'executable',executable,'arguments',json(arguments_json),'status',status,'launch_state',launch_state,'launch_error',launch_error,'failure_category',json_extract(evidence_json,'$.failure_category'),'exit_code',exit_code,'inputs_hash',inputs_hash,'acceptance_coverage',json(acceptance_coverage_json),'elapsed_millis',elapsed_millis,'freshness_state',freshness_state,'evidence',json(evidence_json),'created_at',created_at,'finished_at',finished_at) FROM check_runs ORDER BY created_at DESC LIMIT 200")?;
     let switches=json_rows_no_param(&connection,"SELECT json_object('id',si.id,'attempt_id',si.attempt_id,'role',si.role,'lane_id',COALESCE((SELECT lane_id FROM role_generations WHERE id=si.old_generation_id),(SELECT lane_id FROM role_generations WHERE id=si.new_generation_id),'default'),'old_generation_id',si.old_generation_id,'new_generation_id',si.new_generation_id,'requested_settings_revision',si.requested_settings_revision,'checkpoint_snapshot_id',si.checkpoint_snapshot_id,'handoff',CASE WHEN json_valid(si.handoff_json) THEN json(si.handoff_json) ELSE json_object('malformed_handoff',1) END,'state',si.state,'updated_at',si.updated_at) FROM switch_intents si ORDER BY si.created_at DESC LIMIT 200")?;
@@ -5652,6 +5674,281 @@ pub(crate) fn belongs_to_accepted_turn(alias: &str) -> String {
           OR json_extract({alias}.payload_json,'$.prompt_id')=
              (SELECT json_extract(payload_json,'$.prompt_id') FROM accepted))"
     )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ReportRequirement {
+    ManagerPlan,
+    ImplementerCandidate {
+        plan_hash: String,
+    },
+    Explorer {
+        decision_id: String,
+    },
+    Review {
+        request_id: String,
+        kind: String,
+        candidate_hash: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReportReminderBinding {
+    pub session_id: String,
+    pub role_generation_id: String,
+    pub attempt_id: String,
+    pub role: RoleKind,
+    pub transcript_epoch: String,
+    pub resume_invocation_id: Option<String>,
+    pub accepted_hook_event_id: String,
+    pub stop_hook_event_id: String,
+    pub authority: serde_json::Value,
+    pub requirement: ReportRequirement,
+}
+
+pub(crate) fn report_reminder_turn(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<(String, String)>> {
+    Ok(connection.query_row(
+        &format!(
+            "WITH {CURRENT_TURN_HOOKS_SQL}
+             SELECT accepted.id,stop.id FROM accepted JOIN current_hooks stop
+               ON stop.event_name='Stop' AND stop.hook_rowid>accepted.hook_rowid
+             WHERE {} AND EXISTS(SELECT 1 FROM audit_events audit
+               WHERE audit.event_code='provider.hook.received' AND audit.actor_kind='hook'
+                 AND audit.entity_id=?1 AND audit.actor_id=(SELECT role_generation_id FROM invocation)
+                 AND json_extract(audit.detail_json,'$.hook_event_id')=stop.id
+                 AND json_type(audit.detail_json,'$.safe_idle_boundary')='true')
+               AND NOT EXISTS(SELECT 1 FROM current_hooks later
+                 WHERE later.hook_rowid>stop.hook_rowid
+                   AND later.event_name NOT IN ('Notification','SubagentStop'))
+             ORDER BY stop.hook_rowid DESC LIMIT 1",
+            belongs_to_accepted_turn("stop")
+        ),
+        params![session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?)
+}
+
+pub(crate) fn report_reminder_binding(
+    connection: &Connection,
+    session_id: &str,
+    guidance_id: Option<&str>,
+) -> Result<Option<ReportReminderBinding>> {
+    let row: Option<(String, String, String, String, Option<String>, String)> = connection.query_row(
+        &format!(
+            "SELECT g.id,a.id,g.role,s.transcript_epoch,
+               (SELECT ri.id FROM resume_invocations ri WHERE ri.session_id=s.id
+                 AND ri.transcript_epoch=s.transcript_epoch ORDER BY ri.resume_ordinal DESC LIMIT 1),
+               json_object('project_version',p.version,'task_version',t.version,
+                 'settings_revision',rs.revision,'settings',json(rs.config_json),
+                 'configuration_revision',a.configuration_revision,'configuration_hash',a.configuration_hash,
+                 'scope_hash',a.scope_hash,'plan_hash',a.plan_hash,'candidate_hash',a.candidate_hash,
+                 'workflow_hash',a.workflow_hash,'authority_generation',g.authority_generation,
+                 'project_config_revision',project_state.active_config_revision_id,
+                 'project_config',json(project_config.config_json),
+                 'launch_config',json(s.launch_config_json),'process_identity',s.process_identity_json,
+                 'capability_key',s.capability_key,'native_session_id',s.native_session_id)
+             FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+             JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id
+             JOIN projects p ON p.id=t.project_id
+             JOIN trip_project_state project_state ON project_state.project_id=p.id
+             LEFT JOIN trip_config_revisions project_config ON project_config.id=project_state.active_config_revision_id
+             JOIN role_settings rs ON rs.task_id=t.id AND rs.role=g.role
+               AND rs.effective_generation_id=g.id AND rs.revision=g.config_revision
+             WHERE s.id=?1 AND s.status='running' AND s.launch_state='started'
+               AND g.status='running' AND s.lane_id=g.lane_id AND g.lane_id='default'
+               AND g.role IN ('manager','explorer','implementer','plan_reviewer','code_reviewer')
+               AND s.setup_permit_id IS NULL AND s.validation_cell IS NULL
+               AND a.setup_operation_id IS NULL AND p.internal_purpose IS NULL
+               AND s.process_identity_json IS NOT NULL AND s.native_session_id IS NOT NULL
+               AND (s.readiness_state='idle_candidate' OR (s.readiness_state='idle_verified'
+                 AND EXISTS(SELECT 1 FROM guidance_messages own WHERE own.id=?2
+                   AND own.role_generation_id=g.id AND own.delivery_session_id=s.id
+                   AND own.delivery_transcript_epoch=s.transcript_epoch
+                   AND own.state IN ('delivery_reserved','written_awaiting_submit'))))
+               AND json_type(p.settings_json,'$.role_report_reminders')='true'
+               AND t.archived_at IS NULL AND t.lifecycle='in_progress' AND t.attention='none'
+               AND a.status='running' AND a.legacy_migration_required=0
+               AND a.workflow_version=?3 AND a.workflow_hash=?4
+               AND project_state.readiness='ready' AND project_state.workflow_id=?3
+               AND project_state.package_version=?5 AND project_state.upstream_source_hash=?6
+               AND project_state.overlay_hash=?7
+               AND a.id=(SELECT id FROM attempts WHERE task_id=t.id ORDER BY created_at DESC LIMIT 1)
+               AND EXISTS(SELECT 1 FROM role_credentials rc WHERE rc.role_generation_id=g.id
+                 AND rc.revoked_at IS NULL AND EXISTS(SELECT 1 FROM json_each(rc.permissions_json)
+                   WHERE value='report_result'))
+               AND NOT EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=a.id
+                 AND c.state NOT IN ('finished','cancelled','superseded','rejected'))
+               AND NOT EXISTS(SELECT 1 FROM recovery_records r WHERE r.state='attention_required'
+                 AND (r.attempt_id=a.id OR r.id='database-restore-hold'))
+               AND NOT EXISTS(SELECT 1 FROM switch_intents sw WHERE sw.attempt_id=a.id
+                 AND sw.state NOT IN ('completed','cancelled','rejected'))
+               AND NOT EXISTS(SELECT 1 FROM restart_candidates restart WHERE restart.attempt_id=a.id
+                 AND restart.state IN ('pending_reconciliation','admitting'))
+               AND NOT EXISTS(SELECT 1 FROM permission_requests pr JOIN sessions ps ON ps.id=pr.session_id
+                 JOIN role_generations pg ON pg.id=ps.role_generation_id
+                 WHERE pg.attempt_id=a.id AND {})
+               AND NOT EXISTS(SELECT 1 FROM guidance_messages pending WHERE pending.attempt_id=a.id
+                 AND pending.id IS NOT ?2
+                 AND pending.state IN ('queued','delivery_reserved','written_awaiting_submit','delivery_unknown'))
+               AND NOT EXISTS(SELECT 1 FROM input_leases lease JOIN sessions ls ON ls.id=lease.session_id
+                 JOIN role_generations lg ON lg.id=ls.role_generation_id
+                 WHERE lg.attempt_id=a.id AND lease.revoked_at IS NULL
+                   AND julianday(lease.expires_at)>julianday('now')
+                   AND (?2 IS NULL OR lease.session_id!=s.id OR lease.owner_id!='guidance:'||?2))
+               AND NOT EXISTS(SELECT 1 FROM check_runs checks WHERE checks.attempt_id=a.id
+                 AND checks.status IN ('running','launch_reserved','launch_ambiguous','recovery_required'))
+               AND NOT EXISTS(SELECT 1 FROM freeze_intents freeze WHERE freeze.attempt_id=a.id
+                 AND freeze.state IN ('reserved','capturing','recovery_required'))
+               AND NOT EXISTS(SELECT 1 FROM rework_intents rework WHERE rework.new_attempt_id=a.id
+                 AND rework.state IN ('reserved','materializing','recovery_required'))",
+            crate::permissions::ACTIONABLE_REQUEST_SQL
+        ),
+        params![session_id, guidance_id, crate::trip::WORKFLOW_ID,
+            crate::workflow_resources::workflow_hash(), crate::trip::PACKAGE_VERSION,
+            crate::trip::source_hash(), crate::trip::overlay_hash()],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+    ).optional()?;
+    let Some((generation, attempt, role, epoch, resume, authority)) = row else {
+        return Ok(None);
+    };
+    let role = role.parse::<RoleKind>().map_err(|error| anyhow!(error))?;
+    if role == RoleKind::FinalReviewer
+        || crate::store::failure_stop_fence(connection, &attempt)?.is_some()
+        || crate::store::provider_failure_hold_for_session(connection, session_id)?.is_some()
+    {
+        return Ok(None);
+    }
+    crate::trip::require_attempt_ready(connection, &attempt, None)?;
+    let Some((accepted, stop)) = report_reminder_turn(connection, session_id)? else {
+        return Ok(None);
+    };
+    let Some(requirement) = missing_report_requirement(
+        connection,
+        &attempt,
+        &generation,
+        session_id,
+        role,
+        &accepted,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ReportReminderBinding {
+        session_id: session_id.to_owned(),
+        role_generation_id: generation,
+        attempt_id: attempt,
+        role,
+        transcript_epoch: epoch,
+        resume_invocation_id: resume,
+        accepted_hook_event_id: accepted,
+        stop_hook_event_id: stop,
+        authority: serde_json::from_str(&authority)?,
+        requirement,
+    }))
+}
+
+fn missing_report_requirement(
+    connection: &Connection,
+    attempt_id: &str,
+    generation: &str,
+    session_id: &str,
+    role: RoleKind,
+    accepted_hook_event_id: &str,
+) -> Result<Option<ReportRequirement>> {
+    let (phase, plan_hash, approved): (String, Option<String>, bool) = connection.query_row(
+        "SELECT phase,plan_hash,plan_approved_at IS NOT NULL FROM attempts WHERE id=?1",
+        params![attempt_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let requirement = match role {
+        RoleKind::FinalReviewer => return Ok(None),
+        RoleKind::Manager => {
+            let proposed: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
+                   AND kind='transition_proposal' AND state='proposed')",
+                params![attempt_id],
+                |row| row.get(0),
+            )?;
+            if phase != "planning"
+                || plan_hash.is_some()
+                || proposed
+                || crate::store::eligible_manager_plan(connection, attempt_id, false)?.is_some()
+            {
+                return Ok(None);
+            }
+            ReportRequirement::ManagerPlan
+        }
+        RoleKind::Implementer => {
+            if phase != "implementation"
+                || !approved
+                || crate::store::eligible_implementer_candidate(connection, attempt_id, false)?
+                    .is_some()
+            {
+                return Ok(None);
+            }
+            let Some(plan_hash) = plan_hash else {
+                return Ok(None);
+            };
+            ReportRequirement::ImplementerCandidate { plan_hash }
+        }
+        RoleKind::Explorer => {
+            let id: Option<String> = connection.query_row(
+                "SELECT d.id FROM trip_explorer_decisions d JOIN attempts a ON a.id=d.attempt_id
+                 WHERE d.attempt_id=?1 AND d.role_generation_id=?2 AND d.activated=1
+                   AND d.outcome_json IS NULL AND d.candidate_hash IS a.candidate_hash
+                   AND a.phase IN ('planning','implementation','code_review','checks','final_review')
+                 ORDER BY d.created_at DESC,d.id DESC LIMIT 1",
+                params![attempt_id,generation], |row| row.get(0),
+            ).optional()?;
+            let Some(decision_id) = id else {
+                return Ok(None);
+            };
+            ReportRequirement::Explorer { decision_id }
+        }
+        RoleKind::PlanReviewer | RoleKind::CodeReviewer => {
+            let (kind, required_phase) = if role == RoleKind::PlanReviewer {
+                ("plan", "plan_review")
+            } else {
+                ("code", "code_review")
+            };
+            if phase != required_phase {
+                return Ok(None);
+            }
+            let request: Option<(String, String)> = connection.query_row(
+                "SELECT r.id,r.candidate_hash FROM review_requests r JOIN attempts a ON a.id=r.attempt_id
+                 WHERE r.attempt_id=?1 AND r.role_generation_id=?2 AND r.session_id=?3
+                   AND r.review_kind=?4 AND r.delivery_state='delivered'
+                   AND r.candidate_hash=CASE WHEN r.review_kind='plan' THEN a.plan_hash ELSE a.candidate_hash END
+                   AND NOT EXISTS(SELECT 1 FROM role_results result
+                     WHERE result.role_generation_id=r.role_generation_id AND result.session_id=r.session_id
+                       AND json_extract(result.metadata_json,'$.review_request_id')=r.id
+                       AND json_extract(result.metadata_json,'$.review_kind')=r.review_kind
+                       AND json_extract(result.metadata_json,'$.candidate_hash')=r.candidate_hash
+                       AND result.created_at>=COALESCE((SELECT MAX(ri.created_at) FROM resume_invocations ri
+                         WHERE ri.session_id=r.session_id),(SELECT created_at FROM sessions WHERE id=r.session_id))
+                       AND NOT EXISTS(SELECT 1 FROM role_result_supersessions superseded WHERE superseded.role_result_id=result.id)
+                       AND NOT EXISTS(SELECT 1 FROM hook_events accepted WHERE accepted.id=?5
+                         AND julianday(accepted.received_at)>julianday(result.created_at)))
+                 ORDER BY r.rowid DESC LIMIT 1",
+                params![attempt_id,generation,session_id,kind,accepted_hook_event_id], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).optional()?;
+            let Some((request_id, candidate_hash)) = request else {
+                return Ok(None);
+            };
+            return Ok(Some(ReportRequirement::Review {
+                request_id,
+                kind: kind.into(),
+                candidate_hash,
+            }));
+        }
+    };
+    if latest_invocation_report(connection, session_id)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(requirement))
 }
 
 pub(crate) fn failed_session_stop_binding(
