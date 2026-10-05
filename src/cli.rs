@@ -64,6 +64,14 @@ struct ServeArgs {
         help = "Do not open the authenticated dashboard in the default browser"
     )]
     no_open: bool,
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=720), help = "Create a verified in-service backup every 1 to 720 hours; disabled by default")]
+    backup_every_hours: Option<u16>,
+    #[arg(
+        long,
+        requires = "backup_every_hours",
+        help = "Absolute backup destination; defaults to a sibling of the instance directory"
+    )]
+    backup_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -589,6 +597,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 InstancePaths::resolve(args.data_dir)?,
                 args.port,
                 !args.no_open,
+                crate::database::BackupOptions {
+                    every_hours: args.backup_every_hours,
+                    directory: args.backup_dir,
+                },
             )
             .await
         }
@@ -1931,9 +1943,49 @@ fn env_path(name: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod attach_input_tests {
     use super::{
-        attachment_input_action, persistent_cmux_input_authority, AttachmentInputAction,
-        PersistentCmuxInputAuthority,
+        attachment_input_action, persistent_cmux_input_authority, AttachmentInputAction, Cli,
+        Command, PersistentCmuxInputAuthority,
     };
+    use clap::Parser;
+
+    #[test]
+    fn serve_backup_flags_are_default_off_and_reject_orphans_and_out_of_range_intervals() {
+        let Command::Serve(defaults) = Cli::try_parse_from(["llmrelay", "serve"]).unwrap().command
+        else {
+            panic!("serve command was not parsed")
+        };
+        assert!(defaults.backup_every_hours.is_none());
+        assert!(defaults.backup_dir.is_none());
+        for hours in ["1", "24", "720"] {
+            let Command::Serve(args) = Cli::try_parse_from([
+                "llmrelay",
+                "serve",
+                "--backup-every-hours",
+                hours,
+                "--backup-dir",
+                "/tmp/llmrelay-backups",
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("serve command was not parsed")
+            };
+            assert_eq!(args.backup_every_hours, Some(hours.parse().unwrap()));
+            assert_eq!(args.backup_dir, Some("/tmp/llmrelay-backups".into()));
+        }
+        for hours in ["0", "721", "-1", "1.5", "bad"] {
+            assert!(
+                Cli::try_parse_from(["llmrelay", "serve", "--backup-every-hours", hours]).is_err()
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "llmrelay",
+            "serve",
+            "--backup-dir",
+            "/tmp/llmrelay-backups"
+        ])
+        .is_err());
+    }
 
     #[test]
     fn read_only_attachment_ignores_terminal_input_except_detach() {

@@ -9,7 +9,10 @@ use crate::store::{
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
-use rusqlite::{backup::Backup, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{
+    backup::{Backup, StepResult},
+    Connection, OpenFlags, OptionalExtension, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
@@ -20,7 +23,11 @@ use std::os::unix::{
     fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
 };
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
 const MANIFEST_SCHEMA: u32 = 1;
 const JOURNAL_SCHEMA: u32 = 1;
@@ -29,11 +36,115 @@ const MAX_BACKUPS: usize = 10;
 const MAX_BACKUP_AGE_DAYS: i64 = 30;
 const MAX_BACKUP_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MIGRATION_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+const ONLINE_COPY_LIMIT: Duration = Duration::from_secs(30 * 60);
 
 #[cfg(test)]
 thread_local! {
     pub(crate) static TEST_INTERRUPT_BACKUP_BEFORE_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_BACKUP_PUBLICATION_FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     pub(crate) static TEST_AVAILABLE_CAPACITY: std::cell::RefCell<std::collections::VecDeque<u64>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct BackupOptions {
+    pub every_hours: Option<u16>,
+    pub directory: Option<PathBuf>,
+}
+
+impl BackupOptions {
+    pub(crate) fn resolve(&self, paths: &InstancePaths) -> Result<Option<(Duration, PathBuf)>> {
+        let Some(hours) = self.every_hours else {
+            if self.directory.is_some() {
+                bail!("--backup-dir requires --backup-every-hours")
+            }
+            return Ok(None);
+        };
+        if !(1..=720).contains(&hours) {
+            bail!("--backup-every-hours must be an integer from 1 through 720")
+        }
+        let destination = backup_root(paths, self.directory.as_deref())?;
+        validate_backup_instance_overlap(paths, &destination)?;
+        Ok(Some((
+            Duration::from_secs(u64::from(hours) * 3600),
+            destination,
+        )))
+    }
+}
+
+pub(crate) struct OnlineBackupControl {
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+    #[cfg(test)]
+    pub(crate) copy_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl OnlineBackupControl {
+    pub(crate) fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            deadline: Instant::now() + ONLINE_COPY_LIMIT,
+            #[cfg(test)]
+            copy_hook: None,
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            bail!("scheduled backup cancelled by service shutdown")
+        }
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = if TEST_BACKUP_PUBLICATION_FAILURE.with(|failure| {
+            if failure.get() == Some("deadline") {
+                failure.set(None);
+                true
+            } else {
+                false
+            }
+        }) {
+            self.deadline
+        } else {
+            now
+        };
+        if now >= self.deadline {
+            bail!("scheduled backup exceeded its 30-minute deadline")
+        }
+        Ok(())
+    }
+}
+
+pub(crate) enum BackupPublication {
+    Complete,
+    DurabilityUnconfirmed(String),
+    RetentionWarning(String),
+}
+
+pub(crate) struct PublishedBackup {
+    pub(crate) snapshot: serde_json::Value,
+    pub(crate) publication: BackupPublication,
+}
+
+impl PublishedBackup {
+    fn require_complete(self) -> Result<serde_json::Value> {
+        match self.publication {
+            BackupPublication::Complete => Ok(self.snapshot),
+            BackupPublication::DurabilityUnconfirmed(cause) => bail!(
+                "verified backup renamed at {}; publication durability unconfirmed: {cause}",
+                self.snapshot["backup"]
+            ),
+            BackupPublication::RetentionWarning(cause) => bail!(
+                "durable verified backup at {}; retention incomplete: {cause}",
+                self.snapshot["backup"]
+            ),
+        }
+    }
+}
+
+struct CopiedBackup {
+    operation_id: String,
+    staging: PathBuf,
+    published: PathBuf,
+    target: Connection,
 }
 
 pub struct InstanceLock {
@@ -234,11 +345,14 @@ pub(crate) fn open_service_locked(paths: &InstancePaths, lock: &InstanceLock) ->
     let (backup_budget, migration_budget) = source_storage_budgets(paths, &transaction)?;
     require_upgrade_capacity(&destination, &paths.state, backup_budget, migration_budget)?;
     create_private_directory(&destination)?;
-    let snapshot = publish_backup_locked(&destination, &transaction)
-        .context("publish verified pre-upgrade restore point")?;
+    let copied = copy_backup_locked(&destination, &transaction, None)
+        .context("copy pre-upgrade restore point")?;
     drop(transaction);
     drop(connection);
     drop(source);
+    let snapshot = finalize_backup(&destination, copied, None)
+        .and_then(PublishedBackup::require_complete)
+        .context("publish verified pre-upgrade restore point")?;
     let backup = snapshot["backup"]
         .as_str()
         .context("published backup path missing")?;
@@ -266,67 +380,212 @@ pub fn backup(paths: &InstancePaths, configured: Option<&Path>) -> Result<serde_
     let (backup_budget, _) = source_storage_budgets(paths, &transaction)?;
     require_capacity(&destination, backup_budget).context("backup destination capacity")?;
     create_private_directory(&destination)?;
-    publish_backup_locked(&destination, &transaction)
+    let copied = copy_backup_locked(&destination, &transaction, None)?;
+    drop(transaction);
+    drop(connection);
+    drop(source);
+    finalize_backup(&destination, copied, None)?.require_complete()
 }
 
-fn publish_backup_locked(destination: &Path, source: &Connection) -> Result<serde_json::Value> {
+pub(crate) fn validate_online_backup_destination(
+    paths: &InstancePaths,
+    lock: &InstanceLock,
+    destination: &Path,
+) -> Result<()> {
+    validate_lock_file(&lock.file, &paths.lock_file)?;
+    let resolved = resolve_missing(destination)?;
+    validate_backup_destination(paths, &resolved)?;
+    if destination.exists() {
+        private_directory(destination)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn backup_online(
+    paths: &InstancePaths,
+    lock: Arc<InstanceLock>,
+    destination: &Path,
+    control: &OnlineBackupControl,
+) -> Result<PublishedBackup> {
+    control.check()?;
+    validate_online_backup_destination(paths, &lock, destination)?;
+    validate_live_database_family(paths)?;
+    let source = Store::open_current_readonly(&paths.database)?;
+    let connection = source.lock()?;
+    let transaction = connection.unchecked_transaction()?;
+    // This read, rather than BEGIN alone, pins the committed WAL snapshot.
+    require_current_schema(&transaction)?;
+    #[cfg(test)]
+    if let Some(hook) = &control.copy_hook {
+        hook();
+    }
+    control.check()?;
+    let (budget, _) = source_storage_budgets(paths, &transaction)?;
+    require_capacity(destination, budget).context("backup destination capacity")?;
+    create_private_directory(destination)?;
+    let copied = copy_backup_locked(destination, &transaction, Some(control))?;
+    drop(transaction);
+    drop(connection);
+    drop(source);
+    finalize_backup(destination, copied, Some(control))
+}
+
+fn copy_backup_locked(
+    destination: &Path,
+    source: &Connection,
+    control: Option<&OnlineBackupControl>,
+) -> Result<CopiedBackup> {
     let operation_id = uuid::Uuid::new_v4().to_string();
     let staging = destination.join(format!(".{operation_id}.staging"));
     let published = destination.join(format!(
         "{}-{operation_id}",
         Utc::now().format("%Y%m%dT%H%M%SZ")
     ));
-    create_private_directory(&staging)?;
-    let database = staging.join("database.sqlite3");
-    let mut target = Connection::open(&database)
-        .with_context(|| format!("create backup database {}", database.display()))?;
-    {
+    let target = (|| -> Result<Connection> {
+        create_private_directory(&staging)?;
+        let database = staging.join("database.sqlite3");
+        let mut target = Connection::open(&database)
+            .with_context(|| format!("create backup database {}", database.display()))?;
+        set_private_file(&database)?;
         let backup = Backup::new(source, &mut target)?;
-        backup.run_to_completion(128, Duration::from_millis(5), None)?;
-    }
-    target.pragma_update(None, "query_only", "ON")?;
-    let sqlite_schema_version = require_maintenance_schema(&target)?;
-    let (integrity, foreign_keys) = sqlite_checks(&target)?;
-    if integrity != "ok" || foreign_keys != 0 {
-        bail!(
-            "backup verification failed: integrity={integrity}, foreign_key_violations={foreign_keys}"
+        if let Some(control) = control {
+            loop {
+                control.check()?;
+                match backup.step(128)? {
+                    StepResult::Done => break,
+                    StepResult::More | StepResult::Busy | StepResult::Locked => {}
+                    _ => bail!("unexpected SQLite backup step outcome"),
+                }
+                #[cfg(test)]
+                if let Some(hook) = &control.copy_hook {
+                    hook();
+                }
+                control.check()?;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            backup.run_to_completion(128, Duration::from_millis(5), None)?;
+        }
+        drop(backup);
+        Ok(target)
+    })()
+    .with_context(|| {
+        format!(
+            "unpublished backup {operation_id}; inspect preserved staging at {}",
+            staging.display()
         )
-    }
-    drop(target);
-    set_private_file(&database)?;
-    sync_file(&database)?;
-    let database_bytes = fs::metadata(&database)?.len();
-    let database_sha256 = sha256_file(&database)?;
-    let manifest = BackupManifest {
-        schema: MANIFEST_SCHEMA,
-        operation_id: operation_id.clone(),
-        created_at: Utc::now().to_rfc3339(),
-        application_version: crate::VERSION.to_owned(),
-        database_file: "database.sqlite3".to_owned(),
-        database_bytes,
-        database_sha256,
-        sqlite_schema_version,
-        integrity_check: integrity,
-        foreign_key_violations: foreign_keys,
+    })?;
+    Ok(CopiedBackup {
+        operation_id,
+        staging,
+        published,
+        target,
+    })
+}
+
+fn finalize_backup(
+    destination: &Path,
+    copied: CopiedBackup,
+    control: Option<&OnlineBackupControl>,
+) -> Result<PublishedBackup> {
+    let CopiedBackup {
+        operation_id,
+        staging,
+        published,
+        target,
+    } = copied;
+    let database = staging.join("database.sqlite3");
+    let check_control = || -> Result<()> {
+        if let Some(control) = control {
+            control.check()?;
+        }
+        Ok(())
     };
-    write_private_json(&staging.join("manifest.json"), &manifest)?;
-    sync_directory(&staging)?;
-    verify(&staging).context("reread staged backup before publication")?;
-    #[cfg(test)]
-    if TEST_INTERRUPT_BACKUP_BEFORE_PUBLISH.with(|armed| armed.replace(false)) {
-        bail!("injected interruption before backup publication")
-    }
-    fs::rename(&staging, &published)
-        .with_context(|| format!("publish backup {}", published.display()))?;
-    sync_directory(destination)?;
-    prune_backups(destination, &published)?;
-    Ok(serde_json::json!({
-        "operation_id":operation_id,
-        "backup":published,
-        "database_bytes":database_bytes,
-        "database_sha256":manifest.database_sha256,
-        "verified":true,
-    }))
+    let manifest = (|| -> Result<BackupManifest> {
+        check_control()?;
+        target.pragma_update(None, "query_only", "ON")?;
+        let sqlite_schema_version = require_maintenance_schema(&target)?;
+        let (integrity, foreign_keys) = sqlite_checks(&target)?;
+        if integrity != "ok" || foreign_keys != 0 {
+            bail!(
+                "backup verification failed: integrity={integrity}, foreign_key_violations={foreign_keys}"
+            )
+        }
+        drop(target);
+        check_control()?;
+        set_private_file(&database)?;
+        sync_file(&database)?;
+        let database_bytes = fs::metadata(&database)?.len();
+        let database_sha256 = sha256_file(&database)?;
+        check_control()?;
+        let manifest = BackupManifest {
+            schema: MANIFEST_SCHEMA,
+            operation_id: operation_id.clone(),
+            created_at: Utc::now().to_rfc3339(),
+            application_version: crate::VERSION.to_owned(),
+            database_file: "database.sqlite3".to_owned(),
+            database_bytes,
+            database_sha256,
+            sqlite_schema_version,
+            integrity_check: integrity,
+            foreign_key_violations: foreign_keys,
+        };
+        write_private_json(&staging.join("manifest.json"), &manifest)?;
+        sync_directory(&staging)?;
+        verify(&staging).context("reread staged backup before publication")?;
+        check_control()?;
+        #[cfg(test)]
+        if TEST_INTERRUPT_BACKUP_BEFORE_PUBLISH.with(|armed| armed.replace(false)) {
+            bail!("injected interruption before backup publication")
+        }
+        fs::rename(&staging, &published)
+            .with_context(|| format!("publish backup {}", published.display()))?;
+        Ok(manifest)
+    })()
+    .with_context(|| {
+        format!(
+            "unpublished backup {operation_id}; staging preserved at {}",
+            staging.display()
+        )
+    })?;
+    // After rename, cancellation must not discard the observed snapshot.
+    let durability = (|| -> Result<()> {
+        #[cfg(test)]
+        if TEST_BACKUP_PUBLICATION_FAILURE.with(|failure| failure.get() == Some("sync")) {
+            TEST_BACKUP_PUBLICATION_FAILURE.with(|failure| failure.set(None));
+            bail!("injected post-rename directory sync failure")
+        }
+        sync_directory(destination)
+    })();
+    let publication = match durability {
+        Err(error) => BackupPublication::DurabilityUnconfirmed(format!("{error:#}")),
+        Ok(()) => {
+            let retention = (|| -> Result<()> {
+                #[cfg(test)]
+                if TEST_BACKUP_PUBLICATION_FAILURE
+                    .with(|failure| failure.get() == Some("retention"))
+                {
+                    TEST_BACKUP_PUBLICATION_FAILURE.with(|failure| failure.set(None));
+                    bail!("injected retention failure")
+                }
+                prune_backups(destination, &published, control)
+            })();
+            match retention {
+                Ok(()) => BackupPublication::Complete,
+                Err(error) => BackupPublication::RetentionWarning(format!("{error:#}")),
+            }
+        }
+    };
+    Ok(PublishedBackup {
+        snapshot: serde_json::json!({
+            "operation_id":operation_id,
+            "backup":published,
+            "database_bytes":manifest.database_bytes,
+            "database_sha256":manifest.database_sha256,
+            "verified":true,
+        }),
+        publication,
+    })
 }
 
 pub fn verify(backup: &Path) -> Result<serde_json::Value> {
@@ -1211,11 +1470,16 @@ fn backup_root(paths: &InstancePaths, configured: Option<&Path>) -> Result<PathB
     resolve_missing(&parent.join(format!("{}.backups", name.to_string_lossy())))
 }
 
-fn validate_backup_destination(paths: &InstancePaths, destination: &Path) -> Result<()> {
+fn validate_backup_instance_overlap(paths: &InstancePaths, destination: &Path) -> Result<()> {
     let root = resolve_missing(&paths.root)?;
     if destination.starts_with(&root) || root.starts_with(destination) {
         bail!("backup destination must not overlap the live instance tree")
     }
+    Ok(())
+}
+
+fn validate_backup_destination(paths: &InstancePaths, destination: &Path) -> Result<()> {
+    validate_backup_instance_overlap(paths, destination)?;
     if paths.database.exists() {
         let store = Store::open_maintenance_readonly(&paths.database)?;
         let connection = store.lock()?;
@@ -2025,10 +2289,22 @@ fn require_capacity(path: &Path, required: u64) -> Result<()> {
     Ok(())
 }
 
-fn prune_backups(root: &Path, newest: &Path) -> Result<()> {
+fn prune_backups(root: &Path, newest: &Path, control: Option<&OnlineBackupControl>) -> Result<()> {
+    let check_control = || -> Result<()> {
+        if let Some(control) = control {
+            control.check()?;
+        }
+        Ok(())
+    };
+    #[cfg(test)]
+    if let Some(hook) = control.and_then(|control| control.copy_hook.as_ref()) {
+        hook();
+    }
+    check_control()?;
     let now = Utc::now();
     let mut snapshots = Vec::new();
     for entry in fs::read_dir(root)? {
+        check_control()?;
         let path = entry?.path();
         if !path.is_dir()
             || path
@@ -2037,10 +2313,22 @@ fn prune_backups(root: &Path, newest: &Path) -> Result<()> {
         {
             continue;
         }
+        check_control()?;
         let Ok((_, manifest, _)) = load_manifest(&path) else {
             continue;
         };
-        if !app_owned_snapshot(&path)? || verify(&path).is_err() {
+        check_control()?;
+        if !app_owned_snapshot(&path)? {
+            continue;
+        }
+        check_control()?;
+        let verified = verify(&path);
+        #[cfg(test)]
+        if let Some(hook) = control.and_then(|control| control.copy_hook.as_ref()) {
+            hook();
+        }
+        check_control()?;
+        if verified.is_err() {
             continue;
         }
         let Ok(created) = DateTime::parse_from_rfc3339(&manifest.created_at) else {
@@ -2065,20 +2353,47 @@ fn prune_backups(root: &Path, newest: &Path) -> Result<()> {
             .context("retention snapshot size overflow")
     })?;
     let mut count = snapshots.len();
-    for (path, created, size, version) in snapshots {
-        // Schema anchors survive the ordinary limits so intermediate upgrade retries retain recovery.
-        if path == newest || anchors.get(&version) == Some(&path) {
-            continue;
+    let mut deletion_started = false;
+    let deletion = (|| -> Result<()> {
+        for (path, created, size, version) in snapshots {
+            check_control()?;
+            // Schema anchors survive the ordinary limits so intermediate upgrade retries retain recovery.
+            if path == newest || anchors.get(&version) == Some(&path) {
+                continue;
+            }
+            let expired = now.signed_duration_since(created).num_days() > MAX_BACKUP_AGE_DAYS;
+            if count > MAX_BACKUPS || total > MAX_BACKUP_BYTES || expired {
+                deletion_started = true;
+                fs::remove_dir_all(&path).with_context(|| {
+                    format!("prune verified application backup {}", path.display())
+                })?;
+                count -= 1;
+                total = total.saturating_sub(size);
+                #[cfg(test)]
+                if let Some(hook) = control.and_then(|control| control.copy_hook.as_ref()) {
+                    hook();
+                }
+                check_control()?;
+            }
         }
-        let expired = now.signed_duration_since(created).num_days() > MAX_BACKUP_AGE_DAYS;
-        if count > MAX_BACKUPS || total > MAX_BACKUP_BYTES || expired {
-            fs::remove_dir_all(&path)
-                .with_context(|| format!("prune verified application backup {}", path.display()))?;
-            count -= 1;
-            total = total.saturating_sub(size);
-        }
+        check_control()
+    })();
+    if deletion.is_err() && !deletion_started {
+        return deletion;
     }
-    sync_directory(root)
+    // A stopped or partially failed deletion still needs its directory bookkeeping synced.
+    let directory_sync = sync_directory(root);
+    #[cfg(test)]
+    if let Some(hook) = control.and_then(|control| control.copy_hook.as_ref()) {
+        hook();
+    }
+    match (deletion, directory_sync) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(sync_error)) => Err(error.context(format!(
+            "retention directory sync also failed: {sync_error:#}"
+        ))),
+    }
 }
 
 fn app_owned_snapshot(path: &Path) -> Result<bool> {
@@ -2098,6 +2413,392 @@ mod tests {
     use super::*;
 
     use crate::config::InstancePaths;
+
+    #[test]
+    fn scheduled_backup_options_refuse_invalid_startup_without_filesystem_effects() {
+        let root = std::env::temp_dir().join(format!("llmrelay-options-{}", uuid::Uuid::new_v4()));
+        let paths = InstancePaths::resolve(Some(root)).unwrap();
+        assert!(BackupOptions::default().resolve(&paths).unwrap().is_none());
+        for options in [
+            BackupOptions {
+                every_hours: None,
+                directory: Some(paths.root.with_extension("backups")),
+            },
+            BackupOptions {
+                every_hours: Some(0),
+                directory: None,
+            },
+            BackupOptions {
+                every_hours: Some(721),
+                directory: None,
+            },
+            BackupOptions {
+                every_hours: Some(1),
+                directory: Some(PathBuf::from("relative")),
+            },
+            BackupOptions {
+                every_hours: Some(1),
+                directory: Some(paths.root.join("backups")),
+            },
+        ] {
+            assert!(options.resolve(&paths).is_err());
+        }
+        for hours in [1, 24, 720] {
+            let (interval, destination) = BackupOptions {
+                every_hours: Some(hours),
+                directory: None,
+            }
+            .resolve(&paths)
+            .unwrap()
+            .unwrap();
+            assert_eq!(interval, Duration::from_secs(u64::from(hours) * 3600));
+            assert_eq!(destination, paths.root.with_extension("backups"));
+            assert!(!destination.exists());
+        }
+        assert!(!paths.root.exists());
+    }
+
+    #[test]
+    fn online_backup_pins_committed_wal_without_serializing_live_writer_and_keeps_same_lock() {
+        let root = std::env::temp_dir().join(format!("llmrelay-online-{}", uuid::Uuid::new_v4()));
+        let paths = InstancePaths::resolve(Some(root)).unwrap();
+        let destination = paths.root.with_extension("backups");
+        paths.create().unwrap();
+        let store = Store::open(&paths.database).unwrap();
+        store.lock().unwrap().execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES('before','before','service','fixture','fixture','fixture','{}','2026-01-01T00:00:00Z');"
+        ).unwrap();
+        let pinned = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let mut control = OnlineBackupControl::new(Arc::new(AtomicBool::new(false)));
+        let hook_pinned = pinned.clone();
+        let hook_release = release.clone();
+        let first = AtomicBool::new(true);
+        control.copy_hook = Some(Arc::new(move || {
+            if first.swap(false, Ordering::SeqCst) {
+                hook_pinned.wait();
+                hook_release.wait();
+            }
+        }));
+        let lock = Arc::new(InstanceLock::acquire(&paths).unwrap());
+        let worker_lock = Arc::clone(&lock);
+        let worker_paths = paths.clone();
+        let worker_destination = destination.clone();
+        let worker = std::thread::spawn(move || {
+            backup_online(&worker_paths, worker_lock, &worker_destination, &control)
+        });
+        pinned.wait();
+        drop(lock);
+        store.lock().unwrap().execute_batch(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES('after','after','service','fixture','fixture','fixture','{}','2026-01-01T00:00:00Z');"
+        ).unwrap();
+        assert!(backup(&paths, Some(&destination))
+            .unwrap_err()
+            .to_string()
+            .contains("another LLMRelay instance"));
+        assert!(restore(&paths, &destination)
+            .unwrap_err()
+            .to_string()
+            .contains("another LLMRelay instance"));
+        assert!(!destination.exists());
+        release.wait();
+        let result = worker.join().unwrap().unwrap();
+        assert!(matches!(result.publication, BackupPublication::Complete));
+        let snapshot = PathBuf::from(result.snapshot["backup"].as_str().unwrap());
+        verify(&snapshot).unwrap();
+        let connection = open_sqlite_for_verification(&snapshot.join("database.sqlite3")).unwrap();
+        let ids: Vec<String> = connection
+            .prepare("SELECT id FROM audit_events ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, ["before"]);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM audit_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(InstanceLock::acquire(&paths).unwrap());
+        drop(connection);
+        drop(store);
+        fs::remove_dir_all(paths.root).unwrap();
+        fs::remove_dir_all(destination).unwrap();
+    }
+
+    #[test]
+    fn online_backup_failures_preserve_staging_and_report_observed_publication() {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-online-failure-{}", uuid::Uuid::new_v4()));
+        let paths = InstancePaths::resolve(Some(root)).unwrap();
+        let destination = paths.root.with_extension("backups");
+        paths.create().unwrap();
+        let store = Store::open(&paths.database).unwrap();
+        let first = backup(&paths, Some(&destination)).unwrap();
+        let first_path = PathBuf::from(first["backup"].as_str().unwrap());
+        let lock = Arc::new(InstanceLock::acquire(&paths).unwrap());
+        let control = OnlineBackupControl::new(Arc::new(AtomicBool::new(false)));
+        TEST_AVAILABLE_CAPACITY.with(|values| *values.borrow_mut() = [0].into());
+        let error = backup_online(&paths, lock.clone(), &destination, &control)
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("backup destination capacity"));
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+        TEST_INTERRUPT_BACKUP_BEFORE_PUBLISH.with(|armed| armed.set(true));
+        let error = backup_online(&paths, lock.clone(), &destination, &control)
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("injected interruption"));
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 2);
+        for failure in ["sync", "retention"] {
+            TEST_BACKUP_PUBLICATION_FAILURE.with(|armed| armed.set(Some(failure)));
+            let result = backup_online(&paths, lock.clone(), &destination, &control).unwrap();
+            match (&result.publication, failure) {
+                (BackupPublication::DurabilityUnconfirmed(cause), "sync") => {
+                    assert!(cause.contains("directory sync"))
+                }
+                (BackupPublication::RetentionWarning(cause), "retention") => {
+                    assert!(cause.contains("retention"))
+                }
+                _ => panic!("publication failure was flattened or misreported"),
+            }
+            let path = PathBuf::from(result.snapshot["backup"].as_str().unwrap());
+            verify(&path).unwrap();
+            assert!(result
+                .require_complete()
+                .unwrap_err()
+                .to_string()
+                .contains(path.to_str().unwrap()));
+        }
+        assert_eq!(
+            verify(&first_path).unwrap()["database_sha256"],
+            first["database_sha256"]
+        );
+        drop(lock);
+        for failure in ["sync", "retention"] {
+            TEST_BACKUP_PUBLICATION_FAILURE.with(|armed| armed.set(Some(failure)));
+            assert!(
+                backup(&paths, Some(&destination)).is_err(),
+                "offline publication must fail closed"
+            );
+        }
+        drop(store);
+        fs::remove_dir_all(paths.root).unwrap();
+        fs::remove_dir_all(destination).unwrap();
+    }
+
+    #[test]
+    fn online_backup_cancel_between_batches_and_expired_deadline_never_publish() {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-online-cancel-{}", uuid::Uuid::new_v4()));
+        let paths = InstancePaths::resolve(Some(root)).unwrap();
+        let destination = paths.root.with_extension("backups");
+        paths.create().unwrap();
+        let store = Store::open(&paths.database).unwrap();
+        store.lock().unwrap().execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES('sizing','sizing','service','fixture','fixture','fixture',json_object('payload',?1),'2026-01-01T00:00:00Z')",
+            ["x".repeat(1024 * 1024)],
+        ).unwrap();
+        let lock = Arc::new(InstanceLock::acquire(&paths).unwrap());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut control = OnlineBackupControl::new(cancelled.clone());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        control.copy_hook = Some(Arc::new(move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                cancelled.store(true, Ordering::SeqCst);
+            }
+        }));
+        let error = backup_online(&paths, lock.clone(), &destination, &control)
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("cancelled"));
+        let source = Store::open_current_readonly(&paths.database).unwrap();
+        let connection = source.lock().unwrap();
+        let transaction = connection.unchecked_transaction().unwrap();
+        require_current_schema(&transaction).unwrap();
+        let mut expired = OnlineBackupControl::new(Arc::new(AtomicBool::new(false)));
+        expired.deadline = Instant::now();
+        let error = copy_backup_locked(&destination, &transaction, Some(&expired))
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("deadline"));
+        let copied = copy_backup_locked(&destination, &transaction, None).unwrap();
+        drop(transaction);
+        drop(connection);
+        drop(source);
+        let error = finalize_backup(&destination, copied, Some(&expired))
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("deadline"));
+        let entries: Vec<_> = fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries.len(), 3);
+        assert!(entries
+            .iter()
+            .all(|name| name.to_string_lossy().ends_with(".staging")));
+        drop(lock);
+        drop(store);
+        fs::remove_dir_all(paths.root).unwrap();
+        fs::remove_dir_all(destination).unwrap();
+    }
+
+    #[test]
+    fn online_backup_postpublication_stop_preserves_snapshot_and_bounds_retention_work() {
+        for deadline in [false, true] {
+            for boundary in ["publication", "verification", "deletion"] {
+                let root = std::env::temp_dir()
+                    .join(format!("llmrelay-retention-stop-{}", uuid::Uuid::new_v4()));
+                let paths = InstancePaths::resolve(Some(root)).unwrap();
+                let destination = paths.root.with_extension("backups");
+                paths.create().unwrap();
+                let store = Store::open(&paths.database).unwrap();
+                let older: Vec<_> = (0..3)
+                    .map(|_| {
+                        let snapshot = backup(&paths, Some(&destination)).unwrap();
+                        PathBuf::from(snapshot["backup"].as_str().unwrap())
+                    })
+                    .collect();
+                for path in &older {
+                    let (manifest_path, mut manifest, _) = load_manifest(path).unwrap();
+                    manifest.created_at = "2000-01-01T00:00:00Z".to_owned();
+                    write_private_json(&manifest_path, &manifest).unwrap();
+                }
+                let stop_at = match boundary {
+                    "publication" => 1,
+                    "verification" => 2,
+                    "deletion" => older.len() + 3,
+                    _ => unreachable!(),
+                };
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let mut control = OnlineBackupControl::new(cancelled.clone());
+                let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let hook_observed = observed.clone();
+                let hook_older = older.clone();
+                let hook_destination = destination.clone();
+                control.copy_hook = Some(Arc::new(move || {
+                    let published = fs::read_dir(&hook_destination).unwrap().any(|entry| {
+                        let path = entry.unwrap().path();
+                        !hook_older.contains(&path)
+                            && !path.file_name().unwrap().as_bytes().starts_with(b".")
+                    });
+                    if !published {
+                        return;
+                    }
+                    if hook_observed.fetch_add(1, Ordering::SeqCst) + 1 == stop_at {
+                        if deadline {
+                            TEST_BACKUP_PUBLICATION_FAILURE
+                                .with(|failure| failure.set(Some("deadline")));
+                        } else {
+                            cancelled.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }));
+                let lock = Arc::new(InstanceLock::acquire(&paths).unwrap());
+                let result = backup_online(&paths, lock.clone(), &destination, &control).unwrap();
+                let BackupPublication::RetentionWarning(cause) = &result.publication else {
+                    panic!("postpublication stop must report durable incomplete retention")
+                };
+                assert!(cause.contains(if deadline { "deadline" } else { "cancelled" }));
+                let newest = PathBuf::from(result.snapshot["backup"].as_str().unwrap());
+                assert_eq!(
+                    verify(&newest).unwrap()["operation_id"],
+                    result.snapshot["operation_id"]
+                );
+                let removed = if boundary == "deletion" { 1 } else { 0 };
+                assert_eq!(older.iter().filter(|path| !path.exists()).count(), removed);
+                assert_eq!(
+                    observed.load(Ordering::SeqCst),
+                    stop_at + removed,
+                    "after a deletion, only its required directory sync may follow the stop"
+                );
+                assert!(TEST_BACKUP_PUBLICATION_FAILURE.with(|failure| failure.get().is_none()));
+                for path in older.iter().filter(|path| path.exists()) {
+                    verify(path).unwrap();
+                }
+                drop(lock);
+                drop(store);
+                fs::remove_dir_all(paths.root).unwrap();
+                fs::remove_dir_all(destination).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn online_backup_postpublication_cancel_keeps_same_lock_until_worker_completes() {
+        let root = std::env::temp_dir().join(format!(
+            "llmrelay-published-worker-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = InstancePaths::resolve(Some(root)).unwrap();
+        let destination = paths.root.with_extension("backups");
+        paths.create().unwrap();
+        let store = Store::open(&paths.database).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut control = OnlineBackupControl::new(cancelled.clone());
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let hook_release = release.clone();
+        let hook_destination = destination.clone();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let first = AtomicBool::new(true);
+        control.copy_hook = Some(Arc::new(move || {
+            let published = fs::read_dir(&hook_destination).ok().and_then(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| !path.file_name().unwrap().as_bytes().starts_with(b"."))
+            });
+            if let Some(published) = published {
+                if first.swap(false, Ordering::SeqCst) {
+                    published_tx.send(published).unwrap();
+                    hook_release.wait();
+                }
+            }
+        }));
+        let lock = Arc::new(InstanceLock::acquire(&paths).unwrap());
+        let worker_lock = lock.clone();
+        let worker_paths = paths.clone();
+        let worker_destination = destination.clone();
+        let worker = std::thread::spawn(move || {
+            backup_online(&worker_paths, worker_lock, &worker_destination, &control)
+        });
+        let newest = published_rx.recv().unwrap();
+        let verified = verify(&newest).unwrap();
+        cancelled.store(true, Ordering::SeqCst);
+        drop(lock);
+        assert!(backup(&paths, Some(&destination))
+            .unwrap_err()
+            .to_string()
+            .contains("another LLMRelay instance"));
+        assert!(restore(&paths, &newest)
+            .unwrap_err()
+            .to_string()
+            .contains("another LLMRelay instance"));
+        release.wait();
+        let result = worker.join().unwrap().unwrap();
+        assert!(matches!(
+            result.publication,
+            BackupPublication::RetentionWarning(_)
+        ));
+        assert_eq!(result.snapshot["operation_id"], verified["operation_id"]);
+        assert_eq!(
+            verify(&newest).unwrap()["database_sha256"],
+            verified["database_sha256"]
+        );
+        drop(InstanceLock::acquire(&paths).unwrap());
+        drop(store);
+        fs::remove_dir_all(paths.root).unwrap();
+        fs::remove_dir_all(destination).unwrap();
+    }
 
     #[test]
     fn capacity_refusal_is_explicit() {
@@ -2207,7 +2908,7 @@ mod tests {
 
         TEST_INTERRUPT_BACKUP_BEFORE_PUBLISH.with(|armed| armed.set(true));
         let error = backup(&paths, Some(&destination)).unwrap_err();
-        assert!(error.to_string().contains("injected interruption"));
+        assert!(format!("{error:#}").contains("injected interruption"));
         assert!(destination.join(first_path.file_name().unwrap()).exists());
         assert_eq!(verify(&first_path).unwrap()["database_sha256"], first_hash);
         let entries: Vec<_> = fs::read_dir(&destination)

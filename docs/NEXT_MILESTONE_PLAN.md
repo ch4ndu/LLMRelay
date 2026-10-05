@@ -18,6 +18,33 @@ will defer personal hands-on acceptance until the selected features are present.
 Engineering verification continues at each checkpoint. The earlier implementation
 is a verified foundation, not acceptance of the complete desired product.
 
+## Completed task — scheduled in-service verified backups
+
+Selected October 5 after the verified TRIP upgrade was committed as `f546237`.
+The independently reviewed plan r2 is approved for implementation: default-off
+`serve --backup-every-hours` scheduling for each invocation, one separate
+read-only WAL snapshot worker, safe instance-lock ownership through shutdown,
+explicit publication outcomes and the existing verification/retention policy.
+Restore remains offline. Persistent dashboard scheduling and downtime catch-up
+are outside this slice. Independent code review and its focused retention repair
+recheck approved the implementation. The full configured matrix passed 423 tests
+(63 frontend, 153 library, 205 contracts, 2 runtime), with no failures or ignored
+tests; type-checking, formatting, compilation and asset builds passed. Fresh
+Fable Medium final verification approved on October 5. This is verified source
+delivery. The user authorized a local checkpoint commit after verification; no
+packaging, release or live user-instance backup is claimed. Local evidence is under
+`.local/trip-explorer/scheduled_backups_20261005/`.
+
+## Next candidate — usage and limits
+
+The next item in the features-after-hardening queue is usage/limit display and
+per-turn token accounting, for presentation only. It requires its own scoped
+plan and review: identify trustworthy evidence from the admitted provider CLI
+contracts, distinguish measured values from unavailable data, and preserve
+execution, approval and model-selection authority. Implementation has not been
+selected or started. The remaining queue is richer role handoffs, queued-guidance
+editing/cancellation, comments/activity, persistent drafts and task search.
+
 ## Next-task status — installed TRIP update completed
 
 Completed October 3: upgraded the installed TRIP Explorer tooling from 0.9.0 to

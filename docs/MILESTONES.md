@@ -26,7 +26,17 @@ A first, then D. Both are deferred while the user validates the current service
 flow. This document records the roadmap; it does not authorize starting either
 implementation now or claim that the user has accepted the everyday flow.
 
-## Current next task — TRIP process update
+## Scheduled in-service backups — verified
+
+The user approved the independently reviewed scheduled in-service backup plan
+on October 5. The implementation passed independent code review, a focused
+retention-cancellation repair recheck, the full 423-test matrix and fresh final
+verification. Scheduling is default-off and configured per `serve` invocation;
+restore remains offline. The user authorized a local checkpoint commit after
+verification; no packaging, release or live user data operation is claimed. See [verified scope](NEXT_MILESTONE_PLAN.md#completed-task--scheduled-in-service-verified-backups) and
+[operation](OPERATIONS.md#scheduled-backups-while-the-service-runs).
+
+## Completed TRIP process update
 
 The repository-installed TRIP Explorer upgrade to 0.11.0 is verified. The user
 also authorized adopting 0.11.0 in LLMRelay's separately embedded workflow.
@@ -35,7 +45,8 @@ and the reconciled 410-test matrix under the user-approved bounded migration
 policy. Fresh final verification approved after the host preflight-manifest hash
 was reconciled. Verified implementation is complete; no release or live database
 migration was performed. See [the current next-task status](NEXT_MILESTONE_PLAN.md#next-task-status--installed-trip-update-completed).
-The reminder feature remains complete; scheduled backups remain deferred.
+The reminder feature remains complete. The TRIP upgrade was committed locally
+as `f546237`; scheduled backups are the selected task above.
 
 ## Milestone 1 — Validate the current service flow
 
@@ -936,7 +947,8 @@ instances; no existing user data was purged, upgraded or restored.
 - **Verified:** opt-in, audited reminders (at most two per role generation, never
   for the final verifier) when a role's safely ended turn lacks its required
   report. See [completion](#opt-in-missing-report-reminders--verified).
-- Scheduled in-service verified backup; restore remains offline CLI-only.
+- **Verified:** scheduled in-service backups configured per foreground-service
+  invocation; restore remains offline CLI-only. See [completion](#scheduled-in-service-backups--verified).
 - Usage and limit display plus per-turn token accounting, presentation only.
 - Per-attempt handoff fields in role reports (changed files, verification,
   retry notes, residual risk) fed into rework prompts (Jinn `work-items/runs.ts`).

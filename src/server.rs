@@ -1,6 +1,9 @@
 use crate::auth;
 use crate::config::{atomic_write, InstancePaths};
 use crate::control;
+use crate::database::{
+    BackupOptions, BackupPublication, InstanceLock, OnlineBackupControl, PublishedBackup,
+};
 use crate::domain::{
     AppStateDto, CapabilityProofInput, CmuxKeyboardControlAction, HumanCommand, RoleKind,
 };
@@ -27,8 +30,11 @@ use std::ops::RangeInclusive;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    Arc, Mutex,
+};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 
@@ -297,9 +303,171 @@ enum WebOperation {
     },
 }
 
-pub async fn serve(paths: InstancePaths, requested_port: u16, open_browser: bool) -> Result<()> {
+struct ScheduledBackup {
+    interval: Duration,
+    destination: PathBuf,
+    next_due: Instant,
+    worker: Option<tokio::task::JoinHandle<(Instant, Result<PublishedBackup>)>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+fn backup_due(
+    now: Instant,
+    next_due: Instant,
+    in_flight: bool,
+    draining: bool,
+    held: bool,
+) -> bool {
+    now >= next_due && !in_flight && !draining && !held
+}
+
+impl ScheduledBackup {
+    async fn tick(&mut self, app: &Application, lock: &Arc<InstanceLock>, now: Instant) {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            self.reap(app).await;
+        }
+        if self.cancelled.load(AtomicOrdering::SeqCst)
+            || !backup_due(
+                now,
+                self.next_due,
+                self.worker.is_some(),
+                app.is_draining(),
+                false,
+            )
+        {
+            return;
+        }
+        match crate::database::hold_active(&app.store) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(error=%error, "scheduled backup admission could not read restore hold");
+                return;
+            }
+        }
+        let worker_app = app.clone();
+        let worker_lock = Arc::clone(lock);
+        let destination = self.destination.clone();
+        let control = OnlineBackupControl::new(Arc::clone(&self.cancelled));
+        self.worker = Some(tokio::task::spawn_blocking(move || {
+            let result = run_scheduled_backup(&worker_app, worker_lock, &destination, &control);
+            (Instant::now(), result)
+        }));
+    }
+
+    async fn reap(&mut self, app: &Application) {
+        if let Some(worker) = self.worker.take() {
+            let (finished, result) = match worker.await {
+                Ok(result) => result,
+                Err(error) => (
+                    Instant::now(),
+                    Err(anyhow!("scheduled backup worker failed: {error}")),
+                ),
+            };
+            self.next_due = finished + self.interval;
+            record_backup_outcome(app, result);
+        }
+    }
+
+    async fn finish(&mut self, app: &Application) {
+        self.cancelled.store(true, AtomicOrdering::SeqCst);
+        self.reap(app).await;
+    }
+}
+
+fn run_scheduled_backup(
+    app: &Application,
+    lock: Arc<InstanceLock>,
+    destination: &std::path::Path,
+    control: &OnlineBackupControl,
+) -> Result<PublishedBackup> {
+    record_backup_event(
+        app,
+        "info",
+        "backup.started",
+        "started",
+        None,
+        serde_json::json!({"destination":destination}),
+    );
+    crate::database::validate_online_backup_destination(&app.paths, &lock, destination)?;
+    if app.is_draining() || crate::database::hold_active(&app.store)? {
+        bail!("scheduled backup suppressed before copying because service is draining or a restore hold is active")
+    }
+    crate::database::backup_online(&app.paths, lock, destination, control)
+}
+
+fn record_backup_outcome(app: &Application, result: Result<PublishedBackup>) {
+    let (severity, outcome, operation_id, detail) = match result {
+        Err(error) => (
+            "warn",
+            "unpublished",
+            None,
+            serde_json::json!({"cause":format!("{error:#}"),"action":"Inspect backup storage and diagnostics; the next attempt waits one interval."}),
+        ),
+        Ok(backup) => {
+            let operation_id = backup.snapshot["operation_id"].as_str().map(str::to_owned);
+            let (severity, outcome, warning, action) = match backup.publication {
+                BackupPublication::Complete => ("info", "verified", None, None),
+                BackupPublication::DurabilityUnconfirmed(cause) => (
+                    "warn", "publication_durability_unconfirmed", Some(cause),
+                    Some("Keep the snapshot and inspect storage errors before relying on it for recovery."),
+                ),
+                BackupPublication::RetentionWarning(cause) => (
+                    "warn", "retention_incomplete", Some(cause),
+                    Some("The snapshot is durable; inspect destination permissions, space and the retention warning."),
+                ),
+            };
+            (
+                severity,
+                outcome,
+                operation_id,
+                serde_json::json!({"snapshot":backup.snapshot,"warning":warning,"action":action}),
+            )
+        }
+    };
+    record_backup_event(
+        app,
+        severity,
+        "backup.finished",
+        outcome,
+        operation_id.as_deref(),
+        detail,
+    );
+}
+
+fn record_backup_event(
+    app: &Application,
+    severity: &str,
+    event: &str,
+    outcome: &str,
+    operation_id: Option<&str>,
+    detail: serde_json::Value,
+) {
+    if let Err(error) = app.diagnostics.record(
+        severity,
+        event,
+        "database_backup",
+        outcome,
+        operation_id,
+        detail.clone(),
+    ) {
+        tracing::warn!(error=%error, event, outcome, detail=%crate::diagnostics::sanitize_value(detail), "backup diagnostic could not be persisted");
+    }
+}
+
+pub(crate) async fn serve(
+    paths: InstancePaths,
+    requested_port: u16,
+    open_browser: bool,
+    backup_options: BackupOptions,
+) -> Result<()> {
+    let backup_configuration = backup_options.resolve(&paths)?;
     paths.create()?;
-    let lock = crate::database::InstanceLock::acquire(&paths)?;
+    let lock = Arc::new(InstanceLock::acquire(&paths)?);
     crate::database::recover_interrupted_restore_locked(&paths)?;
     crate::database::validate_live_database_family(&paths)?;
     let store = crate::database::open_service_locked(&paths, &lock)?;
@@ -343,6 +511,18 @@ pub async fn serve(paths: InstancePaths, requested_port: u16, open_browser: bool
     if !restore_held {
         let _ = app.scheduler.reconcile_unknown()?;
     }
+    if let Some((_, destination)) = &backup_configuration {
+        crate::database::validate_online_backup_destination(&paths, &lock, destination)
+            .context("scheduled backup destination is unsafe; choose a private destination outside the instance and repositories, or omit the backup flags")?;
+    }
+    record_backup_event(
+        &app,
+        "info",
+        "backup.configuration",
+        "configured",
+        None,
+        serde_json::json!({"enabled":backup_configuration.is_some(),"interval_hours":backup_options.every_hours,"destination":backup_configuration.as_ref().map(|(_, path)|path)}),
+    );
     let listener = TcpListener::bind(SocketAddr::new(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         requested_port,
@@ -429,7 +609,18 @@ pub async fn serve(paths: InstancePaths, requested_port: u16, open_browser: bool
     let coordinator_shutdown = shutdown_tx.clone();
     let coordinator_failure = failure_tx.clone();
     let mut reconcile_shutdown = shutdown_rx.clone();
-    tokio::spawn(async move {
+    let coordinator_lock = Arc::clone(&lock);
+    let backup_cancelled = Arc::new(AtomicBool::new(false));
+    let coordinator_cancelled = Arc::clone(&backup_cancelled);
+    let mut scheduled_backup =
+        backup_configuration.map(|(interval, destination)| ScheduledBackup {
+            interval,
+            destination,
+            next_due: Instant::now() + interval,
+            worker: None,
+            cancelled: coordinator_cancelled.clone(),
+        });
+    let coordinator_task = tokio::spawn(async move {
         let service_started_at = chrono::Utc::now();
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut intake_error_reported = false;
@@ -437,8 +628,15 @@ pub async fn serve(paths: InstancePaths, requested_port: u16, open_browser: bool
         // the first tick that completes.
         let mut tick_deferral_open = true;
         loop {
+            if *reconcile_shutdown.borrow() {
+                break;
+            }
             tokio::select! {
                 _ = interval.tick() => {
+                    if *reconcile_shutdown.borrow() { break; }
+                    if let Some(backup) = &mut scheduled_backup {
+                        backup.tick(&coordinator_app, &coordinator_lock, Instant::now()).await;
+                    }
                     let tick_app=coordinator_app.clone();
                     match tokio::task::spawn_blocking(move||{
                         let coordinator = tick_app.coordinator_tick();
@@ -492,6 +690,10 @@ pub async fn serve(paths: InstancePaths, requested_port: u16, open_browser: bool
                 changed = reconcile_shutdown.changed() => { if changed.is_err() || *reconcile_shutdown.borrow() { break } }
             }
         }
+        coordinator_cancelled.store(true, AtomicOrdering::SeqCst);
+        if let Some(backup) = &mut scheduled_backup {
+            backup.finish(&coordinator_app).await;
+        }
     });
     let mut opener_shutdown = shutdown_rx.clone();
     let opener_task = if open_browser {
@@ -537,7 +739,7 @@ pub async fn serve(paths: InstancePaths, requested_port: u16, open_browser: bool
             }
         }
     });
-    axum::serve(listener, router)
+    let server_result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             loop {
                 tokio::select! {
@@ -550,15 +752,22 @@ pub async fn serve(paths: InstancePaths, requested_port: u16, open_browser: bool
                 }
             }
         })
-        .await?;
+        .await;
+
+    backup_cancelled.store(true, AtomicOrdering::SeqCst);
+    let _ = shutdown_tx.send(true);
+    let coordinator_error = coordinator_task
+        .await
+        .err()
+        .map(|error| format!("coordinator loop failed: {error}"));
 
     if let Some(task) = opener_task {
         let _ = task.await;
     }
 
-    let listener_failure = failure_tx.borrow().clone();
+    let listener_failure = failure_tx.borrow().clone().or(coordinator_error);
     let final_record = InstanceRecord {
-        status: if listener_failure.is_some() {
+        status: if listener_failure.is_some() || server_result.is_err() {
             "unhealthy".to_owned()
         } else {
             "stopped".to_owned()
@@ -570,6 +779,7 @@ pub async fn serve(paths: InstancePaths, requested_port: u16, open_browser: bool
         &serde_json::to_vec_pretty(&final_record)?,
     )?;
     drop(lock);
+    server_result.context("dashboard listener failed")?;
     if let Some(error) = listener_failure {
         Err(anyhow!(error))
     } else {
@@ -1478,6 +1688,285 @@ mod web_operation_tests {
     use crate::store::Store;
     use axum::http::HeaderValue;
     use rusqlite::params;
+
+    #[test]
+    fn scheduled_backup_admission_is_single_flight_and_restart_waits_a_future_interval() {
+        let boot = Instant::now();
+        let interval = Duration::from_secs(3600);
+        let due = boot + interval;
+        assert!(!backup_due(boot, due, false, false, false));
+        assert!(!backup_due(
+            due - Duration::from_nanos(1),
+            due,
+            false,
+            false,
+            false
+        ));
+        let late = boot + interval * 12;
+        assert!(backup_due(late, due, false, false, false));
+        for (in_flight, draining, held) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert!(!backup_due(late, due, in_flight, draining, held));
+        }
+        assert!(
+            !backup_due(late, late + interval, false, false, false),
+            "restart recreates a future-only schedule"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_backup_failed_attempt_waits_from_completion_without_catch_up() {
+        let (root, app, _, _) = server_test_application();
+        let boot = Instant::now();
+        let interval = Duration::from_secs(3600);
+        let finished = boot + interval * 12;
+        let mut backup = ScheduledBackup {
+            interval,
+            destination: root.with_extension("backups"),
+            next_due: boot + interval,
+            worker: Some(tokio::spawn(async move {
+                (finished, Err(anyhow!("storage unavailable")))
+            })),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        backup.reap(&app).await;
+        assert!(!backup_due(
+            finished,
+            backup.next_due,
+            backup.worker.is_some(),
+            false,
+            false
+        ));
+        assert!(!backup_due(
+            finished + interval - Duration::from_nanos(1),
+            backup.next_due,
+            false,
+            false,
+            false
+        ));
+        assert!(backup_due(
+            finished + interval,
+            backup.next_due,
+            false,
+            false,
+            false
+        ));
+        let events = app.diagnostics.read_sanitized(100).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event_code"] == "backup.finished")
+                .count(),
+            1
+        );
+        assert!(!backup.destination.exists());
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduled_backup_shutdown_joins_actual_worker_before_releasing_offline_ownership() {
+        let (root, app, _, _) = server_test_application();
+        let destination = root.with_extension("backups");
+        let lock = Arc::new(InstanceLock::acquire(&app.paths).unwrap());
+        let worker_lock = lock.clone();
+        let worker_app = app.clone();
+        let worker_destination = destination.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut control = OnlineBackupControl::new(cancelled.clone());
+        let pinned = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let hook_pinned = pinned.clone();
+        let hook_release = release.clone();
+        let first = AtomicBool::new(true);
+        control.copy_hook = Some(Arc::new(move || {
+            if first.swap(false, AtomicOrdering::SeqCst) {
+                hook_pinned.wait();
+                hook_release.wait();
+            }
+        }));
+        let worker = tokio::task::spawn_blocking(move || {
+            let result =
+                run_scheduled_backup(&worker_app, worker_lock, &worker_destination, &control);
+            (Instant::now(), result)
+        });
+        pinned.wait();
+        let mut backup = ScheduledBackup {
+            interval: Duration::from_secs(3600),
+            destination: destination.clone(),
+            next_due: Instant::now(),
+            worker: Some(worker),
+            cancelled: cancelled.clone(),
+        };
+        backup
+            .tick(&app, &lock, Instant::now() + Duration::from_secs(24 * 3600))
+            .await;
+        assert_eq!(
+            app.diagnostics
+                .read_sanitized(100)
+                .unwrap()
+                .iter()
+                .filter(|event| event["event_code"] == "backup.started")
+                .count(),
+            1,
+            "late ticks must not launch a second actual worker"
+        );
+        cancelled.store(true, AtomicOrdering::SeqCst);
+        backup
+            .tick(&app, &lock, Instant::now() + Duration::from_secs(24 * 3600))
+            .await;
+        drop(lock);
+        assert!(crate::database::backup(&app.paths, Some(&destination))
+            .unwrap_err()
+            .to_string()
+            .contains("another LLMRelay instance"));
+        assert!(crate::database::restore(&app.paths, &destination)
+            .unwrap_err()
+            .to_string()
+            .contains("another LLMRelay instance"));
+        let finish_app = app.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let finish = tokio::spawn(async move {
+            entered_tx.send(()).unwrap();
+            backup.finish(&finish_app).await;
+        });
+        entered_rx.await.unwrap();
+        assert!(
+            !finish.is_finished(),
+            "shutdown must await the paused blocking worker"
+        );
+        assert!(!destination.exists());
+        release.wait();
+        finish.await.unwrap();
+        drop(InstanceLock::acquire(&app.paths).unwrap());
+        let events: Vec<_> = app
+            .diagnostics
+            .read_sanitized(100)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event["component"] == "database_backup")
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event_code"], "backup.started");
+        assert_eq!(events[1]["outcome"], "unpublished");
+        assert!(events[1]["detail"]["cause"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled"));
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduled_backup_restore_hold_and_draining_have_no_copy_effects() {
+        let (root, app, _, _) = server_test_application();
+        let lock = Arc::new(InstanceLock::acquire(&app.paths).unwrap());
+        let destination = root.with_extension("backups");
+        let mut backup = ScheduledBackup {
+            interval: Duration::from_secs(3600),
+            destination: destination.clone(),
+            next_due: Instant::now(),
+            worker: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        app.store.lock().unwrap().execute_batch(
+            "INSERT INTO recovery_records(id,state,detail_json,created_at,updated_at)
+             VALUES('database-restore-hold','attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');"
+        ).unwrap();
+        backup.tick(&app, &lock, Instant::now()).await;
+        assert!(backup.worker.is_none());
+        assert!(!destination.exists());
+        let control = OnlineBackupControl::new(backup.cancelled.clone());
+        assert!(
+            run_scheduled_backup(&app, lock.clone(), &destination, &control)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("suppressed")
+        );
+        assert!(!destination.exists());
+        app.store.lock().unwrap().execute_batch(
+            "DELETE FROM recovery_records WHERE id='database-restore-hold'; DELETE FROM sessions;"
+        ).unwrap();
+        app.begin_drain().unwrap();
+        assert!(app.is_draining());
+        backup.tick(&app, &lock, Instant::now()).await;
+        assert!(backup.worker.is_none());
+        assert!(run_scheduled_backup(&app, lock.clone(), &destination, &control).is_err());
+        assert!(!destination.exists());
+        drop(lock);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_rejects_backup_overlap_before_creating_instance_or_opening_database() {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-startup-backup-{}", uuid::Uuid::new_v4()));
+        let paths = InstancePaths::resolve(Some(root)).unwrap();
+        let options = BackupOptions {
+            every_hours: Some(1),
+            directory: Some(paths.root.join("backups")),
+        };
+        let error = serve(paths.clone(), 0, false, options).await.unwrap_err();
+        assert!(error.to_string().contains("overlap"));
+        assert!(!paths.root.exists());
+    }
+
+    #[test]
+    fn online_backup_rechecks_repository_privacy_and_instance_lock_identity() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, app, _, _) = server_test_application();
+        let lock = Arc::new(InstanceLock::acquire(&app.paths).unwrap());
+        let destination = root.with_extension("backups");
+        crate::database::validate_online_backup_destination(&app.paths, &lock, &destination)
+            .unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(crate::database::backup_online(
+            &app.paths,
+            lock.clone(),
+            &destination,
+            &OnlineBackupControl::new(Arc::new(AtomicBool::new(false)))
+        )
+        .is_err());
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700)).unwrap();
+        app.store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE projects SET repository_path=?1 WHERE id='project'",
+                [destination.to_str().unwrap()],
+            )
+            .unwrap();
+        let error =
+            crate::database::validate_online_backup_destination(&app.paths, &lock, &destination)
+                .unwrap_err();
+        assert!(error.to_string().contains("registered repository"));
+        let other_paths = InstancePaths::resolve(Some(root.with_extension("other"))).unwrap();
+        other_paths.create().unwrap();
+        let other_lock = Arc::new(InstanceLock::acquire(&other_paths).unwrap());
+        let error = crate::database::backup_online(
+            &app.paths,
+            other_lock.clone(),
+            &destination,
+            &OnlineBackupControl::new(Arc::new(AtomicBool::new(false))),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("instance lock"));
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+        drop(other_lock);
+        drop(lock);
+        drop(app);
+        std::fs::remove_dir_all(other_paths.root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(destination).unwrap();
+    }
 
     fn server_test_application() -> (
         std::path::PathBuf,

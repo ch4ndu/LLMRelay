@@ -595,6 +595,10 @@ impl Application {
         self.dispatch_enabled.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
     pub fn service_boot_id(&self) -> &str {
         self.permission_boot_id.as_str()
     }

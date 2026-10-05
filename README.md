@@ -79,6 +79,8 @@ Eligible sessions resume their saved native conversation. Uncertain process owne
 
 The default macOS data directory is `~/Library/Application Support/AgenticJira`. The historical directory name is retained so existing installations keep their data. To use another instance, pass an absolute `--data-dir` path and reuse it for every command targeting that instance.
 
+For opt-in verified backups while the foreground service runs, start with `--backup-every-hours 24`. The schedule is off by default, begins anew after restart, and uses existing backup retention. Restore remains offline. See [scheduled backups](docs/OPERATIONS.md#scheduled-backups-while-the-service-runs).
+
 Startup prints the selected data and log paths. Use the dashboard's **Diagnostics** page or the executable's `logs` and `diagnostics export` commands when investigating a failure. A diagnostic export omits credentials, raw transcripts, repository source, and native provider history. See [operations and diagnostics](docs/OPERATIONS.md).
 
 ## Support and documentation

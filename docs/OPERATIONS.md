@@ -496,6 +496,54 @@ protected points alone exceed a limit, they remain; later capacity checks may
 refuse another backup or upgrade. Unrecognized or unverified content, incomplete
 staging and displaced-state quarantine are not automatically removed.
 
+### Scheduled backups while the service runs
+
+Scheduled backups are off by default. Enable them for a foreground service invocation:
+
+```sh
+llmrelay serve --data-dir <ABSOLUTE_INSTANCE_PATH> --backup-every-hours 24
+```
+
+`--backup-every-hours` accepts integer intervals from 1 through 720 hours.
+Optional `--backup-dir <ABSOLUTE_DIRECTORY>` requires the interval flag and uses
+the same destination ownership, privacy and overlap checks as manual backups.
+The default is the private sibling directory described above. An unsafe enabled
+destination refuses startup; correct it or omit the backup flags. Pre-migration
+restore points retain their existing default destination and startup requirements.
+
+The first backup is due one interval after startup. At most one backup runs;
+the next attempt is due one interval after that attempt finishes, including a
+failed attempt. Delayed service ticks do not produce a catch-up burst. Restart
+begins a new schedule and requires the flags again. Draining and database restore
+holds suppress new backups. This schedule is configured at launch, not saved in
+dashboard settings, and does not run while the service is stopped.
+
+The worker uses its own read-only connection and a consistent committed WAL
+snapshot. It releases that source snapshot after copying and verifies the staged
+copy before publication. Ordinary state writes can continue, although storage
+contention and WAL pressure can affect latency. The existing retention rules and
+schema anchors apply. Incomplete staging remains available for inspection and is
+not automatically pruned.
+
+Inspect existing diagnostics for `backup.configuration`, `backup.started` and
+`backup.finished`. A terminal event distinguishes an unpublished failure from a
+renamed snapshot whose publication durability is unconfirmed, a durable snapshot
+with incomplete retention, or complete verified publication. Keep a snapshot
+reported after rename and inspect the storage warning before relying on it; do
+not treat that outcome as proof no backup was made. Backup failures leave the
+service running and wait the interval before the next attempt. Diagnostic-write
+failures are also reported through tracing; persistence is not guaranteed then.
+
+Shutdown stops admission and requests cancellation between copy batches and at
+safe verification and retention boundaries. After publication, cancellation keeps
+the snapshot and reports incomplete retention; deletion already started still
+receives its required directory-sync bookkeeping. Online backup checks a
+30-minute deadline from admission across copying, verification and retention. Blocking
+SQLite or filesystem calls can extend shutdown; the service retains instance
+ownership until the worker stops. After rename it preserves and reports the
+observed snapshot. Manual backup and restore still require stopping the service
+and acquiring the exclusive instance lock; there is no in-service restore.
+
 Restore replaces database state, not repository files, native provider history,
 worktrees, transcripts or external effects. The displaced database and sidecars
 are preserved under `state/database-quarantine/`. A durable journal tracks file
