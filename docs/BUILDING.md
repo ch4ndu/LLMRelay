@@ -137,7 +137,7 @@ or establish a real upstream outage.
 Run `cargo test --locked --lib database::tests::` and
 `cargo test --locked --lib store::interruption_tests::restorepoint_` for capacity,
 publication, retention and older-schema recovery. The existing inline fixtures
-use genuine schema differences for versions 31–35 and committed WAL data. They
+use genuine schema differences for versions 31–36 and committed WAL data. They
 exercise backup, upgrade, restore, authority revocation and held startup, plus
 capacity, corruption, contention, manifest mismatch and interruption refusals.
 An intermediate migration failure checks that earlier recovery points survive

@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 
 pub const WORKFLOW_VERSION: &str = crate::trip::WORKFLOW_ID;
 pub const WORKFLOW: &str =
-    include_str!("../resources/workflows/trip-explorer-0.9.0-llmrelay-1.json");
+    include_str!("../resources/workflows/trip-explorer-0.11.0-llmrelay-1.json");
 pub const OVERLAY: &str = include_str!("../resources/prompts/trip-overlay.md");
 
 pub fn workflow_hash() -> String {

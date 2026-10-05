@@ -28,12 +28,14 @@ implementation now or claim that the user has accepted the everyday flow.
 
 ## Current next task — TRIP process update
 
-On October 3, the user selected updating this repository's installed TRIP process
-from `/Users/murali/Private/GitHub/trip-explorer-workflow` as the next task,
-ahead of the remaining product-feature candidates. The reminder feature is
-verified. See [the current next-task scope](NEXT_MILESTONE_PLAN.md#next-task--update-the-installed-trip-process-from-upstream).
-The upgrade has not started; preserve local workflow adaptations and validate
-changed adapters and their evidence when applying it.
+The repository-installed TRIP Explorer upgrade to 0.11.0 is verified. The user
+also authorized adopting 0.11.0 in LLMRelay's separately embedded workflow.
+The consolidated migration repair passed its retained independent code recheck
+and the reconciled 410-test matrix under the user-approved bounded migration
+policy. Fresh final verification approved after the host preflight-manifest hash
+was reconciled. Verified implementation is complete; no release or live database
+migration was performed. See [the current next-task status](NEXT_MILESTONE_PLAN.md#next-task-status--installed-trip-update-completed).
+The reminder feature remains complete; scheduled backups remain deferred.
 
 ## Milestone 1 — Validate the current service flow
 

@@ -6600,7 +6600,7 @@ fn consume_completed_checks(app: &Application, attempt: &Attempt, candidate: &st
             }
         }
     } else if final_repair_round > 1 {
-        bail!("final repair round exceeds the product v0.9.0 contract")
+        bail!("final repair round exceeds the product v0.11.0 contract")
     }
     if transaction.execute(
         "UPDATE attempts SET phase='final_review',updated_at=?1

@@ -15,15 +15,16 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-pub const WORKFLOW_ID: &str = "trip-explorer-0.9.0-llmrelay-1";
-pub const PACKAGE_VERSION: &str = "0.9.0";
+pub const WORKFLOW_ID: &str = "trip-explorer-0.11.0-llmrelay-1";
+pub const PACKAGE_VERSION: &str = "0.11.0";
 
 const MAX_LANE_SOURCE_BINDINGS: usize = 4096;
 const MAX_LANE_SOURCE_BINDING_BYTES: usize = 128 * 1024;
 
-const SOURCE_MANIFEST: &str = include_str!("../resources/trip-explorer/0.9.0/source-manifest.json");
+const SOURCE_MANIFEST: &str =
+    include_str!("../resources/trip-explorer/0.11.0/source-manifest.json");
 const OVERLAY: &str = include_str!("../resources/prompts/trip-overlay.md");
-const WORKFLOW: &str = include_str!("../resources/workflows/trip-explorer-0.9.0-llmrelay-1.json");
+const WORKFLOW: &str = include_str!("../resources/workflows/trip-explorer-0.11.0-llmrelay-1.json");
 
 const DELEGATED_ROLES: [RoleKind; 5] = [
     RoleKind::Explorer,
@@ -49,18 +50,24 @@ struct PackageFile {
 }
 
 const PACKAGE_FILES: &[PackageFile] = &[
-    PackageFile { relative: "bin/cmux_observer.py", bytes: include_bytes!("../resources/trip-explorer/0.9.0/bin/cmux_observer.py"), sha256: "2b6f3eeb68a84a0f711c38c723cf81a51221d98b491564d6ca82d50e742eaf4b" },
-    PackageFile { relative: "bin/cmux_role_runner.py", bytes: include_bytes!("../resources/trip-explorer/0.9.0/bin/cmux_role_runner.py"), sha256: "8af9608595f52384f9ed1cabc459ea901d4769f76ed36c4ba3cef3de7b3ce754" },
-    PackageFile { relative: "bin/role_config.py", bytes: include_bytes!("../resources/trip-explorer/0.9.0/bin/role_config.py"), sha256: "5df37514d8639177186a85d1014e74b6c8d551d7224c207a4950edbbde2454ad" },
-    PackageFile { relative: "bin/validate_installed.py", bytes: include_bytes!("../resources/trip-explorer/0.9.0/bin/validate_installed.py"), sha256: "249a548553b8fc416a63fb87dfe0dc077a77cb7cc7c311c5e2641ad4db20b44f" },
-    PackageFile { relative: "references/adaptation-contract.md", bytes: include_bytes!("../resources/trip-explorer/0.9.0/references/adaptation-contract.md"), sha256: "97017e2092e399f399e722860cd571608ba07e9b3c9e48287ce6f5dd13885d00" },
-    PackageFile { relative: "skills/trip-explorer-init/SKILL.md", bytes: include_bytes!("../resources/trip-explorer/0.9.0/skills/trip-explorer-init/SKILL.md"), sha256: "7c8c274dabc953b2041fa0ab923277b18316b1ade9de79e75245dfa6beed301f" },
-    PackageFile { relative: "skills/trip-explorer-init/agents/openai.yaml", bytes: include_bytes!("../resources/trip-explorer/0.9.0/skills/trip-explorer-init/agents/openai.yaml"), sha256: "680e238c90633f55b137807a5b7369ed278ac7b7f4b99d7f2d18105b6103a414" },
-    PackageFile { relative: "skills/trip-explorer-upgrade/SKILL.md", bytes: include_bytes!("../resources/trip-explorer/0.9.0/skills/trip-explorer-upgrade/SKILL.md"), sha256: "26e166d259b32615d8d58ef1f976d76fb0a168ceab36a122e37195a9f5cd756e" },
-    PackageFile { relative: "skills/trip-explorer-upgrade/agents/openai.yaml", bytes: include_bytes!("../resources/trip-explorer/0.9.0/skills/trip-explorer-upgrade/agents/openai.yaml"), sha256: "1c6941574cf99cdcfee2f372aad1c9ad45dcf3434a654767d9f255ad8ca7c320" },
-    PackageFile { relative: "skills/trip-explorer-workflow/SKILL.md", bytes: include_bytes!("../resources/trip-explorer/0.9.0/skills/trip-explorer-workflow/SKILL.md"), sha256: "452c60e89d9b7240c8f5497c25ab9fe378e07846fe9eb61e6cdd929fbd2cf73d" },
-    PackageFile { relative: "skills/trip-explorer-workflow/agents/openai.yaml", bytes: include_bytes!("../resources/trip-explorer/0.9.0/skills/trip-explorer-workflow/agents/openai.yaml"), sha256: "8a7cf505b62f328f0959140ad0980b9b4ec23da64d942dcfe7d22533066e2681" },
-    PackageFile { relative: "skills/trip-explorer-workflow/references/explorer-activation.md", bytes: include_bytes!("../resources/trip-explorer/0.9.0/skills/trip-explorer-workflow/references/explorer-activation.md"), sha256: "2f114434383976d5dc1c47c2a14483d5e01cf3fb0a4c89a4d7f97473ffae96af" },
+    PackageFile { relative: "bin/check_evidence.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/check_evidence.py"), sha256: "c7b13ecd2e0dffeaf5f6d31c94ab53492b93ba6c43575a9052e8263b86bb2250" },
+    PackageFile { relative: "bin/claude_console.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/claude_console.py"), sha256: "d899f71dfc5b019a404d7c267a84f7533fd390fb543291aab43ca906222509f5" },
+    PackageFile { relative: "bin/cmux_observer.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/cmux_observer.py"), sha256: "c2dcc814681eba9186b62e9537edf8ad290aadeb80545e846f05518c18502307" },
+    PackageFile { relative: "bin/cmux_role_runner.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/cmux_role_runner.py"), sha256: "cef80e3d91f6c3f611dff3a682ca9256aa69a6cdaffa2fdf8ccb6764a211b551" },
+    PackageFile { relative: "bin/role_config.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/role_config.py"), sha256: "243032ab1f985aedc2be248d08f39b26e5b446c1bbdeb91676d1ab27440d05a6" },
+    PackageFile { relative: "bin/run_report.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/run_report.py"), sha256: "8e27d998adc3a9ade017219296ac3c92168d4ca206a6015da8a63dcfa7231950" },
+    PackageFile { relative: "bin/upgrade_preview.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/upgrade_preview.py"), sha256: "7e5dfc5c6a13cc36e29b8fb97ac4f5fc7e95b89ad4c78b813483738bbe33827a" },
+    PackageFile { relative: "bin/validate_installed.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/validate_installed.py"), sha256: "8a988ab838fdb6e269177320b19b8d852e0c4d65728f2e8e31f474b24c874be7" },
+    PackageFile { relative: "bin/workflow_doctor.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/workflow_doctor.py"), sha256: "5132bd349903a22fbaf2f1be4e12dfd6cafb92ccb00de608814969cece7e1b08" },
+    PackageFile { relative: "skills/trip-explorer-init/SKILL.md", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-init/SKILL.md"), sha256: "723ab8314ffbb4bc03091f3cc336b60e6f56289496aa6382dde28641bd4b0172" },
+    PackageFile { relative: "skills/trip-explorer-init/agents/openai.yaml", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-init/agents/openai.yaml"), sha256: "680e238c90633f55b137807a5b7369ed278ac7b7f4b99d7f2d18105b6103a414" },
+    PackageFile { relative: "skills/trip-explorer-upgrade/SKILL.md", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-upgrade/SKILL.md"), sha256: "ce21c661280a7d210556bcfb657e2701c74ade1acd9412ba170ca1368e5994b7" },
+    PackageFile { relative: "skills/trip-explorer-upgrade/agents/openai.yaml", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-upgrade/agents/openai.yaml"), sha256: "1c6941574cf99cdcfee2f372aad1c9ad45dcf3434a654767d9f255ad8ca7c320" },
+    PackageFile { relative: "skills/trip-explorer-workflow/SKILL.md", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-workflow/SKILL.md"), sha256: "89b1f019ec0e53b14343fb6f2e6dc15b35d203876a705f7ee75a312298773249" },
+    PackageFile { relative: "skills/trip-explorer-workflow/agents/openai.yaml", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-workflow/agents/openai.yaml"), sha256: "8a7cf505b62f328f0959140ad0980b9b4ec23da64d942dcfe7d22533066e2681" },
+    PackageFile { relative: "skills/trip-explorer-workflow/references/evidence-format.md", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-workflow/references/evidence-format.md"), sha256: "56f80418dba6327643b0e7ac118e6b5376391e0099e47602f6edc9f6e34d2019" },
+    PackageFile { relative: "skills/trip-explorer-workflow/references/explorer-activation.md", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-workflow/references/explorer-activation.md"), sha256: "2f114434383976d5dc1c47c2a14483d5e01cf3fb0a4c89a4d7f97473ffae96af" },
+    PackageFile { relative: "skills/trip-explorer-workflow/references/maintenance.md", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-workflow/references/maintenance.md"), sha256: "167582ea26127c36342532dee9cb23e3bf9f3dffef4a2cd757d7f7a1f6a42c38" },
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -105,15 +112,17 @@ struct SetupProfile {
     provider: String,
     model: String,
     effort: String,
-    #[serde(default)]
-    service_tier: Option<String>,
     authority: String,
     session: String,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SetupRole {
     profile: String,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,6 +144,8 @@ struct SetupProposal {
     local_exclude: serde_json::Value,
     #[serde(default)]
     canonical_migration: Option<serde_json::Value>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 pub(crate) struct SetupManagerStopPreparation {
@@ -307,7 +318,7 @@ pub fn overlay_hash() -> String {
 pub fn register_project_state(connection: &Connection, project_id: &str, now: &str) -> Result<()> {
     connection.execute(
         "INSERT OR IGNORE INTO trip_project_state(project_id,readiness,reason,detected_installation,detected_json,updated_at)
-         VALUES(?1,'not_initialized','TRIP Explorer 0.9.0 has not been inspected and activated for this project','unknown','{}',?2)",
+         VALUES(?1,'not_initialized','TRIP Explorer 0.11.0 has not been inspected and activated for this project','unknown','{}',?2)",
         params![project_id, now],
     )?;
     Ok(())
@@ -1970,19 +1981,28 @@ pub(crate) fn reauthorize_attempt_guidance(
 }
 
 pub(crate) fn validate_materialized_policy(policy_json: &str) -> Result<serde_json::Value> {
+    validate_policy_identity(policy_json, WORKFLOW_ID, &source_hash(), &overlay_hash())
+}
+
+fn validate_policy_identity(
+    policy_json: &str,
+    workflow_id: &str,
+    upstream_source_hash: &str,
+    expected_overlay_hash: &str,
+) -> Result<serde_json::Value> {
     let policy: serde_json::Value = serde_json::from_str(policy_json)?;
     if policy
         .get("workflow_id")
         .and_then(serde_json::Value::as_str)
-        != Some(WORKFLOW_ID)
+        != Some(workflow_id)
         || policy
             .get("upstream_source_hash")
             .and_then(serde_json::Value::as_str)
-            != Some(source_hash().as_str())
+            != Some(upstream_source_hash)
         || policy
             .get("overlay_hash")
             .and_then(serde_json::Value::as_str)
-            != Some(overlay_hash().as_str())
+            != Some(expected_overlay_hash)
     {
         bail!("materialized worktree policy identity does not match the pinned TRIP workflow")
     }
@@ -2112,17 +2132,22 @@ pub fn inspect_registered_project(store: &Store, project_id: &str) -> Result<ser
         hash_file(&repository.root.join(".agents/trip-explorer/manifest.json"))?;
     let now = Utc::now().to_rfc3339();
     let connection = store.lock()?;
-    let (current, current_reason, activated_manifest): (String, String, Option<String>) =
+    let (current, current_reason, activated_manifest, current_pins): (String, String, Option<String>, bool) =
         connection.query_row(
-            "SELECT readiness,reason,manifest_hash FROM trip_project_state WHERE project_id=?1",
-            params![project_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            "SELECT s.readiness,s.reason,s.manifest_hash,
+                s.workflow_id=?2 AND s.package_version=?3 AND s.upstream_source_hash=?4 AND s.overlay_hash=?5
+                AND EXISTS(SELECT 1 FROM trip_config_revisions r WHERE r.id=s.active_config_revision_id
+                  AND r.project_id=s.project_id AND r.state='activated' AND r.source_hash=?4 AND r.overlay_hash=?5)
+             FROM trip_project_state s WHERE s.project_id=?1",
+            params![project_id, WORKFLOW_ID, PACKAGE_VERSION, source_hash(), overlay_hash()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, Option<bool>>(3)?.unwrap_or(false))),
         )?;
     let (readiness, reason) =
         if matches!(current.as_str(), "setup_in_progress" | "recovery_required") {
             (current, current_reason)
         } else if current == "ready"
             && observation.kind == "compatible"
+            && current_pins
             && activated_manifest == observed_manifest
         {
             (
@@ -3259,7 +3284,7 @@ fn save_setup_draft(
     expected_project_version: i64,
     proposal_value: &serde_json::Value,
 ) -> Result<OperationResult> {
-    let proposal: SetupProposal = serde_json::from_value(proposal_value.clone())?;
+    let proposal = setup_proposal_preserving_configuration(store, setup_id, proposal_value)?;
     validate_setup_proposal(&proposal)?;
     validate_agents_preservation(store, setup_id, &proposal)?;
     validate_canonical_migration(store, setup_id, &proposal)?;
@@ -3360,7 +3385,7 @@ fn revise_setup_draft(
     expected_project_version: i64,
     proposal_value: &serde_json::Value,
 ) -> Result<OperationResult> {
-    let proposal: SetupProposal = serde_json::from_value(proposal_value.clone())?;
+    let proposal = setup_proposal_preserving_configuration(store, source_setup_id, proposal_value)?;
     validate_setup_proposal(&proposal)?;
     let manager = proposal
         .host_manager
@@ -5194,6 +5219,142 @@ fn authorize_installation(
     ))
 }
 
+fn attempt_session_fingerprints(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<BTreeMap<String, String>> {
+    let sessions = connection
+        .prepare("SELECT id FROM sessions WHERE role_generation_id IN (SELECT id FROM role_generations WHERE attempt_id=?1) ORDER BY id")?
+        .query_map(params![attempt_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    sessions
+        .into_iter()
+        .map(|session| {
+            let (_, fingerprint) = crate::workflow::session_fingerprint(connection, &session)?
+                .ok_or_else(|| anyhow!("migration session disappeared"))?;
+            Ok((session, fingerprint))
+        })
+        .collect()
+}
+
+fn verify_attempt_migration_boundary(
+    store: &Store,
+    attempt_id: &str,
+) -> Result<BTreeMap<String, String>> {
+    let fingerprints = {
+        let connection = store.lock()?;
+        let fingerprints = attempt_session_fingerprints(&connection, attempt_id)?;
+        require_attempt_migration_boundary(&connection, attempt_id, &fingerprints)?;
+        fingerprints
+    };
+    for session in fingerprints.keys() {
+        crate::recovery::verify_session_quiescent(store, session)
+            .context("workflow migration requires positively verified session quiescence")?;
+    }
+    Ok(fingerprints)
+}
+
+fn require_attempt_migration_boundary(
+    connection: &Connection,
+    attempt_id: &str,
+    fingerprints: &BTreeMap<String, String>,
+) -> Result<()> {
+    if attempt_session_fingerprints(connection, attempt_id)? != *fingerprints {
+        bail!("attempt sessions changed during workflow migration quiescence verification")
+    }
+    for session in fingerprints.keys() {
+        for (blocker, sql) in crate::workflow::EXITED_SESSION_FENCES {
+            if connection.query_row(sql, params![session], |row| row.get::<_, bool>(0))? {
+                bail!("workflow migration waits while {blocker}")
+            }
+        }
+    }
+    for (blocker, sql) in crate::workflow::ATTEMPT_PROCESS_OWNERSHIP_FENCES
+        .iter()
+        .chain(crate::workflow::TERMINAL_REPLAN_FENCES.iter())
+        .chain(GUIDANCE_REAUTHORIZATION_FENCES.iter())
+    {
+        if *blocker == "the candidate is already frozen" {
+            continue;
+        }
+        if connection.query_row(sql, params![attempt_id], |row| row.get::<_, bool>(0))? {
+            bail!("workflow migration waits while {blocker}")
+        }
+    }
+    if let Some(held) = crate::store::provider_failure_hold_in_attempt(connection, attempt_id)? {
+        return Err(anyhow::Error::from(held)
+            .context("workflow migration waits for the provider failure hold to end"));
+    }
+    Ok(())
+}
+
+fn project_activation_attempts(connection: &Connection, project_id: &str) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT a.id FROM attempts a JOIN tasks t ON t.id=a.task_id
+         WHERE t.project_id=?1 AND a.status NOT IN ('done','cancelled','failed') ORDER BY a.id",
+    )?;
+    let attempts = statement
+        .query_map(params![project_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(attempts)
+}
+
+fn verify_project_activation_boundary(
+    store: &Store,
+    project_id: &str,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
+    let attempts = {
+        let connection = store.lock()?;
+        project_activation_attempts(&connection, project_id)?
+    };
+    attempts
+        .into_iter()
+        .map(|attempt| {
+            let fingerprints = verify_attempt_migration_boundary(store, &attempt)?;
+            Ok((attempt, fingerprints))
+        })
+        .collect()
+}
+
+fn require_project_activation_boundary(
+    connection: &Connection,
+    project_id: &str,
+    quiescence: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Result<()> {
+    if project_activation_attempts(connection, project_id)?
+        != quiescence.keys().cloned().collect::<Vec<_>>()
+    {
+        bail!("project attempts changed during activation quiescence verification")
+    }
+    for (attempt, fingerprints) in quiescence {
+        let current_identity: bool = connection.query_row(
+            "SELECT workflow_version=?2 AND workflow_hash=?3 AND upstream_source_hash=?4 AND overlay_hash=?5
+             FROM attempts WHERE id=?1",
+            params![attempt, WORKFLOW_ID, crate::workflow_resources::workflow_hash(), source_hash(), overlay_hash()],
+            |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
+        )?;
+        if current_identity {
+            bail!("configuration activation waits for current-workflow attempts to finish")
+        }
+        require_attempt_migration_boundary(connection, attempt, fingerprints)?;
+    }
+    Ok(())
+}
+
+fn mark_project_attempts_for_migration(
+    connection: &Connection,
+    project_id: &str,
+    now: &str,
+) -> Result<()> {
+    connection.execute(
+        "UPDATE attempts SET legacy_migration_required=1,updated_at=?1
+         WHERE task_id IN (SELECT id FROM tasks WHERE project_id=?2) AND status NOT IN ('done','cancelled','failed')
+           AND (workflow_version IS NOT ?3 OR workflow_hash IS NOT ?4 OR upstream_source_hash IS NOT ?5 OR overlay_hash IS NOT ?6)",
+        params![now, project_id, WORKFLOW_ID, crate::workflow_resources::workflow_hash(), source_hash(), overlay_hash()],
+    )?;
+    Ok(())
+}
+
 fn apply_installation(
     store: &Store,
     paths: &InstancePaths,
@@ -5223,17 +5384,10 @@ fn apply_installation(
     if proposal_hash != expected_proposal_hash {
         bail!("installation proposal changed after authorization")
     }
+    let quiescence = verify_project_activation_boundary(store, &project_id)?;
     {
         let connection = store.lock()?;
-        let active: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
-             WHERE t.project_id=?1 AND a.status NOT IN ('done','cancelled','failed'))",
-            params![project_id],
-            |row| row.get(0),
-        )?;
-        if active {
-            bail!("configuration activation waits for target project attempts to reach a quiescent verified boundary")
-        }
+        require_project_activation_boundary(&connection, &project_id, &quiescence)?;
     }
     let root = crate::workspace::inspect(Path::new(&repository_path))?.root;
     let proposal: SetupProposal = serde_json::from_str(&proposal_json)?;
@@ -5384,7 +5538,7 @@ fn adopt_installation(
         .and_then(|value| value.as_str())
         != Some("compatible")
     {
-        bail!("only an exact compatible installation can be adopted without a three-way migration proposal")
+        bail!("only a valid pinned upstream installation can be adopted without a three-way migration proposal")
     }
     let proposal: SetupProposal = serde_json::from_value(configuration.clone())?;
     validate_setup_proposal(&proposal)?;
@@ -5397,16 +5551,13 @@ fn adopt_installation(
         )?
     };
     let root = PathBuf::from(repository_path).canonicalize()?;
+    validate_guidance_files(&root, &proposal)?;
     let manifest_path = root.join(".agents/trip-explorer/manifest.json");
     let manifest_hash = hash_file(&manifest_path)?
         .ok_or_else(|| anyhow!("compatible installation manifest is missing"))?;
     let installed_config: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join(".agents/trip-explorer/config.json"))?)?;
-    let proposed_config = serde_json::json!({
-        "project_name":proposal.project_name,"guidance":proposal.guidance,"verification":proposal.verification,
-        "documentation":proposal.documentation,"observability":proposal.observability,"roles":proposal.roles,
-        "profiles":proposal.profiles,"testing":proposal.testing
-    });
+    let proposed_config = project_configuration(&proposal)?;
     if installed_config != proposed_config
         || serde_json::from_slice::<serde_json::Value>(&fs::read(
             root.join(".agents/trip-explorer/adapters.json"),
@@ -5424,6 +5575,7 @@ fn adopt_installation(
     let role_settings = project_role_settings(&proposal, host_manager)?;
     let proposal_hash = json_hash(&serde_json::to_value(&proposal)?)?;
     let now = Utc::now().to_rfc3339();
+    let quiescence = verify_project_activation_boundary(store, project_id)?;
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: bool = tx.query_row(
@@ -5434,15 +5586,7 @@ fn adopt_installation(
     if !current {
         bail!("project version is stale")
     }
-    let active_attempts: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
-         WHERE t.project_id=?1 AND a.status NOT IN ('done','cancelled','failed'))",
-        params![project_id],
-        |row| row.get(0),
-    )?;
-    if active_attempts {
-        bail!("configuration adoption waits for target project attempts to reach a quiescent verified boundary")
-    }
+    require_project_activation_boundary(&tx, project_id, &quiescence)?;
     let setup_id:String=tx.query_row(
         "SELECT id FROM trip_setup_operations WHERE project_id=?1 AND proposal_hash=?2 AND state IN ('probing','preflight_complete') ORDER BY created_at DESC LIMIT 1",
         params![project_id,proposal_hash],|row|row.get(0)
@@ -5501,6 +5645,7 @@ fn adopt_installation(
         "UPDATE projects SET settings_json=?1,version=version+1,updated_at=?2 WHERE id=?3",
         params![settings.to_string(), now, project_id],
     )?;
+    mark_project_attempts_for_migration(&tx, project_id, &now)?;
     tx.commit()?;
     Ok(operation_result(
         operation_id,
@@ -5510,6 +5655,255 @@ fn adopt_installation(
         "trip_adopted",
         serde_json::json!({"config_revision_id":revision}),
     ))
+}
+
+fn verified_migration_guidance(
+    connection: &Connection,
+    attempt_id: &str,
+    workspace: &Path,
+    preserved: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let prior = &preserved["prior_policy"];
+    let field = |name: &str| {
+        prior[name]
+            .as_str()
+            .ok_or_else(|| anyhow!("migration receipt lacks prior {name}"))
+    };
+    let policy_json = field("policy_json")?;
+    let source_bound: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
+         JOIN projects p ON p.id=t.project_id JOIN workspaces w ON w.attempt_id=a.id
+         JOIN trip_config_revisions r ON r.project_id=p.id AND r.id=?5
+         WHERE a.id=?1 AND w.id=?2 AND w.path=?3 AND w.repository_identity=?4
+           AND p.repository_identity=w.repository_identity AND r.source_hash=?6 AND r.overlay_hash=?7
+           AND r.configuration_hash=?8)",
+        params![attempt_id,field("workspace_id")?,field("workspace_path")?,field("repository_identity")?,
+            field("config_revision_id")?,field("upstream_source_hash")?,field("overlay_hash")?,field("configuration_hash")?], |row| row.get(0),
+    )?;
+    if !source_bound
+        || field("attempt_id")? != attempt_id
+        || Path::new(field("workspace_path")?) != workspace
+        || field("policy_hash")? != sha256(policy_json.as_bytes())
+        || preserved["prior_workflow"].as_str() != Some(field("workflow_id")?)
+    {
+        bail!("migration prior policy is not bound to this attempt, workspace and source workflow")
+    }
+    let policy = validate_policy_identity(
+        policy_json,
+        field("workflow_id")?,
+        field("upstream_source_hash")?,
+        field("overlay_hash")?,
+    )?;
+    let source_configuration: serde_json::Value = serde_json::from_str(field("config_json")?)?;
+    if policy["kind"] != "activated_project"
+        || policy["task_profiles"].as_array().is_none_or(|profiles| {
+            profiles.iter().any(|profile| {
+                profile["project_config_revision_id"].as_str()
+                    != prior["config_revision_id"].as_str()
+                    || profile["project_configuration_hash"].as_str()
+                        != prior["configuration_hash"].as_str()
+            })
+        })
+        || json_hash(&source_configuration)? != field("configuration_hash")?
+    {
+        bail!("migration prior guidance lacks an activated configuration binding")
+    }
+    let target_guidance: String = connection.query_row(
+        "SELECT json_extract(current.config_json,'$.guidance')
+         FROM attempts a JOIN tasks t ON t.id=a.task_id
+         JOIN trip_project_state s ON s.project_id=t.project_id JOIN trip_config_revisions current ON current.id=s.active_config_revision_id
+         WHERE a.id=?1",
+        params![attempt_id], |row| row.get(0),
+    )?;
+    let source_guidance: BTreeSet<String> =
+        serde_json::from_value(source_configuration["guidance"].clone())?;
+    let target_guidance: BTreeSet<String> = serde_json::from_str(&target_guidance)?;
+    let mut files = serde_json::Map::new();
+    for relative in source_guidance.intersection(&target_guidance) {
+        if is_protected_workflow_artifact(relative) && relative != "AGENTS.md" {
+            continue;
+        }
+        validate_relative(relative)?;
+        let expected = policy["files"][relative]
+            .as_str()
+            .ok_or_else(|| anyhow!("prior approved guidance is not pinned: {relative}"))?;
+        read_verified_regular(workspace, &workspace.join(relative), expected).with_context(
+            || format!("prior approved guidance changed without authorization: {relative}"),
+        )?;
+        files.insert(relative.clone(), serde_json::json!(expected));
+    }
+    let mut history = Vec::new();
+    if let Some(guidance) = policy.get("migration_guidance") {
+        let frozen: Option<String> = connection.query_row(
+            "SELECT json_extract(preserved_json,'$.guidance') FROM trip_legacy_migrations
+             WHERE attempt_id=?1 AND to_workflow_id=?2 AND config_revision_id=?3
+               AND target_workflow_hash=?4 AND target_source_hash=?5 AND target_overlay_hash=?6 AND target_manifest_hash=?7
+               AND json_extract(preserved_json,'$.prior_policy.attempt_id')=?1
+               AND json_extract(preserved_json,'$.prior_workflow')=from_workflow_id",
+            params![attempt_id,field("workflow_id")?,field("config_revision_id")?,field("workflow_hash")?,
+                field("upstream_source_hash")?,field("overlay_hash")?,policy["manifest_hash"].as_str()], |row| row.get(0),
+        ).optional()?;
+        if frozen
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()?
+            .as_ref()
+            != Some(guidance)
+        {
+            bail!("prior migrated guidance lacks its exact authorized receipt")
+        }
+        history.extend(
+            guidance["guidance_reauthorizations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|record| {
+                    record["files"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|file| {
+                            file["path"]
+                                .as_str()
+                                .is_some_and(|path| files.contains_key(path))
+                        })
+                })
+                .cloned(),
+        );
+    }
+    if let Some(records) = policy.get("guidance_reauthorizations") {
+        let audits = connection.prepare("SELECT detail_json FROM audit_events WHERE entity_id=?1 AND actor_kind='human' AND event_code='attempt.guidance.reauthorized'")?
+            .query_map(params![attempt_id], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for record in records
+            .as_array()
+            .ok_or_else(|| anyhow!("prior guidance authorization history is malformed"))?
+        {
+            let applicable = record["files"]
+                .as_array()
+                .ok_or_else(|| anyhow!("prior guidance authorization files are malformed"))?
+                .iter()
+                .any(|file| {
+                    file["path"]
+                        .as_str()
+                        .is_some_and(|path| files.contains_key(path))
+                });
+            if !applicable {
+                continue;
+            }
+            let verified = audits.iter().any(|audit| {
+                let Ok(mut detail) = serde_json::from_str::<serde_json::Value>(audit) else {
+                    return false;
+                };
+                let Some(object) = detail.as_object_mut() else {
+                    return false;
+                };
+                object.remove("attempt_id");
+                object.remove("policy_hash");
+                detail == *record
+            });
+            if record["config_revision_id"].as_str() != prior["config_revision_id"].as_str()
+                || !verified
+            {
+                bail!("prior guidance reauthorization is not verified for the source configuration")
+            }
+            history.push(record.clone());
+        }
+    }
+    for (relative, expected) in &files {
+        if let Some(approval) = history
+            .iter()
+            .rev()
+            .flat_map(|record| record["files"].as_array().into_iter().flatten())
+            .find(|file| file["path"].as_str() == Some(relative.as_str()))
+        {
+            if &approval["sha256"] != expected {
+                bail!("prior guidance pin differs from its latest authorization: {relative}")
+            }
+        }
+    }
+    let guidance = serde_json::json!({"prior_policy_hash":field("policy_hash")?,"files":files,"guidance_reauthorizations":history});
+    if preserved
+        .get("guidance")
+        .is_some_and(|frozen| frozen != &guidance)
+    {
+        bail!("migration guidance differs from its frozen authorization")
+    }
+    Ok(guidance)
+}
+
+pub(crate) fn initial_attempt_migration_blocker(
+    connection: &Connection,
+    attempt_id: &str,
+    reviewed_plan_hash: &str,
+) -> Result<Option<&'static str>> {
+    let final_repair: bool = connection.query_row(
+        "SELECT final_repair_round>0 OR EXISTS(SELECT 1 FROM final_repair_rechecks f WHERE f.attempt_id=a.id)
+         FROM attempts a WHERE a.id=?1",
+        params![attempt_id], |row| row.get(0),
+    )?;
+    if final_repair {
+        return Ok(Some("This older attempt has prior final-repair authority. Keep it as history and start a fresh task under the current workflow."));
+    }
+    let reviewed: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempts a JOIN trip_structured_plans sp
+           ON sp.id=a.structured_plan_id AND sp.attempt_id=a.id AND sp.plan_hash=a.plan_hash
+         WHERE a.id=?1 AND a.plan_hash=?2 AND trim(a.plan_hash)!=''
+           AND (NULLIF(trim(sp.approved_at),'') IS NOT NULL OR EXISTS(
+             SELECT 1 FROM review_requests review WHERE review.id=sp.review_request_id
+               AND review.attempt_id=a.id AND review.review_kind='plan' AND review.candidate_hash=sp.plan_hash
+               AND review.delivery_state='finished' AND review.verdict IN ('approved','request_changes','needs_rework'))))",
+        params![attempt_id,reviewed_plan_hash], |row| row.get(0),
+    )?;
+    Ok((!reviewed).then_some("Migration requires this attempt's current reviewed structured-plan hash. Keep an attempt without a matching reviewed plan as history and start a fresh task under the current workflow."))
+}
+
+pub(crate) fn pending_attempt_migration(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<Option<std::result::Result<(String, String), &'static str>>> {
+    let pending: Option<(String, String, bool, Option<String>, Option<String>)> = connection.query_row(
+        "SELECT receipt.reviewed_plan_hash,receipt.config_revision_id,COALESCE(
+           s.readiness='ready' AND s.workflow_id=?2 AND s.package_version=?3
+           AND s.upstream_source_hash=?5 AND s.overlay_hash=?6
+           AND r.id=receipt.config_revision_id AND r.project_id=t.project_id AND r.state='activated'
+           AND r.source_hash=?5 AND r.overlay_hash=?6
+           AND receipt.target_workflow_hash=?4 AND receipt.target_source_hash=?5
+           AND receipt.target_overlay_hash=?6 AND receipt.target_manifest_hash=s.manifest_hash
+           AND a.workflow_version=?2 AND a.workflow_hash=?4 AND a.upstream_source_hash=?5 AND a.overlay_hash=?6
+           AND a.legacy_migration_required=0 AND trim(receipt.reviewed_plan_hash)!=''
+           AND json_extract(receipt.preserved_json,'$.prior_policy.attempt_id')=a.id
+           AND json_extract(receipt.preserved_json,'$.prior_policy.workspace_id')=w.id
+           AND json_extract(receipt.preserved_json,'$.prior_policy.workspace_path')=w.path
+           AND json_extract(receipt.preserved_json,'$.prior_policy.repository_identity')=w.repository_identity
+           AND p.repository_identity=w.repository_identity AND w.path!=p.repository_path
+           AND json_extract(receipt.preserved_json,'$.prior_workflow')=receipt.from_workflow_id
+           AND json_extract(receipt.preserved_json,'$.prior_policy.workflow_id')=receipt.from_workflow_id
+           AND EXISTS(SELECT 1 FROM trip_structured_plans sp
+             WHERE sp.id=json_extract(receipt.preserved_json,'$.reviewed_plan_id')
+               AND sp.attempt_id=a.id AND sp.plan_hash=receipt.reviewed_plan_hash),0),
+           json_extract(receipt.preserved_json,'$.prior_policy.policy_json'),
+           json_extract(receipt.preserved_json,'$.prior_policy.policy_hash')
+         FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN workspaces w ON w.attempt_id=a.id
+         JOIN projects p ON p.id=t.project_id
+         JOIN trip_legacy_migrations receipt ON receipt.attempt_id=a.id AND receipt.to_workflow_id=?2
+         LEFT JOIN trip_project_state s ON s.project_id=t.project_id
+         LEFT JOIN trip_config_revisions r ON r.id=s.active_config_revision_id
+         WHERE a.id=?1 AND w.state IN ('reserved','recovery_required')
+           AND json_extract(receipt.preserved_json,'$.published_at') IS NULL
+           AND a.status NOT IN ('done','cancelled','failed') AND t.lifecycle NOT IN ('done','cancelled')
+           AND a.phase='planning' AND a.plan_hash IS NULL AND a.structured_plan_id IS NULL
+           AND a.candidate_hash IS NULL AND a.plan_approved_at IS NULL AND a.human_acceptance_at IS NULL
+           AND a.accepted_snapshot_id IS NULL",
+        params![attempt_id,WORKFLOW_ID,PACKAGE_VERSION,crate::workflow_resources::workflow_hash(),source_hash(),overlay_hash()],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    ).optional()?;
+    match pending {
+        Some((plan, config, true, Some(policy), Some(hash))) if sha256(policy.as_bytes()) == hash => {
+            Ok(Some(Ok((plan, config))))
+        }
+        Some(_) => Ok(Some(Err("Pending workflow migration no longer matches its frozen authorization and activated target. Review project setup before recovering it."))),
+        None => Ok(None),
+    }
 }
 
 fn migrate_attempt(
@@ -5525,6 +5919,7 @@ fn migrate_attempt(
     if reviewed_plan_hash.trim().is_empty() {
         bail!("migration requires the exact reviewed structured-plan hash")
     }
+    let quiescence = verify_attempt_migration_boundary(store, attempt_id)?;
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -5539,50 +5934,150 @@ fn migrate_attempt(
     }
     require_project_ready(&tx, &project_id)?;
     let config_valid: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM trip_config_revisions WHERE id=?1 AND project_id=?2 AND state='activated')",
-        params![config_revision_id,project_id], |row| row.get(0)
+        "SELECT EXISTS(SELECT 1 FROM trip_config_revisions r JOIN trip_project_state s ON s.active_config_revision_id=r.id
+         WHERE r.id=?1 AND r.project_id=?2 AND s.project_id=?2 AND r.state='activated'
+           AND r.source_hash=?3 AND r.overlay_hash=?4)",
+        params![config_revision_id,project_id,source_hash(),overlay_hash()], |row| row.get(0)
     )?;
     if !config_valid {
         bail!("migration configuration is not the activated project revision")
     }
-    let quiescent: bool = tx.query_row(
-        "SELECT NOT EXISTS(SELECT 1 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
-         WHERE rg.attempt_id=?1 AND s.status NOT IN ('exited','launch_failed'))",
-        params![attempt_id], |row| row.get(0)
+    require_attempt_migration_boundary(&tx, attempt_id, &quiescence)?;
+    let manifest_hash: String = tx.query_row(
+        "SELECT manifest_hash FROM trip_project_state WHERE project_id=?1",
+        params![project_id],
+        |row| row.get(0),
     )?;
-    if !quiescent {
-        bail!("legacy attempt must be quiescent before migration")
-    }
-    let preserved = serde_json::json!({"review_budgets":"preserved","snapshots":"preserved","review_requests":"preserved","prior_workflow":workflow});
-    let existing:Option<(String,String)>=tx.query_row(
-        "SELECT reviewed_plan_hash,config_revision_id FROM trip_legacy_migrations WHERE attempt_id=?1",
-        params![attempt_id],|row|Ok((row.get(0)?,row.get(1)?))
+    let mut preserved;
+    let existing:Option<(String,String,Option<String>,Option<String>,Option<String>,Option<String>,String,String)>=tx.query_row(
+        "SELECT reviewed_plan_hash,config_revision_id,target_workflow_hash,target_source_hash,target_overlay_hash,target_manifest_hash,preserved_json,from_workflow_id
+         FROM trip_legacy_migrations WHERE attempt_id=?1 AND to_workflow_id=?2",
+        params![attempt_id,WORKFLOW_ID],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?))
     ).optional()?;
-    let migrated_version = if let Some((prior_plan, prior_config)) = existing {
-        if prior_plan != reviewed_plan_hash || prior_config != config_revision_id {
-            bail!("legacy migration recovery must retain its originally authorized plan and configuration")
+    let recovering = existing.is_some();
+    let migrated_version = if let Some((
+        prior_plan,
+        prior_config,
+        prior_workflow_hash,
+        prior_source,
+        prior_overlay,
+        prior_manifest,
+        prior_preserved,
+        from_workflow,
+    )) = existing
+    {
+        if prior_plan != reviewed_plan_hash
+            || prior_config != config_revision_id
+            || prior_workflow_hash.as_deref()
+                != Some(crate::workflow_resources::workflow_hash().as_str())
+            || prior_source.as_deref() != Some(source_hash().as_str())
+            || prior_overlay.as_deref() != Some(overlay_hash().as_str())
+            || prior_manifest.as_deref() != Some(manifest_hash.as_str())
+        {
+            bail!("legacy migration recovery must retain its originally authorized plan, configuration and source-target identity")
         }
+        match pending_attempt_migration(&tx, attempt_id)? {
+            Some(Ok(_)) => {}
+            Some(Err(reason)) => bail!("{reason}"),
+            None => bail!("the authorized workflow migration has already been published or its recovery state changed"),
+        }
+        preserved = serde_json::from_str::<serde_json::Value>(&prior_preserved)?;
+        if preserved["prior_workflow"].as_str() != Some(from_workflow.as_str()) {
+            bail!("migration receipt source workflow changed")
+        }
+        verified_migration_guidance(&tx, attempt_id, Path::new(&workspace), &preserved)?;
         expected_task_version
     } else {
+        let migration_required: bool = tx.query_row(
+            "SELECT legacy_migration_required=1 AND (workflow_version IS NOT ?2 OR workflow_hash IS NOT ?3
+               OR upstream_source_hash IS NOT ?4 OR overlay_hash IS NOT ?5) FROM attempts WHERE id=?1",
+            params![attempt_id,WORKFLOW_ID,crate::workflow_resources::workflow_hash(),source_hash(),overlay_hash()], |row| row.get(0),
+        )?;
+        if !migration_required {
+            bail!("attempt does not require an explicit workflow migration")
+        }
+        if let Some(reason) =
+            initial_attempt_migration_blocker(&tx, attempt_id, reviewed_plan_hash)?
+        {
+            bail!("{reason}")
+        }
+        let prior_policy: String = tx.query_row(
+            "SELECT json_object('attempt_id',a.id,'workspace_id',w.id,'workspace_path',w.path,
+                'repository_identity',w.repository_identity,'workflow_id',a.workflow_version,
+                'workflow_hash',a.workflow_hash,'upstream_source_hash',a.upstream_source_hash,'overlay_hash',a.overlay_hash,
+                'config_revision_id',MIN(ap.project_config_revision_id),'configuration_hash',r.configuration_hash,
+                'config_json',r.config_json,'policy_json',w.policy_json)
+             FROM attempts a JOIN workspaces w ON w.attempt_id=a.id JOIN trip_attempt_profiles ap ON ap.attempt_id=a.id
+             JOIN trip_config_revisions r ON r.id=ap.project_config_revision_id
+             WHERE a.id=?1 GROUP BY a.id HAVING COUNT(*)=6 AND MIN(ap.project_config_revision_id)=MAX(ap.project_config_revision_id)",
+            params![attempt_id], |row| row.get(0),
+        )?;
+        let mut prior_policy: serde_json::Value = serde_json::from_str(&prior_policy)?;
+        prior_policy["policy_hash"] = serde_json::json!(sha256(
+            prior_policy["policy_json"]
+                .as_str()
+                .ok_or_else(|| anyhow!("migration prior policy is missing"))?
+                .as_bytes()
+        ));
+        let reviewed_plan_id: String = tx.query_row(
+            "SELECT structured_plan_id FROM attempts WHERE id=?1",
+            params![attempt_id],
+            |row| row.get(0),
+        )?;
+        preserved = serde_json::json!({"review_budgets":"preserved","snapshots":"preserved","review_requests":"preserved",
+            "prior_workflow":workflow,"prior_policy":prior_policy,"reviewed_plan_id":reviewed_plan_id});
+        preserved["guidance"] =
+            verified_migration_guidance(&tx, attempt_id, Path::new(&workspace), &preserved)?;
         tx.execute(
-            "INSERT INTO trip_legacy_migrations(id,attempt_id,from_workflow_id,to_workflow_id,preserved_json,reviewed_plan_hash,config_revision_id,authorized_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![uuid::Uuid::new_v4().to_string(),attempt_id,workflow,WORKFLOW_ID,preserved.to_string(),reviewed_plan_hash,config_revision_id,now],
+            "INSERT INTO trip_legacy_migrations(id,attempt_id,from_workflow_id,to_workflow_id,preserved_json,reviewed_plan_hash,config_revision_id,authorized_at,
+               target_workflow_hash,target_source_hash,target_overlay_hash,target_manifest_hash)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![uuid::Uuid::new_v4().to_string(),attempt_id,workflow,WORKFLOW_ID,preserved.to_string(),reviewed_plan_hash,config_revision_id,now,
+                crate::workflow_resources::workflow_hash(),source_hash(),overlay_hash(),manifest_hash],
+        )?;
+        let configurations = tx.prepare(
+            "SELECT role,revision,config_json FROM role_settings r WHERE task_id=?1 AND revision=(
+                SELECT MAX(revision) FROM role_settings WHERE task_id=r.task_id AND role=r.role) ORDER BY role",
+        )?.query_map(params![task_id], |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let configuration_revision = configurations
+            .iter()
+            .map(|(_, revision, _)| *revision)
+            .max()
+            .ok_or_else(|| anyhow!("migration requires effective task role settings"))?;
+        tx.execute(
+            "UPDATE attempts SET workflow_version=?1,workflow_hash=?2,upstream_source_hash=?3,overlay_hash=?4,
+             configuration_hash=?5,configuration_revision=?6,legacy_migration_required=0,phase='planning',
+             candidate_hash=NULL,accepted_snapshot_id=NULL,structured_plan_id=NULL,plan_hash=NULL,plan_approved_at=NULL,
+             human_acceptance_at=NULL,selected_checks_revision=selected_checks_revision+1,
+             manager_conformance_revision=manager_conformance_revision+1,updated_at=?7 WHERE id=?8",
+            params![WORKFLOW_ID,crate::workflow_resources::workflow_hash(),source_hash(),overlay_hash(),
+                json_hash(&configurations)?,configuration_revision,now,attempt_id],
         )?;
         tx.execute(
-            "UPDATE attempts SET workflow_version=?1,workflow_hash=?2,legacy_migration_required=0,structured_plan_id=NULL,plan_hash=?3,plan_approved_at=NULL,updated_at=?4 WHERE id=?5",
-            params![WORKFLOW_ID,crate::workflow_resources::workflow_hash(),reviewed_plan_hash,now,attempt_id],
-        )?;
-        tx.execute(
-            "UPDATE tasks SET version=version+1,attention='needs_input',updated_at=?1 WHERE id=?2",
+            "UPDATE tasks SET version=version+1,updated_at=?1 WHERE id=?2",
             params![now, task_id],
         )?;
+        tx.execute("UPDATE role_credentials SET revoked_at=?1 WHERE role_generation_id IN (SELECT id FROM role_generations WHERE attempt_id=?2) AND revoked_at IS NULL",params![now,attempt_id])?;
+        tx.execute(
+            "UPDATE role_settings SET effective_generation_id=NULL WHERE task_id=?1",
+            params![task_id],
+        )?;
+        retire_unmatchable_transition_proposals(&tx, attempt_id, "workflow_migration", &now)?;
         expected_task_version + 1
     };
-    let changed=tx.execute("UPDATE workspaces SET state='reserved',updated_at=?1 WHERE attempt_id=?2 AND state IN ('ready','recovery_required')",params![now,attempt_id])?;
+    let changed=tx.execute("UPDATE workspaces SET state='recovery_required',updated_at=?1 WHERE attempt_id=?2 AND (state IN ('ready','recovery_required') OR (?3 AND state='reserved'))",params![now,attempt_id,recovering])?;
     if changed != 1 {
         bail!("legacy attempt workspace is not available for pinned policy materialization")
     }
+    tx.execute(
+        "UPDATE attempts SET status='needs_recovery',updated_at=?1 WHERE id=?2",
+        params![now, attempt_id],
+    )?;
+    tx.execute(
+        "UPDATE tasks SET attention='needs_recovery',updated_at=?1 WHERE id=?2",
+        params![now, task_id],
+    )?;
     tx.execute(
         "DELETE FROM trip_attempt_profiles WHERE attempt_id=?1",
         params![attempt_id],
@@ -5618,17 +6113,20 @@ fn migrate_attempt(
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let policy_json: String = tx.query_row(
-        "SELECT policy_json FROM workspaces WHERE attempt_id=?1 AND state='reserved'",
+        "SELECT policy_json FROM workspaces WHERE attempt_id=?1 AND state='recovery_required'",
         params![attempt_id],
         |row| row.get(0),
     )?;
+    if !matches!(pending_attempt_migration(&tx, attempt_id)?, Some(Ok(_))) {
+        bail!("workflow migration authorization changed before publication")
+    }
     validate_materialized_policy(&policy_json)?;
     let workspace_changed = tx.execute(
-        "UPDATE workspaces SET state='ready',updated_at=?1 WHERE attempt_id=?2 AND state='reserved'",
+        "UPDATE workspaces SET state='ready',updated_at=?1 WHERE attempt_id=?2 AND state='recovery_required'",
         params![published_at, attempt_id],
     )?;
     let attempt_changed = tx.execute(
-        "UPDATE attempts SET status='needs_input',updated_at=?1 WHERE id=?2 AND status IN ('running','held','needs_input','needs_recovery')",
+        "UPDATE attempts SET status='needs_input',updated_at=?1 WHERE id=?2 AND status='needs_recovery'",
         params![published_at, attempt_id],
     )?;
     let task_changed = tx.execute(
@@ -5638,6 +6136,11 @@ fn migrate_attempt(
     if workspace_changed != 1 || attempt_changed != 1 || task_changed != 1 {
         bail!("legacy migration tuple changed before atomic policy publication")
     }
+    tx.execute(
+        "UPDATE trip_legacy_migrations SET preserved_json=json_set(preserved_json,'$.published_at',?1)
+         WHERE attempt_id=?2 AND to_workflow_id=?3",
+        params![published_at,attempt_id,WORKFLOW_ID],
+    )?;
     tx.commit()?;
     Ok(operation_result(
         operation_id,
@@ -8320,7 +8823,11 @@ pub(crate) fn record_setup_probe_report(
             (
                 json_hash(profile)?,
                 profile.provider.clone(),
-                profile.service_tier.clone(),
+                profile
+                    .extra
+                    .get("service_tier")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
             )
         };
         if observed_hash != profile_hash || observed_provider != provider {
@@ -10777,23 +11284,6 @@ fn detect_installation(root: &Path) -> Result<InstallationObservation> {
     if manifest_bin != expected_bin {
         conflicts.push("bin manifest does not match the pinned upstream source".into());
     }
-    if manifest
-        .pointer("/llmrelay/workflow_id")
-        .and_then(|value| value.as_str())
-        != Some(WORKFLOW_ID)
-        || manifest
-            .pointer("/llmrelay/upstream_source_hash")
-            .and_then(|value| value.as_str())
-            != Some(source_hash().as_str())
-        || manifest
-            .pointer("/llmrelay/overlay_hash")
-            .and_then(|value| value.as_str())
-            != Some(overlay_hash().as_str())
-    {
-        conflicts.push(
-            "LLMRelay workflow, upstream source, or overlay identity is missing or changed".into(),
-        );
-    }
     for file in PACKAGE_FILES {
         let base_path = state.join("base").join(PACKAGE_VERSION).join(file.relative);
         if hash_file(&base_path)?.as_deref() != Some(file.sha256) {
@@ -10929,11 +11419,19 @@ fn validate_setup_proposal(proposal: &SetupProposal) -> Result<()> {
             )
         }
         if profile
-            .service_tier
-            .as_deref()
+            .extra
+            .get("service_tier")
+            .and_then(serde_json::Value::as_str)
             .is_some_and(|tier| !tier.trim().is_empty())
         {
             bail!("service_tier is not supported by the current native CLI invocation contract; remove it before probe authorization")
+        }
+        if profile
+            .extra
+            .get("service_tier")
+            .is_some_and(|tier| !tier.is_null() && !tier.is_string())
+        {
+            bail!("service_tier must be a string or null")
         }
         let expected_authority = if role == "implementer" {
             "workspace-write"
@@ -10997,9 +11495,7 @@ fn validate_setup_proposal(proposal: &SetupProposal) -> Result<()> {
             bail!("adapter cannot retain role {role}")
         }
     }
-    if contains_prohibited_key(&proposal.adapters)
-        || contains_prohibited_key(&serde_json::to_value(&proposal.profiles)?)
-    {
+    if contains_prohibited_key(&serde_json::to_value(proposal)?) {
         bail!("configuration cannot contain credentials, secrets, tokens, or hidden reasoning")
     }
     let agents_path = proposal
@@ -11034,6 +11530,125 @@ fn validate_setup_proposal(proposal: &SetupProposal) -> Result<()> {
     Ok(())
 }
 
+fn project_configuration(proposal: &SetupProposal) -> Result<serde_json::Value> {
+    let mut configuration = serde_json::to_value(proposal)?;
+    let object = configuration
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("project configuration must be an object"))?;
+    for field in [
+        "host_manager",
+        "verification_contracts",
+        "adapters",
+        "agents_file",
+        "local_exclude",
+        "canonical_migration",
+    ] {
+        object.remove(field);
+    }
+    Ok(configuration)
+}
+
+fn setup_proposal_preserving_configuration(
+    store: &Store,
+    setup_id: &str,
+    proposed: &serde_json::Value,
+) -> Result<SetupProposal> {
+    let repository: String = store.lock()?.query_row(
+        "SELECT p.repository_path FROM trip_setup_operations so JOIN projects p ON p.id=so.project_id WHERE so.id=?1",
+        params![setup_id], |row| row.get(0),
+    )?;
+    let root = PathBuf::from(repository).canonicalize()?;
+    let Some((mut configuration, adapters)) = detected_installation_configuration(&root)? else {
+        return Ok(serde_json::from_value(proposed.clone())?);
+    };
+    let incoming = proposed
+        .as_object()
+        .ok_or_else(|| anyhow!("setup proposal must be an object"))?;
+    let existing = configuration
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("project configuration must be an object"))?;
+    existing.insert("adapters".into(), adapters);
+    for (field, value) in incoming {
+        if matches!(field.as_str(), "profiles" | "roles") {
+            if let (Some(prior), Some(selected)) = (
+                existing
+                    .get_mut(field)
+                    .and_then(serde_json::Value::as_object_mut),
+                value.as_object(),
+            ) {
+                for (name, entry) in selected {
+                    if let (Some(prior_fields), Some(selected_fields)) = (
+                        prior
+                            .get_mut(name)
+                            .and_then(serde_json::Value::as_object_mut),
+                        entry.as_object(),
+                    ) {
+                        prior_fields.extend(selected_fields.clone());
+                    } else {
+                        prior.insert(name.clone(), entry.clone());
+                    }
+                }
+                continue;
+            }
+        }
+        if field == "adapters" {
+            if let (Some(prior), Some(selected)) = (
+                existing
+                    .get_mut(field)
+                    .and_then(serde_json::Value::as_object_mut),
+                value.as_object(),
+            ) {
+                for (name, entry) in selected {
+                    if name == "adapters" {
+                        if let (Some(definitions), Some(replacements)) = (
+                            prior
+                                .get_mut(name)
+                                .and_then(serde_json::Value::as_object_mut),
+                            entry.as_object(),
+                        ) {
+                            for (adapter, replacement) in replacements {
+                                if let (Some(fields), Some(updates)) = (
+                                    definitions
+                                        .get_mut(adapter)
+                                        .and_then(serde_json::Value::as_object_mut),
+                                    replacement.as_object(),
+                                ) {
+                                    fields.extend(updates.clone());
+                                } else {
+                                    definitions.insert(adapter.clone(), replacement.clone());
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    prior.insert(name.clone(), entry.clone());
+                }
+                continue;
+            }
+        }
+        existing.insert(field.clone(), value.clone());
+    }
+    Ok(serde_json::from_value(configuration)?)
+}
+
+fn validate_guidance_files(root: &Path, proposal: &SetupProposal) -> Result<()> {
+    for relative in &proposal.guidance {
+        let path = contained_path(root, relative, false)?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.is_file() => {
+                bail!("Guidance must use regular files: {relative}. Select the individual regular files inside this directory in Project setup.")
+            }
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && relative == "AGENTS.md" => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("read guidance file {relative}"))
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_agents_preservation(
     store: &Store,
     setup_id: &str,
@@ -11044,6 +11659,7 @@ fn validate_agents_preservation(
         connection.query_row("SELECT p.repository_path FROM trip_setup_operations so JOIN projects p ON p.id=so.project_id WHERE so.id=?1",params![setup_id],|row|row.get(0))?
     };
     let root = PathBuf::from(repository).canonicalize()?;
+    validate_guidance_files(&root, proposal)?;
     let path = root.join("AGENTS.md");
     ensure_no_symlink_ancestry(&root, &path)?;
     let existing = match fs::read(&path) {
@@ -11157,11 +11773,7 @@ fn installation_files(
         .ok_or_else(|| anyhow!("host manager preflight receipt is missing"))?;
     let manager_receipt = receipts.remove(manager_index);
     preflight["llmrelay"] = serde_json::json!({"host_manager_receipt": manager_receipt});
-    let config = serde_json::json!({
-        "project_name":proposal.project_name,"guidance":proposal.guidance,"verification":proposal.verification,
-        "documentation":proposal.documentation,"observability":proposal.observability,"roles":proposal.roles,
-        "profiles":proposal.profiles,"testing":proposal.testing
-    });
+    let config = project_configuration(proposal)?;
     let config_bytes = pretty_json(&config)?;
     let adapters_bytes = pretty_json(&proposal.adapters)?;
     let preflight_bytes = pretty_json(&preflight)?;
@@ -11258,7 +11870,7 @@ fn proposal_installation_skeleton(
     proposal: &SetupProposal,
 ) -> Result<Vec<JournalFile>> {
     let placeholder = serde_json::json!({"profiles":"pending live probes"});
-    let config = serde_json::json!({"project_name":proposal.project_name,"guidance":proposal.guidance,"verification":proposal.verification,"documentation":proposal.documentation,"observability":proposal.observability,"roles":proposal.roles,"profiles":proposal.profiles,"testing":proposal.testing});
+    let config = project_configuration(proposal)?;
     let mut files = Vec::new();
     for file in PACKAGE_FILES {
         if let Some(rest) = file.relative.strip_prefix("skills/") {
@@ -11393,10 +12005,23 @@ fn effective_receipt_id(
                 "SELECT s.launch_config_json FROM trip_preflight_receipts receipt
                  JOIN role_generations rg ON rg.id=receipt.generation_id
                  JOIN sessions s ON s.role_generation_id=rg.id
+                 JOIN attempts a ON a.id=rg.attempt_id
                  WHERE receipt.id=?1 AND s.capability_key=receipt.capability_key
                    AND s.capability_identity_json=receipt.capability_identity_json
+                   AND s.workflow_version=?2 AND s.workflow_hash=?3 AND s.prompt_hash=?4
+                   AND a.workflow_version=?2 AND a.workflow_hash=?3
+                   AND a.upstream_source_hash=?5 AND a.overlay_hash=?6
                  ORDER BY s.created_at DESC LIMIT 1",
-                params![receipt],
+                params![
+                    receipt,
+                    WORKFLOW_ID,
+                    crate::workflow_resources::workflow_hash(),
+                    crate::workflow_resources::prompt_hash(
+                        role.parse().map_err(|error: String| anyhow!(error))?
+                    ),
+                    source_hash(),
+                    overlay_hash()
+                ],
                 |row| row.get(0),
             )
             .optional()?;
@@ -11584,7 +12209,7 @@ fn effective_preflight_json(
         )?;
         receipts.push(serde_json::json!({
             "profile_ids":[profile_id],"role":role,"adapter":profile.adapter,"provider":profile.provider,
-            "model":profile.model,"effort":profile.effort,"service_tier":profile.service_tier,
+            "model":profile.model,"effort":profile.effort,"service_tier":profile.extra.get("service_tier"),
             "authority":profile.authority,"session":profile.session,"result":"pass","nonce_matched":true,
             "model_evidence":model_evidence,"llmrelay_evidence":serde_json::from_str::<serde_json::Value>(&evidence)?
         }));
@@ -11791,6 +12416,41 @@ fn rework_guidance_source(
     {
         return refuse("the parent's policy was bound to a configuration that is no longer active");
     }
+    let mut reauthorizations = Vec::new();
+    if let Some(guidance) = policy.get("migration_guidance") {
+        let frozen: Option<String> = connection.query_row(
+            "SELECT json_extract(preserved_json,'$.guidance') FROM trip_legacy_migrations
+             WHERE attempt_id=?1 AND to_workflow_id=?2 AND config_revision_id=?3
+               AND target_manifest_hash=?4 AND target_workflow_hash=?5 AND target_source_hash=?6 AND target_overlay_hash=?7
+               AND json_extract(preserved_json,'$.prior_policy.attempt_id')=?1
+               AND json_extract(preserved_json,'$.prior_workflow')=from_workflow_id",
+            params![parent_attempt_id,WORKFLOW_ID,active_configuration,manifest_hash,
+                crate::workflow_resources::workflow_hash(),source_hash(),overlay_hash()], |row| row.get(0),
+        ).optional()?;
+        if frozen
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()?
+            .as_ref()
+            != Some(guidance)
+        {
+            return refuse("the parent's migrated guidance lacks its exact authorized receipt");
+        }
+        reauthorizations.extend(
+            guidance["guidance_reauthorizations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+    }
+    reauthorizations.extend(
+        policy["guidance_reauthorizations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
     let manifest: crate::snapshot::SnapshotManifest = serde_json::from_str(&manifest_json)?;
     let snapshot_files = manifest
         .entries
@@ -11808,11 +12468,7 @@ fn rework_guidance_source(
             .and_then(serde_json::Value::as_object)
             .cloned()
             .unwrap_or_default(),
-        reauthorizations: policy
-            .get("guidance_reauthorizations")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
+        reauthorizations,
         snapshot_files,
     })))
 }
@@ -11822,11 +12478,12 @@ pub fn materialize_project_policy(
     attempt_id: &str,
     workspace: &Path,
 ) -> Result<serde_json::Value> {
-    let (root, manifest_hash, guidance, rework_source): (
+    let (root, manifest_hash, guidance, rework_source, migration_guidance): (
         String,
         String,
         String,
         Option<std::result::Result<ReworkGuidanceSource, String>>,
+        Option<serde_json::Value>,
     ) = {
         let connection = store.lock()?;
         require_attempt_ready(&connection, attempt_id, None)?;
@@ -11843,7 +12500,36 @@ pub fn materialize_project_policy(
             &manifest_hash,
             &active_configuration,
         )?;
-        (root, manifest_hash, guidance, rework_source)
+        let migration: Option<(String, String, bool)> = connection.query_row(
+            "SELECT preserved_json,from_workflow_id,COALESCE(config_revision_id=?3 AND target_manifest_hash=?4
+                AND target_workflow_hash=?5 AND target_source_hash=?6 AND target_overlay_hash=?7,0)
+             FROM trip_legacy_migrations WHERE attempt_id=?1 AND to_workflow_id=?2",
+            params![attempt_id,WORKFLOW_ID,active_configuration,manifest_hash,
+                crate::workflow_resources::workflow_hash(),source_hash(),overlay_hash()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional()?;
+        let migration_guidance = if let Some((preserved, from_workflow, target_bound)) = migration {
+            let preserved: serde_json::Value = serde_json::from_str(&preserved)?;
+            if !target_bound || preserved["prior_workflow"].as_str() != Some(from_workflow.as_str())
+            {
+                bail!("migration receipt does not match the authorized source and activated target")
+            }
+            Some(verified_migration_guidance(
+                &connection,
+                attempt_id,
+                workspace,
+                &preserved,
+            )?)
+        } else {
+            None
+        };
+        (
+            root,
+            manifest_hash,
+            guidance,
+            rework_source,
+            migration_guidance,
+        )
     };
     let root = PathBuf::from(root).canonicalize()?;
     let manifest_path = root.join(".agents/trip-explorer/manifest.json");
@@ -11980,6 +12666,17 @@ pub fn materialize_project_policy(
     let mut preserved_guidance = Vec::new();
     for relative in guidance {
         validate_relative(&relative)?;
+        if let Some(expected) = migration_guidance
+            .as_ref()
+            .and_then(|guidance| guidance["files"].get(&relative))
+        {
+            let hash = expected
+                .as_str()
+                .ok_or_else(|| anyhow!("frozen migration guidance hash is malformed"))?;
+            read_verified_regular(workspace, &workspace.join(&relative), hash)?;
+            copied.insert(relative, expected.clone());
+            continue;
+        }
         let source = contained_path(&root, &relative, true)?;
         let bytes = fs::read(&source)?;
         let expected = sha256(&bytes);
@@ -12035,6 +12732,10 @@ pub fn materialize_project_policy(
         bail!("attempt policy materialization requires six frozen effective task profiles")
     }
     let mut policy = serde_json::json!({"kind":"activated_project","workflow_id":WORKFLOW_ID,"upstream_source_hash":source_hash(),"overlay_hash":overlay_hash(),"manifest_hash":manifest_hash,"files":copied,"allowed_prefixes":allowed_prefixes,"base_project_configuration_distinct":true,"task_profiles":task_profiles,"uncommitted_guidance":"approved overlay; not asserted present in base Git revision"});
+    if let Some(guidance) = migration_guidance {
+        // Prior approvals remain provenance, never current planning authority.
+        policy["migration_guidance"] = guidance;
+    }
     if !preserved_guidance.is_empty() {
         // Pins kept from the parent carry their provenance; no plan approval,
         // accepted snapshot or review outcome is inherited with them.
@@ -12305,8 +13006,10 @@ fn activate_configuration(
 ) -> Result<String> {
     verify_applied_journal(store, setup_id, root)?;
     let now = Utc::now().to_rfc3339();
+    let quiescence = verify_project_activation_boundary(store, project_id)?;
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_project_activation_boundary(&tx, project_id, &quiescence)?;
     let complete:bool=tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM trip_apply_journal WHERE setup_operation_id=?1 AND state!='applied')",params![setup_id],|row|row.get(0))?;
     if !complete {
         bail!("installation journal is incomplete")
@@ -12383,6 +13086,7 @@ fn activate_configuration(
         "UPDATE projects SET settings_json=?1,version=version+1,updated_at=?2 WHERE id=?3",
         params![settings.to_string(), now, project_id],
     )?;
+    mark_project_attempts_for_migration(&tx, project_id, &now)?;
     tx.commit()?;
     Ok(revision)
 }
@@ -12402,7 +13106,7 @@ fn insert_config_revision(
         params![project_id],
         |row| row.get(0),
     )?;
-    let config = serde_json::json!({"project_name":proposal.project_name,"guidance":proposal.guidance,"documentation":proposal.documentation,"verification":proposal.verification,"testing":proposal.testing,"observability":proposal.observability,"roles":proposal.roles,"profiles":proposal.profiles});
+    let config = project_configuration(proposal)?;
     let preflight =
         effective_preflight_json(connection, setup_id, proposal, runtime)?["receipts"].to_string();
     connection.execute(
@@ -13049,23 +13753,75 @@ fn write_activated_policy_file(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((preimage, source_bytes, preimage_bytes)) = approved else {
-        bail!(
-            "policy materialization collision: {}",
-            destination.display()
-        )
+    let installation_approved = approved.is_some_and(|(preimage, source_bytes, preimage_bytes)| {
+        observed.as_deref() == Some(preimage.as_str())
+            && sha256(&preimage_bytes) == preimage
+            && sha256(&source_bytes) == expected
+            && source_bytes == bytes
+    });
+    let migration_approved = if !installation_approved {
+        let connection = store.lock()?;
+        if matches!(
+            pending_attempt_migration(&connection, attempt_id)?,
+            Some(Ok(_))
+        ) {
+            let (prior, project_root, manifest_hash): (String, String, String) = connection.query_row(
+                "SELECT json_extract(receipt.preserved_json,'$.prior_policy'),p.repository_path,s.manifest_hash
+                 FROM trip_legacy_migrations receipt JOIN attempts a ON a.id=receipt.attempt_id
+                 JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
+                 JOIN trip_project_state s ON s.project_id=p.id JOIN workspaces w ON w.attempt_id=a.id
+                 WHERE a.id=?1 AND receipt.to_workflow_id=?2 AND w.path=?3 AND w.path!=p.repository_path",
+                params![attempt_id,WORKFLOW_ID,root.to_string_lossy()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )?;
+            let prior: serde_json::Value = serde_json::from_str(&prior)?;
+            let policy_json = prior["policy_json"]
+                .as_str()
+                .ok_or_else(|| anyhow!("migration receipt lacks its prior policy"))?;
+            if prior["policy_hash"].as_str() != Some(sha256(policy_json.as_bytes()).as_str()) {
+                bail!("migration prior policy hash changed")
+            }
+            let policy: serde_json::Value = serde_json::from_str(policy_json)?;
+            let project_root = PathBuf::from(project_root).canonicalize()?;
+            let target_manifest = read_verified_regular(
+                &project_root,
+                &project_root.join(".agents/trip-explorer/manifest.json"),
+                &manifest_hash,
+            )?;
+            let manifest: serde_json::Value = serde_json::from_slice(&target_manifest)?;
+            let base_prefix = format!(".agents/trip-explorer/base/{PACKAGE_VERSION}/");
+            let target_hash = if relative == ".agents/trip-explorer/manifest.json" {
+                Some(manifest_hash.as_str())
+            } else if let Some(path) = relative.strip_prefix(base_prefix.as_str()) {
+                manifest["base"][path].as_str()
+            } else if let Some(path) = relative.strip_prefix(".agents/skills/") {
+                manifest["base"][format!("skills/{path}")].as_str()
+            } else if let Some(path) = relative.strip_prefix(".agents/trip-explorer/bin/") {
+                manifest["bin"][path].as_str()
+            } else {
+                match relative.as_ref() {
+                    ".agents/trip-explorer/config.json" => manifest["config_sha256"].as_str(),
+                    ".agents/trip-explorer/adapters.json" => manifest["adapters_sha256"].as_str(),
+                    ".agents/trip-explorer/preflight.json" => manifest["preflight_sha256"].as_str(),
+                    _ => None,
+                }
+            };
+            policy["files"][relative.as_ref()].as_str() == observed.as_deref()
+                && target_hash == Some(expected)
+                && sha256(bytes) == expected
+        } else {
+            false
+        }
+    } else {
+        false
     };
-    if observed.as_deref() != Some(preimage.as_str())
-        || sha256(&preimage_bytes) != preimage
-        || sha256(&source_bytes) != expected
-        || source_bytes != bytes
-    {
+    if !installation_approved && !migration_approved {
         bail!(
             "policy materialization collision: {}",
             destination.display()
         )
     }
-    // The activated installation authorizes only this exact old-to-new byte pair.
+    // Installation or migration authority binds this exact old-to-new byte pair.
     ensure_safe_parent(root, destination)?;
     if hash_file(destination)? != observed {
         bail!("approved policy preimage changed before worktree replacement")
@@ -13102,6 +13858,12 @@ fn write_new_verified(root: &Path, destination: &Path, bytes: &[u8], expected: &
 }
 fn read_verified_regular(root: &Path, path: &Path, expected: &str) -> Result<Vec<u8>> {
     ensure_no_symlink_ancestry(root, path)?;
+    if !fs::symlink_metadata(path)?.file_type().is_file() {
+        bail!(
+            "activated policy path is not a regular file: {}",
+            path.display()
+        )
+    }
     let bytes = fs::read(path)?;
     if sha256(&bytes) != expected {
         bail!("activated package file drifted: {}", path.display())

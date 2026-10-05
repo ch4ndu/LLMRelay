@@ -1237,6 +1237,30 @@ impl Scheduler {
         drop(connection);
         let mut recovered = Vec::new();
         for (workspace, path, base, identity, attempt, policy_json) in rows {
+            {
+                let mut connection = self.store.lock()?;
+                let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                // A generic recovery record would fence the receipt's explicit migration recovery.
+                if crate::trip::pending_attempt_migration(&tx, &attempt)?.is_some() {
+                    let now = Utc::now().to_rfc3339();
+                    tx.execute(
+                        "UPDATE workspaces SET state='recovery_required',updated_at=?1
+                         WHERE id=?2 AND attempt_id=?3 AND state IN ('reserved','recovery_required')",
+                        params![now,workspace,attempt],
+                    )?;
+                    tx.execute(
+                        "UPDATE attempts SET status='needs_recovery',updated_at=?1 WHERE id=?2",
+                        params![now, attempt],
+                    )?;
+                    tx.execute(
+                        "UPDATE tasks SET attention='needs_recovery',updated_at=?1
+                         WHERE id=(SELECT task_id FROM attempts WHERE id=?2)",
+                        params![now, attempt],
+                    )?;
+                    tx.commit()?;
+                    continue;
+                }
+            }
             let observed = if std::path::Path::new(&path).exists() {
                 crate::workspace::inspect(std::path::Path::new(&path))
                     .map(|repo| {

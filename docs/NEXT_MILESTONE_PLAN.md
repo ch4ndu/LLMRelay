@@ -18,17 +18,45 @@ will defer personal hands-on acceptance until the selected features are present.
 Engineering verification continues at each checkpoint. The earlier implementation
 is a verified foundation, not acceptance of the complete desired product.
 
-## Next task — update the installed TRIP process from upstream
+## Next-task status — installed TRIP update completed
 
-Selected by the user on October 3, after verification of the report-reminder
-feature. Update this repository's installed TRIP Explorer workflow from the local
-upstream checkout `/Users/murali/Private/GitHub/trip-explorer-workflow`.
-First inspect upstream upgrade instructions and compare the installed package,
-local adaptations, role configuration and preflight evidence. Preserve deliberate
-project overrides, reconcile changes through the supported upgrade path, and
-validate the resulting installation and affected CLI behavior. Do not silently
-replace selected models or claim stale preflight evidence applies to changed
-adapters. The upstream update itself has not started.
+Completed October 3: upgraded the installed TRIP Explorer tooling from 0.9.0 to
+0.11.0 using local upstream `c7b360b` at
+`/Users/murali/Private/GitHub/trip-explorer-workflow`. The supported staging and
+manual three-way reconciliation preserved project configuration, adapters,
+guidance and role assignments: Astra High Explorer, Fable High plan reviewer,
+separate Sol 6.1 xhigh implementer/code reviewer sessions, and fresh Fable Medium
+final verifier. Upstream includes the previous local launcher fixes.
+
+All 90 upstream tests and installed validation passed; the workflow doctor is
+healthy. All five selected profiles received fresh preflight evidence on Codex
+0.160.0 / Claude Code 2.1.287, including exact retained-session resumes and an
+isolated implementer write. Comparison, rollback snapshots and verification
+receipts remain in ignored `.local/trip-explorer/upgrade/0.11.0/`. The reminder
+feature and its completed review/test evidence were not reopened. No commit,
+push or release was part of this upgrade.
+
+Completed October 4: LLMRelay's separately embedded workflow now uses 0.11.0.
+The upgrade preserves setup configuration, binds preflight evidence to the
+current workflow, and adds schema 37 migration receipts. The user-approved
+migration policy requires a quiescent attempt with a reviewed plan and no prior
+final-repair authority; other attempts retain their history and use a fresh task.
+Exact workflow-file replacement and explicit interruption recovery preserve
+source edits, approved guidance, historical evidence and spent review budgets.
+
+The retained independent code recheck approved the migration repair. The
+reconciled matrix passed 410 tests (63 frontend, 140 Rust library, 205 contract,
+2 runtime), plus type-checking, formatting, compilation and asset build checks.
+Initial matrix failures were stale schema expectations in tests; their exact
+reruns passed. The original failed receipts remain recorded. Fresh final
+verification approved after reconciling the host manifest's preflight hash.
+Fable host profiles were revalidated on Claude 2.1.289 after external CLI drift;
+models, role assignments and adapters stayed unchanged. Application provider
+pins remain unchanged and are separate from host-tool preflight.
+
+No live user database migration, native-provider or browser acceptance, commit,
+push or release is claimed. Evidence remains under
+`.local/trip-explorer/internal_trip_011_20261003/`.
 
 This tooling task precedes scheduled in-service backups and the other
 features-after-hardening candidates. LaunchAgent, menu-bar, installed updates,

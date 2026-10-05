@@ -437,8 +437,8 @@ reuse old qualification evidence to bypass these checks.
 ## Database restore points
 
 The database commands operate on the instance selected by `--data-dir` and never
-migrate it. Inspect, check and manual backup require current schema 36. Verify
-and restore accept schema 36 and the supported prior schemas 31–35, requiring the
+migrate it. Inspect, check and manual backup require current schema 37. Verify
+and restore accept schema 37 and the supported prior schemas 31–36, requiring the
 manifest version to match the actual SQLite version. Unknown versions are refused.
 
 Service start holds the exclusive instance lock, reconciles an interrupted
@@ -449,7 +449,7 @@ the default backup directory. It checks migration space again after publication.
 A failed preflight or backup prevents migration. Missing and already-current
 databases do not require this extra snapshot.
 
-Supported schemas 31–35 then upgrade to 36 through the existing migration
+Supported schemas 31–36 then upgrade to 37 through the existing migration
 transactions. Each failed migration rolls back its own transaction; earlier
 successful steps may remain committed. The failure identifies the verified
 restore point and offline recovery command. Startup never automatically restores
@@ -490,7 +490,7 @@ cannot prevent another process from consuming disk space afterward.
 
 Retention targets ten backups, thirty days and five GiB. It always preserves the
 newest verified restore point and the newest verified point for each supported
-prior schema 31–35. These bounded schema anchors survive the ordinary limits so
+prior schema 31–36. These bounded schema anchors survive the ordinary limits so
 retries after a partial upgrade cannot erase the earlier recovery point. If
 protected points alone exceed a limit, they remain; later capacity checks may
 refuse another backup or upgrade. Unrecognized or unverified content, incomplete
@@ -513,7 +513,7 @@ permission rules and automatic resume authority are invalidated. The dashboard
 may be available for inspection and safe recovery, but execution remains fenced.
 Restoring an older snapshot first installs its original schema and commits this
 hold. A later service start makes a new verified snapshot and attempts the
-supported forward upgrade while retaining the hold. This build serves schema 36;
+supported forward upgrade while retaining the hold. This build serves schema 37;
 a persistent migration defect still requires a corrected build or operator
 repair. Restoring the data does not promise that a failing migration will succeed
 or launch a compatible older executable.

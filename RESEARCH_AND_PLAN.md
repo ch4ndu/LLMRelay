@@ -3,10 +3,12 @@
 ## Required TRIP Explorer host — approved September 15, 2026
 
 LLMRelay is an extension of the standalone TRIP Explorer workflow, including
-project initialization. The source of truth is the local v0.9.0 package in
-`/Users/murali/Private/GitHub/trip-explorer-workflow`, not the global customized
-JellyScope skill. The selected package contains uncommitted changes; a complete
-content manifest pins the package rather than treating Git HEAD as its identity.
+project initialization. The current embedded source is the verbatim v0.11.0
+package from local upstream commit `c7b360b`, pinned by its content manifest.
+The October 3 internal adoption updates the application workflow identity and
+transport overlay separately from this repository's installed engineering tools.
+The original v0.9.0 integration evidence below remains historical; current
+upgrade verification is tracked in [the next-task plan](docs/NEXT_MILESTONE_PLAN.md).
 The source repository and global workflow installation remain unchanged.
 
 The user approved the concrete integration plan revision 3, SHA-256

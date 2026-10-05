@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-10-03T03:27:16.802803+00:00",
+  "observed_at": "2026-10-04T14:55:41.507122+00:00",
   "receipts": [
     {
       "adapter": "direct-claude-cli",
@@ -19,66 +19,6 @@
       "service_tier": null,
       "session": "retained",
       "session_evidence": "Explicit native UUID resume recalled initial nonce and completed isolated write. Results under .local/trip-explorer/hardening_20261001/preflight/."
-    },
-    {
-      "adapter": "direct-codex-cli",
-      "authority": "read-only",
-      "authority_evidence": "Codex read-only sandbox configured on initial launch and explicit resume.",
-      "effort": "high",
-      "model": "gpt-6-astra",
-      "model_evidence": "Codex0.159.2 ordinary console header matched gpt-6-astra/high/read-only; initial and explicit resume returned exact retained nonce. No fallback configured.",
-      "native_session_id": "01a0f58e-3e66-7f12-bf71-686bc298e25f",
-      "nonce": "PREFLIGHT_ASTRA_HIGH_20261001_c44a",
-      "nonce_matched": true,
-      "profile_ids": [
-        "session-astra-high-read"
-      ],
-      "provider": "codex",
-      "result": "pass",
-      "service_tier": null,
-      "session": "retained",
-      "session_evidence": "Explicit UUID resume returned retained nonce."
-    },
-    {
-      "adapter": "direct-codex-cli",
-      "authority": "read-only",
-      "authority_evidence": "Codex read-only sandbox configured on initial launch and explicit resume.",
-      "effort": "xhigh",
-      "model": "gpt-6.1-sol",
-      "model_evidence": "Codex0.159.2 ordinary console header matched gpt-6.1-sol/xhigh/read-only; initial and explicit resume returned exact retained nonce. No fallback configured.",
-      "native_session_id": "01a0f58e-c3fd-7402-8264-6d5d98d3de80",
-      "nonce": "PREFLIGHT_SOL61_XHIGH_20261001_422b",
-      "nonce_matched": true,
-      "profile_ids": [
-        "session-sol61-xhigh-read"
-      ],
-      "provider": "codex",
-      "result": "pass",
-      "service_tier": null,
-      "session": "retained",
-      "session_evidence": "Explicit UUID resume returned retained nonce."
-    },
-    {
-      "adapter": "direct-codex-cli",
-      "authority": "workspace-write",
-      "authority_evidence": "Initial and resumed invocations wrote only the authorized task-local nonce file; independently checked both lines.",
-      "effort": "xhigh",
-      "ended_at": "2026-10-01T19:58:44.758205+00:00",
-      "model": "gpt-6.1-sol",
-      "model_evidence": "Installed Codex ordinary console gpt-6.1-sol/xhigh/workspace-write header, successful initial and explicit resume. No fallback configured.",
-      "native_session_id": "01a0f90b-e2c8-70b3-92c5-22c6582b5054",
-      "nonce": "H3H15_SOL61_WRITE_20261001_8e213b",
-      "nonce_matched": true,
-      "profile_ids": [
-        "session-sol61-xhigh-write"
-      ],
-      "provider": "codex",
-      "result": "pass",
-      "seconds": 23.944,
-      "service_tier": null,
-      "session": "retained",
-      "session_evidence": "Explicit UUID resume recalled nonce without prompt restating it and appended it to isolated probe.",
-      "started_at": "2026-10-01T19:58:20.813597+00:00"
     },
     {
       "adapter": "direct-codex-cli",
@@ -141,6 +81,43 @@
       "session_evidence": "Independent fresh native session without resume."
     },
     {
+      "adapter": "direct-codex-cli",
+      "authority": "read-only",
+      "effort": "high",
+      "model": "gpt-6-astra",
+      "provider": "codex",
+      "service_tier": null,
+      "session": "retained",
+      "profile_ids": [
+        "session-astra-high-read"
+      ],
+      "result": "pass",
+      "nonce_matched": true,
+      "native_session_id": "01a10338-907e-74e0-b46e-bda3764ba66e",
+      "model_evidence": "Exact staged 0.11.0 runner on Codex 0.160.0 / Claude Code 2.1.287; provider console model matched gpt-6-astra; explicit effort high; no fallback. Provider-exposed identity only.",
+      "authority_evidence": "Explicit sandbox authority for Codex; restricted Read/Grep/Glob-only tool allowlist and strict MCP config for Claude. Isolated implementer writes independently checked; read-only probes requested no tools.",
+      "session_evidence": "Exact observed UUID resume recalled nonce without restatement.",
+      "evidence_paths": [
+        ".local/trip-explorer/upgrade/0.11.0/preflight/explorer-initial.completion.json",
+        ".local/trip-explorer/upgrade/0.11.0/preflight/explorer-resume.completion.json"
+      ],
+      "runner_sha256": "cef80e3d91f6c3f611dff3a682ca9256aa69a6cdaffa2fdf8ccb6764a211b551",
+      "cli_version": "0.160.0",
+      "cli_executable": "/opt/homebrew/Caskroom/codex/0.160.0/bin/codex",
+      "adapter_sha256": "760656c1cfa42280a6e19917dae02afc3cf5b47474a65d0402930b179df852a7",
+      "runtime_sha256": {
+        "check_evidence.py": "c7b13ecd2e0dffeaf5f6d31c94ab53492b93ba6c43575a9052e8263b86bb2250",
+        "claude_console.py": "d899f71dfc5b019a404d7c267a84f7533fd390fb543291aab43ca906222509f5",
+        "cmux_observer.py": "c2dcc814681eba9186b62e9537edf8ad290aadeb80545e846f05518c18502307",
+        "cmux_role_runner.py": "cef80e3d91f6c3f611dff3a682ca9256aa69a6cdaffa2fdf8ccb6764a211b551",
+        "role_config.py": "243032ab1f985aedc2be248d08f39b26e5b446c1bbdeb91676d1ab27440d05a6",
+        "run_report.py": "8e27d998adc3a9ade017219296ac3c92168d4ca206a6015da8a63dcfa7231950",
+        "upgrade_preview.py": "7e5dfc5c6a13cc36e29b8fb97ac4f5fc7e95b89ad4c78b813483738bbe33827a",
+        "validate_installed.py": "8a988ab838fdb6e269177320b19b8d852e0c4d65728f2e8e31f474b24c874be7",
+        "workflow_doctor.py": "5132bd349903a22fbaf2f1be4e12dfd6cafb92ccb00de608814969cece7e1b08"
+      }
+    },
+    {
       "adapter": "direct-claude-cli",
       "provider": "claude",
       "model": "claude-fable-5-1",
@@ -152,12 +129,104 @@
         "session-fable-high-read"
       ],
       "result": "pass",
-      "native_session_id": "213c29df-84ec-409c-aba7-78bb5222616e",
+      "native_session_id": "c0a38de5-a7d5-4d9d-bef5-4167dedb441f",
       "nonce_matched": true,
-      "seconds": 8.058,
-      "model_evidence": "2.1.287 (Claude Code) exact modelUsage canonicalModel claude-fable-5-1; explicit effort high; no fallback configured.",
+      "seconds": 8.587,
+      "model_evidence": "2.1.289 (Claude Code) exact modelUsage canonicalModel claude-fable-5-1; explicit effort high; no fallback configured.",
       "authority_evidence": "Same installed safe-mode/restricted Read,Grep,Glob-only adapter; no Bash/Edit/Write/Agent or MCP. No tools requested.",
-      "session_evidence": "Explicit UUID resume recalled nonce without restatement."
+      "session_evidence": "Explicit UUID resume recalled nonce without restatement.",
+      "runner_sha256": "cef80e3d91f6c3f611dff3a682ca9256aa69a6cdaffa2fdf8ccb6764a211b551",
+      "runtime_sha256": {
+        "check_evidence.py": "c7b13ecd2e0dffeaf5f6d31c94ab53492b93ba6c43575a9052e8263b86bb2250",
+        "claude_console.py": "d899f71dfc5b019a404d7c267a84f7533fd390fb543291aab43ca906222509f5",
+        "cmux_observer.py": "c2dcc814681eba9186b62e9537edf8ad290aadeb80545e846f05518c18502307",
+        "cmux_role_runner.py": "cef80e3d91f6c3f611dff3a682ca9256aa69a6cdaffa2fdf8ccb6764a211b551",
+        "role_config.py": "243032ab1f985aedc2be248d08f39b26e5b446c1bbdeb91676d1ab27440d05a6",
+        "run_report.py": "8e27d998adc3a9ade017219296ac3c92168d4ca206a6015da8a63dcfa7231950",
+        "upgrade_preview.py": "7e5dfc5c6a13cc36e29b8fb97ac4f5fc7e95b89ad4c78b813483738bbe33827a",
+        "validate_installed.py": "8a988ab838fdb6e269177320b19b8d852e0c4d65728f2e8e31f474b24c874be7",
+        "workflow_doctor.py": "5132bd349903a22fbaf2f1be4e12dfd6cafb92ccb00de608814969cece7e1b08"
+      },
+      "cli_version": "2.1.289",
+      "cli_executable": "/Users/murali/.local/share/claude/versions/2.1.289",
+      "adapter_sha256": "29357ca4fb50fb0614146045a30f399df5c2980def0548d6fadbe0d9700978c2",
+      "evidence_paths": [
+        ".local/trip-explorer/internal_trip_011_20261003/fable-preflight-289/result.json"
+      ]
+    },
+    {
+      "adapter": "direct-codex-cli",
+      "authority": "workspace-write",
+      "effort": "xhigh",
+      "model": "gpt-6.1-sol",
+      "provider": "codex",
+      "service_tier": null,
+      "session": "retained",
+      "profile_ids": [
+        "session-sol61-xhigh-write"
+      ],
+      "result": "pass",
+      "nonce_matched": true,
+      "native_session_id": "01a1033a-9a95-77b1-a7d7-86556357c53e",
+      "model_evidence": "Exact staged 0.11.0 runner on Codex 0.160.0 / Claude Code 2.1.287; provider console model matched gpt-6.1-sol; explicit effort xhigh; no fallback. Provider-exposed identity only.",
+      "authority_evidence": "Explicit sandbox authority for Codex; restricted Read/Grep/Glob-only tool allowlist and strict MCP config for Claude. Isolated implementer writes independently checked; read-only probes requested no tools.",
+      "session_evidence": "Exact observed UUID resume recalled nonce without restatement.",
+      "evidence_paths": [
+        ".local/trip-explorer/upgrade/0.11.0/preflight/implementer-initial.completion.json",
+        ".local/trip-explorer/upgrade/0.11.0/preflight/implementer-resume.completion.json"
+      ],
+      "runner_sha256": "cef80e3d91f6c3f611dff3a682ca9256aa69a6cdaffa2fdf8ccb6764a211b551",
+      "cli_version": "0.160.0",
+      "cli_executable": "/opt/homebrew/Caskroom/codex/0.160.0/bin/codex",
+      "adapter_sha256": "760656c1cfa42280a6e19917dae02afc3cf5b47474a65d0402930b179df852a7",
+      "runtime_sha256": {
+        "check_evidence.py": "c7b13ecd2e0dffeaf5f6d31c94ab53492b93ba6c43575a9052e8263b86bb2250",
+        "claude_console.py": "d899f71dfc5b019a404d7c267a84f7533fd390fb543291aab43ca906222509f5",
+        "cmux_observer.py": "c2dcc814681eba9186b62e9537edf8ad290aadeb80545e846f05518c18502307",
+        "cmux_role_runner.py": "cef80e3d91f6c3f611dff3a682ca9256aa69a6cdaffa2fdf8ccb6764a211b551",
+        "role_config.py": "243032ab1f985aedc2be248d08f39b26e5b446c1bbdeb91676d1ab27440d05a6",
+        "run_report.py": "8e27d998adc3a9ade017219296ac3c92168d4ca206a6015da8a63dcfa7231950",
+        "upgrade_preview.py": "7e5dfc5c6a13cc36e29b8fb97ac4f5fc7e95b89ad4c78b813483738bbe33827a",
+        "validate_installed.py": "8a988ab838fdb6e269177320b19b8d852e0c4d65728f2e8e31f474b24c874be7",
+        "workflow_doctor.py": "5132bd349903a22fbaf2f1be4e12dfd6cafb92ccb00de608814969cece7e1b08"
+      }
+    },
+    {
+      "adapter": "direct-codex-cli",
+      "authority": "read-only",
+      "effort": "xhigh",
+      "model": "gpt-6.1-sol",
+      "provider": "codex",
+      "service_tier": null,
+      "session": "retained",
+      "profile_ids": [
+        "session-sol61-xhigh-read"
+      ],
+      "result": "pass",
+      "nonce_matched": true,
+      "native_session_id": "01a1033b-29d3-7b50-88ac-53b71d2651c3",
+      "model_evidence": "Exact staged 0.11.0 runner on Codex 0.160.0 / Claude Code 2.1.287; provider console model matched gpt-6.1-sol; explicit effort xhigh; no fallback. Provider-exposed identity only.",
+      "authority_evidence": "Explicit sandbox authority for Codex; restricted Read/Grep/Glob-only tool allowlist and strict MCP config for Claude. Isolated implementer writes independently checked; read-only probes requested no tools.",
+      "session_evidence": "Exact observed UUID resume recalled nonce without restatement.",
+      "evidence_paths": [
+        ".local/trip-explorer/upgrade/0.11.0/preflight/code_reviewer-initial.completion.json",
+        ".local/trip-explorer/upgrade/0.11.0/preflight/code_reviewer-resume.completion.json"
+      ],
+      "runner_sha256": "cef80e3d91f6c3f611dff3a682ca9256aa69a6cdaffa2fdf8ccb6764a211b551",
+      "cli_version": "0.160.0",
+      "cli_executable": "/opt/homebrew/Caskroom/codex/0.160.0/bin/codex",
+      "adapter_sha256": "760656c1cfa42280a6e19917dae02afc3cf5b47474a65d0402930b179df852a7",
+      "runtime_sha256": {
+        "check_evidence.py": "c7b13ecd2e0dffeaf5f6d31c94ab53492b93ba6c43575a9052e8263b86bb2250",
+        "claude_console.py": "d899f71dfc5b019a404d7c267a84f7533fd390fb543291aab43ca906222509f5",
+        "cmux_observer.py": "c2dcc814681eba9186b62e9537edf8ad290aadeb80545e846f05518c18502307",
+        "cmux_role_runner.py": "cef80e3d91f6c3f611dff3a682ca9256aa69a6cdaffa2fdf8ccb6764a211b551",
+        "role_config.py": "243032ab1f985aedc2be248d08f39b26e5b446c1bbdeb91676d1ab27440d05a6",
+        "run_report.py": "8e27d998adc3a9ade017219296ac3c92168d4ca206a6015da8a63dcfa7231950",
+        "upgrade_preview.py": "7e5dfc5c6a13cc36e29b8fb97ac4f5fc7e95b89ad4c78b813483738bbe33827a",
+        "validate_installed.py": "8a988ab838fdb6e269177320b19b8d852e0c4d65728f2e8e31f474b24c874be7",
+        "workflow_doctor.py": "5132bd349903a22fbaf2f1be4e12dfd6cafb92ccb00de608814969cece7e1b08"
+      }
     },
     {
       "adapter": "direct-claude-cli",
@@ -171,12 +240,30 @@
         "session-fable-medium-fresh"
       ],
       "result": "pass",
-      "native_session_id": "c0e9b8ed-a336-49c2-81c5-ea281a0c5bfa",
+      "native_session_id": "29c4032c-07dd-4cea-87e1-7b8a5740eecd",
       "nonce_matched": true,
-      "seconds": 4.312,
-      "model_evidence": "2.1.287 (Claude Code) exact modelUsage canonicalModel claude-fable-5-1; explicit effort medium; no fallback configured.",
+      "seconds": 4.336,
+      "model_evidence": "2.1.289 (Claude Code) exact modelUsage canonicalModel claude-fable-5-1; explicit effort medium; no fallback configured.",
       "authority_evidence": "Same installed safe-mode/restricted Read,Grep,Glob-only adapter; no Bash/Edit/Write/Agent or MCP. No tools requested.",
-      "session_evidence": "Fresh independent native UUID; no resume."
+      "session_evidence": "Fresh independent native UUID; no resume.",
+      "runner_sha256": "cef80e3d91f6c3f611dff3a682ca9256aa69a6cdaffa2fdf8ccb6764a211b551",
+      "runtime_sha256": {
+        "check_evidence.py": "c7b13ecd2e0dffeaf5f6d31c94ab53492b93ba6c43575a9052e8263b86bb2250",
+        "claude_console.py": "d899f71dfc5b019a404d7c267a84f7533fd390fb543291aab43ca906222509f5",
+        "cmux_observer.py": "c2dcc814681eba9186b62e9537edf8ad290aadeb80545e846f05518c18502307",
+        "cmux_role_runner.py": "cef80e3d91f6c3f611dff3a682ca9256aa69a6cdaffa2fdf8ccb6764a211b551",
+        "role_config.py": "243032ab1f985aedc2be248d08f39b26e5b446c1bbdeb91676d1ab27440d05a6",
+        "run_report.py": "8e27d998adc3a9ade017219296ac3c92168d4ca206a6015da8a63dcfa7231950",
+        "upgrade_preview.py": "7e5dfc5c6a13cc36e29b8fb97ac4f5fc7e95b89ad4c78b813483738bbe33827a",
+        "validate_installed.py": "8a988ab838fdb6e269177320b19b8d852e0c4d65728f2e8e31f474b24c874be7",
+        "workflow_doctor.py": "5132bd349903a22fbaf2f1be4e12dfd6cafb92ccb00de608814969cece7e1b08"
+      },
+      "cli_version": "2.1.289",
+      "cli_executable": "/Users/murali/.local/share/claude/versions/2.1.289",
+      "adapter_sha256": "29357ca4fb50fb0614146045a30f399df5c2980def0548d6fadbe0d9700978c2",
+      "evidence_paths": [
+        ".local/trip-explorer/internal_trip_011_20261003/fable-preflight-289/result.json"
+      ]
     }
   ]
 }

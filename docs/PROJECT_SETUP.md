@@ -60,6 +60,31 @@ See [provider compatibility and permissions](SECURITY.md) for supported Codex ac
 
 Provider profiles remain `Unverified` until matching local preflight succeeds. An imported upstream preflight document is validated as installation data, but cannot by itself prove the local executable and application sandbox behavior. Changing a profile creates a pending configuration revision and requires matching evidence before that profile can run. Failed or declined probes preserve the setup draft and do not activate the project.
 
+A valid standalone 0.11.0 installation still needs explicit application adoption,
+including when its manifest contains older LLMRelay metadata. Adoption leaves its
+files unchanged and records the active application binding in the database.
+Unknown configuration fields, unused profiles and adapters survive reviewed
+proposals. Choose individual regular guidance files; directories are rejected
+before installation. Setup evidence from an older workflow, source, overlay or
+prompt identity cannot qualify the current workflow.
+
+Project activation can proceed with older attempts only after their processes
+are positively quiescent and pending review, recovery, permission, control and
+provider-failure holds are settled. Those attempts then require explicit migration.
+Migration is limited to quiescent attempts with a recorded reviewed plan and no
+prior final-repair authority. Attempts without a reviewed plan or with prior
+final-repair authority remain history; start a fresh task under the current
+workflow for that work. Project activation does not itself migrate an attempt.
+
+An eligible migration returns the attempt to planning, clears prior approval and
+candidate authority, and preserves history, spent review budgets, source edits
+and verified guidance authorizations. Workflow files may be replaced only when
+their prior bytes and the target bytes match the authorized migration. Unexpected
+changes block replacement. If migration is interrupted, startup holds it for
+explicit recovery. The migration action retains the original reviewed-plan and
+configuration binding; recovery does not restore old plan approval or start an
+agent automatically.
+
 An activated setup keeps showing its recorded results. When a selected profile's settings changed after verification, its last verification failed, or newer agent evidence replaced it, the setup page says **Setup activated** and names each profile that must be verified again, instead of reporting an unknown agent version. A version is reported as unsupported only when an agent actually reported that version, or when this LLMRelay release has no support for that provider at all.
 
 During supported Implementer sessions, the Workspace **Approvals** list handles native action requests the CLI actually emits with **Approve once**, **Always approve matching actions**, and **Deny**. Codex honors approvals already granted through its native policy, so a natively allowed or sandbox-allowed action may run without a new inbox item. LLMRelay does not enumerate, create, edit, or revoke native Codex approvals; dashboard **Revoke** affects only LLMRelay-owned reusable rules. Workflow approvals, review-budget changes, role switching, and final acceptance remain separate decisions you make in the dashboard. Trusting a folder does not grant those actions to an agent.

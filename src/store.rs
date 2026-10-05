@@ -506,6 +506,7 @@ const MIGRATION_033: &str = include_str!("../migrations/033_native_resolution.sq
 const MIGRATION_034: &str = include_str!("../migrations/034_guidance_submitted_text.sql");
 const MIGRATION_035: &str = include_str!("../migrations/035_provider_failure_holds.sql");
 const MIGRATION_036: &str = include_str!("../migrations/036_attention_observations.sql");
+const MIGRATION_037: &str = include_str!("../migrations/037_trip_workflow_migrations.sql");
 // Same value rusqlite installs at open; set explicitly before any pragma or DDL can contend.
 pub(crate) const STATE_DATABASE_BUSY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
@@ -9897,7 +9898,7 @@ pub(crate) fn verify_input_lease_in(
     Ok(())
 }
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 36;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 37;
 
 /// Reads the durable state cursor. It is committed state only when the
 /// connection is in autocommit mode.
@@ -9909,12 +9910,12 @@ pub(crate) fn read_state_revision(connection: &Connection) -> rusqlite::Result<i
 
 /// The prior schemas an existing database may be migrated from at service
 /// start. Every other non-current version is left unchanged and refused.
-pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 5] = [31, 32, 33, 34, 35];
+pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 6] = [31, 32, 33, 34, 35, 36];
 
 pub(crate) fn require_maintenance_schema(connection: &Connection) -> Result<i64> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != CURRENT_SCHEMA_VERSION && !SERVICE_UPGRADABLE_SCHEMA_VERSIONS.contains(&version) {
-        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–36")
+        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–37")
     }
     Ok(version)
 }
@@ -10414,6 +10415,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction
             .commit()
             .context("commit attention observation migration")?;
+    }
+    if version <= 36 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_037)?;
+        transaction.pragma_update(None, "user_version", 37)?;
+        transaction
+            .commit()
+            .context("commit workflow migration receipt migration")?;
     }
     Ok(())
 }
@@ -15195,8 +15204,18 @@ mod interruption_tests {
     }
 
     fn prior_service_schema_sql(version: i64) -> String {
-        let drop_schema_36 =
-            "DROP TABLE attention_observations; DROP INDEX role_results_session_generation;";
+        let drop_schema_37 = "CREATE TABLE trip_legacy_migrations_previous (
+            id TEXT PRIMARY KEY,attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id),
+            from_workflow_id TEXT NOT NULL,to_workflow_id TEXT NOT NULL,preserved_json TEXT NOT NULL,
+            reviewed_plan_hash TEXT NOT NULL,config_revision_id TEXT NOT NULL REFERENCES trip_config_revisions(id),
+            authorized_at TEXT NOT NULL);
+            INSERT INTO trip_legacy_migrations_previous SELECT id,attempt_id,from_workflow_id,to_workflow_id,
+                preserved_json,reviewed_plan_hash,config_revision_id,authorized_at FROM trip_legacy_migrations;
+            DROP TABLE trip_legacy_migrations;
+            ALTER TABLE trip_legacy_migrations_previous RENAME TO trip_legacy_migrations;";
+        let drop_schema_36 = format!(
+            "{drop_schema_37} DROP TABLE attention_observations; DROP INDEX role_results_session_generation;"
+        );
         let drop_schema_35 = format!("{drop_schema_36} DROP TABLE provider_failure_holds;");
         let drop_schema_34 = format!(
             "{drop_schema_35} DROP TRIGGER guidance_submitted_form_paired;
@@ -15215,7 +15234,8 @@ mod interruption_tests {
             32 => drop_after_schema_32,
             33 => drop_schema_34,
             34 => drop_schema_35,
-            35 => drop_schema_36.to_owned(),
+            35 => drop_schema_36,
+            36 => drop_schema_37.to_owned(),
             _ => panic!("unsupported fixture schema {version}"),
         };
         format!("{drop_later} PRAGMA user_version={version};")
@@ -15350,7 +15370,7 @@ mod interruption_tests {
             let main_bytes = std::fs::read(&paths.database).unwrap();
             assert_eq!(
                 u32::from_be_bytes(main_bytes[60..64].try_into().unwrap()),
-                36
+                CURRENT_SCHEMA_VERSION as u32
             );
             assert!(
                 std::fs::metadata(format!("{}-wal", paths.database.display()))
@@ -15373,7 +15393,7 @@ mod interruption_tests {
             let upgraded = database::open_service_locked(&paths, &lock).unwrap();
             assert_eq!(
                 require_maintenance_schema(&upgraded.lock().unwrap()).unwrap(),
-                36
+                CURRENT_SCHEMA_VERSION
             );
             assert_eq!(
                 upgraded
@@ -15453,7 +15473,7 @@ mod interruption_tests {
             let next = database::open_service_locked(&paths, &lock).unwrap();
             assert_eq!(
                 require_maintenance_schema(&next.lock().unwrap()).unwrap(),
-                36
+                CURRENT_SCHEMA_VERSION
             );
             assert_eq!(std::fs::metadata(&paths.database).unwrap().ino(), inode);
             assert_eq!(
@@ -15560,7 +15580,7 @@ mod interruption_tests {
             "foreign_keys",
             "schema_0",
             "schema_30",
-            "schema_37",
+            "schema_38",
         ] {
             let (paths, source) = restorepoint_fixture(31);
             let lock = database::InstanceLock::acquire(&paths).unwrap();
@@ -15801,7 +15821,7 @@ mod interruption_tests {
         let repaired = database::open_service_locked(&paths, &lock).unwrap();
         assert_eq!(
             require_maintenance_schema(&repaired.lock().unwrap()).unwrap(),
-            36
+            CURRENT_SCHEMA_VERSION
         );
         assert_eq!(
             repaired.restore_hold().unwrap().unwrap()["operation_id"],
@@ -15999,7 +16019,112 @@ mod interruption_tests {
     }
 
     #[test]
-    fn service_start_upgrades_only_schemas_thirty_one_to_thirty_five_and_preserves_receipts() {
+    fn schema_36_upgrade_preserves_migration_receipts_without_revision_triggers() {
+        let (paths, old) = restorepoint_fixture(36);
+        let receipt_rows =
+            "SELECT json_group_array(json_array(id,attempt_id,from_workflow_id,to_workflow_id,
+            preserved_json,reviewed_plan_hash,config_revision_id,authorized_at))
+            FROM (SELECT * FROM trip_legacy_migrations ORDER BY id)";
+        let (receipts, history): (String, String) = {
+            let connection = old.lock().unwrap();
+            connection.execute_batch(
+                "INSERT INTO trip_config_revisions(id,project_id,revision,state,config_json,adapters_json,preflight_json,
+                    verification_json,source_hash,overlay_hash,configuration_hash,created_at)
+                 VALUES('config','p',1,'activated','{}','{}','[]','{}','source','overlay','configuration','2026-01-01T00:00:00Z');
+                 INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+                 VALUES('a2','t','second-context','planning','base',1,'needs_input','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO trip_legacy_migrations(id,attempt_id,from_workflow_id,to_workflow_id,preserved_json,reviewed_plan_hash,config_revision_id,authorized_at)
+                 VALUES('old-a','a','trip-v1','trip-0.9','{\"history\":true}','approved-a','config','2026-01-01T00:00:01Z'),
+                       ('old-a2','a2','trip-v1','trip-0.9','{\"history\":[1,2]}','approved-a2','config','2026-01-01T00:00:02Z');"
+            ).unwrap();
+            (
+                connection
+                    .query_row(receipt_rows, [], |row| row.get(0))
+                    .unwrap(),
+                connection
+                    .query_row(SERVICE_FIXTURE_HISTORY, [], |row| row.get(0))
+                    .unwrap(),
+            )
+        };
+        drop(old);
+        let upgraded = Store::open_service(&paths.database).unwrap();
+        let connection = upgraded.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            37
+        );
+        assert_eq!(
+            connection
+                .query_row(receipt_rows, [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            receipts
+        );
+        assert_eq!(
+            connection
+                .query_row(SERVICE_FIXTURE_HISTORY, [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            history
+        );
+        assert_eq!(connection.query_row(
+            "SELECT COUNT(*) FROM trip_legacy_migrations WHERE target_workflow_hash IS NULL AND target_source_hash IS NULL
+             AND target_overlay_hash IS NULL AND target_manifest_hash IS NULL", [], |row| row.get::<_, i64>(0),
+        ).unwrap(), 2);
+        assert_eq!(connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name='trip_legacy_migrations'",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap(), 0);
+        let revision: i64 = connection
+            .query_row(
+                "SELECT revision FROM state_revision WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection.execute_batch(
+            "INSERT INTO trip_legacy_migrations(id,attempt_id,from_workflow_id,to_workflow_id,preserved_json,reviewed_plan_hash,
+                config_revision_id,authorized_at,target_workflow_hash,target_source_hash,target_overlay_hash,target_manifest_hash)
+             VALUES('new-a','a','trip-0.9','trip-0.11','{}','approved-new','config','2026-01-02T00:00:00Z','workflow','source','overlay','manifest');"
+        ).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT revision FROM state_revision WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            revision
+        );
+        let duplicate = connection.execute(
+            "INSERT INTO trip_legacy_migrations(id,attempt_id,from_workflow_id,to_workflow_id,preserved_json,reviewed_plan_hash,config_revision_id,authorized_at)
+             VALUES('duplicate','a','trip-v1','trip-0.11','{}','other-plan','config','2026-01-03T00:00:00Z')", [],
+        ).unwrap_err();
+        assert!(
+            duplicate.to_string().contains("UNIQUE constraint failed"),
+            "{duplicate}"
+        );
+        for sql in [
+            "UPDATE trip_legacy_migrations SET preserved_json='{\"retained\":true}' WHERE id='new-a'",
+            "DELETE FROM trip_legacy_migrations WHERE id='new-a'",
+        ] {
+            connection.execute(sql, []).unwrap();
+            assert_eq!(connection.query_row("SELECT revision FROM state_revision WHERE singleton=1", [], |row| row.get::<_, i64>(0)).unwrap(), revision);
+        }
+        assert_eq!(
+            connection
+                .query_row(receipt_rows, [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            receipts
+        );
+        drop(connection);
+        drop(upgraded);
+        std::fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[test]
+    fn service_start_upgrades_only_schemas_thirty_one_to_thirty_six_and_preserves_receipts() {
         let root =
             std::env::temp_dir().join(format!("llmrelay-service-upgrade-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -16066,7 +16191,7 @@ mod interruption_tests {
 
         for _ in 0..2 {
             drop(Store::open_service(&database).unwrap());
-            assert_eq!(scalar(version), "Integer(36)");
+            assert_eq!(scalar(version), "Integer(37)");
             assert_eq!(scalar(history), expected_history);
             assert_eq!(scalar(schema), current_schema);
             assert_eq!(
@@ -16083,7 +16208,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(32))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(36)");
+        assert_eq!(scalar(version), "Integer(37)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         // Schema 33 gains only the guidance submitted form and the later migrations.
@@ -16092,7 +16217,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(33))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(36)");
+        assert_eq!(scalar(version), "Integer(37)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -16100,7 +16225,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(34))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(36)");
+        assert_eq!(scalar(version), "Integer(37)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -16108,26 +16233,34 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(35))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(36)");
+        assert_eq!(scalar(version), "Integer(37)");
+        assert_eq!(scalar(history), expected_history);
+        assert_eq!(scalar(schema), current_schema);
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(&prior_service_schema_sql(36))
+            .unwrap();
+        drop(Store::open_service(&database).unwrap());
+        assert_eq!(scalar(version), "Integer(37)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         // An ordinary open of the current schema reopens it without migrating;
         // only a newer schema is refused as unknown.
         drop(Store::open(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(36)");
+        assert_eq!(scalar(version), "Integer(37)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         set_version(CURRENT_SCHEMA_VERSION + 1);
         let error = Store::open(&database).err().unwrap();
         assert!(
-            error.to_string().contains("database schema 37 is newer"),
+            error.to_string().contains("database schema 38 is newer"),
             "{error:#}"
         );
-        assert_eq!(scalar(version), "Integer(37)");
+        assert_eq!(scalar(version), "Integer(38)");
         assert_eq!(scalar(history), expected_history);
         set_version(CURRENT_SCHEMA_VERSION);
 
-        for unsupported in [0, 14, 29, 30, 37] {
+        for unsupported in [0, 14, 29, 30, 38] {
             set_version(unsupported);
             let error = Store::open_service(&database).err().unwrap();
             assert!(

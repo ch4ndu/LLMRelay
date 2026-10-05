@@ -27,7 +27,7 @@ an explicit read, separate from normal state refresh. See
 [restoration and recovery](OPERATIONS.md#stop-and-recover) for batch limits,
 capacity delays and exact recovery-record selection.
 
-LLMRelay hosts the selected standalone TRIP Explorer v0.9.0 package. Its versioned skills, references, and optional helper scripts are copied verbatim from the selected source snapshot. Content hashes pin that snapshot, including its local changes. A separately versioned LLMRelay overlay maps role launch, context records, build execution, and integration writes onto the local engine. It does not remove the workflow's independent reviews, human approvals, test policy, ownership boundaries, or manager completion gate.
+LLMRelay hosts the selected standalone TRIP Explorer v0.11.0 package. Its versioned skills, references, and optional helper scripts are copied verbatim from the selected source snapshot. Content hashes pin that snapshot, from upstream commit `c7b360b`. A separately versioned LLMRelay overlay maps role launch, context records, build execution, and integration writes onto the local engine. It does not remove the workflow's independent reviews, human approvals, test policy, ownership boundaries, or manager completion gate.
 
 Registering a Git repository creates a project record. Running ordinary tasks additionally requires a compatible, initialized project. The app's host manager remains the engineering owner; the five delegated roles are Explorer, plan reviewer, implementer/fixer, code reviewer, and fresh final verifier. Explorer runs only when the workflow's recorded conditions require it. Existing `final_reviewer` identifiers remain a storage compatibility detail.
 

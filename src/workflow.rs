@@ -1000,7 +1000,7 @@ const UNCONFIRMED_GUIDANCE_STATES: [&str; 3] = [
 
 /// Facts that must be settled before a human retires state bound to an exited
 /// session. `?1` is the session.
-const EXITED_SESSION_FENCES: &[(&str, &str)] = &[
+pub(crate) const EXITED_SESSION_FENCES: &[(&str, &str)] = &[
     (
         "the session has not exited",
         "SELECT NOT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND status='exited')",
@@ -1028,7 +1028,7 @@ const EXITED_SESSION_FENCES: &[(&str, &str)] = &[
 
 /// The attempt-wide subset of the guidance reauthorization fences that bears
 /// on process ownership. `?1` is the attempt.
-const ATTEMPT_PROCESS_OWNERSHIP_FENCES: &[(&str, &str)] = &[
+pub(crate) const ATTEMPT_PROCESS_OWNERSHIP_FENCES: &[(&str, &str)] = &[
     ("an agent session of the attempt is starting, stopping or needs recovery",
      "SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
         WHERE g.attempt_id=?1
@@ -1047,7 +1047,10 @@ const ATTEMPT_PROCESS_OWNERSHIP_FENCES: &[(&str, &str)] = &[
 
 /// Every session fact the process verification relied on, so a change before
 /// the write transaction is detected. Returns the status and fingerprint.
-fn session_fingerprint(connection: &Connection, session: &str) -> Result<Option<(String, String)>> {
+pub(crate) fn session_fingerprint(
+    connection: &Connection,
+    session: &str,
+) -> Result<Option<(String, String)>> {
     Ok(connection
         .query_row(
             "SELECT s.status,json_object('status',s.status,'launch_state',s.launch_state,
@@ -4365,6 +4368,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         rows
     };
     let mut tasks = Vec::new();
+    let mut migration_actions = Vec::new();
     for id in task_ids {
         let mut task = connection.query_row(&format!("SELECT id,project_id,title,description,acceptance_criteria_json,priority,manual_order,lifecycle,attention,version,archived_at,role_overrides_json,legacy_json,EXISTS(SELECT 1 FROM permission_requests pr WHERE pr.task_id=tasks.id AND {}),(archived_at IS NULL AND (lifecycle='done' OR (lifecycle='backlog' AND ready_at IS NULL AND NOT EXISTS(SELECT 1 FROM attempts WHERE task_id=tasks.id)))) FROM tasks WHERE id=?1", crate::permissions::ACTIONABLE_REQUEST_SQL),
             params![id], |row| Ok(TaskDto { id:row.get(0)?,project_id:row.get(1)?,title:row.get(2)?,description:row.get(3)?,acceptance_criteria:serde_json::from_str(&row.get::<_,String>(4)?).unwrap_or_default(),priority:row.get(5)?,manual_order:row.get(6)?,lifecycle:row.get(7)?,attention:row.get(8)?,version:row.get(9)?,archived:row.get::<_,Option<String>>(10)?.is_some(),can_archive:row.get(14)?,recipe_provenance:None,role_overrides:parse(row.get(11)?),legacy:parse(row.get(12)?),permission_waiting:row.get(13)?,dependencies:vec![],active_attempt:None,role_settings:vec![],reviews:vec![],snapshots:vec![],review_budgets:vec![],progress:None }))?;
@@ -4401,6 +4405,55 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             )
             .optional()?
             .map(parse);
+        if let Some(attempt) = task.active_attempt.as_ref() {
+            if let Some(attempt_id) = attempt.get("id").and_then(serde_json::Value::as_str) {
+                let pending = crate::trip::pending_attempt_migration(&connection, attempt_id)?;
+                let required = attempt
+                    .get("legacy_migration_required")
+                    .is_some_and(|value| {
+                        value.as_bool() == Some(true) || value.as_i64() == Some(1)
+                    });
+                if required || pending.is_some() {
+                    let (plan, config, blocker) = match pending {
+                        Some(Ok((plan, config))) => (Some(plan), Some(config), None),
+                        None => {
+                            let plan = attempt.get("plan_hash").and_then(serde_json::Value::as_str);
+                            let blocker = crate::trip::initial_attempt_migration_blocker(
+                                &connection,
+                                attempt_id,
+                                plan.unwrap_or_default(),
+                            )?
+                            .map(str::to_owned);
+                            (
+                                plan.map(str::to_owned),
+                                attempt
+                                    .get("config_revision_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned),
+                                blocker,
+                            )
+                        }
+                        Some(Err(reason)) => (None, None, Some(reason.to_owned())),
+                    };
+                    let enabled = blocker.is_none()
+                        && plan
+                            .as_deref()
+                            .is_some_and(|value| !value.trim().is_empty())
+                        && config
+                            .as_deref()
+                            .is_some_and(|value| !value.trim().is_empty());
+                    migration_actions.push(continuation(
+                        ContinuationActionKind::MigrateAttempt,
+                        enabled,
+                        blocker.as_deref().unwrap_or("Move this older task to the current workflow, or recover its already authorized migration, before continuing."),
+                        "human", None, None, None, "migrate_attempt",
+                        serde_json::json!({"task_id":task.id,"attempt_id":attempt_id,"expected_task_version":task.version,
+                            "plan_hash":plan,"config_revision_id":config}),
+                        Some("Moving it first checks that no agent is still running and that the current workflow settings apply."),
+                    ));
+                }
+            }
+        }
         task.role_settings = json_rows(&connection, "SELECT json_object('id',rs.id,'role',rs.role,'revision',rs.revision,'config',json(rs.config_json),'effective_generation_id',rs.effective_generation_id,'activation',(SELECT json_object('id',a.id,'source',CASE WHEN a.profile_json=json(rs.config_json) THEN 'task_override' ELSE 'task_override' END,'profile_hash',a.profile_hash,'project_config_revision_id',a.project_config_revision_id,'project_configuration_hash',a.project_configuration_hash,'adapter',a.adapter_name,'adapter_hash',a.adapter_hash,'capability_id',a.capability_id,'capability_key',a.capability_key,'capability_proof_hash',a.capability_proof_hash,'activated_at',a.activated_at) FROM trip_task_profile_activations a WHERE a.settings_id=rs.id ORDER BY a.activated_at DESC LIMIT 1)) FROM role_settings rs WHERE rs.task_id=?1 ORDER BY rs.role,rs.revision", &id)?;
         task.reviews = json_rows(&connection, "SELECT json_object('id',r.id,'kind',r.review_kind,'candidate_hash',r.candidate_hash,'delivery_state',r.delivery_state,'verdict',r.verdict,'feedback',r.feedback,'session_id',r.session_id,'role_generation_id',r.role_generation_id,'settings_revision',r.settings_revision,'ambiguity_state',r.ambiguity_state) FROM review_requests r JOIN attempts a ON a.id=r.attempt_id WHERE a.task_id=?1 ORDER BY r.created_at", &id)?;
         task.snapshots = json_rows(&connection, "SELECT json_object('id',s.id,'attempt_id',s.attempt_id,'kind',s.kind,'manifest_hash',s.manifest_hash,'manifest',json(s.manifest_json),'complete',s.complete,'created_at',s.created_at,'original_base',s.original_base,'candidate_head',s.candidate_head,'source_role_generation_id',s.source_role_generation_id,'source_settings_revision',s.source_settings_revision,'workspace_id',s.workspace_id,'workspace_hash',s.workspace_hash) FROM snapshots s JOIN attempts a ON a.id=s.attempt_id WHERE a.task_id=?1 ORDER BY s.created_at", &id)?;
@@ -4907,7 +4960,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             },
         });
     }
-    let continuation_actions = continuation_actions(
+    let mut continuation_actions = continuation_actions(
         &tasks,
         &capabilities,
         &active_sessions,
@@ -4921,6 +4974,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         &trip_lanes,
         &decisions,
     );
+    continuation_actions.extend(migration_actions);
     for setup in &mut trip_setups {
         let setup_receipts = setup
             .get("probe_receipts")
@@ -6556,24 +6610,6 @@ fn continuation_actions(
                     "authorize_implementation",
                     serde_json::json!({"task_id":task.id,"attempt_id":attempt_id,"expected_task_version":task.version,"plan_hash":attempt.get("plan_hash"),"config_revision_id":attempt.get("config_revision_id")}),
                     Some("Allowing implementation starts no agent call by itself; it applies only to this exact plan."),
-                ));
-            }
-            if attempt
-                .get("legacy_migration_required")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            {
-                actions.push(continuation(
-                    ContinuationActionKind::MigrateAttempt,
-                    attempt_id.is_some(),
-                    "This task was started with an older workflow version. Move it to the current workflow before it can continue.",
-                    "human",
-                    None,
-                    None,
-                    None,
-                    "migrate_attempt",
-                    serde_json::json!({"task_id":task.id,"attempt_id":attempt_id,"expected_task_version":task.version,"plan_hash":attempt.get("plan_hash"),"config_revision_id":attempt.get("config_revision_id")}),
-                    Some("Moving it first checks that no agent is still running and that the current workflow settings apply."),
                 ));
             }
         }
@@ -9275,7 +9311,7 @@ struct TerminalReplan<'a> {
 /// Holds and ownership that must be settled on the parent before a terminal
 /// replan is staged. `?1` is the parent attempt. A live manager is not listed:
 /// the coordinator stops it, and materialization waits for proof it exited.
-const TERMINAL_REPLAN_FENCES: &[(&str, &str)] = &[
+pub(crate) const TERMINAL_REPLAN_FENCES: &[(&str, &str)] = &[
     (
         "a review of the attempt is active or its delivery is uncertain",
         "SELECT EXISTS(SELECT 1 FROM review_requests WHERE attempt_id=?1

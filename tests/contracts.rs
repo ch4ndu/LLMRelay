@@ -1564,9 +1564,9 @@ fn seed_synthetic_installed_project(
     provider: Provider,
 ) {
     let package_root =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/trip-explorer/0.9.0");
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/trip-explorer/0.11.0");
     let source: serde_json::Value = serde_json::from_str(include_str!(
-        "../resources/trip-explorer/0.9.0/source-manifest.json"
+        "../resources/trip-explorer/0.11.0/source-manifest.json"
     ))
     .unwrap();
     let files = source["files"].as_object().unwrap();
@@ -1574,6 +1574,9 @@ fn seed_synthetic_installed_project(
     let mut base = serde_json::Map::new();
     let mut bin = serde_json::Map::new();
     for (relative, expected) in files {
+        if relative == "references/adaptation-contract.md" {
+            continue;
+        }
         let bytes = std::fs::read(package_root.join(relative)).unwrap();
         assert_eq!(sha256(&bytes), expected.as_str().unwrap());
         let base_path = state
@@ -1701,7 +1704,8 @@ fn seed_synthetic_installed_project(
     ).unwrap();
     connection.execute(
         "INSERT INTO trip_config_revisions(id,project_id,revision,state,config_json,adapters_json,preflight_json,verification_json,source_hash,overlay_hash,configuration_hash,created_at,activated_at)
-         VALUES(?1,?2,1,'activated',?3,?4,?5,?6,?7,?8,?9,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+         VALUES(?1,?2,(SELECT COALESCE(MAX(revision),0)+1 FROM trip_config_revisions WHERE project_id=?2),
+           'activated',?3,?4,?5,?6,?7,?8,?9,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
         params![revision, project_id, config.to_string(), adapters.to_string(), preflight.to_string(), config["verification"].to_string(), agenticjira::trip::source_hash(), agenticjira::trip::overlay_hash(), agenticjira::store::json_hash(&config).unwrap()],
     ).unwrap();
     connection
@@ -1830,7 +1834,7 @@ fn seed_supported_capabilities_for_config_with_runtime(
     let projects = {
         let mut statement = connection
             .prepare(
-                "SELECT p.id,p.repository_path,p.settings_json,p.version,s.setup_operation_id,
+                "SELECT p.id,p.repository_path,p.settings_json,p.version,setup.id,
                         s.active_config_revision_id,r.configuration_hash,r.config_json,r.adapters_json,
                         fixture.id,fixture.repository_path,fixture.repository_identity
                  FROM projects p JOIN trip_project_state s ON s.project_id=p.id
@@ -6446,6 +6450,65 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
     fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM trip_setup_profile_selections WHERE setup_operation_id='{setup}' AND selection_state='unselected'"), 5);
     record_synthetic_setup_observation(&fixture, &setup, RoleKind::Manager);
     fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM trip_preflight_receipts WHERE setup_operation_id='{setup}' AND role='manager' AND capability_key IS NOT NULL AND adapter_hash IS NOT NULL"), 1);
+    let draft_snapshot_sql = format!(
+        "SELECT json_array(proposal_json,proposal_hash,state) FROM trip_setup_operations WHERE id='{setup}'"
+    );
+    let draft_before_rejections: String = fixture.scalar(&draft_snapshot_sql);
+    std::fs::create_dir(repository.join("guides")).unwrap();
+    let mut directory_guidance = setup_proposal(&manager);
+    directory_guidance["guidance"] = serde_json::json!(["AGENTS.md", "guides"]);
+    let error = execute_trip(
+        &fixture,
+        &paths,
+        "reject-directory-guidance",
+        &TripHumanAction::SaveSetupDraft {
+            setup_operation_id: setup.clone(),
+            expected_project_version: 1,
+            proposal: directory_guidance,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("Select the individual regular files"),
+        "{error}"
+    );
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT COUNT(*) FROM trip_frozen_install_files WHERE setup_operation_id='{setup}'"
+        ),
+        0,
+    );
+    let mut customized_proposal = setup_proposal(&manager);
+    customized_proposal["project_policy"] =
+        serde_json::json!({"owner":"project", "keep":["local"]});
+    customized_proposal["profiles"]["unused"] = customized_proposal["profiles"]["readonly"].clone();
+    customized_proposal["profiles"]["unused"]["provider"] = "unused-provider".into();
+    customized_proposal["profiles"]["readonly"]["display_label"] =
+        "Retained project reviewer".into();
+    customized_proposal["adapters"]["adapters"]["codex"]["project_annotation"] =
+        "Retain local adapter policy".into();
+    customized_proposal["adapters"]["adapters"]["unused"] = serde_json::json!({
+        "kind":"custom-cli", "provider":"custom", "executable":"/usr/bin/false",
+        "invocation":{"arguments":["{prompt_file}"]},
+        "capabilities":{"fresh_session":true,"read_only":true,"resume":true,"workspace_write":true}
+    });
+    let mut prohibited_proposal = customized_proposal.clone();
+    prohibited_proposal["project_policy"]["access_token"] = "never-persist".into();
+    assert!(execute_trip(
+        &fixture,
+        &paths,
+        "reject-extra-secret",
+        &TripHumanAction::SaveSetupDraft {
+            setup_operation_id: setup.clone(),
+            expected_project_version: 1,
+            proposal: prohibited_proposal,
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("cannot contain credentials"));
+    fixture.assert_scalar::<String>(&draft_snapshot_sql, draft_before_rejections);
     let saved = execute_trip(
         &fixture,
         &paths,
@@ -6453,7 +6516,7 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
         &TripHumanAction::SaveSetupDraft {
             setup_operation_id: setup.clone(),
             expected_project_version: 1,
-            proposal: setup_proposal(&manager),
+            proposal: customized_proposal,
         },
     )
     .unwrap();
@@ -6512,6 +6575,36 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
     .to_string()
     .contains("role explorer selected profile readonly lacks successful live preflight"));
     record_synthetic_setup_observation(&fixture, &setup, RoleKind::Explorer);
+    let explorer_session: String = fixture.scalar(&format!(
+        "SELECT s.id FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
+         JOIN attempts a ON a.id=rg.attempt_id WHERE a.setup_operation_id='{setup}' AND rg.role='explorer'"
+    ));
+    fixture.execute(
+        "UPDATE sessions SET workflow_hash='prior-workflow-proof' WHERE id=?1",
+        params![explorer_session],
+    );
+    assert!(execute_trip(
+        &fixture,
+        &paths,
+        "reject-stale-workflow-proof",
+        &TripHumanAction::FinalizeInstallation {
+            setup_operation_id: setup.clone(),
+            proposal_hash: proposal.clone(),
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("lacks successful live preflight"));
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT COUNT(*) FROM trip_frozen_install_files WHERE setup_operation_id='{setup}'"
+        ),
+        0,
+    );
+    fixture.execute(
+        "UPDATE sessions SET workflow_hash=?1 WHERE id=?2",
+        params![workflow_resources::workflow_hash(), explorer_session],
+    );
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM capabilities WHERE status='supported'",
         0,
@@ -6674,6 +6767,35 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
     )
     .unwrap();
     assert_eq!(installed_preflight["receipts"].as_array().unwrap().len(), 5);
+    let installed_config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(repository.join(".agents/trip-explorer/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(installed_config["project_policy"]["owner"], "project");
+    assert_eq!(
+        installed_config["profiles"]["unused"]["provider"],
+        "unused-provider"
+    );
+    assert_eq!(
+        installed_config["profiles"]["readonly"]["display_label"],
+        "Retained project reviewer"
+    );
+    let installed_adapters: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(repository.join(".agents/trip-explorer/adapters.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        installed_adapters["adapters"]["codex"]["project_annotation"],
+        "Retain local adapter policy"
+    );
+    let installed_manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(repository.join(".agents/trip-explorer/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(installed_manifest["bin"].as_object().unwrap().len(), 9);
+    assert!(installed_manifest["base"]
+        .get("references/adaptation-contract.md")
+        .is_none());
     assert_eq!(
         installed_preflight["llmrelay"]["host_manager_receipt"]["role"],
         "manager"
@@ -8004,6 +8126,26 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
     )
     .unwrap();
     let revised_setup = revised.entity_id;
+    let revised_proposal: serde_json::Value = serde_json::from_str(&fixture.scalar::<String>(
+        &format!("SELECT proposal_json FROM trip_setup_operations WHERE id='{revised_setup}'"),
+    ))
+    .unwrap();
+    assert_eq!(
+        revised_proposal["project_policy"],
+        installed_config["project_policy"]
+    );
+    assert_eq!(
+        revised_proposal["profiles"]["unused"],
+        installed_config["profiles"]["unused"]
+    );
+    assert_eq!(
+        revised_proposal["adapters"]["adapters"]["unused"]["kind"],
+        "custom-cli"
+    );
+    assert_eq!(
+        revised_proposal["adapters"]["adapters"]["codex"]["project_annotation"],
+        installed_adapters["adapters"]["codex"]["project_annotation"]
+    );
     assert_eq!(
         revised.detail["affected_proof_roles"],
         serde_json::json!(["explorer"])
@@ -12297,7 +12439,7 @@ fn blocked_role_result_invalidates_transition_authority_and_acceptance() {
 #[test]
 fn source_manifest_provenance_is_portable_and_stale_workspace_or_session_pins_fail_closed() {
     let manifest: serde_json::Value = serde_json::from_str(include_str!(
-        "../resources/trip-explorer/0.9.0/source-manifest.json"
+        "../resources/trip-explorer/0.11.0/source-manifest.json"
     ))
     .unwrap();
     let repository = manifest["source_repository"].as_str().unwrap();
@@ -12305,7 +12447,7 @@ fn source_manifest_provenance_is_portable_and_stale_workspace_or_session_pins_fa
     assert_eq!(repository, "trip-explorer-workflow");
     assert!(!repository.starts_with('/'));
     assert!(!repository.contains("/Users/"));
-    assert_eq!(source_head, "a7c53c4e5cfbdab4c66eafc84f79c0c73dc80ef7");
+    assert_eq!(source_head, "c7b360b84f9457a1c6800563391256f08d9f43e3");
 
     let fixture = Fixture::new("stale-workspace-session-pins");
     let (_, _, plan) = new_task(&fixture, "pins", "pins-task");
@@ -12898,12 +13040,518 @@ fn trip_review_budgets_and_final_sessions_preserve_fresh_only_compatibility() {
 }
 
 #[test]
+fn trip_standalone_adoption_requires_approval_and_retains_database_activation() {
+    let fixture = Fixture::new("standalone-adoption");
+    let repository = fixture.repository("repo");
+    let project = add_project(&fixture, repository.clone(), "standalone-adoption");
+    let paths = instance_paths(&fixture);
+    let manager = role_override(Provider::Codex);
+    let proposal = setup_proposal(&manager);
+    let task = create_task(&fixture, &project, "Prior workflow task", 1);
+    fixture.assert_scalar::<String>(
+        &format!("SELECT lifecycle FROM tasks WHERE id='{task}'"),
+        "ready".into(),
+    );
+    assert_eq!(
+        agenticjira::trip::start_baseline_problem(&fixture.connection(), &project, true).unwrap(),
+        None,
+    );
+    let attempt = claim(&fixture, fixture.root.join("artifacts"));
+    assert_eq!(attempt.task_id, task);
+    authorize_ordinary_implementation(&fixture, &attempt);
+    let reviewed_plan: String = fixture.scalar(&format!(
+        "SELECT plan_hash FROM attempts WHERE id='{}'",
+        attempt.attempt_id
+    ));
+    let manifest_path = repository.join(".agents/trip-explorer/manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["llmrelay"] = serde_json::json!({"workflow_id":"trip-explorer-0.9.0-llmrelay-1","upstream_source_hash":"historical","overlay_hash":"historical"});
+    manifest["upgrade"] = serde_json::json!({"from_version":"0.9.0"});
+    manifest["upgraded_at"] = "2026-10-03T00:00:00Z".into();
+    manifest["skills_root"] = ".agents/skills".into();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let observation =
+        agenticjira::trip::inspect_registered_project(&fixture.store, &project).unwrap();
+    assert_eq!(observation["observation"]["kind"], "compatible");
+    assert_eq!(observation["readiness"], "needs_upgrade_review");
+    let mut missing_host = proposal.clone();
+    missing_host.as_object_mut().unwrap().remove("host_manager");
+    assert!(execute_trip(
+        &fixture,
+        &paths,
+        "adopt-without-host",
+        &TripHumanAction::AdoptInstallation {
+            project_id: project.clone(),
+            expected_project_version: 2,
+            configuration: missing_host,
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("host_manager is required"));
+    assert!(execute_trip(
+        &fixture,
+        &paths,
+        "adopt-with-current-attempt",
+        &TripHumanAction::AdoptInstallation {
+            project_id: project.clone(),
+            expected_project_version: 2,
+            configuration: proposal.clone(),
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("current-workflow attempts to finish"));
+    fixture.execute("UPDATE attempts SET workflow_version='trip-explorer-0.9.0-llmrelay-1',workflow_hash='old',legacy_migration_required=0 WHERE id=?1", params![attempt.attempt_id]);
+    let old_source: serde_json::Value = serde_json::from_str(include_str!(
+        "../resources/trip-explorer/0.9.0/source-manifest.json"
+    ))
+    .unwrap();
+    let old_source_hash = sha256(include_bytes!(
+        "../resources/trip-explorer/0.9.0/source-manifest.json"
+    ));
+    let old_workflow_hash = sha256(include_bytes!(
+        "../resources/workflows/trip-explorer-0.9.0-llmrelay-1.json"
+    ));
+    let old_overlay_hash = sha256(b"historical 0.9 app overlay");
+    let mut old_policy: serde_json::Value =
+        serde_json::from_str(&fixture.scalar::<String>(&format!(
+            "SELECT policy_json FROM workspaces WHERE attempt_id='{}'",
+            attempt.attempt_id
+        )))
+        .unwrap();
+    let mut old_manifest = manifest.clone();
+    old_manifest["version"] = "0.9.0".into();
+    old_manifest["base"] = serde_json::json!({});
+    old_manifest["bin"] = serde_json::json!({});
+    for (relative, hash) in old_source["files"].as_object().unwrap() {
+        if relative == "references/adaptation-contract.md" {
+            continue;
+        }
+        let bytes = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources/trip-explorer/0.9.0")
+                .join(relative),
+        )
+        .unwrap();
+        assert_eq!(sha256(&bytes), hash.as_str().unwrap());
+        let base = format!(".agents/trip-explorer/base/0.9.0/{relative}");
+        let destination = attempt.workspace_path.join(&base);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(destination, &bytes).unwrap();
+        old_policy["files"][&base] = hash.clone();
+        old_manifest["base"][relative] = hash.clone();
+        let active = if let Some(path) = relative.strip_prefix("skills/") {
+            format!(".agents/skills/{path}")
+        } else {
+            let path = relative.strip_prefix("bin/").unwrap();
+            old_manifest["bin"][path] = hash.clone();
+            format!(".agents/trip-explorer/bin/{path}")
+        };
+        std::fs::create_dir_all(attempt.workspace_path.join(&active).parent().unwrap()).unwrap();
+        std::fs::write(attempt.workspace_path.join(&active), bytes).unwrap();
+        old_policy["files"][&active] = hash.clone();
+    }
+    old_manifest["llmrelay"] = serde_json::json!({"workflow_id":"trip-explorer-0.9.0-llmrelay-1",
+        "upstream_source_hash":old_source_hash,"overlay_hash":old_overlay_hash});
+    let old_manifest_bytes = serde_json::to_vec_pretty(&old_manifest).unwrap();
+    std::fs::write(
+        attempt
+            .workspace_path
+            .join(".agents/trip-explorer/manifest.json"),
+        &old_manifest_bytes,
+    )
+    .unwrap();
+    old_policy["files"][".agents/trip-explorer/manifest.json"] = sha256(&old_manifest_bytes).into();
+    old_policy["manifest_hash"] = sha256(&old_manifest_bytes).into();
+    old_policy["workflow_id"] = "trip-explorer-0.9.0-llmrelay-1".into();
+    old_policy["upstream_source_hash"] = old_source_hash.clone().into();
+    old_policy["overlay_hash"] = old_overlay_hash.clone().into();
+    fixture.execute(
+        "UPDATE trip_config_revisions SET source_hash=?1,overlay_hash=?2
+        WHERE id=(SELECT active_config_revision_id FROM trip_project_state WHERE project_id=?3)",
+        params![old_source_hash, old_overlay_hash, project],
+    );
+    fixture.execute(
+        "UPDATE attempts SET upstream_source_hash=?1,overlay_hash=?2,workflow_hash=?3 WHERE id=?4",
+        params![
+            old_source_hash,
+            old_overlay_hash,
+            old_workflow_hash,
+            attempt.attempt_id
+        ],
+    );
+    fixture.execute(
+        "UPDATE trip_structured_plans SET workflow_id='trip-explorer-0.9.0-llmrelay-1'
+        WHERE id=(SELECT structured_plan_id FROM attempts WHERE id=?1)",
+        params![attempt.attempt_id],
+    );
+    fixture.execute(
+        "UPDATE workspaces SET policy_json=?1 WHERE attempt_id=?2",
+        params![old_policy.to_string(), attempt.attempt_id],
+    );
+    std::fs::write(
+        attempt.workspace_path.join("source-edit.txt"),
+        "retained source edit\n",
+    )
+    .unwrap();
+    let state = workflow::state(&fixture.store).unwrap();
+    assert!(!serde_json::to_string(&state.continuation_actions)
+        .unwrap()
+        .contains("migrate_attempt"));
+    let original_policy = std::fs::read(attempt.workspace_path.join("AGENTS.md")).unwrap();
+    for (metadata, expected_version) in [("stale", 2), ("absent", 3)] {
+        if metadata == "absent" {
+            manifest.as_object_mut().unwrap().remove("llmrelay");
+            std::fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                agenticjira::trip::inspect_registered_project(&fixture.store, &project).unwrap()
+                    ["readiness"],
+                "needs_upgrade_review"
+            );
+        }
+        let setup = execute_trip(
+            &fixture,
+            &paths,
+            &format!("begin-adoption-{metadata}"),
+            &TripHumanAction::BeginSetup {
+                project_id: project.clone(),
+                expected_project_version: expected_version,
+                host_manager: manager.clone(),
+            },
+        )
+        .unwrap()
+        .entity_id;
+        record_synthetic_setup_observation(&fixture, &setup, RoleKind::Manager);
+        let saved = execute_trip(
+            &fixture,
+            &paths,
+            &format!("save-adoption-{metadata}"),
+            &TripHumanAction::SaveSetupDraft {
+                setup_operation_id: setup.clone(),
+                expected_project_version: expected_version,
+                proposal: proposal.clone(),
+            },
+        )
+        .unwrap();
+        execute_trip(
+            &fixture,
+            &paths,
+            &format!("authorize-adoption-{metadata}"),
+            &TripHumanAction::AuthorizeSetupProbes {
+                setup_operation_id: setup.clone(),
+                proposal_hash: saved.detail["proposal_hash"].as_str().unwrap().into(),
+            },
+        )
+        .unwrap();
+        let rejection = execute_trip(
+            &fixture,
+            &paths,
+            &format!("adopt-{metadata}-without-service-proofs"),
+            &TripHumanAction::AdoptInstallation {
+                project_id: project.clone(),
+                expected_project_version: expected_version,
+                configuration: proposal.clone(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            rejection.contains(
+                "installation requires a current exact capability and adapter-bound proof for role explorer"
+            ),
+            "{metadata}: {rejection}"
+        );
+        fixture.assert_scalar::<i64>(
+            &format!(
+                "SELECT legacy_migration_required FROM attempts WHERE id='{}'",
+                attempt.attempt_id
+            ),
+            if metadata == "stale" { 0 } else { 1 },
+        );
+        for role in [
+            RoleKind::Explorer,
+            RoleKind::PlanReviewer,
+            RoleKind::Implementer,
+            RoleKind::CodeReviewer,
+            RoleKind::FinalReviewer,
+        ] {
+            record_synthetic_setup_observation(&fixture, &setup, role);
+        }
+        let installed_before = std::fs::read(&manifest_path).unwrap();
+        let adopted = execute_trip(
+            &fixture,
+            &paths,
+            &format!("adopt-approved-{metadata}"),
+            &TripHumanAction::AdoptInstallation {
+                project_id: project.clone(),
+                expected_project_version: expected_version,
+                configuration: proposal.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(adopted.state, "trip_adopted");
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), installed_before);
+        assert_eq!(
+            std::fs::read(attempt.workspace_path.join("AGENTS.md")).unwrap(),
+            original_policy
+        );
+        fixture.assert_scalar::<i64>(
+            &format!(
+                "SELECT legacy_migration_required FROM attempts WHERE id='{}'",
+                attempt.attempt_id
+            ),
+            1,
+        );
+        fixture.assert_scalar::<i64>(
+            &format!("SELECT version FROM projects WHERE id='{project}'"),
+            expected_version + 1,
+        );
+        let observation =
+            agenticjira::trip::inspect_registered_project(&fixture.store, &project).unwrap();
+        assert_eq!(observation["observation"]["kind"], "compatible");
+        assert_eq!(observation["readiness"], "ready");
+        let state = workflow::state(&fixture.store).unwrap();
+        let migration = state
+            .continuation_actions
+            .iter()
+            .find(|action| action.operation == "migrate_attempt")
+            .unwrap();
+        assert!(migration.enabled, "{}", migration.reason);
+        assert_eq!(migration.binding["task_id"], task);
+        assert_eq!(migration.binding["attempt_id"], attempt.attempt_id);
+        assert_eq!(migration.binding["expected_task_version"], 2);
+        assert_eq!(migration.binding["plan_hash"], reviewed_plan);
+        assert!(migration.binding["config_revision_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+    }
+    let state = workflow::state(&fixture.store).unwrap();
+    let binding = &state
+        .continuation_actions
+        .iter()
+        .find(|action| action.operation == "migrate_attempt")
+        .unwrap()
+        .binding;
+    let old_skill = attempt
+        .workspace_path
+        .join(".agents/skills/trip-explorer-workflow/SKILL.md");
+    let approved_old_skill = std::fs::read(&old_skill).unwrap();
+    assert_ne!(
+        approved_old_skill,
+        std::fs::read(repository.join(".agents/skills/trip-explorer-workflow/SKILL.md")).unwrap()
+    );
+    let action = TripHumanAction::MigrateAttempt {
+        task_id: task.clone(),
+        attempt_id: attempt.attempt_id.clone(),
+        expected_task_version: 2,
+        reviewed_plan_hash: reviewed_plan.clone(),
+        config_revision_id: binding["config_revision_id"].as_str().unwrap().into(),
+    };
+    seed_supported_capabilities(&fixture);
+    let claim_sql = format!("SELECT json_array(id,state,attempt_id,repository_identity,process_identity_json) FROM claims WHERE attempt_id='{}'", attempt.attempt_id);
+    let claim_before: String = fixture.scalar(&claim_sql);
+    let installed_manifest = std::fs::read(&manifest_path).unwrap();
+    std::fs::write(&manifest_path, "interrupted target manifest\n").unwrap();
+    let error = execute_trip(
+        &fixture,
+        &paths,
+        "interrupt-before-policy-materialization",
+        &action,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("activated manifest drifted before worktree materialization"),
+        "{error:#}"
+    );
+    std::fs::write(&manifest_path, &installed_manifest).unwrap();
+    assert_eq!(std::fs::read(&old_skill).unwrap(), approved_old_skill);
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT policy_json FROM workspaces WHERE attempt_id='{}'",
+            attempt.attempt_id
+        ),
+        old_policy.to_string(),
+    );
+    assert!(scheduler(&fixture, paths.artifacts.clone())
+        .reconcile_unknown()
+        .unwrap()
+        .is_empty());
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT status FROM attempts WHERE id='{}'",
+            attempt.attempt_id
+        ),
+        "needs_recovery".into(),
+    );
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT state FROM workspaces WHERE attempt_id='{}'",
+            attempt.attempt_id
+        ),
+        "recovery_required".into(),
+    );
+    fixture.assert_scalar::<String>(
+        &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+        "needs_recovery".into(),
+    );
+    fixture.assert_scalar::<String>(&claim_sql, claim_before.clone());
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM trip_legacy_migrations", 1);
+    assert!(scheduler(&fixture, paths.artifacts.clone())
+        .claim_next()
+        .unwrap()
+        .is_none());
+    let state = workflow::state(&fixture.store).unwrap();
+    let pending = state
+        .continuation_actions
+        .iter()
+        .find(|action| action.operation == "migrate_attempt")
+        .unwrap();
+    assert!(pending.enabled, "{}", pending.reason);
+    assert_eq!(pending.binding["task_id"], task);
+    assert_eq!(pending.binding["attempt_id"], attempt.attempt_id);
+    assert_eq!(pending.binding["expected_task_version"], 3);
+    assert_eq!(pending.binding["plan_hash"], reviewed_plan);
+    assert_eq!(
+        pending.binding["config_revision_id"],
+        binding["config_revision_id"]
+    );
+    let mut recovery = action;
+    if let TripHumanAction::MigrateAttempt {
+        expected_task_version,
+        ..
+    } = &mut recovery
+    {
+        *expected_task_version = 3;
+    }
+    for field in ["reviewed_plan_hash", "config_revision_id"] {
+        let mut wrong_binding = serde_json::to_value(&recovery).unwrap();
+        wrong_binding[field] = "wrong-binding".into();
+        let wrong_binding: TripHumanAction = serde_json::from_value(wrong_binding).unwrap();
+        assert!(execute_trip(
+            &fixture,
+            &paths,
+            &format!("refuse-recovery-{field}"),
+            &wrong_binding
+        )
+        .is_err());
+        fixture.assert_scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"), 3);
+        fixture.assert_scalar::<String>(&claim_sql, claim_before.clone());
+        assert_eq!(std::fs::read(&old_skill).unwrap(), approved_old_skill);
+    }
+    let target_manifest: String =
+        fixture.scalar("SELECT target_manifest_hash FROM trip_legacy_migrations");
+    fixture.execute(
+        "UPDATE trip_legacy_migrations SET target_manifest_hash='wrong-target'",
+        [],
+    );
+    assert!(scheduler(&fixture, paths.artifacts.clone())
+        .reconcile_unknown()
+        .unwrap()
+        .is_empty());
+    let state = workflow::state(&fixture.store).unwrap();
+    assert!(
+        !state
+            .continuation_actions
+            .iter()
+            .find(|action| action.operation == "migrate_attempt")
+            .unwrap()
+            .enabled
+    );
+    assert!(execute_trip(&fixture, &paths, "refuse-recovery-target", &recovery).is_err());
+    fixture.assert_scalar::<String>(&claim_sql, claim_before);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+    fixture.assert_scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"), 3);
+    assert_eq!(std::fs::read(&old_skill).unwrap(), approved_old_skill);
+    fixture.execute(
+        "UPDATE trip_legacy_migrations SET target_manifest_hash=?1",
+        params![target_manifest],
+    );
+    std::fs::write(&old_skill, "unexpected preimage\n").unwrap();
+    let error =
+        execute_trip(&fixture, &paths, "migrate-unexpected-preimage", &recovery).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("policy materialization collision"),
+        "{error:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&old_skill).unwrap(),
+        "unexpected preimage\n"
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM trip_legacy_migrations", 1);
+    fixture.assert_scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"), 3);
+    std::fs::write(&old_skill, approved_old_skill).unwrap();
+    execute_trip(&fixture, &paths, "recover-actual-old-workflow", &recovery).unwrap();
+    assert_eq!(
+        std::fs::read(&old_skill).unwrap(),
+        std::fs::read(repository.join(".agents/skills/trip-explorer-workflow/SKILL.md")).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(
+            attempt
+                .workspace_path
+                .join(".agents/trip-explorer/bin/cmux_role_runner.py")
+        )
+        .unwrap(),
+        std::fs::read(repository.join(".agents/trip-explorer/bin/cmux_role_runner.py")).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(attempt.workspace_path.join("AGENTS.md")).unwrap(),
+        original_policy
+    );
+    assert_eq!(
+        std::fs::read_to_string(attempt.workspace_path.join("source-edit.txt")).unwrap(),
+        "retained source edit\n"
+    );
+    assert_eq!(
+        std::fs::read(
+            attempt
+                .workspace_path
+                .join(".agents/trip-explorer/base/0.9.0/skills/trip-explorer-workflow/SKILL.md")
+        )
+        .unwrap(),
+        std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources/trip-explorer/0.9.0/skills/trip-explorer-workflow/SKILL.md")
+        )
+        .unwrap()
+    );
+    std::fs::write(
+        repository.join(".agents/trip-explorer/bin/check_evidence.py"),
+        "drifted helper\n",
+    )
+    .unwrap();
+    assert_ne!(
+        agenticjira::trip::inspect_registered_project(&fixture.store, &project).unwrap()
+            ["readiness"],
+        "ready"
+    );
+}
+
+#[test]
 fn trip_legacy_migration_preserves_review_accounting_and_lineage() {
     let fixture = Fixture::new("trip-legacy-migration");
     let (project, task, plan) = new_task(&fixture, "legacy", "legacy-task");
     let connection = fixture.connection();
     connection.execute(
-        "UPDATE attempts SET workflow_version='trip-v1',workflow_hash='legacy',legacy_migration_required=1 WHERE id=?1",
+        "UPDATE attempts SET workflow_version='trip-v1',workflow_hash='legacy',legacy_migration_required=1,
+         phase='awaiting_human_review',plan_hash='old-plan',candidate_hash='old-candidate',
+         plan_approved_at='2026-01-01T00:00:00Z',human_acceptance_at='2026-01-01T00:00:00Z',
+         selected_checks_revision=3,manager_conformance_revision=4 WHERE id=?1",
+        params![plan.attempt_id],
+    ).unwrap();
+    connection.execute(
+        "UPDATE workspaces SET policy_json=json_set(policy_json,'$.workflow_id','trip-v1') WHERE attempt_id=?1",
         params![plan.attempt_id],
     ).unwrap();
     connection
@@ -12919,17 +13567,126 @@ fn trip_legacy_migration_preserves_review_accounting_and_lineage() {
             |row| row.get(0),
         )
         .unwrap();
+    connection.execute(
+        "INSERT INTO trip_legacy_migrations(id,attempt_id,from_workflow_id,to_workflow_id,preserved_json,
+         reviewed_plan_hash,config_revision_id,authorized_at) VALUES('historical-migration',?1,'older-workflow','trip-v1',
+         '{\"history\":true}','historical-approved-plan',?2,'2026-01-01T00:00:00Z')",
+        params![plan.attempt_id,revision],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,prompt_hash,handoff_hash,
+         delivery_state,verdict,created_at,updated_at) VALUES('historical-plan-review',?1,'plan','old-plan','p','h',
+         'finished','approved','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![plan.attempt_id],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO trip_structured_plans(id,attempt_id,plan_hash,plan_json,workflow_id,profile_revision_id,
+            criteria_hash,verification_hash,ownership_hash,conformance_hash,created_at)
+         VALUES('historical-structured-plan',?1,'old-plan','{}','trip-v1',?2,'c','v','o','f','2026-01-01T00:00:00Z')",
+        params![plan.attempt_id,revision],
+    ).unwrap();
+    connection
+        .execute(
+            "UPDATE attempts SET structured_plan_id='historical-structured-plan' WHERE id=?1",
+            params![plan.attempt_id],
+        )
+        .unwrap();
+    let workspace = plan.workspace_path.clone();
+    std::fs::write(
+        workspace.join("source-edit.txt"),
+        "retained implementation work\n",
+    )
+    .unwrap();
     let paths = InstancePaths::resolve(Some(fixture.root.join("instance"))).unwrap();
+    let migration = |hash: &str| TripHumanAction::MigrateAttempt {
+        task_id: task.clone(),
+        attempt_id: plan.attempt_id.clone(),
+        expected_task_version: 2,
+        reviewed_plan_hash: hash.into(),
+        config_revision_id: revision.clone(),
+    };
+    for cause in ["planless", "draft", "mismatched_row"] {
+        match cause {
+            "planless" => fixture.execute("UPDATE attempts SET plan_hash=NULL,structured_plan_id=NULL WHERE id=?1", params![plan.attempt_id]),
+            "draft" => fixture.execute("UPDATE attempts SET plan_hash='old-plan',structured_plan_id='historical-structured-plan' WHERE id=?1", params![plan.attempt_id]),
+            _ => fixture.execute("UPDATE trip_structured_plans SET plan_hash='other-plan',approved_at='2026-01-01T00:00:00Z' WHERE id='historical-structured-plan'", []),
+        }
+        let state = workflow::state(&fixture.store).unwrap();
+        let action = state
+            .continuation_actions
+            .iter()
+            .find(|action| action.operation == "migrate_attempt")
+            .unwrap();
+        assert!(!action.enabled, "{cause}");
+        assert!(
+            action.reason.contains("start a fresh task"),
+            "{}",
+            action.reason
+        );
+        let before: String = fixture.scalar("SELECT json_array(a.workflow_version,a.legacy_migration_required,a.phase,a.plan_hash,a.structured_plan_id,
+            a.plan_approved_at,a.candidate_hash,a.selected_checks_revision,a.manager_conformance_revision,t.version,w.state,w.policy_json)
+            FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN workspaces w ON w.attempt_id=a.id");
+        let error = execute_trip(
+            &fixture,
+            &paths,
+            &format!("reject-unreviewed-{cause}"),
+            &migration("old-plan"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("current reviewed structured-plan hash"),
+            "{cause}: {error:#}"
+        );
+        fixture.assert_scalar::<String>("SELECT json_array(a.workflow_version,a.legacy_migration_required,a.phase,a.plan_hash,a.structured_plan_id,
+            a.plan_approved_at,a.candidate_hash,a.selected_checks_revision,a.manager_conformance_revision,t.version,w.state,w.policy_json)
+            FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN workspaces w ON w.attempt_id=a.id", before);
+        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM trip_legacy_migrations", 1);
+        fixture.assert_scalar::<i64>(
+            "SELECT spent FROM review_budgets WHERE review_kind='plan'",
+            1,
+        );
+        fixture.assert_scalar::<String>(
+            "SELECT verdict FROM review_requests WHERE id='historical-plan-review'",
+            "approved".into(),
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("source-edit.txt")).unwrap(),
+            "retained implementation work\n"
+        );
+    }
+    fixture.execute("UPDATE trip_structured_plans SET plan_hash='old-plan',approved_at=NULL,
+        review_request_id='historical-plan-review',reviewed_at='2026-01-01T00:00:00Z' WHERE id='historical-structured-plan'", []);
+    let state = workflow::state(&fixture.store).unwrap();
+    let action = state
+        .continuation_actions
+        .iter()
+        .find(|action| action.operation == "migrate_attempt")
+        .unwrap();
+    assert!(action.enabled, "{}", action.reason);
+    assert_eq!(action.binding["plan_hash"], "old-plan");
+    let error = execute_trip(
+        &fixture,
+        &paths,
+        "reject-wrong-reviewed-hash",
+        &migration("unrelated-plan"),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("current reviewed structured-plan hash"),
+        "{error:#}"
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM trip_legacy_migrations", 1);
+    fixture.assert_scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"), 2);
     let result = execute_trip(
         &fixture,
         &paths,
         "reviewed-legacy-migration",
         &TripHumanAction::MigrateAttempt {
-            task_id: task,
+            task_id: task.clone(),
             attempt_id: plan.attempt_id.clone(),
             expected_task_version: 2,
-            reviewed_plan_hash: "reviewed-migration-plan".into(),
-            config_revision_id: revision,
+            reviewed_plan_hash: "old-plan".into(),
+            config_revision_id: revision.clone(),
         },
     )
     .unwrap();
@@ -12939,7 +13696,647 @@ fn trip_legacy_migration_preserves_review_accounting_and_lineage() {
         1,
     );
     fixture.assert_scalar::<i64>("SELECT legacy_migration_required FROM attempts", 0);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM trip_legacy_migrations", 2);
+    fixture.assert_scalar::<String>(
+        "SELECT reviewed_plan_hash FROM trip_legacy_migrations WHERE id='historical-migration'",
+        "historical-approved-plan".into(),
+    );
+    fixture.assert_scalar::<String>("SELECT phase FROM attempts", "planning".into());
+    fixture.assert_scalar::<i64>("SELECT plan_hash IS NULL AND candidate_hash IS NULL AND plan_approved_at IS NULL AND human_acceptance_at IS NULL AND structured_plan_id IS NULL AND accepted_snapshot_id IS NULL FROM attempts", 1);
+    fixture.assert_scalar::<i64>("SELECT selected_checks_revision FROM attempts", 4);
+    fixture.assert_scalar::<i64>("SELECT manager_conformance_revision FROM attempts", 5);
+    fixture.assert_scalar::<String>(
+        "SELECT verdict FROM review_requests WHERE id='historical-plan-review'",
+        "approved".into(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("source-edit.txt")).unwrap(),
+        "retained implementation work\n"
+    );
+    let version = result.version.unwrap();
+    assert!(workflow::execute(
+        &fixture.store,
+        &HumanCommand::ApprovePlan {
+            operation_id: "reject-old-migration-approval".into(),
+            task_id: task.clone(),
+            attempt_id: plan.attempt_id.clone(),
+            expected_version: version,
+            plan_hash: "old-plan".into(),
+        }
+    )
+    .is_err());
+    assert!(execute_trip(
+        &fixture,
+        &paths,
+        "reject-published-migration-replay",
+        &TripHumanAction::MigrateAttempt {
+            task_id: task.clone(),
+            attempt_id: plan.attempt_id.clone(),
+            expected_task_version: version,
+            reviewed_plan_hash: "old-plan".into(),
+            config_revision_id: revision.clone(),
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("already been published"));
+    fixture.execute(
+        "UPDATE attempts SET status='needs_recovery' WHERE id=?1",
+        params![plan.attempt_id],
+    );
+    fixture.execute(
+        "UPDATE workspaces SET state='recovery_required' WHERE attempt_id=?1",
+        params![plan.attempt_id],
+    );
+    fixture.execute(
+        "UPDATE tasks SET attention='needs_recovery' WHERE id=?1",
+        params![task],
+    );
+    assert!(execute_trip(
+        &fixture,
+        &paths,
+        "reject-completed-receipt-after-later-hold",
+        &TripHumanAction::MigrateAttempt {
+            task_id: task.clone(),
+            attempt_id: plan.attempt_id.clone(),
+            expected_task_version: version,
+            reviewed_plan_hash: "old-plan".into(),
+            config_revision_id: revision,
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("already been published"));
+    fixture.assert_scalar::<i64>(
+        &format!("SELECT version FROM tasks WHERE id='{task}'"),
+        version,
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM trip_legacy_migrations", 2);
+    fixture.assert_scalar::<i64>(
+        "SELECT spent FROM review_budgets WHERE review_kind='plan'",
+        1,
+    );
+}
+
+#[test]
+fn trip_migration_freezes_authorized_guidance_for_exact_recovery() {
+    let fixture = Fixture::new("migration-guidance");
+    let paths = instance_paths(&fixture);
+    let project = add_project(&fixture, fixture.repository("repo"), "guidance");
+    let revision: String = fixture.scalar(&format!(
+        "SELECT active_config_revision_id FROM trip_project_state WHERE project_id='{project}'"
+    ));
+    let config_json: String = fixture.scalar(&format!(
+        "SELECT config_json FROM trip_config_revisions WHERE id='{revision}'"
+    ));
+    let mut config: serde_json::Value = serde_json::from_str(&config_json).unwrap();
+    config["guidance"] = serde_json::json!(["AGENTS.md", "fixture.txt"]);
+    fixture.execute(
+        "UPDATE trip_config_revisions SET config_json=?1,configuration_hash=?2 WHERE id=?3",
+        params![
+            config.to_string(),
+            agenticjira::store::json_hash(&config).unwrap(),
+            revision
+        ],
+    );
+    let task = create_task(&fixture, &project, "guidance-task", 1);
+    let plan = claim(&fixture, paths.artifacts.clone());
+    let workspace = &plan.workspace_path;
+    let policy_json: String = fixture.scalar(&format!(
+        "SELECT policy_json FROM workspaces WHERE attempt_id='{}'",
+        plan.attempt_id
+    ));
+    let policy: serde_json::Value = serde_json::from_str(&policy_json).unwrap();
+    let previous = policy["files"]["fixture.txt"].as_str().unwrap();
+    fixture.execute(
+        "INSERT INTO trip_structured_plans(id,attempt_id,plan_hash,plan_json,workflow_id,profile_revision_id,criteria_hash,verification_hash,ownership_hash,conformance_hash,approved_at,implementation_authorized_at,created_at)
+         VALUES('guidance-plan',?1,'prior-plan',?2,?3,?4,'c','v','o','f','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![plan.attempt_id,serde_json::json!({"ownership":{"owned_paths":["fixture.txt"]},"documentation":{"fixture.txt":"Preserve approved guidance"}}).to_string(),agenticjira::trip::WORKFLOW_ID,revision],
+    );
+    fixture.execute(
+        "UPDATE attempts SET phase='implementation',structured_plan_id='guidance-plan',plan_hash='prior-plan',plan_approved_at='2026-01-01T00:00:00Z',
+         workflow_version='trip-v1',workflow_hash='legacy',legacy_migration_required=1 WHERE id=?1",
+        params![plan.attempt_id],
+    );
+    fixture.execute("UPDATE workspaces SET policy_json=json_set(policy_json,'$.workflow_id','trip-v1') WHERE attempt_id=?1",params![plan.attempt_id]);
+    std::fs::write(workspace.join("fixture.txt"), "edited guidance\n").unwrap();
+    let action = |version| TripHumanAction::MigrateAttempt {
+        task_id: task.clone(),
+        attempt_id: plan.attempt_id.clone(),
+        expected_task_version: version,
+        reviewed_plan_hash: "prior-plan".into(),
+        config_revision_id: revision.clone(),
+    };
+    let before: String = fixture.scalar(&format!(
+        "SELECT policy_json FROM workspaces WHERE attempt_id='{}'",
+        plan.attempt_id
+    ));
+    let error =
+        execute_trip(&fixture, &paths, "refuse-unapproved-guidance", &action(2)).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("prior approved guidance changed without authorization"),
+        "{error:#}"
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM trip_legacy_migrations", 0);
+    fixture.assert_scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"), 2);
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT workflow_version FROM attempts WHERE id='{}'",
+            plan.attempt_id
+        ),
+        "trip-v1".into(),
+    );
+    assert_eq!(
+        fixture.scalar::<String>(&format!(
+            "SELECT policy_json FROM workspaces WHERE attempt_id='{}'",
+            plan.attempt_id
+        )),
+        before
+    );
+
+    fixture.execute("UPDATE attempts SET workflow_version=?1,workflow_hash=?2,legacy_migration_required=0 WHERE id=?3",
+        params![agenticjira::trip::WORKFLOW_ID,workflow_resources::workflow_hash(),plan.attempt_id]);
+    fixture.execute(
+        "UPDATE workspaces SET policy_json=?1 WHERE attempt_id=?2",
+        params![policy_json, plan.attempt_id],
+    );
+    let approved = sha256(b"edited guidance\n");
+    let reauthorized = workflow::execute(
+        &fixture.store,
+        &HumanCommand::ReauthorizeAttemptGuidance {
+            operation_id: "approve-guidance".into(),
+            task_id: task.clone(),
+            attempt_id: plan.attempt_id.clone(),
+            expected_version: 2,
+            plan_hash: "prior-plan".into(),
+            config_revision_id: revision.clone(),
+            policy_hash: sha256(policy_json.as_bytes()),
+            files: vec![agenticjira::domain::GuidanceReauthorization {
+                path: "fixture.txt".into(),
+                previous_sha256: previous.into(),
+                sha256: approved.clone(),
+            }],
+        },
+    )
+    .unwrap();
+    fixture.execute("UPDATE attempts SET workflow_version='trip-v1',workflow_hash='legacy',legacy_migration_required=1 WHERE id=?1",params![plan.attempt_id]);
+    fixture.execute("UPDATE workspaces SET policy_json=json_set(policy_json,'$.workflow_id','trip-v1') WHERE attempt_id=?1",params![plan.attempt_id]);
+    let prior_json: String = fixture.scalar(&format!(
+        "SELECT policy_json FROM workspaces WHERE attempt_id='{}'",
+        plan.attempt_id
+    ));
+    let prior: serde_json::Value = serde_json::from_str(&prior_json).unwrap();
+    fixture.execute_batch(&format!(
+        "CREATE TRIGGER interrupt_migration_publication BEFORE UPDATE OF state ON workspaces
+         WHEN NEW.attempt_id='{}' AND NEW.state='ready'
+         BEGIN SELECT RAISE(ABORT,'migration publication interrupted'); END;",
+        plan.attempt_id
+    ));
+    let interrupted = execute_trip(
+        &fixture,
+        &paths,
+        "migrate-authorized-guidance",
+        &action(reauthorized.version.unwrap()),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{interrupted:#}").contains("migration publication interrupted"),
+        "{interrupted:#}"
+    );
+    let version: i64 = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+    let frozen: String = fixture.scalar("SELECT json_extract(preserved_json,'$.prior_policy.policy_json') FROM trip_legacy_migrations");
+    assert_eq!(frozen, prior_json);
+    let current: serde_json::Value = serde_json::from_str(&fixture.scalar::<String>(&format!(
+        "SELECT policy_json FROM workspaces WHERE attempt_id='{}'",
+        plan.attempt_id
+    )))
+    .unwrap();
+    assert_eq!(current["files"]["fixture.txt"], approved);
+    assert_eq!(
+        current["migration_guidance"]["guidance_reauthorizations"],
+        prior["guidance_reauthorizations"]
+    );
+    fixture.assert_scalar::<i64>(&format!("SELECT phase='planning' AND structured_plan_id IS NULL AND plan_hash IS NULL AND plan_approved_at IS NULL FROM attempts WHERE id='{}'",plan.attempt_id), 1);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("fixture.txt")).unwrap(),
+        "edited guidance\n"
+    );
+    let claim_before: String = fixture.scalar(&format!("SELECT json_array(id,state,attempt_id,repository_identity,process_identity_json) FROM claims WHERE attempt_id='{}'",plan.attempt_id));
+    for (relative, hash) in current["files"].as_object().unwrap() {
+        assert_eq!(
+            sha256(&std::fs::read(workspace.join(relative)).unwrap()),
+            hash.as_str().unwrap()
+        );
+    }
+    assert!(scheduler(&fixture, paths.artifacts.clone())
+        .reconcile_unknown()
+        .unwrap()
+        .is_empty());
+    fixture.assert_scalar::<String>(
+        &format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id),
+        "needs_recovery".into(),
+    );
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT state FROM workspaces WHERE attempt_id='{}'",
+            plan.attempt_id
+        ),
+        "recovery_required".into(),
+    );
+    fixture.assert_scalar::<String>(
+        &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+        "needs_recovery".into(),
+    );
+    fixture.assert_scalar::<String>(&format!("SELECT json_array(id,state,attempt_id,repository_identity,process_identity_json) FROM claims WHERE attempt_id='{}'",plan.attempt_id), claim_before);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+    assert!(scheduler(&fixture, paths.artifacts.clone())
+        .claim_next()
+        .unwrap()
+        .is_none());
+    let state = workflow::state(&fixture.store).unwrap();
+    let migration = state
+        .continuation_actions
+        .iter()
+        .find(|action| action.operation == "migrate_attempt")
+        .unwrap();
+    assert!(migration.enabled, "{}", migration.reason);
+    assert_eq!(migration.binding["task_id"], task);
+    assert_eq!(migration.binding["attempt_id"], plan.attempt_id);
+    assert_eq!(migration.binding["expected_task_version"], version);
+    assert_eq!(migration.binding["plan_hash"], "prior-plan");
+    assert_eq!(migration.binding["config_revision_id"], revision);
+    fixture.execute_batch("DROP TRIGGER interrupt_migration_publication;");
+
+    std::fs::write(
+        workspace.join("fixture.txt"),
+        "unauthorized recovery drift\n",
+    )
+    .unwrap();
+    fixture.execute("UPDATE workspaces SET policy_json=json_set(policy_json,'$.files.\"fixture.txt\"',?1) WHERE attempt_id=?2",
+        params![sha256(b"unauthorized recovery drift\n"),plan.attempt_id]);
+    let error = execute_trip(
+        &fixture,
+        &paths,
+        "refuse-mutable-recovery-policy",
+        &action(version),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("prior approved guidance changed without authorization"),
+        "{error:#}"
+    );
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM trip_legacy_migrations", 1);
+    fixture.assert_scalar::<i64>(
+        &format!("SELECT version FROM tasks WHERE id='{task}'"),
+        version,
+    );
+    std::fs::write(workspace.join("fixture.txt"), "edited guidance\n").unwrap();
+    let recovered = execute_trip(
+        &fixture,
+        &paths,
+        "recover-frozen-guidance",
+        &action(version),
+    )
+    .unwrap();
+    assert_eq!(recovered.version, Some(version));
+    let restored: serde_json::Value = serde_json::from_str(&fixture.scalar::<String>(&format!(
+        "SELECT policy_json FROM workspaces WHERE attempt_id='{}'",
+        plan.attempt_id
+    )))
+    .unwrap();
+    assert_eq!(restored["files"]["fixture.txt"], approved);
+    assert_eq!(
+        restored["migration_guidance"]["guidance_reauthorizations"],
+        prior["guidance_reauthorizations"]
+    );
+    assert_eq!(fixture.scalar::<String>("SELECT json_extract(preserved_json,'$.prior_policy.policy_json') FROM trip_legacy_migrations"), frozen);
+    agenticjira::trip::require_attempt_ready(&fixture.connection(), &plan.attempt_id, None)
+        .unwrap();
+    let repository = workspace::inspect(&plan.repository_path).unwrap();
+    let (snapshot, snapshot_hash) = snapshot::capture(
+        &repository,
+        workspace,
+        &paths.artifacts.join("guidance-snapshot"),
+    )
+    .unwrap();
+    fixture.execute(
+        "INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at)
+         VALUES('guidance-source',?1,'candidate',?2,?3,?4,1,'2026-01-02T00:00:00Z')",
+        params![plan.attempt_id,snapshot.snapshot_base,snapshot_hash,serde_json::to_string(&snapshot).unwrap()],
+    );
+    let child_workspace = fixture.root.join("guidance-rework");
+    std::fs::create_dir(&child_workspace).unwrap();
+    std::fs::write(child_workspace.join("fixture.txt"), "edited guidance\n").unwrap();
+    fixture.execute(
+        "INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,workflow_version,workflow_hash,
+            upstream_source_hash,overlay_hash,configuration_hash,legacy_migration_required,parent_attempt_id,created_at,updated_at)
+         SELECT 'guidance-child',task_id,'child-context','planning',base_revision,configuration_revision,'workspace_reserved',workflow_version,
+            workflow_hash,upstream_source_hash,overlay_hash,configuration_hash,0,id,created_at,updated_at FROM attempts WHERE id=?1",
+        params![plan.attempt_id],
+    );
+    fixture.execute(
+        "INSERT INTO workspaces(id,attempt_id,repository_identity,path,base_revision,worktree_head,policy_json,state,created_at,updated_at)
+         SELECT 'guidance-child-workspace','guidance-child',repository_identity,?1,base_revision,worktree_head,'{}','reserved',created_at,updated_at
+         FROM workspaces WHERE attempt_id=?2",
+        params![child_workspace.to_string_lossy(),plan.attempt_id],
+    );
+    fixture.execute(
+        "INSERT INTO trip_attempt_profiles(attempt_id,role,settings_revision,activation_id,source,profile_json,profile_hash,project_config_revision_id,
+            project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at)
+         SELECT 'guidance-child',role,settings_revision,activation_id,source,profile_json,profile_hash,project_config_revision_id,
+            project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at
+         FROM trip_attempt_profiles WHERE attempt_id=?1",
+        params![plan.attempt_id],
+    );
+    fixture.execute(
+        "INSERT INTO rework_intents(id,operation_id,parent_attempt_id,new_attempt_id,snapshot_id,feedback,carry_plan_approval,
+            scope_hash,configuration_hash,state,created_at,updated_at)
+         VALUES('guidance-rework','guidance-rework',?1,'guidance-child','guidance-source','New planning',0,'scope','configuration',
+            'materializing','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z')",
+        params![plan.attempt_id],
+    );
+    let child_policy = agenticjira::trip::materialize_project_policy(
+        &fixture.store,
+        "guidance-child",
+        &child_workspace,
+    )
+    .unwrap();
+    assert_eq!(child_policy["files"]["fixture.txt"], approved);
+    assert_eq!(
+        child_policy["rework_guidance_sources"][0]["parent_attempt_id"],
+        plan.attempt_id
+    );
+    fixture.assert_scalar::<i64>("SELECT plan_hash IS NULL AND structured_plan_id IS NULL AND plan_approved_at IS NULL FROM attempts WHERE id='guidance-child'", 1);
+}
+
+#[test]
+fn trip_initial_migration_refuses_prior_final_repair_authority_without_blocking_activation() {
+    for cause in ["round_only", "pending_receipt", "closed_receipt"] {
+        let name = format!("migration-final-repair-{cause}");
+        let fixture = if cause == "round_only" {
+            final_repair_recheck_fixture(&name)
+        } else {
+            let (fixture, reviews) = recovered_final_repair_fixture(&name);
+            if cause == "closed_receipt" {
+                let request = reserve_final_repair_recheck(&reviews).unwrap().request_id;
+                deliver_final_repair_recheck(&fixture, &reviews, &request, Some("needs_rework"));
+                final_repair_recheck_verdict(&fixture, "needs_rework");
+                fixture.assert_scalar::<String>(
+                    "SELECT state FROM final_repair_rechecks",
+                    "closed".into(),
+                );
+            }
+            fixture.execute("UPDATE attempts SET final_repair_round=0 WHERE id='a'", []);
+            fixture
+        };
+        let repository = fixture.repository("repo");
+        let inspected = workspace::inspect(&repository).unwrap();
+        fixture.execute("UPDATE projects SET repository_path=?1,repository_identity=?2,base_revision=?3 WHERE id='p'",
+            params![repository.to_string_lossy(),inspected.identity,inspected.head]);
+        seed_synthetic_installed_project(&fixture, "p", &repository, Provider::Codex);
+        let old_workspace = fixture.root.join("old-workspace");
+        std::fs::create_dir(&old_workspace).unwrap();
+        fixture.execute("INSERT INTO workspaces(id,attempt_id,repository_identity,path,base_revision,worktree_head,policy_json,state,created_at,updated_at)
+            VALUES('old-workspace','a',?1,?2,?3,?3,'{}','ready','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            params![inspected.identity,old_workspace.to_string_lossy(),inspected.head]);
+        fixture.execute("UPDATE attempts SET workflow_version='trip-v1',workflow_hash='old',legacy_migration_required=1,status='needs_input' WHERE id='a'", []);
+        fixture.execute("INSERT INTO trip_structured_plans(id,attempt_id,plan_hash,plan_json,workflow_id,profile_revision_id,
+            criteria_hash,verification_hash,ownership_hash,conformance_hash,approved_at,created_at)
+            SELECT 'prior-final-repair-plan',id,plan_hash,'{}',workflow_version,'synthetic-seeded-config',
+              'c','v','o','f',plan_approved_at,'2026-01-01T00:00:00Z' FROM attempts WHERE id='a'", []);
+        fixture.execute(
+            "UPDATE attempts SET structured_plan_id='prior-final-repair-plan' WHERE id='a'",
+            [],
+        );
+        let boot = agenticjira::supervisor::system_boot_identity().unwrap();
+        fixture.execute(
+            "UPDATE sessions SET status='exited',launch_state='finished',recovery_anchor_json=?1,
+            launch_boot_identity=?2,recovery_process_group_id=2000000000",
+            params![
+                serde_json::json!({"pid":2000000000_u32,"process_group_id":2000000000,
+                "native_start_marker":"synthetic-absent-reviewer","boot_identity":boot})
+                .to_string(),
+                boot
+            ],
+        );
+        fixture.execute("UPDATE role_generations SET status='exited'", []);
+        let ledger: String = fixture.scalar(FINAL_REPAIR_LEDGER);
+        let receipts: Option<String> = fixture.scalar(SCHEMA_31_RECEIPT_ROWS);
+        let before: String = fixture.scalar("SELECT json_array(a.workflow_version,a.legacy_migration_required,a.status,a.phase,a.plan_hash,a.plan_approved_at,
+            a.candidate_hash,a.final_repair_round,a.selected_checks_revision,a.manager_conformance_revision,t.version,w.state,w.policy_json)
+            FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN workspaces w ON w.attempt_id=a.id WHERE a.id='a'");
+        let state = workflow::state(&fixture.store).unwrap();
+        let action = state
+            .continuation_actions
+            .iter()
+            .find(|action| action.operation == "migrate_attempt")
+            .unwrap();
+        assert!(!action.enabled, "{cause}");
+        assert!(
+            action.reason.contains("prior final-repair authority")
+                && action.reason.contains("start a fresh task"),
+            "{}",
+            action.reason
+        );
+        let paths = instance_paths(&fixture);
+        let revision: String = fixture.scalar(
+            "SELECT active_config_revision_id FROM trip_project_state WHERE project_id='p'",
+        );
+        let error = execute_trip(
+            &fixture,
+            &paths,
+            "refuse-final-repair-migration",
+            &TripHumanAction::MigrateAttempt {
+                task_id: "t".into(),
+                attempt_id: "a".into(),
+                expected_task_version: fixture.scalar("SELECT version FROM tasks WHERE id='t'"),
+                reviewed_plan_hash: "plan-hash".into(),
+                config_revision_id: revision,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("prior final-repair authority"),
+            "{cause}: {error:#}"
+        );
+        fixture.assert_scalar::<String>("SELECT json_array(a.workflow_version,a.legacy_migration_required,a.status,a.phase,a.plan_hash,a.plan_approved_at,
+            a.candidate_hash,a.final_repair_round,a.selected_checks_revision,a.manager_conformance_revision,t.version,w.state,w.policy_json)
+            FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN workspaces w ON w.attempt_id=a.id WHERE a.id='a'", before);
+        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM trip_legacy_migrations", 0);
+        if cause == "pending_receipt" {
+            fixture.execute(
+                "UPDATE attempts SET legacy_migration_required=0 WHERE id='a'",
+                [],
+            );
+            let manager = role_override(Provider::Codex);
+            let setup = execute_trip(
+                &fixture,
+                &paths,
+                "begin-activation-with-final-repair-history",
+                &TripHumanAction::BeginSetup {
+                    project_id: "p".into(),
+                    expected_project_version: 1,
+                    host_manager: manager.clone(),
+                },
+            )
+            .unwrap()
+            .entity_id;
+            record_synthetic_setup_observation(&fixture, &setup, RoleKind::Manager);
+            let saved = execute_trip(
+                &fixture,
+                &paths,
+                "save-activation-with-final-repair-history",
+                &TripHumanAction::SaveSetupDraft {
+                    setup_operation_id: setup.clone(),
+                    expected_project_version: 1,
+                    proposal: setup_proposal(&manager),
+                },
+            )
+            .unwrap();
+            execute_trip(
+                &fixture,
+                &paths,
+                "authorize-activation-with-final-repair-history",
+                &TripHumanAction::AuthorizeSetupProbes {
+                    setup_operation_id: setup.clone(),
+                    proposal_hash: saved.detail["proposal_hash"].as_str().unwrap().into(),
+                },
+            )
+            .unwrap();
+            for role in [
+                RoleKind::Explorer,
+                RoleKind::PlanReviewer,
+                RoleKind::Implementer,
+                RoleKind::CodeReviewer,
+                RoleKind::FinalReviewer,
+            ] {
+                record_synthetic_setup_observation(&fixture, &setup, role);
+            }
+            execute_trip(
+                &fixture,
+                &paths,
+                "activate-with-final-repair-history",
+                &TripHumanAction::AdoptInstallation {
+                    project_id: "p".into(),
+                    expected_project_version: 1,
+                    configuration: setup_proposal(&manager),
+                },
+            )
+            .unwrap();
+            fixture.assert_scalar::<i64>(
+                "SELECT legacy_migration_required FROM attempts WHERE id='a'",
+                1,
+            );
+        }
+        fixture.assert_scalar::<String>(FINAL_REPAIR_LEDGER, ledger);
+        fixture.assert_scalar::<Option<String>>(SCHEMA_31_RECEIPT_ROWS, receipts);
+        fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
+    }
+}
+
+#[test]
+fn trip_migration_and_activation_refuse_uncertain_or_held_work() {
+    for (cause, expected) in [
+        ("live_session", "session has not exited"),
+        (
+            "exited_without_proof",
+            "positively verified session quiescence",
+        ),
+        ("provider_hold", "provider failure hold"),
+        ("unconsumed_review", "has not been consumed"),
+    ] {
+        let fixture = Fixture::new(&format!("migration-refusal-{cause}"));
+        let (project, task, plan) = new_task(&fixture, "migration-refusal", "migration-task");
+        fixture.execute("UPDATE attempts SET workflow_version='trip-v1',workflow_hash='old',legacy_migration_required=1 WHERE id=?1",params![plan.attempt_id]);
+        seed_session(
+            &fixture,
+            &plan.attempt_id,
+            "plan_reviewer",
+            "prior-reviewer",
+            "prior-session",
+            if cause == "live_session" {
+                "running"
+            } else {
+                "exited"
+            },
+        );
+        fixture.execute(
+            "UPDATE sessions SET launch_state='finished' WHERE id='prior-session'",
+            [],
+        );
+        fixture.execute(
+            "UPDATE role_generations SET status='exited' WHERE id='prior-reviewer'",
+            [],
+        );
+        fixture.execute("INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at)
+            VALUES('prior-credential','prior-reviewer','prior-hash','[]','2026-01-01T00:00:00Z')", []);
+        if cause == "provider_hold" {
+            fixture.execute("INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,payload_json,
+                peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+                VALUES('migration-failure','prior-session','prior-reviewer','codex','StopFailure','{}',
+                1,1,'synthetic-fake-hook','managed_process_group_untrusted_payload','2026-01-01T00:00:00Z')", []);
+            fixture.execute("INSERT INTO provider_failure_holds(id,attempt_id,role_generation_id,session_id,transcript_epoch,
+                failure_hook_event_id,failure_kind,attribution,created_at,state)
+                VALUES('migration-hold',?1,'prior-reviewer','prior-session','e','migration-failure','authentication_failed',
+                'arrival_order','2026-01-01T00:00:00Z','active')",params![plan.attempt_id]);
+        }
+        if cause == "unconsumed_review" {
+            fixture.execute("INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,prompt_hash,handoff_hash,
+                delivery_state,verdict,created_at,updated_at) VALUES('old-review',?1,'plan','old-plan','p','h',
+                'finished','approved','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",params![plan.attempt_id]);
+            fixture.execute("INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+                VALUES('old-result','old-report','prior-session','prior-reviewer','approved','old result','[]',
+                '{\"review_request_id\":\"old-review\"}','2026-01-01T00:00:00Z')",[]);
+        }
+        let revision: String = fixture.scalar(&format!(
+            "SELECT active_config_revision_id FROM trip_project_state WHERE project_id='{project}'"
+        ));
+        let activation_snapshot_sql = format!(
+            "SELECT json_array(p.version,s.readiness,s.setup_operation_id,s.active_config_revision_id,
+                s.workflow_id,s.upstream_source_hash,s.overlay_hash,s.manifest_hash)
+             FROM projects p JOIN trip_project_state s ON s.project_id=p.id WHERE p.id='{project}'"
+        );
+        let activation_before_refusals: String = fixture.scalar(&activation_snapshot_sql);
+        let paths = instance_paths(&fixture);
+        let error = execute_trip(
+            &fixture,
+            &paths,
+            "refuse-uncertain-migration",
+            &TripHumanAction::MigrateAttempt {
+                task_id: task.clone(),
+                attempt_id: plan.attempt_id.clone(),
+                expected_task_version: 2,
+                reviewed_plan_hash: "reviewed-migration".into(),
+                config_revision_id: revision,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(expected), "{cause}: {error}");
+        let error = execute_trip(
+            &fixture,
+            &paths,
+            "refuse-uncertain-activation",
+            &TripHumanAction::AdoptInstallation {
+                project_id: project,
+                expected_project_version: 2,
+                configuration: setup_proposal(&role_override(Provider::Codex)),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(expected), "{cause}: {error}");
+        fixture.assert_scalar::<String>(&activation_snapshot_sql, activation_before_refusals);
+        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM trip_legacy_migrations", 0);
+        fixture.assert_scalar::<i64>(
+            "SELECT revoked_at IS NULL FROM role_credentials WHERE id='prior-credential'",
+            1,
+        );
+        fixture.assert_scalar::<String>("SELECT workflow_version FROM attempts", "trip-v1".into());
+        fixture.assert_scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"), 2);
+        fixture.assert_scalar::<i64>("SELECT SUM(spent) FROM review_budgets", 0);
+        fixture.assert_scalar::<String>("SELECT state FROM workspaces", "ready".into());
+    }
 }
 
 #[test]
@@ -34769,7 +36166,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 36_i64);
+    fixture.assert_scalar("PRAGMA user_version", 37_i64);
     fixture.assert_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%'",
         i64::try_from(triggers.len()).unwrap(),
@@ -34804,7 +36201,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 36_i64);
+    fixture.assert_scalar("PRAGMA user_version", 37_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -41089,14 +42486,14 @@ fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordina
 #[test]
 fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
-    fixture.assert_scalar("PRAGMA user_version", 36_i64);
+    fixture.assert_scalar("PRAGMA user_version", 37_i64);
     let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
     fixture.execute_batch(&format!(
         "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; PRAGMA user_version=30;"
     ));
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 36_i64);
+    fixture.assert_scalar("PRAGMA user_version", 37_i64);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
@@ -41969,7 +43366,7 @@ fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
     fixture.assert_scalar("PRAGMA user_version", 31_i64);
 
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 36_i64);
+    fixture.assert_scalar("PRAGMA user_version", 37_i64);
     assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(

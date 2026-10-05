@@ -1,3 +1,7 @@
 # LLMRelay transport overlay
 
 The selected app-host role is the sole manager and user-facing engineering owner. LLMRelay persists the context ledger, launches configured roles directly, owns the one build/check slot, enforces review accounting and phase identity, and displays native CLI output. Agents submit structured records through the authenticated role channel; they do not write the service ledger directly. Integration edits are executed by the retained implementer only from an exact manager-directed integration capsule after every required lane yields. Every final verifier starts fresh for the frozen candidate. No role may delegate, invoke another workflow, launch another agent/provider process, grant human approval, or claim authoritative completion.
+
+The embedded upstream package is TRIP Explorer 0.11.0. LLMRelay owns CLI/PTY transport, native hooks, process quiescence and the durable authenticated role channel. Standalone cmux launchers, JSON receipts, target CLI versions and optional doctor, evidence and usage tools do not replace the application's qualified transport or grant activation authority. Retained native conversations, independent reviewer roles and fresh final verification remain required. Provider compatibility pins remain application-owned.
+
+Project guidance uses contained regular files. Select the individual files inside a guidance directory during setup or adoption; directory traversal is not supported by the application's materialization and freshness contract.
