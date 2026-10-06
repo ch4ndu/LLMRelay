@@ -2,6 +2,10 @@
 /frontend/dist/
 /frontend/node_modules/
 /.local/
+/.agents/trip-explorer/preserved/
+/design/llmrelay-a-guided-setup.png
+/design/llmrelay-b-project-control-center.png
+/design/llmrelay-c-split-workspace.png
 *.swp
 .DS_Store
 __pycache__/
