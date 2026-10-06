@@ -198,3 +198,19 @@ remain the public contract sources. An upstream issue closure, installed version
 change or new field alone does not qualify runtime authority: the documented
 contract, admitted tuple and focused causal checks must agree. No polling service,
 SDK/transport migration or automatic fallback is selected by this follow-up.
+
+## Codex usage evidence boundary
+
+The Codex-first reader admits the 0.157.1 top-level `token_usage_record` contract
+from exact tagged source (commit `36650394c5b38c2990ccf2a3457165ca3e9d9726`)
+and retained-binary static evidence. Required response IDs and numeric fields,
+optional cache-write coverage, the best-effort writer and unconditional rollout
+persistence policy are recorded in local contract evidence. App tests exercise
+bounded reading, managed attribution, durable deduplication and projection with
+synthetic records; they do not prove live provider delivery or accuracy.
+
+Only current managed turn records contribute. Cumulative/context snapshots,
+inherited history and sub-agent records do not. All displayed totals are partial;
+usage never supplies a permission decision, readiness or failure-reset deadline.
+Claude telemetry, account quota windows and costs require separate qualification
+and scope.

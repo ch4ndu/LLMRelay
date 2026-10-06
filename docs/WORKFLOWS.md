@@ -282,3 +282,16 @@ A plan/code reviewer stopped before a native session identity was recorded canno
 A trusted accepted resumed turn can supersede its own prior unconsumed blocked or needs-input report only under exact session, generation, configuration, epoch and invocation fences. Supersession preserves the report and correlated audit; it does not fabricate workflow consumption. Releasing a matching resume-failed hold, advancing the task version and retiring invalidated transition proposals occur in one transaction. Independent committed controls and still-current blockers remain binding. Merely starting a process or sending input cannot perform this reconciliation.
 
 Permission decisions, response delivery, native resolution, role report submission, verification and human acceptance remain separate. A native notification or failed turn does not consume a review call or imply a role verdict. See [operations](OPERATIONS.md#permission-notices-and-appearance) and the [signal matrix](PERMISSION_SIGNAL_MATRIX.md).
+
+## Observed usage authority
+
+Codex usage is presentation-only evidence from uniquely attributed 0.157.1
+response records. Counts belong to the accepted managed turn and original
+invocation; replay does not reassign them. Session and task totals remain partial
+observations, independently of the dashboard's bounded session list. Missing,
+conflicting or unsafe evidence is unavailable, never a fabricated zero.
+
+The existing cycle observes usage without spending a workflow action. Usage
+success or failure cannot grant execution, approval, model-selection or readiness
+authority, or create/release a provider hold. Native delivery and provider accuracy
+remain separate acceptance boundaries. See [operation](OPERATIONS.md#codex-observed-usage).

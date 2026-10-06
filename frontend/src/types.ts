@@ -571,6 +571,7 @@ export interface ReviewBudget {
   version: number;
 }
 export interface Task {
+  observed_usage?: ObservedUsage | null;
   id: string;
   project_id: string;
   title: string;
@@ -705,7 +706,25 @@ export type ProviderFailureHoldRelease =
   | "already_released"
   | "expired"
   | "superseded";
+export interface ObservedUsage {
+  status: "observed" | "unavailable" | "invalid";
+  partial: boolean;
+  counters: {
+    input_tokens: number;
+    cached_input_tokens: number;
+    cache_write_input_tokens: number | null;
+    output_tokens: number;
+    reasoning_output_tokens: number;
+    total_tokens: number;
+  } | null;
+  observed_responses: number | null;
+  source: string;
+  last_observed_at: string | null;
+  reason: string | null;
+}
+
 export interface Session {
+  observed_usage?: { current_turn: ObservedUsage; session: ObservedUsage } | null;
   id: string;
   role_generation_id: string;
   provider: Provider;

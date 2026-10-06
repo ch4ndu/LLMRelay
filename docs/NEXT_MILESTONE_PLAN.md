@@ -35,14 +35,25 @@ delivery. The user authorized a local checkpoint commit after verification; no
 packaging, release or live user-instance backup is claimed. Local evidence is under
 `.local/trip-explorer/scheduled_backups_20261005/`.
 
-## Next candidate — usage and limits
+## Completed task — Codex observed usage
 
-The next item in the features-after-hardening queue is usage/limit display and
-per-turn token accounting, for presentation only. It requires its own scoped
-plan and review: identify trustworthy evidence from the admitted provider CLI
-contracts, distinguish measured values from unavailable data, and preserve
-execution, approval and model-selection authority. Implementation has not been
-selected or started. The remaining queue is richer role handoffs, queued-guidance
+The user selected Codex-first scope and approved independently reviewed plan r2
+on October 5. Implementation supplies bounded current-turn/session observation,
+durable task totals and partial/unavailable dashboard presentation. Schema 38 adds
+response observations while preserving supported startup upgrades from 31–37.
+Independent Sol 6.1 xhigh code review approved the integrated source. The
+reconciled configured matrix passed 430 tests (64 frontend, 159 library, 205
+contracts, 2 runtime), with zero failures or ignored tests after an exact retry
+of one unchanged signal fixture. The original failure is retained in local
+evidence. Fresh Fable Medium final verification approved on October 5. This is verified
+source delivery, with live native delivery and provider accuracy still unverified. Local evidence is under
+`.local/trip-explorer/usage_limits_20261005/`.
+
+Execution, approvals, models, readiness and failure holds retain their authority.
+Source/static evidence supports exact Codex 0.157.1 parsing; live native delivery
+and provider accuracy are unverified. Claude usage, quota/reset windows and costs
+are deferred. No live user database/service operation, commit or release is
+included. The remaining feature queue is richer role handoffs, queued-guidance
 editing/cancellation, comments/activity, persistent drafts and task search.
 
 ## Next-task status — installed TRIP update completed

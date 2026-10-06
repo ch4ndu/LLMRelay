@@ -19,6 +19,7 @@ import {
   type NativePrompt,
   type NativePromptDismissal,
   type NativeTurnFailureKind,
+  type ObservedUsage,
   type PermissionRequest,
   type ProviderFailureHold,
   type ProviderFailureHoldRelease,
@@ -652,6 +653,31 @@ function SessionOutput(
   );
 }
 
+export function ObservedUsageDetails({ usage, label }: { usage?: ObservedUsage | null; label: string }) {
+  const counters = usage?.status === "observed" ? usage.counters : null;
+  const count = (value: number | null) => value === null ? "Unavailable" : value.toLocaleString();
+  return (
+    <section aria-label={label}>
+      <h4>{label} — observed usage (partial)</h4>
+      {counters
+        ? <>
+          <p>Provider-reported observed total: {count(counters.total_tokens)} tokens</p>
+          <p>
+            Input: {count(counters.input_tokens)} · Cached input (included in input): {count(counters.cached_input_tokens)} · Cache write: {count(counters.cache_write_input_tokens)}
+          </p>
+          <p>
+            Output: {count(counters.output_tokens)} · Reasoning (included in output): {count(counters.reasoning_output_tokens)}
+          </p>
+        </>
+        : <p>Usage unavailable. {usage?.reason ?? "No response usage has been observed."}</p>}
+      {usage && <p>
+        {count(usage.observed_responses)} observed responses · Source: {usage.source}
+        {usage.last_observed_at && ` · Last observation: ${new Date(usage.last_observed_at).toLocaleString()}`}
+      </p>}
+    </section>
+  );
+}
+
 export function SessionTree(
   {
     sessions,
@@ -744,6 +770,11 @@ export function SessionTree(
                   ` · Latest turn accepted by the agent ${
                     new Date(acceptedAt).toLocaleString()
                   }`}
+              </small>
+              <small>
+                {session.observed_usage?.session.status === "observed" && session.observed_usage.session.counters
+                  ? `Observed usage (partial): ${session.observed_usage.session.counters.total_tokens.toLocaleString()} tokens`
+                  : "Usage unavailable"}
               </small>
               {awaitingApproval && running && (
                 <small className="warning">
@@ -871,6 +902,8 @@ export function SessionTree(
                 </small>
               )}
               <TechnicalDetails>
+                <ObservedUsageDetails usage={session.observed_usage?.current_turn} label="Current accepted turn" />
+                <ObservedUsageDetails usage={session.observed_usage?.session} label="Session" />
                 <p>
                   Session {session.id} · generation {session.generation} ·
                   process {session.status}; launch{" "}

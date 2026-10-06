@@ -437,8 +437,8 @@ reuse old qualification evidence to bypass these checks.
 ## Database restore points
 
 The database commands operate on the instance selected by `--data-dir` and never
-migrate it. Inspect, check and manual backup require current schema 37. Verify
-and restore accept schema 37 and the supported prior schemas 31–36, requiring the
+migrate it. Inspect, check and manual backup require current schema 38. Verify
+and restore accept schema 38 and the supported prior schemas 31–37, requiring the
 manifest version to match the actual SQLite version. Unknown versions are refused.
 
 Service start holds the exclusive instance lock, reconciles an interrupted
@@ -449,14 +449,15 @@ the default backup directory. It checks migration space again after publication.
 A failed preflight or backup prevents migration. Missing and already-current
 databases do not require this extra snapshot.
 
-Supported schemas 31–36 then upgrade to 37 through the existing migration
+Supported schemas 31–37 then upgrade to 38 through the existing migration
 transactions. Each failed migration rolls back its own transaction; earlier
 successful steps may remain committed. The failure identifies the verified
 restore point and offline recovery command. Startup never automatically restores
 or retries it. Existing receipts retain their recorded values. Schema 32 records
 final-repair receipt provenance; 33 records native-resolution provenance; 34 adds
 the submitted guidance text and digest; 35 adds provider failure holds; 36 adds
-durable attention observations.
+durable attention observations; 37 adds TRIP migration receipts; 38 adds
+Codex observed usage.
 
 ```sh
 llmrelay database --data-dir <ABSOLUTE_INSTANCE_PATH> inspect
@@ -561,7 +562,7 @@ permission rules and automatic resume authority are invalidated. The dashboard
 may be available for inspection and safe recovery, but execution remains fenced.
 Restoring an older snapshot first installs its original schema and commits this
 hold. A later service start makes a new verified snapshot and attempts the
-supported forward upgrade while retaining the hold. This build serves schema 37;
+supported forward upgrade while retaining the hold. This build serves schema 38;
 a persistent migration defect still requires a corrected build or operator
 repair. Restoring the data does not promise that a failing migration will succeed
 or launch a compatible older executable.
@@ -760,3 +761,30 @@ In project settings, enable **Remind agents to submit reports**, then choose **S
 The existing guidance display records the reservation count and delivery state. Queued or typed text is not proof of submission; matching native prompt evidence establishes submission, and explicit acknowledgement is separate. Worker reminders do not require a manager acknowledgement. If delivery is uncertain, inspect the agent output before deciding what to do next; LLMRelay does not resend the reminder or Enter automatically.
 
 Disabling and saving prevents future writes, including Enter if it has not been written yet. Text already pasted cannot be retracted. Pauses, permission requests, recovery holds and manual input ownership continue to take precedence. Missing trustworthy safe-stop evidence leaves the session ineligible: reminders do not resolve the provider-dependent automatic-readiness limitation.
+
+## Codex observed usage
+
+Session cards show **Observed usage (partial)** or **Usage unavailable**. Expand
+**Technical details** for current-turn and session counts, observed response count,
+source and last observation time. The task **Summary** shows its durable observed
+total across attempts and sessions, including sessions outside the dashboard's
+recent-history window. Cached input is included in input; reasoning is included
+in output. Neither is added again to the provider-reported total. An explicitly
+observed zero is zero; an absent cache-write count is unavailable.
+
+The reader accepts only exact Codex 0.157.1 response records tied to the current
+managed accepted turn. It uses the existing no-follow history path safeguards,
+256 KiB record limit and 1 MiB tail. A missing turn boundary, incomplete file,
+unsafe identity, missed observation or unsupported payload supplies no new count.
+It does not backfill old history or count cumulative snapshots, inherited records
+or sub-agent turns. Repeated reads and resumes deduplicate response identities;
+conflicting ownership or counts make affected totals unavailable. Unchanged
+managed bindings and file identities skip another parse.
+
+Only counts, attribution, source identity and observation time are persisted;
+raw transcript text is not retained by usage accounting. The exact-version
+parsing contract is supported by source and static binary evidence. Deterministic
+checks do not establish live native delivery, provider accuracy, billing or
+complete account usage. Claude usage, quota/reset windows and costs are outside
+this increment. Usage display never starts work, changes models, approves tools,
+promotes readiness or releases a provider hold.

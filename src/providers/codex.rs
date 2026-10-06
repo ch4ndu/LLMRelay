@@ -1020,6 +1020,158 @@ fn capacity_turn_complete(tail: &[u8], turn_id: &str) -> Option<()> {
     completed.then_some(())
 }
 
+pub(crate) const USAGE_CONTRACT_REVISION: &str = "codex-0.157.1-response-usage-v1";
+
+pub(crate) fn valid_usage_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+
+#[derive(Debug)]
+pub(crate) struct CodexResponseUsage {
+    pub(crate) response_id: String,
+    pub(crate) counters: crate::domain::ObservedUsageCounters,
+}
+
+pub(crate) enum UsageHistoryRead {
+    Unchanged,
+    Observed {
+        identity: CapacityFileIdentity,
+        responses: Vec<CodexResponseUsage>,
+    },
+}
+
+pub(crate) fn usage_history_identity(root: &Path, path: &Path) -> Option<CapacityFileIdentity> {
+    let (directory, name) = capacity_history_parent(root, path)?;
+    let file = capacity_openat(&directory, &name, 0)?;
+    let identity = CapacityFileIdentity::from_metadata(&file.metadata().ok()?)?;
+    capacity_history_unchanged(root, path, &file, &identity)?;
+    Some(identity)
+}
+
+pub(crate) fn read_usage_history(
+    root: &Path,
+    path: &Path,
+    native_id: &str,
+    turn_id: &str,
+    cwd: &Path,
+    cached: Option<&CapacityFileIdentity>,
+) -> Option<UsageHistoryRead> {
+    if !valid_usage_id(native_id)
+        || uuid::Uuid::parse_str(native_id).is_err()
+        || !valid_usage_id(turn_id)
+    {
+        return None;
+    }
+    let (directory, name) = capacity_history_parent(root, path)?;
+    let mut file = capacity_openat(&directory, &name, 0)?;
+    let identity = CapacityFileIdentity::from_metadata(&file.metadata().ok()?)?;
+    if cached == Some(&identity) {
+        capacity_history_unchanged(root, path, &file, &identity)?;
+        return Some(UsageHistoryRead::Unchanged);
+    }
+    let mut head = Vec::new();
+    (&mut file)
+        .take(CAPACITY_RECORD_BYTES as u64)
+        .read_to_end(&mut head)
+        .ok()?;
+    let end = head.iter().position(|byte| *byte == b'\n')?;
+    let meta: serde_json::Value = serde_json::from_slice(&head[..end]).ok()?;
+    let payload = meta.get("payload")?;
+    if meta.get("type")?.as_str()? != "session_meta"
+        || payload.get("id")?.as_str()? != native_id
+        || payload.get("session_id")?.as_str()? != native_id
+        || payload.get("cli_version")?.as_str()? != "0.157.1"
+        || payload.get("source")?.as_str()? != "cli"
+        || payload.get("originator")?.as_str()? != "codex-tui"
+        || payload.get("thread_source")?.as_str()? != "user"
+        || fs::canonicalize(payload.get("cwd")?.as_str()?).ok()? != cwd
+    {
+        return None;
+    }
+    let tail_start = identity.bytes.saturating_sub(CAPACITY_TAIL_BYTES - 1);
+    file.seek(SeekFrom::Start(tail_start.saturating_sub(1)))
+        .ok()?;
+    let mut tail = Vec::new();
+    (&mut file)
+        .take(CAPACITY_TAIL_BYTES)
+        .read_to_end(&mut tail)
+        .ok()?;
+    if tail.last() != Some(&b'\n') {
+        return None;
+    }
+    let tail = if tail_start > 0 {
+        let start = if tail.first() == Some(&b'\n') {
+            1
+        } else {
+            tail.iter().position(|byte| *byte == b'\n')? + 1
+        };
+        &tail[start..]
+    } else {
+        tail.as_slice()
+    };
+    let responses = usage_responses(tail, native_id, turn_id)?;
+    capacity_history_unchanged(root, path, &file, &identity)?;
+    Some(UsageHistoryRead::Observed {
+        identity,
+        responses,
+    })
+}
+
+fn usage_responses(tail: &[u8], native_id: &str, turn_id: &str) -> Option<Vec<CodexResponseUsage>> {
+    let mut started = false;
+    let mut responses = Vec::new();
+    for line in tail.strip_suffix(b"\n")?.split(|byte| *byte == b'\n') {
+        if line.len() > CAPACITY_RECORD_BYTES {
+            return None;
+        }
+        let record: serde_json::Value = serde_json::from_slice(line).ok()?;
+        let kind = record.get("type")?.as_str()?;
+        if kind == "event_msg" && record.pointer("/payload/type")?.as_str()? == "task_started" {
+            if record.pointer("/payload/turn_id")?.as_str()? == turn_id {
+                if started {
+                    return None;
+                }
+                started = true;
+            } else if started {
+                return None;
+            }
+        }
+        if kind != "token_usage_record" || !started {
+            continue;
+        }
+        let payload = record.get("payload")?.as_object()?;
+        let id = |key| payload.get(key)?.as_str().filter(|id| valid_usage_id(id));
+        let thread = id("thread_id")?;
+        let session = id("session_id")?;
+        let turn = id("turn_id")?;
+        let root = id("root_turn_id")?;
+        let response_id = id("response_id")?;
+        if uuid::Uuid::parse_str(thread).is_err() || uuid::Uuid::parse_str(session).is_err() {
+            return None;
+        }
+        if thread != native_id || session != native_id || turn != turn_id || root != turn_id {
+            continue;
+        }
+        let usage = payload.get("usage")?.as_object()?;
+        if usage
+            .get("cache_write_input_tokens")
+            .is_some_and(serde_json::Value::is_null)
+        {
+            return None;
+        }
+        let counters: crate::domain::ObservedUsageCounters =
+            serde_json::from_value(serde_json::Value::Object(usage.clone())).ok()?;
+        if !counters.valid() {
+            return None;
+        }
+        responses.push(CodexResponseUsage {
+            response_id: response_id.into(),
+            counters,
+        });
+    }
+    started.then_some(responses)
+}
+
 #[cfg(test)]
 mod executor_environment_tests {
     use super::*;
@@ -1052,6 +1204,177 @@ mod executor_environment_tests {
                 .collect::<String>(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn codex_usage_reads_only_current_response_records_and_preserves_zero() {
+        let (root, path, mut records) = capacity_fixture();
+        let response = serde_json::json!({"type":"token_usage_record","payload":{
+            "thread_id":CAPACITY_NATIVE,"session_id":CAPACITY_NATIVE,"turn_id":CAPACITY_TURN,
+            "root_turn_id":CAPACITY_TURN,"response_id":"response-a","usage":{
+                "input_tokens":10,"cached_input_tokens":4,"cache_write_input_tokens":3,
+                "output_tokens":5,"reasoning_output_tokens":2,"total_tokens":17},
+            "turn_token_usage":{"input_tokens":9000,"cached_input_tokens":0,"output_tokens":0,
+                "reasoning_output_tokens":0,"total_tokens":9000},
+            "thread_token_usage":{"input_tokens":90000,"cached_input_tokens":0,"output_tokens":0,
+                "reasoning_output_tokens":0,"total_tokens":90000}}});
+        records.insert(1, response.clone());
+        records.push(response.clone());
+        let mut zero = response.clone();
+        zero["payload"]["response_id"] = serde_json::json!("response-zero");
+        zero["payload"]["usage"] = serde_json::json!({"input_tokens":0,"cached_input_tokens":0,
+            "output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0});
+        records.push(zero.clone());
+        records.push(serde_json::json!({"type":"event_msg","payload":{"type":"token_count",
+            "info":{"total_token_usage":{"input_tokens":999999,"cached_input_tokens":0,"output_tokens":0,
+                "reasoning_output_tokens":0,"total_tokens":999999},
+                "last_token_usage":{"input_tokens":999999,"cached_input_tokens":0,"output_tokens":0,
+                "reasoning_output_tokens":0,"total_tokens":999999},"model_context_window":null},"rate_limits":null}}));
+        records.push(serde_json::json!({"type":"compacted","payload":{"message":"","latest_token_usage_record":response}}));
+        let mut subagent = response;
+        subagent["payload"]["turn_id"] = serde_json::json!("subagent-turn");
+        records.push(subagent);
+        write_capacity_records(&path, &records);
+        let read = |cached| {
+            read_usage_history(
+                &root.join("sessions"),
+                &path,
+                CAPACITY_NATIVE,
+                CAPACITY_TURN,
+                &root,
+                cached,
+            )
+        };
+        let Some(UsageHistoryRead::Observed {
+            identity,
+            responses,
+        }) = read(None)
+        else {
+            panic!("missing observation");
+        };
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].counters.total_tokens, 17);
+        assert_eq!(responses[0].counters.cached_input_tokens, 4);
+        assert_eq!(responses[0].counters.reasoning_output_tokens, 2);
+        assert_eq!(responses[1].counters.total_tokens, 0);
+        assert_eq!(responses[1].counters.cache_write_input_tokens, None);
+        assert!(matches!(
+            read(Some(&identity)),
+            Some(UsageHistoryRead::Unchanged)
+        ));
+        records.push(zero);
+        write_capacity_records(&path, &records);
+        assert!(matches!(
+            read(Some(&identity)),
+            Some(UsageHistoryRead::Observed { .. })
+        ));
+        assert!(read_usage_history(
+            &root.join("sessions"),
+            &path,
+            CAPACITY_NATIVE,
+            "other-turn",
+            &root,
+            None
+        )
+        .is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_usage_rejects_unsafe_contracts_and_missing_or_incomplete_boundaries() {
+        let (root, path, mut records) = capacity_fixture();
+        records.push(serde_json::json!({"type":"token_usage_record","payload":{
+            "thread_id":CAPACITY_NATIVE,"session_id":CAPACITY_NATIVE,"turn_id":CAPACITY_TURN,
+            "root_turn_id":CAPACITY_TURN,"response_id":"response","usage":{
+                "input_tokens":10,"cached_input_tokens":4,"cache_write_input_tokens":0,"output_tokens":5,
+                "reasoning_output_tokens":2,"total_tokens":15},
+            "turn_token_usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":5,
+                "reasoning_output_tokens":2,"total_tokens":15},
+            "thread_token_usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":5,
+                "reasoning_output_tokens":2,"total_tokens":15}}}));
+        let read = || {
+            read_usage_history(
+                &root.join("sessions"),
+                &path,
+                CAPACITY_NATIVE,
+                CAPACITY_TURN,
+                &root,
+                None,
+            )
+        };
+        for (index, pointer, value) in [
+            (0, "/payload/cli_version", serde_json::json!("0.160.0")),
+            (0, "/payload/id", serde_json::json!("other-native-session")),
+            (0, "/payload/cwd", serde_json::json!(root.join("sessions"))),
+            (
+                3,
+                "/payload/response_id",
+                serde_json::json!("bad\u{0085}id"),
+            ),
+            (
+                3,
+                "/payload/response_id",
+                serde_json::json!("x".repeat(129)),
+            ),
+            (3, "/payload/usage/input_tokens", serde_json::json!(-1)),
+            (
+                3,
+                "/payload/usage/cached_input_tokens",
+                serde_json::json!(11),
+            ),
+            (3, "/payload/usage/output_tokens", serde_json::json!(1.5)),
+            (
+                3,
+                "/payload/usage/total_tokens",
+                serde_json::json!(9_007_199_254_740_992_i64),
+            ),
+            (
+                3,
+                "/payload/usage/cache_write_input_tokens",
+                serde_json::Value::Null,
+            ),
+        ] {
+            let mut changed = records.clone();
+            *changed[index]
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing {pointer}")) = value;
+            write_capacity_records(&path, &changed);
+            assert!(read().is_none(), "{pointer}");
+        }
+        for key in ["thread_id", "session_id", "root_turn_id"] {
+            let mut changed = records.clone();
+            changed[3]["payload"][key] = serde_json::json!("01a0fad3-1e45-71e2-8686-83184958e2c9");
+            write_capacity_records(&path, &changed);
+            let Some(UsageHistoryRead::Observed { responses, .. }) = read() else {
+                panic!("missing safe read for mismatched {key}");
+            };
+            assert!(responses.is_empty(), "{key} must not contribute usage");
+        }
+        let mut absent = records.clone();
+        absent[3]["payload"]["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("total_tokens");
+        write_capacity_records(&path, &absent);
+        assert!(read().is_none());
+        write_capacity_records(&path, &records);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.pop();
+        fs::write(&path, bytes).unwrap();
+        assert!(read().is_none());
+        let oversized =
+            serde_json::json!({"type":"notice","payload":"x".repeat(CAPACITY_RECORD_BYTES)});
+        write_capacity_records(&path, &[records.clone(), vec![oversized]].concat());
+        assert!(read().is_none());
+        records.remove(1);
+        write_capacity_records(&path, &records);
+        assert!(read().is_none());
+        fs::write(&path, b"{\"type\":\"session_meta\"").unwrap();
+        assert!(read().is_none());
+        let link = root.join("sessions/link.jsonl");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(usage_history_identity(&root.join("sessions"), &link).is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

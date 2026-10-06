@@ -12,6 +12,7 @@ import type {
   ContinuationAction,
   CmuxViewOutcome,
   DecisionExplanation,
+  ObservedUsage,
   PermissionRequest,
   Project,
   ProviderFailureHold,
@@ -7030,6 +7031,66 @@ Deno.test("User errors explain recovery while retaining collapsed diagnostics", 
     check(document.querySelector('.recovery .error strong')?.textContent?.includes("earlier agent session"), "real request failure bypassed the plain error presentation");
     check(requests.length === 1, "displaying guidance retried the action automatically");
     check(document.querySelector<HTMLTextAreaElement>('textarea')?.value === "Review the earlier session", "error display discarded the user's text");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("observed usage shows partial provenance, zero and unavailable without sending actions", () => {
+  const actions: string[] = [];
+  const zero: ObservedUsage = {
+    status: "observed", partial: true,
+    counters: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: null,
+      output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 0 },
+    observed_responses: 1, source: "Codex 0.157.1 response records",
+    last_observed_at: "2026-10-05T21:00:00Z", reason: null,
+  };
+  const unavailable: ObservedUsage = { ...zero, status: "unavailable", counters: null,
+    observed_responses: 0, last_observed_at: null, source: "Claude usage unavailable",
+    reason: "Observed usage is not supported for Claude yet." };
+  const access = {
+    routes: {}, discarding: {}, routeFor: () => undefined,
+    view: (id: string) => { actions.push(`view:${id}`); return Promise.resolve({ state: "pending" as const, message: "fixture", retry_available: false }); },
+    take: (id: string) => { actions.push(`take:${id}`); return Promise.resolve(); },
+    release: (id: string) => { actions.push(`release:${id}`); return Promise.resolve(); },
+    discard: () => Promise.resolve(), close: noop, refresh: noop,
+  };
+  const render = (usage: ObservedUsage) => <SessionTree sessions={[
+    { ...managerSession, observed_usage: { current_turn: usage, session: usage } },
+    { ...managerSession, id: "claude-session", provider: "claude", observed_usage: { current_turn: unavailable, session: unavailable } },
+  ]} access={access} setupProjectId={() => undefined} onOpenSetup={noop} />;
+  const nativeFetch = globalThis.fetch;
+  const requests: string[] = [];
+  globalThis.fetch = async (input) => {
+    requests.push(String(input));
+    throw new Error("unexpected usage display request");
+  };
+  try {
+    mount(render(zero));
+    check(document.querySelector(".session-metadata")?.textContent?.includes("Observed usage (partial): 0 tokens"), "observed zero became unavailable");
+    const details = document.querySelector<HTMLDetailsElement>(".session-metadata .technical-details");
+    check(!!details && !details.open, "session counters should start collapsed");
+    act(() => details?.querySelector("summary")?.click());
+    check(details?.open === true, "session details did not expand");
+    check(details?.textContent?.includes("Current accepted turn — observed usage (partial)"), "current-turn usage is missing");
+    check(details?.textContent?.includes("Session — observed usage (partial)"), "session usage is missing");
+    check(details?.textContent?.includes("Cache write: Unavailable"), "missing cache writes were displayed as measured zero");
+    check(details?.textContent?.includes("included in input") && details?.textContent?.includes("included in output"), "subset categories lost their inclusion labels");
+    check(details?.textContent?.includes("1 observed responses") && details?.textContent?.includes("Last observation:"), "response count or observation time is missing");
+    check(document.body.textContent?.includes("not supported for Claude yet"), "Claude usage is presented as available");
+    rerender(render({ ...zero, status: "invalid", reason: "Conflicting response observations." }));
+    check(!document.querySelector(".session-metadata")?.textContent?.includes("0 tokens") &&
+      document.querySelector(".session-metadata")?.textContent?.includes("Usage unavailable"), "invalid counters remained in the compact total");
+    check(document.body.textContent?.includes("Conflicting response observations."), "invalid provenance is not explained");
+    const observedTask: Task = { ...task, active_attempt: undefined, observed_usage: {
+      ...zero, counters: { ...zero.counters!, input_tokens: 1234, total_tokens: 1234 }, observed_responses: 4,
+    } };
+    mount(<TaskDetail task={observedTask} state={{ ...liveBase, tasks: [observedTask], active_sessions: [] }} onClose={noop} onChanged={noop} />);
+    const taskUsage = document.querySelector('[aria-label="Task"]');
+    check(taskUsage?.textContent?.includes((1234).toLocaleString()), "task total depended on displayed historical session rows");
+    check(taskUsage?.textContent?.includes("4 observed responses") && taskUsage?.textContent?.includes("Codex 0.157.1"), "task provenance is missing");
+    check(actions.length === 0 && requests.length === 0, "usage display emitted an agent action or request");
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;

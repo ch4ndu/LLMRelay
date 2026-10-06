@@ -4251,6 +4251,7 @@ mod m7_setup_projection_tests {
             review_budgets: vec![],
             legacy: json!({}),
             progress: None,
+            observed_usage: None,
         };
         let session = json!({"id":"session","task_id":"task","attempt_id":"attempt","role":"manager","role_generation_id":"generation","generation_status":"exited","config_revision":1,"provider":"codex","status":"exited","resume_count":0,"transcript_epoch":"epoch","capability_current":false});
         let rejection = json!({"category":"provider_compatibility_invalid_manifest"});
@@ -4371,7 +4372,8 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
     let mut migration_actions = Vec::new();
     for id in task_ids {
         let mut task = connection.query_row(&format!("SELECT id,project_id,title,description,acceptance_criteria_json,priority,manual_order,lifecycle,attention,version,archived_at,role_overrides_json,legacy_json,EXISTS(SELECT 1 FROM permission_requests pr WHERE pr.task_id=tasks.id AND {}),(archived_at IS NULL AND (lifecycle='done' OR (lifecycle='backlog' AND ready_at IS NULL AND NOT EXISTS(SELECT 1 FROM attempts WHERE task_id=tasks.id)))) FROM tasks WHERE id=?1", crate::permissions::ACTIONABLE_REQUEST_SQL),
-            params![id], |row| Ok(TaskDto { id:row.get(0)?,project_id:row.get(1)?,title:row.get(2)?,description:row.get(3)?,acceptance_criteria:serde_json::from_str(&row.get::<_,String>(4)?).unwrap_or_default(),priority:row.get(5)?,manual_order:row.get(6)?,lifecycle:row.get(7)?,attention:row.get(8)?,version:row.get(9)?,archived:row.get::<_,Option<String>>(10)?.is_some(),can_archive:row.get(14)?,recipe_provenance:None,role_overrides:parse(row.get(11)?),legacy:parse(row.get(12)?),permission_waiting:row.get(13)?,dependencies:vec![],active_attempt:None,role_settings:vec![],reviews:vec![],snapshots:vec![],review_budgets:vec![],progress:None }))?;
+            params![id], |row| Ok(TaskDto { id:row.get(0)?,project_id:row.get(1)?,title:row.get(2)?,description:row.get(3)?,acceptance_criteria:serde_json::from_str(&row.get::<_,String>(4)?).unwrap_or_default(),priority:row.get(5)?,manual_order:row.get(6)?,lifecycle:row.get(7)?,attention:row.get(8)?,version:row.get(9)?,archived:row.get::<_,Option<String>>(10)?.is_some(),can_archive:row.get(14)?,recipe_provenance:None,role_overrides:parse(row.get(11)?),legacy:parse(row.get(12)?),permission_waiting:row.get(13)?,dependencies:vec![],active_attempt:None,role_settings:vec![],reviews:vec![],snapshots:vec![],review_budgets:vec![],progress:None,observed_usage:None }))?;
+        task.observed_usage = Some(observed_usage(&connection, "task_id", &id, None)?);
         task.recipe_provenance = crate::recipes::task_provenance(&connection, &id)?;
         task.dependencies = json_rows(&connection, "SELECT json_object('task_id',depends_on_task_id,'integration_ref',integration_ref,'verified_at',verified_at) FROM task_dependencies WHERE task_id=?1", &id)?;
         task.active_attempt = connection
@@ -4685,6 +4687,14 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             session["reported_in_latest_invocation"] = serde_json::json!(report.is_some());
             session["latest_invocation_report"] = report.unwrap_or(serde_json::Value::Null);
             session["native_turn"] = serde_json::to_value(native_turn(&connection, &session_id)?)?;
+            session["observed_usage"] = serde_json::to_value(session_observed_usage(
+                &connection,
+                &session_id,
+                json_text(session, "provider") == Some("codex"),
+                session
+                    .pointer("/native_turn/accepted_hook_event_id")
+                    .and_then(serde_json::Value::as_str),
+            )?)?;
             session["native_prompt"] =
                 serde_json::to_value(native_prompt_presentation(&connection, &session_id, None)?)?;
             session["failed_session_stop"] =
@@ -5687,6 +5697,107 @@ fn permanent_resume_rejection_route(
 }
 
 const NATIVE_TURN_TEXT_LIMIT: usize = 2048;
+
+fn observed_usage(
+    connection: &Connection,
+    owner_column: &str,
+    owner_id: &str,
+    accepted_id: Option<&str>,
+) -> Result<crate::domain::ObservedUsage> {
+    use crate::domain::{ObservedUsage, ObservedUsageCounters, ObservedUsageStatus};
+    let mut usage =
+        ObservedUsage::unavailable("No response usage has been observed for this scope.");
+    let mut statement = connection.prepare(&format!(
+        "WITH owned AS (
+           SELECT rowid FROM codex_usage_observations
+           WHERE {owner_column}=?1 AND (?2 IS NULL OR accepted_hook_event_id=?2)
+           UNION
+           SELECT rowid FROM codex_usage_observations
+           WHERE invalid=1 AND EXISTS(SELECT 1 FROM json_each(conflict_owners_json) owner
+               WHERE json_extract(owner.value,'$.{owner_column}')=?1
+                 AND (?2 IS NULL OR json_extract(owner.value,'$.accepted_hook_event_id')=?2))
+         )
+         SELECT input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,
+            reasoning_output_tokens,total_tokens,invalid,received_at,source_version,contract_revision
+         FROM codex_usage_observations WHERE rowid IN (SELECT rowid FROM owned)"
+    ))?;
+    let mut rows = statement.query(params![owner_id, accepted_id])?;
+    let mut sum: Option<ObservedUsageCounters> = None;
+    while let Some(row) = rows.next()? {
+        let counters = ObservedUsageCounters {
+            input_tokens: row.get(0)?,
+            cached_input_tokens: row.get(1)?,
+            cache_write_input_tokens: row.get(2)?,
+            output_tokens: row.get(3)?,
+            reasoning_output_tokens: row.get(4)?,
+            total_tokens: row.get(5)?,
+        };
+        usage.observed_responses = usage
+            .observed_responses
+            .and_then(|count| count.checked_add(1))
+            .filter(|count| *count <= crate::domain::MAX_OBSERVED_TOKENS);
+        let received_at: String = row.get(7)?;
+        if usage
+            .last_observed_at
+            .as_ref()
+            .is_none_or(|last| last < &received_at)
+        {
+            usage.last_observed_at = Some(received_at);
+        }
+        if row.get::<_, bool>(6)?
+            || !counters.valid()
+            || row.get::<_, String>(8)? != "0.157.1"
+            || row.get::<_, String>(9)? != crate::providers::codex::USAGE_CONTRACT_REVISION
+        {
+            usage.status = ObservedUsageStatus::Invalid;
+            usage.reason =
+                Some("Conflicting or invalid response observations; usage is unavailable.".into());
+        }
+        if usage.status == ObservedUsageStatus::Invalid {
+            continue;
+        }
+        sum = match sum {
+            Some(ref total) => total.checked_add(&counters),
+            None => Some(counters),
+        };
+        if sum.is_none() || usage.observed_responses.is_none() {
+            usage.status = ObservedUsageStatus::Invalid;
+            usage.reason = Some("Observed usage exceeds the supported display range.".into());
+        } else {
+            usage.status = ObservedUsageStatus::Observed;
+            usage.reason = None;
+        }
+    }
+    if usage.status == ObservedUsageStatus::Observed {
+        usage.counters = sum;
+    }
+    Ok(usage)
+}
+
+fn session_observed_usage(
+    connection: &Connection,
+    session_id: &str,
+    supported: bool,
+    accepted_id: Option<&str>,
+) -> Result<crate::domain::SessionObservedUsage> {
+    use crate::domain::{ObservedUsage, SessionObservedUsage};
+    if !supported {
+        let mut unavailable =
+            ObservedUsage::unavailable("Observed usage is not supported for Claude yet.");
+        unavailable.source = "Claude usage unavailable".into();
+        return Ok(SessionObservedUsage {
+            current_turn: unavailable.clone(),
+            session: unavailable,
+        });
+    }
+    Ok(SessionObservedUsage {
+        current_turn: match accepted_id {
+            Some(id) => observed_usage(connection, "session_id", session_id, Some(id))?,
+            None => ObservedUsage::unavailable("No current accepted turn is available."),
+        },
+        session: observed_usage(connection, "session_id", session_id, None)?,
+    })
+}
 
 /// CTEs over one session's current invocation: its trusted hooks after that
 /// invocation's own SessionStart, and the newest accepted UserPromptSubmit.

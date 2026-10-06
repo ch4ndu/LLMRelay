@@ -7,6 +7,7 @@ use crate::domain::{
     RestartCandidateResult, RoleContext, RoleKind, RolePeerProvenance, RoleResultReport,
     ValidationLaunchRequest,
 };
+use crate::providers::codex::CapacityFileIdentity;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{
@@ -507,6 +508,7 @@ const MIGRATION_034: &str = include_str!("../migrations/034_guidance_submitted_t
 const MIGRATION_035: &str = include_str!("../migrations/035_provider_failure_holds.sql");
 const MIGRATION_036: &str = include_str!("../migrations/036_attention_observations.sql");
 const MIGRATION_037: &str = include_str!("../migrations/037_trip_workflow_migrations.sql");
+const MIGRATION_038: &str = include_str!("../migrations/038_codex_observed_usage.sql");
 // Same value rusqlite installs at open; set explicitly before any pragma or DDL can contend.
 pub(crate) const STATE_DATABASE_BUSY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
@@ -1175,6 +1177,7 @@ pub struct Store {
     pub(crate) connection: Arc<Mutex<Connection>>,
     state_changes: Arc<Notify>,
     pub(crate) compatibility_bundles: Arc<crate::provider_compatibility::BundleSet>,
+    codex_usage_cache: Arc<Mutex<BTreeMap<String, (CodexUsageCandidate, CapacityFileIdentity)>>>,
 }
 
 /// Exclusive access to the state connection. Releasing it wakes state waiters
@@ -1239,6 +1242,7 @@ impl Store {
             connection: Arc::new(Mutex::new(connection)),
             state_changes: Arc::new(Notify::new()),
             compatibility_bundles: Arc::new(crate::provider_compatibility::BundleSet::embedded()),
+            codex_usage_cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -9898,7 +9902,7 @@ pub(crate) fn verify_input_lease_in(
     Ok(())
 }
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 37;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 38;
 
 /// Reads the durable state cursor. It is committed state only when the
 /// connection is in autocommit mode.
@@ -9910,12 +9914,12 @@ pub(crate) fn read_state_revision(connection: &Connection) -> rusqlite::Result<i
 
 /// The prior schemas an existing database may be migrated from at service
 /// start. Every other non-current version is left unchanged and refused.
-pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 6] = [31, 32, 33, 34, 35, 36];
+pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 7] = [31, 32, 33, 34, 35, 36, 37];
 
 pub(crate) fn require_maintenance_schema(connection: &Connection) -> Result<i64> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != CURRENT_SCHEMA_VERSION && !SERVICE_UPGRADABLE_SCHEMA_VERSIONS.contains(&version) {
-        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–37")
+        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–38")
     }
     Ok(version)
 }
@@ -10423,6 +10427,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction
             .commit()
             .context("commit workflow migration receipt migration")?;
+    }
+    if version <= 37 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_038)?;
+        transaction.pragma_update(None, "user_version", 38)?;
+        transaction
+            .commit()
+            .context("commit Codex observed usage migration")?;
     }
     Ok(())
 }
@@ -10977,6 +10989,15 @@ fn codex_capacity_candidate(
     session_id: &str,
     frontier: Option<i64>,
 ) -> Result<Option<CodexCapacityCandidate>> {
+    codex_history_candidate(connection, session_id, frontier, false)
+}
+
+fn codex_history_candidate(
+    connection: &Connection,
+    session_id: &str,
+    frontier: Option<i64>,
+    observe_usage: bool,
+) -> Result<Option<CodexCapacityCandidate>> {
     let candidate = connection.query_row(
         &format!("WITH {}, frontier AS (
            SELECT COALESCE(?2,MAX(hook_rowid)) AS hook_rowid FROM current_hooks)
@@ -11000,16 +11021,16 @@ fn codex_capacity_candidate(
            AND length(json_extract(accepted.payload_json,'$.turn_id')) BETWEEN 1 AND 128
            AND json_type(accepted.payload_json,'$.transcript_path')='text'
            AND frontier.hook_rowid>=accepted.hook_rowid
-           AND NOT EXISTS(SELECT 1 FROM current_hooks h WHERE
-             h.event_name IN ('SessionStart','SessionEnd')
-             OR (h.hook_rowid>accepted.hook_rowid
+           AND NOT EXISTS(SELECT 1 FROM current_hooks h WHERE h.event_name IN ('SessionStart','SessionEnd'))
+           AND (?3 OR NOT EXISTS(SELECT 1 FROM current_hooks h WHERE
+             h.hook_rowid>accepted.hook_rowid
                  AND json_type(h.payload_json,'$.turn_id')='text'
                  AND json_extract(h.payload_json,'$.turn_id')=json_extract(accepted.payload_json,'$.turn_id')
                  AND (h.event_name IN ('Stop','Interrupt')
                    OR (h.hook_rowid>frontier.hook_rowid AND h.event_name IN
                        ('PreToolUse','PostToolUse','PermissionRequest','SubagentStart','SubagentStop')))))",
             crate::workflow::CURRENT_TURN_HOOKS_SQL),
-        params![session_id, frontier],
+        params![session_id, frontier, observe_usage],
         |row| {
             Ok((
                 CodexCapacityCandidate {
@@ -11177,6 +11198,207 @@ const CODEX_CAPACITY_AUDITS_SQL: &str =
     "SELECT id,detail_json FROM audit_events INDEXED BY audit_events_entity
     WHERE entity_kind='session' AND entity_id=?1 AND actor_kind='service'
       AND event_code='provider.codex_capacity_observed' AND length(detail_json)<=32768";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CodexUsageCandidate {
+    binding: CodexCapacityBinding,
+    task_id: String,
+    transcript_path: std::path::PathBuf,
+    canonical_cwd: std::path::PathBuf,
+    cwd_identity: (u64, u64),
+}
+
+fn codex_usage_candidate(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<CodexUsageCandidate>> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(candidate) = codex_history_candidate(connection, session_id, None, true)? else {
+        return Ok(None);
+    };
+    let binding = candidate.binding;
+    if !crate::providers::codex::valid_usage_id(&binding.native_session_id)
+        || !crate::providers::codex::valid_usage_id(&binding.turn_id)
+    {
+        return Ok(None);
+    }
+    let Ok(cwd) = std::fs::canonicalize(&binding.cwd) else {
+        return Ok(None);
+    };
+    let Ok(cwd_metadata) = std::fs::metadata(&cwd) else {
+        return Ok(None);
+    };
+    if !cwd_metadata.is_dir() {
+        return Ok(None);
+    }
+    if std::fs::canonicalize(&binding.launch_cwd).ok().as_ref() != Some(&cwd)
+        || std::fs::canonicalize(&binding.hook_cwd).ok().as_ref() != Some(&cwd)
+    {
+        return Ok(None);
+    }
+    let task_id = connection.query_row(
+        "SELECT task_id FROM attempts WHERE id=?1",
+        params![binding.attempt_id],
+        |row| row.get(0),
+    )?;
+    Ok(Some(CodexUsageCandidate {
+        binding,
+        task_id,
+        transcript_path: candidate.transcript_path,
+        canonical_cwd: cwd,
+        cwd_identity: (cwd_metadata.dev(), cwd_metadata.ino()),
+    }))
+}
+
+impl Store {
+    pub(crate) fn read_codex_usage(
+        &self,
+        root: &Path,
+        processes: &crate::supervisor::ProcessSnapshot,
+    ) -> Result<
+        Vec<(
+            CodexUsageCandidate,
+            crate::providers::codex::UsageHistoryRead,
+        )>,
+    > {
+        let mut candidates = Vec::new();
+        {
+            let connection = self.lock()?;
+            if let crate::supervisor::ProcessSnapshot::Read(live) = processes {
+                for process in live {
+                    if let Some(candidate) =
+                        codex_usage_candidate(&connection, &process.session_id)?
+                    {
+                        if candidate.binding.is_live(processes) {
+                            candidates.push(candidate);
+                        }
+                    }
+                }
+            }
+        }
+        let cached = {
+            let mut cache = self
+                .codex_usage_cache
+                .lock()
+                .map_err(|_| anyhow!("Codex usage cache is poisoned"))?;
+            cache.retain(|_, (binding, _)| candidates.contains(binding));
+            cache.clone()
+        };
+        let mut observations = Vec::new();
+        for candidate in candidates {
+            let binding = &candidate.binding;
+            let previous = cached
+                .get(&binding.session_id)
+                .filter(|(old, _)| old == &candidate)
+                .map(|(_, identity)| identity);
+            match crate::providers::codex::read_usage_history(
+                root,
+                &candidate.transcript_path,
+                &binding.native_session_id,
+                &binding.turn_id,
+                &candidate.canonical_cwd,
+                previous,
+            ) {
+                Some(crate::providers::codex::UsageHistoryRead::Unchanged) => {}
+                Some(observed) => observations.push((candidate, observed)),
+                None => {
+                    self.codex_usage_cache
+                        .lock()
+                        .map_err(|_| anyhow!("Codex usage cache is poisoned"))?
+                        .remove(&binding.session_id);
+                }
+            }
+        }
+        Ok(observations)
+    }
+
+    pub(crate) fn record_codex_usage(
+        &self,
+        root: &Path,
+        candidate: &CodexUsageCandidate,
+        observed: &crate::providers::codex::UsageHistoryRead,
+        processes: &crate::supervisor::ProcessSnapshot,
+    ) -> Result<()> {
+        let crate::providers::codex::UsageHistoryRead::Observed {
+            identity,
+            responses,
+        } = observed
+        else {
+            return Ok(());
+        };
+        let binding = &candidate.binding;
+        if !binding.is_live(processes) {
+            return Ok(());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if codex_usage_candidate(&transaction, &binding.session_id)?.as_ref() != Some(candidate)
+            || crate::providers::codex::usage_history_identity(root, &candidate.transcript_path)
+                .as_ref()
+                != Some(identity)
+        {
+            return Ok(());
+        }
+        let source = serde_json::to_string(identity)?;
+        let now = Utc::now().to_rfc3339();
+        let owner = serde_json::to_string(&serde_json::json!({"task_id":candidate.task_id,
+            "session_id":binding.session_id,"accepted_hook_event_id":binding.accepted_hook_id}))?;
+        for response in responses {
+            let counters = &response.counters;
+            let existing: Option<bool> = transaction.query_row(
+                "SELECT task_id=?4 AND attempt_id=?5 AND role_generation_id=?6 AND session_id=?7
+                    AND transcript_epoch=?8 AND invocation_start=?9 AND accepted_hook_event_id=?10
+                    AND input_tokens=?11 AND cached_input_tokens=?12 AND cache_write_input_tokens IS ?13
+                    AND output_tokens=?14 AND reasoning_output_tokens=?15 AND total_tokens=?16
+                    AND source_version='0.157.1' AND contract_revision=?17
+                 FROM codex_usage_observations WHERE provider='codex' AND native_thread_id=?1
+                    AND native_turn_id=?2 AND response_id=?3",
+                params![binding.native_session_id, binding.turn_id, response.response_id, candidate.task_id,
+                    binding.attempt_id, binding.role_generation_id, binding.session_id, binding.transcript_epoch,
+                    binding.invocation_start, binding.accepted_hook_id, counters.input_tokens, counters.cached_input_tokens,
+                    counters.cache_write_input_tokens, counters.output_tokens, counters.reasoning_output_tokens,
+                    counters.total_tokens, crate::providers::codex::USAGE_CONTRACT_REVISION], |row| row.get(0)
+            ).optional()?;
+            match existing {
+                Some(true) => {}
+                Some(false) => {
+                    // Preserve the first owner so all conflicting owners stay
+                    // unavailable after restart.
+                    transaction.execute(
+                        "UPDATE codex_usage_observations SET invalid=1,
+                            conflict_owners_json=CASE WHEN EXISTS(SELECT 1 FROM json_each(conflict_owners_json)
+                                WHERE value=json(?4)) THEN conflict_owners_json
+                                ELSE json_insert(conflict_owners_json,'$[#]',json(?4)) END
+                         WHERE provider='codex' AND native_thread_id=?1 AND native_turn_id=?2 AND response_id=?3",
+                        params![binding.native_session_id,binding.turn_id,response.response_id,owner])?;
+                }
+                None => {
+                    transaction.execute(
+                        "INSERT INTO codex_usage_observations(provider,native_thread_id,native_turn_id,response_id,
+                            task_id,attempt_id,role_generation_id,session_id,transcript_epoch,invocation_start,
+                            accepted_hook_event_id,input_tokens,cached_input_tokens,cache_write_input_tokens,
+                            output_tokens,reasoning_output_tokens,total_tokens,source_version,contract_revision,
+                            source_identity_json,received_at)
+                         VALUES('codex',?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'0.157.1',?17,?18,?19)",
+                        params![binding.native_session_id, binding.turn_id, response.response_id, candidate.task_id,
+                            binding.attempt_id, binding.role_generation_id, binding.session_id, binding.transcript_epoch,
+                            binding.invocation_start, binding.accepted_hook_id, counters.input_tokens, counters.cached_input_tokens,
+                            counters.cache_write_input_tokens, counters.output_tokens, counters.reasoning_output_tokens,
+                            counters.total_tokens, crate::providers::codex::USAGE_CONTRACT_REVISION, source, now])?;
+                }
+            }
+        }
+        transaction.commit()?;
+        self.codex_usage_cache
+            .lock()
+            .map_err(|_| anyhow!("Codex usage cache is poisoned"))?
+            .insert(
+                binding.session_id.clone(),
+                (candidate.clone(), identity.clone()),
+            );
+        Ok(())
+    }
+}
 
 pub(crate) fn current_codex_capacity(connection: &Connection) -> Result<Vec<CodexCapacityBinding>> {
     let mut sessions = connection
@@ -15236,9 +15458,10 @@ mod interruption_tests {
             34 => drop_schema_35,
             35 => drop_schema_36,
             36 => drop_schema_37.to_owned(),
+            37 => String::new(),
             _ => panic!("unsupported fixture schema {version}"),
         };
-        format!("{drop_later} PRAGMA user_version={version};")
+        format!("DROP TABLE codex_usage_observations; {drop_later} PRAGMA user_version={version};")
     }
 
     fn schema_31_service_fixture(store: &Store) {
@@ -15391,6 +15614,16 @@ mod interruption_tests {
 
             let lock = database::InstanceLock::acquire(&paths).unwrap();
             let upgraded = database::open_service_locked(&paths, &lock).unwrap();
+            assert_eq!(
+                upgraded
+                    .lock()
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM codex_usage_observations", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0
+            );
             assert_eq!(
                 require_maintenance_schema(&upgraded.lock().unwrap()).unwrap(),
                 CURRENT_SCHEMA_VERSION
@@ -15580,7 +15813,7 @@ mod interruption_tests {
             "foreign_keys",
             "schema_0",
             "schema_30",
-            "schema_38",
+            "schema_39",
         ] {
             let (paths, source) = restorepoint_fixture(31);
             let lock = database::InstanceLock::acquire(&paths).unwrap();
@@ -16053,7 +16286,7 @@ mod interruption_tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            37
+            CURRENT_SCHEMA_VERSION
         );
         assert_eq!(
             connection
@@ -16124,7 +16357,7 @@ mod interruption_tests {
     }
 
     #[test]
-    fn service_start_upgrades_only_schemas_thirty_one_to_thirty_six_and_preserves_receipts() {
+    fn service_start_upgrades_only_schemas_thirty_one_to_thirty_seven_and_preserves_receipts() {
         let root =
             std::env::temp_dir().join(format!("llmrelay-service-upgrade-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -16191,7 +16424,7 @@ mod interruption_tests {
 
         for _ in 0..2 {
             drop(Store::open_service(&database).unwrap());
-            assert_eq!(scalar(version), "Integer(37)");
+            assert_eq!(scalar(version), "Integer(38)");
             assert_eq!(scalar(history), expected_history);
             assert_eq!(scalar(schema), current_schema);
             assert_eq!(
@@ -16208,7 +16441,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(32))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(37)");
+        assert_eq!(scalar(version), "Integer(38)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         // Schema 33 gains only the guidance submitted form and the later migrations.
@@ -16217,7 +16450,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(33))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(37)");
+        assert_eq!(scalar(version), "Integer(38)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -16225,7 +16458,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(34))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(37)");
+        assert_eq!(scalar(version), "Integer(38)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -16233,7 +16466,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(35))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(37)");
+        assert_eq!(scalar(version), "Integer(38)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -16241,26 +16474,38 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(36))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(37)");
+        assert_eq!(scalar(version), "Integer(38)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(&prior_service_schema_sql(37))
+            .unwrap();
+        drop(Store::open_service(&database).unwrap());
+        assert_eq!(scalar(version), "Integer(38)");
+        assert_eq!(scalar(history), expected_history);
+        assert_eq!(scalar(schema), current_schema);
+        assert_eq!(
+            scalar("SELECT COUNT(*) FROM codex_usage_observations"),
+            "Integer(0)"
+        );
         // An ordinary open of the current schema reopens it without migrating;
         // only a newer schema is refused as unknown.
         drop(Store::open(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(37)");
+        assert_eq!(scalar(version), "Integer(38)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         set_version(CURRENT_SCHEMA_VERSION + 1);
         let error = Store::open(&database).err().unwrap();
         assert!(
-            error.to_string().contains("database schema 38 is newer"),
+            error.to_string().contains("database schema 39 is newer"),
             "{error:#}"
         );
-        assert_eq!(scalar(version), "Integer(38)");
+        assert_eq!(scalar(version), "Integer(39)");
         assert_eq!(scalar(history), expected_history);
         set_version(CURRENT_SCHEMA_VERSION);
 
-        for unsupported in [0, 14, 29, 30, 38] {
+        for unsupported in [0, 14, 29, 30, 39] {
             set_version(unsupported);
             let error = Store::open_service(&database).err().unwrap();
             assert!(
@@ -16690,6 +16935,57 @@ mod attention_observation_tests {
                 .unwrap()
         }
 
+        fn write_usage(&self, turn: &str, responses: &[serde_json::Value]) {
+            let mut records = vec![
+                serde_json::json!({"type":"session_meta","payload":{"id":CAPACITY_NATIVE,"session_id":CAPACITY_NATIVE,
+                    "cwd":self.root,"cli_version":"0.157.1","source":"cli","originator":"codex-tui","thread_source":"user"}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":turn}}),
+            ];
+            records.extend(responses.iter().cloned().map(|mut record| {
+                let usage = record["payload"]["usage"].clone();
+                let payload = record["payload"].as_object_mut().unwrap();
+                payload
+                    .entry("turn_token_usage")
+                    .or_insert_with(|| usage.clone());
+                payload.entry("thread_token_usage").or_insert(usage);
+                record
+            }));
+            std::fs::write(
+                self.root.join("sessions/day/turn.jsonl"),
+                records
+                    .iter()
+                    .map(|record| format!("{record}\n"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        }
+
+        fn read_usage(
+            &self,
+        ) -> Vec<(
+            CodexUsageCandidate,
+            crate::providers::codex::UsageHistoryRead,
+        )> {
+            self.store
+                .read_codex_usage(&self.root.join("sessions"), &live())
+                .unwrap()
+        }
+
+        fn record_usage(
+            &self,
+            observation: &(
+                CodexUsageCandidate,
+                crate::providers::codex::UsageHistoryRead,
+            ),
+        ) -> Result<()> {
+            self.store.record_codex_usage(
+                &self.root.join("sessions"),
+                &observation.0,
+                &observation.1,
+                &live(),
+            )
+        }
+
         fn capacity_items(&self) -> Vec<crate::domain::AttentionItem> {
             crate::workflow::state(&self.store)
                 .unwrap()
@@ -16797,7 +17093,7 @@ mod attention_observation_tests {
             let tables = connection
                 .prepare(
                     "SELECT name FROM sqlite_master WHERE type='table'
-                AND name NOT IN ('attention_observations','audit_events','state_revision')
+                AND name NOT IN ('attention_observations','codex_usage_observations','audit_events','state_revision')
                 AND name NOT LIKE 'sqlite_%' ORDER BY name",
                 )
                 .unwrap()
@@ -17437,6 +17733,397 @@ mod attention_observation_tests {
             transcript_epoch: "e".into(),
             process_identity_json: PROCESS.into(),
         }])
+    }
+
+    #[test]
+    fn codex_usage_deduplicates_committed_records_and_preserves_authority() {
+        use crate::domain::ObservedUsageStatus;
+        let session = ObservedSession::codex_capacity();
+        let response = |id: &str, count| {
+            serde_json::json!({"type":"token_usage_record","payload":{
+            "thread_id":CAPACITY_NATIVE,"session_id":CAPACITY_NATIVE,"turn_id":CAPACITY_TURN,
+            "root_turn_id":CAPACITY_TURN,"response_id":id,"usage":{"input_tokens":count,
+                "cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":count},
+            "turn_token_usage":{"input_tokens":999,"cached_input_tokens":0,"output_tokens":0,
+                "reasoning_output_tokens":0,"total_tokens":999},
+            "thread_token_usage":{"input_tokens":9999,"cached_input_tokens":0,"output_tokens":0,
+                "reasoning_output_tokens":0,"total_tokens":9999}}})
+        };
+        let mut measured = response("a", 15);
+        measured["payload"]["usage"]["cache_write_input_tokens"] = serde_json::json!(3);
+        let records = [measured, response("b", 15), response("zero", 0)];
+        session.write_usage(CAPACITY_TURN, &records);
+        session.capacity_hook("Stop", serde_json::json!({"turn_id":CAPACITY_TURN}));
+        let observations = session.read_usage();
+        assert_eq!(
+            observations.len(),
+            1,
+            "matching Stop must not suppress observed usage"
+        );
+        let before = session.business_rows();
+        let revision = session.revision();
+        session.record_usage(&observations[0]).unwrap();
+        assert_eq!(session.business_rows(), before);
+        assert_eq!(session.revision(), revision + 3);
+        let state = crate::workflow::state(&session.store).unwrap();
+        let task = state.tasks[0].observed_usage.as_ref().unwrap();
+        assert_eq!(task.status, ObservedUsageStatus::Observed);
+        assert_eq!(task.observed_responses, Some(3));
+        assert_eq!(task.counters.as_ref().unwrap().total_tokens, 30);
+        assert_eq!(
+            task.counters.as_ref().unwrap().cache_write_input_tokens,
+            None
+        );
+        assert_eq!(
+            state.active_sessions[0]["observed_usage"]["current_turn"]["counters"]["total_tokens"],
+            30
+        );
+        assert!(
+            session.read_usage().is_empty(),
+            "unchanged source must skip parsing"
+        );
+        session.record_usage(&observations[0]).unwrap();
+        assert_eq!(session.revision(), revision + 3);
+        let mut changed = records.to_vec();
+        changed.push(records[2].clone());
+        session.write_usage(CAPACITY_TURN, &changed);
+        assert_eq!(
+            session.read_usage().len(),
+            1,
+            "changed identity must be read again"
+        );
+        let restarted = Store::open(&session.root.join("state.sqlite3")).unwrap();
+        let reread = restarted
+            .read_codex_usage(&session.root.join("sessions"), &live())
+            .unwrap();
+        restarted
+            .record_codex_usage(
+                &session.root.join("sessions"),
+                &reread[0].0,
+                &reread[0].1,
+                &live(),
+            )
+            .unwrap();
+        assert_eq!(
+            session.scalar::<i64>("SELECT COUNT(*) FROM codex_usage_observations"),
+            3
+        );
+        assert_eq!(
+            crate::workflow::state(&restarted).unwrap().tasks[0]
+                .observed_usage
+                .as_ref()
+                .unwrap()
+                .counters
+                .as_ref()
+                .unwrap()
+                .total_tokens,
+            30
+        );
+        session.execute("UPDATE sessions SET transcript_epoch='next';
+            INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,launch_config_json,
+                capability_key,capability_identity_json,state,created_at,updated_at,hook_event_boundary_rowid)
+            VALUES('resume','s',1,'next','{}','fixture','{}','running','2026-01-01T00:00:00Z',
+                '2026-01-01T00:00:00Z',(SELECT MAX(rowid) FROM hook_events));");
+        session.capacity_hook("SessionStart", serde_json::json!({}));
+        session.capacity_hook(
+            "UserPromptSubmit",
+            serde_json::json!({"turn_id":"next-turn",
+            "transcript_path":session.root.join("sessions/day/turn.jsonl")}),
+        );
+        let mut next = response("next-response", 7);
+        next["payload"]["turn_id"] = serde_json::json!("next-turn");
+        next["payload"]["root_turn_id"] = serde_json::json!("next-turn");
+        session.write_usage("next-turn", &[records[0].clone(), next]);
+        let processes = ProcessSnapshot::Read(vec![LiveInvocation {
+            session_id: "s".into(),
+            role_generation_id: "g".into(),
+            transcript_epoch: "next".into(),
+            process_identity_json: PROCESS.into(),
+        }]);
+        let observed = session
+            .store
+            .read_codex_usage(&session.root.join("sessions"), &processes)
+            .unwrap();
+        assert_eq!(observed.len(), 1);
+        session
+            .store
+            .record_codex_usage(
+                &session.root.join("sessions"),
+                &observed[0].0,
+                &observed[0].1,
+                &processes,
+            )
+            .unwrap();
+        let state = crate::workflow::state(&session.store).unwrap();
+        assert_eq!(
+            state.active_sessions[0]["observed_usage"]["current_turn"]["counters"]["total_tokens"],
+            7
+        );
+        assert_eq!(
+            state.active_sessions[0]["observed_usage"]["session"]["counters"]["total_tokens"],
+            37
+        );
+        assert_eq!(
+            session.scalar::<String>(
+                "SELECT transcript_epoch FROM codex_usage_observations WHERE response_id='a'"
+            ),
+            "e"
+        );
+    }
+
+    #[test]
+    fn codex_usage_revalidation_and_transaction_failure_never_advance_cache() {
+        let session = ObservedSession::codex_capacity();
+        session.write_usage(CAPACITY_TURN, &[]);
+        let empty = session.read_usage();
+        session.record_usage(&empty[0]).unwrap();
+        assert!(
+            session.read_usage().is_empty(),
+            "valid empty read can be cached"
+        );
+        session.capacity_hook(
+            "UserPromptSubmit",
+            serde_json::json!({"turn_id":CAPACITY_TURN,
+            "transcript_path":session.root.join("sessions/day/turn.jsonl")}),
+        );
+        assert_eq!(
+            session.read_usage().len(),
+            1,
+            "new accepted binding requires a fresh read"
+        );
+        let record = serde_json::json!({"type":"token_usage_record","payload":{
+            "thread_id":CAPACITY_NATIVE,"session_id":CAPACITY_NATIVE,"turn_id":CAPACITY_TURN,
+            "root_turn_id":CAPACITY_TURN,"response_id":"one","usage":{"input_tokens":0,
+                "cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,
+                "reasoning_output_tokens":0,"total_tokens":0}}});
+        session.write_usage(CAPACITY_TURN, &[record.clone()]);
+        let observed = session.read_usage();
+        session.execute(
+            "CREATE TRIGGER fail_usage BEFORE INSERT ON codex_usage_observations
+            BEGIN SELECT RAISE(ABORT,'usage persistence fixture failure'); END;",
+        );
+        let before = session.business_rows();
+        let revision = session.revision();
+        let error = session.record_usage(&observed[0]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("usage persistence fixture failure"));
+        assert_eq!(session.business_rows(), before);
+        assert_eq!(session.revision(), revision);
+        assert_eq!(
+            session.read_usage().len(),
+            1,
+            "failed persistence cannot cache the new identity"
+        );
+        session.execute("DROP TRIGGER fail_usage;");
+        session.write_usage(CAPACITY_TURN, &[]);
+        session.record_usage(&observed[0]).unwrap();
+        assert_eq!(
+            session.scalar::<i64>("SELECT COUNT(*) FROM codex_usage_observations"),
+            0,
+            "changed file identity after reading must discard the source"
+        );
+        session.write_usage(CAPACITY_TURN, &[record.clone()]);
+        let fresh = session.read_usage();
+        session.capacity_hook(
+            "UserPromptSubmit",
+            serde_json::json!({"turn_id":"later-turn",
+            "transcript_path":session.root.join("sessions/day/turn.jsonl")}),
+        );
+        session.record_usage(&fresh[0]).unwrap();
+        assert_eq!(
+            session.scalar::<i64>("SELECT COUNT(*) FROM codex_usage_observations"),
+            0
+        );
+        for turn in ["x".repeat(129), "invalid\u{0085}turn".into()] {
+            session.capacity_hook(
+                "UserPromptSubmit",
+                serde_json::json!({"turn_id":turn,
+                "transcript_path":session.root.join("sessions/day/turn.jsonl")}),
+            );
+            assert!(session.read_usage().is_empty());
+        }
+        let session = ObservedSession::codex_capacity();
+        let cwd = session.root.join("working");
+        std::fs::create_dir(&cwd).unwrap();
+        {
+            let connection = session.store.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE projects SET repository_path=?1",
+                    params![cwd.to_str().unwrap()],
+                )
+                .unwrap();
+            connection.execute("UPDATE sessions SET launch_config_json=json_set(launch_config_json,'$.cwd',?1)",
+                params![cwd.to_str().unwrap()]).unwrap();
+            connection.execute("UPDATE hook_events SET payload_json=json_set(payload_json,'$.cwd',?1) WHERE event_name='UserPromptSubmit'",
+                params![cwd.to_str().unwrap()]).unwrap();
+        }
+        session.write_usage(CAPACITY_TURN, &[record]);
+        let path = session.root.join("sessions/day/turn.jsonl");
+        let mut records: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        records[0]["payload"]["cwd"] = serde_json::json!(cwd);
+        std::fs::write(
+            &path,
+            records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let original = session.read_usage();
+        assert_eq!(original.len(), 1);
+        std::fs::rename(&cwd, session.root.join("previous-working")).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+        session.record_usage(&original[0]).unwrap();
+        assert_eq!(
+            session.scalar::<i64>("SELECT COUNT(*) FROM codex_usage_observations"),
+            0
+        );
+        let replacement = session.read_usage();
+        assert_eq!(original[0].0.canonical_cwd, replacement[0].0.canonical_cwd);
+        assert_ne!(original[0].0.cwd_identity, replacement[0].0.cwd_identity);
+    }
+
+    #[test]
+    fn codex_usage_conflicts_keep_original_provenance_and_invalidate_both_turn_owners() {
+        use crate::domain::ObservedUsageStatus;
+        let session = ObservedSession::codex_capacity();
+        let mut record = serde_json::json!({"type":"token_usage_record","payload":{
+            "thread_id":CAPACITY_NATIVE,"session_id":CAPACITY_NATIVE,"turn_id":CAPACITY_TURN,
+            "root_turn_id":CAPACITY_TURN,"response_id":"conflict","usage":{"input_tokens":10,
+                "cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,
+                "reasoning_output_tokens":0,"total_tokens":10}}});
+        session.write_usage(CAPACITY_TURN, &[record.clone()]);
+        let original = session.read_usage();
+        session.record_usage(&original[0]).unwrap();
+        let provenance: String = session.scalar("SELECT accepted_hook_event_id||':'||transcript_epoch||':'||input_tokens FROM codex_usage_observations");
+        record["payload"]["usage"]["input_tokens"] = serde_json::json!(200);
+        record["payload"]["usage"]["total_tokens"] = serde_json::json!(200);
+        session.write_usage(CAPACITY_TURN, &[record]);
+        let conflict = session.read_usage();
+        session.record_usage(&conflict[0]).unwrap();
+        let revision = session.revision();
+        session.record_usage(&conflict[0]).unwrap();
+        assert_eq!(
+            session.revision(),
+            revision,
+            "identical conflict replay is idempotent"
+        );
+        session.capacity_hook(
+            "UserPromptSubmit",
+            serde_json::json!({"turn_id":CAPACITY_TURN,
+            "transcript_path":session.root.join("sessions/day/turn.jsonl")}),
+        );
+        let reassignment = session.read_usage();
+        session.record_usage(&reassignment[0]).unwrap();
+        assert_eq!(
+            session.scalar::<i64>("SELECT COUNT(*) FROM codex_usage_observations"),
+            1
+        );
+        assert_eq!(session.scalar::<String>("SELECT accepted_hook_event_id||':'||transcript_epoch||':'||input_tokens FROM codex_usage_observations"), provenance);
+        let reopened = Store::open(&session.root.join("state.sqlite3")).unwrap();
+        let state = crate::workflow::state(&reopened).unwrap();
+        let task = state.tasks[0].observed_usage.as_ref().unwrap();
+        assert_eq!(task.status, ObservedUsageStatus::Invalid);
+        assert!(task.counters.is_none());
+        assert_eq!(
+            state.active_sessions[0]["observed_usage"]["current_turn"]["status"],
+            "invalid"
+        );
+        assert!(state.active_sessions[0]["observed_usage"]["current_turn"]["counters"].is_null());
+        assert_eq!(
+            session.scalar::<i64>(
+                "SELECT json_array_length(conflict_owners_json) FROM codex_usage_observations"
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn codex_usage_task_projection_survives_session_window_and_rejects_overflow() {
+        use crate::domain::ObservedUsageStatus;
+        let session = ObservedSession::codex_capacity();
+        let response = |id: &str| {
+            serde_json::json!({"type":"token_usage_record","payload":{
+            "thread_id":CAPACITY_NATIVE,"session_id":CAPACITY_NATIVE,"turn_id":CAPACITY_TURN,
+            "root_turn_id":CAPACITY_TURN,"response_id":id,"usage":{"input_tokens":15,
+                "cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,
+                "reasoning_output_tokens":0,"total_tokens":15}}})
+        };
+        session.write_usage(CAPACITY_TURN, &[response("one"), response("two")]);
+        let observations = session.read_usage();
+        session.execute("UPDATE sessions SET status='exited',exit_json='{}'");
+        session.record_usage(&observations[0]).unwrap();
+        assert_eq!(
+            session.scalar::<i64>("SELECT COUNT(*) FROM codex_usage_observations"),
+            0,
+            "exit after reading retires the binding"
+        );
+        session.execute("UPDATE sessions SET status='running',exit_json=NULL");
+        session
+            .store
+            .record_codex_usage(
+                &session.root.join("sessions"),
+                &observations[0].0,
+                &observations[0].1,
+                &ProcessSnapshot::Unavailable,
+            )
+            .unwrap();
+        assert_eq!(
+            session.scalar::<i64>("SELECT COUNT(*) FROM codex_usage_observations"),
+            0
+        );
+        session.record_usage(&observations[0]).unwrap();
+        session.execute("UPDATE sessions SET status='exited',exit_json='{}'");
+        for index in 0..201 {
+            session.store.lock().unwrap().execute("INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,
+                executable_version,transcript_epoch,created_at,updated_at)
+                VALUES(?1,'g','codex','exited','{}','fixture',?1,'2026-02-01T00:00:00Z','2026-02-01T00:00:00Z')",
+                params![format!("newer-{index}")]).unwrap();
+        }
+        let state = crate::workflow::state(&session.store).unwrap();
+        assert!(!state.active_sessions.iter().any(|row| row["id"] == "s"));
+        assert_eq!(
+            state.tasks[0]
+                .observed_usage
+                .as_ref()
+                .unwrap()
+                .counters
+                .as_ref()
+                .unwrap()
+                .total_tokens,
+            30
+        );
+        assert!(session.read_usage().is_empty());
+        assert!(session.store.codex_usage_cache.lock().unwrap().is_empty());
+        let revision = session.revision();
+        session.store.lock().unwrap().execute("UPDATE codex_usage_observations SET input_tokens=?1,total_tokens=?1 WHERE response_id='two'",
+            params![crate::domain::MAX_OBSERVED_TOKENS]).unwrap();
+        assert_eq!(session.revision(), revision + 1);
+        let usage = crate::workflow::state(&session.store).unwrap().tasks[0]
+            .observed_usage
+            .clone()
+            .unwrap();
+        assert_eq!(usage.status, ObservedUsageStatus::Invalid);
+        assert!(usage.counters.is_none());
+        session.execute("DELETE FROM codex_usage_observations WHERE response_id='two'");
+        assert_eq!(session.revision(), revision + 2);
+        assert_eq!(
+            crate::workflow::state(&session.store).unwrap().tasks[0]
+                .observed_usage
+                .as_ref()
+                .unwrap()
+                .counters
+                .as_ref()
+                .unwrap()
+                .total_tokens,
+            15
+        );
     }
 
     #[test]

@@ -36,7 +36,7 @@ import { ServiceCheckPermissionActions } from "./ApprovalInbox";
 import { MarkdownContent } from "./MarkdownContent";
 import { guidanceState } from "./AttentionInbox";
 import { ActivityTimeline } from "./ActivityTimeline";
-import { SessionTree, useSessionAccess } from "./SessionTree";
+import { ObservedUsageDetails, SessionTree, useSessionAccess } from "./SessionTree";
 import { PHASE_STEPS, phaseStep, StatusBadge, taskStatus } from "./TaskBoard";
 
 export type TaskTab = "overview" | "changes" | "checks" | "activity";
@@ -626,6 +626,7 @@ export function TaskDetail(
       <div className="task-overview-main">
         <section className="panel" aria-labelledby="task-summary-title">
           <h3 id="task-summary-title">Summary</h3>
+          <ObservedUsageDetails usage={task.observed_usage} label="Task" />
           {task.description.trim()
             ? <MarkdownContent className="task-description" text={task.description} />
             : <p className="empty">No description.</p>}

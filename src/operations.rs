@@ -766,7 +766,21 @@ impl Application {
                     }
                     Ok(())
                 })();
-                attention.and(capacity)
+                let usage = (|| {
+                    let Some(root) = crate::providers::codex::capacity_history_root() else {
+                        return Ok(());
+                    };
+                    let observations = self.store.read_codex_usage(&root, &processes)?;
+                    if !observations.is_empty() {
+                        let current = self.supervisor.process_snapshot()?;
+                        for (candidate, source) in observations {
+                            self.store
+                                .record_codex_usage(&root, &candidate, &source, &current)?;
+                        }
+                    }
+                    Ok(())
+                })();
+                attention.and(capacity).and(usage)
             });
         let Ok(mut reported) = self.attention_failure_reported.lock() else {
             tracing::warn!("attention observation failure state is poisoned");

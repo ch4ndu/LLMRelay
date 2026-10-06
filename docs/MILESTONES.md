@@ -996,3 +996,21 @@ matrix and fresh final verification passed. The matrix includes 61 frontend and
 ## Opt-in missing-report reminders — verified
 
 The approved follow-up adds a default-off project setting, a durable lifetime limit of two reservations per role generation, exact missing-report/native-idle eligibility and guarded delivery through existing guidance. Final verification and setup/probe sessions are excluded. Current source and focused tests cover cancellation, later ordinary guidance, uncertain delivery, report arrival, permissions, input leases and settings preservation. Independent code review and its focused repair recheck passed. The reconciled full verification matrix passed (63 frontend tests and 342 Rust tests), and fresh Fable Medium final verification approved the candidate. The selected feature is verified; no commit or release is implied. Original provider-dependent automatic readiness remains outside this feature.
+
+## Codex observed usage — verified
+
+The user-approved Codex-first plan r2 delivers presentation-only observed turn,
+session and durable task usage from exact 0.157.1 response records. Totals are
+partial, with distinct observed-zero, unavailable and invalid states. Durable
+response identity prevents replay/resume duplication; task aggregation is
+independent of the dashboard's recent-session window. Schema 38 and the existing
+restore-point path preserve upgrades from supported schemas 31–37.
+
+Independent Sol 6.1 xhigh code review approved the integrated candidate. The
+reconciled matrix passed 430 tests (64 frontend, 159 library, 205 contracts,
+2 runtime), with zero failures or ignored tests after an isolated retry of one
+unchanged signal fixture. The original failure remains recorded. Fresh Fable Medium final
+verification approved on October 5. This is verified source delivery. Live native delivery and provider
+accuracy remain unverified; Claude usage, quota/reset and cost displays are
+deferred. No execution/approval/model/readiness authority changes or live user
+instance operation are included. Evidence: `.local/trip-explorer/usage_limits_20261005/`.

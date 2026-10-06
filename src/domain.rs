@@ -880,6 +880,102 @@ pub struct TaskDto {
     /// actually advancing. Absent for finished tasks and tasks without work.
     #[serde(default)]
     pub progress: Option<TaskProgress>,
+    #[serde(default)]
+    pub observed_usage: Option<ObservedUsage>,
+}
+
+pub(crate) const MAX_OBSERVED_TOKENS: i64 = 9_007_199_254_740_991;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ObservedUsageCounters {
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub cache_write_input_tokens: Option<i64>,
+    pub output_tokens: i64,
+    pub reasoning_output_tokens: i64,
+    pub total_tokens: i64,
+}
+
+impl ObservedUsageCounters {
+    pub(crate) fn valid(&self) -> bool {
+        [
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.output_tokens,
+            self.reasoning_output_tokens,
+            self.total_tokens,
+        ]
+        .into_iter()
+        .chain(self.cache_write_input_tokens)
+        .all(|count| (0..=MAX_OBSERVED_TOKENS).contains(&count))
+            && self.cached_input_tokens <= self.input_tokens
+            && self.reasoning_output_tokens <= self.output_tokens
+            && self
+                .input_tokens
+                .checked_add(self.output_tokens)
+                .is_some_and(|included| included <= self.total_tokens)
+    }
+
+    pub(crate) fn checked_add(&self, other: &Self) -> Option<Self> {
+        let sum = Self {
+            input_tokens: self.input_tokens.checked_add(other.input_tokens)?,
+            cached_input_tokens: self
+                .cached_input_tokens
+                .checked_add(other.cached_input_tokens)?,
+            cache_write_input_tokens: match (
+                self.cache_write_input_tokens,
+                other.cache_write_input_tokens,
+            ) {
+                (Some(left), Some(right)) => Some(left.checked_add(right)?),
+                _ => None,
+            },
+            output_tokens: self.output_tokens.checked_add(other.output_tokens)?,
+            reasoning_output_tokens: self
+                .reasoning_output_tokens
+                .checked_add(other.reasoning_output_tokens)?,
+            total_tokens: self.total_tokens.checked_add(other.total_tokens)?,
+        };
+        sum.valid().then_some(sum)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedUsageStatus {
+    Observed,
+    Unavailable,
+    Invalid,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ObservedUsage {
+    pub status: ObservedUsageStatus,
+    pub partial: bool,
+    pub counters: Option<ObservedUsageCounters>,
+    pub observed_responses: Option<i64>,
+    pub source: String,
+    pub last_observed_at: Option<String>,
+    pub reason: Option<String>,
+}
+
+impl ObservedUsage {
+    pub(crate) fn unavailable(reason: &str) -> Self {
+        Self {
+            status: ObservedUsageStatus::Unavailable,
+            partial: true,
+            counters: None,
+            observed_responses: Some(0),
+            source: "Codex 0.157.1 response records".into(),
+            last_observed_at: None,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionObservedUsage {
+    pub current_turn: ObservedUsage,
+    pub session: ObservedUsage,
 }
 
 /// Where a task stands, derived from authoritative workflow evidence. Hook

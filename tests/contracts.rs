@@ -35775,7 +35775,7 @@ fn mb14_stale_exit_cannot_mutate_reserved_or_running_replacement_generation() {
 }
 
 /// Tables read directly or through helper decisions by `workflow::state`.
-const STATE_PROJECTED_TABLES: [&str; 70] = [
+const STATE_PROJECTED_TABLES: [&str; 71] = [
     "attempts",
     "attention_observations",
     "audit_events",
@@ -35784,6 +35784,7 @@ const STATE_PROJECTED_TABLES: [&str; 70] = [
     "check_suites",
     "claims",
     "cmux_session_surfaces",
+    "codex_usage_observations",
     "controls",
     "freeze_intents",
     "guidance_messages",
@@ -36166,7 +36167,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 37_i64);
+    fixture.assert_scalar("PRAGMA user_version", 38_i64);
     fixture.assert_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%'",
         i64::try_from(triggers.len()).unwrap(),
@@ -36201,7 +36202,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 37_i64);
+    fixture.assert_scalar("PRAGMA user_version", 38_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -42486,14 +42487,14 @@ fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordina
 #[test]
 fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
-    fixture.assert_scalar("PRAGMA user_version", 37_i64);
+    fixture.assert_scalar("PRAGMA user_version", 38_i64);
     let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
     fixture.execute_batch(&format!(
         "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; PRAGMA user_version=30;"
     ));
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 37_i64);
+    fixture.assert_scalar("PRAGMA user_version", 38_i64);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
@@ -43261,8 +43262,8 @@ fn stale_restart_candidate_cancellation_refuses_live_sessions_and_pending_admiss
 }
 
 const MIGRATION_031_SQL: &str = include_str!("../migrations/031_final_repair_recheck.sql");
-const DROP_AFTER_SCHEMA_32: &str =
-    "DROP TABLE attention_observations; DROP INDEX role_results_session_generation;
+const DROP_AFTER_SCHEMA_32: &str = "DROP TABLE codex_usage_observations;
+     DROP TABLE attention_observations; DROP INDEX role_results_session_generation;
      DROP TABLE provider_failure_holds;
      DROP TRIGGER guidance_submitted_form_paired;
      DROP TRIGGER guidance_submitted_form_once;
@@ -43366,7 +43367,7 @@ fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
     fixture.assert_scalar("PRAGMA user_version", 31_i64);
 
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 37_i64);
+    fixture.assert_scalar("PRAGMA user_version", 38_i64);
     assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(
