@@ -1,6 +1,0 @@
-interface:
-  display_name: "TRIP Explorer Workflow"
-  short_description: "Run manager-gated engineering with conditional Explorer"
-  default_prompt: "Use $trip-explorer-workflow for this engineering task. Plan first and edit only after my explicit approval and authorization."
-policy:
-  allow_implicit_invocation: false

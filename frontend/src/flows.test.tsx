@@ -21,6 +21,7 @@ import type {
   StateWaitResult,
   Task,
   TripSetupState,
+  TripSetupProfile,
   TripTaskVerification,
 } from "./types";
 import type { LiveEnvironment, LiveStatus } from "./liveState";
@@ -1250,6 +1251,185 @@ const initialized: Project = {
     detected_installation: "compatible",
   },
 };
+Deno.test("setup migration review follows installation kind rather than path inventory", async () => {
+  const profile = (
+    authority: TripSetupProfile["authority"],
+    session: TripSetupProfile["session"],
+  ): TripSetupProfile => ({
+    adapter: "llmrelay_codex",
+    provider: "codex",
+    model: "gpt-6.1-sol",
+    effort: "xhigh",
+    authority,
+    session,
+  });
+  const configuration = {
+    project_name: "Fixture",
+    guidance: ["AGENTS.md"],
+    documentation: { no_change_text: "No documentation changes required." },
+    verification: { focused: [], broad: [], cleanup: [] },
+    testing: { coverage: "moderate" },
+    observability: { cmux: "off" },
+    roles: Object.fromEntries(
+      ROLES.filter((role) => role !== "manager").map((
+        role,
+      ) => [role, { profile: role }]),
+    ),
+    profiles: {
+      explorer: profile("read-only", "retained"),
+      plan_reviewer: profile("read-only", "retained"),
+      implementer: profile("workspace-write", "retained"),
+      code_reviewer: profile("read-only", "retained"),
+      final_verifier: profile("read-only", "fresh"),
+    },
+  };
+  const setup: TripSetupState = {
+    setup_operation_id: "migration-kind",
+    project_id: "p1",
+    state: "draft",
+    selected_profiles: [{
+      role: "manager",
+      selection_state: "selected",
+      profile: { provider: "codex", model: "gpt-6.1-sol", effort: "xhigh" },
+    }],
+    probe_receipts: [{
+      id: "manager-proof",
+      profile_id: "manager",
+      profile_hash: "hash",
+      provider: "codex",
+      role: "manager",
+      authority: "read-only",
+      session_mode: "retained",
+      generation_id: "generation",
+      result: "pass",
+      model_evidence: "observed",
+      evidence: {},
+      created_at: "",
+    }],
+    target_inventory: {},
+    final_files: [],
+    installation_source_binding_complete: false,
+    installation_source_binding_reason: "draft",
+    sessions: [],
+    runtime_admissions: [],
+    agents_file: { content: "Project guidance" },
+    created_at: "",
+    updated_at: "",
+  };
+  const observed = (kind: string): Project => ({
+    ...initialized,
+    trip: {
+      ...initialized.trip!,
+      detected: {
+        kind,
+        observation_hash: "observation",
+        partial_paths: [".agents/trip-explorer"],
+        configuration,
+      },
+    },
+  });
+  const requests: Array<
+    {
+      proposal: {
+        canonical_migration?: {
+          observed_kind: string;
+          observation_hash: string;
+          resolutions: Record<string, string>;
+        };
+      };
+    }
+  > = [];
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ result: { state: "draft" } }));
+    }) as typeof fetch;
+  try {
+    for (const kind of ["compatible", "absent", "partial", "conflicting"]) {
+      localStorage.clear();
+      mount(
+        <ProjectSetup
+          project={observed(kind)}
+          setup={setup}
+          onChanged={noop}
+          onViewSession={cmuxFixture}
+        />,
+      );
+      const review = [...document.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("Review changes"));
+      check(!!review, "review stage missing");
+      act(() => review!.click());
+      const save = [...document.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent === "Save setup proposal");
+      check(!!save, "save control missing");
+      if (kind === "compatible" || kind === "absent") {
+        check(
+          !save!.disabled,
+          `${kind} inventory incorrectly requires migration resolution: ${
+            save!.title
+          }`,
+        );
+        check(
+          !document.body.textContent?.includes(
+            "Existing customization preservation",
+          ),
+          "informational paths rendered as conflicts",
+        );
+      } else {
+        check(
+          save!.disabled,
+          "genuine migration did not require preservation resolution",
+        );
+        const resolution = [
+          ...document.querySelectorAll<HTMLSelectElement>("select"),
+        ].find((select) =>
+          [...select.options].some((option) => option.value === "use_pinned")
+        );
+        check(!!resolution, "migration resolution missing");
+        act(() => {
+          resolution!.value = "use_pinned";
+          resolution!.dispatchEvent(new Event("change", { bubbles: true }));
+        });
+      }
+      click("Save setup proposal");
+      await settle();
+      const migration = requests.at(-1)?.proposal.canonical_migration;
+      if (kind === "compatible" || kind === "absent") {
+        check(
+          migration === undefined,
+          "compatible/absent proposal contains migration authority",
+        );
+      } else {
+        check(
+          migration?.observed_kind === kind &&
+            migration.observation_hash === "observation" &&
+            migration.resolutions["partial:.agents/trip-explorer"] ===
+              "use_pinned",
+          "migration lost exact observation or resolution",
+        );
+      }
+      unmount();
+    }
+    localStorage.clear();
+    mount(<ProjectSetup project={observed("compatible")} setup={setup} onChanged={noop} onViewSession={cmuxFixture} />);
+    field("Project name", "Preserved edited name");
+    const review = [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.includes("Review changes"));
+    act(() => review!.click());
+    rerender(<ProjectSetup project={observed("partial")} setup={setup} onChanged={noop} onViewSession={cmuxFixture} />);
+    const save = [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent === "Save setup proposal");
+    check(save?.disabled, "changed observation retained compatible-installation save authority");
+    const settings = [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.includes("2") && button.textContent.includes("Project settings"));
+    act(() => settings!.click());
+    check(findField("Project name").value === "Preserved edited name", "observation refresh discarded edited settings");
+  } finally {
+    unmount();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
 const task: Task = {
   id: "AJ-1",
   project_id: "p1",

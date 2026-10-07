@@ -2,12 +2,12 @@
   "schema": 1,
   "provider": "claude",
   "pack_id": "llmrelay-claude-compatibility",
-  "pack_revision": "3",
-  "description": "Embedded Claude Code 2.1.283 compatibility candidates.",
+  "pack_revision": "4",
+  "description": "Embedded Claude Code 2.1.289 compatibility candidates.",
   "selectors": [
     {
-      "predicate_id": "claude-code-2.1.283",
-      "exact_version": "2.1.283 (Claude Code)",
+      "predicate_id": "claude-code-2.1.289",
+      "exact_version": "2.1.289 (Claude Code)",
       "contracts": [
         {
           "role": "manager",

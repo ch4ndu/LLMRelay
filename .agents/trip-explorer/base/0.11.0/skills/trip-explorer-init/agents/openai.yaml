@@ -1,6 +1,0 @@
-interface:
-  display_name: "Initialize TRIP Explorer"
-  short_description: "Adapt and verify TRIP Explorer for this project"
-  default_prompt: "Use $trip-explorer-init to configure this copied workflow, its AGENTS.md guidance, and all delegated role profiles."
-policy:
-  allow_implicit_invocation: false

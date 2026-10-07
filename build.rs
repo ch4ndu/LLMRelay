@@ -89,8 +89,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=AGENTICJIRA_FRONTEND_DIST");
     println!("cargo:rerun-if-env-changed=AGENTICJIRA_ALLOW_FOUNDATION");
     println!("cargo:rerun-if-changed=resources/foundation.html");
-    println!("cargo:rerun-if-changed=resources/trip-explorer/0.9.0");
-    println!("cargo:rerun-if-changed=resources/workflows/trip-explorer-0.9.0-llmrelay-1.json");
+    println!("cargo:rerun-if-changed=resources/trip-explorer/0.12.0");
+    println!("cargo:rerun-if-changed=resources/workflows/trip-explorer-0.12.0-llmrelay-1.json");
     println!("cargo:rerun-if-changed=resources/prompts/trip-overlay.md");
     println!("cargo:rerun-if-changed=frontend/dist");
     println!("cargo:rerun-if-changed=frontend/src");

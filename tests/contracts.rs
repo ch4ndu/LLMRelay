@@ -1564,9 +1564,9 @@ fn seed_synthetic_installed_project(
     provider: Provider,
 ) {
     let package_root =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/trip-explorer/0.11.0");
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/trip-explorer/0.12.0");
     let source: serde_json::Value = serde_json::from_str(include_str!(
-        "../resources/trip-explorer/0.11.0/source-manifest.json"
+        "../resources/trip-explorer/0.12.0/source-manifest.json"
     ))
     .unwrap();
     let files = source["files"].as_object().unwrap();
@@ -12439,7 +12439,7 @@ fn blocked_role_result_invalidates_transition_authority_and_acceptance() {
 #[test]
 fn source_manifest_provenance_is_portable_and_stale_workspace_or_session_pins_fail_closed() {
     let manifest: serde_json::Value = serde_json::from_str(include_str!(
-        "../resources/trip-explorer/0.11.0/source-manifest.json"
+        "../resources/trip-explorer/0.12.0/source-manifest.json"
     ))
     .unwrap();
     let repository = manifest["source_repository"].as_str().unwrap();
@@ -12447,7 +12447,7 @@ fn source_manifest_provenance_is_portable_and_stale_workspace_or_session_pins_fa
     assert_eq!(repository, "trip-explorer-workflow");
     assert!(!repository.starts_with('/'));
     assert!(!repository.contains("/Users/"));
-    assert_eq!(source_head, "c7b360b84f9457a1c6800563391256f08d9f43e3");
+    assert_eq!(source_head, "a3edbad8b10953ea9dbdba39b8d3523713da3e5c");
 
     let fixture = Fixture::new("stale-workspace-session-pins");
     let (_, _, plan) = new_task(&fixture, "pins", "pins-task");
@@ -19289,10 +19289,10 @@ fn capability_identity_orders_overlapping_denials_and_preserves_probe_commands()
 #[test]
 fn capability_keys_keep_external_socket_identity_without_probe_policy() {
     let binding = agenticjira::provider_compatibility::BundleSet::embedded()
-        .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
+        .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
         .unwrap();
     let mut first = launch(RoleKind::Manager, "fixture", "/fixture/c".into());
-    first.executable_version = "codex-cli 0.157.1".into();
+    first.executable_version = "codex-cli 0.160.0".into();
     first.compatibility = Some(binding);
     first.argv = vec![
         "--cd".into(),
@@ -19328,9 +19328,9 @@ fn m7_embedded_provider_selectors_are_exact_and_require_role_qualification() {
     use agenticjira::provider_compatibility::{AuthorityBinding, BundleSet, CompatibilityError};
     let bundles = BundleSet::embedded();
     let matched = bundles
-        .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
+        .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
         .unwrap();
-    assert_eq!(matched.predicate_id, "codex-cli-0.157.1");
+    assert_eq!(matched.predicate_id, "codex-cli-0.160.0");
     assert!(!matched.effective_hash.is_empty());
     assert_ne!(matched.effective_hash, matched.bundle_hash);
     let authority = serde_json::to_value(AuthorityBinding::from(&matched)).unwrap();
@@ -19340,6 +19340,12 @@ fn m7_embedded_provider_selectors_are_exact_and_require_role_qualification() {
         bundles.resolve(Provider::Codex, "codex-cli 0.155.2", RoleKind::Manager),
         Err(CompatibilityError::Unsupported { .. })
     ));
+    for version in ["codex-cli 0.157.1", "codex-cli 0.161.0"] {
+        assert!(matches!(
+            bundles.resolve(Provider::Codex, version, RoleKind::Manager),
+            Err(CompatibilityError::Unsupported { .. })
+        ));
+    }
     assert!(matches!(
         bundles.resolve(Provider::Claude, "any-version", RoleKind::Manager),
         Err(CompatibilityError::Unsupported { .. })
@@ -19353,21 +19359,22 @@ fn m7_embedded_provider_selectors_are_exact_and_require_role_qualification() {
         RoleKind::FinalReviewer,
     ] {
         let claude = bundles
-            .resolve(Provider::Claude, "2.1.283 (Claude Code)", role)
+            .resolve(Provider::Claude, "2.1.289 (Claude Code)", role)
             .unwrap();
-        assert_eq!(claude.predicate_id, "claude-code-2.1.283");
+        assert_eq!(claude.predicate_id, "claude-code-2.1.289");
         assert!(!claude.synthetic_origin);
         assert!(claude
             .required_evidence
             .iter()
             .any(|item| item == "role_capability_proof"));
         bundles
-            .resolve(Provider::Codex, "codex-cli 0.157.1", role)
+            .resolve(Provider::Codex, "codex-cli 0.160.0", role)
             .unwrap();
         for version in [
+            "2.1.283 (Claude Code)",
             "2.1.282 (Claude Code)",
-            "2.1.284 (Claude Code)",
-            "2.1.283",
+            "2.1.290 (Claude Code)",
+            "2.1.289",
             "synthetic-claude-v1",
         ] {
             assert!(matches!(
@@ -19382,25 +19389,25 @@ fn m7_embedded_provider_selectors_are_exact_and_require_role_qualification() {
     changed["description"] = "Different display text".into();
     changed["pack_revision"] = "2".into();
     let reworded = BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes)
-        .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
+        .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
         .unwrap();
     assert_eq!(matched.effective_hash, reworded.effective_hash);
     assert_ne!(matched.bundle_hash, reworded.bundle_hash);
     changed["selectors"][0]["contracts"][3]["contract_revision"] = "codex-implementer-v2".into();
     let unrelated = BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes)
-        .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
+        .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
         .unwrap();
     assert_eq!(matched.effective_hash, unrelated.effective_hash);
     changed["selectors"][0]["contracts"][0]["contract_revision"] = "codex-manager-v2".into();
     let affected = BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes)
-        .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
+        .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
         .unwrap();
     assert_ne!(matched.effective_hash, affected.effective_hash);
     changed["unexpected"] = true.into();
     assert!(matches!(
         BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes).resolve(
             Provider::Codex,
-            "codex-cli 0.157.1",
+            "codex-cli 0.160.0",
             RoleKind::Manager
         ),
         Err(CompatibilityError::InvalidManifest { .. })
@@ -19409,7 +19416,7 @@ fn m7_embedded_provider_selectors_are_exact_and_require_role_qualification() {
     let duplicate = changed["selectors"][0].clone();
     changed["selectors"].as_array_mut().unwrap().push(duplicate);
     let overlap = BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes)
-        .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
+        .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
         .unwrap_err();
     assert!(matches!(
         overlap,
@@ -19445,7 +19452,7 @@ fn m7_legacy_binding_cannot_admit_and_synthetic_store_cannot_enter_production_ap
         .find(|row| row["config_hash"] == "legacy-key")
         .unwrap();
     assert_eq!(legacy_row["status"], "unverified");
-    assert_eq!(legacy_row["compatibility"]["status"], "evidence_stale");
+    assert_eq!(legacy_row["compatibility"]["status"], "unknown_version");
     let connection = Connection::open(root.join("state.sqlite3")).unwrap();
     let persisted: (String, String) = connection
         .query_row(
@@ -19501,10 +19508,10 @@ fn m7_persisted_production_equivalent_synthetic_proof_cannot_authorize_normal_re
         .unwrap()
         .with_synthetic_compatibility_for_tests(codex, claude);
     let mut synthetic_launch = launch(RoleKind::Manager, "fixture", root.clone());
-    synthetic_launch.executable_version = "codex-cli 0.157.1".into();
+    synthetic_launch.executable_version = "codex-cli 0.160.0".into();
     synthetic_launch.compatibility = Some(
         BundleSet::synthetic_for_tests(codex, claude)
-            .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
+            .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
             .unwrap(),
     );
     let synthetic_key = providers::capability_key(&synthetic_launch).unwrap();
@@ -19534,7 +19541,7 @@ fn m7_persisted_production_equivalent_synthetic_proof_cannot_authorize_normal_re
     let proof = serde_json::json!({"compatibility":synthetic_identity.compatibility});
     Connection::open(&database).unwrap().execute(
         "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,hook_hash,proof_json)
-         VALUES('synthetic-proof','codex','codex-cli 0.157.1','manager','interactive_pty',?1,'supported','fixture','[]','2026-09-23T00:00:00Z','fixture',?2)",
+         VALUES('synthetic-proof','codex','codex-cli 0.160.0','manager','interactive_pty',?1,'supported','fixture','[]','2026-09-23T00:00:00Z','fixture',?2)",
         params![synthetic_key, proof.to_string()],
     ).unwrap();
     drop(synthetic);
@@ -19542,7 +19549,7 @@ fn m7_persisted_production_equivalent_synthetic_proof_cannot_authorize_normal_re
     let mut production_launch = synthetic_launch.clone();
     production_launch.compatibility = Some(
         BundleSet::embedded()
-            .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
+            .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
             .unwrap(),
     );
     let production_key = providers::capability_key(&production_launch).unwrap();
@@ -19820,10 +19827,10 @@ fn m7_retained_launch_and_resume_share_exact_bound_identity() {
         .join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&root).unwrap();
     let binding = agenticjira::provider_compatibility::BundleSet::embedded()
-        .resolve(Provider::Codex, "codex-cli 0.157.1", RoleKind::Manager)
+        .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
         .unwrap();
     let mut fresh = launch(RoleKind::Manager, "fixture", root);
-    fresh.executable_version = "codex-cli 0.157.1".into();
+    fresh.executable_version = "codex-cli 0.160.0".into();
     fresh.compatibility = Some(binding);
     fresh.argv = vec!["prompt".into()];
     let mut resumed = fresh.clone();
@@ -25036,7 +25043,7 @@ fn claude_idle_setup_first_turn_uses_provider_neutral_completion_gate() {
         params![uuid::Uuid::new_v4().to_string(),context.session_id,context.role_generation_id,native],
     );
     let stop_rowid = fixture.scalar::<i64>("SELECT MAX(rowid) FROM hook_events");
-    // Claude 2.1.283 can report subagent shutdown and an idle notice after the
+    // Claude 2.1.289 can report subagent shutdown and an idle notice after the
     // safe Stop; neither is new work.
     for (event, payload) in [
         ("SubagentStop", "{}"),
@@ -34037,7 +34044,7 @@ args = ["--unicode"]
             old_rejection["observed_identity"],
             serde_json::json!({
                 "provider":"codex",
-                "executable_version":"codex-cli 0.157.1",
+                "executable_version":"codex-cli 0.160.0",
                 "role":"implementer",
                 "model":"gpt-5.6-sol",
                 "effort":"high",
@@ -40202,13 +40209,13 @@ fn claude_manager_guidance_needs_a_qualified_bounded_submitted_form_and_keeps_it
     let refusal =
         |operation: &str, body: String| format!("{:#}", guidance(operation, body).unwrap_err());
     assert!(refusal("unbound", "/compact".into())
-        .contains("qualified only for the admitted Claude Code 2.1.283 contract"));
+        .contains("qualified only for the admitted Claude Code 2.1.289 contract"));
     fixture.execute(
         "UPDATE sessions SET capability_identity_json=?1 WHERE id='s'",
         params![serde_json::json!({"compatibility":{
             "synthetic_origin":false,"provider":"claude","schema":1,
-            "pack_id":"llmrelay-claude-compatibility","predicate_id":"claude-code-2.1.283",
-            "exact_version":"2.1.283 (Claude Code)","contract_id":"claude-manager",
+            "pack_id":"llmrelay-claude-compatibility","predicate_id":"claude-code-2.1.289",
+            "exact_version":"2.1.289 (Claude Code)","contract_id":"claude-manager",
             "contract_revision":"claude-role-contract-v1","effective_hash":"fixture",
             "session_class":"retained","required_evidence":[]
         }})

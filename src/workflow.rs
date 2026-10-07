@@ -5746,8 +5746,14 @@ fn observed_usage(
         }
         if row.get::<_, bool>(6)?
             || !counters.valid()
-            || row.get::<_, String>(8)? != "0.157.1"
-            || row.get::<_, String>(9)? != crate::providers::codex::USAGE_CONTRACT_REVISION
+            || !matches!(
+                (
+                    row.get::<_, String>(8)?.as_str(),
+                    row.get::<_, String>(9)?.as_str()
+                ),
+                ("0.157.1", "codex-0.157.1-response-usage-v1")
+                    | ("0.160.0", crate::providers::codex::USAGE_CONTRACT_REVISION)
+            )
         {
             usage.status = ObservedUsageStatus::Invalid;
             usage.reason =

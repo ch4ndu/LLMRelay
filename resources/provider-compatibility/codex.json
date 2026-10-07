@@ -2,12 +2,12 @@
   "schema": 1,
   "provider": "codex",
   "pack_id": "llmrelay-codex-compatibility",
-  "pack_revision": "2",
+  "pack_revision": "3",
   "description": "Embedded codex provider compatibility candidates.",
   "selectors": [
     {
-      "predicate_id": "codex-cli-0.157.1",
-      "exact_version": "codex-cli 0.157.1",
+      "predicate_id": "codex-cli-0.160.0",
+      "exact_version": "codex-cli 0.160.0",
       "contracts": [
         {
           "role": "manager",

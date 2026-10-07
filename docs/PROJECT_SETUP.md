@@ -60,7 +60,7 @@ See [provider compatibility and permissions](SECURITY.md) for supported Codex ac
 
 Provider profiles remain `Unverified` until matching local preflight succeeds. An imported upstream preflight document is validated as installation data, but cannot by itself prove the local executable and application sandbox behavior. Changing a profile creates a pending configuration revision and requires matching evidence before that profile can run. Failed or declined probes preserve the setup draft and do not activate the project.
 
-A valid standalone 0.11.0 installation still needs explicit application adoption,
+A valid standalone 0.12.0 installation still needs explicit application adoption,
 including when its manifest contains older LLMRelay metadata. Adoption leaves its
 files unchanged and records the active application binding in the database.
 Unknown configuration fields, unused profiles and adapters survive reviewed

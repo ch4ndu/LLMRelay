@@ -11012,7 +11012,7 @@ fn codex_history_candidate(
          JOIN projects p ON p.id=t.project_id CROSS JOIN accepted CROSS JOIN frontier
          WHERE s.id=?1 AND s.provider='codex' AND rg.provider='codex'
            AND s.status='running' AND rg.status='running' AND s.exit_json IS NULL
-           AND s.executable_version='codex-cli 0.157.1' AND s.process_identity_json IS NOT NULL
+           AND s.executable_version='codex-cli 0.160.0' AND s.process_identity_json IS NOT NULL
            AND {OBSERVED_CURRENT_ATTEMPT_SQL} AND {OBSERVED_EFFECTIVE_GENERATION_SQL}
            AND json_type(accepted.payload_json,'$.session_id')='text'
            AND json_extract(accepted.payload_json,'$.session_id')=s.native_session_id
@@ -11350,7 +11350,7 @@ impl Store {
                     AND transcript_epoch=?8 AND invocation_start=?9 AND accepted_hook_event_id=?10
                     AND input_tokens=?11 AND cached_input_tokens=?12 AND cache_write_input_tokens IS ?13
                     AND output_tokens=?14 AND reasoning_output_tokens=?15 AND total_tokens=?16
-                    AND source_version='0.157.1' AND contract_revision=?17
+                    AND source_version='0.160.0' AND contract_revision=?17
                  FROM codex_usage_observations WHERE provider='codex' AND native_thread_id=?1
                     AND native_turn_id=?2 AND response_id=?3",
                 params![binding.native_session_id, binding.turn_id, response.response_id, candidate.task_id,
@@ -11379,7 +11379,7 @@ impl Store {
                             accepted_hook_event_id,input_tokens,cached_input_tokens,cache_write_input_tokens,
                             output_tokens,reasoning_output_tokens,total_tokens,source_version,contract_revision,
                             source_identity_json,received_at)
-                         VALUES('codex',?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'0.157.1',?17,?18,?19)",
+                         VALUES('codex',?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'0.160.0',?17,?18,?19)",
                         params![binding.native_session_id, binding.turn_id, response.response_id, candidate.task_id,
                             binding.attempt_id, binding.role_generation_id, binding.session_id, binding.transcript_epoch,
                             binding.invocation_start, binding.accepted_hook_id, counters.input_tokens, counters.cached_input_tokens,
@@ -16565,7 +16565,7 @@ mod interruption_tests {
         };
         let eligible =
             || eligible_setup_retained_first_turn_stop(&store.lock().unwrap(), None).unwrap();
-        // The observed Claude 2.1.283 order: Stop, then SubagentStop, then a notification.
+        // The observed Claude 2.1.289 order: Stop, then SubagentStop, then a notification.
         hook("PostToolUse", "g", "native", TRUSTED, "{}");
         let stop = hook("Stop", "g", "native", TRUSTED, "{}");
         hook("SubagentStop", "g", "native", TRUSTED, "{}");
@@ -16850,7 +16850,7 @@ mod attention_observation_tests {
             std::fs::create_dir_all(session.root.join("sessions/day")).unwrap();
             let records = [
                 serde_json::json!({"type":"session_meta","payload":{"id":CAPACITY_NATIVE,"session_id":CAPACITY_NATIVE,
-                    "cwd":session.root,"cli_version":"0.157.1","source":"cli","originator":"codex-tui","thread_source":"user"}}),
+                    "cwd":session.root,"cli_version":"0.160.0","source":"cli","originator":"codex-tui","thread_source":"user"}}),
                 serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":CAPACITY_TURN}}),
                 serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":CAPACITY_TURN,
                     "error":{"codex_error_info":"server_overloaded","message":"private provider text"}}}),
@@ -16938,7 +16938,7 @@ mod attention_observation_tests {
         fn write_usage(&self, turn: &str, responses: &[serde_json::Value]) {
             let mut records = vec![
                 serde_json::json!({"type":"session_meta","payload":{"id":CAPACITY_NATIVE,"session_id":CAPACITY_NATIVE,
-                    "cwd":self.root,"cli_version":"0.157.1","source":"cli","originator":"codex-tui","thread_source":"user"}}),
+                    "cwd":self.root,"cli_version":"0.160.0","source":"cli","originator":"codex-tui","thread_source":"user"}}),
                 serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":turn}}),
             ];
             records.extend(responses.iter().cloned().map(|mut record| {
@@ -18101,6 +18101,23 @@ mod attention_observation_tests {
         );
         assert!(session.read_usage().is_empty());
         assert!(session.store.codex_usage_cache.lock().unwrap().is_empty());
+        session.execute("UPDATE codex_usage_observations SET source_version='0.157.1',contract_revision='codex-0.157.1-response-usage-v1' WHERE response_id='one'");
+        let historical = crate::workflow::state(&session.store).unwrap().tasks[0]
+            .observed_usage
+            .clone()
+            .unwrap();
+        assert_eq!(historical.status, ObservedUsageStatus::Observed);
+        assert_eq!(historical.counters.unwrap().total_tokens, 30);
+        session.execute("UPDATE codex_usage_observations SET contract_revision='codex-0.160.0-response-usage-v1' WHERE response_id='one'");
+        assert_eq!(
+            crate::workflow::state(&session.store).unwrap().tasks[0]
+                .observed_usage
+                .as_ref()
+                .unwrap()
+                .status,
+            ObservedUsageStatus::Invalid
+        );
+        session.execute("UPDATE codex_usage_observations SET contract_revision='codex-0.157.1-response-usage-v1' WHERE response_id='one'");
         let revision = session.revision();
         session.store.lock().unwrap().execute("UPDATE codex_usage_observations SET input_tokens=?1,total_tokens=?1 WHERE response_id='two'",
             params![crate::domain::MAX_OBSERVED_TOKENS]).unwrap();

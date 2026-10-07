@@ -965,7 +965,7 @@ impl ObservedUsage {
             partial: true,
             counters: None,
             observed_responses: Some(0),
-            source: "Codex 0.157.1 response records".into(),
+            source: "Codex response records".into(),
             last_observed_at: None,
             reason: Some(reason.into()),
         }

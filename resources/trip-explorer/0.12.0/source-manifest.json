@@ -1,0 +1,28 @@
+{
+  "version": "0.12.0",
+  "source_repository": "trip-explorer-workflow",
+  "source_head": "a3edbad8b10953ea9dbdba39b8d3523713da3e5c",
+  "files": {
+    "bin/check_evidence.py": "c7b13ecd2e0dffeaf5f6d31c94ab53492b93ba6c43575a9052e8263b86bb2250",
+    "bin/claude_console.py": "d899f71dfc5b019a404d7c267a84f7533fd390fb543291aab43ca906222509f5",
+    "bin/cmux_observer.py": "c2dcc814681eba9186b62e9537edf8ad290aadeb80545e846f05518c18502307",
+    "bin/cmux_role_runner.py": "cef80e3d91f6c3f611dff3a682ca9256aa69a6cdaffa2fdf8ccb6764a211b551",
+    "bin/role_config.py": "243032ab1f985aedc2be248d08f39b26e5b446c1bbdeb91676d1ab27440d05a6",
+    "bin/run_report.py": "cadd620dc5e2c8d43f237b52cb1ef79c0ce3b9dfa1caad1c2c072a347a27a323",
+    "bin/upgrade_preview.py": "550cd66ab495cb5df289629a9effaa8e204355e7be46bc58893eb8df692d79e1",
+    "bin/validate_installed.py": "8a988ab838fdb6e269177320b19b8d852e0c4d65728f2e8e31f474b24c874be7",
+    "bin/workflow_doctor.py": "5132bd349903a22fbaf2f1be4e12dfd6cafb92ccb00de608814969cece7e1b08",
+    "references/adaptation-contract.md": "d7bed6abae42d8170535cc05774b544aa616a46afc71e668222d0aad74cd14e8",
+    "skills/trip-explorer-init/SKILL.md": "723ab8314ffbb4bc03091f3cc336b60e6f56289496aa6382dde28641bd4b0172",
+    "skills/trip-explorer-init/agents/openai.yaml": "680e238c90633f55b137807a5b7369ed278ac7b7f4b99d7f2d18105b6103a414",
+    "skills/trip-explorer-upgrade/SKILL.md": "7a9c62094a8927da9b8c33c605937cd4f875738c83fd571b0bb7ae8248e63fe0",
+    "skills/trip-explorer-upgrade/agents/openai.yaml": "1c6941574cf99cdcfee2f372aad1c9ad45dcf3434a654767d9f255ad8ca7c320",
+    "skills/trip-explorer-workflow/SKILL.md": "376e009353ff8eacd5e0d1b4a92b9131a82ae13fc5e44ed234c7ee44a86d69e6",
+    "skills/trip-explorer-workflow/agents/openai.yaml": "8a7cf505b62f328f0959140ad0980b9b4ec23da64d942dcfe7d22533066e2681",
+    "skills/trip-explorer-workflow/references/behavior-testing.md": "af9919619a297c447a24a17b92246f7ba66d4232863e24b0f6be2d79a63f4229",
+    "skills/trip-explorer-workflow/references/evidence-format.md": "56f80418dba6327643b0e7ac118e6b5376391e0099e47602f6edc9f6e34d2019",
+    "skills/trip-explorer-workflow/references/explorer-activation.md": "180a9858fc9c579408c2a8200394007fb4039801c7449ba0fc7bf5b0af5a746a",
+    "skills/trip-explorer-workflow/references/guidance-quality.md": "7d4d9cbfed98e265909d76dbbd1dc692e0cafba31810903efae75c00c53a50a4",
+    "skills/trip-explorer-workflow/references/maintenance.md": "ae12c0eee1d97d33748b24302faec609eca38cf28109ea50c43c57298cd521c9"
+  }
+}

@@ -629,7 +629,8 @@ export function ProjectSetup({
   const detectedKind = String(
     detected.kind || trip.detected_installation || "unknown",
   );
-  const migrationItems = useMemo(() => [
+  const migrationItems = useMemo(() =>
+    ["compatible", "absent"].includes(detectedKind) ? [] : [
     ...((detected.conflicts as string[] | undefined) || []),
     ...((detected.partial_paths as string[] | undefined) || []).map((path) =>
       `partial:${path}`
@@ -637,7 +638,7 @@ export function ProjectSetup({
     ...((detected.alternate_roots as string[] | undefined) || []).map((path) =>
       `alternate_root:${path}`
     ),
-  ], [detected]);
+  ], [detected, detectedKind]);
   const existingAdapters =
     (setup?.proposal?.adapters || detected.adapters || { adapters: {} })
       .adapters || {};

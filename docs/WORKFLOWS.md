@@ -27,7 +27,7 @@ an explicit read, separate from normal state refresh. See
 [restoration and recovery](OPERATIONS.md#stop-and-recover) for batch limits,
 capacity delays and exact recovery-record selection.
 
-LLMRelay hosts the selected standalone TRIP Explorer v0.11.0 package. Its versioned skills, references, and optional helper scripts are copied verbatim from the selected source snapshot. Content hashes pin that snapshot, from upstream commit `c7b360b`. A separately versioned LLMRelay overlay maps role launch, context records, build execution, and integration writes onto the local engine. It does not remove the workflow's independent reviews, human approvals, test policy, ownership boundaries, or manager completion gate.
+LLMRelay hosts the selected standalone TRIP Explorer v0.12.0 package. Its versioned skills, references, and optional helper scripts are copied verbatim from the selected source snapshot. Content hashes pin that snapshot, from upstream commit `a3edbad`. A separately versioned LLMRelay overlay maps role launch, context records, build execution, and integration writes onto the local engine. It does not remove the workflow's independent reviews, human approvals, test policy, ownership boundaries, or manager completion gate.
 
 Registering a Git repository creates a project record. Running ordinary tasks additionally requires a compatible, initialized project. The app's host manager remains the engineering owner; the five delegated roles are Explorer, plan reviewer, implementer/fixer, code reviewer, and fresh final verifier. Explorer runs only when the workflow's recorded conditions require it. Existing `final_reviewer` identifiers remain a storage compatibility detail.
 
@@ -115,7 +115,7 @@ Each role generation has two reminder reservations for its entire lifetime, incl
 Use **Continue**, **Run next**, **Pause after this step**, **Pause now**, **Retry**, or **Cancel** from task details. These are versioned requests. A draining control remains visible until owned process state is reconciled. **Run next** arms one coordinator action and then pauses again.
 
 
-For the admitted Claude Code 2.1.283 contract, automatic guidance uses a
+For the admitted Claude Code 2.1.289 contract, automatic guidance uses a
 JSON-encoded text envelope so slash commands, mentions, shell prefixes and image
 paths remain guidance text instead of native terminal actions. The original
 body remains unchanged in the dashboard and audit. Before writing, the service
@@ -285,7 +285,7 @@ Permission decisions, response delivery, native resolution, role report submissi
 
 ## Observed usage authority
 
-Codex usage is presentation-only evidence from uniquely attributed 0.157.1
+Codex usage is presentation-only evidence from uniquely attributed admitted-version
 response records. Counts belong to the accepted managed turn and original
 invocation; replay does not reassign them. Session and task totals remain partial
 observations, independently of the dashboard's bounded session list. Missing,

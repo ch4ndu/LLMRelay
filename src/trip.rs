@@ -15,16 +15,16 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-pub const WORKFLOW_ID: &str = "trip-explorer-0.11.0-llmrelay-1";
-pub const PACKAGE_VERSION: &str = "0.11.0";
+pub const WORKFLOW_ID: &str = "trip-explorer-0.12.0-llmrelay-1";
+pub const PACKAGE_VERSION: &str = "0.12.0";
 
 const MAX_LANE_SOURCE_BINDINGS: usize = 4096;
 const MAX_LANE_SOURCE_BINDING_BYTES: usize = 128 * 1024;
 
 const SOURCE_MANIFEST: &str =
-    include_str!("../resources/trip-explorer/0.11.0/source-manifest.json");
+    include_str!("../resources/trip-explorer/0.12.0/source-manifest.json");
 const OVERLAY: &str = include_str!("../resources/prompts/trip-overlay.md");
-const WORKFLOW: &str = include_str!("../resources/workflows/trip-explorer-0.11.0-llmrelay-1.json");
+const WORKFLOW: &str = include_str!("../resources/workflows/trip-explorer-0.12.0-llmrelay-1.json");
 
 const DELEGATED_ROLES: [RoleKind; 5] = [
     RoleKind::Explorer,
@@ -50,24 +50,26 @@ struct PackageFile {
 }
 
 const PACKAGE_FILES: &[PackageFile] = &[
-    PackageFile { relative: "bin/check_evidence.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/check_evidence.py"), sha256: "c7b13ecd2e0dffeaf5f6d31c94ab53492b93ba6c43575a9052e8263b86bb2250" },
-    PackageFile { relative: "bin/claude_console.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/claude_console.py"), sha256: "d899f71dfc5b019a404d7c267a84f7533fd390fb543291aab43ca906222509f5" },
-    PackageFile { relative: "bin/cmux_observer.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/cmux_observer.py"), sha256: "c2dcc814681eba9186b62e9537edf8ad290aadeb80545e846f05518c18502307" },
-    PackageFile { relative: "bin/cmux_role_runner.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/cmux_role_runner.py"), sha256: "cef80e3d91f6c3f611dff3a682ca9256aa69a6cdaffa2fdf8ccb6764a211b551" },
-    PackageFile { relative: "bin/role_config.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/role_config.py"), sha256: "243032ab1f985aedc2be248d08f39b26e5b446c1bbdeb91676d1ab27440d05a6" },
-    PackageFile { relative: "bin/run_report.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/run_report.py"), sha256: "8e27d998adc3a9ade017219296ac3c92168d4ca206a6015da8a63dcfa7231950" },
-    PackageFile { relative: "bin/upgrade_preview.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/upgrade_preview.py"), sha256: "7e5dfc5c6a13cc36e29b8fb97ac4f5fc7e95b89ad4c78b813483738bbe33827a" },
-    PackageFile { relative: "bin/validate_installed.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/validate_installed.py"), sha256: "8a988ab838fdb6e269177320b19b8d852e0c4d65728f2e8e31f474b24c874be7" },
-    PackageFile { relative: "bin/workflow_doctor.py", bytes: include_bytes!("../resources/trip-explorer/0.11.0/bin/workflow_doctor.py"), sha256: "5132bd349903a22fbaf2f1be4e12dfd6cafb92ccb00de608814969cece7e1b08" },
-    PackageFile { relative: "skills/trip-explorer-init/SKILL.md", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-init/SKILL.md"), sha256: "723ab8314ffbb4bc03091f3cc336b60e6f56289496aa6382dde28641bd4b0172" },
-    PackageFile { relative: "skills/trip-explorer-init/agents/openai.yaml", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-init/agents/openai.yaml"), sha256: "680e238c90633f55b137807a5b7369ed278ac7b7f4b99d7f2d18105b6103a414" },
-    PackageFile { relative: "skills/trip-explorer-upgrade/SKILL.md", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-upgrade/SKILL.md"), sha256: "ce21c661280a7d210556bcfb657e2701c74ade1acd9412ba170ca1368e5994b7" },
-    PackageFile { relative: "skills/trip-explorer-upgrade/agents/openai.yaml", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-upgrade/agents/openai.yaml"), sha256: "1c6941574cf99cdcfee2f372aad1c9ad45dcf3434a654767d9f255ad8ca7c320" },
-    PackageFile { relative: "skills/trip-explorer-workflow/SKILL.md", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-workflow/SKILL.md"), sha256: "89b1f019ec0e53b14343fb6f2e6dc15b35d203876a705f7ee75a312298773249" },
-    PackageFile { relative: "skills/trip-explorer-workflow/agents/openai.yaml", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-workflow/agents/openai.yaml"), sha256: "8a7cf505b62f328f0959140ad0980b9b4ec23da64d942dcfe7d22533066e2681" },
-    PackageFile { relative: "skills/trip-explorer-workflow/references/evidence-format.md", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-workflow/references/evidence-format.md"), sha256: "56f80418dba6327643b0e7ac118e6b5376391e0099e47602f6edc9f6e34d2019" },
-    PackageFile { relative: "skills/trip-explorer-workflow/references/explorer-activation.md", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-workflow/references/explorer-activation.md"), sha256: "2f114434383976d5dc1c47c2a14483d5e01cf3fb0a4c89a4d7f97473ffae96af" },
-    PackageFile { relative: "skills/trip-explorer-workflow/references/maintenance.md", bytes: include_bytes!("../resources/trip-explorer/0.11.0/skills/trip-explorer-workflow/references/maintenance.md"), sha256: "167582ea26127c36342532dee9cb23e3bf9f3dffef4a2cd757d7f7a1f6a42c38" },
+    PackageFile { relative: "bin/check_evidence.py", bytes: include_bytes!("../resources/trip-explorer/0.12.0/bin/check_evidence.py"), sha256: "c7b13ecd2e0dffeaf5f6d31c94ab53492b93ba6c43575a9052e8263b86bb2250" },
+    PackageFile { relative: "bin/claude_console.py", bytes: include_bytes!("../resources/trip-explorer/0.12.0/bin/claude_console.py"), sha256: "d899f71dfc5b019a404d7c267a84f7533fd390fb543291aab43ca906222509f5" },
+    PackageFile { relative: "bin/cmux_observer.py", bytes: include_bytes!("../resources/trip-explorer/0.12.0/bin/cmux_observer.py"), sha256: "c2dcc814681eba9186b62e9537edf8ad290aadeb80545e846f05518c18502307" },
+    PackageFile { relative: "bin/cmux_role_runner.py", bytes: include_bytes!("../resources/trip-explorer/0.12.0/bin/cmux_role_runner.py"), sha256: "cef80e3d91f6c3f611dff3a682ca9256aa69a6cdaffa2fdf8ccb6764a211b551" },
+    PackageFile { relative: "bin/role_config.py", bytes: include_bytes!("../resources/trip-explorer/0.12.0/bin/role_config.py"), sha256: "243032ab1f985aedc2be248d08f39b26e5b446c1bbdeb91676d1ab27440d05a6" },
+    PackageFile { relative: "bin/run_report.py", bytes: include_bytes!("../resources/trip-explorer/0.12.0/bin/run_report.py"), sha256: "cadd620dc5e2c8d43f237b52cb1ef79c0ce3b9dfa1caad1c2c072a347a27a323" },
+    PackageFile { relative: "bin/upgrade_preview.py", bytes: include_bytes!("../resources/trip-explorer/0.12.0/bin/upgrade_preview.py"), sha256: "550cd66ab495cb5df289629a9effaa8e204355e7be46bc58893eb8df692d79e1" },
+    PackageFile { relative: "bin/validate_installed.py", bytes: include_bytes!("../resources/trip-explorer/0.12.0/bin/validate_installed.py"), sha256: "8a988ab838fdb6e269177320b19b8d852e0c4d65728f2e8e31f474b24c874be7" },
+    PackageFile { relative: "bin/workflow_doctor.py", bytes: include_bytes!("../resources/trip-explorer/0.12.0/bin/workflow_doctor.py"), sha256: "5132bd349903a22fbaf2f1be4e12dfd6cafb92ccb00de608814969cece7e1b08" },
+    PackageFile { relative: "skills/trip-explorer-init/SKILL.md", bytes: include_bytes!("../resources/trip-explorer/0.12.0/skills/trip-explorer-init/SKILL.md"), sha256: "723ab8314ffbb4bc03091f3cc336b60e6f56289496aa6382dde28641bd4b0172" },
+    PackageFile { relative: "skills/trip-explorer-init/agents/openai.yaml", bytes: include_bytes!("../resources/trip-explorer/0.12.0/skills/trip-explorer-init/agents/openai.yaml"), sha256: "680e238c90633f55b137807a5b7369ed278ac7b7f4b99d7f2d18105b6103a414" },
+    PackageFile { relative: "skills/trip-explorer-upgrade/SKILL.md", bytes: include_bytes!("../resources/trip-explorer/0.12.0/skills/trip-explorer-upgrade/SKILL.md"), sha256: "7a9c62094a8927da9b8c33c605937cd4f875738c83fd571b0bb7ae8248e63fe0" },
+    PackageFile { relative: "skills/trip-explorer-upgrade/agents/openai.yaml", bytes: include_bytes!("../resources/trip-explorer/0.12.0/skills/trip-explorer-upgrade/agents/openai.yaml"), sha256: "1c6941574cf99cdcfee2f372aad1c9ad45dcf3434a654767d9f255ad8ca7c320" },
+    PackageFile { relative: "skills/trip-explorer-workflow/SKILL.md", bytes: include_bytes!("../resources/trip-explorer/0.12.0/skills/trip-explorer-workflow/SKILL.md"), sha256: "376e009353ff8eacd5e0d1b4a92b9131a82ae13fc5e44ed234c7ee44a86d69e6" },
+    PackageFile { relative: "skills/trip-explorer-workflow/agents/openai.yaml", bytes: include_bytes!("../resources/trip-explorer/0.12.0/skills/trip-explorer-workflow/agents/openai.yaml"), sha256: "8a7cf505b62f328f0959140ad0980b9b4ec23da64d942dcfe7d22533066e2681" },
+    PackageFile { relative: "skills/trip-explorer-workflow/references/behavior-testing.md", bytes: include_bytes!("../resources/trip-explorer/0.12.0/skills/trip-explorer-workflow/references/behavior-testing.md"), sha256: "af9919619a297c447a24a17b92246f7ba66d4232863e24b0f6be2d79a63f4229" },
+    PackageFile { relative: "skills/trip-explorer-workflow/references/evidence-format.md", bytes: include_bytes!("../resources/trip-explorer/0.12.0/skills/trip-explorer-workflow/references/evidence-format.md"), sha256: "56f80418dba6327643b0e7ac118e6b5376391e0099e47602f6edc9f6e34d2019" },
+    PackageFile { relative: "skills/trip-explorer-workflow/references/explorer-activation.md", bytes: include_bytes!("../resources/trip-explorer/0.12.0/skills/trip-explorer-workflow/references/explorer-activation.md"), sha256: "180a9858fc9c579408c2a8200394007fb4039801c7449ba0fc7bf5b0af5a746a" },
+    PackageFile { relative: "skills/trip-explorer-workflow/references/guidance-quality.md", bytes: include_bytes!("../resources/trip-explorer/0.12.0/skills/trip-explorer-workflow/references/guidance-quality.md"), sha256: "7d4d9cbfed98e265909d76dbbd1dc692e0cafba31810903efae75c00c53a50a4" },
+    PackageFile { relative: "skills/trip-explorer-workflow/references/maintenance.md", bytes: include_bytes!("../resources/trip-explorer/0.12.0/skills/trip-explorer-workflow/references/maintenance.md"), sha256: "ae12c0eee1d97d33748b24302faec609eca38cf28109ea50c43c57298cd521c9" },
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -318,7 +320,7 @@ pub fn overlay_hash() -> String {
 pub fn register_project_state(connection: &Connection, project_id: &str, now: &str) -> Result<()> {
     connection.execute(
         "INSERT OR IGNORE INTO trip_project_state(project_id,readiness,reason,detected_installation,detected_json,updated_at)
-         VALUES(?1,'not_initialized','TRIP Explorer 0.11.0 has not been inspected and activated for this project','unknown','{}',?2)",
+         VALUES(?1,'not_initialized','TRIP Explorer 0.12.0 has not been inspected and activated for this project','unknown','{}',?2)",
         params![project_id, now],
     )?;
     Ok(())

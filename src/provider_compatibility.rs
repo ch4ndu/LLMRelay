@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 const CODEX_BYTES: &str = include_str!("../resources/provider-compatibility/codex.json");
 const CLAUDE_BYTES: &str = include_str!("../resources/provider-compatibility/claude.json");
-pub const CODEX_EXACT_VERSION: &str = "codex-cli 0.157.1";
+pub const CODEX_EXACT_VERSION: &str = "codex-cli 0.160.0";
 const REQUIRED_EVIDENCE: [&str; 4] = [
     "exact_native_policy",
     "hook_trust",

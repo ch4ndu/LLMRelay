@@ -1,0 +1,48 @@
+{
+  "id": "trip-explorer-0.12.0-llmrelay-1",
+  "schema": 2,
+  "package_version": "0.12.0",
+  "roles": [
+    "manager",
+    "explorer",
+    "plan_reviewer",
+    "implementer",
+    "code_reviewer",
+    "final_verifier"
+  ],
+  "phases": [
+    "planning",
+    "exploration",
+    "plan_review",
+    "awaiting_plan_approval",
+    "awaiting_implementation_authorization",
+    "implementation",
+    "integration",
+    "code_review",
+    "checks",
+    "final_review",
+    "manager_handoff",
+    "awaiting_human_review"
+  ],
+  "review_budgets": {
+    "plan": { "initial": 2, "maximum": 5 },
+    "code": { "initial": 2, "maximum": 5 },
+    "final": { "initial": 1, "conditional_maximum": 2 }
+  },
+  "session_contracts": {
+    "explorer": "retained",
+    "plan_reviewer": "retained",
+    "implementer": "retained_per_lane",
+    "code_reviewer": "retained",
+    "final_verifier": "fresh"
+  },
+  "authority": {
+    "manager": "governs orchestration, lane admission, exact integration capsules, integration decisions, and request verification",
+    "service": "enforces readiness, identity, accounting, concurrency, checks, and freshness",
+    "plan_approval": "human",
+    "implementation_authorization": "human",
+    "probe_approval": "human",
+    "installation_approval": "human",
+    "acceptance": "human"
+  }
+}

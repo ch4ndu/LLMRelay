@@ -7,6 +7,7 @@ pub const NATIVE_SANDBOX_POLICY_REVISION: &str = "claude-native-sandbox-role-soc
 pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-claude-launch-v2";
 pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-claude-resume-v2";
 pub const CREDENTIAL_CONTRACT_REVISION: &str = "llmrelay-local-credential-v1";
+pub const EXACT_CLAUDE_VERSION: &str = "2.1.289 (Claude Code)";
 
 #[allow(clippy::too_many_arguments)]
 pub fn prepare(
@@ -657,8 +658,8 @@ fn augmented_prompt(prompt: &str, role: RoleKind, executable: &Path, socket: &Pa
     )
 }
 
-// Only this version was observed: pasted `/`, `@`, `!` or image paths trigger actions; this envelope does not.
-const LITERAL_GUIDANCE_PREDICATE: &str = "claude-code-2.1.283";
+// Escape CLI action prefixes while preserving the guidance as a JSON string.
+const LITERAL_GUIDANCE_PREDICATE: &str = "claude-code-2.1.289";
 const LITERAL_GUIDANCE_PREFIX: &str =
     "LLMRelay task guidance (JSON-encoded string; decode to read):\n";
 
@@ -670,8 +671,9 @@ pub(crate) fn literal_guidance_submission(
         binding.provider == Provider::Claude
             && !binding.synthetic_origin
             && binding.predicate_id == LITERAL_GUIDANCE_PREDICATE
+            && binding.exact_version == EXACT_CLAUDE_VERSION
     }) {
-        bail!("literal guidance delivery is qualified only for the admitted Claude Code 2.1.283 contract, and this session is not bound to it")
+        bail!("literal guidance delivery is qualified only for the admitted Claude Code 2.1.289 contract, and this session is not bound to it")
     }
     let encoded = serde_json::to_string(guidance)?
         .replace('@', "\\u0040")
@@ -691,7 +693,7 @@ mod tests {
             schema: 1,
             pack_id: "llmrelay-claude-compatibility".into(),
             predicate_id: LITERAL_GUIDANCE_PREDICATE.into(),
-            exact_version: "2.1.283 (Claude Code)".into(),
+            exact_version: "2.1.289 (Claude Code)".into(),
             contract_id: "claude-manager".into(),
             contract_revision: "claude-role-contract-v1".into(),
             effective_hash: "fixture".into(),
@@ -732,6 +734,10 @@ mod tests {
             predicate_id: "claude-code-2.1.284".into(),
             ..qualified.clone()
         };
+        let mismatched_version = crate::provider_compatibility::AuthorityBinding {
+            exact_version: "2.1.283 (Claude Code)".into(),
+            ..qualified.clone()
+        };
         let other_provider = crate::provider_compatibility::AuthorityBinding {
             provider: Provider::Codex,
             ..qualified
@@ -740,6 +746,7 @@ mod tests {
             None,
             Some(&synthetic),
             Some(&other_version),
+            Some(&mismatched_version),
             Some(&other_provider),
         ] {
             assert!(literal_guidance_submission(binding, "/compact").is_err());

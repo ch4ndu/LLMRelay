@@ -16,12 +16,12 @@ pub const IMPLEMENTER_NATIVE_POLICY_REASON: &str = "Codex Implementer requires e
 pub const DENIED_READ_FLOOR_VERSION: &str = "codex-denied-read-floor-v2";
 pub const DENIED_READ_FLOOR_PROFILE: &str = "agenticjira_role";
 pub const LEGACY_DENIED_READ_FLOOR_GAP: &str = "historical Codex configuration predates the canonical control-socket denied-read and restricted-proxy floor; fresh native validation is required";
-pub const MCP_COVERAGE_REVISION: &str = "codex-local-mcp-coverage-v1-0.157.1";
+pub const MCP_COVERAGE_REVISION: &str = "codex-local-mcp-coverage-v1-0.160.0";
 pub const MCP_COVERAGE_CLASS: &str = "personal_ineligible_observed_prelaunch";
 pub const APPROVAL_OWNERSHIP_REVISION: &str = "codex-native-approval-ownership-v1";
 pub const LEGACY_MCP_COVERAGE_GAP: &str = "historical Codex configuration predates exact local MCP-source coverage; fresh native validation is required";
 pub const LEGACY_APPROVAL_OWNERSHIP_GAP: &str = "historical Codex Implementer configuration predates native approval ownership; fresh native validation is required";
-pub const EXACT_CODEX_VERSION: &str = "codex-cli 0.157.1";
+pub const EXACT_CODEX_VERSION: &str = "codex-cli 0.160.0";
 pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-codex-launch-v2";
 pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-codex-resume-v2";
 pub const CREDENTIAL_CONTRACT_REVISION: &str = "llmrelay-local-credential-v1";
@@ -946,7 +946,7 @@ pub(crate) fn read_capacity_history(
     if meta.get("type")?.as_str()? != "session_meta"
         || payload.get("id")?.as_str()? != native_id
         || payload.get("session_id")?.as_str()? != native_id
-        || payload.get("cli_version")?.as_str()? != "0.157.1"
+        || payload.get("cli_version")?.as_str()? != "0.160.0"
         || payload.get("source")?.as_str()? != "cli"
         || payload.get("originator")?.as_str()? != "codex-tui"
         || payload.get("thread_source")?.as_str()? != "user"
@@ -1020,7 +1020,7 @@ fn capacity_turn_complete(tail: &[u8], turn_id: &str) -> Option<()> {
     completed.then_some(())
 }
 
-pub(crate) const USAGE_CONTRACT_REVISION: &str = "codex-0.157.1-response-usage-v1";
+pub(crate) const USAGE_CONTRACT_REVISION: &str = "codex-0.160.0-response-usage-v1";
 
 pub(crate) fn valid_usage_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
@@ -1080,7 +1080,7 @@ pub(crate) fn read_usage_history(
     if meta.get("type")?.as_str()? != "session_meta"
         || payload.get("id")?.as_str()? != native_id
         || payload.get("session_id")?.as_str()? != native_id
-        || payload.get("cli_version")?.as_str()? != "0.157.1"
+        || payload.get("cli_version")?.as_str()? != "0.160.0"
         || payload.get("source")?.as_str()? != "cli"
         || payload.get("originator")?.as_str()? != "codex-tui"
         || payload.get("thread_source")?.as_str()? != "user"
@@ -1186,7 +1186,7 @@ mod executor_environment_tests {
         let path = root.join("sessions/day/rollout.jsonl");
         let records = vec![
             serde_json::json!({"type":"session_meta","payload":{"id":CAPACITY_NATIVE,
-                "session_id":CAPACITY_NATIVE,"cwd":root,"cli_version":"0.157.1",
+                "session_id":CAPACITY_NATIVE,"cwd":root,"cli_version":"0.160.0",
                 "source":"cli","originator":"codex-tui","thread_source":"user","history_mode":"paginated"}}),
             serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":CAPACITY_TURN}}),
             serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":CAPACITY_TURN,
@@ -1303,7 +1303,7 @@ mod executor_environment_tests {
             )
         };
         for (index, pointer, value) in [
-            (0, "/payload/cli_version", serde_json::json!("0.160.0")),
+            (0, "/payload/cli_version", serde_json::json!("0.161.0")),
             (0, "/payload/id", serde_json::json!("other-native-session")),
             (0, "/payload/cwd", serde_json::json!(root.join("sessions"))),
             (
