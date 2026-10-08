@@ -2,7 +2,9 @@
 
 **Date:** October 6, 2026
 
-**Status:** Future product direction. Implementation follows repository cleanup and the initial GitHub push. The current TRIP product contract remains in effect until an implementation plan is approved.
+**Status:** Future product direction, with the replacement MW-01 design recorded in the [shared workflow architecture plan](MULTI_WORKFLOW_PLAN.md). The ordered MW-01 through MW-04 chain starts from checkpoint `8c6f1e7`; repository publication is not its prerequisite. This documentation does not implement Single agent. The current TRIP product contract remains in effect until the separately authorized implementation and qualification gates are satisfied.
+
+The [requirement ledger](MULTI_WORKFLOW_REQUIREMENTS.md) binds all five MW-01 acceptance criteria to decisions, owners and future tests. The [TRIP compatibility baseline](TRIP_COMPATIBILITY_BASELINE.md) separates source observations, activated profile identities, historical runtime evidence and native behavior still requiring qualification. MW-02 owns policy/profile/run contracts and additive migration; MW-03 owns lifecycle and dashboard behavior; MW-04 owns bounded native/dashboard qualification. Each follow-up requires its own reviewed scope and authorization. Build and review, Research, workflow editing, plugins and recipe generalization remain deferred.
 
 LLMRelay can offer several workflows in one distributed application. TRIP would become one option alongside simpler ways to run development work. The existing session runtime provides a substantial foundation, but workflow selection requires changes to execution authority, profile activation, admission, recovery, and result handling.
 
