@@ -4332,6 +4332,69 @@ mod m7_setup_projection_tests {
     }
 }
 
+/// Recovery reads must not depend on the size of unrelated workspace history.
+pub fn task_recovery_bindings(store: &Store, task_id: &str) -> Result<serde_json::Value> {
+    let mut connection = store.lock()?;
+    let transaction = connection.transaction()?;
+    let task: Option<String> = transaction.query_row(
+        "SELECT json_object('task_id',t.id,'expected_version',t.version,'project_id',t.project_id,
+            'config_revision_id',s.active_config_revision_id,
+            'attempt_id',a.id,'phase',a.phase,'status',a.status,
+            'plan_hash',a.plan_hash,'candidate_hash',a.candidate_hash)
+         FROM tasks t JOIN projects p ON p.id=t.project_id
+         LEFT JOIN trip_project_state s ON s.project_id=t.project_id
+         LEFT JOIN attempts a ON a.id=(SELECT latest.id FROM attempts latest
+           WHERE latest.task_id=t.id ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)
+         WHERE t.id=?1 AND p.internal_purpose IS NULL",
+        params![task_id], |row| row.get(0),
+    ).optional()?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&task.ok_or_else(|| anyhow!("task not found: {task_id}"))?)?;
+    let attempt_id = value["attempt_id"].as_str();
+    let workspace: Option<(String, String, String)> = transaction
+        .query_row(
+            "SELECT path,state,policy_json FROM workspaces WHERE attempt_id=?1",
+            params![attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let workspace = workspace
+        .map(|(path, state, policy)| -> Result<serde_json::Value> {
+            let parsed: serde_json::Value = serde_json::from_str(&policy)?;
+            Ok(serde_json::json!({"path":path,"state":state,
+            "policy_hash":format!("{:x}", Sha256::digest(policy.as_bytes())),
+            "pinned_files":parsed.get("files")}))
+        })
+        .transpose()?;
+    let recoveries = {
+        let mut statement = transaction.prepare(
+            "SELECT json_object('id',id,'state',state,'session_id',session_id,
+                'kind',json_extract(detail_json,'$.kind'),
+                'operation',json_extract(detail_json,'$.operation'),
+                'effect_certainty',json_extract(detail_json,'$.effect_certainty'),
+                'failure_key',json_extract(detail_json,'$.failure_key'))
+             FROM recovery_records WHERE attempt_id=?1 AND state='attention_required'
+             ORDER BY created_at,rowid LIMIT 101",
+        )?;
+        let rows = statement
+            .query_map(params![attempt_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.len() > 100 {
+            bail!("task recovery bindings exceed the 100 open-recovery limit")
+        }
+        rows.into_iter()
+            .map(|row| serde_json::from_str::<serde_json::Value>(&row))
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    value["workspace"] = serde_json::to_value(workspace)?;
+    value["recoveries"] = serde_json::to_value(recoveries)?;
+    if serde_json::to_vec(&value)?.len() > 256 * 1024 {
+        bail!("task recovery bindings exceed the 256 KiB limit")
+    }
+    transaction.commit()?;
+    Ok(value)
+}
+
 pub fn state(store: &Store) -> Result<AppStateDto> {
     let connection = store.lock()?;
     // Read before any projected row: without a read transaction, an external
@@ -9725,6 +9788,7 @@ fn apply_review_transition(
         params![phase, clearing, kind, now, attempt],
     )?;
     if clearing {
+        crate::store::cancel_queued_candidate_notice(transaction, attempt, now)?;
         transaction.execute(
             "UPDATE controls SET state='superseded',updated_at=?1 WHERE attempt_id=?2 AND kind='transition_proposal' AND state='proposed'",
             params![now, attempt],

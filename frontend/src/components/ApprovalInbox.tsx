@@ -63,10 +63,12 @@ export function ServiceCheckPermissionActions(
       )}
       <div className="approval-actions">
         <button
-          disabled={busy || !selection.scope_hash || !canApprove}
+          disabled={busy || !selection.scope_hash || !canApprove ||
+            (permission.authorized && !rerun)}
           onClick={() => onDecision("approved", "once")}
         >
-          {rerun ? "Approve once to rerun" : "Approve once"}
+          {rerun ? "Approve once to rerun" : permission.authorized
+            ? "Approved for this candidate" : "Approve once"}
         </button>
         <button
           disabled={busy || !selection.scope_hash ||

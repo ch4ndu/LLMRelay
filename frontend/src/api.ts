@@ -14,6 +14,7 @@ import type {
   StateCursor,
   StateWaitResult,
   TaskContent,
+  GuidanceReauthorizationPreview,
 } from "./types";
 
 export class ApiError extends Error {
@@ -669,6 +670,23 @@ export const getTaskContent = async (taskId: string, signal?: AbortSignal) => {
   }
   return content;
 };
+export const getGuidanceReauthorization = async (taskId: string) => {
+  const preview = await json<GuidanceReauthorizationPreview>(
+    `/api/tasks/${encodeURIComponent(taskId)}/guidance-reauthorization`,
+    undefined, transportTimeouts.read,
+  );
+  if (preview.task_id !== taskId ||
+    !hasStrings(preview, ["attempt_id", "plan_hash", "config_revision_id", "policy_hash"]) ||
+    !Number.isSafeInteger(preview.expected_version) || !Array.isArray(preview.files) ||
+    preview.files.length > 32 || !preview.files.every((file) =>
+      hasStrings(file, ["path", "previous_sha256", "sha256", "content"]) &&
+      /^[0-9a-f]{64}$/.test(file.previous_sha256) && /^[0-9a-f]{64}$/.test(file.sha256)
+    )) {
+    throw new Error("The service returned unsupported instruction-file recovery information. Refresh after updating the service.");
+  }
+  return preview;
+};
+
 export const getModelCatalog = (provider: Provider) =>
   json<ModelCatalog>(
     `/api/model-catalog?provider=${encodeURIComponent(provider)}`,

@@ -38944,6 +38944,53 @@ fn an_answered_manager_question_reaches_the_plan_through_the_exact_boundary_once
 }
 
 #[test]
+fn a_delayed_session_start_does_not_strand_a_balanced_current_manager_turn() {
+    for (name, events, expected) in [
+        (
+            "delayed-start",
+            vec![
+                "UserPromptSubmit",
+                "PreToolUse",
+                "SessionStart",
+                "PostToolUse",
+                "Stop",
+            ],
+            "idle_candidate",
+        ),
+        (
+            "missing-current-start",
+            vec!["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"],
+            "busy_unresolved_hook_work",
+        ),
+        (
+            "delayed-start-open-tool",
+            vec!["UserPromptSubmit", "PreToolUse", "SessionStart", "Stop"],
+            "busy_unresolved_hook_work",
+        ),
+    ] {
+        let (fixture, paths, app, _, manager) = ordinary_manager_fixture(name);
+        let native = "5d6a1c2e-8a4b-4f3e-b1a9-2c7d9e0f1a23";
+        record_manager_hook(&fixture, &manager, native, "SessionStart");
+        fixture.execute(
+            "UPDATE sessions SET initial_hook_event_boundary_rowid=(SELECT MAX(rowid) FROM hook_events) WHERE id=?1",
+            params![manager.session_id],
+        );
+        for event in events {
+            record_manager_hook(&fixture, &manager, native, event);
+        }
+        fixture.assert_scalar::<String>(
+            &format!(
+                "SELECT readiness_state FROM sessions WHERE id='{}'",
+                manager.session_id
+            ),
+            expected.into(),
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(paths.socket_dir);
+    }
+}
+
+#[test]
 fn an_ordinary_manager_stop_is_reconciled_only_at_an_exact_current_boundary() {
     let (fixture, paths, app, _task, manager) = ordinary_manager_fixture("ordinary-stop");
     let native = "5d6a1c2e-8a4b-4f3e-b1a9-2c7d9e0f1a23";
@@ -40735,6 +40782,344 @@ fn reauthorize_guidance(
 }
 
 #[test]
+fn selected_check_approval_releases_only_its_current_hold_once() {
+    let (fixture, _) = guidance_fixture("check-approval-hold");
+    fixture.execute_batch("UPDATE sessions SET status='exited' WHERE id='s-writer';
+      UPDATE role_generations SET status='exited' WHERE id='g-writer';
+      UPDATE attempts SET phase='checks',status='needs_input',candidate_hash='candidate',selected_checks_revision=1 WHERE id='a';
+      UPDATE tasks SET attention='needs_input' WHERE id='t';
+      INSERT INTO trip_verification_checks(id,project_id,config_revision_id,check_key,category,command_kind,executable,arguments_json,cwd,timeout_seconds,acceptance_rows_json,relevant_inputs_json,invalidation_json,original_text)
+      VALUES('check','p','synthetic-seeded-config','focused','focused','argv','/usr/bin/true','[]','.',60,'[]','[]','[]','fixture check');
+      INSERT INTO trip_selected_checks(attempt_id,revision,check_id,required,selected_by_generation_id,created_at)
+      VALUES('a',1,'check',1,'g-writer','2026-01-01T00:00:00Z');
+      INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+      VALUES('approval-hold','hold','service','attempt.attention.changed','attempt','a',
+        '{\"attention\":\"needs_input\",\"reason\":\"check_needs_approval\",\"message\":\"Approve the check\"}','2099-01-01T00:00:00Z');");
+    let app = Application::new_with_synthetic_dispatch_for_tests(
+        instance_paths(&fixture),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+        test_hooks(&fixture),
+    )
+    .unwrap();
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    agenticjira::coordinator::tick(&app).unwrap();
+    fixture.assert_scalar(
+        "SELECT status FROM attempts WHERE id='a'",
+        "needs_input".to_owned(),
+    );
+    let selection = workflow::state(&fixture.store)
+        .unwrap()
+        .trip_task_verification
+        .into_iter()
+        .find(|entry| entry["check_id"] == "check")
+        .unwrap();
+    execute_trip(
+        &fixture,
+        &instance_paths(&fixture),
+        "approve-exact-check",
+        &TripHumanAction::AuthorizeCheck {
+            attempt_id: "a".into(),
+            check_id: "check".into(),
+            selected_revision: 1,
+            exact_command_hash: selection["exact_command_hash"].as_str().unwrap().into(),
+            scope_hash: selection["scope_hash"].as_str().unwrap().into(),
+            decision: "approved".into(),
+            lifetime: "once".into(),
+        },
+    )
+    .unwrap();
+    // Approval for the previous candidate cannot release this hold.
+    fixture.execute(
+        "UPDATE attempts SET candidate_hash='new-candidate' WHERE id='a'",
+        [],
+    );
+    agenticjira::coordinator::tick(&app).unwrap();
+    fixture.assert_scalar(
+        "SELECT status FROM attempts WHERE id='a'",
+        "needs_input".to_owned(),
+    );
+    fixture.execute(
+        "UPDATE attempts SET candidate_hash='candidate' WHERE id='a'",
+        [],
+    );
+    // An independent recovery is preserved even with exact approval.
+    fixture.execute_batch("INSERT INTO recovery_records(id,attempt_id,state,detail_json,created_at,updated_at) VALUES('independent','a','attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');");
+    agenticjira::coordinator::tick(&app).unwrap();
+    fixture.assert_scalar(
+        "SELECT status FROM attempts WHERE id='a'",
+        "needs_input".to_owned(),
+    );
+    fixture.execute(
+        "UPDATE recovery_records SET state='resolved_retry' WHERE id='independent'",
+        [],
+    );
+    // A different attention reason cannot ride on the check's approval.
+    fixture.execute("UPDATE audit_events SET detail_json=json_set(detail_json,'$.reason','role_needs_input') WHERE id='approval-hold'",[]);
+    agenticjira::coordinator::tick(&app).unwrap();
+    fixture.assert_scalar(
+        "SELECT status FROM attempts WHERE id='a'",
+        "needs_input".to_owned(),
+    );
+    fixture.execute("UPDATE audit_events SET detail_json=json_set(detail_json,'$.reason','check_needs_approval') WHERE id='approval-hold'",[]);
+    let released = agenticjira::coordinator::tick(&app).unwrap();
+    assert_eq!(released["action"], "check_approval_hold_released");
+    fixture.assert_scalar(
+        "SELECT status FROM attempts WHERE id='a'",
+        "running".to_owned(),
+    );
+    fixture.assert_scalar(
+        "SELECT attention FROM tasks WHERE id='t'",
+        "none".to_owned(),
+    );
+    fixture.assert_scalar("SELECT version FROM tasks WHERE id='t'", version + 1);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM check_runs", 0);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM trip_check_authorizations WHERE consumed_at IS NOT NULL",
+        0,
+    );
+    // A later independent hold is never cleared by the old receipt.
+    fixture.execute_batch("UPDATE tasks SET attention='needs_input' WHERE id='t'; UPDATE attempts SET status='needs_input' WHERE id='a';
+      INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+      VALUES('later-hold','later','service','attempt.attention.changed','attempt','a','{\"attention\":\"needs_input\",\"reason\":\"role_needs_input\",\"message\":\"Question\"}','2099-01-02T00:00:00Z');");
+    agenticjira::coordinator::tick(&app).unwrap();
+    fixture.assert_scalar(
+        "SELECT status FROM attempts WHERE id='a'",
+        "needs_input".to_owned(),
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events WHERE json_extract(detail_json,'$.reason')='selected_check_authorized'",1);
+    // Old hosts also left an accepted conformance receipt behind a service-owned hold.
+    fixture.execute("UPDATE audit_events SET detail_json=json_set(detail_json,'$.reason','manager_confirmation_missing') WHERE id='later-hold'",[]);
+    agenticjira::coordinator::tick(&app).unwrap();
+    fixture.assert_scalar(
+        "SELECT status FROM attempts WHERE id='a'",
+        "needs_input".to_owned(),
+    );
+    fixture.execute_batch("INSERT INTO check_runs(id,attempt_id,candidate_hash,executable,arguments_json,cwd,status,exit_code,created_at,check_id,selected_check_revision,freshness_state)
+      VALUES('passed','a','candidate','/usr/bin/true','[]','.','finished',0,'2026-01-01T00:00:00Z','check',1,'current');
+      INSERT INTO trip_conformance_receipts(id,attempt_id,revision,candidate_hash,config_hash,acceptance_json,ownership_json,documentation_json,test_policy_json,readability_json,submitted_by_generation_id,created_at)
+      VALUES('conformance','a',1,'old-candidate','config','[]','{}','{}','{}','{}','g-writer','2026-01-02T00:00:00Z');
+      UPDATE attempts SET manager_conformance_revision=1,updated_at='2026-01-02T00:00:00Z' WHERE id='a';");
+    agenticjira::coordinator::tick(&app).unwrap();
+    fixture.assert_scalar(
+        "SELECT status FROM attempts WHERE id='a'",
+        "needs_input".to_owned(),
+    );
+    fixture.execute(
+        "UPDATE trip_conformance_receipts SET candidate_hash='candidate' WHERE id='conformance'",
+        [],
+    );
+    let resumed = agenticjira::coordinator::tick(&app).unwrap();
+    assert_eq!(resumed["reason"], "manager_conformance_recorded");
+    fixture.assert_scalar(
+        "SELECT status FROM attempts WHERE id='a'",
+        "running".to_owned(),
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events WHERE json_extract(detail_json,'$.reason')='manager_conformance_recorded'",1);
+}
+
+#[test]
+fn guidance_preview_preserves_authority_and_approval_rechecks_the_displayed_content() {
+    let (fixture, workspace) = guidance_fixture("guidance-preview");
+    let policy = guidance_policy(&fixture);
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let changed = "# Project\n\nApproved architecture link.\n";
+    std::fs::write(workspace.join("README.md"), changed).unwrap();
+    let preview = agenticjira::trip::guidance_reauthorization_preview(&fixture.store, "t").unwrap();
+    assert_eq!(preview["expected_version"], version);
+    assert_eq!(preview["policy_hash"], sha256(policy.as_bytes()));
+    assert_eq!(preview["files"].as_array().unwrap().len(), 1);
+    assert_eq!(preview["files"][0]["path"], "README.md");
+    assert_eq!(preview["files"][0]["content"], changed);
+    assert_eq!(preview["files"][0]["sha256"], sha256(changed.as_bytes()));
+    assert_eq!(guidance_policy(&fixture), policy);
+    fixture.assert_scalar("SELECT version FROM tasks WHERE id='t'", version);
+    // A changed file after preview cannot inherit approval of the displayed text.
+    std::fs::write(workspace.join("README.md"), "Different content\n").unwrap();
+    let file = &preview["files"][0];
+    let error = reauthorize_guidance(
+        &fixture,
+        "preview-race",
+        version,
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        preview["policy_hash"].as_str().unwrap(),
+        &[(
+            "README.md",
+            file["previous_sha256"].as_str().unwrap(),
+            file["sha256"].as_str().unwrap(),
+        )],
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("does not have the approved new content"),
+        "{error}"
+    );
+    assert_eq!(guidance_policy(&fixture), policy);
+    std::fs::write(workspace.join("README.md"), changed).unwrap();
+    // Unowned drift cannot be hidden by offering approval for README.
+    std::fs::write(workspace.join("docs/UNOWNED.md"), "Unauthorized\n").unwrap();
+    assert!(
+        agenticjira::trip::guidance_reauthorization_preview(&fixture.store, "t")
+            .unwrap_err()
+            .to_string()
+            .contains("docs/UNOWNED.md")
+    );
+    assert_eq!(guidance_policy(&fixture), policy);
+}
+
+#[test]
+fn task_recovery_bindings_are_read_only_and_exclude_unrelated_history() {
+    let (fixture, workspace) = guidance_fixture("task-recovery-bindings");
+    fixture.execute_batch(
+        "INSERT INTO recovery_records(id,attempt_id,state,detail_json,created_at,updated_at)
+         VALUES('open-recovery','a','attention_required',
+         '{\"kind\":\"coordinator_failure\",\"operation\":\"guidance_delivery\",\"private_launch_environment\":\"do-not-expose\"}',
+         '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+    );
+    let before: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let value = workflow::task_recovery_bindings(&fixture.store, "t").unwrap();
+    assert_eq!(value["expected_version"], before);
+    assert_eq!(value["attempt_id"], "a");
+    assert_eq!(value["plan_hash"], "plan-hash");
+    assert_eq!(value["config_revision_id"], GUIDANCE_CONFIG_REVISION);
+    assert_eq!(
+        value["workspace"]["path"],
+        workspace.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        value["workspace"]["policy_hash"],
+        sha256(guidance_policy(&fixture).as_bytes())
+    );
+    assert_eq!(
+        value["workspace"]["pinned_files"]["README.md"],
+        guidance_pin(&fixture, "README.md")
+    );
+    assert_eq!(value["recoveries"][0]["id"], "open-recovery");
+    assert!(!value.to_string().contains("do-not-expose"));
+    assert!(workflow::task_recovery_bindings(&fixture.store, "unknown")
+        .unwrap_err()
+        .to_string()
+        .contains("task not found"));
+    fixture.assert_scalar("SELECT version FROM tasks WHERE id='t'", before);
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM recovery_records WHERE id='open-recovery'",
+        "attention_required".into(),
+    );
+}
+
+#[test]
+fn a_settled_guidance_subject_does_not_release_an_unchanged_readiness_failure() {
+    let (fixture, workspace) = guidance_fixture("guidance-stable-hold");
+    fixture.execute_batch(
+        "UPDATE sessions SET status='exited',exit_json='{\"process_group_quiescent\":true}' WHERE id='s-writer';
+         UPDATE role_generations SET status='exited' WHERE id='g-writer';
+         INSERT INTO recovery_records(id,attempt_id,state,detail_json,created_at,updated_at)
+           VALUES('readiness-hold','a','attention_required',
+             '{\"kind\":\"coordinator_failure\",\"operation\":\"guidance_delivery\",\"causal_identity\":{\"session_id\":\"s-writer\",\"report_reminder\":true}}',
+             '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+    );
+    let original = std::fs::read(workspace.join("README.md")).unwrap();
+    std::fs::write(workspace.join("README.md"), "Changed guidance\n").unwrap();
+    let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let app = synthetic_coordinator(&fixture);
+    for _ in 0..3 {
+        app.coordinator_tick().unwrap();
+        fixture.assert_scalar::<String>(
+            "SELECT state FROM recovery_records WHERE id='readiness-hold'",
+            "attention_required".into(),
+        );
+        fixture.assert_scalar("SELECT version FROM tasks WHERE id='t'", version);
+    }
+    std::fs::write(workspace.join("README.md"), original).unwrap();
+    let settled = app.coordinator_tick().unwrap();
+    assert_eq!(
+        settled["action"], "coordinator_failure_released",
+        "{settled}"
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM recovery_records WHERE id='readiness-hold'",
+        "resolved_retry".into(),
+    );
+}
+
+#[test]
+fn guidance_reauthorization_accepts_documentation_owned_paths_without_expanding_authority() {
+    let plan = serde_json::json!({
+        "ownership": {
+            "owned_paths": ["README.md", "docs/PROTECTED.md", "docs/UNDOCUMENTED.md"],
+            "protected_paths": ["docs/PROTECTED.md"],
+        },
+        "documentation": {
+            "owned_paths": ["README.md", "docs/UNOWNED.md", "docs/PROTECTED.md"],
+            "implementation": "README planning link.",
+        },
+    });
+    let (fixture, workspace) = guidance_fixture_with(
+        "guidance-documentation-owned-paths",
+        &[
+            ("README.md", "# Project\n"),
+            ("docs/UNOWNED.md", "Unowned\n"),
+            ("docs/PROTECTED.md", "Protected\n"),
+            ("docs/UNDOCUMENTED.md", "Undocumented\n"),
+        ],
+        &[
+            "README.md",
+            "docs/UNOWNED.md",
+            "docs/PROTECTED.md",
+            "docs/UNDOCUMENTED.md",
+        ],
+        plan,
+    );
+    let version = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    let policy = guidance_policy(&fixture);
+    let policy_hash = sha256(policy.as_bytes());
+    for path in [
+        "docs/UNOWNED.md",
+        "docs/PROTECTED.md",
+        "docs/UNDOCUMENTED.md",
+    ] {
+        let original = std::fs::read(workspace.join(path)).unwrap();
+        let previous = guidance_pin(&fixture, path);
+        let changed = "Unauthorized change.\n";
+        std::fs::write(workspace.join(path), changed).unwrap();
+        let error = reauthorize_guidance(
+            &fixture,
+            path,
+            version,
+            "plan-hash",
+            GUIDANCE_CONFIG_REVISION,
+            &policy_hash,
+            &[(path, &previous, &sha256(changed.as_bytes()))],
+        )
+        .unwrap_err();
+        assert!(error.contains("does not explicitly own"), "{path}: {error}");
+        assert_eq!(guidance_policy(&fixture), policy);
+        std::fs::write(workspace.join(path), original).unwrap();
+    }
+    let previous = guidance_pin(&fixture, "README.md");
+    let repaired = "# Project\n\n[Architecture plan](docs/PLAN.md).\n";
+    std::fs::write(workspace.join("README.md"), repaired).unwrap();
+    assert!(guidance_ready(&fixture).unwrap_err().contains("README.md"));
+    let result = reauthorize_guidance(
+        &fixture,
+        "approved-readme",
+        version,
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        &policy_hash,
+        &[("README.md", &previous, &sha256(repaired.as_bytes()))],
+    )
+    .unwrap();
+    assert_eq!(result.state, "guidance_reauthorized");
+    guidance_ready(&fixture).unwrap();
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.guidance.reauthorized'",
+        1,
+    );
+}
+
+#[test]
 fn guidance_reauthorization_refuses_stale_bindings_unapproved_paths_and_symlinks() {
     let (fixture, workspace) = guidance_fixture("guidance-refusals");
     let write = |relative: &str, text: &str| {
@@ -41406,6 +41791,15 @@ fn code_review_rejection_retires_proposals_bound_to_the_cleared_candidate() {
         params![version, payload],
     );
     let paths = instance_paths(&fixture);
+    fixture.execute_batch(
+        "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at)
+           VALUES('stale-candidate-notice','a','manager-generation',
+             'Implementation candidate is frozen. Inspect the evidence and propose phase code_review.',
+             'queued','2026-01-01T00:00:00Z');
+         INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at)
+           VALUES('human-guidance','a','manager-generation','Keep the smaller scope.',
+             'queued','2026-01-01T00:00:00Z');",
+    );
     let app = Application::new(
         paths.clone(),
         fixture.store.clone(),
@@ -41415,6 +41809,14 @@ fn code_review_rejection_retires_proposals_bound_to_the_cleared_candidate() {
     let applied = app.coordinator_tick().unwrap();
     assert_eq!(applied["action"], "review_applied", "{applied}");
     assert_eq!(applied["verdict"], "request_changes");
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM guidance_messages WHERE id='stale-candidate-notice'",
+        "cancelled".into(),
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT state FROM guidance_messages WHERE id='human-guidance'",
+        "queued".into(),
+    );
     fixture.assert_scalar::<String>(
         "SELECT phase||':'||COALESCE(candidate_hash,'cleared') FROM attempts WHERE id='a'",
         "implementation:cleared".into(),

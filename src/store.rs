@@ -1782,8 +1782,20 @@ impl Store {
                         "SELECT MAX(rowid) FROM hook_events
                      WHERE session_id=?1 AND event_name='UserPromptSubmit'
                        AND native_session_id=(SELECT native_session_id FROM sessions WHERE id=?1)
-                       AND rowid>?2 AND rowid<=?3",
-                        params![context.session_id, session_start, hook_rowid],
+                       AND rowid>CASE WHEN ?4='codex' THEN COALESCE(
+                         (SELECT ri.hook_event_boundary_rowid FROM resume_invocations ri
+                          JOIN sessions s ON s.id=ri.session_id
+                          WHERE s.id=?1 AND ri.transcript_epoch=s.transcript_epoch
+                          ORDER BY ri.resume_ordinal DESC LIMIT 1),
+                         (SELECT initial_hook_event_boundary_rowid FROM sessions WHERE id=?1),0)
+                         ELSE ?2 END
+                       AND rowid<=?3",
+                        params![
+                            context.session_id,
+                            session_start,
+                            hook_rowid,
+                            context.provider.to_string()
+                        ],
                         |row| row.get(0),
                     )?
                 } else {
@@ -14032,7 +14044,7 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
                    AND start.native_session_id=bounded_turn.native_session_id
                    AND start.provenance_state='managed_process_group_untrusted_payload'
                    AND start.rowid>bounded_turn.boundary
-                   AND start.rowid<bounded_turn.submit_rowid)
+                   AND start.rowid<bounded_turn.stop_rowid)
                AND (SELECT COUNT(*) FROM hook_events started
                     WHERE started.session_id=bounded_turn.session_id
                       AND started.event_name='PreToolUse'
@@ -14326,6 +14338,27 @@ fn setup_retained_first_turn_stop_timeout_candidate_in(
         .map_err(Into::into)
 }
 
+pub(crate) fn cancel_queued_candidate_notice(
+    connection: &rusqlite::Connection,
+    attempt_id: &str,
+    now: &str,
+) -> Result<()> {
+    let cancelled = connection.execute(
+        "UPDATE guidance_messages SET state='cancelled',reason='candidate_invalidated_before_delivery'
+         WHERE attempt_id=?1 AND body=?2 AND state='queued' AND written_at IS NULL",
+        params![attempt_id, crate::coordinator::CANDIDATE_FROZEN_NOTICE],
+    )?;
+    if cancelled != 0 {
+        connection.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES(?1,?1,'service','workflow.candidate_notice.cancelled','attempt',?2,?3,?4)",
+            params![uuid::Uuid::new_v4().to_string(), attempt_id,
+                serde_json::json!({"cancelled":cancelled,"reason":"candidate_invalidated_before_delivery"}).to_string(), now],
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn eligible_manager_service_stop(
     connection: &rusqlite::Connection,
     attempt_id: &str,
@@ -14391,7 +14424,7 @@ pub(crate) fn eligible_manager_service_stop(
                    AND start.role_generation_id=stopped_turn.generation_id
                    AND start.event_name='SessionStart'
                    AND start.rowid>stopped_turn.boundary
-                   AND start.rowid<stopped_turn.submit_rowid)
+                   AND start.rowid<stopped_turn.stop_rowid)
                AND (SELECT COUNT(*) FROM hook_events started
                     WHERE started.session_id=stopped_turn.session_id
                       AND started.event_name='PreToolUse'

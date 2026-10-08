@@ -196,6 +196,9 @@ pub enum ControlRequest {
         guidance_id: String,
     },
     State,
+    TaskRecoveryBindings {
+        task_id: String,
+    },
     Diagnostics {
         limit: usize,
     },
@@ -1562,6 +1565,9 @@ fn dispatch(
             ControlResponse::success(app.roles.deliver_guidance(&guidance_id)?)
         }
         ControlRequest::State => ControlResponse::success(crate::workflow::state(&app.store)?),
+        ControlRequest::TaskRecoveryBindings { task_id } => ControlResponse::success(
+            crate::workflow::task_recovery_bindings(&app.store, &task_id)?,
+        ),
         ControlRequest::Diagnostics { limit } => {
             ControlResponse::success(app.diagnostics.read_sanitized(limit.min(2_000))?)
         }
@@ -1634,6 +1640,7 @@ fn blocking_control_request(request: &ControlRequest) -> bool {
         | ControlRequest::RoleSwitchRequest { .. }
         | ControlRequest::GuidanceDeliver { .. }
         | ControlRequest::State
+        | ControlRequest::TaskRecoveryBindings { .. }
         | ControlRequest::Diagnostics { .. }
         | ControlRequest::CheckRun { .. }
         | ControlRequest::LegacyPreview { .. }

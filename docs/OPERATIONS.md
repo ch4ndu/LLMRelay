@@ -128,6 +128,41 @@ llmrelay import --data-dir <INSTANCE> apply --project <PROJECT_ID> \
 
 ## Stop and recover
 
+### Approved documentation changed an instruction file
+
+A task may own a documentation edit to a file such as `README.md` that is also
+configured as agent guidance. The app holds further work when that edit differs
+from the instruction content pinned for the attempt. Preserve the approved edit;
+restoring it solely to force progress can make the delivered candidate incomplete.
+
+In the task's **Overview**, choose **Review planned documentation update**.
+Read the displayed current content and compare it with the approved plan, then
+choose **Approve planned documentation update**. The preview is read-only;
+approval uses the exact displayed content hashes and task bindings. If the task
+or file changes after preview, approval is refused until you review a fresh
+preview. Other recovery holds must be resolved through their own actions.
+
+The CLI route remains available. At a settled boundary, retrieve the current bindings with
+`llmrelay state --data-dir <INSTANCE> --task <TASK_ID>`, inspect the approved plan
+and changed file, then submit the existing authenticated `apply` command:
+
+```json
+{"kind":"reauthorize_attempt_guidance","operation_id":"<new id>",
+ "task_id":"<task>","attempt_id":"<attempt>","expected_version":7,
+ "plan_hash":"<approved plan hash>","config_revision_id":"<active revision>",
+ "policy_hash":"<workspace policy hash>",
+ "files":[{"path":"README.md","previous_sha256":"<pinned hash>",
+           "sha256":"<reviewed new file hash>"}]}
+```
+
+The service accepts only exact documentation paths owned by the approved plan
+and configured as guidance. It refuses protected workflow artifacts, stale
+bindings, unreviewed file changes, active implementation work, unresolved recovery or delivery,
+and open restart holds. Resolve each prerequisite through its own recovery route
+before submitting; the command does not waive those holds. Successful approval
+records both content hashes and the policy change in the audit, without approving
+the implementation or its reviews. Ordinary recovery and review gates still apply.
+
 ### Preview and bounded restoration
 
 Use **Preview restart** under **Restart and recovery tools** in Workspace, or run
@@ -139,6 +174,16 @@ completed work. Running-session eligibility is conditional on verified quiescenc
 a preview never authorizes a resume. The CLI control channel retains its 1 MiB
 response limit and returns an explicit error when a complete preview exceeds it.
 It does not silently truncate the result.
+
+For a task recovery, use `llmrelay state --data-dir <INSTANCE> --task <TASK_ID>`
+with the exact task ID. This authenticated, read-only command returns the current
+task version, attempt, approved plan and candidate hashes, active configuration
+revision, workspace policy hash and pinned files, and open recovery identifiers.
+It excludes other tasks, transcripts, provider launch configuration and report
+history. The read uses one database snapshot and is limited to 100 open recoveries
+and 256 KiB; exceeding either limit fails explicitly. Reading these bindings
+does not approve a recovery or change any workflow state. The unscoped `state`
+command still returns the full workspace projection and retains its 1 MiB limit.
 
 One distinct selected session uses the direct resume path. **Resume eligible**
 and selections with two or more distinct sessions create a durable batch of at

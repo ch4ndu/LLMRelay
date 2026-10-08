@@ -1806,6 +1806,7 @@ button:disabled {
 .error-notice p { margin: 0.35rem 0; }
 .error-notice details, .technical-details { margin-top: 0.4rem; }
 .error-notice pre, .technical-details pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.guidance-recovery pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 28rem; overflow: auto; }
 
 /* Task focus layout: one navigation shell, adaptive at every width. */
 :root {

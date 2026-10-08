@@ -99,6 +99,11 @@ const attentionStatus: Record<string, Omit<TaskStatus, "completed">> = {
     detail:
       "Automatic work stopped until you confirm what happened to this task's agents.",
   },
+  resume_failed: {
+    label: "Resume needs recovery",
+    tone: "danger",
+    detail: "An agent could not resume. Open the task to review the failure and its recovery action.",
+  },
   restart_parked: {
     label: "Paused after restart",
     tone: "attention",
@@ -268,6 +273,24 @@ export function taskStatus(
     };
   }
   const phase = attempt && phaseStatus[attempt.phase];
+  if (attempt?.phase === "implementation" &&
+    !running.some((session) => session.role === "implementer")) {
+    if (attempt.candidate_hash) {
+      return {
+        label: "Waiting for code review",
+        tone: "waiting",
+        detail: "The implementation candidate is frozen. The manager must request code review; code review has not started yet.",
+        completed,
+      };
+    }
+    return {
+      label: "Waiting between implementation steps",
+      tone: "waiting",
+      detail: task.progress?.waiting_reason ||
+        "No implementer is running. LLMRelay is preparing the next implementation step.",
+      completed,
+    };
+  }
   if (phase) return { ...phase, completed };
   return {
     label: lifecycleLabels[task.lifecycle] || "In progress",

@@ -1595,7 +1595,12 @@ fn approved_documentation_paths(plan: &serde_json::Value) -> BTreeSet<String> {
             .flatten()
             .filter_map(|(key, _)| owned_match(key)),
     );
-    let protected = ["protected", "protected_paths_and_state"]
+    documented.extend(
+        strings(plan.pointer("/documentation/owned_paths"))
+            .into_iter()
+            .filter(|path| owned.contains(path)),
+    );
+    let protected = ["protected", "protected_paths", "protected_paths_and_state"]
         .into_iter()
         .flat_map(|key| strings(ownership.and_then(|value| value.get(key))))
         .collect::<BTreeSet<_>>();
@@ -1778,6 +1783,108 @@ pub(crate) fn retire_unmatchable_transition_proposals(
         retired += 1;
     }
     Ok(retired)
+}
+
+/// Read-only content preview; approval rechecks every authority and settled-boundary fence.
+pub fn guidance_reauthorization_preview(store: &Store, task_id: &str) -> Result<serde_json::Value> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    const MAX_FILE_BYTES: usize = 64 * 1024;
+    const MAX_CONTENT_BYTES: usize = 256 * 1024;
+    let mut connection = store.lock()?;
+    let transaction = connection.transaction()?;
+    let row: Option<(i64, String, String, String, String, String, String, String)> = transaction
+        .query_row(
+            "SELECT t.version,a.id,a.plan_hash,r.id,p.plan_json,
+                    json_extract(r.config_json,'$.guidance'),w.path,w.policy_json
+             FROM tasks t JOIN attempts a ON a.id=(SELECT latest.id FROM attempts latest
+               WHERE latest.task_id=t.id ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)
+             JOIN trip_structured_plans p ON p.id=a.structured_plan_id AND p.plan_hash=a.plan_hash
+             JOIN trip_project_state s ON s.project_id=t.project_id
+             JOIN trip_config_revisions r ON r.id=s.active_config_revision_id
+             JOIN workspaces w ON w.attempt_id=a.id AND w.state='ready'
+             WHERE t.id=?1 AND t.archived_at IS NULL AND t.lifecycle IN ('in_progress','validation')
+               AND a.status IN ('running','needs_input','held') AND a.plan_approved_at IS NOT NULL
+               AND p.approved_at IS NOT NULL AND p.implementation_authorized_at IS NOT NULL",
+            params![task_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (version, attempt, plan_hash, config, plan, guidance, root, policy_json) =
+        row.ok_or_else(|| anyhow!("no current approved implementation plan and ready workspace"))?;
+    let root = PathBuf::from(root).canonicalize()?;
+    let named = approved_documentation_paths(&serde_json::from_str(&plan)?);
+    let guidance: BTreeSet<String> = serde_json::from_str(&guidance)?;
+    let mut policy = validate_materialized_policy(&policy_json)?;
+    if policy["kind"] != "activated_project" {
+        bail!("only an activated-project workspace policy carries approved guidance")
+    }
+    let mut files = Vec::new();
+    let mut content_bytes = 0;
+    for relative in guidance.intersection(&named) {
+        if is_protected_workflow_artifact(relative) {
+            continue;
+        }
+        validate_relative(relative)?;
+        let Some(previous) = policy["files"][relative].as_str().map(str::to_owned) else {
+            continue;
+        };
+        let path = root.join(relative);
+        ensure_no_symlink_ancestry(&root, &path)?;
+        if !fs::symlink_metadata(&path)?.file_type().is_file() {
+            bail!("{relative} is not a regular file in the workspace")
+        }
+        let mut bytes = Vec::new();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        let opened = file.metadata()?;
+        if !opened.is_file() {
+            bail!("{relative} is not a regular documentation file")
+        }
+        file.take((MAX_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        ensure_no_symlink_ancestry(&root, &path)?;
+        let current = fs::symlink_metadata(&path)?;
+        if !current.is_file() || current.dev() != opened.dev() || current.ino() != opened.ino() {
+            bail!("{relative} changed while reading the documentation preview")
+        }
+        if bytes.len() > MAX_FILE_BYTES {
+            bail!("{relative} exceeds the 64 KiB documentation preview limit")
+        }
+        let hash = sha256(&bytes);
+        if hash == previous {
+            continue;
+        }
+        content_bytes += bytes.len();
+        if files.len() == 32 || content_bytes > MAX_CONTENT_BYTES {
+            bail!("documentation preview exceeds its file or content limit")
+        }
+        let content =
+            String::from_utf8(bytes).context("documentation preview requires UTF-8 text")?;
+        files.push(serde_json::json!({"path":relative,"previous_sha256":previous,"sha256":hash,"content":content}));
+        policy["files"][relative] = serde_json::json!(hash);
+    }
+    // A preview cannot offer approval while another pinned file has drifted.
+    verified_policy_paths(&root, &policy)?;
+    transaction.commit()?;
+    Ok(
+        serde_json::json!({"task_id":task_id,"attempt_id":attempt,"expected_version":version,
+        "plan_hash":plan_hash,"config_revision_id":config,"policy_hash":sha256(policy_json.as_bytes()),
+        "files":files}),
+    )
 }
 
 /// Applies your explicit approval that listed guidance files in the active

@@ -799,6 +799,10 @@ fn web_router(web_state: WebState) -> Router {
             get(api_role_preparations),
         )
         .route("/api/tasks/{task_id}/content", get(api_task_content))
+        .route(
+            "/api/tasks/{task_id}/guidance-reauthorization",
+            get(api_guidance_reauthorization),
+        )
         .route("/api/command", post(api_command))
         .route("/api/operation", post(api_operation))
         .route("/api/diagnostics", get(api_diagnostics))
@@ -1221,6 +1225,34 @@ async fn api_role_preparations(
         Err(error) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error":format!("{error:#}")})),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_guidance_reauthorization(
+    State(state): State<WebState>,
+    AxumPath(task_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_browser(&state, &headers) {
+        return response;
+    }
+    let store = state.app.store.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::trip::guidance_reauthorization_preview(&store, &task_id)
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error":format!("{error:#}")})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":format!("guidance preview read failed: {error}")})),
         )
             .into_response(),
     }
@@ -2215,6 +2247,7 @@ mod web_operation_tests {
             ("GET", "/api/restart-preview"),
             ("GET", "/api/model-catalog?provider=invalid"),
             ("GET", "/api/tasks/fixture/role-preparations"),
+            ("GET", "/api/tasks/fixture/guidance-reauthorization"),
             ("GET", "/api/diagnostics"),
             ("POST", "/api/command"),
             ("POST", "/api/operation"),

@@ -333,39 +333,7 @@ impl CheckService {
             return Ok(false);
         }
         let connection = self.store.lock()?;
-        let row: Option<(i64,String,Option<String>,Option<String>,Option<String>,String)> = connection.query_row(
-            "SELECT a.selected_checks_revision,c.command_kind,c.executable,c.arguments_json,c.shell_command,c.cwd
-             FROM attempts a JOIN trip_selected_checks s ON s.attempt_id=a.id AND s.revision=a.selected_checks_revision
-             JOIN trip_verification_checks c ON c.id=s.check_id AND c.enabled=1
-             WHERE a.id=?1 AND s.check_id=?2 AND s.required=1 AND a.phase='checks' AND a.candidate_hash IS NOT NULL",
-            params![attempt,check_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))
-        ).optional()?;
-        let Some((revision, kind, executable, arguments, shell, cwd)) = row else {
-            return Ok(false);
-        };
-        let candidate: String = connection.query_row(
-            "SELECT candidate_hash FROM attempts WHERE id=?1",
-            params![attempt],
-            |row| row.get(0),
-        )?;
-        let command_hash = crate::store::json_hash(
-            &serde_json::json!({"kind":kind,"executable":executable,"arguments":arguments,"shell":shell,"cwd":cwd}),
-        )?;
-        let scope_hash = crate::store::json_hash(
-            &serde_json::json!({"attempt_id":attempt,"candidate_hash":candidate,"check_id":check_id,"selected_revision":revision,"cwd":cwd}),
-        )?;
-        Ok(selected_check_authority(
-            &connection,
-            attempt,
-            check_id,
-            revision,
-            &command_hash,
-            &scope_hash,
-            &kind,
-            executable.as_deref(),
-            &cwd,
-        )?
-        .is_some())
+        selected_authorized_on(&connection, attempt, check_id)
     }
 
     fn run(
@@ -1358,6 +1326,46 @@ impl CheckService {
         }
         Ok(ids)
     }
+}
+
+pub(crate) fn selected_authorized_on(
+    connection: &rusqlite::Connection,
+    attempt: &str,
+    check_id: &str,
+) -> Result<bool> {
+    let row: Option<(i64,String,Option<String>,Option<String>,Option<String>,String)> = connection.query_row(
+            "SELECT a.selected_checks_revision,c.command_kind,c.executable,c.arguments_json,c.shell_command,c.cwd
+             FROM attempts a JOIN trip_selected_checks s ON s.attempt_id=a.id AND s.revision=a.selected_checks_revision
+             JOIN trip_verification_checks c ON c.id=s.check_id AND c.enabled=1
+             WHERE a.id=?1 AND s.check_id=?2 AND s.required=1 AND a.phase='checks' AND a.candidate_hash IS NOT NULL",
+            params![attempt,check_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))
+        ).optional()?;
+    let Some((revision, kind, executable, arguments, shell, cwd)) = row else {
+        return Ok(false);
+    };
+    let candidate: String = connection.query_row(
+        "SELECT candidate_hash FROM attempts WHERE id=?1",
+        params![attempt],
+        |row| row.get(0),
+    )?;
+    let command_hash = crate::store::json_hash(
+        &serde_json::json!({"kind":kind,"executable":executable,"arguments":arguments,"shell":shell,"cwd":cwd}),
+    )?;
+    let scope_hash = crate::store::json_hash(
+        &serde_json::json!({"attempt_id":attempt,"candidate_hash":candidate,"check_id":check_id,"selected_revision":revision,"cwd":cwd}),
+    )?;
+    Ok(selected_check_authority(
+        connection,
+        attempt,
+        check_id,
+        revision,
+        &command_hash,
+        &scope_hash,
+        &kind,
+        executable.as_deref(),
+        &cwd,
+    )?
+    .is_some())
 }
 
 fn selected_check_authority(

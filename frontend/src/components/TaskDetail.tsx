@@ -31,6 +31,7 @@ import { projectSetupProblem, WorkflowControls } from "./WorkflowControls";
 import { ReviewPanel } from "./ReviewPanel";
 import { RoleSettings } from "./RoleSettings";
 import { RecoveryPanel } from "./RecoveryPanel";
+import { GuidanceRecovery } from "./GuidanceRecovery";
 import { WorkSummary } from "./WorkSummary";
 import { ServiceCheckPermissionActions } from "./ApprovalInbox";
 import { MarkdownContent } from "./MarkdownContent";
@@ -579,6 +580,11 @@ export function TaskDetail(
       ?.primary_blocker
     : undefined;
   const waitingReason = waitingBlocker?.message;
+  const guidanceConflict = task.progress?.reason_code === "workflow.attempt_readiness_stale" ||
+    state.recovery.some((record) => record.attempt_id === attempt?.id &&
+      record.state === "attention_required" && typeof record.detail === "object" &&
+      record.detail !== null && "cause" in record.detail && typeof record.detail.cause === "string" &&
+      record.detail.cause.includes("worktree policy file changed after verified materialization:"));
   // Follows whichever explanation the panel would otherwise show.
   const setupProblem = !terminal
     ? projectSetupProblem(
@@ -736,15 +742,15 @@ export function TaskDetail(
                 <p className="hint">
                   The manager that asked is no longer running, so a reply
                   cannot be sent now. Refresh to see the current state, or
-                  choose Continue below once you have resolved what it asked
-                  for.
+                  use an available action in Controls below once you have
+                  resolved what it asked for.
                 </p>
               )
               : (
                 <p className="hint">
                   This wait is not a question the manager can take a reply
-                  to. Resolve what the report describes, then choose Continue
-                  below.
+                  to. Resolve what the report describes, then use an available
+                  action in Controls below.
                 </p>
               )}
             {guidance.length > 0 && (
@@ -787,6 +793,8 @@ export function TaskDetail(
           selectedRecordId={selectedRecoveryId}
           onChanged={onChanged}
         />
+        {guidanceConflict &&
+          <GuidanceRecovery key={attempt?.id} task={task} onChanged={onChanged} />}
         <section className="panel verification-summary">
           <h3>Verification</h3>
           <p>

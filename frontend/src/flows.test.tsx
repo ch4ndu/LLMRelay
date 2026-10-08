@@ -79,6 +79,7 @@ const { MarkdownContent, safeMarkdownUrl } = await import(
   "./components/MarkdownContent"
 );
 const { taskStatus } = await import("./components/TaskBoard");
+const { GuidanceRecovery } = await import("./components/GuidanceRecovery");
 const { explainError } = await import("./components/ErrorNotice");
 const { AppErrorBoundary } = await import("./components/AppErrorBoundary");
 const nativeFetch = globalThis.fetch;
@@ -4900,6 +4901,21 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
     }
     unmount();
 
+    const approvedState = {
+      ...serviceState,
+      trip_task_verification: [{
+        ...serviceCheck,
+        authorization: { ...serviceCheck.authorization, authorized: true, once_available: true, state: "approved_once" },
+      }],
+    } as AppState;
+    mount(<TaskDetail task={task} state={approvedState} onClose={() => {}} onChanged={() => changed++} />);
+    click("Checks");
+    const approvedButton = [...document.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Approved for this candidate");
+    if (!approvedButton?.disabled) throw new Error("recorded check approval was not visible or offered duplicate approval");
+    const approvedRun = [...document.querySelectorAll<HTMLButtonElement>(".verification-row > .button-row button")][0];
+    if (approvedRun.disabled) throw new Error("approved current check did not enable Run");
+    unmount();
+
     const inactiveState = {
       ...serviceState,
       trip_task_verification: [{
@@ -7565,6 +7581,35 @@ Deno.test("Active and Completed work stay separate and Ready means queued", () =
     check(taskStatus(recovering).label === "Manual action needed", "recovery was not named plainly");
     check(taskStatus(done).label === "Completed" && taskStatus(done).completed, "done work was not completed");
     check(
+      taskStatus({ ...task, attention: "resume_failed" }).label ===
+        "Resume needs recovery",
+      "a failed resume was shown as implementing",
+    );
+    const frozen: Task = {
+      ...task,
+      attention: "none",
+      active_attempt: {
+        ...task.active_attempt!,
+        phase: "implementation",
+        candidate_hash: "frozen",
+      },
+    };
+    check(
+      taskStatus(frozen).label === "Waiting for code review" &&
+        taskStatus(frozen).detail.includes("code review has not started"),
+      "a frozen candidate was shown as actively implementing",
+    );
+    check(
+      taskStatus(frozen, {
+        sessions: [{
+          ...managerSession,
+          role: "implementer",
+          attempt_id: frozen.active_attempt!.id,
+        }],
+      }).label === "Implementing",
+      "an active writer was shown as a finished handoff",
+    );
+    check(
       taskStatus(task, {
         sessions: [{ ...managerSession, attempt_id: "a1", readiness: "unknown" }],
       }).label === "Waiting for startup",
@@ -9992,6 +10037,90 @@ Deno.test("H1 failed-step retry waits for unknown outcomes and an exact selectio
         !document.querySelector("button, textarea, [data-attention-target]") &&
         requests.length === 0,
       "a vanished failed step fell back to the remaining session hold",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Planned documentation recovery previews content and approves only its exact current binding", async () => {
+  const requests: Record<string, unknown>[] = [];
+  let refreshes = 0;
+  const preview = {
+    task_id: task.id,
+    attempt_id: "a1",
+    expected_version: task.version,
+    plan_hash: "approved-plan",
+    config_revision_id: "config",
+    policy_hash: "policy",
+    files: [{
+      path: "README.md",
+      previous_sha256: "a".repeat(64),
+      sha256: "b".repeat(64),
+      content: "# Approved documentation\n<script>must remain text</script>",
+    }],
+  };
+  globalThis.fetch =
+    (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/guidance-reauthorization")) {
+        return new Response(JSON.stringify(preview));
+      }
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(
+        JSON.stringify({ result: { state: "guidance_reauthorized" } }),
+      );
+    }) as typeof fetch;
+  try {
+    mount(
+      <GuidanceRecovery
+        task={task}
+        onChanged={() => {
+          refreshes += 1;
+        }}
+      />,
+    );
+    click("Review planned documentation update");
+    await settle();
+    check(
+      requests.length === 0 &&
+        document.querySelector("pre")?.textContent ===
+          preview.files[0].content &&
+        !document.querySelector("script"),
+      "preview changed state or executed documentation markup",
+    );
+    click("Approve planned documentation update");
+    await settle();
+    check(
+      requests.length === 1 &&
+        requests[0].kind === "reauthorize_attempt_guidance" &&
+        requests[0].attempt_id === "a1" &&
+        requests[0].expected_version === task.version &&
+        requests[0].plan_hash === "approved-plan" &&
+        requests[0].policy_hash === "policy" &&
+        JSON.stringify(requests[0].files) ===
+          JSON.stringify([{
+            path: "README.md",
+            previous_sha256: "a".repeat(64),
+            sha256: "b".repeat(64),
+          }]) &&
+        refreshes === 1,
+      "approval lost the reviewed binding or sent file contents as authority",
+    );
+    mount(
+      <GuidanceRecovery
+        task={{ ...task, version: task.version + 1 }}
+        onChanged={noop}
+      />,
+    );
+    click("Review planned documentation update");
+    await settle();
+    check(
+      Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((
+        button,
+      ) => button.textContent === "Approve planned documentation update")
+        ?.disabled === true,
+      "a stale task preview still allowed approval",
     );
   } finally {
     unmount();

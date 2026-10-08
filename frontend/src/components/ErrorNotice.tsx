@@ -48,7 +48,7 @@ export function explainError(error: string): ErrorGuidance {
       summary:
         "A workflow or guidance file in the task's workspace was changed during the attempt.",
       nextStep:
-        "Restore the file named in Technical details in the task's workspace. Changes to guidance files are delivered separately from task work.",
+        "If the approved plan includes this documentation edit, preserve it and use Review planned documentation update in the task's Overview. Otherwise restore the reviewed copy named in Technical details. Resolve other recovery holds separately; approval never changes protected workflow files.",
     };
   }
   if (/profile change pending/.test(text)) {

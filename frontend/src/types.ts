@@ -1085,6 +1085,15 @@ export interface TaskProgress {
   last_agent_activity_at: string | null;
   activity: "no_live_agent" | "agent_live_idle" | "agent_active_without_progress";
 }
+export interface GuidanceReauthorizationPreview {
+  task_id: string;
+  attempt_id: string;
+  expected_version: number;
+  plan_hash: string;
+  config_revision_id: string;
+  policy_hash: string;
+  files: { path: string; previous_sha256: string; sha256: string; content: string }[];
+}
 /**
  * The next step a task offers on its board card and in its header: the first
  * of the task's attention items, which is the one `item_id` opens.

@@ -30,7 +30,7 @@ enum Command {
     Attach(AttachArgs),
     Capability(CapabilityArgs),
     Apply(ApplyArgs),
-    State(InstanceArgs),
+    State(StateArgs),
     Scheduler(SchedulerArgs),
     Snapshot(SnapshotArgs),
     Dispatch(DispatchArgs),
@@ -78,6 +78,14 @@ struct ServeArgs {
 struct InstanceArgs {
     #[arg(long)]
     data_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct StateArgs {
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    #[arg(long, help = "Read bounded recovery bindings for one exact task ID")]
+    task: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -622,11 +630,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Capability(args) => run_capability(args).await,
         Command::Apply(args) => run_apply(args).await,
         Command::State(args) => {
-            print_control(
-                &InstancePaths::resolve(args.data_dir)?,
-                ControlRequest::State,
-            )
-            .await
+            let request = match args.task {
+                Some(task_id) => ControlRequest::TaskRecoveryBindings { task_id },
+                None => ControlRequest::State,
+            };
+            print_control(&InstancePaths::resolve(args.data_dir)?, request).await
         }
         Command::Scheduler(args) => {
             print_control(

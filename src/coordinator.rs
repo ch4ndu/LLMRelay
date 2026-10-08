@@ -33,6 +33,9 @@ fn tick_steps(app: &Application) -> Result<serde_json::Value> {
     if let crate::supervisor::ProcessInventory::Unavailable(cause) = inventory {
         return process_independent_control(app, cause);
     }
+    if let Some(value) = release_one_check_obligation_hold(&app.store)? {
+        return Ok(value);
+    }
     if let Some(value) = release_one_settled_hold(&app.store)? {
         return Ok(value);
     }
@@ -427,7 +430,7 @@ struct ImplementationLaneState {
 }
 
 const INTEGRATION_READY_NOTICE: &str = "All required implementation lanes have accepted persisted yield receipts and their exact current writers are positively quiescent. The exact ordered integration request can now proceed through request-integration; do not fabricate a request, report, or approval.";
-const CANDIDATE_FROZEN_NOTICE: &str =
+pub(crate) const CANDIDATE_FROZEN_NOTICE: &str =
     "Implementation candidate is frozen. Inspect the evidence and propose phase code_review.";
 const CONFORMANCE_NOTICE: &str = "Required checks are current. Load current role context and submit exact candidate-bound manager conformance after confirming every required lane is yielded and writer-quiescent. Do not fabricate evidence or clear a human hold.";
 const FINAL_EXPLORER_NOTICE: &str = "Manager conformance is current. Load current role context and record the exact candidate-bound final Explorer activation decision. Do not bypass an activated Explorer or any human authorization gate.";
@@ -2144,13 +2147,13 @@ fn evaluate_checks(
             attempt,
             prerequisites,
             "workflow.manager_conformance_or_lane_yield_missing",
-            DecisionDisposition::Held,
-            DecisionEvidenceState::Missing,
+            DecisionDisposition::Waiting,
+            DecisionEvidenceState::Pending,
             DecisionOwner::Provider,
             serde_json::json!({"candidate_hash":candidate}),
             serde_json::json!({
-                "action":"held",
-                "reason":"manager_conformance_or_lane_yield_missing",
+                "action":"waiting",
+                "for":"manager_conformance",
             }),
         ),
         ChecksSelection::DispatchFinalExplorerManager => role_dispatch_decision(
@@ -3709,6 +3712,7 @@ fn consume_review_result(
     // As with a manual verdict: proposals bound to the cleared plan or
     // candidate and the old phase can never be applied again.
     if clearing {
+        crate::store::cancel_queued_candidate_notice(&transaction, &attempt.id, &now)?;
         transaction.execute(
             "UPDATE controls SET state='superseded',updated_at=?1
              WHERE attempt_id=?2 AND kind='transition_proposal' AND state='proposed'",
@@ -4028,22 +4032,14 @@ fn advance_checks(
             {
                 return Ok(value);
             }
-            set_attention(
-                app,
-                &attempt.task_id,
-                &attempt.id,
-                "needs_input",
-                AttentionHold {
-                    code: "manager_confirmation_missing",
-                    message: "The manager is still running and has been asked to confirm that the finished work matches the plan. Open the manager's output to check its progress; when it has confirmed, choose Continue.".into(),
-                },
-            )?;
             Ok(serde_json::json!({
-                "action":"held",
-                "hold_recorded":true,
-                "reason":"manager_conformance_or_lane_yield_missing",
+                "action":"waiting",
+                "for":"manager_conformance",
+                "attempt_id":attempt.id,
+                "candidate_hash":attempt.candidate_hash,
             }))
         }
+
         ChecksSelection::DispatchFinalExplorerManager => {
             let prompt = crate::workflow_resources::render(
                 RoleKind::Manager,
@@ -4605,6 +4601,75 @@ const HELD_SUBJECT_OUTCOME: &str = "CASE
           WHERE ri.new_attempt_id=r.attempt_id AND ri.state IN ('completed','cancelled','failed'))
     END";
 
+fn release_one_check_obligation_hold(
+    store: &crate::store::Store,
+) -> Result<Option<serde_json::Value>> {
+    if crate::database::hold_active(store)? {
+        return Ok(None);
+    }
+    let mut connection = store.lock()?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for attempt in attempts_from_connection(&tx, false)? {
+        if attempt.phase != "checks"
+            || attempt.status != "needs_input"
+            || attempt.attention != "needs_input"
+        {
+            continue;
+        }
+        let reason: Option<String> = tx
+            .query_row(
+                "SELECT json_extract(detail_json,'$.reason') FROM audit_events
+             WHERE entity_kind='attempt' AND entity_id=?1 AND event_code='attempt.attention.changed'
+             ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                params![attempt.id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(candidate) = attempt.candidate_hash.as_deref() else {
+            continue;
+        };
+        let (check_id, release_reason) = match reason.as_deref() {
+            Some("check_needs_approval") => {
+                let Some(check_id) = next_required_check_on(&tx, &attempt, candidate)? else {
+                    continue;
+                };
+                if !crate::checks::selected_authorized_on(&tx, &attempt.id, &check_id)? {
+                    continue;
+                }
+                (Some(check_id), "selected_check_authorized")
+            }
+            Some("manager_confirmation_missing") => {
+                if !manager_conformance_ready_on(&tx, &attempt)?
+                    || next_required_check_on(&tx, &attempt, candidate)?.is_some()
+                    || selected_check_completion_on(&tx, &attempt, candidate)?.0 == 0
+                {
+                    continue;
+                }
+                (None, "manager_conformance_recorded")
+            }
+            _ => continue,
+        };
+        if crate::trip::require_attempt_ready(&tx, &attempt.id, None).is_err()
+            || !crate::workflow::unsettled_effects(&tx, &attempt.id)?.is_empty()
+        {
+            continue;
+        }
+        let now = Utc::now().to_rfc3339();
+        tx.execute("UPDATE tasks SET attention='none',version=version+1,updated_at=?1 WHERE id=?2 AND version=?3 AND attention='needs_input'",params![now,attempt.task_id,attempt.task_version])?;
+        tx.execute(
+            "UPDATE attempts SET status='running' WHERE id=?1 AND status='needs_input'",
+            params![attempt.id],
+        )?;
+        record_hold_release(&tx, &attempt.id, release_reason, None, &now)?;
+        tx.commit()?;
+        return Ok(Some(
+            serde_json::json!({"action":"check_approval_hold_released","attempt_id":attempt.id,"check_id":check_id,"reason":release_reason}),
+        ));
+    }
+    Ok(None)
+}
+
 /// Releases one held step whose exact subject has reached a terminal outcome,
 /// once nothing the attempt started is unsettled. Only that record changes:
 /// any other coordinator hold on the attempt stays open and keeps it held.
@@ -4638,6 +4703,13 @@ fn release_one_settled_hold(store: &crate::store::Store) -> Result<Option<serde_
         let Some(outcome) = outcome else {
             continue;
         };
+        // A finished recipient does not repair changed instruction files. Keep
+        // the hold stable until the prerequisite that failed is ready again.
+        if operation == "guidance_delivery"
+            && crate::trip::require_attempt_ready(&transaction, &attempt, None).is_err()
+        {
+            continue;
+        }
         if !crate::workflow::unsettled_effects(&transaction, &attempt)?.is_empty() {
             continue;
         }
@@ -6946,7 +7018,7 @@ fn plain_readiness_problem(detail: &str) -> String {
     match detail.split(POLICY_DRIFT).nth(1) {
         Some(path) => {
             let path = path.split_whitespace().next().unwrap_or(path);
-            format!("{path} in this task's workspace changed after the workspace was prepared. Workflow and guidance files stay fixed for the whole attempt, so work is held until {path} matches the reviewed copy again. Restore it in the task workspace; deliver documentation changes to guidance files separately.")
+            format!("{path} in this task's workspace changed after the workspace was prepared. LLMRelay paused because this file also supplies instructions for the agents. If the approved plan includes this documentation change, preserve it and reauthorize its exact reviewed content at a stopped boundary using the guidance recovery procedure in Operations. Otherwise restore the reviewed copy in the task workspace. An approved documentation edit must not be discarded just to continue.")
         }
         None => detail.to_owned(),
     }
