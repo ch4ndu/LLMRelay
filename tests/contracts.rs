@@ -15570,13 +15570,16 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
         checks_version,
     );
-    assert_eq!(
-        handoff_app.coordinator_tick().unwrap()["reason"],
-        "manager_conformance_or_lane_yield_missing"
-    );
+    let conformance_wait = handoff_app.coordinator_tick().unwrap();
+    assert_eq!(conformance_wait["action"], "idle");
     handoff.assert_scalar::<String>(
         "SELECT attention FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
-        "needs_input".into(),
+        "none".into(),
+    );
+    handoff.assert_scalar::<String>("SELECT status FROM attempts LIMIT 1", "running".into());
+    handoff.assert_scalar::<i64>(
+        "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        checks_version,
     );
     handoff.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM guidance_messages
