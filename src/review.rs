@@ -6,6 +6,68 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+pub(crate) fn ordinary_code_review_cap_reached(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempts a
+         JOIN review_budgets b ON b.attempt_id=a.id AND b.review_kind='code'
+         WHERE a.id=?1 AND a.phase IN ('implementation','code_review')
+           AND a.candidate_hash IS NOT NULL AND a.final_repair_round=0
+           AND b.initial_allowance+b.extension_allowance=5 AND b.spent>=5
+           AND NOT EXISTS(SELECT 1 FROM review_requests r WHERE r.attempt_id=a.id
+             AND r.review_kind='code' AND (r.delivery_state IN ('reserved','launching','delivered','ambiguous')
+               OR (r.candidate_hash=a.candidate_hash AND r.delivery_state='finished' AND r.verdict='approved'))))",
+        params![attempt_id], |row| row.get(0),
+    ).map_err(Into::into)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnansweredReview {
+    pub attempt_id: String,
+    pub request_id: String,
+    pub session_id: String,
+    pub generation_id: String,
+    pub transcript_epoch: String,
+    pub missing_native_history: bool,
+}
+
+pub(crate) fn unanswered_ordinary_review(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<Option<UnansweredReview>> {
+    connection.query_row(
+        "SELECT r.id,s.id,g.id,s.transcript_epoch,COALESCE(s.native_session_id,'')=''
+         FROM attempts a JOIN tasks t ON t.id=a.task_id
+         JOIN review_requests r ON r.attempt_id=a.id AND r.delivery_state='delivered' AND r.verdict IS NULL
+           AND ((a.phase='code_review' AND r.review_kind='code' AND r.candidate_hash=a.candidate_hash)
+             OR (a.phase='plan_review' AND r.review_kind='plan' AND r.candidate_hash=a.plan_hash))
+         JOIN role_generations g ON g.id=r.role_generation_id AND g.attempt_id=a.id AND g.status='exited'
+           AND ((r.review_kind='code' AND g.role='code_reviewer') OR (r.review_kind='plan' AND g.role='plan_reviewer'))
+         JOIN role_settings rs ON rs.task_id=t.id AND rs.role=g.role AND rs.effective_generation_id=g.id
+           AND rs.revision=r.settings_revision AND g.config_revision=rs.revision
+         JOIN sessions s ON s.id=r.session_id AND s.role_generation_id=g.id AND s.status='exited'
+           AND s.validation_cell IS NULL AND json_extract(s.exit_json,'$.process_group_quiescent')=1
+         WHERE a.id=?1 AND a.final_repair_round=0 AND a.status='running'
+           AND t.lifecycle='in_progress' AND t.attention='none' AND t.archived_at IS NULL
+           AND a.id=(SELECT id FROM attempts WHERE task_id=t.id ORDER BY created_at DESC LIMIT 1)
+           AND s.id=(SELECT id FROM sessions WHERE role_generation_id=g.id ORDER BY created_at DESC,rowid DESC LIMIT 1)
+           AND NOT EXISTS(SELECT 1 FROM role_results result WHERE result.session_id=s.id
+             AND result.role_generation_id=g.id AND json_extract(result.metadata_json,'$.review_request_id')=r.id)
+           AND NOT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=a.id AND state='attention_required')
+           AND NOT EXISTS(SELECT 1 FROM restart_candidates WHERE attempt_id=a.id AND state NOT IN ('resumed','released_fresh_dispatch','cancelled'))
+           AND NOT EXISTS(SELECT 1 FROM switch_intents WHERE attempt_id=a.id AND state NOT IN ('completed','cancelled','rejected','superseded'))
+           AND NOT EXISTS(SELECT 1 FROM controls WHERE attempt_id=a.id AND state NOT IN ('finished','cancelled','superseded','rejected','failed','abandoned')
+             AND NOT (kind='transition_proposal' AND state='proposed'))
+         ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1",
+        params![attempt_id], |row| Ok(UnansweredReview {
+            attempt_id: attempt_id.into(), request_id: row.get(0)?, session_id: row.get(1)?,
+            generation_id: row.get(2)?, transcript_epoch: row.get(3)?, missing_native_history: row.get(4)?,
+        }),
+    ).optional().map_err(Into::into)
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReviewDispatch {
     pub request_id: String,

@@ -181,8 +181,16 @@ pub(crate) fn prepare_with_bundles(
             2
         };
         let event_hook_command = format!("{hook_command} --event {}", shell_quote(event));
+        // Codex keys hook trust by source/event/group/handler position. Reserve
+        // group zero for read-only roles so their shorter timeout cannot replace
+        // the Implementer's trusted PermissionRequest definition.
+        let reserved_group = if role == RoleKind::Implementer && event == "PermissionRequest" {
+            "{hooks=[]},"
+        } else {
+            ""
+        };
         let hook_value = format!(
-            "[{{hooks=[{{type=\"command\",command={},timeout={timeout}}}]}}]",
+            "[{reserved_group}{{hooks=[{{type=\"command\",command={},timeout={timeout}}}]}}]",
             toml_string(&event_hook_command)?
         );
         arguments.extend(["--config".to_owned(), format!("hooks.{event}={hook_value}")]);

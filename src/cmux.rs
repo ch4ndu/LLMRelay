@@ -1005,7 +1005,9 @@ fn create_targeted_surface(
     }
     // Closing the last terminal can remove its workspace. Validate the parent
     // before creating another role surface in the durable workspace identity.
-    match cmux_rpc(app, "system.tree", json!({})).and_then(|value| parse_global_tree(&value)) {
+    match cmux_rpc(app, "system.tree", json!({"all_windows": true}))
+        .and_then(|value| parse_global_tree(&value))
+    {
         Ok(inventory) if !inventory.contains_key(workspace_id) => {
             app.store.mark_cmux_task_workspace_lost(
                 &workspace.id,
@@ -1648,7 +1650,8 @@ fn inspect_global_tree(
     expected_workspace_id: &str,
     expected_surface_id: &str,
 ) -> std::result::Result<TreePresence, CmuxCommandError> {
-    let response = cmux_rpc(app, "system.tree", json!({}))?;
+    // The default response covers only the current window and cannot prove loss.
+    let response = cmux_rpc(app, "system.tree", json!({"all_windows": true}))?;
     let inventory = parse_global_tree(&response)?;
     let Some(surfaces) = inventory.get(expected_workspace_id) else {
         return Ok(TreePresence::WorkspaceMissing);
@@ -1872,7 +1875,7 @@ fn cmux_rpc(
 ) -> std::result::Result<Value, CmuxCommandError> {
     #[cfg(test)]
     if let Some(hook) = take_test_cmux_rpc_hook() {
-        hook();
+        hook(method, &params);
     }
     #[cfg(test)]
     if let Some(result) = take_test_cmux_rpc_result() {
@@ -1897,18 +1900,18 @@ fn cmux_rpc(
 #[cfg(test)]
 thread_local! {
     static TEST_CMUX_RPC_RESULTS: RefCell<VecDeque<std::result::Result<Value, CmuxCommandError>>> = RefCell::new(VecDeque::new());
-    static TEST_CMUX_RPC_HOOKS: RefCell<VecDeque<Box<dyn FnOnce()>>> = RefCell::new(VecDeque::new());
+    static TEST_CMUX_RPC_HOOKS: RefCell<VecDeque<Box<dyn FnOnce(&str, &Value)>>> = RefCell::new(VecDeque::new());
     static TEST_CMUX_COMMAND_RESULTS: RefCell<VecDeque<std::result::Result<String, CmuxCommandError>>> = RefCell::new(VecDeque::new());
     static TEST_INTERRUPT_WORKSPACE_CREATE_BEFORE_BIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
-fn take_test_cmux_rpc_hook() -> Option<Box<dyn FnOnce()>> {
+fn take_test_cmux_rpc_hook() -> Option<Box<dyn FnOnce(&str, &Value)>> {
     TEST_CMUX_RPC_HOOKS.with(|hooks| hooks.borrow_mut().pop_front())
 }
 
 #[cfg(test)]
-fn push_test_cmux_rpc_hook(hook: impl FnOnce() + 'static) {
+fn push_test_cmux_rpc_hook(hook: impl FnOnce(&str, &Value) + 'static) {
     TEST_CMUX_RPC_HOOKS.with(|hooks| hooks.borrow_mut().push_back(Box::new(hook)));
 }
 
@@ -2171,6 +2174,112 @@ mod g14_tests {
     use crate::operations::Application;
     use crate::store::Store;
     use rusqlite::params;
+
+    #[test]
+    fn cross_window_views_and_role_creates_preserve_the_existing_workspace() {
+        for create_role_surface in [false, true] {
+            let (root, app) = cmux_test_application();
+            let binding = seed_attachment(&app, "other-window");
+            let boot = uuid::Uuid::new_v4().to_string();
+            let (workspace, prior) = open_persistent_surface(&app, &boot, &binding);
+            let workspace_id = workspace.workspace_id.clone().unwrap();
+            let surface_id = prior.surface_id.clone().unwrap();
+            let pane_id = uuid::Uuid::new_v4().to_string();
+            clear_test_cmux_rpc_results();
+            let other_window = json!({
+                "id": uuid::Uuid::new_v4(), "workspace_count": 1,
+                "workspaces": [{"id": workspace_id, "panes": [{
+                    "id": pane_id, "surface_count": 1,
+                    "surface_ids": [surface_id],
+                    "surfaces": [{"id": surface_id, "pane_id": pane_id, "type": "terminal"}]
+                }]}]
+            });
+            push_test_cmux_rpc_hook(move |method, params| {
+                assert_eq!(method, "system.tree");
+                // cmux defaults to the current window, which does not own this task.
+                let mut windows = vec![json!({
+                    "id": uuid::Uuid::new_v4(), "workspace_count": 0, "workspaces": []
+                })];
+                if params.get("all_windows").and_then(Value::as_bool) == Some(true) {
+                    windows.push(other_window);
+                }
+                push_test_cmux_rpc_result(Ok(json!({"windows": windows})));
+            });
+            let expected_workspace = workspace_id.clone();
+            if create_role_surface {
+                app.store
+                    .mark_cmux_session_surface_ended(
+                        &prior.id,
+                        &boot,
+                        &binding,
+                        prior.binding_revision,
+                    )
+                    .unwrap();
+                let (surface, created) = app
+                    .store
+                    .reserve_cmux_session_surface(&boot, &workspace.id, &binding)
+                    .unwrap();
+                assert!(created);
+                push_test_cmux_rpc_hook(move |method, params| {
+                    assert_eq!(method, "surface.create");
+                    assert_eq!(params["workspace_id"], expected_workspace);
+                    push_test_cmux_rpc_result(Err(CmuxCommandError::AccessDenied(
+                        "fixture stops at exact targeted create".to_owned(),
+                    )));
+                });
+                let outcome = create_targeted_surface(
+                    &app,
+                    &boot,
+                    workspace.clone(),
+                    surface,
+                    "other-window-create",
+                )
+                .unwrap();
+                assert!(outcome
+                    .message
+                    .contains("fixture stops at exact targeted create"));
+            } else {
+                let expected_surface = surface_id.clone();
+                push_test_cmux_rpc_hook(move |method, params| {
+                    assert_eq!(method, "surface.health");
+                    assert_eq!(params["workspace_id"], expected_workspace);
+                    assert_eq!(params["surface_id"], expected_surface);
+                    push_test_cmux_rpc_result(Ok(json!({
+                        "workspace_id": expected_workspace,
+                        "surfaces": [{"id": expected_surface, "type": "terminal"}]
+                    })));
+                });
+                push_test_cmux_rpc_hook(move |method, params| {
+                    assert_eq!(method, "surface.focus");
+                    assert_eq!(params["workspace_id"], workspace_id);
+                    assert_eq!(params["surface_id"], surface_id);
+                    push_test_cmux_rpc_result(Ok(json!({})));
+                });
+                let prior_id = prior.id.clone();
+                let outcome = view_existing_surface(
+                    &app,
+                    &boot,
+                    workspace.clone(),
+                    prior,
+                    "other-window-view",
+                )
+                .unwrap();
+                let viewed = outcome.surface.unwrap();
+                assert_eq!(viewed.id, prior_id);
+                assert_eq!(viewed.surface_state, "open");
+                assert_eq!(viewed.attachment_state, "live");
+            }
+            assert_eq!(
+                app.store.cmux_task_workspace(&workspace.id).unwrap().state,
+                "open"
+            );
+            assert_eq!(test_cmux_rpc_result_count(), 0);
+            TEST_CMUX_RPC_HOOKS.with(|hooks| assert!(hooks.borrow().is_empty()));
+            clear_test_cmux_rpc_results();
+            drop(app);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[test]
     fn new_role_surface_retires_a_missing_parent_before_targeted_create() {
@@ -3558,7 +3667,7 @@ mod g14_tests {
         let hook_store = app.store.clone();
         let hook_binding = binding.clone();
         let hook_boot = service_boot_id.clone();
-        push_test_cmux_rpc_hook(move || {
+        push_test_cmux_rpc_hook(move |_, _| {
             let route_id: String = hook_store
                 .lock()
                 .unwrap()

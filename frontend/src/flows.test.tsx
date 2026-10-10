@@ -109,6 +109,184 @@ Object.defineProperty(globalThis, "fetch", {
   },
 });
 
+Deno.test("ReviewPanel hides decisions for completed and cancelled tasks with retained review phases", () => {
+  try {
+    for (const lifecycle of ["done", "cancelled"]) {
+      mount(
+        <ReviewPanel
+          task={{
+            ...task,
+            lifecycle,
+            active_attempt: {
+              id: "finished-review",
+              phase: "awaiting_human_review",
+              status: lifecycle,
+              base_revision: "base",
+              candidate_hash: "reviewed-candidate",
+            },
+          }}
+          onChanged={noop}
+        />,
+      );
+      check(
+        !document.querySelector(".review-panel"),
+        `${lifecycle} task still offered review decisions`,
+      );
+    }
+  } finally {
+    unmount();
+  }
+});
+
+Deno.test("ReviewPanel sends one decision while pending and hides it after confirmation before refresh", async () => {
+  const reviewing: Task = {
+    ...task,
+    id: "review-once",
+    lifecycle: "awaiting_review",
+    active_attempt: {
+      id: "review-once-attempt",
+      phase: "awaiting_human_review",
+      status: "running",
+      base_revision: "base",
+      candidate_hash: "reviewed-candidate",
+    },
+  };
+  const requests: Record<string, unknown>[] = [];
+  const responses: Array<(response: Response) => void> = [];
+  let refreshes = 0;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return await new Promise<Response>((resolve) => responses.push(resolve));
+    }) as typeof fetch;
+  try {
+    mount(
+      <ReviewPanel
+        task={reviewing}
+        onChanged={() => {
+          refreshes += 1;
+        }}
+      />,
+    );
+    field("Review or rework feedback", "An alternative decision");
+    const accept = [...document.querySelectorAll("button")].find((button) =>
+      button.textContent === "Accept result"
+    )!;
+    act(() => {
+      accept.click();
+      accept.click();
+    });
+    await settle();
+    check(
+      accept.disabled,
+      "accept stayed enabled while its request was pending",
+    );
+    click("Request rework");
+    await settle();
+    check(
+      requests.length === 1,
+      "repeated or conflicting clicks submitted another decision",
+    );
+    check(requests[0].decision === "accept", "the accepted decision changed");
+    responses[0](
+      new Response(JSON.stringify({
+        result: {
+          entity_id: reviewing.id,
+          version: reviewing.version + 1,
+          state: "accepted",
+        },
+      })),
+    );
+    await settle();
+    check(
+      refreshes === 1,
+      "the confirmed decision did not request state refresh",
+    );
+    check(
+      !document.querySelector(".review-panel"),
+      "accepted decision remained actionable before the state refresh",
+    );
+    rerender(<ReviewPanel task={{ ...reviewing }} onChanged={noop} />);
+    check(
+      !document.querySelector(".review-panel"),
+      "an unchanged snapshot restored the accepted decision",
+    );
+    rerender(
+      <ReviewPanel
+        task={{
+          ...reviewing,
+          version: reviewing.version + 1,
+          lifecycle: "done",
+          active_attempt: { ...reviewing.active_attempt!, status: "done" },
+        }}
+        onChanged={noop}
+      />,
+    );
+    check(
+      !document.querySelector(".review-panel"),
+      "completed snapshot restored the accepted decision",
+    );
+    check(requests.length === 1, "completion submitted an extra request");
+  } finally {
+    for (const resolve of responses) resolve(new Response("{}"));
+    await settle();
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("ReviewPanel preserves the operation identity after an unconfirmed decision", async () => {
+  const reviewing: Task = {
+    ...task,
+    id: "review-unconfirmed",
+    lifecycle: "awaiting_review",
+    active_attempt: {
+      id: "review-unconfirmed-attempt",
+      phase: "awaiting_human_review",
+      status: "running",
+      base_revision: "base",
+      candidate_hash: "reviewed-candidate",
+    },
+  };
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      if (requests.length === 1) {
+        throw new ApiError("request outcome is unknown", 0, undefined, true);
+      }
+      return new Response(JSON.stringify({ result: { state: "accepted" } }));
+    }) as typeof fetch;
+  try {
+    mount(<ReviewPanel task={reviewing} onChanged={noop} />);
+    click("Accept result");
+    await settle();
+    check(
+      !!document.querySelector(".review-panel"),
+      "an unconfirmed decision hid the review",
+    );
+    check(
+      document.body.textContent?.includes("Refresh and reconcile"),
+      "uncertain outcome lost its recovery guidance",
+    );
+    rerender(<ReviewPanel task={{ ...reviewing }} onChanged={noop} />);
+    click("Accept result");
+    await settle();
+    check(requests.length === 2, "the explicit retry did not submit");
+    check(
+      requests[0].operation_id === requests[1].operation_id,
+      "the retry created a new operation for an uncertain outcome",
+    );
+    check(
+      !document.querySelector(".review-panel"),
+      "confirmed retry left acceptance visible",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
 Deno.test("M9 Recipes creates an exact draft and explicitly arms a paused schedule", async () => {
   sessionStorage.clear();
   const requests: Record<string, unknown>[] = [];
@@ -2555,7 +2733,8 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
               capability_key: "explorer-capability-key",
               nonce: "not-rendered",
               state: "failed",
-              failure_category: "model_refusal",
+              failure_category: "observation_unavailable",
+              failure_reason: "ordinary runtime probe reported an observed failure",
               has_native_session: true,
             }, {
               role: "manager",
@@ -2579,6 +2758,11 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         onViewSession={cmuxFixture}
       />,
     );
+    check(document.body.textContent?.includes("did not identify which required observation was missing"),
+      "the historical runtime failure hid its missing-observation diagnostic");
+    check([...document.querySelectorAll("details pre")].some((node) =>
+      node.textContent === "ordinary runtime probe reported an observed failure\nFailure category: observation_unavailable"),
+      "the historical backend reason and category were not retained in Technical details");
     click("Prepare a new verification");
     await settle();
     if (
@@ -4352,6 +4536,8 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       requests.at(-1)?.expected_version !== 7 ||
       requests.at(-1)?.carry_plan_approval !== false
     ) throw new Error("rework target, version, or explicit carry drifted");
+    unmount();
+    mount(<ReviewPanel task={reviewing} onChanged={() => {}} />);
     click("Accept result");
     await settle();
     if (
@@ -7194,8 +7380,16 @@ Deno.test("M6 direct task opens drop a stale attention selection and route notic
 Deno.test("User errors explain recovery while retaining collapsed diagnostics", async () => {
   const { ErrorNotice } = await import("./components/ErrorNotice");
   const cases = [
+    ["setup discovery manager must exit before profile probes are frozen", "agent session has not closed yet", "saved setup information does not need correcting"],
     ["role capacity is full", "agent slots are busy", "Wait for an active session"],
     ["attempt is not dispatchable", "earlier agent session has stopped", "Check recovery and continue"],
+    ["ordinary runtime probe terminal reporting invocation exited quiescently without an accepted role report; prepare corrected runtime verification for a fresh scope", "verification finished without an accepted report", "Prepare a new verification"],
+    ["ordinary runtime evidence does not match the exact authenticated native hook commands and count; prepare corrected runtime verification for a fresh scope", "verification did not match the required check", "inspect the rejected report"],
+    ["ordinary runtime probe reported observation_unavailable: model_evidence", "could not observe which model was running", "before spending another call"],
+    ["ordinary runtime probe reported observation_unavailable: authentication_observed", "could not confirm its authenticated session", "cannot publish proof"],
+    ["ordinary runtime probe reported observation_unavailable: missing observation not identified", "did not identify which required observation was missing", "cause is understood"],
+    ["ordinary runtime probe reported an observed failure", "recorded a failed verification", "affected role's explanation"],
+    ["runtime model evidence does not match the bound first-invocation provider SessionStart observation; prepare corrected runtime verification for a fresh scope", "reported model could not be matched", "Prepare a new verification"],
     ["browser session required", "sign-in has expired", "fresh dashboard sign-in link"],
     ["role manager lacks exact current runtime authority: exact current runtime-scoped ordinary production capability proof is missing or stale; complete runtime verification for this project, setup, fixture, configuration, adapter, profile, and prepared identity", "profile still needs verification", "runtime verification"],
     ["authentication credentials missing", "agent's current sign-in", "Complete sign-in there"],
@@ -10126,4 +10320,50 @@ Deno.test("Planned documentation recovery previews content and approves only its
     unmount();
     globalThis.fetch = nativeFetch;
   }
+});
+
+Deno.test("exhausted review limit keeps Cancel and removes empty resume advice", () => {
+  mount(<WorkflowControls task={task} onChanged={() => {}} decision={{
+    decision_schema: 1, reason_code: "workflow.review_budget_exhausted", disposition: "held",
+    subject: { task_id: task.id }, observed_revision: { task_version: task.version },
+    primary_blocker: { code: "review_limit", state: "pending", owner: "human", evidence: null,
+      message: "This attempt has used 5 of 5 allowed code reviews. The latest candidate is saved." },
+    prerequisites: [], ownership: { owner: "human", state: "held", binding: {} }, next_action: null,
+    control_policy: { allowed_controls: ["cancel"] },
+  }} />);
+  try {
+    const buttons = [...document.querySelectorAll<HTMLButtonElement>("button")];
+    for (const label of ["Continue", "Run next", "Retry"]) {
+      const button = buttons.find((button) => button.textContent?.trim() === label);
+      if (!button?.disabled) throw new Error(`${label} can still loop an exhausted attempt`);
+    }
+    const cancel = buttons.find((button) => button.textContent?.trim() === "Cancel");
+    if (!cancel || cancel.disabled) throw new Error("Cancel is unavailable at the review limit");
+    const text = document.body.textContent || "";
+    if (!text.includes("5 of 5") || !text.includes("saved candidate") ||
+      text.includes("Continue resumes automatic work")) throw new Error("The cap still promises progress");
+  } finally { unmount(); }
+});
+
+Deno.test("allowing one review uses the bounded command without starting a session", async () => {
+  const requests: Record<string, unknown>[] = [];
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ result: { state: "review_budget_extended" } }));
+  }) as typeof fetch;
+  try {
+    mount(<WorkflowControls task={task} onChanged={() => {}} actions={[{
+      kind: "authorization_required", enabled: true,
+      reason: "The review used the last authorized round without a verdict.", owner: "human",
+      operation: "extend_review_budget", binding: { task_id: task.id, attempt_id: "a", review_kind: "code" },
+      accounting_note: "Allows one additional paid review. This button does not launch it.",
+    }]} />);
+    click("Allow one more code review");
+    await settle();
+    if (requests.length !== 1 || requests[0].kind !== "extend_review_budget" ||
+      requests[0].additional !== 1 || requests[0].attempt_id !== "a" ||
+      requests[0].task_id !== task.id || requests[0].expected_version !== task.version ||
+      requests[0].review_kind !== "code") throw new Error("Review extension did not preserve its exact bounded command");
+  } finally { unmount(); globalThis.fetch = previousFetch; }
 });

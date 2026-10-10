@@ -3369,7 +3369,12 @@ function RuntimeAdmission(
                 <code>{probe.capability_key.slice(0, 12)}</code>
               </small>
               {probe.failure_reason && (
-                <ErrorNotice error={probe.failure_reason} />
+                <ErrorNotice error={
+                  probe.failure_reason === "ordinary runtime probe reported an observed failure" &&
+                    probe.failure_category === "observation_unavailable"
+                    ? `${probe.failure_reason}\nFailure category: ${probe.failure_category}`
+                    : probe.failure_reason
+                } />
               )}
               {probe.session_id && (
                 <>

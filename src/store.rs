@@ -1524,7 +1524,14 @@ impl Store {
             if stored_hash != request_hash {
                 bail!("operation ID was already used with different input")
             }
-            return Ok(serde_json::from_str(&result)?);
+            let result: serde_json::Value = serde_json::from_str(&result)?;
+            if let Some(rejection) = result["rejection_code"]
+                .as_str()
+                .and_then(crate::trip::RuntimeReportRejection::from_code)
+            {
+                return Err(rejection.into());
+            }
+            return Ok(result);
         }
         let current_authority: bool = transaction.query_row(
             "SELECT EXISTS(
@@ -1547,7 +1554,39 @@ impl Store {
         if !current_authority {
             bail!("role result authority was revoked, replaced, or stopped before persistence")
         }
-        crate::trip::record_setup_probe_report(&transaction, context, report)?;
+        if context.role == RoleKind::Manager
+            && !isolated_validation
+            && !workflow_validation
+            && validation_cell.is_none()
+            && report.metadata.get("implementation_capsule").is_some()
+        {
+            if report.outcome != "needs_input" {
+                bail!("Manager source repair handoffs require the needs_input outcome")
+            }
+            crate::repair_handoff::validate(&transaction, &context.attempt_id, &report.metadata)?;
+        }
+        if let Err(error) = crate::trip::record_setup_probe_report(&transaction, context, report) {
+            if let Some(rejection) = error.downcast_ref::<crate::trip::RuntimeReportRejection>() {
+                // Preserve the rejected invocation's terminal outcome without recording
+                // a role result or granting capability authority.
+                crate::trip::record_runtime_report_rejection(
+                    &transaction,
+                    context,
+                    &report.operation_id,
+                    &now,
+                    *rejection,
+                )?;
+                transaction.execute(
+                    "INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at)
+                     VALUES(?1,?2,'role_report',?3,?4,?5)",
+                    params![report.operation_id,context.role_generation_id,request_hash,
+                        serde_json::json!({"accepted":false,"authoritative_completion":false,
+                            "rejection_code":rejection.code()}).to_string(),now],
+                )?;
+                transaction.commit()?;
+            }
+            return Err(error);
+        }
         if context.role == RoleKind::Implementer
             && context.lane_id != "default"
             && report.outcome == "candidate_ready"
@@ -3432,10 +3471,11 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let attempt: String = transaction.query_row(
-            "SELECT rg.attempt_id FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id WHERE s.id=?1",
-            params![session_id],
-            |row| row.get(0),
+        let (attempt, prior_attention, prior_status, generation, epoch): (String,String,String,String,String) = transaction.query_row(
+            "SELECT a.id,t.attention,a.status,rg.id,s.transcript_epoch FROM sessions s
+             JOIN role_generations rg ON rg.id=s.role_generation_id JOIN attempts a ON a.id=rg.attempt_id
+             JOIN tasks t ON t.id=a.task_id WHERE s.id=?1",
+            params![session_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
         )?;
         transaction.execute(
             "UPDATE sessions SET status='recovery_required',launch_state='delivery_unknown',launch_error=?1,readiness_state='unknown',updated_at=?2 WHERE id=?3",
@@ -3462,7 +3502,7 @@ impl Store {
             "provider session delivery became uncertain",
         )?;
         transaction.execute("INSERT INTO recovery_records(id,session_id,attempt_id,state,process_identity_json,detail_json,created_at,updated_at) SELECT ?1,s.id,rg.attempt_id,'attention_required',s.process_identity_json,?2,?3,?3 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id WHERE s.id=?4 AND NOT EXISTS(SELECT 1 FROM recovery_records WHERE session_id=?4 AND state='attention_required')",
-            params![uuid::Uuid::new_v4().to_string(),serde_json::json!({"kind":"provider_delivery_unknown","reason":reason,"replacement_allowed_after_quiescence":true}).to_string(),now,session_id])?;
+            params![uuid::Uuid::new_v4().to_string(),serde_json::json!({"kind":"provider_delivery_unknown","reason":reason,"replacement_allowed_after_quiescence":true,"prior_task_attention":prior_attention,"prior_attempt_status":prior_status,"role_generation_id":generation,"transcript_epoch":epoch}).to_string(),now,session_id])?;
         transaction.commit()?;
         Ok(())
     }
@@ -3883,6 +3923,13 @@ impl Store {
             "UPDATE input_leases SET revoked_at=COALESCE(revoked_at,?1),updated_at=?1
              WHERE session_id=?2 AND process_identity_json=?3",
             params![now, session_id, process_json],
+        )?;
+        settle_completed_review_exit(
+            &transaction,
+            session_id,
+            transcript_epoch,
+            process_json,
+            &now,
         )?;
         self.settle_graceful_stop_recovery_after_quiescence(
             &transaction,
@@ -8067,6 +8114,35 @@ impl Store {
         attempted: Option<&PreparedResumeIdentity>,
         compatibility: Option<&crate::provider_compatibility::CompatibilityExplanation>,
     ) -> Result<bool> {
+        self.record_permanent_resume_rejection_inner(
+            session_id,
+            category,
+            reason,
+            attempted,
+            compatibility,
+            None,
+        )
+    }
+
+    pub(crate) fn record_unanswered_review_rejection(
+        &self,
+        receipt: &crate::review::UnansweredReview,
+        attempted: &PreparedResumeIdentity,
+    ) -> Result<bool> {
+        self.record_permanent_resume_rejection_inner(&receipt.session_id, "native_history_unavailable",
+            "The reviewer exited before establishing a resumable session or reporting a verdict. Its delivered review remains counted. Review the recovery options before authorizing a fresh session.",
+            Some(attempted), None, Some(receipt))
+    }
+
+    fn record_permanent_resume_rejection_inner(
+        &self,
+        session_id: &str,
+        category: &str,
+        reason: &str,
+        attempted: Option<&PreparedResumeIdentity>,
+        compatibility: Option<&crate::provider_compatibility::CompatibilityExplanation>,
+        unanswered: Option<&crate::review::UnansweredReview>,
+    ) -> Result<bool> {
         let allowed = [
             "frozen_runtime_identity_changed",
             "profile_authority_changed",
@@ -8087,6 +8163,15 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = unanswered {
+            if crate::review::unanswered_ordinary_review(&transaction, &receipt.attempt_id)?
+                .as_ref()
+                != Some(receipt)
+                || !receipt.missing_native_history
+            {
+                return Ok(false);
+            }
+        }
         let row: Option<(
             String,
             String,
@@ -8343,7 +8428,7 @@ impl Store {
 
     pub(crate) fn mark_codex_stop_idle_candidate(
         &self,
-        receipt: &CodexStopIdleReceipt,
+        receipt: &StoppedTurnReceipt,
     ) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
@@ -8390,6 +8475,7 @@ impl Store {
                     "task_version":receipt.task_version,
                     "late_terminal_hooks":receipt.late_terminal_hooks,
                     "accepted_result_id":receipt.accepted_result_id,
+                    "rejected_runtime_report_id":receipt.rejected_runtime_report_id,
                     "phase":receipt.phase,
                     "plan_hash":receipt.plan_hash,
                     "candidate_hash":receipt.candidate_hash,
@@ -8398,6 +8484,54 @@ impl Store {
                 }).to_string(),
                 now
             ],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn reserve_resolved_implementer_stop(
+        &self,
+        receipt: &StoppedTurnReceipt,
+    ) -> Result<bool> {
+        self.reserve_completed_turn_stop(receipt, StoppedTurnPurpose::ResolvedImplementer)
+    }
+
+    pub(crate) fn reserve_completed_probe_report_stop(
+        &self,
+        receipt: &StoppedTurnReceipt,
+    ) -> Result<bool> {
+        self.reserve_completed_turn_stop(receipt, StoppedTurnPurpose::CompletedProbeReport)
+    }
+
+    fn reserve_completed_turn_stop(
+        &self,
+        receipt: &StoppedTurnReceipt,
+        purpose: StoppedTurnPurpose,
+    ) -> Result<bool> {
+        let event_code = match purpose {
+            StoppedTurnPurpose::ResolvedImplementer => "implementer.resolved_turn.stop_reserved",
+            StoppedTurnPurpose::CompletedProbeReport if receipt.scope == "runtime_report" => {
+                "runtime.completed_report.stop_reserved"
+            }
+            StoppedTurnPurpose::CompletedProbeReport => "setup.completed_report.stop_reserved",
+            StoppedTurnPurpose::ReconcileIdle => bail!("idle reconciliation cannot reserve a stop"),
+        };
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if eligible_stopped_turn(&transaction, Some(&receipt.session_id), purpose)?.as_ref()
+            != Some(receipt)
+        {
+            return Ok(false);
+        }
+        let now = Utc::now().to_rfc3339();
+        Self::mark_interrupt_requested_in(&transaction, &receipt.session_id, &now)?;
+        transaction.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES(?1,?2,'service',?6,'session',?3,?4,?5)",
+            params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),receipt.session_id,
+                serde_json::json!({"role_generation_id":receipt.generation_id,"transcript_epoch":receipt.transcript_epoch,
+                    "result_id":receipt.accepted_result_id,"rejected_runtime_report_id":receipt.rejected_runtime_report_id,
+                    "stop_event_rowid":receipt.stop_rowid,"attempt_id":receipt.attempt_id}).to_string(),now,event_code],
         )?;
         transaction.commit()?;
         Ok(true)
@@ -13813,7 +13947,7 @@ pub(crate) enum ManagerServiceStopClaim {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CodexStopIdleReceipt {
+pub(crate) struct StoppedTurnReceipt {
     pub session_id: String,
     pub generation_id: String,
     pub credential_id: String,
@@ -13822,8 +13956,8 @@ pub(crate) struct CodexStopIdleReceipt {
     pub invocation_boundary_rowid: i64,
     pub native_session_id: String,
     pub stop_rowid: i64,
-    /// `setup` for a retained setup discovery or profile probe turn,
-    /// `ordinary_manager` for the task's current manager.
+    /// `setup` for a first retained probe turn, `setup_report` or `runtime_report` for its report,
+    /// `ordinary_manager` or `ordinary_implementer` for its current default role.
     pub scope: String,
     pub attempt_id: String,
     pub task_version: i64,
@@ -13831,8 +13965,9 @@ pub(crate) struct CodexStopIdleReceipt {
     /// starts inside the stopped turn.
     pub late_terminal_hooks: i64,
     /// The accepted report the stopped turn made, between its correlated
-    /// prompt and its Stop. Required for the ordinary manager.
+    /// prompt and its Stop. Required for ordinary task roles.
     pub accepted_result_id: Option<String>,
+    pub rejected_runtime_report_id: Option<String>,
     pub phase: String,
     pub plan_hash: Option<String>,
     pub candidate_hash: Option<String>,
@@ -13874,6 +14009,73 @@ pub(crate) struct InterruptDeadlineReceipt {
     pub interrupt_requested_at: String,
 }
 
+fn settle_completed_review_exit(
+    transaction: &Transaction<'_>,
+    session: &str,
+    epoch: &str,
+    process: &str,
+    now: &str,
+) -> Result<()> {
+    let completed: Option<(String,String,String)> = transaction.query_row(
+        "SELECT recovery.id,a.id,t.id FROM recovery_records recovery
+         JOIN sessions s ON s.id=recovery.session_id JOIN role_generations g ON g.id=s.role_generation_id
+         JOIN attempts a ON a.id=g.attempt_id AND a.id=recovery.attempt_id JOIN tasks t ON t.id=a.task_id
+         WHERE s.id=?1 AND s.transcript_epoch=?2 AND s.process_identity_json=?3
+           AND recovery.process_identity_json=?3 AND recovery.state='attention_required'
+           AND json_extract(recovery.detail_json,'$.kind')='provider_delivery_unknown'
+           AND json_extract(recovery.detail_json,'$.role_generation_id')=g.id
+           AND json_extract(recovery.detail_json,'$.transcript_epoch')=s.transcript_epoch
+           AND json_extract(recovery.detail_json,'$.prior_task_attention')='none'
+           AND json_extract(recovery.detail_json,'$.prior_attempt_status')='running'
+           AND s.status='exited' AND json_extract(s.exit_json,'$.process_group_quiescent')=1
+           AND s.validation_cell IS NULL AND g.role IN ('plan_reviewer','code_reviewer','final_verifier')
+           AND t.lifecycle='in_progress' AND t.archived_at IS NULL
+           AND a.id=(SELECT id FROM attempts WHERE task_id=t.id ORDER BY created_at DESC LIMIT 1)
+           AND EXISTS(SELECT 1 FROM review_requests review JOIN role_results result
+             ON result.session_id=review.session_id AND result.role_generation_id=review.role_generation_id
+               AND result.outcome=review.verdict AND result.consumed_at IS NOT NULL
+               AND json_extract(result.metadata_json,'$.review_request_id')=review.id
+               AND json_extract(result.metadata_json,'$.review_kind')=review.review_kind
+               AND json_extract(result.metadata_json,'$.candidate_hash')=review.candidate_hash
+             WHERE review.attempt_id=a.id AND review.session_id=s.id AND review.role_generation_id=g.id
+               AND review.delivery_state='finished' AND review.verdict IN ('approved','request_changes','needs_rework')
+               AND julianday(result.created_at)>=julianday(COALESCE((SELECT created_at FROM resume_invocations
+                 WHERE session_id=s.id AND transcript_epoch=s.transcript_epoch ORDER BY resume_ordinal DESC LIMIT 1),s.created_at)))",
+        params![session,epoch,process], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).optional()?;
+    let Some((recovery, attempt, task)) = completed else {
+        return Ok(());
+    };
+    transaction.execute("UPDATE recovery_records SET state='resolved_quiescent',resolved_at=?1,updated_at=?1,
+        detail_json=json_set(detail_json,'$.verification',json(?2)) WHERE id=?3",
+        params![now,serde_json::json!({"source":"completed_review_positive_exit","process_group_quiescent":true,"transcript_epoch":epoch}).to_string(),recovery])?;
+    let independent_hold: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE state='attention_required' AND (attempt_id=?1 OR id='database-restore-hold'))
+          OR EXISTS(SELECT 1 FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id=?1 AND s.status='recovery_required')
+          OR EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1 AND state NOT IN ('finished','cancelled','superseded','rejected','failed','abandoned') AND NOT (kind='transition_proposal' AND state='proposed'))
+          OR EXISTS(SELECT 1 FROM switch_intents WHERE attempt_id=?1 AND state NOT IN ('completed','cancelled','rejected','superseded'))
+          OR EXISTS(SELECT 1 FROM restart_candidates WHERE attempt_id=?1 AND state NOT IN ('resumed','released_fresh_dispatch','cancelled'))",
+        params![attempt], |row| row.get(0),
+    )?;
+    if !independent_hold {
+        let changed = transaction.execute("UPDATE tasks SET attention='none',version=version+1,updated_at=?1 WHERE id=?2
+            AND attention='needs_recovery' AND EXISTS(SELECT 1 FROM attempts WHERE id=?3 AND status='needs_recovery')",params![now,task,attempt])?;
+        if changed == 1 {
+            transaction.execute(
+                "UPDATE attempts SET status='running',updated_at=?1 WHERE id=?2",
+                params![now, attempt],
+            )?;
+            transaction.execute("UPDATE claims SET state='running',updated_at=?1 WHERE attempt_id=?2 AND state='unknown'",params![now,attempt])?;
+        }
+    }
+    transaction.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+        VALUES(?1,?2,'service','review.completed_exit.reconciled','session',?3,?4,?5)",
+        params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),session,
+            serde_json::json!({"recovery_id":recovery,"attempt_id":attempt,"transcript_epoch":epoch,
+                "independent_hold_preserved":independent_hold,"review_accounting_changed":false}).to_string(),now])?;
+    Ok(())
+}
+
 /// A Codex turn whose final Stop arrived with tool bookkeeping still open.
 /// Codex does not always emit a completion hook for every started tool, so such
 /// a Stop cannot be a safe idle boundary on its own. The coordinator promotes
@@ -13881,25 +14083,65 @@ pub(crate) struct InterruptDeadlineReceipt {
 /// current and the supervisor has positively inventoried the native process
 /// and its descendants as idle; elapsed time and terminal quiet are never used.
 ///
-/// Two scopes qualify. A retained setup discovery or profile probe first turn
-/// keeps its original, narrower rules. The task's current ordinary manager
-/// additionally requires its current resume invocation to be running, no
+/// Setup and ordinary task scopes qualify. A retained setup discovery or profile probe first turn
+/// keeps its original, narrower rules. Its reporting turn and the task's current
+/// ordinary Manager or default Implementer additionally require its current resume invocation to be running, no
 /// untrusted hook in the invocation, and no permission, input lease, uncertain
 /// guidance delivery, control, switch, restart, recovery, freeze, or running
-/// check for the attempt. For the manager, completion hooks that arrive after
+/// check for the attempt. For these reported turns, completion hooks that arrive after
 /// the Stop and match a tool started in the stopped turn are late bookkeeping,
 /// not new work; any other later hook keeps the turn busy.
 pub(crate) fn eligible_codex_stop_idle_reconciliation(
     connection: &rusqlite::Connection,
     session_id: Option<&str>,
-) -> Result<Option<CodexStopIdleReceipt>> {
+) -> Result<Option<StoppedTurnReceipt>> {
+    eligible_stopped_turn(connection, session_id, StoppedTurnPurpose::ReconcileIdle)
+}
+
+pub(crate) fn eligible_resolved_implementer_turn(
+    connection: &rusqlite::Connection,
+    session_id: Option<&str>,
+) -> Result<Option<StoppedTurnReceipt>> {
+    eligible_stopped_turn(
+        connection,
+        session_id,
+        StoppedTurnPurpose::ResolvedImplementer,
+    )
+}
+
+pub(crate) fn eligible_completed_probe_report(
+    connection: &rusqlite::Connection,
+    session_id: Option<&str>,
+) -> Result<Option<StoppedTurnReceipt>> {
+    eligible_stopped_turn(
+        connection,
+        session_id,
+        StoppedTurnPurpose::CompletedProbeReport,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum StoppedTurnPurpose {
+    ReconcileIdle,
+    ResolvedImplementer,
+    CompletedProbeReport,
+}
+
+fn eligible_stopped_turn(
+    connection: &rusqlite::Connection,
+    session_id: Option<&str>,
+    purpose: StoppedTurnPurpose,
+) -> Result<Option<StoppedTurnReceipt>> {
     connection
         .query_row(
-            &format!("WITH current_codex AS (
+            &format!("WITH current_session AS (
                SELECT s.id AS session_id,rg.id AS generation_id,rc.id AS credential_id,
-                      s.transcript_epoch,s.native_session_id,a.id AS attempt_id,COALESCE(t.version,0) AS task_version,
+                      s.transcript_epoch,s.native_session_id,s.provider,rg.role,s.resume_count,a.id AS attempt_id,COALESCE(t.version,0) AS task_version,
                       a.phase,a.plan_hash,a.candidate_hash,
-                      CASE WHEN s.setup_permit_id IS NULL THEN 'ordinary_manager' ELSE 'setup' END AS scope,
+                      CASE WHEN sp.purpose='runtime_probe' AND sp.state='consumed' THEN 'runtime_report'
+                           WHEN s.setup_permit_id IS NOT NULL AND sp.state='consumed' THEN 'setup_report'
+                           WHEN s.setup_permit_id IS NOT NULL THEN 'setup'
+                           WHEN rg.role='implementer' THEN 'ordinary_implementer' ELSE 'ordinary_manager' END AS scope,
                       (SELECT ri.id FROM resume_invocations ri
                         WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
                         ORDER BY ri.resume_ordinal DESC LIMIT 1) AS resume_invocation_id,
@@ -13921,42 +14163,53 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
                  AND rs.effective_generation_id=rg.id
                JOIN role_credentials rc ON rc.role_generation_id=rg.id AND rc.revoked_at IS NULL
                LEFT JOIN trip_setup_permits sp ON sp.id=s.setup_permit_id
-               WHERE (?1 IS NULL OR s.id=?1) AND s.provider='codex'
+               WHERE (?1 IS NULL OR s.id=?1)
+                 AND (s.provider='codex' OR (?3 AND s.provider='claude'))
                  AND rg.status='running' AND s.status='running'
-                 AND rg.role!='final_verifier'
+                 AND (rg.role!='final_verifier' OR (?3 AND (s.provider='claude' OR sp.purpose='runtime_probe') AND s.resume_count=0))
                  AND s.native_session_id IS NOT NULL AND s.native_session_id!=''
                  AND s.id=(SELECT latest.id FROM sessions latest
                    WHERE latest.role_generation_id=rg.id
                    ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)
                  AND ((s.setup_permit_id IS NOT NULL
-                       AND s.readiness_state='busy_unresolved_hook_work'
-                       AND s.resume_count=0
-                       AND sp.state='issued' AND sp.attempt_id=a.id AND sp.role=rg.role
-                       AND sp.purpose IN ('setup_discovery','profile_probe')
+                       AND ((s.resume_count=0 AND sp.state='issued'
+                             AND s.readiness_state='busy_unresolved_hook_work')
+                         OR ((s.resume_count=1 OR (?3 AND (s.provider='claude' OR sp.purpose='runtime_probe') AND rg.role='final_verifier' AND s.resume_count=0))
+                             AND sp.state='consumed'
+                             AND (s.readiness_state IN ('busy_unresolved_hook_work','busy')
+                               OR (?3 AND s.readiness_state='idle_candidate'))))
+                       AND sp.attempt_id=a.id AND sp.role=rg.role
                        AND ((sp.purpose='setup_discovery' AND s.validation_cell='trip_setup_discovery')
-                         OR (sp.purpose='profile_probe' AND s.validation_cell='trip_setup_probe')))
-                   OR (s.setup_permit_id IS NULL AND rg.role='manager'
-                       AND s.readiness_state IN ('busy_unresolved_hook_work','busy')
+                         OR (sp.purpose='profile_probe' AND s.validation_cell='trip_setup_probe')
+                         OR ({RUNTIME_PROBE_STOP_BINDING_SQL})))
+                   OR (s.setup_permit_id IS NULL
+                       AND (rg.role='manager' OR (rg.role='implementer' AND rg.lane_id='default'
+                         AND a.phase='implementation' AND a.plan_hash IS NOT NULL
+                         AND a.candidate_hash IS NULL AND t.lifecycle='in_progress'
+                         AND s.validation_cell IS NULL
+                         AND NOT EXISTS(SELECT 1 FROM implementation_lanes WHERE attempt_id=a.id)))
+                       AND (s.readiness_state IN ('busy_unresolved_hook_work','busy')
+                         OR (?2 AND s.readiness_state='idle_candidate'))
                        AND a.status IN ('running','needs_input')
                        -- A pending service-owned obligation on a frozen candidate
                        -- keeps its own one-shot service stop instead.
                        AND (a.candidate_hash IS NULL OR t.attention!='none')
                        AND t.lifecycle IN ('in_progress','validation','awaiting_review')
                        AND t.archived_at IS NULL
-                       -- No second live manager authority for the attempt.
+                       -- No second live authority for this role.
                        AND NOT EXISTS(SELECT 1 FROM role_generations other
-                         WHERE other.attempt_id=a.id AND other.role='manager' AND other.id!=rg.id
+                         WHERE other.attempt_id=a.id AND other.role=rg.role AND other.id!=rg.id
                            AND other.status IN ('launch_reserved','running','stopping'))))
              ), latest_stop AS (
-               SELECT current_codex.*,h.rowid AS stop_rowid
-               FROM current_codex JOIN hook_events h ON h.session_id=current_codex.session_id
+               SELECT current_session.*,h.rowid AS stop_rowid
+               FROM current_session JOIN hook_events h ON h.session_id=current_session.session_id
                WHERE h.rowid=(SELECT MAX(latest.rowid) FROM hook_events latest
-                 WHERE latest.session_id=current_codex.session_id
-                   AND latest.rowid>current_codex.boundary
-                   AND (current_codex.scope='setup' OR latest.event_name='Stop'))
-                 AND h.event_name='Stop' AND h.provider='codex'
-                 AND h.role_generation_id=current_codex.generation_id
-                 AND h.native_session_id=current_codex.native_session_id
+                 WHERE latest.session_id=current_session.session_id
+                   AND latest.rowid>current_session.boundary
+                   AND (current_session.scope='setup' OR latest.event_name='Stop'))
+                 AND h.event_name='Stop' AND h.provider=current_session.provider
+                 AND h.role_generation_id=current_session.generation_id
+                 AND h.native_session_id=current_session.native_session_id
                  AND h.provenance_state='managed_process_group_untrusted_payload'
              ), stopped_turn AS (
                SELECT latest_stop.*,
@@ -14001,6 +14254,16 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
                                  AND json_valid(finished.payload_json)
                                  AND json_extract(finished.payload_json,'$.tool_use_id')
                                    =json_extract(started.payload_json,'$.tool_use_id')))) AS late_terminal_hooks,
+                      (SELECT COUNT(*) FROM hook_events late
+                       WHERE stopped_turn.scope IN ('setup_report','runtime_report') AND stopped_turn.provider='claude'
+                         AND late.session_id=stopped_turn.session_id AND late.rowid>stopped_turn.stop_rowid
+                         AND late.provider=stopped_turn.provider
+                         AND late.role_generation_id=stopped_turn.generation_id
+                         AND late.native_session_id=stopped_turn.native_session_id
+                         AND late.provenance_state='managed_process_group_untrusted_payload'
+                         AND (late.event_name='SubagentStop' OR (late.event_name='Notification'
+                           AND json_valid(late.payload_json)
+                           AND json_extract(late.payload_json,'$.notification_type')='idle_prompt'))) AS late_setup_terminal_hooks,
                       (SELECT COUNT(DISTINCT json_extract(late.payload_json,'$.tool_use_id'))
                        FROM hook_events late
                        WHERE late.session_id=stopped_turn.session_id
@@ -14026,17 +14289,53 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
                          WHERE retired.event_code='role_result.superseded'
                            AND retired.entity_id=result.id)
                      ORDER BY result.rowid DESC LIMIT 1) AS accepted_result_id,
-                    bounded_turn.phase,bounded_turn.plan_hash,bounded_turn.candidate_hash
+                    bounded_turn.phase,bounded_turn.plan_hash,bounded_turn.candidate_hash,
+                    (SELECT rejection.id FROM audit_events rejection
+                     WHERE bounded_turn.scope='runtime_report'
+                       AND rejection.event_code='runtime.report.rejected' AND rejection.actor_kind='service'
+                       AND rejection.entity_kind='session' AND rejection.entity_id=bounded_turn.session_id
+                       AND json_extract(rejection.detail_json,'$.role_generation_id')=bounded_turn.generation_id
+                       AND json_extract(rejection.detail_json,'$.transcript_epoch')=bounded_turn.transcript_epoch
+                       AND json_extract(rejection.detail_json,'$.credential_id')=bounded_turn.credential_id
+                       AND json_extract(rejection.detail_json,'$.reason_code') IN ('runtime_command_mismatch','runtime_model_observation_mismatch')
+                       AND julianday(rejection.created_at)>=julianday(bounded_turn.submit_at)
+                       AND julianday(rejection.created_at)<=julianday(bounded_turn.stop_at)
+                       AND EXISTS(SELECT 1 FROM sessions current
+                         JOIN trip_runtime_probes probe ON probe.session_id=current.id
+                         WHERE current.id=bounded_turn.session_id AND probe.state='failed'
+                           AND current.setup_permit_id=json_extract(rejection.detail_json,'$.permit_id'))
+                     ORDER BY rejection.rowid DESC LIMIT 1) AS rejected_runtime_report_id
              FROM bounded_turn
              WHERE bounded_turn.submit_rowid IS NOT NULL AND {hold_absent}
-               AND bounded_turn.later_hooks=bounded_turn.late_terminal_hooks
+               AND bounded_turn.later_hooks=bounded_turn.late_terminal_hooks+bounded_turn.late_setup_terminal_hooks
                -- Each late completion closes a different unmatched tool.
                AND bounded_turn.late_terminal_hooks=bounded_turn.late_terminal_tools
-               -- The ordinary manager must have reported in this exact turn;
+               -- Ordinary roles must have reported in this exact turn;
                -- a Stop alone never makes it idle.
-               AND (bounded_turn.scope='setup' OR accepted_result_id IS NOT NULL)
-               AND (bounded_turn.readiness_state='busy_unresolved_hook_work'
+               AND (bounded_turn.scope='setup' OR accepted_result_id IS NOT NULL OR rejected_runtime_report_id IS NOT NULL)
+               AND (((?2 OR ?3) AND bounded_turn.readiness_state='idle_candidate')
+                 OR bounded_turn.readiness_state='busy_unresolved_hook_work'
                  OR bounded_turn.late_terminal_hooks>0)
+               AND (NOT ?2 OR (bounded_turn.scope='ordinary_implementer'
+                 AND bounded_turn.readiness_state='idle_candidate'
+                 AND EXISTS(SELECT 1 FROM attempts current JOIN tasks task ON task.id=current.task_id
+                   WHERE current.id=bounded_turn.attempt_id AND current.status='running' AND task.attention='none')
+                 AND EXISTS(SELECT 1 FROM role_results result WHERE result.id=accepted_result_id
+                   AND result.outcome IN ('needs_input','blocked') AND result.consumed_at IS NOT NULL
+                   AND NOT EXISTS(SELECT 1 FROM role_results later WHERE later.session_id=result.session_id
+                     AND later.role_generation_id=result.role_generation_id AND later.rowid>result.rowid))))
+               AND (NOT ?3 OR (bounded_turn.scope IN ('setup_report','runtime_report')
+                 AND bounded_turn.readiness_state='idle_candidate'))
+               AND (bounded_turn.scope NOT IN ('setup_report','runtime_report') OR (
+                 ((bounded_turn.resume_count=1 AND bounded_turn.resume_invocation_id IS NOT NULL AND bounded_turn.resume_state='running')
+                   OR ((bounded_turn.provider='claude' OR bounded_turn.scope='runtime_report') AND bounded_turn.role='final_verifier'
+                     AND bounded_turn.resume_count=0 AND bounded_turn.resume_invocation_id IS NULL))
+                 AND (rejected_runtime_report_id IS NOT NULL OR EXISTS(SELECT 1 FROM role_results result WHERE result.id=accepted_result_id
+                   AND result.outcome='capability_observed'
+                   AND NOT EXISTS(SELECT 1 FROM role_results later WHERE later.session_id=result.session_id
+                     AND later.role_generation_id=result.role_generation_id AND later.rowid>result.rowid)))
+                 AND (bounded_turn.scope='runtime_report' OR EXISTS(SELECT 1 FROM trip_preflight_receipts proof
+                   WHERE proof.generation_id=bounded_turn.generation_id AND proof.result='success'))))
                AND EXISTS(SELECT 1 FROM hook_events start
                  WHERE start.session_id=bounded_turn.session_id
                    AND start.role_generation_id=bounded_turn.generation_id
@@ -14045,7 +14344,7 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
                    AND start.provenance_state='managed_process_group_untrusted_payload'
                    AND start.rowid>bounded_turn.boundary
                    AND start.rowid<bounded_turn.stop_rowid)
-               AND (SELECT COUNT(*) FROM hook_events started
+               AND (((?2 OR ?3) AND bounded_turn.readiness_state='idle_candidate') OR (SELECT COUNT(*) FROM hook_events started
                     WHERE started.session_id=bounded_turn.session_id
                       AND started.event_name='PreToolUse'
                       AND started.role_generation_id=bounded_turn.generation_id
@@ -14058,7 +14357,7 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
                       AND finished.role_generation_id=bounded_turn.generation_id
                       AND finished.native_session_id=bounded_turn.native_session_id
                       AND finished.provenance_state='managed_process_group_untrusted_payload'
-                      AND finished.rowid BETWEEN bounded_turn.submit_rowid AND bounded_turn.stop_rowid)
+                      AND finished.rowid BETWEEN bounded_turn.submit_rowid AND bounded_turn.stop_rowid))
                AND (SELECT COUNT(*) FROM hook_events started
                     WHERE started.session_id=bounded_turn.session_id
                       AND started.event_name='SubagentStart'
@@ -14125,9 +14424,9 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
              ORDER BY bounded_turn.stop_rowid LIMIT 1",
                 hold_absent = crate::coordinator::coordinator_hold_absent("bounded_turn.attempt_id"),
             ),
-            params![session_id],
+            params![session_id, purpose == StoppedTurnPurpose::ResolvedImplementer, purpose == StoppedTurnPurpose::CompletedProbeReport],
             |row| {
-                Ok(CodexStopIdleReceipt {
+                Ok(StoppedTurnReceipt {
                     session_id: row.get(0)?,
                     generation_id: row.get(1)?,
                     credential_id: row.get(2)?,
@@ -14141,6 +14440,7 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
                     task_version: row.get(10)?,
                     late_terminal_hooks: row.get(11)?,
                     accepted_result_id: row.get(12)?,
+                    rejected_runtime_report_id: row.get(16)?,
                     phase: row.get(13)?,
                     plan_hash: row.get(14)?,
                     candidate_hash: row.get(15)?,
@@ -14150,6 +14450,20 @@ pub(crate) fn eligible_codex_stop_idle_reconciliation(
         .optional()
         .map_err(Into::into)
 }
+
+// A runtime stop can only target the exact authorized fixture session. Stopping
+// it neither publishes its observations nor authorizes a fresh provider call.
+const RUNTIME_PROBE_STOP_BINDING_SQL: &str = "sp.purpose='runtime_probe'
+    AND sp.approved_action='ordinary_runtime_capability' AND s.validation_cell='trip_runtime_probe'
+    AND EXISTS(SELECT 1 FROM trip_runtime_probes probe
+      JOIN trip_runtime_admissions admission ON admission.id=probe.admission_id
+      WHERE probe.session_id=s.id AND probe.attempt_id=rg.attempt_id AND probe.role=rg.role
+        AND probe.profile_hash=sp.profile_hash AND sp.settings_revision=rg.config_revision
+        AND probe.fixture_project_id=sp.fixture_project_id
+        AND admission.authorized_at IS NOT NULL
+        AND admission.state IN ('authorized','running','awaiting_publication','failed')
+        AND ((sp.state='issued' AND probe.state IN ('running','awaiting_resume'))
+          OR (sp.state='consumed' AND probe.state IN ('evidence_recorded','failed'))))";
 
 /// The newest trusted Stop of the setup session's first invocation, over
 /// aliases `s` (sessions) and `rg` (role_generations).
@@ -14235,10 +14549,10 @@ pub(crate) fn eligible_setup_retained_first_turn_stop(
                AND s.native_session_id IS NOT NULL AND s.native_session_id!=''
                AND s.process_identity_json IS NOT NULL AND s.process_identity_json!=''
                AND sp.state='issued' AND sp.attempt_id=a.id AND sp.role=rg.role
-               AND sp.purpose IN ('setup_discovery','profile_probe')
                AND rg.role!='final_verifier'
                AND ((sp.purpose='setup_discovery' AND s.validation_cell='trip_setup_discovery')
-                 OR (sp.purpose='profile_probe' AND s.validation_cell='trip_setup_probe'))
+                 OR (sp.purpose='profile_probe' AND s.validation_cell='trip_setup_probe')
+                 OR ({RUNTIME_PROBE_STOP_BINDING_SQL}))
                AND {SETUP_FIRST_TURN_STOP_ROWID_SQL} IS NOT NULL
                AND NOT EXISTS(SELECT 1 FROM role_results result
                  WHERE result.session_id=s.id AND result.role_generation_id=rg.id
@@ -14850,9 +15164,10 @@ fn has_completed_setup_first_turn_stop_authority(
            AND s.status='exited' AND rg.status='exited' AND s.resume_count=0
            AND COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)=1
            AND sp.state='issued' AND sp.attempt_id=rg.attempt_id AND sp.role=rg.role
-           AND sp.purpose IN ('setup_discovery','profile_probe') AND rg.role!='final_verifier'
+           AND rg.role!='final_verifier'
            AND ((sp.purpose='setup_discovery' AND s.validation_cell='trip_setup_discovery')
-             OR (sp.purpose='profile_probe' AND s.validation_cell='trip_setup_probe'))
+             OR (sp.purpose='profile_probe' AND s.validation_cell='trip_setup_probe')
+             OR ({RUNTIME_PROBE_STOP_BINDING_SQL}))
            AND json_extract(audit.detail_json,'$.role_generation_id')=rg.id
            AND json_extract(audit.detail_json,'$.transcript_epoch')=s.transcript_epoch
            AND json_extract(audit.detail_json,'$.native_session_id')=s.native_session_id

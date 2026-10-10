@@ -318,6 +318,21 @@ export function WorkflowControls(
     const transcriptEpoch = actionValue(action, "transcript_epoch");
     const processIdentity = actionIdentity(action);
     switch (action.kind) {
+      case "authorization_required": {
+        const reviewKind = actionValue(action, "review_kind");
+        if (action.operation !== "extend_review_budget") return null;
+        return (
+          <button
+            disabled={!action.enabled || !attemptId ||
+              (reviewKind !== "plan" && reviewKind !== "code") || !!busy}
+            onClick={() => void send("extend_review_budget", {
+              attempt_id: attemptId, review_kind: reviewKind, additional: 1,
+            })}
+          >
+            Allow one more {reviewKind} review
+          </button>
+        );
+      }
       case "exact_resume":
         const restartResume = action.operation === "restart_resume";
         return (
@@ -736,6 +751,10 @@ export function WorkflowControls(
       <small className="hint">
         {terminal
           ? "Completed and cancelled tasks cannot be resumed or changed."
+          : decision?.reason_code === "workflow.review_budget_exhausted"
+          ? "The saved candidate still needs code review, and this attempt has reached its review limit. Leave it held to inspect the work, or choose Cancel to stop the task and keep its history."
+          : decision?.reason_code === "workflow.review_session_exited"
+          ? "Use Resume the stopped session above to continue the existing review. Continue and Retry do not recover this session."
           : task.lifecycle === "backlog"
           ? project?.trip?.readiness === "ready"
             ? "Make Ready checks the task and all six agent roles, then queues it. Queued tasks start automatically when an agent slot is free."

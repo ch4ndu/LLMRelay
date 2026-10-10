@@ -406,6 +406,12 @@ pub(crate) fn ordinary_control_policy(
         if pending_continue(connection, attempt_id, None)? {
             controls.retain(|control| control != "continue");
         }
+        if crate::review::ordinary_code_review_cap_reached(connection, attempt_id)?
+            || crate::review::unanswered_ordinary_review(connection, attempt_id)?.is_some()
+        {
+            controls
+                .retain(|control| !matches!(control.as_str(), "continue" | "run_next" | "retry"));
+        }
         if crate::store::provider_failure_hold_in_attempt(connection, attempt_id)?.is_some() {
             controls.retain(|control| control != "retry");
         }
@@ -2382,6 +2388,13 @@ pub fn execute_with_runtime(
                     params![attempt],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
+                if matches!(action.as_str(), "continue" | "run_next" | "retry")
+                    && (crate::review::ordinary_code_review_cap_reached(&transaction, &attempt)?
+                        || crate::review::unanswered_ordinary_review(&transaction, &attempt)?
+                            .is_some())
+                {
+                    bail!("this review needs its specific recovery action or has reached the five-review limit; Continue and Retry cannot resolve it")
+                }
                 let unfinished_rework: Option<(String, bool)> = transaction
                     .query_row(
                         "SELECT state,COALESCE(json_extract(result_json,'$.cancellation_pending'),0)
@@ -5308,6 +5321,7 @@ fn continuation(
 enum ReviewerFreshRoute {
     NotReviewer,
     Eligible,
+    AllowanceExtendable,
     AllowanceExhausted,
     Stale,
     FinalFreshOnly,
@@ -5380,6 +5394,27 @@ fn reviewer_fresh_route(
                 .is_some_and(|remaining| remaining > 0)
     }) {
         ReviewerFreshRoute::Eligible
+    } else if task
+        .active_attempt
+        .as_ref()
+        .and_then(|attempt| attempt.get("final_repair_round"))
+        .and_then(serde_json::Value::as_i64)
+        == Some(0)
+        && task.review_budgets.iter().any(|budget| {
+            budget.get("attempt_id").and_then(serde_json::Value::as_str) == attempt_id
+                && budget.get("kind").and_then(serde_json::Value::as_str) == Some(review_kind)
+                && budget
+                    .get("initial_allowance")
+                    .and_then(serde_json::Value::as_i64)
+                    .zip(
+                        budget
+                            .get("extension_allowance")
+                            .and_then(serde_json::Value::as_i64),
+                    )
+                    .is_some_and(|(initial, extension)| initial + extension < 5)
+        })
+    {
+        ReviewerFreshRoute::AllowanceExtendable
     } else {
         ReviewerFreshRoute::AllowanceExhausted
     }
@@ -7265,13 +7300,20 @@ fn continuation_actions(
                                 "authorization_required",
                                 Some("The dashboard cannot add another final verification."),
                             ),
+                            ReviewerFreshRoute::AllowanceExtendable if same_profile_authority && current_capability_supported => (
+                                ContinuationActionKind::AuthorizationRequired,
+                                true,
+                                "The previous review used the last authorized round without producing a verdict. You can allow one more review, then choose Start a fresh session.",
+                                "human", "extend_review_budget",
+                                Some("Allows one additional paid review within the five-review limit. This button does not launch it."),
+                            ),
                             ReviewerFreshRoute::AllowanceExhausted if same_profile_authority => (
                                 ContinuationActionKind::AuthorizationRequired,
                                 false,
                                 "This review was already delivered and no reviews are left for a new request.",
                                 "external",
                                 "authorization_required",
-                                Some("The dashboard cannot add reviews."),
+                                Some("The five-review limit has been reached. Keep the task held or choose Cancel; recorded work is preserved."),
                             ),
                             ReviewerFreshRoute::Stale if same_profile_authority => (
                                 ContinuationActionKind::ReplaceStaleAuthority,
@@ -7340,6 +7382,9 @@ fn continuation_actions(
                         "plan_hash":session.get("attempt_plan_hash"),
                         "setup_permit_id":detail.get("setup_permit_id"),
                         "review_request_id":detail.get("review_request_id"),
+                        "review_kind":match session.get("role").and_then(serde_json::Value::as_str) {
+                            Some("plan_reviewer") => Some("plan"), Some("code_reviewer") => Some("code"), _ => None,
+                        },
                     }),
                     accounting_note,
                 ));
@@ -7383,25 +7428,33 @@ fn continuation_actions(
                 actions.push(continuation(
                     if resumable {
                         ContinuationActionKind::ExactResume
-                    } else {
+                    } else if !quiescent {
                         ContinuationActionKind::WaitForExit
+                    } else {
+                        ContinuationActionKind::AuthorizationRequired
                     },
                     resumable,
                     if resumable && runtime_probe {
                         "The profile verification stopped before finishing. You can resume that same verification."
                     } else if resumable {
                         "The session stopped before reporting its result. You can resume the same session where it left off."
-                    } else {
+                    } else if !quiescent {
                         "The session stopped before reporting its result. It can be resumed once LLMRelay confirms it has fully exited."
+                    } else if !native_session {
+                        "The agent has fully exited without a resumable conversation. Its session recovery must be checked before a replacement can be authorized; waiting for exit will not resolve this."
+                    } else {
+                        "The agent has fully exited, but the current profile verification does not authorize resuming it. Open agent settings to verify its current profile."
                     },
-                    if resumable { "human" } else { "service" },
-                    (!resumable).then_some("LLMRelay to confirm the session has fully exited"),
+                    if resumable || quiescent { "human" } else { "service" },
+                    (!quiescent).then_some("LLMRelay to confirm the session has fully exited"),
                     session.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
                     None,
                     if resumable {
                         if runtime_probe { "runtime_probe_resume" } else { "role_resume" }
-                    } else {
+                    } else if !quiescent {
                         "wait_for_exit"
+                    } else {
+                        "authorization_required"
                     },
                     serde_json::json!({"task_id":session.get("task_id"),"attempt_id":session.get("attempt_id"),"session_id":id,"role_generation_id":session.get("role_generation_id"),"transcript_epoch":session.get("transcript_epoch"),"runtime_admission_id":runtime_admission,"role":session.get("role")}),
                     Some(if runtime_probe {
@@ -8338,7 +8391,14 @@ impl AttentionSources<'_> {
                         "needs_input" | "needs_review_budget" => AttentionCategory::Decision,
                         _ => AttentionCategory::Blocked,
                     },
-                    task_attention_title(attention),
+                    if self.decisions.iter().any(|decision| {
+                        decision.subject.task_id.as_deref() == Some(task.id.as_str())
+                            && decision.reason_code == "workflow.review_budget_exhausted"
+                    }) {
+                        "Code review limit reached".into()
+                    } else {
+                        task_attention_title(attention)
+                    },
                     reason,
                     match attention {
                         "needs_human_review" => AttentionActionKind::ReviewResult,

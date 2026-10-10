@@ -132,6 +132,26 @@ The first retained invocation must finish its exact probes without reporting. An
 
 After a completed failed check, choose **Prepare corrected runtime verification**. This creates a new pending scope with its own challenge and cost approval. The failed session and consumed permission remain history; the app does not reset them or automatically retry a paid call.
 
+The initial runtime context may expose `provider_model_observation` from one
+SessionStart payload correlated to the same managed native invocation. Its model
+must match the requested launch model; absent, malformed, conflicting, duplicate,
+or differently bound payloads supply no observation and never fall back to
+settings. The agent may retain its `provider_session_start:<model>` evidence atom
+and report it after resume; acceptance checks it against that first invocation.
+This records an untrusted provider payload, not remote backend model attestation.
+It grants no proof by itself and does not relax the nonce, native command,
+confinement, frozen policy or separate publication gates. Retained context reads
+remain prohibited, and earlier failed reports remain failed.
+
+An `observation_unavailable` failure must identify the missing required fact with
+`--missing-observation`: `model_evidence`, `session_mode_observed`,
+`target_data_accessed`, `fallback_observed`, or `authentication_observed`.
+The stored failure names that fact so the user can investigate before spending
+another call. An unavailable optional sandbox description is not a failure.
+Older reports without this diagnostic remain failed and explicitly say that
+the agent did not identify the missing observation; they are never promoted to
+passing evidence or retried automatically.
+
 Imported preflight files are installation evidence, not proof that a current local profile is Supported. Actual local evidence must cover the required role authority and native session semantics. Ordinary roles retain their own conversation; a final verifier always starts fresh for its frozen candidate. An interrupted final review remains incomplete instead of being resumed and relabelled fresh.
 
 The older `capability` CLI remains an advanced diagnostic surface. Use the runtime verification controls to launch or resume an ordinary runtime probe; generic setup dispatch and diagnostic capability resume are not alternate routes for those sessions. Historical L01–L10 receipts belong to their original workflow and instance and cannot be reused as proof for the new TRIP contract. Inspect current command help before a bounded diagnostic; neither a diagnostic report nor provider terminal prose can grant human installation, implementation, or acceptance authority.

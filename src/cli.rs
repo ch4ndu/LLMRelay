@@ -513,6 +513,8 @@ enum RoleCommand {
         #[arg(long, require_equals = true, requires = "runtime_v1")]
         failure_category: Option<String>,
         #[arg(long, require_equals = true, requires = "runtime_v1")]
+        missing_observation: Option<String>,
+        #[arg(long, require_equals = true, requires = "runtime_v1")]
         cmux_stderr_hex: Option<String>,
         #[arg(long, require_equals = true, requires = "runtime_v1")]
         actual: Vec<String>,
@@ -1697,6 +1699,7 @@ async fn run_role(args: RoleArgs) -> Result<()> {
             fallback_observed,
             authentication_observed,
             failure_category,
+            missing_observation,
             cmux_stderr_hex,
             actual,
         } => {
@@ -1713,6 +1716,7 @@ async fn run_role(args: RoleArgs) -> Result<()> {
                     ("fallback-observed", fallback_observed),
                     ("authentication-observed", authentication_observed),
                     ("failure-category", failure_category),
+                    ("missing-observation", missing_observation),
                     ("cmux-stderr-hex", cmux_stderr_hex),
                 ] {
                     if let Some(value) = value {
@@ -1955,6 +1959,41 @@ mod attach_input_tests {
         Command, PersistentCmuxInputAuthority,
     };
     use clap::Parser;
+
+    #[test]
+    fn runtime_report_accepts_the_missing_observation_flag_only_in_runtime_mode() {
+        let Command::Role(args) = Cli::try_parse_from([
+            "llmrelay",
+            "role",
+            "report",
+            "--runtime-v1",
+            "--operation-id=missing-model",
+            "--status=failed",
+            "--failure-category=observation_unavailable",
+            "--missing-observation=model_evidence",
+            "--actual=direct_write,true,1,denied,os,native_session",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("role command was not parsed")
+        };
+        let super::RoleCommand::Report {
+            missing_observation,
+            ..
+        } = args.command
+        else {
+            panic!("runtime report was not parsed")
+        };
+        assert_eq!(missing_observation.as_deref(), Some("model_evidence"));
+        assert!(Cli::try_parse_from([
+            "llmrelay",
+            "role",
+            "report",
+            "--missing-observation=model_evidence"
+        ])
+        .is_err());
+    }
 
     #[test]
     fn serve_backup_flags_are_default_off_and_reject_orphans_and_out_of_range_intervals() {

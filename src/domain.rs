@@ -482,8 +482,20 @@ const RUNTIME_FIELDS: &[&str] = &[
     "fallback-observed",
     "authentication-observed",
     "failure-category",
+    "missing-observation",
     "cmux-stderr-hex",
 ];
+
+pub(crate) fn runtime_missing_observation(value: &str) -> bool {
+    [
+        "model_evidence",
+        "session_mode_observed",
+        "target_data_accessed",
+        "fallback_observed",
+        "authentication_observed",
+    ]
+    .contains(&value)
+}
 
 fn runtime_atom(name: &str, value: &str) -> Result<(), String> {
     if value.is_empty()
@@ -664,6 +676,12 @@ fn runtime_role_report(
                 "cell":"trip_runtime_probe", "status":"failed",
                 "failure_category":category, "actual_outcomes":runtime_outcomes(actual)?
             });
+            if let Some(missing) = fields.remove("missing-observation") {
+                if category != "observation_unavailable" || !runtime_missing_observation(&missing) {
+                    return Err("runtime-v1 missing-observation must name a required non-command observation and requires observation_unavailable".into());
+                }
+                observation["missing_observation"] = serde_json::Value::String(missing);
+            }
             if let Some(stderr) = fields.remove("cmux-stderr-hex") {
                 observation["cmux_socket_stderr_hex"] = serde_json::Value::String(stderr);
             }
@@ -2842,6 +2860,57 @@ pub struct RolePeerProvenance {
     pub managed_root_pid: u32,
     pub managed_root_start_marker: String,
     pub state: String,
+}
+
+#[cfg(test)]
+mod runtime_report_tests {
+    use super::parse_runtime_role_report_args;
+
+    #[test]
+    fn missing_observation_is_bounded_failure_diagnostic_only() {
+        let legacy = [
+            "--runtime-v1",
+            "--operation-id=missing-model",
+            "--status=failed",
+            "--failure-category=observation_unavailable",
+            "--actual=direct_write,true,1,denied,os,native_session",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(
+            parse_runtime_role_report_args(&legacy).unwrap().metadata["validation_observation"]
+                ["status"],
+            "failed"
+        );
+        let mut named = legacy.clone();
+        named.push("--missing-observation=model_evidence".into());
+        let report = parse_runtime_role_report_args(&named).unwrap();
+        assert_eq!(
+            report.metadata["validation_observation"]["missing_observation"],
+            "model_evidence"
+        );
+        assert!(report.metadata.get("history_nonce").is_none());
+        for invalid in [
+            "effective_sandbox_identity",
+            "unrecognized",
+            "model_evidence;exit",
+            "",
+        ] {
+            let mut args = legacy.clone();
+            args.push(format!("--missing-observation={invalid}"));
+            assert!(parse_runtime_role_report_args(&args).is_err());
+        }
+        named[3] = "--failure-category=model_refusal".into();
+        assert!(parse_runtime_role_report_args(&named).is_err());
+        let missing_context = [
+            "--runtime-v1",
+            "--operation-id=missing-context",
+            "--status=missing_context",
+            "--missing-observation=model_evidence",
+        ]
+        .map(str::to_owned);
+        assert!(parse_runtime_role_report_args(&missing_context).is_err());
+    }
 }
 
 #[cfg(test)]

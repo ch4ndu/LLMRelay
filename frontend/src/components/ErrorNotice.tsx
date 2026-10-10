@@ -5,6 +5,42 @@ export type ErrorGuidance = { summary: string; nextStep: string };
 // Backend diagnostics remain unchanged. This is display copy, never retry authority.
 export function explainError(error: string): ErrorGuidance {
   const text = error.toLowerCase();
+  if (
+    text.startsWith("ordinary runtime probe reported observation_unavailable") ||
+    (text.startsWith("ordinary runtime probe reported an observed failure") &&
+      text.includes("failure category: observation_unavailable"))
+  ) {
+    const missing = text.startsWith("ordinary runtime probe reported observation_unavailable")
+      ? text.split(":", 2)[1]?.trim()
+      : undefined;
+    const descriptions: Record<string, string> = {
+      model_evidence: "The agent could not observe which model was running.",
+      session_mode_observed: "The agent could not confirm its conversation was retained or fresh as required.",
+      target_data_accessed: "The agent could not confirm whether it accessed the target project.",
+      fallback_observed: "The agent could not confirm whether a fallback was used.",
+      authentication_observed: "The agent could not confirm its authenticated session.",
+    };
+    return {
+      summary: descriptions[missing ?? ""] ??
+        "Agent verification is incomplete, but the agent did not identify which required observation was missing.",
+      nextStep:
+        "Choose View output and review this agent profile before spending another call. The failed check cannot publish proof. After the session has stopped and the cause is understood, choose Prepare a new verification and review its scope before approving it.",
+    };
+  }
+  if (text.startsWith("runtime model evidence does not match the bound first-invocation provider sessionstart observation")) {
+    return {
+      summary: "The reported model could not be matched to the native session's recorded model.",
+      nextStep:
+        "Choose View output and check this agent profile. This verification failed and cannot publish proof. Once the session has stopped and the mismatch is understood, choose Prepare a new verification.",
+    };
+  }
+  if (text.startsWith("ordinary runtime probe reported an observed failure")) {
+    return {
+      summary: "The agent recorded a failed verification.",
+      nextStep:
+        "Review the affected role's explanation and choose View output. Correct the reported issue before using Prepare a new verification; the failed check stays in history and a new check needs approval for another agent call.",
+    };
+  }
   // Matched first: the listed outcomes are free text that can contain other
   // patterns' keywords, such as "timeout".
   if (
@@ -75,6 +111,13 @@ export function explainError(error: string): ErrorGuidance {
         "Open Project setup to review the change. LLMRelay will not overwrite it.",
     };
   }
+  if (text.includes("setup discovery manager must exit before profile probes are frozen")) {
+    return {
+      summary: "Discovery has reported, but its agent session has not closed yet.",
+      nextStep:
+        "Wait for Project setup to show that the discovery session has exited, then authorize the profile probes. If it remains open, choose View output to inspect it and check for a recovery action. Your saved setup information does not need correcting.",
+    };
+  }
   if (/role capacity|capacity.*full/.test(text)) {
     return {
       summary: "All available agent slots are busy.",
@@ -139,6 +182,24 @@ export function explainError(error: string): ErrorGuidance {
       summary: "LLMRelay could not use the agent's current sign-in.",
       nextStep:
         "Open the agent's own terminal app and check its sign-in. Complete sign-in there, then return to LLMRelay and verify the profile again.",
+    };
+  }
+  if (
+    text.includes("ordinary runtime probe terminal reporting invocation exited quiescently without an accepted role report")
+  ) {
+    return {
+      summary: "That verification finished without an accepted report.",
+      nextStep:
+        "In Project setup, review Technical details, then choose Prepare a new verification. Review and approve its scope before launching. The earlier check stays in history, and the new check uses another agent call.",
+    };
+  }
+  if (
+    text.includes("ordinary runtime evidence does not match the exact authenticated native hook commands and count")
+  ) {
+    return {
+      summary: "Agent verification did not match the required check.",
+      nextStep:
+        "Choose View output to inspect the rejected report. After the session has stopped, choose Prepare a new verification in Project setup and review its scope before approving another agent call.",
     };
   }
   if (

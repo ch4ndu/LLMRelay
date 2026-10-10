@@ -1847,6 +1847,57 @@ impl Supervisor {
         self.interrupt_once(session_id).map(|_| ())
     }
 
+    pub(crate) fn interrupt_resolved_implementer(
+        &self,
+        receipt: &crate::store::StoppedTurnReceipt,
+    ) -> Result<bool> {
+        self.interrupt_completed_turn(receipt, |store| {
+            store.reserve_resolved_implementer_stop(receipt)
+        })
+    }
+
+    pub(crate) fn interrupt_completed_probe_report(
+        &self,
+        receipt: &crate::store::StoppedTurnReceipt,
+    ) -> Result<bool> {
+        self.interrupt_completed_turn(receipt, |store| {
+            store.reserve_completed_probe_report_stop(receipt)
+        })
+    }
+
+    fn interrupt_completed_turn(
+        &self,
+        receipt: &crate::store::StoppedTurnReceipt,
+        reserve: impl FnOnce(&Store) -> Result<bool>,
+    ) -> Result<bool> {
+        let handle = self.handle(&receipt.session_id)?;
+        let _boundary = handle
+            .io_boundary
+            .lock()
+            .map_err(|_| anyhow!("session I/O boundary poisoned"))?;
+        let mut first_stop = handle
+            .first_stop_requested_at
+            .lock()
+            .map_err(|_| anyhow!("session stop-state lock poisoned"))?;
+        if first_stop.is_some()
+            || handle.role_generation_id != receipt.generation_id
+            || handle.transcript_epoch != receipt.transcript_epoch
+        {
+            return Ok(false);
+        }
+        self.verify_process(&handle)?;
+        if !reserve(&self.store)? {
+            return Ok(false);
+        }
+        // Reservation is one-shot even if signal delivery becomes uncertain.
+        *first_stop = Some(std::time::Instant::now());
+        if unsafe { libc::kill(-handle.process.process_group_id, libc::SIGINT) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("stop verified completed provider turn");
+        }
+        Ok(true)
+    }
+
     pub fn interrupt_once(&self, session_id: &str) -> Result<InterruptOutcome> {
         let handle = self.handle(session_id)?;
         let mut first_stop = handle

@@ -18,6 +18,7 @@ pub mod provider_compatibility;
 pub mod providers;
 pub mod recipes;
 pub mod recovery;
+mod repair_handoff;
 pub mod review;
 pub mod roles;
 pub mod scheduler;

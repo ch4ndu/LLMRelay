@@ -42,6 +42,12 @@ fn tick_steps(app: &Application) -> Result<serde_json::Value> {
     if let Some(value) = reconcile_one_codex_stop_idle(app)? {
         return Ok(value);
     }
+    if let Some(value) = quiesce_one_resolved_implementer_turn(app)? {
+        return Ok(value);
+    }
+    if let Some(value) = quiesce_one_completed_probe_report(app)? {
+        return Ok(value);
+    }
     if let Some(value) = complete_one_setup_retained_first_turn(app)? {
         return Ok(value);
     }
@@ -329,6 +335,64 @@ fn reconcile_one_codex_stop_idle(app: &Application) -> Result<Option<serde_json:
     })))
 }
 
+fn quiesce_one_resolved_implementer_turn(app: &Application) -> Result<Option<serde_json::Value>> {
+    let receipt = {
+        let connection = app.store.lock()?;
+        crate::store::eligible_resolved_implementer_turn(&connection, None)?
+    };
+    let Some(receipt) = receipt else {
+        return Ok(None);
+    };
+    if !matches!(
+        app.retained_session_native_idle_ready(&receipt.session_id),
+        Ok(true)
+    ) {
+        return Ok(None);
+    }
+    let stopped = app.interrupt_resolved_implementer(&receipt).map_err(|error| {
+        subject_failure(error, &receipt.attempt_id, SubjectStep::AttemptAdvance, StepEffect::Possible,
+            serde_json::json!({"operation":"resolved_implementer_stop","session_id":receipt.session_id,
+                "transcript_epoch":receipt.transcript_epoch,"stop_event_rowid":receipt.stop_rowid}))
+    })?;
+    if !stopped {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::json!({
+        "action":"quiescing_resolved_implementer_turn","attempt_id":receipt.attempt_id,
+        "session_id":receipt.session_id,"accepted_result_id":receipt.accepted_result_id,
+        "replacement_started":false
+    })))
+}
+
+fn quiesce_one_completed_probe_report(app: &Application) -> Result<Option<serde_json::Value>> {
+    let receipt = {
+        let connection = app.store.lock()?;
+        crate::store::eligible_completed_probe_report(&connection, None)?
+    };
+    let Some(receipt) = receipt else {
+        return Ok(None);
+    };
+    if !matches!(
+        app.retained_session_native_idle_ready(&receipt.session_id),
+        Ok(true)
+    ) {
+        return Ok(None);
+    }
+    let stopped = app.interrupt_completed_probe_report(&receipt).map_err(|error| {
+        subject_failure(error, &receipt.attempt_id, SubjectStep::AttemptAdvance, StepEffect::Possible,
+            serde_json::json!({"operation":"completed_probe_report_stop","session_id":receipt.session_id,
+                "transcript_epoch":receipt.transcript_epoch,"stop_event_rowid":receipt.stop_rowid}))
+    })?;
+    if !stopped {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::json!({
+        "action":if receipt.scope == "runtime_report" { "quiescing_completed_runtime_report" } else { "quiescing_completed_setup_report" },"attempt_id":receipt.attempt_id,
+        "session_id":receipt.session_id,"accepted_result_id":receipt.accepted_result_id,
+        "replacement_started":false
+    })))
+}
+
 fn complete_one_setup_retained_first_turn(app: &Application) -> Result<Option<serde_json::Value>> {
     let receipt = {
         let connection = app.store.lock()?;
@@ -591,6 +655,7 @@ enum ReviewAction {
         session_id: String,
     },
     ConsumeResult,
+    ReconcileUnanswered(crate::review::UnansweredReview),
     Dispatch,
     CloseUnansweredRecheck {
         request_id: String,
@@ -630,6 +695,10 @@ enum ImplementationSelection {
         unyielded: i64,
     },
     NotifyIntegrationReady,
+    RepairHandoffBlocked {
+        notice: String,
+        notify: bool,
+    },
     WaitForIntegrationRequest {
         configured: i64,
     },
@@ -789,13 +858,31 @@ fn evaluate_attempt_owner(connection: &Connection, attempt: &Attempt) -> Result<
         decision.explanation.subject.recovery_id = Some(recovery_id);
         return Ok(decision);
     }
+    let hold = current_attention_hold(connection, &attempt.id, &attempt.attention)?;
+    if (attempt.attention == "none"
+        || attempt.attention == "needs_review_budget"
+        || (attempt.attention == "needs_input"
+            && hold
+                .as_ref()
+                .is_some_and(|(reason, _)| reason == "role_blocked")))
+        && crate::review::ordinary_code_review_cap_reached(connection, &attempt.id)?
+    {
+        return Ok(blocked_attempt_decision(
+            attempt, "workflow.review_budget_exhausted", DecisionDisposition::Held,
+            DecisionEvidenceState::Pending, DecisionOwner::Human,
+            serde_json::json!({"review_kind":"code","spent":5,"maximum":5,"remaining":0,"candidate_hash":attempt.candidate_hash}),
+            Some("This attempt has used 5 of 5 allowed code reviews. The latest candidate is saved but has not passed code review. Continue and Retry cannot add another review. You can leave the work held for inspection or choose Cancel to stop the task; cancellation keeps its recorded work and history.".into()),
+            prerequisites,
+            serde_json::json!({"action":"held","for":"review_budget_exhausted","attempt_id":attempt.id}),
+            AttemptDecisionFlow::Skip, None, Vec::new(),
+        ));
+    }
     if attempt.attention != "none" {
         let owner = if attempt.attention == "queued_capacity" {
             DecisionOwner::Service
         } else {
             DecisionOwner::Human
         };
-        let hold = current_attention_hold(connection, &attempt.id, &attempt.attention)?;
         return Ok(blocked_attempt_decision(
             attempt,
             "workflow.task_attention_required",
@@ -1369,8 +1456,14 @@ fn classify_review(connection: &Connection, attempt: &Attempt) -> Result<ReviewS
             action: ReviewAction::ConsumeResult,
         });
     }
-    // Ordinary delivered requests keep waiting here, but the final-repair
-    // recheck has no replacement, so its unanswered delivery must close.
+    if let Some(receipt) = crate::review::unanswered_ordinary_review(connection, &attempt.id)? {
+        return Ok(ReviewSelection {
+            kind,
+            role,
+            action: ReviewAction::ReconcileUnanswered(receipt),
+        });
+    }
+    // The final-repair recheck has no replacement, so its unanswered delivery closes.
     if kind == "code" {
         if let Some(request_id) =
             crate::review::unanswered_final_repair_recheck(connection, &attempt.id)?
@@ -1501,6 +1594,17 @@ fn evaluate_review(
 ) -> Result<AttemptDecision> {
     let selection = classify_review(connection, attempt)?;
     let mut decision = match &selection.action {
+        ReviewAction::ReconcileUnanswered(receipt) if !receipt.missing_native_history => blocked_attempt_decision(
+            attempt, "workflow.review_session_exited", DecisionDisposition::Held,
+            DecisionEvidenceState::Pending, DecisionOwner::Human,
+            serde_json::json!({"review_request_id":receipt.request_id,"session_id":receipt.session_id}),
+            Some("The reviewer stopped without a verdict. Choose Resume the stopped session to continue that same review. Its existing review round stays counted.".into()),
+            prerequisites, serde_json::json!({"action":"waiting","for":"review_session_resume","session_id":receipt.session_id}),
+            AttemptDecisionFlow::Observe, None, Vec::new(),
+        ),
+        ReviewAction::ReconcileUnanswered(_) => ready_attempt_decision(
+            attempt, prerequisites, "workflow.review_exit_reconciliation_pending",
+        ),
         ReviewAction::QuiesceCompleted { .. } | ReviewAction::ConsumeResult => {
             ready_attempt_decision(attempt, prerequisites, "workflow.review_result_available")
         }
@@ -1771,6 +1875,12 @@ fn classify_implementation(
             );
         }
         if no_configured_lanes && !active_role_on(connection, &attempt.id, "implementer")? {
+            if let Some(blocker) = crate::repair_handoff::feedback(connection, &attempt.id)?.blocker
+            {
+                let notice = format!("The current source handoff {} cannot be delivered: {}. Load role context and correct it using repair_handoff_template before the retained writer continues. This is an internal handoff correction, not a request for new plan approval.", blocker["result_id"], blocker["reason"]);
+                let notify = manager_notice_pending_on(connection, attempt, &notice, true)?;
+                return Ok(ImplementationSelection::RepairHandoffBlocked { notice, notify });
+            }
             return unless_provider_held(
                 connection,
                 attempt,
@@ -1919,6 +2029,26 @@ fn evaluate_implementation(
                 "unyielded_lanes":unyielded,
             }),
         ),
+        ImplementationSelection::RepairHandoffBlocked { notice, notify } => {
+            if *notify {
+                ready_attempt_decision(
+                    attempt,
+                    prerequisites,
+                    "workflow.repair_handoff_correction_available",
+                )
+            } else {
+                phase_wait_decision(
+                    attempt,
+                    prerequisites,
+                    "workflow.repair_handoff_correction_pending",
+                    DecisionDisposition::Waiting,
+                    DecisionEvidenceState::Pending,
+                    DecisionOwner::Provider,
+                    serde_json::json!({"role":"manager","message":notice}),
+                    serde_json::json!({"action":"waiting","for":"manager_repair_handoff_correction","attempt_id":attempt.id}),
+                )
+            }
+        }
         ImplementationSelection::NotifyIntegrationReady => ready_attempt_decision(
             attempt,
             prerequisites,
@@ -3124,6 +3254,15 @@ fn advance_implementation(
                 "lane_status":lane_status,
             }))
         }
+        ImplementationSelection::RepairHandoffBlocked { notice, notify } => {
+            if notify && queue_manager_notice(app, attempt, &notice, true)? {
+                Ok(
+                    serde_json::json!({"action":"manager_repair_handoff_correction_notified","attempt_id":attempt.id}),
+                )
+            } else {
+                Ok(waiting(attempt, "manager_repair_handoff_correction"))
+            }
+        }
         ImplementationSelection::NotifyIntegrationReady => {
             if queue_manager_notice(app, attempt, INTEGRATION_READY_NOTICE, true)? {
                 Ok(serde_json::json!({
@@ -3223,11 +3362,13 @@ fn advance_implementation(
                     "required_outcome":"candidate_ready",
                 }),
             )?;
-            let launch = app.dispatch_attempt_role(&attempt.id, RoleKind::Implementer, &prompt)?;
+            let (launch, resumed) =
+                dispatch_or_resume_retained_role(app, &attempt.id, &prompt, RoleKind::Implementer)?;
             Ok(serde_json::json!({
                 "action":"implementer_dispatched",
                 "attempt_id":attempt.id,
                 "session_id":launch.session_id,
+                "resumed":resumed,
             }))
         }
         ImplementationSelection::ProviderHeld(held) => Ok(provider_hold_wait(&attempt.id, &held)),
@@ -3513,6 +3654,7 @@ fn advance_review(
 ) -> Result<serde_json::Value> {
     let role = selection.role.to_string();
     match selection.action {
+        ReviewAction::ReconcileUnanswered(receipt) => app.reconcile_unanswered_review(&receipt),
         ReviewAction::QuiesceCompleted { session_id } => {
             app.supervisor.interrupt(&session_id)?;
             Ok(serde_json::json!({
@@ -6850,14 +6992,22 @@ fn dispatch_or_resume_manager(
     attempt: &str,
     prompt: &str,
 ) -> Result<(crate::domain::ValidationLaunchResult, bool)> {
-    let (resumable, current_manager) =
+    dispatch_or_resume_retained_role(app, attempt, prompt, RoleKind::Manager)
+}
+fn dispatch_or_resume_retained_role(
+    app: &Application,
+    attempt: &str,
+    prompt: &str,
+    role: RoleKind,
+) -> Result<(crate::domain::ValidationLaunchResult, bool)> {
+    let (resumable, current_role) =
         {
             let connection = app.store.lock()?;
             let resumable = connection.query_row(
             "SELECT s.id FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
              JOIN attempts a ON a.id=rg.attempt_id JOIN role_settings rs ON rs.task_id=a.task_id
-               AND rs.role='manager' AND rs.effective_generation_id=rg.id
-             WHERE rg.attempt_id=?1 AND rg.role='manager' AND rg.status='exited'
+               AND rs.role=?2 AND rs.effective_generation_id=rg.id
+             WHERE rg.attempt_id=?1 AND rg.role=?2 AND rg.status='exited'
                AND s.status='exited' AND s.native_session_id IS NOT NULL AND s.native_session_id!=''
                AND s.capability_identity_json IS NOT NULL
                AND EXISTS(SELECT 1 FROM capabilities current_capability
@@ -6876,29 +7026,29 @@ fn dispatch_or_resume_manager(
                AND NOT EXISTS(SELECT 1 FROM restart_candidates rc WHERE rc.session_id=s.id
                  AND rc.state NOT IN ('resumed','released_fresh_dispatch','cancelled'))
              ORDER BY rg.generation DESC,s.created_at DESC LIMIT 1",
-            params![attempt],
+            params![attempt, role.to_string()],
             |row| row.get::<_, String>(0),
         ).optional()?;
-            let current_manager = connection.query_row(
+            let current_role = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM role_generations rg JOIN attempts a ON a.id=rg.attempt_id
-             JOIN role_settings rs ON rs.task_id=a.task_id AND rs.role='manager'
+             JOIN role_settings rs ON rs.task_id=a.task_id AND rs.role=?2
                AND rs.effective_generation_id=rg.id
-             WHERE rg.attempt_id=?1 AND rg.role='manager')",
-            params![attempt],
+             WHERE rg.attempt_id=?1 AND rg.role=?2)",
+            params![attempt, role.to_string()],
             |row| row.get(0),
         )?;
-            (resumable, current_manager)
+            (resumable, current_role)
         };
     if let Some(session) = resumable {
         return Ok((app.resume_role_session(&session, "")?, true));
     }
-    if current_manager {
-        bail!("current manager native resume capability or quiescence is unavailable; explicit replacement is required")
+    if current_role {
+        if role == RoleKind::Manager {
+            bail!("current manager native resume capability or quiescence is unavailable; explicit replacement is required")
+        }
+        bail!("current {role} cannot resume its recorded native session; verify its exact identity and quiescence or choose an explicit replacement")
     }
-    Ok((
-        app.dispatch_attempt_role(attempt, RoleKind::Manager, prompt)?,
-        false,
-    ))
+    Ok((app.dispatch_attempt_role(attempt, role, prompt)?, false))
 }
 fn has_result_on(
     connection: &Connection,
@@ -7980,9 +8130,10 @@ fn finish_control_in_transaction(
         tx.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'service','control.applied','control',?3,?4,?5)",params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),id,serde_json::json!({"attention":applied_attention,"attempt_status":applied_status,"rework_state":applied_rework_state,"unfinished_rework":true,"parent_claim_quiescent":parent_claim_quiescent}).to_string(),now])?;
         return Ok(());
     }
-    // attempts.updated_at anchors report currency, so a report made before or during a pause stays consumable.
+    // Control enqueue already clears task attention. Preserve report currency when
+    // releasing the attempt's input hold, as well as when pausing or resuming it.
     let (released_hold, paused_or_resumed): (bool, bool) = tx.query_row(
-        "SELECT a.status='needs_input' AND t.attention='needs_input' AND ?3='running' AND ?4='none',
+        "SELECT a.status='needs_input' AND t.attention IN ('needs_input','none') AND ?3='running' AND ?4='none',
                 (?3='held' AND ?4='paused') OR (a.status='held' AND ?3='running' AND ?4='none')
          FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1 AND t.id=?2",
         params![attempt, task, status, attention],
@@ -8043,6 +8194,35 @@ fn consume_blocked_result(app: &Application, attempt: &str) -> Result<Option<ser
     let row = eligible_blocked_result(&transaction, attempt)?;
     if let Some((result_id, outcome, summary)) = row {
         let now = Utc::now().to_rfc3339();
+        let handoff: Option<String> = transaction.query_row(
+            "SELECT r.metadata_json FROM role_results r JOIN role_generations g ON g.id=r.role_generation_id
+             JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id
+             JOIN sessions s ON s.id=r.session_id AND s.validation_cell IS NULL
+             WHERE r.id=?1 AND g.role='manager' AND r.outcome='needs_input'
+               AND a.phase='implementation' AND t.lifecycle!='validation'
+               AND json_type(r.metadata_json,'$.implementation_capsule') IS NOT NULL",
+            params![result_id], |row| row.get(0),
+        ).optional()?;
+        if let Some(metadata) = handoff {
+            let metadata = serde_json::from_str(&metadata)?;
+            let validation = crate::repair_handoff::validate(&transaction, attempt, &metadata);
+            transaction.execute(
+                "UPDATE role_results SET consumed_at=?1 WHERE id=?2",
+                params![now, result_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+                 VALUES(?1,?2,'service','repair_handoff.consumed','role_result',?3,?4,?5)",
+                params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),result_id,
+                    serde_json::json!({"attempt_id":attempt,"valid":validation.is_ok(),
+                        "problem":validation.err().map(|error|format!("{error:#}")),"human_hold_created":false}).to_string(),now],
+            )?;
+            transaction.commit()?;
+            return Ok(Some(
+                serde_json::json!({"action":"manager_repair_handoff_consumed",
+                "attempt_id":attempt,"result_id":result_id,"human_hold_created":false}),
+            ));
+        }
         transaction.execute(
             "UPDATE attempts SET status='needs_input',updated_at=?1 WHERE id=?2",
             params![now, attempt],
@@ -8065,9 +8245,9 @@ fn consume_blocked_result(app: &Application, attempt: &str) -> Result<Option<ser
                     "role_blocked"
                 },
                 message: if outcome == "needs_input" {
-                    format!("{who} needs your input before it can continue. Read its report in the task's Activity tab, then reply or choose Continue.")
+                    format!("{who} needs your input before it can continue. Read its report in the task's Activity tab, answer the question, then choose Retry when the issue is resolved.")
                 } else {
-                    format!("{who} reported that it is blocked. Read its report in the task's Activity tab, resolve the problem it describes, then choose Continue.")
+                    format!("{who} reported that it is blocked. Read its report in the task's Activity tab, resolve the problem it describes, then choose Retry.")
                 },
             },
             Some((&result_id, &generation_id)),

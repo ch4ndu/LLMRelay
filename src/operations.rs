@@ -375,6 +375,28 @@ impl Application {
         }
     }
 
+    pub(crate) fn interrupt_resolved_implementer(
+        &self,
+        receipt: &crate::store::StoppedTurnReceipt,
+    ) -> Result<bool> {
+        if self.synthetic_dispatch_for_tests {
+            self.store.reserve_resolved_implementer_stop(receipt)
+        } else {
+            self.supervisor.interrupt_resolved_implementer(receipt)
+        }
+    }
+
+    pub(crate) fn interrupt_completed_probe_report(
+        &self,
+        receipt: &crate::store::StoppedTurnReceipt,
+    ) -> Result<bool> {
+        if self.synthetic_dispatch_for_tests {
+            self.store.reserve_completed_probe_report_stop(receipt)
+        } else {
+            self.supervisor.interrupt_completed_probe_report(receipt)
+        }
+    }
+
     pub(crate) fn manager_control_native_idle_ready(&self, session_id: &str) -> Result<bool> {
         // Synthetic dispatch has no provider process to inventory. Its tests still
         // require the durable hook/authority boundary before reaching this seam.
@@ -1859,7 +1881,24 @@ impl Application {
             None
         };
         let feedback = {
-            let mut statement=connection.prepare("SELECT json_object('request_id',id,'kind',review_kind,'verdict',verdict,'feedback',feedback,'candidate_hash',candidate_hash) FROM review_requests WHERE attempt_id=?1 AND delivery_state='finished' AND verdict!='approved' ORDER BY updated_at DESC LIMIT 10")?;
+            let mut statement = connection.prepare(
+                "SELECT json_object('request_id',r.id,'kind',r.review_kind,'verdict',r.verdict,
+                   'feedback',r.feedback,'candidate_hash',r.candidate_hash,'result',json((
+                     SELECT json_object('result_id',rr.id,'summary',rr.summary,
+                       'evidence',json(rr.evidence_json),'metadata',json(rr.metadata_json))
+                     FROM role_results rr JOIN role_generations g ON g.id=rr.role_generation_id
+                     WHERE rr.session_id=r.session_id AND rr.role_generation_id=r.role_generation_id
+                       AND g.attempt_id=r.attempt_id AND rr.outcome=r.verdict
+                       AND g.role=CASE r.review_kind WHEN 'plan' THEN 'plan_reviewer'
+                         WHEN 'code' THEN 'code_reviewer' WHEN 'final' THEN 'final_verifier' END
+                       AND rr.consumed_at IS NOT NULL
+                       AND json_extract(rr.metadata_json,'$.review_request_id')=r.id
+                       AND json_extract(rr.metadata_json,'$.review_kind')=r.review_kind
+                       AND json_extract(rr.metadata_json,'$.candidate_hash')=r.candidate_hash
+                     ORDER BY rr.created_at DESC,rr.id DESC LIMIT 1)))
+                 FROM review_requests r WHERE r.attempt_id=?1 AND r.delivery_state='finished'
+                   AND r.verdict!='approved' ORDER BY r.updated_at DESC LIMIT 10",
+            )?;
             let rows = statement
                 .query_map(params![context.attempt_id], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2313,24 +2352,47 @@ impl Application {
         } else {
             None
         };
-        let manager_feedback: Option<String> = if context.role
-            == crate::domain::RoleKind::Implementer
+        let repair_feedback = if ordinary_task
+            && matches!(
+                context.role,
+                crate::domain::RoleKind::Manager | crate::domain::RoleKind::Implementer
+            ) {
+            Some(crate::repair_handoff::feedback(
+                &connection,
+                &context.attempt_id,
+            )?)
+        } else {
+            None
+        };
+        let repair_bindings = if ordinary_task && context.role == crate::domain::RoleKind::Manager {
+            crate::repair_handoff::bindings(&connection, &context.attempt_id)?
+        } else {
+            None
+        };
+        let implementation_handoff: Option<String> = if ordinary_task
+            && matches!(
+                context.role,
+                crate::domain::RoleKind::Manager | crate::domain::RoleKind::Implementer
+            )
+            && context.lane_id == "default"
         {
             connection.query_row(
-                "SELECT json_object('result_id',r.id,'outcome',r.outcome,'summary',r.summary,
-                   'metadata',json(r.metadata_json),'created_at',r.created_at)
-                 FROM role_results r JOIN role_generations g ON g.id=r.role_generation_id
-                 JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id
-                 JOIN role_settings settings ON settings.task_id=t.id AND settings.role='manager'
-                   AND settings.effective_generation_id=g.id
-                 WHERE t.project_id=?1 AND t.id=?2 AND a.id=?3 AND a.phase='implementation'
-                   AND g.role='manager' AND r.outcome='needs_input'
-                   AND json_extract(r.metadata_json,'$.approved_plan_hash')=a.plan_hash
-                   AND json_extract(r.metadata_json,'$.candidate_hash') IS a.candidate_hash
-                   AND EXISTS(SELECT 1 FROM sessions own WHERE own.id=?4 AND own.validation_cell IS NULL)
-                 ORDER BY r.created_at DESC,r.id DESC LIMIT 1",
-                params![context.project_id,context.task_id,context.attempt_id,context.session_id],
-                |row| row.get(0),
+                "SELECT json_object('structured_plan',json(p.plan_json),'bindings',json_object(
+                  'task_id',t.id,'attempt_id',a.id,'task_version',t.version,'source_phase',a.phase,
+                  'approved_plan_hash',a.plan_hash,'approved_plan_record_id',p.id,'candidate_hash',a.candidate_hash,
+                  'base_revision',a.base_revision,'scope_hash',a.scope_hash,'attempt_configuration_hash',a.configuration_hash,
+                  'implementer_role_generation_id',g.id,'session_id',s.id,'transcript_epoch',s.transcript_epoch,'lane_id',g.lane_id,
+                  'reviewed_at',p.reviewed_at,'approved_at',p.approved_at,'implementation_authorized_at',p.implementation_authorized_at))
+                 FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN trip_structured_plans p ON p.id=a.structured_plan_id AND p.attempt_id=a.id AND p.plan_hash=a.plan_hash
+                 JOIN role_generations g ON g.id=?4 AND g.attempt_id=a.id AND g.role=?6 AND g.lane_id='default'
+                 JOIN role_settings settings ON settings.task_id=t.id AND settings.role=g.role AND settings.effective_generation_id=g.id
+                 JOIN sessions s ON s.id=?5 AND s.role_generation_id=g.id AND s.validation_cell IS NULL
+                 WHERE a.id=?1 AND t.id=?2 AND t.project_id=?3
+                   AND ((?6='implementer' AND a.phase='implementation' AND a.candidate_hash IS NULL)
+                     OR (?6='manager' AND a.phase IN ('implementation','code_review','checks','final_review','manager_handoff')))
+                   AND p.reviewed_at IS NOT NULL AND p.approved_at IS NOT NULL AND p.implementation_authorized_at IS NOT NULL
+                   AND g.status NOT IN ('replaced','revoked')",
+                params![context.attempt_id,context.task_id,context.project_id,context.role_generation_id,context.session_id,context.role.to_string()],|row|row.get(0),
             ).optional()?
         } else {
             None
@@ -2405,11 +2467,48 @@ impl Application {
         if let Some(recheck) = final_repair_recheck {
             value["final_repair_recheck"] = serde_json::from_str(&recheck)?;
         }
-        if let Some(feedback) = manager_feedback {
-            value["manager_feedback"] = serde_json::json!({
-                "result":serde_json::from_str::<serde_json::Value>(&feedback)?,
-                "authority":"Source repair guidance only. Preserve approved ownership and human approval boundaries. This is not a new approval, a selected-check receipt, or permission to report unverified completion. A source candidate may list pending checks for later service verification."
+        if let Some(feedback) = repair_feedback {
+            if context.role == crate::domain::RoleKind::Implementer {
+                if let Some(result) = feedback.result.filter(|result| {
+                    result["metadata"].get("implementation_capsule").is_none()
+                        || (result["metadata"]["implementation_capsule"]["bindings"]["session_id"]
+                            == context.session_id
+                            && result["metadata"]["implementation_capsule"]["bindings"]
+                                ["implementer_role_generation_id"]
+                                == context.role_generation_id)
+                }) {
+                    value["manager_feedback"] = serde_json::json!({
+                        "result":result,
+                        "authority":"Source repair guidance only. Preserve approved ownership and human approval boundaries. This is not a new approval, a selected-check receipt, or permission to report unverified completion. A source candidate may list pending checks for later service verification."
+                    });
+                }
+            }
+            if let Some(blocker) = feedback.blocker {
+                value["manager_feedback_blocker"] = blocker;
+            }
+        }
+        if let Some(bindings) = repair_bindings {
+            value["repair_handoff_template"] = serde_json::json!({
+                "bindings":bindings,
+                "report_metadata":{"approved_plan_hash":bindings["approved_plan_hash"],
+                    "candidate_hash":bindings["candidate_hash"],"implementation_capsule":{"bindings":bindings}},
+                "guidance":"Use this exact metadata shape only when Manager source directions are needed. Routine accepted review repairs use review_feedback and the complete approved plan. Add directions beside bindings. Never pin a future retained turn to a historical task_version, transcript_epoch or resume_count. This template grants no new scope, check execution, review allowance or human approval."
             });
+        }
+        if let Some(handoff) = implementation_handoff {
+            let handoff: serde_json::Value = serde_json::from_str(&handoff)?;
+            value["structured_plan"] = handoff["structured_plan"].clone();
+            if context.role == crate::domain::RoleKind::Implementer {
+                value["implementation_capsule"] = serde_json::json!({
+                    "bindings":handoff["bindings"],"ownership":handoff["structured_plan"]["ownership"],
+                    "restrictions":handoff["structured_plan"]["restrictions"],"documentation":handoff["structured_plan"]["documentation"],
+                    "verification_matrix":handoff["structured_plan"]["verification_matrix"],
+                    "config_revision_id":value["project_policy"]["config_revision_id"],
+                    "project_configuration_hash":value["project_policy"]["configuration_hash"],
+                    "selected_checks":value["selected_checks"],
+                    "authority":"Exact recorded approved plan and separate implementation authorization. This projection grants no broader scope, check execution, native permission or completion authority."
+                });
+            }
         }
         if serde_json::to_vec(&value)?.len() > 1024 * 1024 {
             bail!("task-scoped role context exceeds the 1 MiB response bound")
@@ -3153,6 +3252,56 @@ impl Application {
             self.record_permanent_resume_rejection(session_id, error, None)?;
         }
         result
+    }
+
+    pub(crate) fn reconcile_unanswered_review(
+        &self,
+        receipt: &crate::review::UnansweredReview,
+    ) -> Result<serde_json::Value> {
+        let recorded = if receipt.missing_native_history {
+            let record = self.store.session_json(&receipt.session_id)?;
+            let prior: LaunchConfig = serde_json::from_value(record["launch_config"].clone())?;
+            let invocation = self.store.invocation_input(&receipt.session_id)?;
+            self.store
+                .validate_resume_input(&receipt.session_id, &invocation)?;
+            let prompt = invocation["prompt"]
+                .as_str()
+                .context("review session is missing its persisted input")?;
+            let read_denials =
+                crate::trip::setup_target_read_denials(&self.store, &receipt.attempt_id)?;
+            // Prepare the exact profile to measure its current identity. No
+            // reservation, provider spawn, or review allowance is spent here.
+            let prepared = providers::prepare_role_launch_with_read_denials_and_bundles(
+                prior.provider,
+                prior.role,
+                &prior.model,
+                &prior.effort,
+                &prior.cwd,
+                prompt,
+                &self.paths.role_socket,
+                &auth::issue_secret(),
+                &receipt.generation_id,
+                &receipt.session_id,
+                None,
+                &self.hooks,
+                &self.executable,
+                &read_denials,
+                &self.store.compatibility_bundles,
+            )?;
+            self.store.record_unanswered_review_rejection(
+                receipt,
+                &PreparedResumeIdentity::from_launch(&prepared.config)?,
+            )?
+        } else {
+            return Ok(
+                serde_json::json!({"action":"waiting","for":"review_session_resume",
+                "request_id":receipt.request_id,"session_id":receipt.session_id}),
+            );
+        };
+        Ok(
+            serde_json::json!({"action":if recorded {"review_session_recovery_required"} else {"review_recovery_superseded"},
+            "request_id":receipt.request_id,"session_id":receipt.session_id,"new_provider_call":false}),
+        )
     }
 
     pub fn resume_role_session_with_operation(

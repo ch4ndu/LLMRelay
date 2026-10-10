@@ -21,7 +21,13 @@ export function ReviewPanel(
   const [carryApproval, setCarryApproval] = useState(false);
   const [additionalJustification, setAdditionalJustification] = useState("");
   const [error, setError] = useState("");
+  const [pending, setPending] = useState(false);
+  const [submittedDecision, setSubmittedDecision] = useState<string | null>(null);
+  const inFlight = useRef(false);
   const attempt = task.active_attempt;
+  const terminal = ["done", "cancelled"].includes(task.lifecycle) ||
+    ["done", "cancelled"].includes(attempt?.status ?? "");
+  const reviewStage = JSON.stringify([task.id, attempt?.id, attempt?.phase]);
   const operationStorageKey = `llmrelay.review.operations.${task.id}`;
   const commandIdentities = useRef(
     new Map<string, { body: string; id: string }>(
@@ -38,6 +44,9 @@ export function ReviewPanel(
     ),
   );
   const invoke = async (body: Record<string, unknown>) => {
+    if (terminal || inFlight.current || submittedDecision === reviewStage) {
+      return false;
+    }
     const key = operationIntent(body);
     const stable = reuseOperationIdentity(
       commandIdentities.current.get(key),
@@ -49,6 +58,8 @@ export function ReviewPanel(
       operationStorageKey,
       JSON.stringify([...commandIdentities.current]),
     );
+    inFlight.current = true;
+    setPending(true);
     try {
       await command({ ...request, operation_id: id } as never);
       commandIdentities.current.delete(key);
@@ -57,6 +68,9 @@ export function ReviewPanel(
         JSON.stringify([...commandIdentities.current]),
       );
       setError("");
+      if (body.kind === "human_review" || body.kind === "approve_plan") {
+        setSubmittedDecision(reviewStage);
+      }
       onChanged();
       return true;
     } catch (cause) {
@@ -76,6 +90,9 @@ export function ReviewPanel(
       );
       onChanged();
       return false;
+    } finally {
+      inFlight.current = false;
+      setPending(false);
     }
   };
   const relevantActions = actions.filter((action) =>
@@ -119,7 +136,7 @@ export function ReviewPanel(
   };
 
   if (
-    !attempt ||
+    terminal || submittedDecision === reviewStage || !attempt ||
     ![
         "awaiting_plan_approval",
         "awaiting_human_review",
@@ -187,6 +204,7 @@ export function ReviewPanel(
         <>
           <textarea
             aria-label="Review or rework feedback"
+            disabled={pending}
             placeholder="Describe what should change (required to request rework)"
             value={feedback}
             onChange={(event) => setFeedback(event.target.value)}
@@ -194,6 +212,7 @@ export function ReviewPanel(
           <label className="toggle">
             <input
               type="checkbox"
+              disabled={pending}
               checked={carryApproval}
               onChange={(event) => setCarryApproval(event.target.checked)}
             />Keep the approved plan for the rework (only when the task scope
@@ -204,7 +223,7 @@ export function ReviewPanel(
       <div className="button-row">
         {!plan && !implementation && (
           <button
-            disabled={!feedback.trim()}
+            disabled={pending || !feedback.trim()}
             onClick={() => apply("request_changes")}
           >
             Request rework
@@ -214,7 +233,7 @@ export function ReviewPanel(
           ? (
             <button
               className="primary"
-              disabled={!implementationAuthorization?.enabled ||
+              disabled={pending || !implementationAuthorization?.enabled ||
                 !bindingString(implementationAuthorization, "plan_hash")}
               onClick={() =>
                 void invoke({
@@ -235,7 +254,7 @@ export function ReviewPanel(
           : (
             <button
               className="primary"
-              disabled={plan && !attempt.plan}
+              disabled={pending || (plan && !attempt.plan)}
               onClick={() => apply("accept")}
             >
               {plan ? "Approve plan" : "Accept result"}
@@ -247,7 +266,7 @@ export function ReviewPanel(
           <strong>Move this task to the current workflow</strong>
           <span>{migration.reason}</span>
           <button
-            disabled={!migration.enabled ||
+            disabled={pending || !migration.enabled ||
               !bindingString(migration, "plan_hash") ||
               !bindingString(migration, "config_revision_id")}
             onClick={() =>
@@ -274,13 +293,14 @@ export function ReviewPanel(
           <span>{additionalExplorer.reason}</span>
           <textarea
             aria-label="Additional Explorer justification"
+            disabled={pending}
             maxLength={400}
             value={additionalJustification}
             onChange={(event) => setAdditionalJustification(event.target.value)}
             placeholder="Why one more Explorer call is needed"
           />
           <button
-            disabled={!additionalExplorer.enabled ||
+            disabled={pending || !additionalExplorer.enabled ||
               !additionalJustification.trim()}
             onClick={() =>
               void invoke({

@@ -7705,6 +7705,7 @@ struct RuntimePermissionHook {
 struct RuntimeFirstInvocationHooks {
     commands: Vec<RuntimeHookCommand>,
     permission_requests: Vec<RuntimePermissionHook>,
+    provider_model: Option<String>,
 }
 
 fn bound_runtime_first_invocation_hooks(
@@ -7788,26 +7789,53 @@ fn bound_runtime_first_invocation_hooks(
     let Some(prompt_boundary) = prompt_boundary else {
         return Ok(None);
     };
-    let session_started: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM hook_events
+    let mut starts = connection.prepare(
+        "SELECT payload_json FROM hook_events
          WHERE session_id=?1 AND role_generation_id=?2 AND provider=?3
            AND event_name='SessionStart' AND native_session_id=?4
            AND provenance_state='managed_process_group_untrusted_payload'
            AND peer_pid>0 AND peer_process_group_id>0
-           AND TRIM(peer_start_marker)!='' AND rowid>?5 AND rowid<?6)",
-        params![
-            session_id,
-            role_generation_id,
-            provider.to_string(),
-            native_session_id,
-            initial_boundary,
-            prompt_boundary
-        ],
-        |row| row.get(0),
+           AND TRIM(peer_start_marker)!='' AND rowid>?5 AND rowid<?6
+         ORDER BY rowid LIMIT 2",
     )?;
-    if !session_started {
+    let starts = starts
+        .query_map(
+            params![
+                session_id,
+                role_generation_id,
+                provider.to_string(),
+                native_session_id,
+                initial_boundary,
+                prompt_boundary
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if starts.is_empty() {
         return Ok(None);
     }
+    let requested_model: String = connection.query_row(
+        "SELECT json_extract(launch_config_json,'$.model') FROM sessions WHERE id=?1",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    // This relays one bounded provider claim, not remote model attestation.
+    // Missing, conflicting or ambiguous payloads cannot fall back to settings.
+    let provider_model = if starts.len() == 1 {
+        serde_json::from_str::<serde_json::Value>(&starts[0])
+            .ok()
+            .and_then(|payload| payload.get("model")?.as_str().map(str::to_owned))
+            .filter(|model| {
+                model == &requested_model
+                    && !model.is_empty()
+                    && model.len() <= 256
+                    && model
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-:/".contains(&byte))
+            })
+    } else {
+        None
+    };
     let mut statement = connection.prepare(
         "SELECT event_name,payload_json FROM hook_events
          WHERE session_id=?1 AND role_generation_id=?2 AND provider=?3
@@ -7889,6 +7917,7 @@ fn bound_runtime_first_invocation_hooks(
     Ok(Some(RuntimeFirstInvocationHooks {
         commands,
         permission_requests,
+        provider_model,
     }))
 }
 
@@ -7960,6 +7989,81 @@ fn require_runtime_permission_delivery_denial(
 enum RuntimeCommandConsistency {
     Exact,
     PermanentMismatch,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RuntimeReportRejection {
+    CommandMismatch,
+    ModelObservationMismatch,
+}
+
+impl RuntimeReportRejection {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::CommandMismatch => "runtime_command_mismatch",
+            Self::ModelObservationMismatch => "runtime_model_observation_mismatch",
+        }
+    }
+
+    pub(crate) fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "runtime_command_mismatch" => Some(Self::CommandMismatch),
+            "runtime_model_observation_mismatch" => Some(Self::ModelObservationMismatch),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RuntimeReportRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CommandMismatch => "ordinary runtime evidence does not match the exact authenticated native hook commands and count; prepare corrected runtime verification for a fresh scope",
+            Self::ModelObservationMismatch => "runtime model evidence does not match the bound first-invocation provider SessionStart observation; prepare corrected runtime verification for a fresh scope",
+        })
+    }
+}
+
+impl std::error::Error for RuntimeReportRejection {}
+
+pub(crate) fn record_runtime_report_rejection(
+    connection: &Connection,
+    context: &RoleContext,
+    operation_id: &str,
+    now: &str,
+    rejection: RuntimeReportRejection,
+) -> Result<()> {
+    let (admission, permit): (String, String) = connection.query_row(
+        "SELECT p.admission_id,sp.id FROM trip_runtime_probes p
+         JOIN sessions s ON s.id=p.session_id
+         JOIN role_generations rg ON rg.id=s.role_generation_id AND rg.attempt_id=p.attempt_id AND rg.role=p.role
+         JOIN trip_setup_permits sp ON sp.id=s.setup_permit_id AND sp.attempt_id=p.attempt_id AND sp.role=p.role
+         JOIN role_credentials rc ON rc.id=?4 AND rc.role_generation_id=rg.id AND rc.revoked_at IS NULL
+         WHERE s.id=?1 AND rg.id=?2 AND s.transcript_epoch=?3
+           AND s.status='running' AND rg.status='running' AND s.validation_cell='trip_runtime_probe'
+           AND sp.state='issued' AND sp.purpose='runtime_probe' AND sp.approved_action='ordinary_runtime_capability'
+           AND p.state IN ('authorized','running','awaiting_resume')",
+        params![context.session_id,context.role_generation_id,context.transcript_epoch,context.credential_id],
+        |row| Ok((row.get(0)?,row.get(1)?)),
+    )?;
+    let reason = rejection.to_string();
+    connection.execute(
+        "UPDATE trip_runtime_probes SET state='failed',failure_reason=?1,updated_at=?2 WHERE admission_id=?3 AND session_id=?4",
+        params![reason,now,admission,context.session_id],
+    )?;
+    connection.execute(
+        "UPDATE trip_setup_permits SET state='consumed',consumed_at=?1 WHERE id=?2",
+        params![now, permit],
+    )?;
+    refresh_runtime_admission_state(connection, &admission, now)?;
+    connection.execute(
+        "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+         VALUES(?1,?2,'service','runtime.report.rejected','session',?3,?4,?5)",
+        params![uuid::Uuid::new_v4().to_string(),operation_id,context.session_id,
+            serde_json::json!({"role_generation_id":context.role_generation_id,
+                "transcript_epoch":context.transcript_epoch,"credential_id":context.credential_id,
+                "permit_id":permit,"reason_code":rejection.code(),"reason":reason}).to_string(),now],
+    )?;
+    Ok(())
 }
 
 fn runtime_command_consistency(
@@ -8661,6 +8765,15 @@ fn record_runtime_probe_report(
             if !category_matches {
                 bail!("failed ordinary runtime evidence category does not match its structured outcomes")
             }
+            if let Some(missing) = evidence.get("missing_observation") {
+                if category != "observation_unavailable"
+                    || !missing
+                        .as_str()
+                        .is_some_and(crate::domain::runtime_missing_observation)
+                {
+                    bail!("missing_observation must name a required non-command observation and requires observation_unavailable")
+                }
+            }
             if matches!(
                 runtime_command_consistency(
                     connection,
@@ -8678,13 +8791,25 @@ fn record_runtime_probe_report(
                 )?,
                 RuntimeCommandConsistency::PermanentMismatch
             ) {
-                bail!("ordinary runtime evidence does not match the exact authenticated native hook commands and count; prepare corrected runtime verification for a fresh scope")
+                return Err(RuntimeReportRejection::CommandMismatch.into());
             }
         }
         let reason = if status == Some("missing_context") {
             "retained native conversation did not recall the original nonce and observations"
+                .to_owned()
         } else {
-            "ordinary runtime probe reported an observed failure"
+            let category = evidence["failure_category"]
+                .as_str()
+                .unwrap_or("unexpected_result");
+            if category == "observation_unavailable" {
+                let missing = evidence
+                    .get("missing_observation")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("missing observation not identified");
+                format!("ordinary runtime probe reported observation_unavailable: {missing}")
+            } else {
+                format!("ordinary runtime probe reported an observed failure: {category}")
+            }
         };
         let now = Utc::now().to_rfc3339();
         connection.execute("UPDATE trip_runtime_probes SET state='failed',failure_reason=?1,session_id=?2,updated_at=?3 WHERE admission_id=?4 AND role=?5",params![reason,context.session_id,now,admission,role])?;
@@ -8776,9 +8901,25 @@ fn record_runtime_probe_report(
         )?,
         RuntimeCommandConsistency::PermanentMismatch
     ) {
-        bail!("ordinary runtime evidence does not match the exact authenticated native hook commands and count; prepare corrected runtime verification for a fresh scope")
+        return Err(RuntimeReportRejection::CommandMismatch.into());
     }
     require_runtime_probe_session_policy(connection, &context.session_id, role_kind, None)?;
+    if let Some(model) = evidence
+        .get("model_evidence")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.strip_prefix("provider_session_start:"))
+    {
+        let observed = bound_runtime_first_invocation_hooks(
+            connection,
+            &context.session_id,
+            &context.role_generation_id,
+            role_kind,
+        )?
+        .and_then(|hooks| hooks.provider_model);
+        if observed.as_deref() != Some(model) {
+            return Err(RuntimeReportRejection::ModelObservationMismatch.into());
+        }
+    }
     if role_kind == RoleKind::Implementer {
         let write = Path::new(workspace).join(format!("runtime-write-{nonce}.txt"));
         let permission = Path::new(workspace).join(format!("runtime-permission-{nonce}.txt"));
@@ -9191,7 +9332,7 @@ pub fn setup_context(
             bail!("resumed runtime probe context is unavailable; submit the retained recall report without reading context")
         }
     }
-    let contract = if purpose == "setup_discovery" {
+    let mut contract = if purpose == "setup_discovery" {
         serde_json::json!({"setup_operation_id":setup_id,"purpose":purpose,"approved_action":action,
             "target_inventory":serde_json::from_str::<serde_json::Value>(&inventory)?,"target_write_authority":false})
     } else {
@@ -9226,6 +9367,25 @@ pub fn setup_context(
             "workspace_probe_relative_path":nonce.as_ref().map(|value|format!("trip-probe-{value}.txt")),
             "target_inventory":serde_json::Value::Null,"target_data_access":false})
     };
+    if purpose == "runtime_probe" {
+        let role_kind: RoleKind = role.parse().map_err(|error: String| anyhow!(error))?;
+        if let Some(model) = bound_runtime_first_invocation_hooks(
+            connection,
+            &context.session_id,
+            &context.role_generation_id,
+            role_kind,
+        )?
+        .and_then(|hooks| hooks.provider_model)
+        {
+            contract["provider_model_observation"] = serde_json::json!({
+                "model":model,
+                "model_evidence":format!("provider_session_start:{model}"),
+                "source":"managed_process_session_start_payload",
+                "source_trust":"untrusted_provider_payload",
+                "backend_identity_attested":false
+            });
+        }
+    }
     Ok(Some(contract))
 }
 
@@ -9283,7 +9443,7 @@ fn probe_contracts(store: &Store, attempt_id: &str) -> Result<Vec<serde_json::Va
 
 const RUNTIME_OUTCOME_REPORT_SCHEMA: &str = "Only a native invocation with exactly the listed command text counts as the prescribed attempt: no prefix, suffix, echo/status fragment, shell wrapper, or other token is allowed, and a prescribed command must not be altered to fit a deviation. Record exit_status from native tool exit metadata; a provider denial before spawn has null exit_status and must not be wrapped to manufacture a status. A provider denial before spawn must be reported as `--actual=<operation>,true,null,denied,provider,native_session`, not invocation_prevented. Reserve invocation_prevented exclusively for a shell-construction failure with result=invocation_prevented and denial=shell. Repeat --actual=operation,attempted,exit-or-null,result,denial,authentication once for every prescribed operation. result is succeeded, denied, invocation_prevented, refused, unavailable, or unexpected; denial is none, os, provider, shell, model, or unavailable; authentication is native_session or none. attempted=true means the exact invocation was issued through the native tool/provider, including an authenticated provider denial before spawn. attempted=false is valid only for refused/model or unavailable/unavailable, with null exit and none authentication. A spawned success requires exit 0 and denial none; an OS denial has a nonzero exit with denied/os. Preserve actual integer or null exit values for every other observation. A passing report requires every operation attempted through native_session with its prescribed result. When cmux_socket_connect is listed, only an authenticated nonzero denied/os outcome plus the exact diagnostic line `llmrelay: unix-connect os_error errno=1 class=EPERM` or `llmrelay: unix-connect os_error errno=13 class=EACCES` satisfies that bounded connection check. Preserve the exact native diagnostic bytes; if provider display strips it, it may omit only one terminal LF or CRLF from that line. Timeout, path errors, absent or refused endpoints, provider prevention, unexpected or truncated stderr, or an exit code by itself do not prove sandbox denial. For every attempted cmux_socket_connect, preserve its complete native stderr with --cmux-stderr-hex=<hex>; use --cmux-stderr-hex=empty only when the observed stderr is empty. A failed report uses one matching failure category: authentication_missing, os_denial, provider_denial, shell_construction, model_refusal, observation_unavailable, or unexpected_result. An expected denied result is not itself a failure. A prescribed command result of unavailable uses unexpected_result. Use observation_unavailable only when every prescribed command outcome matches but a required non-command pass observation cannot be directly observed. The service-recorded frozen launch-policy identity describes configured controls; it is not OS-enforcement attestation. Command outcomes, exit statuses, denial sources, and authentication are native observations. Optional --sandbox-identity is only an untrusted supplementary agent description: supply it only if directly exposed by the active provider/runtime, never invent it or infer it from launch configuration, expected policy, or provider-denied commands. Its absence does not make otherwise complete passed evidence fail. When a command-derived failure exists, use its concrete matching category instead of observation_unavailable.";
 
-const RUNTIME_TYPED_REPORT_SCHEMA: &str = "For this runtime probe only, these instructions override the appended generic JSON report channel: use one direct `<exact-executable> role report --runtime-v1` command, never --json, --file, stdin, a pipe, redirect, heredoc, command substitution, helper, wrapper, prefix, suffix, or second report. Every supplied value is a decoded unquoted atom using only ASCII letters, digits, dot, underscore, hyphen, colon, or slash; use equals only between each flag and value and commas only inside --actual. --cmux-stderr-hex is the one exception: it is the exact native diagnostic stderr encoded as hexadecimal, or the atom empty only for zero stderr. If provider display strips only one terminal LF or CRLF from the exact cmux diagnostic line, encode that otherwise exact line without the stripped ending. Always supply --operation-id=<new-safe-id> and --status=<passed|failed|missing_context>. Passed requires --nonce=<remembered-nonce>, --model-evidence=<observed-atom>, --session-mode=<fresh|retained>, --target-data-accessed=<true|false>, --fallback-observed=<true|false>, --authentication-observed=<true|false>, and all --actual fields; do not default any required observation. Passed may additionally include --sandbox-identity=<observed-atom> only as an optional untrusted supplementary agent description directly exposed by the active provider/runtime. Failed requires only --failure-category=<category> and all --actual fields. When cmux_socket_connect was attempted, either status requires --cmux-stderr-hex=<exact-native-stderr-hex>. Missing_context accepts no other fields. The CLI inserts the fixed runtime cell metadata and canonical transport metadata; neither is an agent observation. Do not supply commands in --actual.";
+const RUNTIME_TYPED_REPORT_SCHEMA: &str = "For this runtime probe only, these instructions override the appended generic JSON report channel: use one direct `<exact-executable> role report --runtime-v1` command, never --json, --file, stdin, a pipe, redirect, heredoc, command substitution, helper, wrapper, prefix, suffix, or second report. Every supplied value is a decoded unquoted atom using only ASCII letters, digits, dot, underscore, hyphen, colon, or slash; use equals only between each flag and value and commas only inside --actual. --cmux-stderr-hex is the one exception: it is the exact native diagnostic stderr encoded as hexadecimal, or the atom empty only for zero stderr. If provider display strips only one terminal LF or CRLF from the exact cmux diagnostic line, encode that otherwise exact line without the stripped ending. Always supply --operation-id=<new-safe-id> and --status=<passed|failed|missing_context>. Passed requires --nonce=<remembered-nonce>, --model-evidence=<observed-atom>, --session-mode=<fresh|retained>, --target-data-accessed=<true|false>, --fallback-observed=<true|false>, --authentication-observed=<true|false>, and all --actual fields; do not default any required observation. When the first invocation's role context exposes setup_contract.provider_model_observation, retain its exact model_evidence atom and use that as the observed --model-evidence on the reporting turn. This records what the native CLI SessionStart payload reported, not attestation of the remote backend model. The service checks this observation against the same first invocation; requested profile settings alone are not model evidence. Do not reread context on retained resume. Passed may additionally include --sandbox-identity=<observed-atom> only as an optional untrusted supplementary agent description directly exposed by the active provider/runtime. Failed requires --failure-category=<category> and all --actual fields. For observation_unavailable, also identify the missing required non-command observation with --missing-observation=<field>, choosing model_evidence, session_mode_observed, target_data_accessed, fallback_observed, or authentication_observed. An unavailable optional sandbox description is not a failure; omit that optional flag. Never infer a passed observation from requested settings. Older failed reports without the diagnostic field remain failed and explicitly lack an identified cause. When cmux_socket_connect was attempted, either status requires --cmux-stderr-hex=<exact-native-stderr-hex>. Missing_context accepts no other fields. The CLI inserts the fixed runtime cell metadata and canonical transport metadata; neither is an agent observation. Do not supply commands in --actual.";
 
 pub fn setup_launch_prompt(store: &Store, attempt_id: &str, role: RoleKind) -> Result<String> {
     let connection = store.lock()?;
@@ -9348,7 +9508,7 @@ pub fn setup_launch_prompt(store: &Store, attempt_id: &str, role: RoleKind) -> R
             base_expectations,
             cmux_connection_requirement,
         );
-        format!("{phase} Perform only the service-owned ordinary runtime capability probe `{action}` in this app-owned disposable empty worktree. {checks} {RUNTIME_TYPED_REPORT_SCHEMA} {RUNTIME_OUTCOME_REPORT_SCHEMA} {session} Do not install, implement, inspect the user's target, delegate, retry any action, or claim approval. If every required observation actually passed, use --nonce={nonce} and --session-mode={}; supply target-data-accessed=false, fallback-observed=false, and authentication-observed=true only because you actually observed them. If any observation failed or was unavailable, use --status=failed with one normalized matching --failure-category and the complete actual outcomes, without passing nonce, identity, session, or boolean flags. At reporting time submit exactly one report; if it is rejected, stop without changing its operation ID or contents and without submitting a successor report. The report is evidence input only; an authenticated human must separately publish proof. {phase_end}",if role==RoleKind::FinalReviewer{"fresh"}else{"retained"})
+        format!("{phase} Perform only the service-owned ordinary runtime capability probe `{action}` in this app-owned disposable empty worktree. Read role context once before these probe commands to observe any setup_contract.provider_model_observation; retain the observation for the reporting turn. {checks} {RUNTIME_TYPED_REPORT_SCHEMA} {RUNTIME_OUTCOME_REPORT_SCHEMA} {session} Do not install, implement, inspect the user's target, delegate, retry any action, or claim approval. If every required observation actually passed, use --nonce={nonce} and --session-mode={}; supply target-data-accessed=false, fallback-observed=false, and authentication-observed=true only because you actually observed them. If any observation failed or was unavailable, use --status=failed with one normalized matching --failure-category and the complete actual outcomes, without passing nonce, identity, session, or boolean flags. At reporting time submit exactly one report; if it is rejected, stop without changing its operation ID or contents and without submitting a successor report. The report is evidence input only; an authenticated human must separately publish proof. {phase_end}",if role==RoleKind::FinalReviewer{"fresh"}else{"retained"})
     } else if purpose == "setup_discovery" {
         "Perform only the setup discovery contract in role context. Use the bounded service inventory and setup-read for additional contained non-secret text; do not write the target, access it by another path, delegate, or propose implementation work. On the first invocation, reach a safe idle boundary without reporting; report only after the service resumes this same retained manager session. Report capability_observed with validation_observation containing cell=trip_setup_discovery, model_evidence, effective_sandbox_identity, session_mode_observed=retained, and an actionable setup_proposal_summary object. That object permits only these optional policy fields: project_name (non-blank string, at most 512 bytes); guidance (at most 64 normalized contained project-relative path strings, each at most 4 KiB); documentation ({\"no_change_text\": non-blank string}); verification (an object with optional focused, broad, and cleanup arrays, each at most 64 non-blank single-line exact shell-command strings, each at most 8 KiB); and agents_content (non-blank string containing the existing AGENTS.md bytes exactly followed by any proposed additions). The complete validation_observation remains within 64 KiB. Include at least one policy field, omit fields you cannot support, and include no other setup_proposal_summary keys. These are suggestions only: do not suggest profiles, model or permission changes, test-coverage consent, observability consent, local-exclude approval, migration resolutions, probe authorization, save, installation, or activation authority. Human choices remain explicit and this report cannot save or activate installation.".into()
     } else {

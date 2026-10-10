@@ -246,14 +246,40 @@ authorize a replacement or bypass an approval.
 
 | Situation | Next action and boundary |
 | --- | --- |
+| Agent asks a question or reports a blocker | Read its report in **Activity**, answer or resolve the issue, then choose **Retry** if the task still needs input. Releasing this hold preserves already accepted candidate reports; it does not require another Implementer report or change the plan, review budgets or approval gates. |
 | Exact native resume rejected after runtime identity changes | Review the reason. **Start a fresh session** is available only if the same role profile and current authority still qualify. It consumes a fresh call; it is not native resume. |
 | Role, candidate, configuration, hook trust, native history or invocation provenance changed | Review the current role authority or prepare corrected verification. Old approval evidence cannot be reused as replacement authority. |
 | Resume or review authority already spent | New explicit authorization is required; the dashboard cannot reset the allowance. Unknown permanent rejections remain terminal with their reason. |
+| Reviewer exited without a verdict | A known conversation offers **Resume the stopped session**. If no resumable conversation was established, the service measures the current profile and records recovery without starting another agent. The delivered review remains spent. |
+| Failed reviewer has used its authorized rounds, below the five-review limit | **Allow one more code review** or **Allow one more plan review** adds exactly one authorized round. It does not launch an agent; refresh and use **Start a fresh session** only when the exact recovery binding qualifies. |
+| Saved candidate needs code review after all five ordinary reviews were spent | The task explains **Code review limit reached**. Continue, Run next and Retry cannot add a sixth review. Leave the candidate held for inspection or use **Cancel**, which preserves recorded work and history. The dedicated final-repair recheck retains its separate receipt rules. |
 | Interrupted installation or uncertain workspace creation | Open project/task recovery and follow its journal or reservation action; see [project recovery](PROJECT_SETUP.md#interrupted-setup-and-workspace-recovery). |
 | Workspace preparation refused to overwrite changed workflow or guidance files | The task explains which case applies. A guidance file that differs from the commit can be restored and the reservation retried. Workflow files changed again after setup cannot be fixed by retrying, because the workspace always starts from the recorded commit: choose **Verify and cancel reservation** (this cancels the task), commit the changes, choose **Validate and relink**, then create the task again. The failed reservation stays recorded. |
 | Service cannot prove process exit | Resolve exact process ownership before resuming or replacing work. A quiet terminal is not proof of exit. |
 | Graceful stop exceeds 30 seconds | The service records recovery for the exact managed process. Choose **Ask it to stop again** or explicitly **Force stop this process** when offered. |
 | Browser request times out | Refresh and reconcile. The operation may have succeeded; retain its operation ID until a definitive result rather than submit a new operation blindly. |
+
+A default Implementer that reported `needs_input` or `blocked` may leave its CLI
+open after completing the turn. Once that hold is resolved, the service can stop
+the exact idle turn and continue the retained session through normal admission.
+This requires the current accepted report, correlated native completion, positive
+process inventory and no conflicting work or control. Repeated ticks do not
+create a replacement writer or repeat the stop request.
+
+For a completed reviewer, a delayed positive exit can resolve its exact
+`provider_delivery_unknown` recovery record when the current invocation's
+consumed verdict proves the review already finished. This does not change the
+verdict or review count. Other recovery records, user holds and uncertain process
+ownership remain fenced; historical records without the necessary bindings need
+their existing explicit recovery action.
+
+Manager source-repair handoffs use `repair_handoff_template` from current role
+context. The report boundary validates its `implementation_capsule.bindings`
+before accepting it. Durable plan, configuration, review and recipient bindings
+survive a retained resume; task versions and transcript epochs belong to the
+current authenticated invocation. A valid internal handoff does not create a new
+human-input hold. An unusable historical handoff requests one Manager correction
+and cannot silently fall back to older instructions.
 
 For an eligible failed task session, **Stop failed session and pause task** in
 Session Access requests a graceful stop for that exact session and reserves a
@@ -798,6 +824,34 @@ restart-reconciled and cancellation exits without that flag are excluded.
 Intentional stops do not create this notice. No observation repairs those states
 or authorizes a retry. Notices resolve only from positive evidence for their exact
 subject, not absence from a page or activity from another role.
+
+## Completed setup and runtime probe sessions
+
+After a retained Codex or Claude discovery/profile-probe session, or a fresh
+Claude final-verifier probe, submits its accepted capability report, the coordinator closes that same invocation once its current
+native Stop and process inventory prove it is idle. Human keyboard control,
+pending permissions, uncertain guidance and recovery holds prevent the stop.
+The stop reservation is one-shot and does not launch a replacement or spend
+another resume. Setup still waits for a confirmed process exit before admitting
+the next stage. A saved discovery proposal does not need editing while that exit
+is pending; inspect **View output** and any recovery action if it remains open.
+
+Ordinary runtime probes use the same guarded turn closure. The first retained
+invocation exits without a report and keeps its one recall allowance. After
+positive exit evidence, **Resume same native session** starts that recall;
+LLMRelay never spends it automatically. The accepted reporting turn, including
+a fresh-only final verifier, also closes once idle. Closing a failed report
+preserves its failure; closing a passed report leaves **Publish exact ordinary
+proof** as a separate action. The exact authorized fixture, profile, permit,
+current invocation and report stay bound throughout.
+
+When runtime command evidence fails the exact native command/count check,
+LLMRelay records the rejection against that invocation and marks verification
+failed. It does not save an accepted role result or publish proof. The same
+guarded idle closure releases the session; the rejection remains visible after
+exit. Choose **Prepare a new verification** to review a corrected scope and its
+additional call allowance. Replaying the rejected submission returns the same
+rejection, and neither closure nor replay authorizes another agent call.
 
 ## Missing-report reminders
 
