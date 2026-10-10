@@ -884,6 +884,8 @@ pub struct TaskDto {
     pub version: i64,
     pub archived: bool,
     pub can_archive: bool,
+    #[serde(default)]
+    pub draft_deletion: Option<DraftDeletion>,
     pub recipe_provenance: Option<serde_json::Value>,
     pub permission_waiting: bool,
     pub role_overrides: serde_json::Value,
@@ -900,6 +902,12 @@ pub struct TaskDto {
     pub progress: Option<TaskProgress>,
     #[serde(default)]
     pub observed_usage: Option<ObservedUsage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DraftDeletion {
+    pub allowed: bool,
+    pub reason: Option<String>,
 }
 
 pub(crate) const MAX_OBSERVED_TOKENS: i64 = 9_007_199_254_740_991;
@@ -2456,6 +2464,11 @@ pub enum HumanCommand {
         #[serde(default)]
         role_overrides: serde_json::Value,
     },
+    DeleteDraftTask {
+        operation_id: String,
+        task_id: String,
+        expected_version: i64,
+    },
     MakeReady {
         operation_id: String,
         task_id: String,
@@ -2491,6 +2504,12 @@ pub enum HumanCommand {
         name: String,
     },
     AddDependency {
+        operation_id: String,
+        task_id: String,
+        depends_on_task_id: String,
+        expected_version: i64,
+    },
+    RemoveDependency {
         operation_id: String,
         task_id: String,
         depends_on_task_id: String,
@@ -2728,9 +2747,11 @@ impl HumanCommand {
             | Self::RelinkProject { operation_id, .. }
             | Self::CreateTask { operation_id, .. }
             | Self::UpdateTask { operation_id, .. }
+            | Self::DeleteDraftTask { operation_id, .. }
             | Self::MakeReady { operation_id, .. }
             | Self::SetQueuePaused { operation_id, .. }
             | Self::AddDependency { operation_id, .. }
+            | Self::RemoveDependency { operation_id, .. }
             | Self::UpdateProjectSettings { operation_id, .. }
             | Self::UpsertCheckSuite { operation_id, .. }
             | Self::RemoveCheckSuite { operation_id, .. }

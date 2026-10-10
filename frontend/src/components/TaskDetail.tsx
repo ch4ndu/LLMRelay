@@ -437,6 +437,14 @@ export function TaskDetail(
   const [integrationRef, setIntegrationRef] = useState("");
   const [answer, setAnswer] = useState("");
   const [error, setError] = useState("");
+  const [deleteVersion, setDeleteVersion] = useState<number | null>(null);
+  const [queueBusy, setQueueBusy] = useState(false);
+  const queueGuard = useRef(false);
+  useEffect(() => {
+    setDeleteVersion(null);
+    setQueueBusy(false);
+    queueGuard.current = false;
+  }, [task.id, task.version]);
   const dialog = useRef<HTMLElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
   const trapTab = useDialogFocus(dialog, closeButton, onClose);
@@ -459,6 +467,11 @@ export function TaskDetail(
   const project = state.projects.find((item) => item.id === task.project_id);
   const terminal = task.archived ||
     task.lifecycle === "done" || task.lifecycle === "cancelled";
+  const dependenciesEditable = !terminal && !attempt &&
+    ["backlog", "ready"].includes(task.lifecycle);
+  const dependentTasks = state.tasks.filter((other) =>
+    other.dependencies.some((item) => item.task_id === task.id)
+  );
   const taskSessions = state.active_sessions.filter((session) =>
     session.task_id === task.id
   );
@@ -505,6 +518,12 @@ export function TaskDetail(
       }:${String(body.check_id || "")}`
       : body.kind === "archive"
       ? `archive:${task.id}:${task.version}`
+      : [
+        "delete_draft_task", "add_dependency", "remove_dependency", "record_integration",
+      ].includes(String(body.kind))
+      ? `${String(body.kind)}:${task.id}:${task.version}:${
+        String(body.depends_on_task_id || "")
+      }`
       : "";
     const prior = key ? commandIdentities.current.get(key) : undefined;
     const stable = reuseOperationIdentity(prior, body);
@@ -538,8 +557,26 @@ export function TaskDetail(
       return false;
     }
   };
+  const queueMutation = async (body: Record<string, unknown>) => {
+    if (queueGuard.current) return;
+    queueGuard.current = true;
+    setQueueBusy(true);
+    let applied = false;
+    try {
+      applied = await apply(body);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+    if (!applied) {
+      queueGuard.current = false;
+      setQueueBusy(false);
+    } else if (body.kind === "delete_draft_task") {
+      localStorage.removeItem(operationStorageKey);
+      onClose();
+    }
+  };
   const addDependency = () =>
-    apply({
+    queueMutation({
       kind: "add_dependency",
       task_id: task.id,
       depends_on_task_id: dependency,
@@ -830,6 +867,11 @@ export function TaskDetail(
       <WorkSummary task={task} />
       <section className="panel">
         <h3>Depends on</h3>
+        <p className="hint">
+          {dependenciesEditable
+            ? "Add or remove dependencies before this task starts. Removing one lets this task proceed without waiting for those changes."
+            : "Dependencies are fixed once a task starts. Restore an archived draft before editing its dependencies."}
+        </p>
         {task.dependencies.map((item, index) => {
           const other = state.tasks.find((value) => value.id === item.task_id);
           return (
@@ -840,21 +882,22 @@ export function TaskDetail(
                   ? "Its accepted changes are in this task's starting commit."
                   : "Waiting for its accepted changes to be integrated."}
               </span>
-              {!terminal && !item.verified_at && (
+              {dependenciesEditable && !item.verified_at && (
                 <div className="compact-fields">
                   <label>
                     Integrated commit or branch
                     <input
                       aria-label={`Integration ref for ${String(item.task_id)}`}
                       value={integrationRef}
+                      disabled={queueBusy}
                       onChange={(event) => setIntegrationRef(event.target.value)}
                       placeholder="Exact integrated git ref"
                     />
                   </label>
                   <button
-                    disabled={!integrationRef}
+                    disabled={queueBusy || !integrationRef}
                     onClick={() =>
-                      apply({
+                      queueMutation({
                         kind: "record_integration",
                         task_id: task.id,
                         depends_on_task_id: item.task_id,
@@ -865,6 +908,20 @@ export function TaskDetail(
                     Record
                   </button>
                 </div>
+              )}
+              {dependenciesEditable && (
+                <button
+                  disabled={queueBusy}
+                  aria-label={`Remove dependency on ${other?.title || String(item.task_id)}`}
+                  onClick={() => queueMutation({
+                    kind: "remove_dependency",
+                    task_id: task.id,
+                    depends_on_task_id: item.task_id,
+                    expected_version: task.version,
+                  })}
+                >
+                  Remove dependency
+                </button>
               )}
               <TechnicalDetails>
                 <p>
@@ -878,18 +935,21 @@ export function TaskDetail(
         {!task.dependencies.length && (
           <p className="empty">This task does not depend on another task.</p>
         )}
-        {!terminal && (
+        {dependenciesEditable && (
           <div className="compact-fields">
             <label>
               Add a task this depends on
               <select
                 aria-label="Dependency task"
                 value={dependency}
+                disabled={queueBusy}
                 onChange={(event) => setDependency(event.target.value)}
               >
                 <option value="">Choose a task in this project</option>
                 {state.tasks.filter((value) =>
-                  value.id !== task.id && value.project_id === task.project_id
+                  value.id !== task.id && value.project_id === task.project_id &&
+                  !value.archived && value.lifecycle !== "cancelled" &&
+                  !task.dependencies.some((item) => item.task_id === value.id)
                 ).map((value) => (
                   <option value={value.id} key={value.id}>
                     {value.title}
@@ -897,7 +957,7 @@ export function TaskDetail(
                 ))}
               </select>
             </label>
-            <button disabled={!dependency} onClick={addDependency}>
+            <button disabled={queueBusy || !dependency} onClick={addDependency}>
               Add
             </button>
           </div>
@@ -1475,6 +1535,34 @@ export function TaskDetail(
           {tab === "changes" && changes}
           {tab === "checks" && checksTab}
           {tab === "activity" && activity}
+          {queueBusy && (
+            <p role="status">
+              Updating this task. <button onClick={onChanged}>Refresh task</button>
+            </p>
+          )}
+          {deleteVersion === task.version && task.draft_deletion?.allowed && (
+            <section className="panel" aria-label="Confirm draft deletion">
+              <h3>Delete “{task.title}”?</h3>
+              <p>
+                This permanently removes the unused draft and its settings.
+                It cannot be restored.
+              </p>
+              <button disabled={queueBusy} onClick={() => setDeleteVersion(null)}>
+                Keep draft
+              </button>
+              <button
+                className="danger"
+                disabled={queueBusy}
+                onClick={() => queueMutation({
+                  kind: "delete_draft_task",
+                  task_id: task.id,
+                  expected_version: task.version,
+                })}
+              >
+                Confirm delete draft
+              </button>
+            </section>
+          )}
           {error && <ErrorNotice error={error} />}
           <TechnicalDetails>
             <dl className="technical-list">
@@ -1527,6 +1615,26 @@ export function TaskDetail(
           </TechnicalDetails>
         </div>
         <footer className="task-dialog-footer">
+          {task.lifecycle === "backlog" && task.draft_deletion && (
+            <div>
+              <button
+                className="danger"
+                disabled={queueBusy || !task.draft_deletion.allowed}
+                aria-describedby={task.draft_deletion.reason ? "draft-delete-reason" : undefined}
+                onClick={() => setDeleteVersion(task.version)}
+              >
+                Delete draft
+              </button>
+              {task.draft_deletion.reason && (
+                <p id="draft-delete-reason" className="hint">{task.draft_deletion.reason}</p>
+              )}
+              {dependentTasks.length > 0 && (
+                <p className="hint">
+                  Used by: {dependentTasks.map((other) => other.title).join(", ")}
+                </p>
+              )}
+            </div>
+          )}
           {liveSession && tab !== "activity" && (
             <button onClick={() => chooseTab("activity")}>
               View agent output

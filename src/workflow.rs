@@ -1888,6 +1888,43 @@ pub fn execute_with_runtime(
                 },
             )
         }
+        HumanCommand::DeleteDraftTask {
+            task_id,
+            expected_version,
+            ..
+        } => {
+            task_version(&transaction, task_id, *expected_version)?;
+            if let Some(reason) = draft_deletion_blocker(&transaction, task_id)? {
+                bail!("{reason}")
+            }
+            transaction.execute(
+                "DELETE FROM task_dependencies WHERE task_id=?1",
+                params![task_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM trip_task_profile_activations WHERE task_id=?1",
+                params![task_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM role_settings WHERE task_id=?1",
+                params![task_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM task_recipe_bindings WHERE task_id=?1",
+                params![task_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM tasks WHERE id=?1 AND version=?2",
+                params![task_id, expected_version],
+            )?;
+            result(
+                operation_id,
+                "task",
+                task_id.clone(),
+                Some(expected_version + 1),
+                "draft_deleted",
+            )
+        }
         HumanCommand::MakeReady {
             task_id,
             expected_version,
@@ -2085,12 +2122,7 @@ pub fn execute_with_runtime(
             expected_version,
             ..
         } => {
-            require_task_state(
-                &transaction,
-                task_id,
-                *expected_version,
-                &["backlog", "ready"],
-            )?;
+            require_dependency_editable(&transaction, task_id, *expected_version)?;
             let same_project: bool = transaction.query_row(
                 "SELECT a.project_id=b.project_id FROM tasks a JOIN tasks b ON b.id=?2 WHERE a.id=?1",
                 params![task_id, depends_on_task_id], |row| row.get(0),
@@ -2115,6 +2147,29 @@ pub fn execute_with_runtime(
                 task_id.clone(),
                 Some(expected_version + 1),
                 "dependency_added",
+            )
+        }
+        HumanCommand::RemoveDependency {
+            task_id,
+            depends_on_task_id,
+            expected_version,
+            ..
+        } => {
+            require_dependency_editable(&transaction, task_id, *expected_version)?;
+            if transaction.execute(
+                "DELETE FROM task_dependencies WHERE task_id=?1 AND depends_on_task_id=?2",
+                params![task_id, depends_on_task_id],
+            )? != 1
+            {
+                bail!("This dependency is no longer present. Refresh the task before making another change.")
+            }
+            bump_task(&transaction, task_id, *expected_version, &now)?;
+            result(
+                operation_id,
+                "task",
+                task_id.clone(),
+                Some(expected_version + 1),
+                "dependency_removed",
             )
         }
         HumanCommand::RecordIntegration {
@@ -4251,6 +4306,7 @@ mod m7_setup_projection_tests {
             version: 1,
             archived: false,
             can_archive: false,
+            draft_deletion: None,
             recipe_provenance: None,
             permission_waiting: false,
             role_overrides: json!({}),
@@ -4448,7 +4504,14 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
     let mut migration_actions = Vec::new();
     for id in task_ids {
         let mut task = connection.query_row(&format!("SELECT id,project_id,title,description,acceptance_criteria_json,priority,manual_order,lifecycle,attention,version,archived_at,role_overrides_json,legacy_json,EXISTS(SELECT 1 FROM permission_requests pr WHERE pr.task_id=tasks.id AND {}),(archived_at IS NULL AND (lifecycle='done' OR (lifecycle='backlog' AND ready_at IS NULL AND NOT EXISTS(SELECT 1 FROM attempts WHERE task_id=tasks.id)))) FROM tasks WHERE id=?1", crate::permissions::ACTIONABLE_REQUEST_SQL),
-            params![id], |row| Ok(TaskDto { id:row.get(0)?,project_id:row.get(1)?,title:row.get(2)?,description:row.get(3)?,acceptance_criteria:serde_json::from_str(&row.get::<_,String>(4)?).unwrap_or_default(),priority:row.get(5)?,manual_order:row.get(6)?,lifecycle:row.get(7)?,attention:row.get(8)?,version:row.get(9)?,archived:row.get::<_,Option<String>>(10)?.is_some(),can_archive:row.get(14)?,recipe_provenance:None,role_overrides:parse(row.get(11)?),legacy:parse(row.get(12)?),permission_waiting:row.get(13)?,dependencies:vec![],active_attempt:None,role_settings:vec![],reviews:vec![],snapshots:vec![],review_budgets:vec![],progress:None,observed_usage:None }))?;
+            params![id], |row| Ok(TaskDto { id:row.get(0)?,project_id:row.get(1)?,title:row.get(2)?,description:row.get(3)?,acceptance_criteria:serde_json::from_str(&row.get::<_,String>(4)?).unwrap_or_default(),priority:row.get(5)?,manual_order:row.get(6)?,lifecycle:row.get(7)?,attention:row.get(8)?,version:row.get(9)?,archived:row.get::<_,Option<String>>(10)?.is_some(),can_archive:row.get(14)?,draft_deletion:None,recipe_provenance:None,role_overrides:parse(row.get(11)?),legacy:parse(row.get(12)?),permission_waiting:row.get(13)?,dependencies:vec![],active_attempt:None,role_settings:vec![],reviews:vec![],snapshots:vec![],review_budgets:vec![],progress:None,observed_usage:None }))?;
+        if task.lifecycle == "backlog" {
+            let reason = draft_deletion_blocker(&connection, &id)?;
+            task.draft_deletion = Some(crate::domain::DraftDeletion {
+                allowed: reason.is_none(),
+                reason,
+            });
+        }
         task.observed_usage = Some(observed_usage(&connection, "task_id", &id, None)?);
         task.recipe_provenance = crate::recipes::task_provenance(&connection, &id)?;
         task.dependencies = json_rows(&connection, "SELECT json_object('task_id',depends_on_task_id,'integration_ref',integration_ref,'verified_at',verified_at) FROM task_dependencies WHERE task_id=?1", &id)?;
@@ -9790,6 +9853,62 @@ fn task_version(transaction: &Transaction<'_>, task_id: &str, expected: i64) -> 
         )
         .optional()?
         .ok_or_else(|| anyhow!("task version is stale"))
+}
+
+fn draft_deletion_blocker(connection: &Connection, task_id: &str) -> Result<Option<String>> {
+    let (draft, archived, attempted, depended_on, history): (bool, bool, bool, bool, bool) =
+        connection.query_row(
+            "SELECT lifecycle='backlog', archived_at IS NOT NULL,
+         EXISTS(SELECT 1 FROM attempts WHERE task_id=?1),
+         EXISTS(SELECT 1 FROM task_dependencies WHERE depends_on_task_id=?1),
+         (EXISTS(SELECT 1 FROM trip_runtime_admissions WHERE task_id=?1)
+          OR EXISTS(SELECT 1 FROM recipe_schedule_fires WHERE task_id=?1)
+          OR EXISTS(SELECT 1 FROM cmux_task_workspaces WHERE task_id=?1)
+          OR EXISTS(SELECT 1 FROM trip_setup_operations WHERE validation_task_id=?1)
+          OR EXISTS(SELECT 1 FROM claims WHERE task_id=?1)
+          OR EXISTS(SELECT 1 FROM restart_candidates WHERE task_id=?1)
+          OR EXISTS(SELECT 1 FROM permission_requests WHERE task_id=?1)
+          OR EXISTS(SELECT 1 FROM final_repair_rechecks WHERE task_id=?1)
+          OR EXISTS(SELECT 1 FROM codex_usage_observations WHERE task_id=?1))
+         FROM tasks WHERE id=?1",
+            params![task_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+    Ok(if !draft || attempted {
+        Some("Only a draft that has never started can be deleted. Keep started work in its task history.".into())
+    } else if archived {
+        Some("Restore this archived draft before deleting it.".into())
+    } else if depended_on {
+        Some("Other tasks depend on this draft. Remove those dependencies in each task's Changes tab before deleting it.".into())
+    } else if history {
+        Some("This draft has saved verification or scheduling history. Use Archive to remove it from the board while keeping that history.".into())
+    } else {
+        None
+    })
+}
+
+fn require_dependency_editable(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    version: i64,
+) -> Result<()> {
+    require_task_state(transaction, task_id, version, &["backlog", "ready"])?;
+    let editable: bool = transaction.query_row(
+        "SELECT archived_at IS NULL AND NOT EXISTS(SELECT 1 FROM attempts WHERE task_id=?1) FROM tasks WHERE id=?1",
+        params![task_id], |row| row.get(0),
+    )?;
+    if !editable {
+        bail!("Dependencies can only change before a task starts. Restore an archived draft before editing it.")
+    }
+    Ok(())
 }
 
 fn require_task_state(

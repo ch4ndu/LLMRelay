@@ -584,6 +584,7 @@ export interface Task {
   version: number;
   archived: boolean;
   can_archive: boolean;
+  draft_deletion?: { allowed: boolean; reason: string | null } | null;
   recipe_provenance?: null | {
     recipe_id: string;
     recipe_name: string;

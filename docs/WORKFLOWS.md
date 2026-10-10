@@ -225,6 +225,18 @@ the timestamp freshness check. Publication consumes the exact eligible report.
 
 ## Human gates and continuation authority
 
+Open a task's **Changes** tab to add or remove dependencies while it is still a
+draft or Ready and has never started. Removing a dependency means the task can
+proceed without waiting for that task's accepted changes. Dependencies are fixed
+after an attempt starts; archived drafts must be restored before editing them.
+
+Unused drafts offer **Delete draft** in task details. Review the confirmation
+before deleting; deletion removes the draft and its settings permanently while
+retaining the command audit. If other tasks depend on it, remove those links in
+their Changes tabs first. Drafts with saved verification or scheduling history
+retain that history and explain why deletion is unavailable; use **Archive**
+when available to hide them without deleting history.
+
 Plan approval and implementation authorization are separate decisions. After
 approving a plan, use **Authorize implementation of this exact plan** when
 shown; generic Continue cannot grant that authorization. The request binds the

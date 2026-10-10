@@ -17494,6 +17494,271 @@ Created.
 }
 
 #[test]
+fn draft_deletion_preserves_references_and_audit_and_replays_exactly() {
+    let fixture = Fixture::new("draft-deletion");
+    let project = add_project(&fixture, fixture.repository("repo"), "draft-project");
+    let draft = workflow::execute(
+        &fixture.store,
+        &HumanCommand::CreateTask {
+            operation_id: "delete-draft-create".into(),
+            project_id: project.clone(),
+            title: "Duplicate draft".into(),
+            description: String::new(),
+            acceptance_criteria: vec!["works".into()],
+            priority: 0,
+            ready: false,
+            role_overrides: roles(),
+        },
+    )
+    .unwrap()
+    .entity_id;
+    let dependent = create_task(&fixture, &project, "dependent", 0);
+    let prerequisite = create_task(&fixture, &project, "prerequisite", 0);
+    let add = |task: &str, prerequisite: &str, version, id: &str| HumanCommand::AddDependency {
+        operation_id: id.into(),
+        task_id: task.into(),
+        depends_on_task_id: prerequisite.into(),
+        expected_version: version,
+    };
+    workflow::execute(
+        &fixture.store,
+        &add(&dependent, &draft, 1, "depends-on-draft"),
+    )
+    .unwrap();
+    workflow::execute(
+        &fixture.store,
+        &add(&draft, &prerequisite, 1, "draft-depends-on-other"),
+    )
+    .unwrap();
+    let delete = HumanCommand::DeleteDraftTask {
+        operation_id: "delete-draft".into(),
+        task_id: draft.clone(),
+        expected_version: 2,
+    };
+    let state = workflow::state(&fixture.store).unwrap();
+    let eligibility = state
+        .tasks
+        .iter()
+        .find(|task| task.id == draft)
+        .unwrap()
+        .draft_deletion
+        .as_ref()
+        .unwrap();
+    assert!(!eligibility.allowed);
+    assert!(eligibility
+        .reason
+        .as_ref()
+        .unwrap()
+        .contains("Other tasks depend"));
+    assert!(workflow::execute(&fixture.store, &delete)
+        .unwrap_err()
+        .to_string()
+        .contains("Other tasks depend"));
+    fixture.assert_scalar("SELECT COUNT(*) FROM task_dependencies", 2_i64);
+    assert!(fixture.scalar::<i64>("SELECT COUNT(*) FROM role_settings") > 0);
+    let remove = HumanCommand::RemoveDependency {
+        operation_id: "remove-draft-dependency".into(),
+        task_id: dependent.clone(),
+        depends_on_task_id: draft.clone(),
+        expected_version: 2,
+    };
+    let removed = workflow::execute(&fixture.store, &remove).unwrap();
+    assert_eq!(removed.version, Some(3));
+    assert_eq!(
+        workflow::execute(&fixture.store, &remove).unwrap().version,
+        Some(3)
+    );
+    let stale = HumanCommand::DeleteDraftTask {
+        operation_id: "delete-stale".into(),
+        task_id: draft.clone(),
+        expected_version: 1,
+    };
+    assert!(workflow::execute(&fixture.store, &stale)
+        .unwrap_err()
+        .to_string()
+        .contains("stale"));
+    let state = workflow::state(&fixture.store).unwrap();
+    assert!(
+        state
+            .tasks
+            .iter()
+            .find(|task| task.id == draft)
+            .unwrap()
+            .draft_deletion
+            .as_ref()
+            .unwrap()
+            .allowed
+    );
+    let before_revision = state.revision;
+    assert_eq!(
+        workflow::execute(&fixture.store, &delete).unwrap().state,
+        "draft_deleted"
+    );
+    assert_eq!(
+        workflow::execute(&fixture.store, &delete).unwrap().state,
+        "draft_deleted"
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    assert_ne!(state.revision, before_revision);
+    assert!(!state.tasks.iter().any(|task| task.id == draft));
+    assert_eq!(state.tasks.len(), 2);
+    assert!(state
+        .tasks
+        .iter()
+        .find(|task| task.id == dependent)
+        .unwrap()
+        .dependencies
+        .is_empty());
+    fixture.assert_scalar("SELECT COUNT(*) FROM task_dependencies", 0_i64);
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM role_settings WHERE task_id NOT IN (SELECT id FROM tasks)",
+        0_i64,
+    );
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE operation_id='delete-draft'",
+        1_i64,
+    );
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE operation_id='delete-draft-create'",
+        1_i64,
+    );
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='delete-draft'",
+        1_i64,
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", 0_i64);
+    fixture.assert_scalar("SELECT queue_paused FROM projects", 0_i64);
+}
+
+#[test]
+fn queued_task_edits_reject_started_archived_and_historical_drafts() {
+    let fixture = Fixture::new("queued-edit-guards");
+    let project = add_project(&fixture, fixture.repository("repo"), "edit-project");
+    let queued = create_task(&fixture, &project, "queued", 1);
+    let other = create_task(&fixture, &project, "other", 0);
+    let add = HumanCommand::AddDependency {
+        operation_id: "guard-add".into(),
+        task_id: queued.clone(),
+        depends_on_task_id: other.clone(),
+        expected_version: 1,
+    };
+    workflow::execute(&fixture.store, &add).unwrap();
+    let cycle = HumanCommand::AddDependency {
+        operation_id: "guard-cycle".into(),
+        task_id: other.clone(),
+        depends_on_task_id: queued.clone(),
+        expected_version: 1,
+    };
+    assert!(workflow::execute(&fixture.store, &cycle)
+        .unwrap_err()
+        .to_string()
+        .contains("cycle"));
+    let remove = HumanCommand::RemoveDependency {
+        operation_id: "guard-remove".into(),
+        task_id: queued.clone(),
+        depends_on_task_id: other.clone(),
+        expected_version: 2,
+    };
+    fixture.execute(
+        "UPDATE tasks SET archived_at='fixture' WHERE id=?1",
+        params![queued],
+    );
+    assert!(workflow::execute(&fixture.store, &remove)
+        .unwrap_err()
+        .to_string()
+        .contains("Restore"));
+    fixture.execute(
+        "UPDATE tasks SET archived_at=NULL WHERE id=?1",
+        params![queued],
+    );
+    workflow::execute(&fixture.store, &remove).unwrap();
+    let missing = HumanCommand::RemoveDependency {
+        operation_id: "guard-missing".into(),
+        task_id: queued.clone(),
+        depends_on_task_id: other.clone(),
+        expected_version: 3,
+    };
+    assert!(workflow::execute(&fixture.store, &missing)
+        .unwrap_err()
+        .to_string()
+        .contains("no longer present"));
+    let plan = claim(&fixture, fixture.root.join("artifacts"));
+    let started = workflow::state(&fixture.store)
+        .unwrap()
+        .tasks
+        .into_iter()
+        .find(|task| task.active_attempt.is_some())
+        .unwrap();
+    assert_eq!(
+        started.active_attempt.as_ref().unwrap()["id"],
+        plan.attempt_id
+    );
+    let delete_started = HumanCommand::DeleteDraftTask {
+        operation_id: "guard-started-delete".into(),
+        task_id: started.id.clone(),
+        expected_version: started.version,
+    };
+    assert_eq!(
+        started.id, queued,
+        "removed dependency still blocked pickup"
+    );
+    assert!(workflow::execute(&fixture.store, &delete_started)
+        .unwrap_err()
+        .to_string()
+        .contains("never started"));
+    let remove_started = HumanCommand::RemoveDependency {
+        operation_id: "guard-started-remove".into(),
+        task_id: started.id.clone(),
+        depends_on_task_id: other.clone(),
+        expected_version: started.version,
+    };
+    assert!(workflow::execute(&fixture.store, &remove_started).is_err());
+    let historical = workflow::execute(
+        &fixture.store,
+        &HumanCommand::CreateTask {
+            operation_id: "historical-draft-create".into(),
+            project_id: project.clone(),
+            title: "Historical draft".into(),
+            description: String::new(),
+            acceptance_criteria: vec!["works".into()],
+            priority: 0,
+            ready: false,
+            role_overrides: roles(),
+        },
+    )
+    .unwrap()
+    .entity_id;
+    fixture.execute("INSERT INTO trip_runtime_admissions(id,project_id,task_id,scope_hash,state,fresh_call_count,created_at,updated_at) VALUES('historical-admission',?1,?2,'hash','failed',1,'now','now')",params![project,historical]);
+    let delete_history = HumanCommand::DeleteDraftTask {
+        operation_id: "guard-history-delete".into(),
+        task_id: historical.clone(),
+        expected_version: 1,
+    };
+    assert!(workflow::execute(&fixture.store, &delete_history)
+        .unwrap_err()
+        .to_string()
+        .contains("history"));
+    let state = workflow::state(&fixture.store).unwrap();
+    assert!(
+        !state
+            .tasks
+            .iter()
+            .find(|task| task.id == historical)
+            .unwrap()
+            .draft_deletion
+            .as_ref()
+            .unwrap()
+            .allowed
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM trip_runtime_admissions", 1_i64);
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='guard-history-delete'",
+        0_i64,
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM attempts", 1_i64);
+}
+
+#[test]
 fn archived_backlog_draft_restores_without_becoming_ready() {
     let fixture = Fixture::new("m9-archive-draft");
     let project = add_project(&fixture, fixture.repository("repo"), "archive-project");

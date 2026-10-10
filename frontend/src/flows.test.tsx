@@ -10915,3 +10915,248 @@ Deno.test("Prepared task attention opens controls and Continue targets only that
     localStorage.clear();
   }
 });
+
+Deno.test("Draft deletion confirms once, closes on success, and explains blocked deletion", async () => {
+  const requests: Record<string, unknown>[] = [];
+  let finish: ((response: Response) => void) | undefined;
+  let closed = 0;
+  let changed = 0;
+  const draft: Task = {
+    ...task,
+    lifecycle: "backlog",
+    active_attempt: undefined,
+    draft_deletion: { allowed: true, reason: null },
+  };
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (String(_input) === "/api/state") {
+        return new Response(JSON.stringify(snapshotAt("draft-delete-api", "1", {
+          tasks: [draft],
+        })));
+      }
+      requests.push(JSON.parse(String(init?.body)));
+      return await new Promise<Response>((resolve) => {
+        finish = resolve;
+      });
+    }) as typeof fetch;
+  localStorage.clear();
+  try {
+    const initial = await getState();
+    check(
+      initial.tasks[0].draft_deletion?.allowed,
+      "draft deletion authority was lost at the API boundary",
+    );
+    mount(
+      <TaskDetail
+        task={initial.tasks[0]}
+        state={initial}
+        onClose={() => closed++}
+        onChanged={() => changed++}
+      />,
+    );
+    click("Delete draft");
+    check(requests.length === 0, "opening confirmation deleted the draft");
+    check(
+      document.body.textContent?.includes("cannot be restored"),
+      "permanent deletion was not explained",
+    );
+    click("Keep draft");
+    check(
+      !document.querySelector('[aria-label="Confirm draft deletion"]'),
+      "cancel did not dismiss confirmation",
+    );
+    click("Delete draft");
+    click("Confirm delete draft");
+    click("Confirm delete draft");
+    await settle();
+    check(
+      requests.length === 1 && requests[0].kind === "delete_draft_task" &&
+        requests[0].task_id === draft.id && requests[0].expected_version === 7,
+      "delete repeated or lost the exact draft version",
+    );
+    check(
+      closed === 0 && changed === 0,
+      "pending deletion was shown as success",
+    );
+    finish!(
+      new Response(JSON.stringify({ result: { state: "draft_deleted" } })),
+    );
+    await settle();
+    check(
+      closed === 1 && changed === 1,
+      "confirmed deletion did not close and refresh",
+    );
+    const blocked = {
+      ...draft,
+      draft_deletion: {
+        allowed: false,
+        reason:
+          "Other tasks depend on this draft. Remove those dependencies in each task's Changes tab before deleting it.",
+      },
+    };
+    mount(
+      <TaskDetail
+        task={blocked}
+        state={{ ...liveBase, tasks: [blocked] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    const deletion = [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent === "Delete draft");
+    check(
+      deletion?.disabled && document.body.textContent?.includes("Changes tab"),
+      "unavailable deletion omitted its reason and recovery step",
+    );
+    mount(
+      <TaskDetail
+        task={task}
+        state={{ ...liveBase, tasks: [task] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    check(
+      !document.body.textContent?.includes("Delete draft"),
+      "started task offered deletion",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Queued dependencies can be removed and added with exact task versions", async () => {
+  const requests: Record<string, unknown>[] = [];
+  const prerequisite: Task = { ...task, id: "AJ-2", title: "Previous work" };
+  const available: Task = { ...task, id: "AJ-3", title: "Another task" };
+  const queued: Task = {
+    ...task,
+    lifecycle: "backlog",
+    active_attempt: undefined,
+    dependencies: [{ task_id: prerequisite.id, verified_at: null }],
+  };
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(
+        JSON.stringify({ result: { state: "dependency_removed" } }),
+      );
+    }) as typeof fetch;
+  const show = (current: Task) => (
+    <TaskDetail
+      task={current}
+      state={{ ...liveBase, tasks: [current, prerequisite, available] }}
+      onClose={noop}
+      onChanged={noop}
+    />
+  );
+  localStorage.clear();
+  try {
+    mount(show(queued));
+    click("Changes");
+    const select = document.querySelector<HTMLSelectElement>(
+      '[aria-label="Dependency task"]',
+    )!;
+    check(
+      ![...select.options].some((option) => option.value === prerequisite.id),
+      "existing dependency was offered again",
+    );
+    click("Remove dependency");
+    await settle();
+    click("Remove dependency");
+    check(
+      requests.length === 1 && requests[0].kind === "remove_dependency" &&
+        requests[0].task_id === queued.id &&
+        requests[0].depends_on_task_id === prerequisite.id &&
+        requests[0].expected_version === 7,
+      "remove lost binding or repeated before refresh",
+    );
+    const updated = { ...queued, version: 8, dependencies: [] };
+    act(() => root!.render(show(updated)));
+    await settle();
+    const add = document.querySelector<HTMLSelectElement>(
+      '[aria-label="Dependency task"]',
+    )!;
+    act(() => {
+      add.value = available.id;
+      add.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    click("Add");
+    await settle();
+    check(
+      requests.length === 2 && requests[1].kind === "add_dependency" &&
+        requests[1].depends_on_task_id === available.id &&
+        requests[1].expected_version === 8,
+      "add did not use refreshed task version",
+    );
+    mount(show({ ...task, dependencies: queued.dependencies }));
+    click("Changes");
+    check(
+      !document.querySelector('[aria-label="Dependency task"]') &&
+        ![...document.querySelectorAll("button")].some((button) =>
+          button.textContent === "Remove dependency"
+        ),
+      "started task still offers dependency edits",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Uncertain draft deletion retains the exact operation after reopening", async () => {
+  const requests: Record<string, unknown>[] = [];
+  let closed = 0;
+  const draft: Task = {
+    ...task,
+    lifecycle: "backlog",
+    active_attempt: undefined,
+    draft_deletion: { allowed: true, reason: null },
+  };
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      if (requests.length === 1) throw new TypeError("Connection lost");
+      return new Response(
+        JSON.stringify({ result: { state: "draft_deleted" } }),
+      );
+    }) as typeof fetch;
+  const show = () =>
+    mount(
+      <TaskDetail
+        task={draft}
+        state={{ ...liveBase, tasks: [draft] }}
+        onClose={() => closed++}
+        onChanged={noop}
+      />,
+    );
+  localStorage.clear();
+  try {
+    show();
+    click("Delete draft");
+    click("Confirm delete draft");
+    await settle();
+    check(
+      closed === 0 && requests.length === 1,
+      "uncertain delete was retried or shown as successful",
+    );
+    show();
+    click("Delete draft");
+    click("Confirm delete draft");
+    await settle();
+    check(
+      requests.length === 2 &&
+        requests[0].operation_id === requests[1].operation_id &&
+        JSON.stringify(requests[0]) === JSON.stringify(requests[1]),
+      "reopened delete lost exact operation identity",
+    );
+    check(closed === 1, "reconciled delete did not close the task");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});

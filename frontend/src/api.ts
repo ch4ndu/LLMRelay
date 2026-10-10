@@ -478,6 +478,12 @@ const currentSnapshot = (state: AppState): AppState => {
     )
     || !Array.isArray(state.tasks) || !state.tasks.every((task) => {
       if (typeof task.can_archive !== "boolean") return false;
+      const deletion = task.draft_deletion;
+      if (deletion != null &&
+        (typeof deletion.allowed !== "boolean" ||
+          (deletion.reason !== null && typeof deletion.reason !== "string"))) {
+        return false;
+      }
       const provenance = task.recipe_provenance;
       const requiredCheckIds = field(provenance, "required_check_ids");
       return provenance == null ||
