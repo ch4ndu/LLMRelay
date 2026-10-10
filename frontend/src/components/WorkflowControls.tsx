@@ -506,6 +506,13 @@ export function WorkflowControls(
       <header>
         <h3>Controls</h3>
       </header>
+      {task.lifecycle === "ready" && (
+        <p className="hint">
+          Prepare task creates its workspace and pauses before starting an agent.
+          Then choose Continue to start this task. Other queued tasks stay paused
+          if project pickup is paused.
+        </p>
+      )}
       {decision && decision.primary_blocker?.message && (
         <p className="hint decision-summary">
           {setupProblem || decision.primary_blocker.message}{" "}
@@ -579,7 +586,7 @@ export function WorkflowControls(
               disabled={!!busy || !allows("run_next")}
               onClick={() => control("run_next")}
             >
-              Run next
+              {task.lifecycle === "ready" ? "Prepare task" : "Run next"}
             </button>
             <button
               disabled={!!busy || !allows("pause_after_role")}

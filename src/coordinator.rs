@@ -899,7 +899,10 @@ fn evaluate_attempt_owner(connection: &Connection, attempt: &Attempt) -> Result<
                 }
                 None => serde_json::json!({"attention":attempt.attention}),
             },
-            hold.map(|(_, message)| message),
+            hold.map(|(_, message)| message).or_else(|| {
+                (attempt.attention == "paused").then(||
+                    "This task is paused. Choose Continue to start or resume its work. This does not resume pickup for other tasks in the project.".into())
+            }),
             prerequisites,
             serde_json::json!({
                 "action":"held",

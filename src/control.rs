@@ -24,6 +24,7 @@ const MAX_CONTROL_MESSAGE_BYTES: usize = 1024 * 1024;
 // scheduling room while ensuring a silent authenticated peer cannot retain a
 // live route or input lease indefinitely.
 const CONTROL_IDLE_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+const CONTROL_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -689,19 +690,30 @@ pub async fn serve_bound(
     listener: UnixListener,
 ) -> Result<()> {
     let mut stop = shutdown.subscribe();
+    let mut connections = tokio::task::JoinSet::new();
     loop {
+        if *stop.borrow() {
+            break;
+        }
         let stream = tokio::select! {
-            accepted = accept_control_stream(&listener) => accepted?,
+            biased;
             changed = stop.changed() => {
-                if changed.is_err() || *stop.borrow() { return Ok(()) }
+                if changed.is_err() || *stop.borrow() { break }
                 continue
             }
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    tracing::warn!(error = %error, "control connection task failed");
+                }
+                continue
+            }
+            accepted = accept_control_stream(&listener) => accepted?,
         };
         let app = app.clone();
         let diagnostic_app = app.clone();
         let shutdown = shutdown.clone();
         let instance = instance.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             if let Err(error) = handle(stream, app, shutdown, instance).await {
                 tracing::warn!(error = %error, "control request failed");
                 if let Err(sink_error) = diagnostic_app.diagnostics.record(
@@ -720,6 +732,14 @@ pub async fn serve_bound(
             }
         });
     }
+    drop(listener);
+    // Stop can be signalled inside dispatch, before its response has been written.
+    while let Some(result) = connections.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(error = %error, "control connection task failed during shutdown");
+        }
+    }
+    Ok(())
 }
 
 async fn handle(
@@ -779,8 +799,9 @@ async fn serve_connection(
     mut connection: ConnectionState,
     idle_read_deadline: std::time::Duration,
 ) -> Result<()> {
+    let mut stop = shutdown.subscribe();
     let result = async {
-        let first = tokio::time::timeout(idle_read_deadline, read_control_message(reader))
+        let first = tokio::time::timeout(idle_read_deadline, read_until_shutdown(reader, &mut stop))
             .await
             .map_err(|_| anyhow!("control connection idle read deadline expired"))?;
         let first = match first {
@@ -825,7 +846,7 @@ async fn serve_connection(
             }
         };
         loop {
-            let line = tokio::time::timeout(idle_read_deadline, read_control_message(reader))
+            let line = tokio::time::timeout(idle_read_deadline, read_until_shutdown(reader, &mut stop))
                 .await
                 .map_err(|_| anyhow!("control connection idle read deadline expired"))??;
             let Some(line) = line else {
@@ -890,13 +911,26 @@ async fn serve_connection(
     result
 }
 
+async fn read_until_shutdown(
+    reader: &mut BufReader<OwnedReadHalf>,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<Option<Vec<u8>>> {
+    tokio::select! {
+        biased;
+        _ = stop.wait_for(|stopping| *stopping) => Ok(None),
+        result = read_control_message(reader) => result,
+    }
+}
+
 async fn write_protocol_response(
     writer: &mut OwnedWriteHalf,
     response: &serde_json::Value,
 ) -> Result<()> {
     let mut frame = serde_json::to_vec(response)?;
     frame.push(b'\n');
-    writer.write_all(&frame).await?;
+    tokio::time::timeout(CONTROL_WRITE_DEADLINE, writer.write_all(&frame))
+        .await
+        .map_err(|_| anyhow!("control response write deadline expired"))??;
     Ok(())
 }
 
@@ -1685,8 +1719,10 @@ async fn write_control_response(
             "control response exceeds the 1 MiB message limit"
         )))?;
     }
-    writer.write_all(&encoded).await?;
-    writer.write_all(b"\n").await?;
+    encoded.push(b'\n');
+    tokio::time::timeout(CONTROL_WRITE_DEADLINE, writer.write_all(&encoded))
+        .await
+        .map_err(|_| anyhow!("control response write deadline expired"))??;
     Ok(())
 }
 
@@ -2291,6 +2327,80 @@ mod tests {
             "service shutdown channel is closed"
         );
         assert!(!*shutdown.borrow());
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_accepted_response_and_closes_idle_connections() {
+        let (root, app, _) = control_test_application();
+        let listener = bind(&app).unwrap();
+        let (shutdown, _) = watch::channel(false);
+        let padding = "x".repeat(900_000);
+        let mut service = tokio::spawn(serve_bound(
+            app.clone(),
+            shutdown.clone(),
+            serde_json::json!({"instance_id": "fixture", "padding": padding}),
+            listener,
+        ));
+        let mut idle_before_hello = UnixStream::connect(&app.paths.control_socket)
+            .await
+            .unwrap();
+        let mut idle_after_hello = ControlConnection::connect(&app.paths.control_socket)
+            .await
+            .unwrap();
+        let mut client = ControlConnection::connect(&app.paths.control_socket)
+            .await
+            .unwrap();
+        client
+            .writer
+            .as_mut()
+            .unwrap()
+            .write_all(b"{\"kind\":\"status\"}\n")
+            .await
+            .unwrap();
+        let first_byte = client.reader.as_mut().unwrap().read_u8().await.unwrap();
+        assert_eq!(first_byte, b'{');
+        shutdown.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut service)
+                .await
+                .is_err(),
+            "control listener abandoned a response that was still being written"
+        );
+        let mut remaining = Vec::new();
+        client
+            .reader
+            .as_mut()
+            .unwrap()
+            .read_until(b'\n', &mut remaining)
+            .await
+            .unwrap();
+        remaining.insert(0, first_byte);
+        let response: ControlResponse = serde_json::from_slice(&remaining).unwrap();
+        assert!(response.ok);
+        assert_eq!(response.result["instance"]["padding"], padding);
+        tokio::time::timeout(std::time::Duration::from_secs(2), service)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let before_hello_error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            idle_before_hello.read_u8(),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(before_hello_error.kind(), std::io::ErrorKind::UnexpectedEof);
+        let after_hello_error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            idle_after_hello.reader.as_mut().unwrap().read_u8(),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(after_hello_error.kind(), std::io::ErrorKind::UnexpectedEof);
+        drop((client, idle_before_hello, idle_after_hello, app));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

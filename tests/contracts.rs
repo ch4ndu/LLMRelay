@@ -47861,6 +47861,89 @@ fn completed_review_late_exit_settles_only_its_exact_recovery() {
 }
 
 #[test]
+fn prepared_ready_task_remains_paused_and_explains_continue_without_resuming_project() {
+    let fixture = Fixture::new("prepared-task-continue");
+    let project = add_project(&fixture, fixture.repository("repo"), "prepare-project");
+    let task = create_task(&fixture, &project, "prepare-task", 1);
+    fixture.execute(
+        "UPDATE projects SET queue_paused=1 WHERE id=?1",
+        params![project],
+    );
+    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: "prepare-one-task".into(),
+            task_id: task.clone(),
+            expected_version: version,
+            action: "run_next".into(),
+            payload: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    let preparing = workflow::state(&fixture.store).unwrap();
+    assert!(preparing.attention.iter().any(|item| {
+        item.id == format!("task:{task}:run_next_requested") && item.title == "Preparing task"
+    }));
+    let plan = claim(&fixture, fixture.root.join("artifacts"));
+    assert_eq!(plan.state, "ready_held");
+    let state = workflow::state(&fixture.store).unwrap();
+    let prepared = state.tasks.iter().find(|item| item.id == task).unwrap();
+    assert_eq!(prepared.attention, "paused");
+    let decision = state
+        .decisions
+        .iter()
+        .find(|item| item.subject.task_id.as_deref() == Some(task.as_str()))
+        .unwrap();
+    assert!(decision
+        .primary_blocker
+        .as_ref()
+        .unwrap()
+        .message
+        .as_ref()
+        .unwrap()
+        .contains("Choose Continue"));
+    assert!(decision
+        .control_policy
+        .allowed_controls
+        .contains(&"continue".into()));
+    let action = state
+        .task_actions
+        .iter()
+        .find(|item| item.task_id == task)
+        .unwrap();
+    assert_eq!(
+        action.action.kind,
+        agenticjira::domain::AttentionActionKind::OpenTask
+    );
+    assert_eq!(action.action.label, "Open task");
+    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", 0_i64);
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: "continue-prepared-task".into(),
+            task_id: task,
+            expected_version: prepared.version,
+            action: "continue".into(),
+            payload: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    let app = Application::new_with_synthetic_dispatch_for_tests(
+        instance_paths(&fixture),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+        test_hooks(&fixture),
+    )
+    .unwrap();
+    assert_eq!(app.coordinator_tick().unwrap()["action"], "continued");
+    fixture.assert_scalar("SELECT status FROM attempts", "running".to_owned());
+    fixture.assert_scalar("SELECT attention FROM tasks", "none".to_owned());
+    fixture.assert_scalar("SELECT queue_paused FROM projects", 1_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", 0_i64);
+}
+
+#[test]
 fn reliability_manager_resume_after_plan_rejection_preserves_planning_and_feedback() {
     let fixture = Fixture::new("reliability-manager-rejected-plan");
     let (_, _, plan) = new_task(&fixture, "rejected-plan-project", "rejected-plan-task");

@@ -69,7 +69,7 @@ const { WorkflowControls } = await import("./components/WorkflowControls");
 const { ModelSelector } = await import("./components/ModelSelector");
 const { Workspace } = await import("./components/Workspace");
 const { SessionTree } = await import("./components/SessionTree");
-const { ApiError, ProtocolError, command, getState, transportTimeouts } = await import("./api");
+const { ApiError, ProtocolError, command, getState, waitForState, transportTimeouts } = await import("./api");
 const { liveEnvironment, liveTiming, startLiveState } = await import(
   "./liveState"
 );
@@ -5953,11 +5953,12 @@ Deno.test("M5 decision policy keeps the permitted control and explains the block
       />,
     );
     const runNext = [...document.querySelectorAll<HTMLButtonElement>("button")]
-      .find((button) => button.textContent?.trim() === "Run next");
+      .find((button) => button.textContent?.trim() === "Prepare task");
     if (!runNext || runNext.disabled) {
       throw new Error("Ready Run next policy was disabled");
     }
-    click("Run next");
+    check(document.body.textContent?.includes("pauses before starting an agent"), "Prepare task implies immediate agent startup");
+    click("Prepare task");
     await settle();
     if (
       requests.at(-1)?.kind !== "control" ||
@@ -10757,4 +10758,160 @@ Deno.test("Reliability: checks awaiting Manager conformance show the next step a
       "Manual action needed",
     "conformance hid recovery",
   );
+});
+
+Deno.test("Paused task actions survive snapshot reads and live updates", async () => {
+  const priorFetch = globalThis.fetch;
+  const notice: AttentionItem = {
+    ...railItem("task:AJ-1:paused", "blocked", "Paused", {
+      kind: "task",
+      project_id: "p1",
+      task_id: "AJ-1",
+      task_version: 7,
+    }),
+    action: { kind: "open_task", label: "Open task" },
+  };
+  const state = snapshotAt("paused-task-api", "2", {
+    projects: [initialized],
+    tasks: [{ ...task, attention: "paused" }],
+    attention: [notice],
+    task_actions: [{
+      task_id: "AJ-1",
+      item_id: notice.id,
+      item_ids: [notice.id],
+      action: notice.action!,
+    }],
+  });
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    check(
+      url === "/api/state" || url.startsWith("/api/state/wait?"),
+      "snapshot reader used an unexpected route",
+    );
+    return new Response(JSON.stringify(
+      url === "/api/state" ? state : changedTo(state),
+    ));
+  }) as typeof fetch;
+  try {
+    const initial = await getState();
+    const update = await waitForState(
+      { incarnation: state.incarnation, revision: "1" },
+      { waitMs: 100, requestMs: 1000 },
+      new AbortController().signal,
+    );
+    if (update.outcome !== "state_changed") {
+      throw new Error("live update was not delivered");
+    }
+    for (const snapshot of [initial, update.state]) {
+      check(
+        snapshot.attention[0].action?.kind === "open_task" &&
+          snapshot.task_actions?.[0].action.kind === "open_task",
+        "paused task actions were rejected or lost at the API boundary",
+      );
+    }
+  } finally {
+    globalThis.fetch = priorFetch;
+  }
+});
+
+Deno.test("Prepared task attention opens controls and Continue targets only that task", async () => {
+  const live = liveHarness();
+  const priorEnvironment = { ...liveEnvironment };
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.body) requests.push(JSON.parse(String(init.body)));
+      return new Response(JSON.stringify({ result: { state: "continued" } }));
+    }) as typeof fetch;
+  liveEnvironment.transport = live.environment.transport;
+  liveEnvironment.scheduler = live.environment.scheduler;
+  localStorage.clear();
+  localStorage.setItem("agenticjira.page", "workspace");
+  const paused: Task = {
+    ...task,
+    attention: "paused",
+    active_attempt: {
+      ...task.active_attempt!,
+      phase: "planning",
+      status: "held",
+    },
+  };
+  const notice: AttentionItem = {
+    ...railItem("task:AJ-1:paused", "blocked", "Paused", {
+      kind: "task",
+      project_id: "p1",
+      task_id: "AJ-1",
+      task_version: 7,
+    }),
+    reason: "This task is paused. Choose Continue to start its work.",
+    action: { kind: "open_task", label: "Open task" },
+  };
+  try {
+    mount(<App />);
+    await settle();
+    live.reads[0].resolve(snapshotAt("service-a", "71", {
+      projects: [{ ...initialized, queue_paused: true }],
+      tasks: [paused],
+      attention: [notice],
+      decisions: [{
+        decision_schema: 1,
+        reason_code: "workflow.task_attention_required",
+        disposition: "held",
+        subject: { task_id: "AJ-1", attempt_id: "a1" },
+        observed_revision: { task_version: 7 },
+        primary_blocker: {
+          code: "workflow.task_attention_required",
+          state: "pending",
+          owner: "human",
+          evidence: { attention: "paused" },
+          message: notice.reason,
+        },
+        prerequisites: [],
+        ownership: { owner: "human", state: "held", binding: {} },
+        next_action: null,
+        control_policy: {
+          allowed_controls: ["continue", "run_next", "cancel"],
+        },
+      }],
+    }));
+    await settle();
+    const open = document.querySelector<HTMLButtonElement>(
+      '[data-attention-id="task:AJ-1:paused"] button',
+    );
+    check(
+      open?.textContent?.startsWith("Open task"),
+      "paused task still looks like a recovery failure",
+    );
+    act(() => open!.click());
+    await settle();
+    check(
+      requests.length === 0,
+      "opening a paused task changed workflow state",
+    );
+    const dialog = document.querySelector('[role="dialog"]');
+    check(
+      dialog?.textContent?.includes("Choose Continue"),
+      "paused task did not explain the next step",
+    );
+    const resume = [...dialog!.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent === "Continue");
+    check(
+      resume && !resume.disabled,
+      "Continue is unavailable for the prepared task",
+    );
+    act(() => resume!.click());
+    await settle();
+    check(
+      requests.length === 1 && requests[0].kind === "control" &&
+        requests[0].action === "continue" && requests[0].task_id === "AJ-1" &&
+        requests[0].expected_version === 7,
+      "Continue changed project pickup or lost the exact task/version",
+    );
+  } finally {
+    unmount();
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
 });

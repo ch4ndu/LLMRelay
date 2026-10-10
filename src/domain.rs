@@ -2051,6 +2051,7 @@ pub enum AttentionTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionActionKind {
+    OpenTask,
     ReviewPlan,
     ReviewRequest,
     ReviewResult,
@@ -2065,6 +2066,7 @@ pub enum AttentionActionKind {
 impl AttentionActionKind {
     pub fn label(self) -> &'static str {
         match self {
+            Self::OpenTask => "Open task",
             Self::ReviewPlan => "Review plan",
             Self::ReviewRequest => "Review request",
             Self::ReviewResult => "Review result",

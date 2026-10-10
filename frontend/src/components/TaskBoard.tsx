@@ -203,9 +203,9 @@ export function taskStatus(
     }
     if (task.attention === "run_next_requested") {
       return {
-        label: "Ready · starting next",
+        label: "Ready · preparing",
         tone: "active",
-        detail: "You chose Run next, so this task starts as soon as possible.",
+        detail: "Preparing this task's workspace. It will pause before starting an agent; choose Continue when preparation finishes.",
         completed,
       };
     }
@@ -216,7 +216,7 @@ export function taskStatus(
       label: "Ready",
       tone: "waiting",
       detail: context.project?.queue_paused
-        ? "Queued and eligible to start, but pickup is paused for this project. Choose Resume pickup, or Run next to start only this task."
+        ? "Task pickup is paused for this project. Choose Resume pickup to start queued tasks automatically, or Prepare task to create this task's workspace, then Continue to start it."
         : "Queued and eligible to start. It starts automatically when an agent slot is free.",
       completed,
     };

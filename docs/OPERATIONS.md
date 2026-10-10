@@ -230,6 +230,12 @@ Request a safe drain with:
 llmrelay stop --drain --data-dir "$PWD/.local/my-agenticjira"
 ```
 
+The host lets accepted control requests finish their replies before exiting and
+closes idle control connections during shutdown. A drain reply describes the
+current process state; active or unknown processes still require reconciliation.
+If the connection fails before a reply arrives, the outcome remains uncertain:
+inspect the instance status before deciding whether another stop is needed.
+
 Drain disables new dispatch, interrupts owned PTY and configured-check processes, and waits until recorded processes are absent. Closing the browser does not stop the host. Nondelivery requires evidence that the provider never started, such as an explicit pre-provider failure acknowledgement from the launch wrapper. Proven provider nondelivery keeps the request unspent, but uncertain wrapper cleanup still fences another launch until positive reconciliation. Once the provider starts, cleanup can prove that its processes stopped, but cannot prove that it never received the prompt; an uncertain delivery keeps its review round spent and its workflow authority fenced until recovery. Recovery records the process-group leader's generation separately from the provider child and observed descendants. After an unexpected restart, complete process inventory may prove those generations absent or positively identify an unrelated replacement group without signaling it. A changed stable operating-system boot UUID can prove prior-boot absence; restarting LLMRelay or migrating an older identity format cannot. Human recovery text is an annotation and cannot declare an unknown process quiescent.
 
 Offline diagnostics and sanitized export use the same selected data directory:

@@ -89,6 +89,103 @@ fn environment(name: &str) -> String {
     std::env::var(name).unwrap()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_service_stop_cli_receives_success_before_host_exit() {
+    use std::io::{BufRead, Read};
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    async fn wait_for_exit(child: &mut ChildGuard) -> std::process::ExitStatus {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    return status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture process did not exit")
+    }
+    for drain in [false, true] {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-stop-reply-{}", uuid::Uuid::new_v4()));
+        let mut service = ChildGuard(
+            std::process::Command::new(env!("CARGO_BIN_EXE_llmrelay"))
+                .args(["serve", "--port", "0", "--no-open", "--data-dir"])
+                .arg(&root)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = service.0.stdout.take().unwrap();
+        let startup = tokio::task::spawn_blocking(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                if line.unwrap().contains("Automatic browser opening disabled") {
+                    return;
+                }
+            }
+            panic!("service exited before startup");
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(15), startup)
+            .await
+            .unwrap()
+            .unwrap();
+        let paths = InstancePaths::resolve(Some(root.clone())).unwrap();
+        let idle = control::ControlConnection::connect(&paths.control_socket)
+            .await
+            .unwrap();
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_llmrelay"));
+        command
+            .args(["stop", "--data-dir"])
+            .arg(&root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if drain {
+            command.arg("--drain");
+        }
+        let mut stop = ChildGuard(command.spawn().unwrap());
+        let status = wait_for_exit(&mut stop).await;
+        let mut errors = String::new();
+        stop.0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut errors)
+            .unwrap();
+        assert!(status.success(), "stop failed: {errors}");
+        let mut output = Vec::new();
+        stop.0
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut output)
+            .unwrap();
+        let reply: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        if drain {
+            assert_eq!(reply["draining"], true);
+            assert_eq!(reply["active"], serde_json::json!([]));
+            assert_eq!(reply["active_checks"], serde_json::json!([]));
+            assert_eq!(reply["unknown"], serde_json::json!([]));
+            assert_eq!(reply["process_inventory"]["state"], "observed");
+        } else {
+            assert_eq!(reply["shutdown_requested"], true);
+        }
+        assert!(wait_for_exit(&mut service).await.success());
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.instance_file).unwrap()).unwrap();
+        assert_eq!(record["status"], "stopped");
+        drop((idle, stop, service));
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(paths.socket_dir);
+    }
+}
+
 fn hook_cli(provider: &str, event: &str, input: &str) -> std::process::Output {
     use std::io::Write;
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_agenticjira"))

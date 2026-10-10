@@ -393,6 +393,7 @@ const attentionActionIsCurrent = (value: unknown) =>
       "review_request",
       "review_result",
       "answer_question",
+      "open_task",
       "open_agent_output",
       "open_project_setup",
       "open_agent_settings",

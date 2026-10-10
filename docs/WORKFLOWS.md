@@ -182,6 +182,12 @@ A Codex manager turn sometimes ends without a completion hook for every tool it 
 
 Each task card on the Board and in Workspace, and the task's header, shows the same next step as the Workspace inbox, for example **Review plan**, **Review request**, **Answer question**, **Open agent output**, **Open agent settings** or **Resolve issue**, and opens the same exact item. When a task has more than one waiting item, the card shows how many more there are and the task header lists each of them with its own button. If an item changed before it could open, nothing is opened or run and the latest state is requested. An item with no current page to open offers **Refresh**.
 
+On a Ready task, **Prepare task** creates its workspace and pauses before any
+agent starts. The paused task offers **Open task**; choose **Continue** in its
+controls to start its work. This does not change project pickup; if pickup is
+paused, other tasks stay queued. **Resume pickup** is the separate action that
+lets queued tasks start automatically.
+
 The task's Overview explains why it is waiting, who it is waiting on (you, LLMRelay, a named agent role or another task), when the wait began and when the last workflow step was recorded. Reports, decisions, deliveries, reviews, recoveries and phase changes count as steps; an agent that is only running, or is producing output without reporting anything, is shown as such and never counts as progress.
 
 If one workflow step fails on every try, Workspace shows **Automatic progress is paused**. When the failure belongs to one task, the item names the task and opens it; otherwise **Open diagnostics** opens the Diagnostics page, which lists the recorded failure. The raw error is under **Technical details**. LLMRelay keeps retrying and records each distinct failure once, not on every retry; the item clears by itself when the step succeeds.

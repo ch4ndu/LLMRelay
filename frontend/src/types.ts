@@ -1048,6 +1048,7 @@ export type AttentionTarget =
   }
   | { kind: "diagnostics" };
 export type AttentionActionKind =
+  | "open_task"
   | "review_plan"
   | "review_request"
   | "review_result"

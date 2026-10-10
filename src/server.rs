@@ -579,7 +579,7 @@ pub(crate) async fn serve(
     let control_instance = serde_json::to_value(&record)?;
     let control_tx = shutdown_tx.clone();
     let control_failure = failure_tx.clone();
-    tokio::spawn(async move {
+    let control_task = tokio::spawn(async move {
         if let Err(error) = control::serve_bound(
             control_app,
             control_tx.clone(),
@@ -760,12 +760,20 @@ pub(crate) async fn serve(
         .await
         .err()
         .map(|error| format!("coordinator loop failed: {error}"));
+    let control_error = control_task
+        .await
+        .err()
+        .map(|error| format!("control listener task failed: {error}"));
 
     if let Some(task) = opener_task {
         let _ = task.await;
     }
 
-    let listener_failure = failure_tx.borrow().clone().or(coordinator_error);
+    let listener_failure = failure_tx
+        .borrow()
+        .clone()
+        .or(coordinator_error)
+        .or(control_error);
     let final_record = InstanceRecord {
         status: if listener_failure.is_some() || server_result.is_err() {
             "unhealthy".to_owned()

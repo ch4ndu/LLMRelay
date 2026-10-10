@@ -8403,6 +8403,7 @@ impl AttentionSources<'_> {
                     match attention {
                         "needs_human_review" => AttentionActionKind::ReviewResult,
                         _ if answer.is_some() => AttentionActionKind::AnswerQuestion,
+                        "paused" => AttentionActionKind::OpenTask,
                         _ => AttentionActionKind::ResolveIssue,
                     },
                     answer.or_else(task_scope),
@@ -9069,7 +9070,7 @@ fn task_attention_title(attention: &str) -> String {
         "pause_requested" => "Pausing after the current step".into(),
         "queued_capacity" => "Waiting for a free agent slot".into(),
         "blocked" => "Can't continue with current settings".into(),
-        "run_next_requested" => "Starting next".into(),
+        "run_next_requested" => "Preparing task".into(),
         other => plain_words(other),
     }
 }
@@ -9088,7 +9089,7 @@ pub(crate) fn plain_scheduler_reason(reason_code: &str) -> Option<String> {
             "The maximum number of tasks is already running. This task starts automatically when one finishes."
         }
         "scheduler.queue_paused" => {
-            "Task pickup is paused for this project. Choose Resume pickup to let queued tasks start, or Run next to start only this task."
+            "Task pickup is paused for this project. Choose Resume pickup to start queued tasks automatically, or Prepare task to create this task's workspace, then Continue to start it."
         }
         "scheduler.repository_claim_active" => {
             "Another task is using this repository. This task starts automatically when that task finishes."
