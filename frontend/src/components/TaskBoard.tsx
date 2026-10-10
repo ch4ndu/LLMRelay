@@ -273,6 +273,15 @@ export function taskStatus(
     };
   }
   const phase = attempt && phaseStatus[attempt.phase];
+  if (attempt?.phase === "checks" &&
+    task.progress?.reason_code.startsWith("workflow.manager_conformance_")) {
+    return {
+      label: "Checking plan conformance",
+      tone: "active",
+      detail: "The selected checks have passed. The manager must confirm that the result meets the approved plan before final review.",
+      completed,
+    };
+  }
   if (attempt?.phase === "implementation" &&
     !running.some((session) => session.role === "implementer")) {
     if (attempt.candidate_hash) {

@@ -382,6 +382,20 @@ export function App() {
       live.current = undefined;
     };
   }, []);
+  useEffect(() => {
+    const refreshVisible = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
+    const refreshOnReturn = () => void refresh();
+    document.addEventListener("visibilitychange", refreshVisible);
+    window.addEventListener("focus", refreshOnReturn);
+    window.addEventListener("online", refreshOnReturn);
+    return () => {
+      document.removeEventListener("visibilitychange", refreshVisible);
+      window.removeEventListener("focus", refreshOnReturn);
+      window.removeEventListener("online", refreshOnReturn);
+    };
+  }, [refresh]);
   // A routed attention click settles in the render that routed it. Without its
   // exact marker nothing stands in: the route is withdrawn, explained and
   // refreshed once.

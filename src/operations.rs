@@ -2397,6 +2397,15 @@ impl Application {
         } else {
             None
         };
+        let human_approval_context =
+            if ordinary_task && context.role == crate::domain::RoleKind::Manager {
+                Some(crate::trip::human_approval_context(
+                    &connection,
+                    &context.attempt_id,
+                )?)
+            } else {
+                None
+            };
         drop(connection);
         let plan = if let Some((id, hash)) = plan_record {
             let path = self
@@ -2463,6 +2472,9 @@ impl Application {
         let mut value = serde_json::json!({"identity":context,"task":serde_json::from_str::<serde_json::Value>(&task)?,"attempt":serde_json::from_str::<serde_json::Value>(&attempt)?,"task_profiles":task_profiles.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"project_policy":project_policy,"verification_catalog":verification_catalog,"selected_checks":selected_checks,"explorer_decisions":explorer_decisions,"approved_plan":plan,"active_review":current_review.map(|value|serde_json::from_str::<serde_json::Value>(&value.5)).transpose()?,"completed_final_review":completed_final_review.map(|value|serde_json::from_str::<serde_json::Value>(&value)).transpose()?,"review_feedback":feedback.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"review_budgets":budgets.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"check_results":checks.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"guidance":guidance,"guidance_contract":guidance_contract,"setup_contract":setup_contract,"commands":commands});
         if let Some(evidence) = ordinary_review_evidence {
             value["ordinary_review_evidence"] = evidence;
+        }
+        if let Some(approvals) = human_approval_context {
+            value["human_approval_context"] = approvals;
         }
         if let Some(recheck) = final_repair_recheck {
             value["final_repair_recheck"] = serde_json::from_str(&recheck)?;
@@ -3418,11 +3430,25 @@ impl Application {
             bail!("resume input differs from the persisted invocation; create a fresh role or review request")
         }
         self.store.validate_resume_input(session_id, &invocation)?;
-        // Only this delivered turn carries the notice; the saved invocation stays the original prompt.
-        let delivered_prompt = match restart_admission {
-            Some(_) => format!("{HOST_RESTART_RESUME_NOTICE}\n\n{persisted_prompt}"),
-            None => persisted_prompt.to_owned(),
-        };
+        let mut delivered_prompt = persisted_prompt.to_owned();
+        if prior.role == crate::domain::RoleKind::Manager && record["validation_cell"].is_null() {
+            let approvals = {
+                let connection = self.store.lock()?;
+                crate::trip::human_approval_context(
+                    &connection,
+                    record["attempt_id"]
+                        .as_str()
+                        .ok_or_else(|| anyhow!("session attempt is missing"))?,
+                )?
+            };
+            delivered_prompt = format!(
+                "Current workflow checkpoint: {approvals}\nThe saved invocation below is historical context. Continue the current phase shown above using authenticated role context, preserving its current scope and feedback.\n\n{delivered_prompt}"
+            );
+        }
+        // The restart notice leads only its admitted turn; the saved invocation stays unchanged.
+        if restart_admission.is_some() {
+            delivered_prompt = format!("{HOST_RESTART_RESUME_NOTICE}\n\n{delivered_prompt}");
+        }
         let generation = record["role_generation_id"]
             .as_str()
             .ok_or_else(|| anyhow!("session generation is missing"))?

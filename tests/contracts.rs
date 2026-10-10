@@ -22067,8 +22067,8 @@ fn m5_restart_due_capacity_failures_and_recovery_writers_preserve_authority() {
         "resumed:capacity-batch:completed:0:1:capacity-2",
     );
 
-    // Only the admitted host-restart turn carries the notice, ahead of the byte-identical
-    // original prompt; a later ordinary resume of the same native session carries none.
+    // Only the admitted host-restart turn carries the leading notice. Both turns
+    // project their current checkpoint and preserve the original prompt below it.
     let host_restart_notice = "LLMRelay restarted while this session was running and interrupted its previous turn. Before repeating any command, edit or report that may already have been in flight, check its actual effect; do not assume it did or did not happen. The task instructions below are unchanged.";
     let delivered = |ordinal: i64| -> (Vec<String>, String) {
         let (launch, capability_key): (String, String) = fixture
@@ -22097,13 +22097,21 @@ fn m5_restart_due_capacity_failures_and_recovery_writers_preserve_authority() {
         .unwrap();
     let (ordinary_argv, ordinary_key) = delivered(2);
     let ordinary_turn = ordinary_argv.last().unwrap();
-    assert!(
-        ordinary_turn.starts_with(&format!("{prompt}\n\n")),
-        "{ordinary_turn}"
-    );
+    assert!(!ordinary_turn.contains(host_restart_notice));
+    let restart_turn = restart_argv
+        .last()
+        .unwrap()
+        .strip_prefix(&format!("{host_restart_notice}\n\n"))
+        .expect("restart notice leads the admitted turn");
+    let original_suffix = |turn: &str| -> String {
+        assert!(turn.starts_with("Current workflow checkpoint: "), "{turn}");
+        let (_, original) = turn.split_once("\n\n").unwrap();
+        assert!(original.starts_with(&format!("{prompt}\n\n")), "{original}");
+        original.to_owned()
+    };
     assert_eq!(
-        restart_argv.last().unwrap(),
-        &format!("{host_restart_notice}\n\n{ordinary_turn}")
+        original_suffix(restart_turn),
+        original_suffix(ordinary_turn)
     );
     let frozen_key: String =
         fixture.scalar("SELECT capability_key FROM sessions WHERE id='capacity-session-2'");
@@ -47325,6 +47333,13 @@ fn default_writer_receives_exact_approved_structure_without_a_manager_question()
                     app.role_context_payload(&manager).unwrap()["structured_plan"],
                     structure
                 );
+                assert_eq!(
+                    app.role_context_payload(&manager).unwrap()["human_approval_context"]
+                        ["implementation_authorized"],
+                    true
+                );
+                let invocation = fixture.store.invocation_input(&manager.session_id).unwrap();
+                assert!(invocation.to_string().contains("human_approval_context"));
                 manager_context = Some(manager);
             }
             (tick["action"] == "implementer_dispatched").then_some(tick)
@@ -47842,5 +47857,279 @@ fn completed_review_late_exit_settles_only_its_exact_recovery() {
             "SELECT COUNT(*) FROM audit_events WHERE event_code='review.completed_exit.reconciled'",
             i64::from(resolved),
         );
+    }
+}
+
+#[test]
+fn reliability_manager_resume_after_plan_rejection_preserves_planning_and_feedback() {
+    let fixture = Fixture::new("reliability-manager-rejected-plan");
+    let (_, _, plan) = new_task(&fixture, "rejected-plan-project", "rejected-plan-task");
+    let mut paths = instance_paths(&fixture);
+    paths.role_socket = fixture.root.join("role.sock");
+    let app = Application::new_with_synthetic_dispatch_for_tests(
+        paths,
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+        test_hooks(&fixture),
+    )
+    .unwrap();
+    let launched = app
+        .dispatch_attempt_role(
+            &plan.attempt_id,
+            RoleKind::Manager,
+            "Prepare the task plan.",
+        )
+        .unwrap();
+    let before = fixture
+        .store
+        .invocation_input(&launched.session_id)
+        .unwrap();
+    fixture.execute(
+        "UPDATE sessions SET native_session_id=?1,native_identity_verified_at='2026-01-01T00:00:00Z' WHERE id=?2",
+        params![uuid::Uuid::new_v4().to_string(), launched.session_id],
+    );
+    let (epoch, process) = runtime_session_identity(&fixture, &launched.session_id);
+    assert!(fixture
+        .store
+        .update_session_exit(
+            &launched.session_id,
+            &epoch,
+            &process,
+            r#"{"code":0,"process_group_quiescent":true}"#,
+        )
+        .unwrap());
+    seed_session(
+        &fixture,
+        &plan.attempt_id,
+        "plan_reviewer",
+        "rejected-plan-reviewer",
+        "rejected-plan-session",
+        "exited",
+    );
+    fixture.execute(
+        "UPDATE attempts SET phase='plan_review',plan_hash='rejected-plan' WHERE id=?1",
+        params![plan.attempt_id],
+    );
+    fixture.execute(
+        "UPDATE review_budgets SET spent=1 WHERE attempt_id=?1 AND review_kind='plan'",
+        params![plan.attempt_id],
+    );
+    fixture.execute("UPDATE role_settings SET effective_generation_id='rejected-plan-reviewer' WHERE task_id=?1 AND role='plan_reviewer'", params![plan.task_id]);
+    fixture.execute(
+        "UPDATE role_generations SET status='exited' WHERE id='rejected-plan-reviewer'",
+        [],
+    );
+    fixture.execute("INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,prompt_hash,handoff_hash,delivery_state,session_id,created_at,updated_at)
+        VALUES('rejected-plan-request',?1,'plan','rejected-plan','rejected-plan-reviewer','prompt','handoff','delivered','rejected-plan-session','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", params![plan.attempt_id]);
+    fixture.execute_batch(r#"INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+        VALUES('rejected-plan-result','rejected-plan-report','rejected-plan-session','rejected-plan-reviewer','request_changes','Clarify the acceptance criteria.','[]','{"review_request_id":"rejected-plan-request","review_kind":"plan","candidate_hash":"rejected-plan"}','2026-01-01T00:00:00Z');"#);
+    let applied = app.coordinator_tick().unwrap();
+    assert_eq!(applied["action"], "review_applied", "{applied}");
+    assert_eq!(applied["phase"], "planning");
+
+    let resumed = app.resume_role_session(&launched.session_id, "").unwrap();
+    let delivered = resumed
+        .launch
+        .argv
+        .iter()
+        .find(|arg| arg.starts_with("Current workflow checkpoint: "))
+        .unwrap();
+    let checkpoint: serde_json::Value = serde_json::from_str(
+        delivered
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Current workflow checkpoint: ")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(checkpoint["phase"], "planning");
+    assert_eq!(checkpoint["plan_approved"], false);
+    assert_eq!(checkpoint["implementation_authorized"], false);
+    assert!(checkpoint["plan_hash"].is_null());
+    assert!(delivered.contains("Continue the current phase shown above using authenticated role context, preserving its current scope and feedback."));
+    assert!(!delivered.contains("rather than restarting its original planning step"));
+    let (_, original_prompt) = delivered.split_once("\n\n").unwrap();
+    assert!(original_prompt.starts_with(&format!("{}\n\n", before["prompt"].as_str().unwrap())));
+    assert_eq!(
+        fixture
+            .store
+            .invocation_input(&launched.session_id)
+            .unwrap(),
+        before
+    );
+    let feedback: serde_json::Value = serde_json::from_str(&fixture.scalar::<String>(
+        "SELECT body FROM guidance_messages WHERE reason='engine_plan_rejection_notice'",
+    ))
+    .unwrap();
+    assert_eq!(feedback["feedback"], "Clarify the acceptance criteria.");
+    fixture.assert_scalar("SELECT SUM(spent) FROM review_budgets", 1_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", 2_i64);
+}
+
+#[test]
+fn reliability_manager_resume_projects_current_approvals_without_rewriting_saved_input() {
+    let fixture = Fixture::new("reliability-manager-approval-context");
+    let (_, _, plan) = new_task(&fixture, "approval-project", "approval-task");
+    let mut paths = instance_paths(&fixture);
+    paths.role_socket = fixture.root.join("role.sock");
+    let app = Application::new_with_synthetic_dispatch_for_tests(
+        paths,
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+        test_hooks(&fixture),
+    )
+    .unwrap();
+    let launched = app
+        .dispatch_attempt_role(
+            &plan.attempt_id,
+            RoleKind::Manager,
+            "Stop after planning so the user can inspect the plan.",
+        )
+        .unwrap();
+    let context = app
+        .synthetic_role_context_for_tests(&launched.session_id)
+        .unwrap();
+    let before = fixture.store.invocation_input(&context.session_id).unwrap();
+    let initial = app.role_context_payload(&context).unwrap();
+    assert_eq!(
+        initial["human_approval_context"]["implementation_authorized"],
+        false
+    );
+    authorize_ordinary_implementation(&fixture, &plan);
+    fixture.execute(
+        "UPDATE trip_structured_plans SET reviewed_at='2026-01-01T00:00:00Z' WHERE attempt_id=?1",
+        params![plan.attempt_id],
+    );
+    let approved = app.role_context_payload(&context).unwrap();
+    let approvals = &approved["human_approval_context"];
+    assert_eq!(approvals["phase"], "implementation");
+    assert_eq!(approvals["plan_approved"], true);
+    assert_eq!(approvals["implementation_authorized"], true);
+    assert!(approvals["approved_at"].is_string());
+    assert!(approvals["implementation_authorized_at"].is_string());
+    fixture.execute("UPDATE sessions SET native_session_id=?1,native_identity_verified_at='2026-01-01T00:00:00Z' WHERE id=?2",
+        params![uuid::Uuid::new_v4().to_string(),context.session_id]);
+    let (epoch, process) = runtime_session_identity(&fixture, &context.session_id);
+    assert!(fixture
+        .store
+        .update_session_exit(
+            &context.session_id,
+            &epoch,
+            &process,
+            r#"{"code":0,"process_group_quiescent":true}"#
+        )
+        .unwrap());
+    let resumed = app.resume_role_session(&context.session_id, "").unwrap();
+    assert_eq!(resumed.session_id, context.session_id);
+    let delivered = resumed
+        .launch
+        .argv
+        .iter()
+        .find(|arg| arg.starts_with("Current workflow checkpoint: "))
+        .expect("resumed Manager receives a current checkpoint");
+    let checkpoint: serde_json::Value = serde_json::from_str(
+        delivered
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Current workflow checkpoint: ")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(checkpoint["implementation_authorized"], true);
+    assert_eq!(checkpoint["plan_hash"], approvals["plan_hash"]);
+    assert!(delivered.contains("already satisfied"));
+    assert_eq!(
+        fixture.store.invocation_input(&context.session_id).unwrap(),
+        before
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", 1_i64);
+    fixture.assert_scalar("SELECT SUM(spent) FROM review_budgets", 0_i64);
+    let resumed_context = app
+        .synthetic_role_context_for_tests(&context.session_id)
+        .unwrap();
+    for change in [
+        "UPDATE trip_structured_plans SET implementation_authorized_at=NULL",
+        "UPDATE trip_structured_plans SET implementation_authorized_at='2026-01-01T00:00:00Z',approved_at=NULL",
+        "UPDATE trip_structured_plans SET approved_at='2026-01-01T00:00:00Z',plan_hash='stale-plan'",
+    ] {
+        fixture.execute_batch(change);
+        assert_eq!(app.role_context_payload(&resumed_context).unwrap()["human_approval_context"]["implementation_authorized"], false);
+    }
+}
+
+#[test]
+fn reliability_skipped_completed_restart_is_history_but_uncertain_exit_stays_actionable() {
+    for lifecycle in ["awaiting_review", "done", "cancelled"] {
+        let fixture = Fixture::new(&format!("reliability-skipped-{lifecycle}"));
+        seed_attempt(&fixture, "awaiting_human_review");
+        seed_session(
+            &fixture,
+            "a",
+            "manager",
+            "skipped-generation",
+            "skipped-session",
+            "exited",
+        );
+        let attention = if lifecycle == "awaiting_review" {
+            "needs_human_review"
+        } else {
+            "none"
+        };
+        fixture.execute(
+            "UPDATE tasks SET lifecycle=?1,attention=?2 WHERE id='t'",
+            params![lifecycle, attention],
+        );
+        if lifecycle != "awaiting_review" {
+            fixture.execute(
+                "UPDATE attempts SET status=?1 WHERE id='a'",
+                params![lifecycle],
+            );
+        }
+        fixture.execute_batch("UPDATE role_generations SET status='exited';
+            INSERT INTO restart_candidates(session_id,attempt_id,task_id,source,state,reason,result_json,created_at,updated_at)
+            VALUES('skipped-session','a','t','planned_shutdown','skipped','task is terminal','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');");
+        let state = workflow::state(&fixture.store).unwrap();
+        let decision = state
+            .decisions
+            .iter()
+            .find(|d| {
+                d.subject.session_id.as_deref() == Some("skipped-session")
+                    && d.reason_code.starts_with("restart.")
+                    && d.reason_code != "restart.hold_active"
+            })
+            .unwrap();
+        assert_eq!(decision.reason_code, "restart.complete");
+        assert!(!state
+            .continuation_actions
+            .iter()
+            .any(|a| a.binding["session_id"] == "skipped-session"
+                && a.operation == "refresh_and_reconcile"));
+        assert_eq!(state.restart_candidates[0]["state"], "skipped");
+        assert!(!state
+            .task_actions
+            .iter()
+            .any(|action| action.task_id == "t" && action.action.label == "Resolve issue"));
+        fixture.execute_batch("INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at)
+            VALUES('unresolved','skipped-session','a','attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');");
+        let unresolved = workflow::state(&fixture.store).unwrap();
+        assert!(unresolved
+            .decisions
+            .iter()
+            .any(
+                |d| d.subject.session_id.as_deref() == Some("skipped-session")
+                    && d.reason_code == "restart.candidate_unavailable"
+            ));
+        fixture.execute_batch("UPDATE recovery_records SET state='resolved' WHERE id='unresolved'");
+        fixture.execute_batch("UPDATE sessions SET exit_json='{}' WHERE id='skipped-session'");
+        let uncertain = workflow::state(&fixture.store).unwrap();
+        assert!(uncertain
+            .decisions
+            .iter()
+            .any(
+                |d| d.subject.session_id.as_deref() == Some("skipped-session")
+                    && d.reason_code == "restart.candidate_unavailable"
+            ));
     }
 }

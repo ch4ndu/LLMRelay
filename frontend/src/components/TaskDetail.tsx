@@ -599,9 +599,22 @@ export function TaskDetail(
     typeof item.evidence === "object" && item.evidence !== null &&
     "task_id" in item.evidence && item.evidence.task_id === task.id
   );
-  const proposals = state.controls.filter((value) =>
+  const transitionProposals = state.controls.filter((value) =>
     value.attempt_id === attempt?.id && value.kind === "transition_proposal"
   );
+  const managerGeneration = task.role_settings.filter((value) => value.role === "manager")
+    .sort((left, right) => right.revision - left.revision)
+    .find((value) => value.effective_generation_id)?.effective_generation_id;
+  const proposals = transitionProposals.filter((value) =>
+    !terminal && value.state === "proposed" &&
+    !!managerGeneration && value.role_generation_id === managerGeneration &&
+    value.payload.role_generation_id === managerGeneration &&
+    value.payload.expected_task_version === task.version &&
+    value.payload.source_phase === attempt?.phase &&
+    (value.payload.plan_hash ?? null) === (attempt?.plan_hash ?? null) &&
+    (value.payload.candidate_hash ?? null) === (attempt?.candidate_hash ?? null)
+  );
+  const historicalProposals = transitionProposals.filter((value) => !proposals.includes(value));
   const passedChecks = selectedChecks.filter((selection) =>
     selection.latest_run?.freshness_state === "current" &&
     selection.latest_run.status === "finished" &&
@@ -1172,6 +1185,20 @@ export function TaskDetail(
         <h3>Reports</h3>
         <ReportList content={content} error={contentError} started={!!attempt} />
       </section>
+      {historicalProposals.length > 0 && (
+        <details className="panel">
+          <summary>Earlier transition proposals</summary>
+          <p>These proposals no longer apply to the current task state.</p>
+          {historicalProposals.map((proposal) => (
+            <article className="review-row" key={proposal.id}>
+              <strong>{String(proposal.payload.source_phase)} → {String(proposal.payload.phase)}</strong>
+              <TechnicalDetails>
+                <pre>{JSON.stringify(proposal.payload, null, 2)}</pre>
+              </TechnicalDetails>
+            </article>
+          ))}
+        </details>
+      )}
       <details
         className="panel"
         open={settingsOpen}

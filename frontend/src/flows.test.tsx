@@ -3674,7 +3674,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     }
     for (
       const historical of [
-        "The manager proposed moving to another step",
+        "Earlier transition proposals",
         "contracts",
         "AJ-0",
         "2 used · 1 left",
@@ -10366,4 +10366,395 @@ Deno.test("allowing one review uses the bounded command without starting a sessi
       requests[0].task_id !== task.id || requests[0].expected_version !== task.version ||
       requests[0].review_kind !== "code") throw new Error("Review extension did not preserve its exact bounded command");
   } finally { unmount(); globalThis.fetch = previousFetch; }
+});
+
+Deno.test("Reliability: obsolete transition proposals leave Overview while current proposals remain", () => {
+  const current: Task = {
+    ...task,
+    role_settings: [{
+      id: "manager-settings",
+      role: "manager",
+      revision: 1,
+      config: { provider: "codex", model: "gpt-6.1-sol", effort: "xhigh" },
+      effective_generation_id: "manager-current",
+    }],
+    active_attempt: {
+      ...task.active_attempt!,
+      plan_hash: "plan",
+      candidate_hash: "candidate",
+    },
+  };
+  const proposal = {
+    id: "current",
+    attempt_id: "a1",
+    role_generation_id: "manager-current",
+    kind: "transition_proposal",
+    state: "proposed",
+    expected_version: 7,
+    updated_at: "2026-10-10T00:00:00Z",
+    payload: {
+      role_generation_id: "manager-current",
+      source_phase: "implementation",
+      phase: "code_review",
+      expected_task_version: 7,
+      plan_hash: "plan",
+      candidate_hash: "candidate",
+    },
+  };
+  const controls = [proposal, {
+    ...proposal,
+    id: "finished",
+    state: "finished",
+  }, {
+    ...proposal,
+    id: "old-version",
+    payload: { ...proposal.payload, expected_task_version: 6 },
+  }, {
+    ...proposal,
+    id: "old-candidate",
+    payload: { ...proposal.payload, candidate_hash: "old" },
+  }, {
+    ...proposal,
+    id: "old-manager",
+    role_generation_id: "manager-old",
+    payload: { ...proposal.payload, role_generation_id: "manager-old" },
+  }];
+  try {
+    mount(
+      <TaskDetail
+        task={current}
+        state={{ ...liveBase, tasks: [current], controls }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    check(
+      document.querySelectorAll(".task-overview-main > .panel").length === 2,
+      "Overview presented historical proposals as current work",
+    );
+    check(
+      [...document.querySelectorAll("button")].filter((b) =>
+        b.textContent === "Apply proposed step"
+      ).length === 1,
+      "the current proposal was hidden or obsolete proposals remained actionable",
+    );
+    rerender(
+      <TaskDetail
+        task={{ ...current, lifecycle: "done" }}
+        state={{ ...liveBase, controls }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    check(
+      !document.body.textContent?.includes(
+        "The manager proposed moving to another step",
+      ),
+      "finished task still promotes a historical transition",
+    );
+    click("Activity");
+    check(
+      document.body.textContent?.includes("Earlier transition proposals"),
+      "Activity lost historical proposals",
+    );
+    check(
+      ![...document.querySelectorAll("button")].some((button) =>
+        button.textContent === "Apply proposed step"
+      ),
+      "historical proposal could still be applied",
+    );
+  } finally {
+    unmount();
+  }
+});
+
+Deno.test("Reliability: returning to the dashboard refreshes open check results without a reload or mutation", async () => {
+  const live = liveHarness();
+  const priorEnvironment = { ...liveEnvironment };
+  const registrations: {
+    target: "window" | "document";
+    type: string;
+    listener: Parameters<typeof window.addEventListener>[1];
+    removed: boolean;
+  }[] = [];
+  const restoreListeners = [
+    { target: window, name: "window" as const, events: ["focus", "online"] },
+    {
+      target: window.document,
+      name: "document" as const,
+      events: ["visibilitychange"],
+    },
+  ].map(({ target, name, events }) => {
+    const add = target.addEventListener;
+    const remove = target.removeEventListener;
+    target.addEventListener = (...args: Parameters<typeof add>) => {
+      if (events.includes(args[0])) {
+        registrations.push({
+          target: name,
+          type: args[0],
+          listener: args[1],
+          removed: false,
+        });
+      }
+      add.apply(target, args);
+    };
+    target.removeEventListener = (...args: Parameters<typeof remove>) => {
+      for (const registration of registrations) {
+        if (
+          registration.target === name && registration.type === args[0] &&
+          registration.listener === args[1]
+        ) {
+          registration.removed = true;
+        }
+      }
+      remove.apply(target, args);
+    };
+    return () => {
+      target.addEventListener = add;
+      target.removeEventListener = remove;
+    };
+  });
+  const methods: string[] = [];
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      methods.push(init?.method ?? "GET");
+      return new Response("[]");
+    }) as typeof fetch;
+  liveEnvironment.transport = live.environment.transport;
+  liveEnvironment.scheduler = live.environment.scheduler;
+  localStorage.clear();
+  localStorage.setItem("agenticjira.task", "AJ-1");
+  const checking: Task = {
+    ...task,
+    active_attempt: {
+      ...task.active_attempt!,
+      phase: "checks",
+      candidate_hash: "candidate",
+    },
+  };
+  const selected: TripTaskVerification = {
+    attempt_id: "a1",
+    selected_revision: 1,
+    check_id: "focused",
+    required: true,
+    candidate_hash: "candidate",
+    exact_command_hash: "command",
+    scope_hash: "scope",
+    command: {
+      kind: "structured_argv",
+      executable: "python3",
+      arguments: ["-m", "unittest"],
+      cwd: ".",
+    },
+    authorization: {
+      once_available: true,
+      reusable: false,
+      family: false,
+      authorized: true,
+      action_state: "actionable",
+      state: "approved_once",
+      source: "service_check",
+    },
+  };
+  try {
+    mount(<App />);
+    await settle();
+    live.reads[0].resolve(
+      snapshotAt("service-a", "10", {
+        tasks: [checking],
+        trip_task_verification: [selected],
+      }),
+    );
+    await settle();
+    click("Checks");
+    await settle();
+    check(
+      document.body.textContent?.includes("Not run yet"),
+      "fixture did not start with a pending check",
+    );
+    act(() => window.dispatchEvent(new window.Event("focus")));
+    await settle();
+    check(
+      live.reads.length === 2,
+      "returning to the dashboard left checks stale until the watchdog or reload",
+    );
+    live.reads[1].resolve(
+      snapshotAt("service-a", "11", {
+        tasks: [checking],
+        trip_task_verification: [{
+          ...selected,
+          authorization: {
+            ...selected.authorization,
+            once_available: false,
+            authorized: false,
+            action_state: "current_receipt",
+          },
+          latest_run: {
+            id: "run",
+            attempt_id: "a1",
+            acceptance_coverage: [],
+            evidence: {},
+            status: "finished",
+            exit_code: 0,
+            freshness_state: "current",
+            created_at: "2026-10-10T00:00:00Z",
+            finished_at: "2026-10-10T00:00:01Z",
+          },
+        }],
+      }),
+    );
+    await settle();
+    check(
+      document.querySelector('[role="tab"][aria-selected="true"]')
+        ?.textContent === "Checks",
+      "refresh closed the open check view",
+    );
+    check(
+      document.body.textContent?.includes("Passed") &&
+        !document.body.textContent?.includes("Not run yet"),
+      "finished check did not update in place",
+    );
+    check(
+      methods.every((method) => method === "GET"),
+      "refresh submitted an action",
+    );
+    act(() => window.dispatchEvent(new window.Event("online")));
+    await settle();
+    check(live.reads.length === 3, "network restoration did not refresh state");
+    live.reads[2].resolve(snapshotAt("service-a", "12", { tasks: [checking] }));
+    await settle();
+    const visibility = Object.getOwnPropertyDescriptor(
+      document,
+      "visibilityState",
+    );
+    try {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        value: "hidden",
+      });
+      act(() =>
+        window.document.dispatchEvent(new window.Event("visibilitychange"))
+      );
+      await settle();
+      check(
+        live.reads.length === 3,
+        "hiding the page triggered a return refresh",
+      );
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        value: "visible",
+      });
+      act(() =>
+        window.document.dispatchEvent(new window.Event("visibilitychange"))
+      );
+      await settle();
+      check(live.reads.length === 4, "showing the page did not refresh state");
+      live.reads[3].resolve(
+        snapshotAt("service-a", "13", { tasks: [checking] }),
+      );
+      await settle();
+    } finally {
+      if (visibility) {
+        Object.defineProperty(document, "visibilityState", visibility);
+      } else Reflect.deleteProperty(document, "visibilityState");
+    }
+    unmount();
+    for (
+      const [target, type] of [["window", "focus"], ["window", "online"], [
+        "document",
+        "visibilitychange",
+      ]]
+    ) {
+      const matching = registrations.filter((registration) =>
+        registration.target === target && registration.type === type
+      );
+      check(
+        matching.length > 0,
+        `dashboard did not register ${target} ${type}`,
+      );
+      check(
+        matching.every((registration) => registration.removed),
+        `unmounted dashboard did not remove its ${target} ${type} listener`,
+      );
+    }
+    const reads = live.reads.length;
+    act(() => window.dispatchEvent(new window.Event("focus")));
+    await settle();
+    check(
+      live.reads.length === reads,
+      "unmounted dashboard triggered a state read",
+    );
+  } finally {
+    unmount();
+    for (const restore of restoreListeners) restore();
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Reliability: checks awaiting Manager conformance show the next step and preserve holds", () => {
+  const checking: Task = {
+    ...task,
+    active_attempt: { ...task.active_attempt!, phase: "checks" },
+    progress: {
+      reason_code: "workflow.manager_conformance_or_lane_yield_missing",
+      waiting_reason: "Waiting for plan conformance",
+      responsible: "agent",
+      responsible_role: "manager",
+      next_operation: null,
+      next_target: null,
+      waiting_since: null,
+      last_meaningful_at: null,
+      last_meaningful_event: null,
+      last_agent_activity_at: null,
+      activity: "agent_live_idle",
+    },
+  };
+  for (
+    const reason of [
+      "workflow.manager_conformance_dispatch_available",
+      "workflow.manager_conformance_stop_available",
+      "workflow.manager_conformance_or_lane_yield_missing",
+    ]
+  ) {
+    const current = {
+      ...checking,
+      progress: { ...checking.progress!, reason_code: reason },
+    };
+    check(
+      taskStatus(current).label === "Checking plan conformance",
+      "finished checks still appeared to be running",
+    );
+    try {
+      mount(
+        <TaskDetail
+          task={current}
+          state={{ ...liveBase, tasks: [current] }}
+          onClose={noop}
+          onChanged={noop}
+        />,
+      );
+      check(
+        document.body.textContent?.includes("Checking plan conformance"),
+        "task detail did not use the current phase label",
+      );
+    } finally {
+      unmount();
+    }
+  }
+  check(
+    taskStatus({ ...checking, progress: null }).label === "Running checks",
+    "normal check execution changed",
+  );
+  check(
+    taskStatus({ ...checking, attention: "paused" }).label === "Paused",
+    "conformance hid a human hold",
+  );
+  check(
+    taskStatus({ ...checking, attention: "needs_recovery" }).label ===
+      "Manual action needed",
+    "conformance hid recovery",
+  );
 });

@@ -11,6 +11,8 @@ seconds. A separate 30-second reconciliation read refreshes process observations
 lease expiry and other time-dependent data, and recovers missed notifications.
 Transient failures use bounded retry delays while retaining the last snapshot.
 The existing refresh/reconcile control requests a fresh authoritative read.
+Returning to the browser tab or restoring its network connection also requests
+a fresh read, updating the open task without submitting workflow actions.
 After a service restart, the dashboard resets its cursor to the new service
 identity; if its browser session is no longer valid, use the current startup
 authentication flow below.
@@ -32,6 +34,17 @@ exact binding is eligible. Sessions that reported their result and were stopped
 after their turn, sessions replaced by a newer generation, and sessions of
 completed or cancelled tasks are history: they appear under **Earlier sessions**
 and in the task's **Activity** tab, never as urgent recovery.
+This includes skipped restart records for tasks awaiting human review, completed
+or cancelled when their sessions have a confirmed quiescent exit and no unresolved
+recovery. An uncertain exit or unresolved recovery still needs attention.
+
+The task Overview shows only transition proposals matching the current task
+version, phase, plan and candidate. Older proposals remain in recorded history.
+Once selected checks pass, the board distinguishes the Manager's plan conformance
+step from running checks. Retained Managers receive the current recorded plan
+approval and implementation authorization alongside their saved original prompt,
+so a satisfied approval checkpoint does not require another approval. Independent
+holds, verification permissions and final human acceptance still apply.
 
 Native OS notifications are deferred; the dashboard attention rail is the
 implemented notification surface for this milestone.

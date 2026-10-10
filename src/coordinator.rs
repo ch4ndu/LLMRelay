@@ -3145,6 +3145,10 @@ fn advance_implementation(
         })),
         ImplementationSelection::DispatchManager => {
             let feedback = latest_rework_feedback(app, &attempt.id)?;
+            let approvals = {
+                let connection = app.store.lock()?;
+                crate::trip::human_approval_context(&connection, &attempt.id)?
+            };
             let prompt = crate::workflow_resources::render(
                 RoleKind::Manager,
                 &serde_json::json!({
@@ -3156,7 +3160,8 @@ fn advance_implementation(
                     "acceptance_criteria":attempt.criteria,
                     "rework_feedback":feedback,
                     "plan_hash":attempt.plan_hash,
-                    "coordination_contract":"remain in this fresh attempt context; after the exact candidate is frozen, inspect evidence and propose code_review"
+                    "human_approval_context":approvals,
+                    "coordination_contract":"read current role context and its human_approval_context; do not repeat satisfied approval checkpoints from the historical task description. After the exact candidate is frozen, inspect evidence and propose code_review. Preserve independent holds and scope limits."
                 }),
             )?;
             let (launch, resumed) = dispatch_or_resume_manager(app, &attempt.id, &prompt)?;

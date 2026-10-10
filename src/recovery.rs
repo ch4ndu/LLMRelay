@@ -1855,7 +1855,13 @@ fn recorded_restart_decision(
             "refresh_and_reconcile",
             false,
         )
-    } else if matches!(state, "resumed" | "released_fresh_dispatch" | "cancelled") {
+    } else if matches!(state, "resumed" | "released_fresh_dispatch" | "cancelled")
+        || (state == "skipped"
+            && facts.terminal()
+            && facts.session_status == "exited"
+            && facts.process_group_quiescent
+            && !facts.unresolved_recovery)
+    {
         (
             "restart.complete",
             DecisionDisposition::Terminal,

@@ -18,6 +18,34 @@ use std::sync::Arc;
 pub const WORKFLOW_ID: &str = "trip-explorer-0.12.0-llmrelay-1";
 pub const PACKAGE_VERSION: &str = "0.12.0";
 
+pub(crate) fn human_approval_context(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<serde_json::Value> {
+    let raw: String = connection.query_row(
+        "SELECT json_object('task_id',a.task_id,'attempt_id',a.id,'task_version',t.version,
+           'phase',a.phase,'attempt_status',a.status,'task_attention',t.attention,
+           'plan_hash',a.plan_hash,'plan_record_id',p.id,'reviewed_at',p.reviewed_at,
+           'approved_at',p.approved_at,'attempt_plan_approved_at',a.plan_approved_at,
+           'implementation_authorized_at',p.implementation_authorized_at)
+         FROM attempts a JOIN tasks t ON t.id=a.task_id
+         LEFT JOIN trip_structured_plans p ON p.id=a.structured_plan_id
+           AND p.attempt_id=a.id AND p.plan_hash=a.plan_hash
+         WHERE a.id=?1",
+        params![attempt_id],
+        |row| row.get(0),
+    )?;
+    let mut context: serde_json::Value = serde_json::from_str(&raw)?;
+    let approved = context["reviewed_at"].is_string()
+        && context["approved_at"].is_string()
+        && context["attempt_plan_approved_at"].is_string();
+    context["plan_approved"] = approved.into();
+    context["implementation_authorized"] =
+        (approved && context["implementation_authorized_at"].is_string()).into();
+    context["guidance"] = "These are the recorded gates for the exact current plan. Gates marked true are already satisfied; historical requests to wait for those same approvals do not require another approval. Read current authenticated role context before acting. Preserve independent holds, scope limits, check permissions, review budgets and final human acceptance.".into();
+    Ok(context)
+}
+
 const MAX_LANE_SOURCE_BINDINGS: usize = 4096;
 const MAX_LANE_SOURCE_BINDING_BYTES: usize = 128 * 1024;
 
