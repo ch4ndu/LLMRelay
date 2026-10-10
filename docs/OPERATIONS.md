@@ -71,6 +71,8 @@ llmrelay state --data-dir "$PWD/.local/my-agenticjira"
 llmrelay diagnostics --data-dir "$PWD/.local/my-agenticjira"
 ```
 
+`status` reports session counts by state and compact records for the 100 most recently created sessions. `session_summary.truncated` identifies a partial history; `coordinator.active`, active checks and process-inventory uncertainty are separate current-state observations. Launch configurations and full historical records are omitted from status so accumulated history cannot overflow its control-message limit. Use `capability inspect --session <id>` for one full record.
+
 LLMRelay stores human control authority separately from role credentials. Role processes cannot use same-user Unix access as human authority. Service hooks, human authentication, session state, and other repositories remain outside an implementer's write root.
 
 ## Attach from a terminal

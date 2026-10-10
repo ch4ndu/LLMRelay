@@ -4,6 +4,7 @@ import {
   ApiError,
   command,
   getRolePreparations,
+  getState,
   operation,
   reuseOperationIdentity,
 } from "../api";
@@ -19,6 +20,7 @@ import {
   type RoleConfig,
   roleLabel,
   type RolePreparation,
+  type RuntimeAdmissionState,
   ROLES,
   type Session,
   type SwitchIntent,
@@ -87,6 +89,7 @@ export function RoleSettings(
     project,
     productionRestrictions = [],
     capabilities = [],
+    runtimeAdmissions = [],
     actions = [],
     onChanged,
   }: {
@@ -97,6 +100,7 @@ export function RoleSettings(
     lanes?: TripLaneState[];
     productionRestrictions?: ProductionRoleRestriction[];
     capabilities?: CapabilityEvidence[];
+    runtimeAdmissions?: RuntimeAdmissionState[];
     actions?: ContinuationAction[];
     onChanged: () => void;
   },
@@ -199,6 +203,21 @@ export function RoleSettings(
     project?.settings.roles && typeof project.settings.roles === "object"
       ? project.settings.roles as Partial<Record<Role, RoleConfig>>
       : {};
+  const canUseDefaults = !terminal && !task.active_attempt &&
+    ["backlog", "ready"].includes(task.lifecycle);
+  const defaultsComplete = ROLES.every((role) => {
+    const value = projectRoles[role];
+    return value && ["codex", "claude"].includes(value.provider) &&
+      typeof value.model === "string" && value.model.trim() &&
+      typeof value.effort === "string" && value.effort.trim();
+  });
+  const defaultsPending = useRef(false);
+  const [defaultsState, setDefaultsState] = useState<{
+    version: number;
+    state: "saving" | "saved" | "unknown";
+  }>();
+  const defaultsBlocked = defaultsState?.state === "saving" ||
+    defaultsState?.version === task.version;
   const settings = (role: Role) =>
     [...task.role_settings].filter((value) => value.role === role).sort((
       left,
@@ -222,6 +241,38 @@ export function RoleSettings(
         : "none",
   ).join("|");
   const [preparations, setPreparations] = useState<RolePreparation[]>([]);
+  const preparationEvidenceKey = JSON.stringify({
+    configuration: project?.settings.trip_config_revision_id,
+    capabilities: capabilities.map((item) => [
+      item.provider,
+      item.role,
+      item.mode,
+      item.config_hash,
+      item.hook_hash,
+      item.status,
+      item.checked_at,
+      item.compatibility,
+    ]),
+    admissions: runtimeAdmissions.filter((item) =>
+      !item.task_id || item.task_id === task.id
+    )
+      .map((
+        item,
+      ) => [
+        item.id,
+        item.state,
+        item.updated_at,
+        item.probes.map((probe) => [
+          probe.role,
+          probe.state,
+          probe.session_id,
+          probe.session_status,
+          probe.readiness,
+          probe.failure_reason,
+          probe.published_at,
+        ]),
+      ]),
+  });
   const [preparationError, setPreparationError] = useState("");
   const [preparationRefresh, setPreparationRefresh] = useState(0);
   useEffect(() => {
@@ -245,12 +296,23 @@ export function RoleSettings(
     return () => {
       cancelled = true;
     };
-  }, [task.id, preparationRevisionKey, preparationRefresh, terminal]);
+  }, [task.id, task.version, preparationRevisionKey, preparationEvidenceKey, preparationRefresh, terminal]);
   const refresh = () => {
     setPreparationRefresh((value) => value + 1);
     onChanged();
   };
-
+  const checkDefaultsOutcome = async () => {
+    try {
+      await getState();
+      refresh();
+      setDefaultsState((current) =>
+        current?.state === "unknown" ? undefined : current
+      );
+      setError("");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
   const save = async (role: Role) => {
     if (!config) return;
     try {
@@ -266,6 +328,42 @@ export function RoleSettings(
       refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+  const useProjectDefaults = async () => {
+    if (
+      !canUseDefaults || !defaultsComplete || defaultsPending.current ||
+      defaultsBlocked
+    ) return;
+    defaultsPending.current = true;
+    setDefaultsState({ version: task.version, state: "saving" });
+    setError("");
+    try {
+      await runCommand(`project-defaults:${task.version}`, {
+        kind: "update_task",
+        task_id: task.id,
+        expected_version: task.version,
+        title: task.title,
+        description: task.description,
+        acceptance_criteria: task.acceptance_criteria,
+        priority: task.priority,
+        manual_order: task.manual_order,
+        role_overrides: Object.fromEntries(
+          ROLES.map((role) => [role, projectRoles[role]]),
+        ),
+      });
+      setEditing(undefined);
+      setDefaultsState({ version: task.version, state: "saved" });
+      refresh();
+    } catch (cause) {
+      const ambiguous = cause instanceof ApiError && cause.ambiguous;
+      setDefaultsState(
+        ambiguous ? { version: task.version, state: "unknown" } : undefined,
+      );
+      setError(cause instanceof Error ? cause.message : String(cause));
+      refresh();
+    } finally {
+      defaultsPending.current = false;
     }
   };
   const activate = async (role: Role, revision: number) => {
@@ -412,6 +510,37 @@ export function RoleSettings(
         <h3>Agent roles</h3>
         <span>The manager plus five delegated roles</span>
       </header>
+      {canUseDefaults && (
+        <div className="project-role-defaults">
+          <p className="hint">
+            Use project defaults copies the six project role choices into this
+            task, replacing its current choices. Verification is checked
+            separately; this does not start agents or make the task Ready.
+          </p>
+          {!defaultsComplete && (
+            <p className="hint">Complete the six role choices in Project setup first.</p>
+          )}
+          <button
+            disabled={!defaultsComplete || defaultsBlocked}
+            onClick={() => void useProjectDefaults()}
+          >
+            {defaultsState?.state === "saving" ? "Applying project defaults…" : "Use project defaults"}
+          </button>
+          {defaultsState && (
+            <p role="status">
+              {defaultsState.state === "unknown"
+                ? "The save outcome is unknown. Refresh role settings and check the requested revisions before retrying."
+                : defaultsState.state === "saved"
+                ? "Project role choices saved. Refresh role settings to see their current verification status."
+                : "Saving the project role choices…"}
+              {" "}<button
+                disabled={defaultsState.state === "saving"}
+                onClick={defaultsState.state === "unknown" ? () => void checkDefaultsOutcome() : refresh}
+              >Refresh role settings</button>
+            </p>
+          )}
+        </div>
+      )}
       <div className="role-list">
         {ROLES.map((role) => {
           const revisions = settings(role);

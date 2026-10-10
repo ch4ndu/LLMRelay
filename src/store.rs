@@ -4133,6 +4133,43 @@ impl Store {
         ids.into_iter().map(|id| self.session_json(&id)).collect()
     }
 
+    pub fn session_status_summary(&self) -> Result<serde_json::Value> {
+        const RECENT_LIMIT: i64 = 100;
+        let connection = self.lock()?;
+        let mut counts =
+            connection.prepare("SELECT status,COUNT(*) FROM sessions GROUP BY status")?;
+        let by_status = counts
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?;
+        let total: i64 = by_status.values().sum();
+        let mut statement = connection.prepare(
+            "SELECT s.id,s.status,s.provider,rg.role,t.id,t.project_id,s.updated_at
+             FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
+             JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
+             ORDER BY s.created_at DESC,s.id DESC LIMIT ?1",
+        )?;
+        let recent = statement
+            .query_map(params![RECENT_LIMIT], |row| {
+                Ok(serde_json::json!({
+                    "id":row.get::<_,String>(0)?, "status":row.get::<_,String>(1)?,
+                    "provider":row.get::<_,String>(2)?, "role":row.get::<_,String>(3)?,
+                    "task_id":row.get::<_,String>(4)?, "project_id":row.get::<_,String>(5)?,
+                    "updated_at":row.get::<_,String>(6)?
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(serde_json::json!({
+            "sessions":recent,
+            "session_summary":{
+                "total":total,"by_status":by_status,
+                "recent_limit":RECENT_LIMIT,"truncated":total > RECENT_LIMIT,
+                "details":"Use capability inspect --session <id> for a full session record. Coordinator active sessions and checks are reported separately."
+            }
+        }))
+    }
+
     pub fn session_evidence_json(&self, session_id: &str) -> Result<serde_json::Value> {
         let connection = self.lock()?;
         let hooks: i64 = connection.query_row(

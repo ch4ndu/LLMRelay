@@ -1083,6 +1083,9 @@ Deno.test("M7 fresh qualification stays reachable while stale exact resume is he
   };
   try {
     mount(<ProjectSetup project={initialized} setup={setup} onChanged={noop} onViewSession={cmuxFixture} />);
+    check(document.body.textContent?.includes("These are installation records") &&
+      !document.body.textContent.includes("verification again before tasks can use"),
+      "historical setup evidence was presented as current runtime authority");
     const probeRows = [...document.querySelectorAll(".profile-list > div")];
     const explorerRow = probeRows.find((row) => row.querySelector("strong")?.textContent === "Explorer");
     const reviewerRow = probeRows.find((row) => row.querySelector("strong")?.textContent === "Plan Reviewer");
@@ -3046,7 +3049,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         }}
       />,
     );
-    click("View output");
+    click("View recorded output");
     await settle();
     if (
       recoveryViewedSessions.at(-1) !== recoverySession.id ||
@@ -3072,7 +3075,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         "recovery-required setup session exposed keyboard control",
       );
     }
-    click("View output");
+    click("View recorded output");
     await settle();
     if (
       recoveryViewedSessions.at(-1) !== recoverySession.id
@@ -4358,7 +4361,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     const liveView = [
       ...(implementerSession?.querySelectorAll("button") || []),
     ]
-      .find((button) => button.textContent?.includes("View output"));
+      .find((button) => button.textContent?.includes("View recorded output"));
     act(() => liveView!.click());
     await settle();
     if (
@@ -4387,7 +4390,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     }
     const unknownLiveView = [
       ...(implementerSession?.querySelectorAll("button") || []),
-    ].find((button) => button.textContent?.includes("View output"));
+    ].find((button) => button.textContent?.includes("View recorded output"));
     act(() => unknownLiveView!.click());
     await settle();
     if (
@@ -11158,5 +11161,550 @@ Deno.test("Uncertain draft deletion retains the exact operation after reopening"
     unmount();
     globalThis.fetch = nativeFetch;
     localStorage.clear();
+  }
+});
+
+Deno.test("Project defaults recover empty draft roles without starting work and retain uncertain identity", async () => {
+  localStorage.clear();
+  const requests: Record<string, unknown>[] = [];
+  let finish!: (response: Response) => void;
+  let fail!: (reason: unknown) => void;
+  let refreshes = 0;
+  globalThis.fetch = ((input, init) => {
+    if (String(input).includes("role-preparations")) {
+      return Promise.resolve(new Response(JSON.stringify([])));
+    }
+    if (String(input) === "/api/state") {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify(
+            snapshotAt("defaults-service", "9", { tasks: [draft] }),
+          ),
+        ),
+      );
+    }
+    requests.push(JSON.parse(String(init?.body)));
+    return new Promise<Response>((resolve, reject) => {
+      finish = resolve;
+      fail = reject;
+    });
+  }) as typeof fetch;
+  const draft: Task = {
+    ...task,
+    lifecycle: "backlog",
+    active_attempt: undefined,
+    role_settings: [],
+  };
+  const card = (value = draft, owner = initialized) => (
+    <RoleSettings
+      task={value}
+      project={owner}
+      sessions={[]}
+      onChanged={() => refreshes++}
+    />
+  );
+  try {
+    mount(card());
+    await settle();
+    click("Use project defaults");
+    await settle();
+    rerender(card({ ...draft, version: draft.version + 1 }));
+    click("Applying project defaults");
+    check(
+      requests.length === 1,
+      "a snapshot update released the in-flight defaults guard",
+    );
+    const saved = requests[0];
+    check(
+      saved.kind === "update_task" &&
+        saved.expected_version === draft.version &&
+        saved.task_id === draft.id &&
+        JSON.stringify(saved.role_overrides) === JSON.stringify(inheritedRoles),
+      "defaults did not copy the exact six project choices",
+    );
+    finish(new Response(JSON.stringify({ result: { state: "updated" } })));
+    await settle();
+    check(
+      refreshes === 1 &&
+        document.body.textContent?.includes("Project role choices saved"),
+      "save did not refresh settings",
+    );
+    check(
+      !requests.some((request) =>
+        request.kind === "make_ready" || request.kind === "runtime_probe_launch"
+      ),
+      "copying defaults started work",
+    );
+    unmount();
+
+    mount(card());
+    await settle();
+    click("Use project defaults");
+    await settle();
+    fail(new TypeError("Connection lost"));
+    await settle();
+    const uncertain = requests.at(-1)!;
+    check(
+      document.body.textContent?.includes("outcome is unknown"),
+      "uncertain save was called a definite failure",
+    );
+    click("Use project defaults");
+    await settle();
+    check(
+      requests.at(-1) === uncertain,
+      "uncertain save automatically repeated",
+    );
+    click("Refresh role settings");
+    await settle();
+    check(
+      requests.at(-1) === uncertain,
+      "checking the outcome repeated the mutation",
+    );
+    unmount();
+    mount(card());
+    await settle();
+    click("Use project defaults");
+    await settle();
+    check(
+      requests.at(-1)?.operation_id === uncertain.operation_id,
+      "manual retry lost the exact operation identity",
+    );
+    finish(new Response(JSON.stringify({ result: { state: "updated" } })));
+    await settle();
+    unmount();
+
+    mount(card(draft, { ...initialized, settings: {} }));
+    check(
+      document.querySelector<HTMLButtonElement>(".project-role-defaults button")
+        ?.disabled,
+      "incomplete defaults were enabled",
+    );
+    rerender(card(task));
+    check(
+      !document.body.textContent?.includes("Use project defaults"),
+      "running work exposed bulk role replacement",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Stopped session recorded output survives historical cmux failures and reloads", async () => {
+  const { useSessionAccess } = await import("./components/SessionTree");
+  const { cmuxOutcomeWithDurableSurface, terminalGuidance } = await import(
+    "./cmuxRouting"
+  );
+  const surface = persistentSurface("closed-viewer", {
+    surface_state: "lost",
+    attachment_state: "ended",
+    last_error: "terminal closed",
+  });
+  const ended: Session = {
+    ...managerSession,
+    status: "exited",
+    cmux_surface: surface,
+    reported_in_latest_invocation: true,
+  };
+  const recorded: CmuxViewOutcome = {
+    state: "recorded_output",
+    message: "retained transcript",
+    retry_available: false,
+    recorded_output: {
+      frames: [{
+        epoch: "e",
+        sequence: 1,
+        captured_at: "",
+        encoding: "utf8",
+        data: "Finished report body",
+        gap: false,
+      }],
+      next_sequence: 1,
+      has_more: false,
+    },
+  };
+  let viewed = 0;
+  function Card() {
+    const access = useSessionAccess([ended], {
+      onView: () => {
+        viewed++;
+        return Promise.resolve(recorded);
+      },
+      onSetKeyboardControl: () => {
+        throw new Error("stopped session requested keyboard control");
+      },
+      onDiscard: () => {
+        throw new Error("stopped session requested terminal discard");
+      },
+      onChanged: noop,
+    });
+    return (
+      <SessionTree
+        sessions={[ended]}
+        access={access}
+        setupProjectId={() => undefined}
+        onOpenSetup={noop}
+      />
+    );
+  }
+  try {
+    check(
+      cmuxOutcomeWithDurableSurface(recorded, surface) === recorded,
+      "saved terminal failure overrode the transcript",
+    );
+    check(
+      !terminalGuidance(recorded).includes("could not show"),
+      "recorded output was described as a failed terminal",
+    );
+    mount(<Card />);
+    check(
+      !document.body.textContent?.includes("View fresh view-only surface"),
+      "stopped session offered a live viewer",
+    );
+    click("View recorded output");
+    await settle();
+    rerender(<Card />);
+    check(
+      viewed === 1 &&
+        document.querySelector(".recorded-output")?.textContent ===
+          "Finished report body",
+      "refresh replaced recorded output or repeated its request",
+    );
+    check(
+      document.body.textContent?.includes("does not restart the agent") &&
+        !document.body.textContent.includes("the agent keeps working"),
+      "closed output implied a running agent",
+    );
+    click("Close output");
+    check(
+      !document.querySelector(".recorded-output"),
+      "Close output did not hide the transcript",
+    );
+  } finally {
+    unmount();
+  }
+});
+
+Deno.test("Queued edit remains pending when another client advances the task version", async () => {
+  localStorage.clear();
+  const queued: Task = {
+    ...task,
+    lifecycle: "backlog",
+    active_attempt: undefined,
+    dependencies: [{ task_id: "AJ-2" }],
+  };
+  const other = { ...task, id: "AJ-2", title: "Prerequisite" };
+  let resolve!: (response: Response) => void;
+  let requests = 0;
+  globalThis.fetch = ((_input, init) => {
+    if (init?.body) requests++;
+    return new Promise<Response>((done) => {
+      resolve = done;
+    });
+  }) as typeof fetch;
+  const card = (value: Task) => (
+    <TaskDetail
+      task={value}
+      state={{ ...liveBase, tasks: [value, other] }}
+      onClose={noop}
+      onChanged={noop}
+    />
+  );
+  try {
+    mount(card(queued));
+    click("Changes");
+    click("Remove dependency");
+    await settle();
+    rerender(card({ ...queued, version: queued.version + 1 }));
+    click("Remove dependency");
+    await settle();
+    check(
+      requests === 1,
+      "new snapshot allowed another edit before the first request resolved",
+    );
+    resolve(
+      new Response(JSON.stringify({ error: "task version is stale" }), {
+        status: 409,
+      }),
+    );
+    await settle();
+    const remove = [...document.querySelectorAll("button")].find((button) =>
+      button.textContent === "Remove dependency"
+    );
+    check(
+      remove && !remove.disabled,
+      "completed rejection left the new version permanently busy",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Probe launch explains conflicting writer and reviewer sessions before dispatch", async () => {
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input, init) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ result: { state: "launched" } }));
+  }) as typeof fetch;
+  const reader: TripSetupState["sessions"][number] = {
+    id: "probe-reader",
+    attempt_id: "probe-attempt",
+    role: "explorer",
+    provider: "codex",
+    generation: 1,
+    lane_id: "default",
+    status: "running",
+    launch_state: "started",
+    readiness: "busy",
+    capture_state: "capturing",
+    has_native_session: true,
+    resume_count: 0,
+    updated_at: "",
+  };
+  const setup: TripSetupState = {
+    setup_operation_id: "probe-conflict",
+    project_id: initialized.id,
+    state: "probing",
+    probe_attempt_id: "probe-attempt",
+    target_inventory: {},
+    final_files: [],
+    installation_source_binding_complete: false,
+    installation_source_binding_reason: "probes",
+    selected_profiles: [],
+    probe_receipts: [],
+    sessions: [reader],
+    runtime_admissions: [],
+    agents_file: {},
+    created_at: "",
+    updated_at: "",
+  };
+  const card = (value: TripSetupState) => (
+    <ProjectSetup
+      project={initialized}
+      setup={value}
+      onChanged={noop}
+      onViewSession={cmuxFixture}
+    />
+  );
+  const implementer = () =>
+    [...document.querySelectorAll(".setup-invocation")].find((row) =>
+      row.querySelector("strong")?.textContent === "Implementer"
+    )!;
+  try {
+    mount(card(setup));
+    const launch = implementer().querySelector<HTMLButtonElement>("button")!;
+    check(
+      launch.disabled &&
+        implementer().textContent?.includes("Waiting for Explorer to stop"),
+      "writer launch failed to explain the active reader",
+    );
+    act(() => launch.click());
+    await settle();
+    check(requests.length === 0, "blocked probe dispatched a paid action");
+    rerender(card({ ...setup, sessions: [{ ...reader, status: "exited" }] }));
+    const available = implementer().querySelector<HTMLButtonElement>("button")!;
+    check(!available.disabled, "writer stayed blocked after the reader exited");
+    act(() => available.click());
+    await settle();
+    check(
+      requests.length === 1 && requests[0].role === "implementer",
+      "unblocked writer lost its exact dispatch role",
+    );
+    unmount();
+    mount(
+      card({
+        ...setup,
+        sessions: [{ ...reader, attempt_id: "unrelated-attempt" }],
+      }),
+    );
+    check(
+      !implementer().querySelector<HTMLButtonElement>("button")?.disabled,
+      "another attempt incorrectly blocked this probe",
+    );
+    unmount();
+
+    const runtime: TripSetupState = {
+      ...setup,
+      state: "activated",
+      runtime_admissions: [{
+        id: "runtime-scope",
+        scope_hash: "scope",
+        state: "authorized",
+        fresh_call_count: 1,
+        probes: [{
+          role: "implementer",
+          attempt_id: reader.attempt_id,
+          state: "authorized",
+          profile: { provider: "codex", model: "model", effort: "high" },
+          profile_hash: "profile",
+          project_config_revision_id: "config",
+          project_configuration_hash: "configuration",
+          adapter: "llmrelay_codex",
+          adapter_hash: "adapter",
+          capability_key: "capability",
+          nonce: "nonce",
+          has_native_session: false,
+        }],
+      }],
+    };
+    mount(card(runtime));
+    click("Activate");
+    const runtimeRow = document.querySelector(
+      ".runtime-admission .profile-list > div",
+    )!;
+    check(
+      runtimeRow.textContent?.includes("Waiting for Explorer to stop") &&
+        runtimeRow.querySelector<HTMLButtonElement>("button")?.disabled,
+      "runtime probe omitted its conflicting reader",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Role readiness refreshes when runtime evidence changes without changing task settings", async () => {
+  for (const surface of ["task settings", "Projects page"]) {
+    let reads = 0;
+    const live = liveHarness();
+    const priorEnvironment = { ...liveEnvironment };
+    liveEnvironment.transport = live.environment.transport;
+    liveEnvironment.scheduler = live.environment.scheduler;
+    localStorage.clear();
+    localStorage.setItem("agenticjira.page", "roles");
+    const config = {
+      provider: "codex" as const,
+      model: "fixture",
+      effort: "high",
+    };
+    const configured: Task = {
+      ...task,
+      role_settings: [{
+        id: "current-manager",
+        role: "manager",
+        revision: 1,
+        config,
+      }],
+    };
+    const admission = (state: string) => ({
+      id: "current-runtime",
+      scope_hash: "scope",
+      state,
+      fresh_call_count: 1,
+      probes: [],
+    });
+    const compatibility = {
+      status: "matched" as const,
+      observed_version: "fixture",
+      pack_id: "fixture",
+      pack_revision: "1",
+      contract_id: "fixture",
+      contract_revision: "1",
+      short_hash: "hash",
+      predicate_id: "fixture",
+      missing_evidence: [],
+      action: "requalify_exact_profile" as const,
+      message: "Matched fixture",
+    };
+    let runtime = {
+      ...admission("failed"),
+      failure_reason: "Previous probe needs correction" as string | null,
+    };
+    globalThis.fetch = (async (input) => {
+      if (!String(input).includes("role-preparations")) {
+        throw new Error("unexpected mutation or request");
+      }
+      reads++;
+      return new Response(JSON.stringify([{
+        task_id: task.id,
+        role: "manager",
+        requested_revision: 1,
+        config,
+        status: "unverified",
+        reason: "Verification pending",
+        compatibility,
+        runtime_admission: runtime,
+      }]));
+    }) as typeof fetch;
+    const card = () => (
+      <RoleSettings
+        task={configured}
+        project={initialized}
+        sessions={[]}
+        runtimeAdmissions={[runtime]}
+        onChanged={noop}
+      />
+    );
+    const snapshot = (revision: string) =>
+      snapshotAt("readiness-service", revision, {
+        projects: [initialized],
+        tasks: [configured],
+        trip_setups: [{
+          setup_operation_id: "readiness-setup",
+          project_id: initialized.id,
+          state: "activated",
+          target_inventory: {},
+          final_files: [],
+          installation_source_binding_complete: true,
+          installation_source_binding_reason: "Fixture installation is current",
+          selected_profiles: [],
+          probe_receipts: [],
+          sessions: [],
+          runtime_admissions: [runtime],
+          agents_file: {},
+          created_at: "",
+          updated_at: "",
+        }],
+      });
+    const update = (revision: string) => {
+      if (surface === "Projects page") {
+        live.waits.at(-1)!.resolve(changedTo(snapshot(revision)));
+      } else {
+        rerender(card());
+      }
+    };
+    try {
+      if (surface === "Projects page") {
+        mount(<App />);
+        await settle();
+        live.reads[0].resolve(snapshot("1"));
+      } else {
+        mount(card());
+      }
+      await settle();
+      check(
+        document.body.textContent?.includes(
+          "Previous probe needs correction",
+        ) &&
+          reads === 1,
+        "initial failure was not visible",
+      );
+      runtime = { ...admission("running"), failure_reason: null };
+      update("2");
+      await settle();
+      check(
+        reads === 2 &&
+          !document.body.textContent?.includes(
+            "Previous probe needs correction",
+          ),
+        `${surface}: new runtime evidence left the old failure displayed`,
+      );
+      update("3");
+      await settle();
+      check(
+        reads === 2,
+        "unchanged snapshot objects repeatedly requested preparations",
+      );
+    } finally {
+      unmount();
+      globalThis.fetch = nativeFetch;
+      liveEnvironment.transport = priorEnvironment.transport;
+      liveEnvironment.scheduler = priorEnvironment.scheduler;
+      localStorage.clear();
+    }
   }
 });

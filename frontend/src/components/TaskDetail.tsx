@@ -440,10 +440,15 @@ export function TaskDetail(
   const [deleteVersion, setDeleteVersion] = useState<number | null>(null);
   const [queueBusy, setQueueBusy] = useState(false);
   const queueGuard = useRef(false);
+  const queueRequestPending = useRef(false);
+  const currentTaskVersion = useRef(task.version);
+  currentTaskVersion.current = task.version;
   useEffect(() => {
     setDeleteVersion(null);
-    setQueueBusy(false);
-    queueGuard.current = false;
+    if (!queueRequestPending.current) {
+      setQueueBusy(false);
+      queueGuard.current = false;
+    }
   }, [task.id, task.version]);
   const dialog = useRef<HTMLElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
@@ -560,6 +565,7 @@ export function TaskDetail(
   const queueMutation = async (body: Record<string, unknown>) => {
     if (queueGuard.current) return;
     queueGuard.current = true;
+    queueRequestPending.current = true;
     setQueueBusy(true);
     let applied = false;
     try {
@@ -567,10 +573,12 @@ export function TaskDetail(
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
-    if (!applied) {
+    queueRequestPending.current = false;
+    if (!applied || currentTaskVersion.current !== task.version) {
       queueGuard.current = false;
       setQueueBusy(false);
-    } else if (body.kind === "delete_draft_task") {
+    }
+    if (applied && body.kind === "delete_draft_task") {
       localStorage.removeItem(operationStorageKey);
       onClose();
     }
@@ -1273,6 +1281,8 @@ export function TaskDetail(
           lanes={tripLanes}
           productionRestrictions={state.production_role_restrictions}
           capabilities={state.capabilities}
+          runtimeAdmissions={(state.trip_setups || []).filter((setup) => setup.project_id === task.project_id)
+            .flatMap((setup) => setup.runtime_admissions)}
           actions={continuationActions}
           onChanged={onChanged}
         />

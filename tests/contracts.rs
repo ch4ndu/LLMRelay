@@ -48481,3 +48481,199 @@ fn reliability_skipped_completed_restart_is_history_but_uncertain_exit_stays_act
             ));
     }
 }
+
+#[test]
+fn status_summary_bounds_historical_sessions_without_losing_counts() {
+    let fixture = Fixture::new("bounded-status");
+    seed_attempt(&fixture, "planning");
+    for index in 0..125 {
+        seed_session(
+            &fixture,
+            "a",
+            "explorer",
+            &format!("g{index:03}"),
+            &format!("s{index:03}"),
+            if index == 0 {
+                "recovery_required"
+            } else {
+                "exited"
+            },
+        );
+    }
+    let config =
+        serde_json::json!({"prompt":"large retained launch context ".repeat(4_000)}).to_string();
+    fixture.execute("UPDATE sessions SET launch_config_json=?1", params![config]);
+    assert!(
+        serde_json::to_vec(&fixture.store.list_sessions().unwrap())
+            .unwrap()
+            .len()
+            > 1024 * 1024
+    );
+    let status = fixture.store.session_status_summary().unwrap();
+    assert!(serde_json::to_vec(&status).unwrap().len() < 64 * 1024);
+    assert_eq!(status["session_summary"]["total"], 125);
+    assert_eq!(
+        status["session_summary"]["by_status"]["recovery_required"],
+        1
+    );
+    assert_eq!(status["session_summary"]["by_status"]["exited"], 124);
+    assert_eq!(status["session_summary"]["truncated"], true);
+    assert_eq!(status["sessions"].as_array().unwrap().len(), 100);
+    assert_eq!(status["sessions"][0]["id"], "s124");
+    assert!(status["sessions"][0].get("launch_config").is_none());
+    assert_eq!(
+        fixture.store.session_json("s000").unwrap()["launch_config"]["prompt"]
+            .as_str()
+            .unwrap()
+            .len(),
+        serde_json::from_str::<serde_json::Value>(&config).unwrap()["prompt"]
+            .as_str()
+            .unwrap()
+            .len()
+    );
+}
+
+#[test]
+fn copying_project_defaults_restores_empty_draft_roles_without_admitting_work() {
+    let fixture = Fixture::new("restore-draft-defaults");
+    let project = add_project(&fixture, fixture.repository("repo"), "defaults-project");
+    let draft = workflow::execute(
+        &fixture.store,
+        &HumanCommand::CreateTask {
+            operation_id: "defaults-draft".into(),
+            project_id: project.clone(),
+            title: "Existing draft".into(),
+            description: "keep description".into(),
+            acceptance_criteria: vec!["keep criteria".into()],
+            priority: 3,
+            ready: false,
+            role_overrides: serde_json::json!({}),
+        },
+    )
+    .unwrap()
+    .entity_id;
+    // Reproduce a draft created before project setup supplied role choices.
+    fixture.execute("DELETE FROM role_settings WHERE task_id=?1", params![draft]);
+    let blocked = serde_json::to_string(&workflow::state(&fixture.store).unwrap()).unwrap();
+    assert!(blocked.contains("0 of six app roles have current settings"));
+    assert!(blocked.contains("Open Agent settings and choose Use project defaults"));
+    let defaults = workflow::state(&fixture.store)
+        .unwrap()
+        .projects
+        .into_iter()
+        .find(|item| item.id == project)
+        .unwrap()
+        .settings["roles"]
+        .clone();
+    let update = HumanCommand::UpdateTask {
+        operation_id: "copy-defaults".into(),
+        task_id: draft.clone(),
+        expected_version: 1,
+        title: "Existing draft".into(),
+        description: "keep description".into(),
+        acceptance_criteria: vec!["keep criteria".into()],
+        priority: 3,
+        manual_order: 0,
+        role_overrides: defaults.clone(),
+    };
+    let result = workflow::execute(&fixture.store, &update).unwrap();
+    assert_eq!(result.state, "updated");
+    assert_eq!(
+        workflow::execute(&fixture.store, &update).unwrap().version,
+        result.version
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM role_settings", 6_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM attempts", 0_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", 0_i64);
+    let state = workflow::state(&fixture.store).unwrap();
+    let restored = state.tasks.iter().find(|item| item.id == draft).unwrap();
+    assert_eq!(restored.lifecycle.to_string(), "backlog");
+    assert_eq!(restored.description, "keep description");
+    assert_eq!(
+        serde_json::to_value(&restored.role_overrides).unwrap(),
+        defaults
+    );
+    let mut stale = update;
+    if let HumanCommand::UpdateTask { operation_id, .. } = &mut stale {
+        *operation_id = "stale-copy".into();
+    }
+    assert!(workflow::execute(&fixture.store, &stale).is_err());
+}
+
+#[test]
+fn draft_deletion_removes_profile_and_recipe_bindings_but_keeps_shared_evidence() {
+    let fixture = Fixture::new("draft-bound-deletion");
+    let project = add_project(&fixture, fixture.repository("repo"), "bound-project");
+    let profile = workflow::execute(
+        &fixture.store,
+        &HumanCommand::UpsertProfileSet {
+            operation_id: "bound-profile".into(),
+            project_id: project.clone(),
+            profile_set_id: None,
+            expected_version: None,
+            name: "Shared choices".into(),
+            roles: roles(),
+        },
+    )
+    .unwrap();
+    let recipe = workflow::execute(
+        &fixture.store,
+        &HumanCommand::UpsertTaskRecipe {
+            operation_id: "bound-recipe".into(),
+            project_id: project.clone(),
+            recipe_id: None,
+            expected_version: None,
+            name: "Shared recipe".into(),
+            title: "Unused draft".into(),
+            description: String::new(),
+            acceptance_criteria: vec!["works".into()],
+            priority: 0,
+            profile_revision_id: profile.detail["revision_id"].as_str().unwrap().into(),
+            required_check_ids: vec![],
+        },
+    )
+    .unwrap();
+    let draft = workflow::execute(
+        &fixture.store,
+        &HumanCommand::CreateDraftFromRecipe {
+            operation_id: "bound-draft".into(),
+            project_id: project.clone(),
+            recipe_id: recipe.entity_id.clone(),
+            recipe_revision_id: recipe.detail["revision_id"].as_str().unwrap().into(),
+            expected_recipe_version: 1,
+        },
+    )
+    .unwrap()
+    .entity_id;
+    seed_supported_capabilities(&fixture);
+    // A retained activation refers to the draft's settings and shared proof rows.
+    fixture.execute("INSERT INTO trip_task_profile_activations(id,task_id,role,settings_id,settings_revision,
+        profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,
+        capability_id,capability_key,capability_proof_hash,activated_at)
+        SELECT 'delete-activation',rs.task_id,rs.role,rs.id,rs.revision,rs.config_json,'fixture-profile',
+        ps.active_config_revision_id,'fixture-configuration','llmrelay_codex','fixture-adapter',c.id,c.config_hash,'fixture-proof','now'
+        FROM role_settings rs JOIN tasks t ON t.id=rs.task_id JOIN trip_project_state ps ON ps.project_id=t.project_id
+        JOIN capabilities c ON c.role=rs.role WHERE rs.task_id=?1 AND rs.role='explorer' LIMIT 1", params![draft]);
+    fixture.assert_scalar("SELECT COUNT(*) FROM trip_task_profile_activations", 1_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM task_recipe_bindings", 1_i64);
+    let proofs: i64 = fixture.scalar("SELECT COUNT(*) FROM capabilities");
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::DeleteDraftTask {
+            operation_id: "bound-delete".into(),
+            task_id: draft,
+            expected_version: 1,
+        },
+    )
+    .unwrap();
+    fixture.assert_scalar("SELECT COUNT(*) FROM trip_task_profile_activations", 0_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM task_recipe_bindings", 0_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM role_settings", 0_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM capabilities", proofs);
+    fixture.assert_scalar("SELECT COUNT(*) FROM task_recipe_revisions", 1_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM project_profile_sets", 1_i64);
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='bound-delete'",
+        1_i64,
+    );
+}

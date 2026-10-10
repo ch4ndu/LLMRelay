@@ -18,6 +18,10 @@ Unsaved edits are retained in this browser for the same project and setup revisi
 
 Stage navigation does not approve anything or mark a check complete. The current server state determines the initial stage and available actions. Corrected configurations and interrupted setup retain their specific recovery and approval steps. Setup and runtime-admission cards rehydrate their cmux notices and controls from the current durable `cmux_surface` projection whenever the dashboard refreshes or reloads. A newer requested control revision is shown as pending before any historical actual-control value, so it never grants newly rendered local input authority. **View output** creates or focuses the selected live session's exact mode-neutral cmux surface in view-only mode; ended sessions show recorded output. **Take keyboard control** sends an explicit revision-bound acquire request to that same authenticated surface. Neither action starts another provider, resumes the setup workflow, or resumes a native conversation.
 
+After activation, **Setup verification history** retains installation evidence. It is separate from ordinary runtime permission. **Selected runtime verification** names the roles covered by the selected verification group; its proof count is not an overall project readiness count. A one-role correction does not erase proofs for other roles. Task **Agent settings** shows the current requested role configuration and its exact runtime evidence.
+
+Probe launch and resume controls explain when an active reader or Implementer in the same attempt must stop first. Sessions in another attempt do not create this UI hold. The service still checks authority and process state at dispatch. **View recorded output** on a stopped session reads retained output and never restarts it; a historical cmux failure cannot replace that output after refresh.
+
 If saving is unavailable, read the displayed prerequisite. In particular, selecting a manager is not enough: its discovery invocation must finish and record its result before the proposal can be saved.
 
 ### Choose an exact model

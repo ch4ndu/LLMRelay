@@ -112,6 +112,8 @@ Projects can opt in to **Remind agents to submit reports** in project settings. 
 
 Each role generation has two reminder reservations for its entire lifetime, including resumed sessions. Reservations are durable and remain spent after cancellation or uncertain delivery; duplicate observations of the same accepted turn do not reserve again. Reminders use the existing guidance path and respect pauses, holds, permissions, input ownership and current report/turn identity before both paste and Enter. A definite refusal before writing cancels the reminder and restores only its unchanged idle reservation so later ordinary guidance can proceed. After a possible write, delivery remains uncertain and is never retried automatically. This feature neither fabricates native readiness nor makes failure recovery automatic.
 
+For a draft or Ready task that has never started, open **Agent settings → Use project defaults** to copy all six current project role choices into the task. This replaces task role choices and keeps prior setting revisions for history. It neither starts agents nor makes a draft Ready. A Ready task whose new choices lack current runtime authority returns to backlog. An uncertain save keeps its operation identity: choose **Refresh role settings**, inspect the requested settings, and retry explicitly only if needed.
+
 Use **Continue**, **Run next**, **Pause after this step**, **Pause now**, **Retry**, or **Cancel** from task details. These are versioned requests. A draining control remains visible until owned process state is reconciled. **Run next** arms one coordinator action and then pauses again.
 
 

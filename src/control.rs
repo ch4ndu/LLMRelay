@@ -691,14 +691,14 @@ pub async fn serve_bound(
 ) -> Result<()> {
     let mut stop = shutdown.subscribe();
     let mut connections = tokio::task::JoinSet::new();
-    loop {
+    let serving = loop {
         if *stop.borrow() {
-            break;
+            break Ok(());
         }
         let stream = tokio::select! {
             biased;
             changed = stop.changed() => {
-                if changed.is_err() || *stop.borrow() { break }
+                if changed.is_err() || *stop.borrow() { break Ok(()) }
                 continue
             }
             Some(result) = connections.join_next(), if !connections.is_empty() => {
@@ -707,7 +707,10 @@ pub async fn serve_bound(
                 }
                 continue
             }
-            accepted = accept_control_stream(&listener) => accepted?,
+            accepted = accept_control_stream(&listener) => match accepted {
+                Ok(stream) => stream,
+                Err(error) => break Err(error),
+            },
         };
         let app = app.clone();
         let diagnostic_app = app.clone();
@@ -731,15 +734,26 @@ pub async fn serve_bound(
                 }
             }
         });
-    }
+    };
     drop(listener);
+    finish_control_connections(connections, &shutdown, serving).await
+}
+
+async fn finish_control_connections(
+    mut connections: tokio::task::JoinSet<()>,
+    shutdown: &watch::Sender<bool>,
+    serving: Result<()>,
+) -> Result<()> {
+    if serving.is_err() {
+        shutdown.send_replace(true);
+    }
     // Stop can be signalled inside dispatch, before its response has been written.
     while let Some(result) = connections.join_next().await {
         if let Err(error) = result {
             tracing::warn!(error = %error, "control connection task failed during shutdown");
         }
     }
-    Ok(())
+    serving
 }
 
 async fn handle(
@@ -957,9 +971,12 @@ fn dispatch(
     connection: &mut ConnectionState,
 ) -> Result<ControlResponse> {
     match request {
-        ControlRequest::Status => ControlResponse::success(
-            serde_json::json!({"instance": instance, "sessions": app.store.list_sessions()?,"coordinator":app.drain_status()?}),
-        ),
+        ControlRequest::Status => {
+            let mut status = app.store.session_status_summary()?;
+            status["instance"] = instance.clone();
+            status["coordinator"] = app.drain_status()?;
+            ControlResponse::success(status)
+        }
         ControlRequest::RestartPreview => ControlResponse::success(app.restart_preview()?),
         ControlRequest::Stop { drain } => {
             if drain {
@@ -2327,6 +2344,32 @@ mod tests {
             "service shutdown channel is closed"
         );
         assert!(!*shutdown.borrow());
+    }
+
+    #[tokio::test]
+    async fn listener_failure_drains_accepted_handlers_before_returning_error() {
+        let (shutdown, mut stop) = watch::channel(false);
+        let (completed, receipt) = tokio::sync::oneshot::channel();
+        let mut connections = tokio::task::JoinSet::new();
+        connections.spawn(async move {
+            stop.wait_for(|stopping| *stopping).await.unwrap();
+            tokio::task::yield_now().await;
+            completed
+                .send("reply and attachment cleanup completed")
+                .unwrap();
+        });
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            finish_control_connections(connections, &shutdown, Err(anyhow!("accept failed"))),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.to_string(), "accept failed");
+        assert_eq!(
+            receipt.await.unwrap(),
+            "reply and attachment cleanup completed"
+        );
     }
 
     #[tokio::test]

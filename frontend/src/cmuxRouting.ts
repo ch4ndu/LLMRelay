@@ -199,6 +199,7 @@ export const cmuxOutcomeWithDurableSurface = (
   local: CmuxViewOutcome | undefined,
   durable?: CmuxSessionSurface | null,
 ): CmuxViewOutcome | undefined => {
+  if (local?.state === "recorded_output") return local;
   if (!durable) return local;
   const durableOutcome = cmuxSurfaceOutcome(durable);
   if (!local) return durableOutcome;
@@ -411,6 +412,9 @@ export const recordedOutputText = (outcome?: CmuxViewOutcome) => {
 };
 
 export function terminalGuidance(outcome: CmuxViewOutcome): string {
+  if (outcome.state === "recorded_output") {
+    return "This is recorded output from a stopped session. Opening this record does not restart the agent.";
+  }
   if (outcome.surface) {
     const presentation = cmuxSurfacePresentation(outcome.surface);
     if (presentation.guidance) return presentation.guidance;

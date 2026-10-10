@@ -647,7 +647,9 @@ function SessionOutput(
         <button onClick={() => access.close(session.id)}>Close output</button>
       </div>
       <small className="hint">
-        Closing output only hides it here; the agent keeps working.
+        {session.status === "running"
+          ? "Closing output only hides it here; the agent keeps working."
+          : "Closing output only hides the recorded output here."}
       </small>
     </section>
   );
@@ -892,7 +894,7 @@ export function SessionTree(
                   available.
                 </small>
               )}
-              {surface && actionability.guidance && (
+              {running && surface && actionability.guidance && (
                 <small className="warning">{actionability.guidance}</small>
               )}
               {session.input_control && running && (
@@ -952,7 +954,7 @@ export function SessionTree(
                 disabled={running && !actionability.viewAvailable}
                 onClick={() => void access.view(session.id)}
               >
-                {actionability.viewLabel}
+                {running ? actionability.viewLabel : "View recorded output"}
               </button>
               {running && (
                 <button disabled={!canTake} onClick={() => void access.take(session.id)}>

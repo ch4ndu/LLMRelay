@@ -1024,6 +1024,9 @@ export function App() {
                 lanes={state.trip_lanes || []}
                 productionRestrictions={state.production_role_restrictions}
                 capabilities={state.capabilities}
+                runtimeAdmissions={(state.trip_setups || []).filter((setup) =>
+                  setup.project_id === task.project_id
+                ).flatMap((setup) => setup.runtime_admissions)}
                 actions={state.continuation_actions}
                 onChanged={refresh}
               />

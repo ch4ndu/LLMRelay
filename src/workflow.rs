@@ -5316,7 +5316,7 @@ fn backlog_readiness_decision(
         prerequisite("task.project_ready", if project.is_ok() { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Missing }, project.as_ref().err().map(|error| format!("{error:#}"))),
         prerequisite("task.start_baseline_current", if start_baseline.is_none() { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Stale }, start_baseline.map(str::to_owned)),
         prerequisite("task.valid_scope", if scope.is_ok() { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Missing }, scope.as_ref().err().map(|error| format!("{error:#}"))),
-        prerequisite("task.six_role_settings", if configured == 6 { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Missing }, (configured != 6).then(|| format!("{configured} of six app roles have current settings"))),
+        prerequisite("task.six_role_settings", if configured == 6 { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Missing }, (configured != 6).then(|| format!("{configured} of six app roles have current settings. Open Agent settings and choose Use project defaults to copy the project role choices, then check their verification status."))),
         prerequisite("task.profile_activation_and_runtime", DecisionEvidenceState::Unknown, Some("Exact project-default or task-override activation and current runtime capability are checked by Make Ready".into())),
     ];
     let blocker = prerequisites
@@ -9889,7 +9889,7 @@ fn draft_deletion_blocker(connection: &Connection, task_id: &str) -> Result<Opti
     } else if depended_on {
         Some("Other tasks depend on this draft. Remove those dependencies in each task's Changes tab before deleting it.".into())
     } else if history {
-        Some("This draft has saved verification or scheduling history. Use Archive to remove it from the board while keeping that history.".into())
+        Some("This draft has saved verification or scheduling history and cannot be deleted. Keep it in task history, or use Archive when available to remove it from the board.".into())
     } else {
         None
     })

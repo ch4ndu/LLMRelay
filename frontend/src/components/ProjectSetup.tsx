@@ -1356,24 +1356,20 @@ export function ProjectSetup({
         </span>
       </header>
       {staleSelections.length > 0 && (
-        <p className="warning" role="status">
+        <p className={trip.readiness === "ready" ? "hint" : "warning"} role="status">
           {trip.readiness === "ready"
-            ? "Setup is activated, but"
-            : "In the current setup draft,"}{" "}
-          {staleSelections.length === 1
-            ? "one agent profile needs"
-            : `${staleSelections.length} agent profiles need`}{" "}
-          verification again before tasks can use{" "}
-          {staleSelections.length === 1 ? "it" : "them"}:{" "}
+            ? "Recorded setup verification needs review for:"
+            : "The current setup draft needs agent verification for:"}{" "}
           {staleSelections.map((selection) => roleName(selection.role)).join(
             ", ",
-          )}. The recorded setup results are kept; see Agent verification
-          below for what changed.
+          )}. {trip.readiness === "ready"
+            ? "These are installation records, not the current permission to run task agents. Check Runtime verification and each task's Agent settings for current runtime evidence."
+            : "See Agent verification below for what changed before continuing setup."}
         </p>
       )}
       {setup?.selected_profiles.some((selection) => selection.selection_state === "selected") && (
         <section className="panel" aria-label="Agent verification">
-          <h5>Agent verification</h5>
+          <h5>{trip.readiness === "ready" ? "Setup verification history" : "Agent verification"}</h5>
           {setup.selected_profiles.filter((selection) => selection.selection_state === "selected")
             .map((selection) => {
               const profile = selection.profile;
@@ -1387,7 +1383,15 @@ export function ProjectSetup({
                       ? "Codex"
                       : "not selected"}
                   </strong>
-                  {selection.compatibility
+                  {trip.readiness === "ready"
+                    ? (
+                      <details>
+                        <summary>View recorded setup verification</summary>
+                        <CompatibilityDetails compatibility={selection.compatibility} />
+                        {!selection.compatibility && <p className="hint">No setup verification is recorded for this profile.</p>}
+                      </details>
+                    )
+                    : selection.compatibility
                     ? <CompatibilityDetails compatibility={selection.compatibility} />
                     : <p className="hint">No verification is recorded for this profile yet.</p>}
                 </div>
@@ -2656,6 +2660,7 @@ export function ProjectSetup({
               )}
               <RuntimeAdmission
                 admission={runtimeAdmission}
+                sessions={setup?.sessions || []}
                 busy={busy}
                 onAuthorize={authorizeRuntime}
                 onLaunch={(role) => runtimeDispatch(runtimeAdmission.id, role)}
@@ -2757,6 +2762,35 @@ const requestCmuxKeyboardControl = async (
     ),
   );
 
+function probeDispatchWait(
+  role: Role,
+  attemptId: string | null | undefined,
+  sessions: Array<
+    { role: Role; attempt_id?: string | null; status?: string | null }
+  >,
+): string | undefined {
+  if (!attemptId) return undefined;
+  const readers: Role[] = [
+    "explorer",
+    "plan_reviewer",
+    "code_reviewer",
+    "final_verifier",
+  ];
+  const conflicts = sessions.filter((session) =>
+    session.attempt_id === attemptId &&
+    ["launch_reserved", "running", "interrupt_requested", "recovery_required"]
+      .includes(session.status || "") &&
+    (role === "implementer"
+      ? readers.includes(session.role)
+      : readers.includes(role) && session.role === "implementer")
+  );
+  if (!conflicts.length) return undefined;
+  const roles = [...new Set(conflicts.map((session) => roleName(session.role)))]
+    .join(", ");
+  return `Waiting for ${roles} to stop before ${
+    roleName(role)
+  } can start. View the session's output to inspect it; these controls update when its stop is confirmed.`;
+}
 function SetupInvocation(
   {
     role,
@@ -2805,6 +2839,7 @@ function SetupInvocation(
   const session = [...sessions].reverse().find((item) =>
     item.attempt_id === attemptId && item.role === role
   );
+  const dispatchWait = probeDispatchWait(role, attemptId, sessions);
   const viewOutcome = sessionView?.sessionId === session?.id ? sessionView?.outcome : undefined;
   const setViewOutcome = (outcome: CmuxViewOutcome) => {
     if (session) setSessionView({ sessionId: session.id, outcome });
@@ -2978,7 +3013,7 @@ function SetupInvocation(
               !presentationActionability.viewAvailable}
             onClick={() => void viewOutput()}
           >
-            {presentationActionability.viewLabel}
+            {session.status === "running" ? presentationActionability.viewLabel : "View recorded output"}
           </button>
           {session.status === "running" && (
             <button
@@ -3011,6 +3046,7 @@ function SetupInvocation(
         </small>
       )}
       {recovery && <SetupRecovery recovery={recovery} onChanged={onChanged} />}
+      {dispatchWait && <p className="hint" role="status">{dispatchWait}</p>}
       {dispatchHeld && (
         <small className="warning">
           Discovery manager dispatch and resume are held until this replacement
@@ -3019,7 +3055,7 @@ function SetupInvocation(
       )}
       {contractReady && !receipt && !session && (
         <button
-          disabled={!!busy || dispatchHeld}
+          disabled={!!busy || dispatchHeld || !!dispatchWait}
           onClick={() => onDispatch(attemptId, role)}
         >
           {purpose === "discovery"
@@ -3034,7 +3070,7 @@ function SetupInvocation(
             Resume starts the retained reporting turn explicitly.
           </small>
           <button
-            disabled={!!busy}
+            disabled={!!busy || !!dispatchWait}
             onClick={() => onDispatch(attemptId, role, session.id)}
           >
             Resume the stopped session
@@ -3043,7 +3079,7 @@ function SetupInvocation(
       )}
       {freshRetry && !recovery && (
         <button
-          disabled={!!busy}
+          disabled={!!busy || !!dispatchWait}
           onClick={() => onDispatch(attemptId, role)}
         >
           {purpose === "discovery"
@@ -3147,6 +3183,7 @@ function SetupRecovery(
 function RuntimeAdmission(
   {
     admission,
+    sessions,
     busy,
     onAuthorize,
     onLaunch,
@@ -3161,6 +3198,7 @@ function RuntimeAdmission(
     onChanged,
   }: {
     admission: RuntimeAdmissionState;
+    sessions: TripSetupState["sessions"];
     busy: string;
     onAuthorize: (id: string, scopeHash: string) => void;
     onLaunch: (role: Role) => void;
@@ -3344,6 +3382,7 @@ function RuntimeAdmission(
           const publish = probe.state === "evidence_recorded" &&
             probe.session_status === "exited";
           const launch = contractReady && probe.state === "authorized";
+          const dispatchWait = probeDispatchWait(probe.role, probe.attempt_id, sessions);
           const cmuxOutcome = probe.session_id
             ? presentationOutcomeForSession(probe.session_id)
             : undefined;
@@ -3383,7 +3422,7 @@ function RuntimeAdmission(
                       !cmuxPresentation.viewAvailable}
                     onClick={() => void viewOutput(probe.session_id!)}
                   >
-                    {cmuxPresentation.viewLabel}
+                    {probe.session_status === "running" ? cmuxPresentation.viewLabel : "View recorded output"}
                   </button>
                   {probe.session_status === "running" && (
                     <button
@@ -3420,9 +3459,10 @@ function RuntimeAdmission(
               {recovery && (
                 <SetupRecovery recovery={recovery} onChanged={onChanged} />
               )}
+              {dispatchWait && <p className="hint" role="status">{dispatchWait}</p>}
               {launch && (
                 <button
-                  disabled={!!busy}
+                  disabled={!!busy || !!dispatchWait}
                   onClick={() => onLaunch(probe.role)}
                 >
                   Launch bounded probe
@@ -3430,7 +3470,7 @@ function RuntimeAdmission(
               )}
               {retainedResume && !recovery && (
                 <button
-                  disabled={!!busy}
+                  disabled={!!busy || !!dispatchWait}
                   onClick={() => onResume(probe.role)}
                 >
                   Resume same native session
@@ -3510,7 +3550,7 @@ function ActiveConfiguration(
           </span>
         </article>
         <article>
-          <small>Runtime readiness</small>
+          <small>Selected runtime verification</small>
           <strong>
             {runtimeAdmission
               ? runtimeAdmission.state.replaceAll("_", " ")
@@ -3518,9 +3558,15 @@ function ActiveConfiguration(
           </strong>
           <span>
             {runtimeAdmission
-              ? `${currentRuntimeProofs}/${runtimeAdmission.probes.length} current proofs`
+              ? `${currentRuntimeProofs}/${runtimeAdmission.probes.length} current proofs in this verification`
               : "Installation does not grant runtime authority"}
           </span>
+          {runtimeAdmission && (
+            <span>
+              Covers {runtimeAdmission.probes.map((probe) => roleName(probe.role)).join(", ") || "no roles"}.
+              {" "}This is not a readiness count for all project roles.
+            </span>
+          )}
         </article>
         <article>
           <small>Agent profiles</small>
