@@ -1363,7 +1363,7 @@ export function ProjectSetup({
           {staleSelections.map((selection) => roleName(selection.role)).join(
             ", ",
           )}. {trip.readiness === "ready"
-            ? "These are installation records, not the current permission to run task agents. Check Runtime verification and each task's Agent settings for current runtime evidence."
+            ? "These are installation records, not the current permission to run task agents. Check Runtime verification here and the Roles tab of each task for current runtime evidence."
             : "See Agent verification below for what changed before continuing setup."}
         </p>
       )}
@@ -2371,7 +2371,9 @@ export function ProjectSetup({
                 use the selected native CLI accounts and their available
                 allowance. It does not authorize installation.
               </p>
-              <code>{setup.proposal_hash}</code>
+              <TechnicalDetails>
+                <p>Saved proposal {setup.proposal_hash}</p>
+              </TechnicalDetails>
               <button
                 className="primary"
                 disabled={!!busy}
@@ -2429,7 +2431,14 @@ export function ProjectSetup({
               setup.state,
             ) && (
             <fieldset className="setup-step">
-              <legend>Approve exact installation</legend>
+              <legend>Review the files setup will write</legend>
+              <p>
+                Setup writes these workflow files into{" "}
+                <strong>{project.display_name}</strong> at{" "}
+                <code>{project.repository_path}</code>. Nothing in the project
+                changes until you approve and then choose Apply staged
+                authorized installation in Activate.
+              </p>
               {setup.destination_preview_error && (
                 <ErrorNotice error={setup.destination_preview_error} />
               )}
@@ -2438,50 +2447,59 @@ export function ProjectSetup({
                   <div key={entry.relative_path}>
                     <code>{entry.relative_path}</code>
                     <small>
-                      draft source {entry.source_sha256.slice(0, 12)} · preimage
-                      {" "}
-                      {entry.preimage_sha256?.slice(0, 12) || "absent"}
+                      {entry.preimage_sha256
+                        ? "Replaces the existing file"
+                        : "New file"}
                     </small>
                   </div>
                 ))}
               </div>
-              <p>
-                Proposal <code>{setup.proposal_hash}</code>
-                <br />Preimages <code>{setup.approved_preimages_hash}</code>
-                <br />Final source set{" "}
-                <code>{setup.final_source_set_hash || "not frozen"}</code>
-              </p>
               {detectedKind === "compatible" &&
                   !setup.supersedes_setup_operation_id
                 ? (
-                  <button
-                    className="primary"
-                    disabled={!!busy || !setup.proposal}
-                    onClick={() => void adopt()}
-                  >
-                    Adopt exact compatible installation
-                  </button>
+                  <>
+                    <p className="hint">
+                      The project already has a compatible installation.
+                      Adopting records it as this project's workflow setup
+                      without writing these files.
+                    </p>
+                    <button
+                      className="primary"
+                      disabled={!!busy || !setup.proposal}
+                      onClick={() => void adopt()}
+                    >
+                      Adopt exact compatible installation
+                    </button>
+                  </>
                 )
                 : (
                   <>
                     {!setup.installation_source_binding_complete && (
-                      <button
-                        className="primary"
-                        disabled={!!busy}
-                        onClick={() => void finalizeInstall()}
-                      >
-                        Freeze exact final files and destination preimages
-                      </button>
+                      <>
+                        <p className="hint">
+                          First prepare the final preview. It records the
+                          exact content setup would write and each file's
+                          current content in the project, so you can compare
+                          them below. Preparing the preview does not change
+                          the project or approve anything. LLMRelay prepares
+                          it only after every probe session has exited.
+                        </p>
+                        <button
+                          className="primary"
+                          disabled={!!busy}
+                          onClick={() => void finalizeInstall()}
+                        >
+                          Prepare final file preview
+                        </button>
+                      </>
                     )}
-                    <p className="hint">
-                      {setup.installation_source_binding_reason}
-                    </p>
                     {setup.final_files.map((entry) => (
                       <details key={entry.relative_path}>
                         <summary>
-                          <code>{entry.relative_path}</code> · source{" "}
-                          {entry.source_sha256.slice(0, 12)} · preimage{" "}
-                          {entry.preimage_sha256?.slice(0, 12) || "absent"}
+                          <code>{entry.relative_path}</code> ·{" "}
+                          {entry.preimage_content == null
+                            ? "new file"
+                            : "replaces the current file"}
                         </summary>
                         <strong>Before</strong>
                         <pre>{entry.preimage_content ?? "(file absent)"}</pre>
@@ -2489,16 +2507,36 @@ export function ProjectSetup({
                         <pre>{entry.content}</pre>
                       </details>
                     ))}
+                    <p className="hint">
+                      {!setup.installation_source_binding_complete
+                        ? "Approve installation becomes available after the final preview is prepared."
+                        : "Approving authorizes installing exactly these files over exactly the current content shown as Before. If any of those files changes first, LLMRelay refuses the approval and you prepare a new preview. After approval, choose Apply staged authorized installation in Activate to write the files."}
+                    </p>
                     <button
                       className="primary"
                       disabled={!setup.installation_source_binding_complete ||
                         !!busy || !setup.final_files.length}
                       onClick={() => void authorizeInstall()}
                     >
-                      Approve exact final files and preimages
+                      Approve installation
                     </button>
                   </>
                 )}
+              <TechnicalDetails>
+                <p>
+                  Proposal {setup.proposal_hash} · destination preimages{" "}
+                  {setup.approved_preimages_hash ?? "not recorded"} · final
+                  source set {setup.final_source_set_hash || "not frozen"} ·
+                  {" "}{setup.installation_source_binding_reason}
+                </p>
+                {[...(setup.destination_preview ?? []), ...setup.final_files]
+                  .map((entry, index) => (
+                    <p key={`${index}:${entry.relative_path}`}>
+                      {entry.relative_path} · source {entry.source_sha256} ·
+                      preimage {entry.preimage_sha256 ?? "absent"}
+                    </p>
+                  ))}
+              </TechnicalDetails>
             </fieldset>
           )}
           {activeStage === "activate" &&

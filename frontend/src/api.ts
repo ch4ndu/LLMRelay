@@ -27,6 +27,7 @@ import type {
   TranscriptPage,
   GuidanceReauthorizationPreview,
 } from "./types";
+import { ROLES } from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -908,6 +909,51 @@ const taskContentRecordIsCurrent = (value: unknown) =>
     const item = field(value, name);
     return item === undefined || item === null || typeof item === "string";
   });
+const executionActors: string[] = [...ROLES, "single_agent"];
+const currentInputOutcome = (kind: unknown) =>
+  kind === "question" ? "needs_input" : kind === "blocked" ? "blocked" : undefined;
+const currentInputUnavailableReasons = [
+  "not_recorded",
+  "missing",
+  "mismatched",
+  "superseded",
+  "generation_replaced",
+];
+// Absent from older services. A present source must be bound to the same
+// attempt, and an available report must be exactly the one the hold names:
+// same ID, actor and outcome, never retired by a later native turn.
+const currentInputIsCurrent = (value: unknown, attemptId: string | null) => {
+  if (value === undefined || value === null) return true;
+  const outcome = currentInputOutcome(field(value, "kind"));
+  const role = field(value, "role");
+  if (
+    attemptId === null || field(value, "attempt_id") !== attemptId ||
+    outcome === undefined ||
+    !(role === null || executionActors.includes(String(role))) ||
+    !hasNullableString(value, "result_id") ||
+    !hasNullableString(value, "role_generation_id")
+  ) return false;
+  const report = field(value, "report");
+  switch (field(value, "state")) {
+    case "available":
+      return field(value, "unavailable_reason") === undefined &&
+        taskContentRecordIsCurrent(report) &&
+        field(report, "kind") === "report" &&
+        typeof field(value, "result_id") === "string" &&
+        field(report, "id") === field(value, "result_id") &&
+        typeof field(value, "role_generation_id") === "string" &&
+        role !== null && field(report, "role") === role &&
+        field(report, "outcome") === outcome &&
+        field(report, "superseded_by_native_turn") == null;
+    case "unavailable":
+      return report === undefined &&
+        currentInputUnavailableReasons.includes(
+          String(field(value, "unavailable_reason")),
+        );
+    default:
+      return false;
+  }
+};
 /** Plans, reports and feedback for the task's current attempt. */
 export const getTaskContent = async (taskId: string, signal?: AbortSignal) => {
   const content = await json<TaskContent>(
@@ -921,7 +967,8 @@ export const getTaskContent = async (taskId: string, signal?: AbortSignal) => {
     typeof content.content_revision !== "string" ||
     typeof content.truncated !== "boolean" ||
     !Array.isArray(content.records) ||
-    !content.records.every(taskContentRecordIsCurrent)
+    !content.records.every(taskContentRecordIsCurrent) ||
+    !currentInputIsCurrent(content.current_input, content.attempt_id)
   ) {
     throw new Error(
       "The service returned unsupported task content. Refresh after updating the service.",

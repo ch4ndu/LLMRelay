@@ -604,6 +604,12 @@ export function ProviderSettings(
           >
             {startBusy ? "Starting…" : "Start these checks"}
           </button>
+          {callsNeeded > 0 && !authorize && !otherStartUnknown && (
+            <small className="hint">
+              Start these checks becomes available after you allow the model
+              calls above.
+            </small>
+          )}
         </section>
       )}
       {pendingStart && !resolvedStart && !startBusy && (

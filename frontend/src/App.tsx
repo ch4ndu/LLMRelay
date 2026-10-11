@@ -40,7 +40,9 @@ import {
 } from "./components/SessionTree";
 import {
   attentionFocusElement,
+  type AttentionIntent,
   attentionTargetProblem,
+  type AttemptTarget,
 } from "./components/AttentionInbox";
 import { ProjectPicker } from "./components/ProjectPicker";
 import { ProjectSettings } from "./components/ProjectSettings";
@@ -366,8 +368,10 @@ export function App() {
   const [taskTabs, setTaskTabs] = useState<Record<string, TaskTab>>({});
   const pendingSection = useRef<string | undefined>(undefined);
   const pendingFocus = useRef<
-    { title: string; target: AttentionTarget } | undefined
+    { title: string; target: AttentionTarget; openPlan: boolean } | undefined
   >(undefined);
+  // A fresh object per Open plan click, so a repeated click opens it again.
+  const [planRequest, setPlanRequest] = useState<AttemptTarget>();
   const live = useRef<LiveStateController | undefined>(undefined);
   const currentProject = useRef(project);
   currentProject.current = project;
@@ -468,6 +472,11 @@ export function App() {
     if (element) {
       element.scrollIntoView({ block: "nearest" });
       element.focus({ preventScroll: true });
+      // The plan opens over the focused decision only after it is found, so
+      // the decision is where focus returns when the plan closes.
+      if (pending.openPlan && pending.target.kind === "attempt") {
+        setPlanRequest({ ...pending.target });
+      }
       return;
     }
     setSelectedId(undefined);
@@ -601,6 +610,7 @@ export function App() {
   const openTask = (task: Task) => {
     pendingFocus.current = undefined;
     setAttentionFocus(undefined);
+    setPlanRequest(undefined);
     setNavigationNotice("");
     setSelectedId(task.id);
   };
@@ -609,6 +619,7 @@ export function App() {
   const navigateAttention = (
     item: AttentionItem,
     target: AttentionTarget,
+    intent?: AttentionIntent,
   ): string | undefined => {
     setNavigationNotice("");
     const latest = live.current?.latest() ?? state;
@@ -626,6 +637,7 @@ export function App() {
         : item.action?.kind === "open_agent_output"
         ? "activity"
         : "overview",
+      intent === "open_plan" && item.action?.kind === "review_plan",
     );
     return undefined;
   };
@@ -634,7 +646,9 @@ export function App() {
     title: string,
     target: AttentionTarget,
     taskTab: TaskTab,
+    openPlan = false,
   ) => {
+    setPlanRequest(undefined);
     if (
       "project_id" in target &&
       latest.projects.some((candidate) => candidate.id === target.project_id)
@@ -667,7 +681,7 @@ export function App() {
     }
     // A fresh object re-renders, and so re-focuses, a repeated click.
     setAttentionFocus({ ...target });
-    pendingFocus.current = { title, target };
+    pendingFocus.current = { title, target, openPlan };
   };
   // Rechecks the wait against the newest accepted snapshot; opening never acts.
   const openWait = (wait: WaitNotice) => {
@@ -1185,12 +1199,14 @@ export function App() {
               attentionFocus.task_id === selected.id
             ? attentionFocus
             : undefined}
+          planRequest={planRequest?.task_id === selected.id ? planRequest : undefined}
           tab={taskTabs[selected.id] || "overview"}
           onTabChange={(tab) =>
             setTaskTabs((current) => ({ ...current, [selected.id]: tab }))}
           onClose={() => {
             setSelectedId(undefined);
             setAttentionFocus(undefined);
+            setPlanRequest(undefined);
           }}
           onChanged={refresh}
           onOpenSetup={(projectId) => {

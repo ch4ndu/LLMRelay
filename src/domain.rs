@@ -2673,6 +2673,56 @@ pub enum UnacceptedInputKind {
     Resume,
 }
 
+/// The agent report that raised the current input hold of a task's latest
+/// attempt, bound by its exact report and role generation. It is context for
+/// the person only: it names no reply target and grants no approval, resume
+/// or other authority. An unavailable source is never replaced by another
+/// report.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CurrentInputSourceDto {
+    pub attempt_id: String,
+    pub kind: CurrentInputKind,
+    /// The execution actor key of the generation the hold names, when that
+    /// generation belongs to this attempt.
+    pub role: Option<String>,
+    pub result_id: Option<String>,
+    pub role_generation_id: Option<String>,
+    #[serde(flatten)]
+    pub source: CurrentInputSourceState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentInputKind {
+    Question,
+    Blocked,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CurrentInputSourceState {
+    /// `report` has the task content record shape; its plan text is left to
+    /// the plan viewer.
+    Available { report: serde_json::Value },
+    Unavailable {
+        unavailable_reason: CurrentInputUnavailableReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentInputUnavailableReason {
+    /// The hold was recorded before holds named their report.
+    NotRecorded,
+    Missing,
+    /// The named report belongs to another generation or attempt, or its
+    /// outcome is not the one the hold records.
+    Mismatched,
+    Superseded,
+    /// The role that reported has since been replaced or revoked.
+    GenerationReplaced,
+}
+
 /// Claude `StopFailure` error values of the admitted Claude Code release. Any
 /// other value is `Unknown`; its text stays in `provider_error`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

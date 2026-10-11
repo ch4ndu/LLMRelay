@@ -229,7 +229,7 @@ export function explainError(error: string): ErrorGuidance {
       summary:
         "The agent has not accepted the connection needed to report its progress.",
       nextStep:
-        "Choose View output, then Take keyboard control to review the agent's hook prompt. Return to Project setup and follow the available retry or recovery action.",
+        "Choose View output, then Take control to review LLMRelay's listed hooks in the agent's prompt, and Release control when you are done. Waiting alone will not answer the prompt. Then return to Project setup and follow the available retry or recovery action.",
     };
   }
   if (

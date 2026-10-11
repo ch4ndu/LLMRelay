@@ -35520,6 +35520,36 @@ fn single_agent_question_stops_its_own_turn_once() {
     exit_single_agent(&fixture, &first);
     tick_until(&fixture, &app, "held");
     assert_eq!(stop_reservations(), 1);
+    let content = workflow::task_content(&fixture.store, &first_task).unwrap();
+    let source = &content["current_input"];
+    assert_eq!(source["state"], "available", "{content}");
+    assert_eq!(source["kind"], "question");
+    assert_eq!(source["role"], "single_agent");
+    assert_eq!(source["role_generation_id"], first.role_generation_id);
+    assert_eq!(source["report"]["summary"], "Which file should say done?");
+
+    // A current hold in the baseline form, which stored only its reason, is
+    // still a question whose report is not recorded; nothing is substituted.
+    // A current hold with another cause has no question at all.
+    let record_hold = |id: &str, reason: &str| {
+        fixture.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             SELECT ?1,?1,'service','single_agent.attempt.held','attempt',id,json_object('reason',?2),updated_at
+             FROM attempts WHERE id=?3",
+            params![id, reason, first.attempt_id],
+        );
+        workflow::task_content(&fixture.store, &first_task).unwrap()["current_input"].clone()
+    };
+    let baseline = record_hold(
+        "baseline-hold",
+        "The agent reported needs_input: Which file should say done?",
+    );
+    assert_eq!(baseline["state"], "unavailable", "{baseline}");
+    assert_eq!(baseline["unavailable_reason"], "not_recorded");
+    assert_eq!(baseline["kind"], "question");
+    assert!(baseline["result_id"].is_null() && baseline.get("report").is_none());
+    let other = record_hold("start-hold", "The agent could not start: fixture");
+    assert!(other.is_null(), "{other}");
 }
 
 #[test]
@@ -40381,6 +40411,161 @@ fn task_content_returns_bounded_current_attempt_text_with_a_revision() {
     assert_eq!(records.last().unwrap()["id"], "r59");
 }
 
+#[test]
+fn task_content_binds_the_current_input_hold_to_its_exact_report() {
+    let fixture = Fixture::new("task-content-input-source");
+    seed_attempt(&fixture, "implementation");
+    seed_session(
+        &fixture,
+        "a",
+        "manager",
+        "g-manager",
+        "s-manager",
+        "running",
+    );
+    seed_session(&fixture, "a", "implementer", "g-impl", "s-impl", "running");
+    let report = |id: &str, session: &str, generation: &str, created: &str| {
+        fixture.execute(
+            "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+             VALUES(?1,?1,?2,?3,'needs_input',?4,'[]','{\"plan\":\"Plan text\"}',?5)",
+            params![id, session, generation, format!("Question {id}"), created],
+        );
+    };
+    let hold = |event: &str, source: &str| {
+        fixture.execute_batch(&format!(
+            "UPDATE tasks SET attention='needs_input' WHERE id='t';
+             UPDATE attempts SET status='needs_input',updated_at='2026-01-01T00:00:05Z' WHERE id='a';
+             INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+               VALUES('{event}','{event}-op','service','attempt.attention.changed','attempt','a',
+                      '{{\"attention\":\"needs_input\",\"reason\":\"role_needs_input\",\"message\":\"m\"{source}}}',
+                      '2026-01-01T00:00:05Z');"
+        ));
+    };
+    let content = || workflow::task_content(&fixture.store, "t").unwrap();
+    let bound = r#","result_id":"question","role_generation_id":"g-impl""#;
+    assert!(content()["current_input"].is_null());
+
+    report("question", "s-impl", "g-impl", "2026-01-01T00:00:04Z");
+    hold("hold", bound);
+    let source = content()["current_input"].clone();
+    assert_eq!(source["state"], "available", "{source}");
+    assert_eq!(source["kind"], "question");
+    assert_eq!(source["role"], "implementer");
+    assert_eq!(source["role_generation_id"], "g-impl");
+    assert_eq!(source["report"]["id"], "question");
+    assert_eq!(source["report"]["summary"], "Question question");
+    assert!(source["report"]["plan"].is_null(), "{source}");
+
+    // A newer report from another agent is not this hold's question, and the
+    // bound question stays available after history retention drops it.
+    report("later", "s-manager", "g-manager", "2026-01-01T00:00:06Z");
+    for index in 0..60 {
+        report(
+            &format!("r{index:02}"),
+            "s-manager",
+            "g-manager",
+            &format!("2026-01-02T00:00:{index:02}Z"),
+        );
+    }
+    let current = content();
+    let records = current["records"].as_array().unwrap();
+    assert!(records.iter().all(|record| record["id"] != "question"));
+    assert!(
+        records.len() < 50,
+        "the bound report counts toward the record bound"
+    );
+    assert_eq!(current["truncated"], true);
+    assert_eq!(current["current_input"]["state"], "available");
+    assert_eq!(current["current_input"]["report"]["id"], "question");
+
+    // A source that is wrong, missing or never recorded is unavailable, and
+    // no other report is offered in its place.
+    for (event, source, reason) in [
+        (
+            "wrong-generation",
+            r#","result_id":"later","role_generation_id":"g-impl""#,
+            "mismatched",
+        ),
+        (
+            "missing",
+            r#","result_id":"deleted","role_generation_id":"g-impl""#,
+            "missing",
+        ),
+        ("legacy", "", "not_recorded"),
+    ] {
+        hold(event, source);
+        let source = content()["current_input"].clone();
+        assert_eq!(source["state"], "unavailable", "{event}: {source}");
+        assert_eq!(source["unavailable_reason"], reason, "{event}");
+        assert!(source.get("report").is_none(), "{event}: {source}");
+    }
+
+    // The question keeps its exact summary but no free metadata, and the whole
+    // response stays within its byte bound beside oversized metadata or a
+    // maximum-size summary whose JSON escaping multiplies its size.
+    const TASK_CONTENT_BYTE_LIMIT: usize = 512 * 1024;
+    for (id, summary, metadata) in [
+        (
+            "short-question",
+            "Which scope should I keep?".to_owned(),
+            serde_json::json!({"review_kind": "x".repeat(600 * 1024)}).to_string(),
+        ),
+        (
+            "escaped-question",
+            "\u{1}".repeat(64 * 1024),
+            "{}".to_owned(),
+        ),
+    ] {
+        fixture.execute(
+            "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+             VALUES(?1,?1,'s-impl','g-impl','needs_input',?2,'[]',?3,'2026-01-03T00:00:00Z')",
+            params![id, summary, metadata],
+        );
+        hold(
+            &format!("{id}-hold"),
+            &format!(r#","result_id":"{id}","role_generation_id":"g-impl""#),
+        );
+        let current = content();
+        assert!(current.to_string().len() <= TASK_CONTENT_BYTE_LIMIT, "{id}");
+        let source = &current["current_input"];
+        assert_eq!(source["state"], "available", "{id}");
+        assert_eq!(source["report"]["id"], id);
+        assert_eq!(source["report"]["summary"], summary.as_str(), "{id}");
+        assert!(source["report"]["review_kind"].is_null(), "{id}");
+    }
+
+    // Replacing the role that asked retires its question and changes the
+    // content revision so the dashboard refetches it.
+    hold("again", bound);
+    let revision = content()["content_revision"].clone();
+    assert_eq!(content()["current_input"]["state"], "available");
+    seed_session(
+        &fixture,
+        "a",
+        "implementer",
+        "g-impl-2",
+        "s-impl-2",
+        "running",
+    );
+    let replaced = content();
+    assert_ne!(replaced["content_revision"], revision);
+    assert_eq!(replaced["current_input"]["state"], "unavailable");
+    assert_eq!(
+        replaced["current_input"]["unavailable_reason"],
+        "generation_replaced"
+    );
+
+    // A released hold has no current input.
+    fixture.execute_batch(
+        "UPDATE tasks SET attention='none' WHERE id='t';
+         UPDATE attempts SET status='running' WHERE id='a';
+         INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+           VALUES('release','release-op','service','attempt.attention.changed','attempt','a',
+                  '{\"attention\":\"none\",\"reason\":\"released_by_control\"}','2026-01-01T00:00:07Z');",
+    );
+    assert!(content()["current_input"].is_null());
+}
+
 /// Makes `generation` the task's current authority for `role`, as the
 /// scheduler and switch paths do for real dispatches.
 fn make_effective(fixture: &Fixture, role: &str, generation: &str) {
@@ -40439,6 +40624,16 @@ fn a_newer_report_from_the_asking_agent_releases_its_hold_exactly_once() {
     };
     let released =
         || agenticjira::coordinator::reconcile_superseded_role_hold(&fixture.store).unwrap();
+    let question_state = || {
+        let content = workflow::task_content(&fixture.store, "t").unwrap();
+        let source = &content["current_input"];
+        assert!(source.get("report").is_none() || source["report"]["id"] == "question");
+        (
+            source["state"].as_str().unwrap().to_owned(),
+            source["unavailable_reason"].as_str().map(str::to_owned),
+        )
+    };
+    let available = || ("available".to_owned(), None::<String>);
     let task_state = || {
         fixture
             .connection()
@@ -40471,12 +40666,15 @@ fn a_newer_report_from_the_asking_agent_releases_its_hold_exactly_once() {
     hold("sourced", sourced, "2026-01-01T00:00:07Z");
     report("explored", "g-explorer", "exploration_complete", None);
     assert!(released().is_none());
+    assert_eq!(question_state(), available());
     fixture.execute(
         "UPDATE role_results SET consumed_at='2026-01-01T00:00:08Z' WHERE id='explored'",
         [],
     );
 
-    // Guidance whose delivery is unconfirmed keeps the hold.
+    // Guidance whose delivery is unconfirmed keeps the hold, but the asking
+    // agent's usable report (with the same timestamp as its question) has
+    // answered the question, so it is no longer offered as current.
     report("plan", "g-manager", "plan_ready", None);
     fixture.execute(
         "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at)
@@ -40484,6 +40682,11 @@ fn a_newer_report_from_the_asking_agent_releases_its_hold_exactly_once() {
         [],
     );
     assert!(released().is_none());
+    assert_eq!(task_state().0, "needs_input");
+    assert_eq!(
+        question_state(),
+        ("unavailable".to_owned(), Some("superseded".to_owned()))
+    );
 
     // So does another blocked report that nobody has read yet.
     fixture.execute(
@@ -40501,12 +40704,14 @@ fn a_newer_report_from_the_asking_agent_releases_its_hold_exactly_once() {
         [],
     );
     assert!(released().is_none());
+    assert_eq!(question_state(), available());
     fixture.execute("UPDATE attempts SET phase='planning' WHERE id='a'", []);
     fixture.execute(
         "UPDATE role_settings SET effective_generation_id=NULL WHERE role='manager'",
         [],
     );
     assert!(released().is_none());
+    assert_eq!(question_state(), available());
     fixture.execute(
         "UPDATE role_settings SET effective_generation_id='g-manager' WHERE role='manager'",
         [],

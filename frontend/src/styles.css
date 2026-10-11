@@ -2084,6 +2084,15 @@ details.panel > summary,
   flex: 0 0 auto;
   min-height: 44px;
 }
+.attention-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.attention-actions button {
+  min-height: 44px;
+}
 .held-tasks {
   display: flex;
   flex-wrap: wrap;
@@ -3030,6 +3039,12 @@ details.panel > summary,
 .plan-preview-actions {
   display: flex;
   justify-content: flex-end;
+  margin: 8px 0;
+}
+.question-plan {
+  display: grid;
+  gap: 4px;
+  justify-items: start;
   margin: 8px 0;
 }
 .plan-viewer-backdrop {

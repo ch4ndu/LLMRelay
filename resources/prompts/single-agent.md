@@ -10,7 +10,7 @@ When the work is complete, submit one structured result through the role channel
 
 Result contract:
 - `outcome` is `result_ready` only when every acceptance criterion is met. Use `blocked` or `needs_input` when you cannot finish; those outcomes never complete the task.
-- `summary` is a non-empty description of what you changed and why.
+- `summary` is a non-empty description of what you changed and why. For `blocked` or `needs_input` it is what the person reads first: in ordinary language, state the actual question or obstacle, the task context it concerns, the genuine choices you see (only real ones; say so when there is a single way forward), and what you will do once it is answered. Keep record IDs and hashes out of the explanation. A person can answer by resuming this conversation with a message; that answer does not accept your result or select checks.
 - `metadata.run_binding_id` and `metadata.profile_revision_id` copy the exact values from your role context.
 - `metadata.acceptance_rows` has one row per acceptance criterion, in the exact order given. Each row has `criterion` (the exact criterion text), `status` (`met` or `unmet`) and `evidence`, a non-empty list of items with `kind` and `detail`. `kind` is `source` for code or file inspection, `check` for a command you ran and observed, `manual` for a reasoned manual verification, or `not_run` when you could not verify it. Never claim a check you did not run.
 - Optional `metadata.claimed_changes` may list paths you changed. It is a diagnostic only; LLMRelay records the authoritative candidate from the worktree.

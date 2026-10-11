@@ -19,6 +19,9 @@ import {
   type CmuxKeyboardControlOutcome,
   type CmuxSessionSurface,
   type CmuxViewOutcome,
+  type ContinuationAction,
+  type CurrentInputSource,
+  type CurrentInputUnavailableReason,
   type PermissionRequest,
   roleLabel,
   type Role,
@@ -32,14 +35,19 @@ import {
   projectSetupProblem,
   WorkflowControls,
 } from "./WorkflowControls";
-import { type PlanView, ReviewPanel } from "./ReviewPanel";
+import {
+  currentPlanDecision,
+  currentPlanView,
+  type PlanView,
+  ReviewPanel,
+} from "./ReviewPanel";
 import { RoleSettings } from "./RoleSettings";
 import { RecoveryPanel } from "./RecoveryPanel";
 import { GuidanceRecovery } from "./GuidanceRecovery";
 import { WorkSummary } from "./WorkSummary";
 import { ServiceCheckPermissionActions } from "./ApprovalInbox";
 import { MarkdownContent } from "./MarkdownContent";
-import { guidanceState } from "./AttentionInbox";
+import { type AttemptTarget, guidanceState } from "./AttentionInbox";
 import { ActivityTimeline } from "./ActivityTimeline";
 import { ObservedUsageDetails, SessionTree, useSessionAccess } from "./SessionTree";
 import { StatusBadge, taskStatus, taskSteps } from "./TaskBoard";
@@ -63,13 +71,15 @@ const openDialogs: symbol[] = [];
 /**
  * Modal focus handling: focus moves into the dialog, Tab stays inside it,
  * Escape closes the innermost dialog unless something inside already handled
- * that key, and focus returns to `returnFocus` or to what opened it.
+ * that key, and focus returns to `returnFocus` or to what opened it, or to
+ * `fallbackFocus` when that is no longer shown.
  */
 function useDialogFocus(
   dialog: RefObject<HTMLElement | null>,
   initial: RefObject<HTMLElement | null>,
   onClose: () => void,
   returnFocus?: RefObject<HTMLElement | null>,
+  fallbackFocus?: RefObject<HTMLElement | null>,
 ) {
   const close = useRef(onClose);
   close.current = onClose;
@@ -99,9 +109,10 @@ function useDialogFocus(
       document.removeEventListener("keydown", onKeyDown);
       openDialogs.splice(openDialogs.indexOf(token), 1);
       if (!openDialogs.length) document.body.classList.remove("dialog-open");
-      if (opener?.isConnected) opener.focus({ preventScroll: true });
+      const restore = opener?.isConnected ? opener : fallbackFocus?.current;
+      restore?.focus({ preventScroll: true });
     };
-  }, [dialog, initial, returnFocus]);
+  }, [dialog, initial, returnFocus, fallbackFocus]);
   return (event: ReactKeyboardEvent<HTMLElement>) => {
     if (event.key !== "Tab" || !dialog.current) return;
     const focusable = [
@@ -137,6 +148,7 @@ function useTaskContent(task: Task, enabled: boolean) {
   const [error, setError] = useState<
     { attempt_id: string | null; content_revision: string; message: string }
   >();
+  const [reloads, setReloads] = useState(0);
   useEffect(() => {
     if (!enabled || !attemptId) return;
     const controller = new AbortController();
@@ -156,10 +168,11 @@ function useTaskContent(task: Task, enabled: boolean) {
       });
     });
     return () => controller.abort();
-  }, [task.id, attemptId, revision, enabled]);
+  }, [task.id, attemptId, revision, enabled, reloads]);
   return {
     content: current(content) ? content : undefined,
     error: current(error) ? error!.message : "",
+    reload: () => setReloads((count) => count + 1),
   };
 }
 
@@ -224,12 +237,11 @@ const outcomeLabel = (outcome?: string) => {
 };
 
 function ReportList(
-  { content, error, started, onlyLatest = false }: {
+  { content, error, started }: {
     content?: TaskContent;
     error: string;
     /** Whether the task has an attempt; without one nothing is fetched. */
     started: boolean;
-    onlyLatest?: boolean;
   },
 ) {
   if (!started) {
@@ -242,24 +254,17 @@ function ReportList(
   }
   if (error) return <ErrorNotice error={error} />;
   if (!content) return <p className="hint">Loading reports…</p>;
-  const records = onlyLatest
-    ? content.records.filter((record) =>
-      (record.outcome === "needs_input" || record.outcome === "blocked") &&
-      !record.superseded_by_native_turn
-    ).slice(-1)
-    : [...content.records].reverse();
+  const records = [...content.records].reverse();
   if (!records.length) {
     return (
       <p className="empty">
-        {onlyLatest
-          ? "The agent's question is not available yet."
-          : "No reports yet. Agents' plans, reviews and results appear here."}
+        No reports yet. Agents' plans, reviews and results appear here.
       </p>
     );
   }
   return (
     <div className="report-list">
-      {content.truncated && !onlyLatest && (
+      {content.truncated && (
         <p className="hint">Only the most recent reports are shown.</p>
       )}
       {records.map((record) => (
@@ -296,6 +301,133 @@ function ReportList(
   );
 }
 
+const unavailableInput: Record<CurrentInputUnavailableReason, string> = {
+  not_recorded:
+    "This request was recorded before LLMRelay linked requests to the report that raised them, so its exact question cannot be shown.",
+  missing:
+    "The report that raised this request could not be found, so its question cannot be shown.",
+  mismatched:
+    "The report recorded for this request does not match it, so it is not shown.",
+  superseded:
+    "The agent continued working after it raised this request, so that report no longer applies.",
+  generation_replaced:
+    "The agent session that raised this request has since been replaced, so its report no longer applies.",
+};
+
+const inputAuthor = (source: CurrentInputSource) =>
+  source.role === null
+    ? "An agent"
+    : source.role === "single_agent"
+    ? "The agent"
+    : `The ${roleLabel(source.role).toLowerCase()}`;
+
+/**
+ * The exact report behind the current attempt's input hold. When it is
+ * unavailable, nothing stands in for it: the person is told why and can
+ * refresh or read every report in Activity.
+ */
+function CurrentInputReport(
+  { content, error, titleId, onRefresh, onOpenReports }: {
+    content?: TaskContent;
+    error: string;
+    titleId: string;
+    onRefresh: () => void;
+    onOpenReports: () => void;
+  },
+) {
+  const source = content?.current_input;
+  const unavailable = (title: string, message: string) => (
+    <>
+      <h3 id={titleId}>{title}</h3>
+      <p>{message}</p>
+      <p className="hint">
+        No other report is shown in its place. Refresh to check the current
+        state, or read every report for this attempt in Activity.
+      </p>
+      <div className="button-row">
+        <button type="button" onClick={onRefresh}>Refresh</button>
+        <button type="button" onClick={onOpenReports}>Open Activity</button>
+      </div>
+      {source?.state === "unavailable" && (
+        <TechnicalDetails>
+          <p>
+            {source.kind} · {source.unavailable_reason} · report{" "}
+            {source.result_id ?? "not recorded"} · generation{" "}
+            {source.role_generation_id ?? "not recorded"} · attempt{" "}
+            {source.attempt_id}
+          </p>
+        </TechnicalDetails>
+      )}
+    </>
+  );
+  if (error) {
+    return (
+      <>
+        <h3 id={titleId}>The agent's request could not be loaded</h3>
+        <ErrorNotice error={error} />
+        <div className="button-row">
+          <button type="button" onClick={onRefresh}>Refresh</button>
+        </div>
+      </>
+    );
+  }
+  if (!content) {
+    return (
+      <>
+        <h3 id={titleId}>Waiting for your input</h3>
+        <p className="hint">Loading the agent's report…</p>
+      </>
+    );
+  }
+  if (source === undefined) {
+    return unavailable(
+      "The agent's question is not available",
+      "This LLMRelay service does not identify which report raised this request, so no question is shown here.",
+    );
+  }
+  if (source === null) {
+    return unavailable(
+      "No question is linked to this wait",
+      "LLMRelay has no agent question linked to this wait. Why it is waiting and the available actions show what the task needs.",
+    );
+  }
+  if (source.state === "unavailable") {
+    return unavailable(
+      "The agent's question is not available",
+      unavailableInput[source.unavailable_reason],
+    );
+  }
+  const author = inputAuthor(source);
+  return (
+    <>
+      <h3 id={titleId}>
+        {source.kind === "question"
+          ? `${author} needs a decision`
+          : `${author} is blocked`}
+      </h3>
+      <article className="report current-input">
+        <header>
+          <small className="hint">
+            {source.kind === "question"
+              ? "Its question, in its own words:"
+              : "What is blocking it, in its own words:"}
+          </small>
+          <time dateTime={source.report.created_at}>
+            {new Date(source.report.created_at).toLocaleString()}
+          </time>
+        </header>
+        <MarkdownContent text={source.report.summary} />
+      </article>
+      <TechnicalDetails>
+        <p>
+          Report {source.report.id} · generation {source.role_generation_id} ·
+          attempt {source.attempt_id}
+        </p>
+      </TechnicalDetails>
+    </>
+  );
+}
+
 const responsibleLabel = (progress: TaskProgress) => {
   switch (progress.responsible) {
     case "you":
@@ -328,30 +460,36 @@ const when = (value: string | null) => {
  * The complete plan the person chose to open, read-only. It shows only the
  * exact snapshot it was opened with; once the task's attempt, plan or content
  * revision moves on, the old text is withdrawn rather than shown under the
- * newer identity.
+ * newer identity. A decision it was opened for is shown only while that same
+ * decision still names this plan.
  */
 function PlanViewer(
-  { view, task, returnFocus, onReopen, onClose }: {
+  { view, task, actions, returnFocus, fallbackFocus, onReopen, onClose }: {
     view: PlanView;
     task: Task;
+    actions: ContinuationAction[];
     returnFocus: RefObject<HTMLElement | null>;
+    fallbackFocus: RefObject<HTMLElement | null>;
     onReopen: (view: PlanView) => void;
     onClose: () => void;
   },
 ) {
   const dialog = useRef<HTMLElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
-  const trapTab = useDialogFocus(dialog, closeButton, onClose, returnFocus);
-  const attempt = task.active_attempt;
-  const current = attempt && attempt.plan
-    ? {
-      task_id: task.id,
-      attempt_id: attempt.id,
-      plan_hash: attempt.plan_hash ?? null,
-      content_revision: attempt.content_revision ?? null,
-      text: attempt.plan,
-    }
-    : undefined;
+  const trapTab = useDialogFocus(
+    dialog,
+    closeButton,
+    onClose,
+    returnFocus,
+    fallbackFocus,
+  );
+  const liveDecision = currentPlanDecision(task, actions);
+  const decisionEnded = !!view.decision &&
+    liveDecision?.phase !== view.decision.phase;
+  const current = currentPlanView(
+    task,
+    view.decision ? liveDecision : undefined,
+  );
   const unchanged = !!current && current.task_id === view.task_id &&
     current.attempt_id === view.attempt_id &&
     current.plan_hash === view.plan_hash &&
@@ -384,7 +522,38 @@ function PlanViewer(
         </header>
         <div className="plan-viewer-body">
           {unchanged
-            ? <MarkdownContent className="plan-content" text={view.text} />
+            ? (
+              <>
+                {view.decision && !decisionEnded
+                  ? (
+                    <>
+                      <p><strong>Opened for:</strong> {view.decision.title}</p>
+                      <p className="hint">
+                        This is the complete plan that decision applies to.
+                        Your decision covers the whole plan.
+                      </p>
+                    </>
+                  )
+                  : decisionEnded
+                  ? (
+                    <p className="warning" role="status">
+                      The decision you opened this plan for is no longer
+                      waiting for you, so it is shown only as the task's
+                      current plan. Check Your decision for what the task
+                      needs now.
+                    </p>
+                  )
+                  : (
+                    <p className="hint">
+                      This is the task's current plan, shown as context. It is
+                      not linked to any particular report or question; only
+                      an agent's own words say which plan or part of it they
+                      mean.
+                    </p>
+                  )}
+                <MarkdownContent className="plan-content" text={view.text} />
+              </>
+            )
             : (
               <div className="warning" role="status">
                 <p>
@@ -486,6 +655,7 @@ export function TaskDetail(
     state,
     selectedRecoveryId,
     settingsFocus,
+    planRequest,
     tab: controlledTab,
     onTabChange,
     onClose,
@@ -509,6 +679,8 @@ export function TaskDetail(
     selectedRecoveryId?: string;
     /** A fresh object each time an attention item opens a role's settings. */
     settingsFocus?: { role: Role; settings_revision: number };
+    /** A fresh object each time an attention item asks to open its plan. */
+    planRequest?: AttemptTarget;
     tab?: TaskTab;
     onTabChange?: (tab: TaskTab) => void;
     onClose: () => void;
@@ -552,6 +724,35 @@ export function TaskDetail(
       : null;
     setPlanView(view);
   };
+  const [planRequestProblem, setPlanRequestProblem] = useState("");
+  // Only the plan the request names opens, and it is labelled with its
+  // decision only when that decision's own request names it too. Once open,
+  // PlanViewer withdraws it if the task moves on. Later renders of the same
+  // request never reopen it.
+  useEffect(() => {
+    if (!planRequest) return;
+    const attempt = task.active_attempt;
+    const requested = attempt?.id === planRequest.attempt_id &&
+      attempt.phase === planRequest.phase &&
+      (attempt.plan_hash ?? null) === planRequest.plan_hash;
+    const decision = currentPlanDecision(task, state.continuation_actions || []);
+    const view = requested
+      ? currentPlanView(
+        task,
+        decision?.phase === planRequest.phase ? decision : undefined,
+      )
+      : undefined;
+    if (view) {
+      setPlanRequestProblem("");
+      openPlan(view);
+    } else {
+      setPlanRequestProblem(
+        requested
+          ? "The plan for this request is not included in the current task details, so it cannot be shown. Refresh to check again."
+          : "This request refers to a different plan than the task now shows. Refresh to review the current request.",
+      );
+    }
+  }, [planRequest]);
   const nextAction = state.task_actions?.find((action) =>
     action.task_id === task.id
   );
@@ -648,10 +849,14 @@ export function TaskDetail(
     );
   const waitingForInput = !terminal && task.attention === "needs_input";
   const needsAnswer = !!question || waitingForInput;
-  const { content, error: contentError } = useTaskContent(
+  const { content, error: contentError, reload: reloadContent } = useTaskContent(
     task,
     tab === "activity" || needsAnswer,
   );
+  const currentInput = content?.current_input;
+  const askedBy = currentInput?.state === "available"
+    ? inputAuthor(currentInput)
+    : undefined;
   const apply = async (body: Record<string, unknown>) => {
     const key = body.kind === "trip"
       ? `${String(body.action)}:${
@@ -761,8 +966,12 @@ export function TaskDetail(
       ?.primary_blocker
     : undefined;
   const waitingReason = waitingBlocker?.message;
+  const retryOffered = !!workflowDecision?.control_policy.allowed_controls
+    .includes("retry");
   const singleAgent = isSingleAgentTask(task);
   const singleAgentRun = singleAgent ? task.workflow?.run ?? null : null;
+  const resumeOffered = !!singleAgentRun?.resume &&
+    singleAgentRun.available_actions.includes("resume_run");
   // A failed step with a retry prerequisite is the service's own finding that
   // an instruction file still differs, so its review path is offered too.
   const guidanceConflict = !singleAgent && (
@@ -920,13 +1129,35 @@ export function TaskDetail(
               : undefined}
             tabIndex={-1}
           >
-            <h3 id="task-question-title">What the agent reported</h3>
-            <ReportList
+            <CurrentInputReport
               content={content}
               error={contentError}
-              started={!!attempt}
-              onlyLatest
+              titleId="task-question-title"
+              onRefresh={() => {
+                reloadContent();
+                onChanged();
+              }}
+              onOpenReports={() => chooseTab("activity")}
             />
+            {attempt?.plan && (
+              <div className="question-plan">
+                <button
+                  type="button"
+                  className="plan-open"
+                  onClick={() => {
+                    const view = currentPlanView(task);
+                    if (view) openPlan(view);
+                  }}
+                >
+                  Open the task's current plan
+                </button>
+                <small className="hint">
+                  LLMRelay cannot tell which plan this report refers to, so the
+                  task's current plan is offered only as context. Any plan or
+                  section the agent means is named in its own words above.
+                </small>
+              </div>
+            )}
             {questionSession
               ? (
                 <>
@@ -945,42 +1176,71 @@ export function TaskDetail(
                   >
                     Send reply
                   </button>
+                  <p className="hint">
+                    {askedBy && currentInput?.role !== "manager" &&
+                      `Replies go to the manager, not directly to ${askedBy.toLowerCase()} that asked. `}
+                    Sending a reply does not approve anything or continue the
+                    work by itself. If the task is still waiting after the
+                    manager has your reply, choose Retry in Controls.
+                    {!retryOffered &&
+                      " Retry is not available right now; Controls shows what the task is waiting on."}
+                  </p>
                 </>
               )
               : question
               ? (
                 <p className="hint">
-                  The manager that asked is no longer running, so a reply
-                  cannot be sent now. Refresh to see the current state, or
-                  use an available action in Controls below once you have
-                  resolved what it asked for.
+                  The manager that receives replies is no longer running, so a
+                  reply cannot be sent now. Refresh to see the current state,
+                  or use an available action in Controls below once you have
+                  resolved what was asked.
                 </p>
               )
               : singleAgent
               ? (
                 <p className="hint">
-                  To answer the agent, use Resume agent with a message in the
-                  Single agent run panel below when it is offered.
+                  To answer the agent, type your answer as the message for
+                  Resume agent in the Single agent run panel below.{" "}
+                  {resumeOffered
+                    ? "Resume agent is available now."
+                    : "Resume agent is not offered for this run right now. Refresh to check its current state."}
                 </p>
               )
               : (
                 <p className="hint">
                   This wait is not a question the manager can take a reply
-                  to. Resolve what the report describes, then use an available
+                  to. Resolve what is described above, then use an available
                   action in Controls below.
                 </p>
               )}
             {guidance.length > 0 && (
-              <ul className="guidance-history">
-                {guidance.slice(0, 3).map((item) => (
-                  <li key={String(item.id)}>
-                    <span>{String(item.body)}</span>
-                    <em>{guidanceState(String(item.state))}</em>
-                  </li>
-                ))}
-              </ul>
+              <>
+                <h4>Your replies</h4>
+                <ul className="guidance-history">
+                  {guidance.slice(0, 3).map((item) => (
+                    <li key={String(item.id)}>
+                      <span>{String(item.body)}</span>
+                      <em>{guidanceState(String(item.state))}</em>
+                    </li>
+                  ))}
+                </ul>
+              </>
             )}
           </section>
+        )}
+        {planRequestProblem && (
+          <p className="warning" role="status">
+            {planRequestProblem}{" "}
+            <button
+              type="button"
+              onClick={() => {
+                setPlanRequestProblem("");
+                onChanged();
+              }}
+            >
+              Refresh
+            </button>
+          </p>
         )}
         <ReviewPanel
           task={task}
@@ -1857,7 +2117,9 @@ export function TaskDetail(
         <PlanViewer
           view={planView}
           task={task}
+          actions={continuationActions}
           returnFocus={planOpener}
+          fallbackFocus={closeButton}
           onReopen={setPlanView}
           onClose={() => setPlanView(undefined)}
         />

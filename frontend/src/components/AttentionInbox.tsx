@@ -8,6 +8,10 @@ import type {
   AttentionTarget,
 } from "../types";
 
+export type AttemptTarget = Extract<AttentionTarget, { kind: "attempt" }>;
+/** Opening a plan decision can also open its exact plan; it never decides. */
+export type AttentionIntent = "open_plan";
+
 const attentionGroups: Array<{ category: AttentionCategory; label: string }> = [
   { category: "permission", label: "Waiting for your approval" },
   { category: "decision", label: "Waiting for your decision" },
@@ -182,6 +186,7 @@ export function AttentionInbox(
     onNavigate: (
       item: AttentionItem,
       target: AttentionTarget,
+      intent?: AttentionIntent,
     ) => string | undefined;
     onChanged: () => void;
   },
@@ -190,8 +195,11 @@ export function AttentionInbox(
   const [target, setTarget] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const open = (item: AttentionItem, destination: AttentionTarget) =>
-    setNotice(onNavigate(item, destination) ?? "");
+  const open = (
+    item: AttentionItem,
+    destination: AttentionTarget,
+    intent?: AttentionIntent,
+  ) => setNotice(onNavigate(item, destination, intent) ?? "");
   const projectName = (projectId: string) =>
     state.projects.find((project) => project.id === projectId)?.display_name;
   const taskTitle = (taskId: string) =>
@@ -324,14 +332,27 @@ export function AttentionInbox(
                   </div>
                   {destination
                     ? (
-                      <button
-                        type="button"
-                        className="attention-open"
-                        onClick={() => open(item, destination)}
-                      >
-                        {item.action?.label || "Open"}
-                        <span className="visually-hidden">: {item.title}</span>
-                      </button>
+                      <div className="attention-actions">
+                        <button
+                          type="button"
+                          className="attention-open"
+                          onClick={() => open(item, destination)}
+                        >
+                          {item.action?.label || "Open"}
+                          <span className="visually-hidden">: {item.title}</span>
+                        </button>
+                        {item.action?.kind === "review_plan" &&
+                          destination.kind === "attempt" &&
+                          destination.plan_hash !== null && (
+                          <button
+                            type="button"
+                            onClick={() => open(item, destination, "open_plan")}
+                          >
+                            Open plan
+                            <span className="visually-hidden">: {item.title}</span>
+                          </button>
+                        )}
+                      </div>
                     )
                     : item.held_tasks.length > 0
                     ? (

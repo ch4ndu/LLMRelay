@@ -1,7 +1,8 @@
 use crate::domain::{
-    DecisionActionBinding, DecisionControlPolicy, DecisionDisposition, DecisionEvidenceState,
-    DecisionExplanation, DecisionNextAction, DecisionObservedRevision, DecisionOwner,
-    DecisionOwnership, DecisionPrerequisite, DecisionSubject, RoleKind, DECISION_SCHEMA_V1,
+    CurrentInputKind, CurrentInputUnavailableReason, DecisionActionBinding, DecisionControlPolicy,
+    DecisionDisposition, DecisionEvidenceState, DecisionExplanation, DecisionNextAction,
+    DecisionObservedRevision, DecisionOwner, DecisionOwnership, DecisionPrerequisite,
+    DecisionSubject, RoleKind, DECISION_SCHEMA_V1,
 };
 use crate::operations::Application;
 use crate::store::ProviderFailureHeld;
@@ -976,6 +977,10 @@ fn single_agent_decision(connection: &Connection, attempt: &Attempt) -> Result<A
         SingleAgentStep::Hold { reason } => {
             waiting_on_person("workflow.single_agent.needs_person", Some(reason))
         }
+        SingleAgentStep::ReportedHold(report) => waiting_on_person(
+            "workflow.single_agent.needs_person",
+            Some(report.hold_reason().into()),
+        ),
         SingleAgentStep::Wait => match attempt.phase.as_str() {
             "agent_execution" => waiting(
                 "workflow.single_agent.writing",
@@ -1070,7 +1075,7 @@ fn evaluate_attempt_owner(connection: &Connection, attempt: &Attempt) -> Result<
         || (attempt.attention == "needs_input"
             && hold
                 .as_ref()
-                .is_some_and(|(reason, _)| reason == "role_blocked")))
+                .is_some_and(|hold| hold.reason == "role_blocked")))
         && crate::review::ordinary_code_review_cap_reached(connection, &attempt.id)?
     {
         return Ok(blocked_attempt_decision(
@@ -1100,12 +1105,12 @@ fn evaluate_attempt_owner(connection: &Connection, attempt: &Attempt) -> Result<
             DecisionEvidenceState::Pending,
             owner,
             match &hold {
-                Some((reason, _)) => {
-                    serde_json::json!({"attention":attempt.attention,"hold_reason":reason})
+                Some(hold) => {
+                    serde_json::json!({"attention":attempt.attention,"hold_reason":hold.reason})
                 }
                 None => serde_json::json!({"attention":attempt.attention}),
             },
-            hold.map(|(_, message)| message).or_else(|| {
+            hold.map(|hold| hold.message).or_else(|| {
                 (attempt.attention == "paused").then(||
                     "This task is paused. Choose Continue to start or resume its work. This does not resume pickup for other tasks in the project.".into())
             }),
@@ -5587,11 +5592,30 @@ enum SingleAgentStep {
     CompleteChecks,
     SettleProbe,
     Hold { reason: String },
+    ReportedHold(WriterReport),
     Wait,
 }
 
 /// The run's one writer session: status, recorded process-group quiescence.
 type WriterSession = (String, String, bool);
+
+/// The stopped writer's unread `blocked` or `needs_input` report, which the
+/// run hold records as its source.
+struct WriterReport {
+    result_id: String,
+    role_generation_id: String,
+    outcome: String,
+}
+
+impl WriterReport {
+    fn hold_reason(&self) -> &'static str {
+        if self.outcome == "needs_input" {
+            "The agent asked a question and stopped. Read its question in the task, then choose Resume agent and give your answer as the message."
+        } else {
+            "The agent stopped because something is blocking it. Read its report in the task, resolve the problem it describes, then choose Resume agent; you can add a message saying what changed."
+        }
+    }
+}
 
 fn single_agent_step(connection: &Connection, attempt_id: &str) -> Result<SingleAgentStep> {
     let phase: String = connection.query_row(
@@ -5661,13 +5685,19 @@ fn agent_execution_step(connection: &Connection, attempt_id: &str) -> Result<Sin
     let Some((session_id, status, quiescent)) = writer else {
         return Ok(SingleAgentStep::Dispatch);
     };
-    let reported: Option<(String, String)> = connection
+    let reported: Option<WriterReport> = connection
         .query_row(
-            "SELECT rr.outcome,rr.summary FROM role_results rr
+            "SELECT rr.id,rr.role_generation_id,rr.outcome FROM role_results rr
              WHERE rr.session_id=?1 AND rr.outcome IN ('blocked','needs_input') AND rr.consumed_at IS NULL
              ORDER BY rr.created_at DESC,rr.rowid DESC LIMIT 1",
             params![session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok(WriterReport {
+                    result_id: row.get(0)?,
+                    role_generation_id: row.get(1)?,
+                    outcome: row.get(2)?,
+                })
+            },
         )
         .optional()?;
     let stopped = status == "launch_failed" || (status == "exited" && quiescent);
@@ -5678,9 +5708,7 @@ fn agent_execution_step(connection: &Connection, attempt_id: &str) -> Result<Sin
                 None => SingleAgentStep::Wait,
             }
         }
-        Some((outcome, summary)) if stopped => SingleAgentStep::Hold {
-            reason: format!("The agent reported {outcome}: {summary}"),
-        },
+        Some(report) if stopped => SingleAgentStep::ReportedHold(report),
         None if stopped
             && crate::workflow::single_agent_resume_target(
                 connection,
@@ -5841,6 +5869,7 @@ fn advance_one_single_agent_attempt(app: &Application) -> Result<Option<serde_js
                         app,
                         &attempt_id,
                         &format!("The agent could not start: {error:#}"),
+                        None,
                     )
                     .map_err(|error| failure(error, StepEffect::None));
                 }
@@ -5894,6 +5923,7 @@ fn advance_one_single_agent_attempt(app: &Application) -> Result<Option<serde_js
                             app,
                             &attempt_id,
                             &format!("The probe did not prove the profile: {error:#}"),
+                            None,
                         )
                         .map_err(|error| failure(error, StepEffect::None));
                     }
@@ -5910,8 +5940,17 @@ fn advance_one_single_agent_attempt(app: &Application) -> Result<Option<serde_js
                 }
             }
             SingleAgentStep::Hold { reason } => {
-                return hold_single_agent_attempt(app, &attempt_id, &reason)
+                return hold_single_agent_attempt(app, &attempt_id, &reason, None)
                     .map_err(|error| failure(error, StepEffect::None));
+            }
+            SingleAgentStep::ReportedHold(report) => {
+                return hold_single_agent_attempt(
+                    app,
+                    &attempt_id,
+                    report.hold_reason(),
+                    Some(&report),
+                )
+                .map_err(|error| failure(error, StepEffect::None));
             }
         }
     }
@@ -5922,7 +5961,14 @@ fn hold_single_agent_attempt(
     app: &Application,
     attempt_id: &str,
     reason: &str,
+    source: Option<&WriterReport>,
 ) -> Result<Option<serde_json::Value>> {
+    let mut detail = serde_json::json!({ "reason": reason });
+    if let Some(report) = source {
+        detail["result_id"] = serde_json::json!(report.result_id);
+        detail["role_generation_id"] = serde_json::json!(report.role_generation_id);
+        detail["outcome"] = serde_json::json!(report.outcome);
+    }
     let now = Utc::now().to_rfc3339();
     let mut connection = app.store.lock()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -5950,7 +5996,7 @@ fn hold_single_agent_attempt(
             uuid::Uuid::new_v4().to_string(),
             uuid::Uuid::new_v4().to_string(),
             attempt_id,
-            serde_json::json!({"reason": reason}).to_string(),
+            detail.to_string(),
             now
         ],
     )?;
@@ -7869,6 +7915,13 @@ pub(crate) fn record_hold_release(
     Ok(())
 }
 
+struct RecordedHold {
+    reason: String,
+    message: String,
+    /// The role result and generation a role-reported hold names.
+    source: Option<(String, String)>,
+}
+
 /// The hold recorded with this attempt's current attention, if any. Only the
 /// newest hold counts, and only while it still names the current attention
 /// and no later attempt change has superseded it; otherwise the generic
@@ -7877,23 +7930,216 @@ fn current_attention_hold(
     connection: &Connection,
     attempt_id: &str,
     attention: &str,
-) -> Result<Option<(String, String)>> {
-    let latest: Option<(Option<String>, Option<String>, Option<String>)> = connection
+) -> Result<Option<RecordedHold>> {
+    type LatestHold = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let latest: Option<LatestHold> = connection
         .query_row(
             "SELECT json_extract(e.detail_json,'$.attention'),json_extract(e.detail_json,'$.reason'),
-                    json_extract(e.detail_json,'$.message')
+                    json_extract(e.detail_json,'$.message'),json_extract(e.detail_json,'$.result_id'),
+                    json_extract(e.detail_json,'$.role_generation_id')
              FROM audit_events e JOIN attempts a ON a.id=e.entity_id
              WHERE e.event_code='attempt.attention.changed' AND e.entity_kind='attempt'
                AND e.entity_id=?1 AND e.created_at>=a.updated_at
              ORDER BY e.created_at DESC,e.rowid DESC LIMIT 1",
             params![attempt_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;
-    Ok(latest.and_then(|(recorded, reason, message)| {
-        (recorded.as_deref() == Some(attention)).then_some((reason?, message?))
+    Ok(
+        latest.and_then(|(recorded, reason, message, result_id, generation_id)| {
+            if recorded.as_deref() != Some(attention) {
+                return None;
+            }
+            Some(RecordedHold {
+                reason: reason?,
+                message: message?,
+                source: result_id.zip(generation_id),
+            })
+        }),
+    )
+}
+
+/// The agent report behind the current input hold of an attempt, as recorded
+/// when the hold was raised.
+pub(crate) struct CurrentInputHold {
+    pub(crate) kind: CurrentInputKind,
+    pub(crate) role: Option<String>,
+    pub(crate) result_id: Option<String>,
+    pub(crate) role_generation_id: Option<String>,
+    /// `Ok` only while the named report is still this hold's exact source.
+    pub(crate) source: std::result::Result<(), CurrentInputUnavailableReason>,
+}
+
+/// The report-raised input hold of this attempt, if it is held for input now.
+/// TRIP holds come from the newest current attention hold and Single agent
+/// holds from the newest current run hold, under the same rule: the hold must
+/// postdate the attempt's last change. A hold with any other cause has no
+/// report source, and no other report is ever chosen in its place.
+pub(crate) fn current_input_hold(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<Option<CurrentInputHold>> {
+    let held: Option<(bool, bool)> = connection
+        .query_row(
+            "SELECT t.attention='needs_input' AND a.status='needs_input',
+                    EXISTS(SELECT 1 FROM workflow_run_bindings b
+                           WHERE b.attempt_id=a.id AND b.family='single_agent')
+             FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1",
+            params![attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((true, single_agent)) = held else {
+        return Ok(None);
+    };
+    let recorded = if single_agent {
+        current_single_agent_report_hold(connection, attempt_id)?
+    } else {
+        current_attention_hold(connection, attempt_id, "needs_input")?.and_then(|hold| {
+            let kind = match hold.reason.as_str() {
+                "role_needs_input" => CurrentInputKind::Question,
+                "role_blocked" => CurrentInputKind::Blocked,
+                _ => return None,
+            };
+            Some((kind, hold.source))
+        })
+    };
+    let Some((kind, source)) = recorded else {
+        return Ok(None);
+    };
+    let Some((result_id, generation_id)) = source else {
+        return Ok(Some(CurrentInputHold {
+            kind,
+            role: None,
+            result_id: None,
+            role_generation_id: None,
+            source: Err(CurrentInputUnavailableReason::NotRecorded),
+        }));
+    };
+    let role: Option<String> = connection
+        .query_row(
+            "SELECT role FROM role_generations WHERE id=?1 AND attempt_id=?2",
+            params![generation_id, attempt_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let source = verify_input_source(connection, attempt_id, kind, &result_id, &generation_id)?;
+    Ok(Some(CurrentInputHold {
+        kind,
+        role,
+        result_id: Some(result_id),
+        role_generation_id: Some(generation_id),
+        source,
     }))
 }
+
+/// A Single agent run hold that a writer report raised. Holds recorded before
+/// run holds named their report, and holds with another cause, have no source.
+fn current_single_agent_report_hold(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<Option<(CurrentInputKind, Option<(String, String)>)>> {
+    type LatestRunHold = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let latest: Option<LatestRunHold> = connection
+        .query_row(
+            "SELECT json_extract(e.detail_json,'$.outcome'),json_extract(e.detail_json,'$.result_id'),
+                    json_extract(e.detail_json,'$.role_generation_id'),json_extract(e.detail_json,'$.reason')
+             FROM audit_events e JOIN attempts a ON a.id=e.entity_id
+             WHERE e.event_code='single_agent.attempt.held' AND e.entity_kind='attempt'
+               AND e.entity_id=?1 AND e.created_at>=a.updated_at
+             ORDER BY e.created_at DESC,e.rowid DESC LIMIT 1",
+            params![attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let reported_kind = |outcome: &str| match outcome {
+        "needs_input" => Some(CurrentInputKind::Question),
+        "blocked" => Some(CurrentInputKind::Blocked),
+        _ => None,
+    };
+    Ok(latest.and_then(
+        |(outcome, result_id, generation_id, reason)| match outcome {
+            Some(outcome) => Some((reported_kind(&outcome)?, result_id.zip(generation_id))),
+            // Baseline report holds stored only "The agent reported {outcome}:
+            // {summary}"; they show as report-raised with no recorded source.
+            None => {
+                let reported = reason.as_deref()?.strip_prefix("The agent reported ")?;
+                let (outcome, _) = reported.split_once(": ")?;
+                Some((reported_kind(outcome)?, None))
+            }
+        },
+    ))
+}
+
+fn verify_input_source(
+    connection: &Connection,
+    attempt_id: &str,
+    kind: CurrentInputKind,
+    result_id: &str,
+    generation_id: &str,
+) -> Result<std::result::Result<(), CurrentInputUnavailableReason>> {
+    type SourceRow = (String, String, String, String, i64, bool, bool);
+    let report: Option<SourceRow> = connection
+        .query_row(
+            "SELECT rr.role_generation_id,rg.attempt_id,rg.role,rr.outcome,rr.rowid,
+                    EXISTS(SELECT 1 FROM role_result_supersessions superseded
+                           WHERE superseded.role_result_id=rr.id),
+                    rg.status IN ('replaced','revoked')
+                      OR EXISTS(SELECT 1 FROM role_generations newer
+                                WHERE newer.attempt_id=rg.attempt_id AND newer.role=rg.role
+                                  AND newer.lane_id=rg.lane_id AND newer.generation>rg.generation)
+             FROM role_results rr JOIN role_generations rg ON rg.id=rr.role_generation_id
+             WHERE rr.id=?1",
+            params![result_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((reported_by, reported_in, role, outcome, rowid, superseded, replaced)) = report
+    else {
+        return Ok(Err(CurrentInputUnavailableReason::Missing));
+    };
+    let expected_outcome = match kind {
+        CurrentInputKind::Question => "needs_input",
+        CurrentInputKind::Blocked => "blocked",
+    };
+    if reported_by != generation_id || reported_in != attempt_id || outcome != expected_outcome {
+        return Ok(Err(CurrentInputUnavailableReason::Mismatched));
+    }
+    // The same answer check that releases a hold: a newer report from this
+    // generation that its phase would consume. Another hold condition may keep
+    // the task waiting, but the question itself has been answered.
+    let answered = eligible_progress_result(connection, attempt_id, generation_id, &role)?
+        .is_some_and(|(_, progress_rowid)| progress_rowid > rowid);
+    Ok(if superseded || answered {
+        Err(CurrentInputUnavailableReason::Superseded)
+    } else if replaced {
+        Err(CurrentInputUnavailableReason::GenerationReplaced)
+    } else {
+        Ok(())
+    })
+}
+
 fn finish_control(
     app: &Application,
     id: &str,
@@ -8863,9 +9109,9 @@ fn consume_blocked_result(app: &Application, attempt: &str) -> Result<Option<ser
                     "role_blocked"
                 },
                 message: if outcome == "needs_input" {
-                    format!("{who} needs your input before it can continue. Read its report in the task's Activity tab, answer the question, then choose Retry when the issue is resolved.")
+                    format!("{who} asked a question and is waiting for your answer. Read the question in the task, then send your reply to the manager. Replying does not approve anything or restart the work by itself; if the task is still waiting once the question is settled, choose Retry.")
                 } else {
-                    format!("{who} reported that it is blocked. Read its report in the task's Activity tab, resolve the problem it describes, then choose Retry.")
+                    format!("{who} stopped because something is blocking it. Read its report in the task, resolve the problem it describes, then choose Retry to let the work continue.")
                 },
             },
             Some((&result_id, &generation_id)),

@@ -50,8 +50,8 @@ Keep the LLMRelay executable and its data directory outside the repository being
 1. Review the detected TRIP installation and project guidance. A new project needs initialization; an existing installation may need adoption, conflict resolution, or a reviewed upgrade. Existing customized files and alternate skill roots are preserved.
 2. Review the discovery manager’s suggested guidance and check commands. **Apply suggestions to draft** copies those policy fields into the editable form; it does not save or approve them. Choose the project test policy and each delegated profile explicitly. Existing draft edits change only when you apply a suggestion or edit the fields yourself. Unsupported adapters remain visible with their reason; the app does not silently substitute another model or provider.
 3. Review and authorize the required live profile probes. Setup shows the exact profiles and expected fresh-session cost before spending CLI allowance. Discovery and probes run in a private empty fixture with narrowly scoped authority; they do not grant ordinary task execution in the target repository.
-4. Review the proposed guidance and installation changes, including exact destination paths and existing contents. Approval to run probes and approval to install files are separate decisions.
-5. Apply the approved installation. Installation validation and ordinary runtime readiness are separate. An interrupted or conflicting installation remains blocked with recovery details; it is never treated as a completed setup.
+4. In **Review the files setup will write**, choose **Prepare final file preview** after the probe sessions exit. Compare each destination file’s **Before** and **After** content, then choose **Approve installation**. Preparing the preview does not change files or approve installation. Approval binds the displayed content and current destination files; changed files require a new preview. Hashes remain under **Technical details**. Approval to run probes and approval to install files are separate decisions.
+5. In **Activate**, choose **Apply staged authorized installation** to write the approved files. Adopting a compatible existing installation records it without writing those files. Installation validation and ordinary runtime readiness are separate. An interrupted or conflicting installation remains blocked with recovery details; it is never treated as a completed setup.
 6. Prepare the missing ordinary runtime capability checks from Project Setup or Role Settings. Review their exact profiles, scope, and fresh-call count, explicitly authorize them, and launch the selected checks. They run in app-owned empty worktrees. Observe their output and any trust or permission requests in Workspace, then explicitly publish valid evidence. Setup probe receipts cannot substitute for these checks because the effective security policies differ. Tasks remain pending until their required current profiles have valid runtime evidence.
 
 Retained runtime checks first exit after observing their bounded commands, then resume once to report from the same native conversation. The fresh final-verifier check does not resume. If a reporting invocation exits without an accepted report, the check becomes failed once the service confirms that its processes have exited. Use **Prepare corrected runtime verification** after addressing the failure; this creates an explicitly authorized fresh scope. It does not replay the old observations or turn the failed check into a pass. Accepted evidence still requires a separate publication action.
@@ -70,7 +70,11 @@ files unchanged and records the active application binding in the database.
 Unknown configuration fields, unused profiles and adapters survive reviewed
 proposals. Choose individual regular guidance files; directories are rejected
 before installation. Setup evidence from an older workflow, source, overlay or
-prompt identity cannot qualify the current workflow.
+prompt identity cannot qualify the current workflow. The human-input guidance
+changes the embedded TRIP overlay and Single agent prompt identities. Existing
+project activation or profile evidence may therefore require setup review and
+fresh matching checks. Standalone TRIP CLI preflight does not refresh the app’s
+evidence or authorize an unqualified provider mode.
 
 Project activation can proceed with older attempts only after their processes
 are positively quiescent and pending review, recovery, permission, control and

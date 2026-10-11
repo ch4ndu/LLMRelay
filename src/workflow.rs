@@ -1,6 +1,7 @@
 use crate::domain::{
     AppStateDto, AttentionActionKind, AttentionCategory, AttentionItem, AttentionTarget,
-    ContinuationAction, ContinuationActionKind, DecisionActionBinding, DecisionControlPolicy,
+    ContinuationAction, ContinuationActionKind, CurrentInputSourceDto, CurrentInputSourceState,
+    CurrentInputUnavailableReason, DecisionActionBinding, DecisionControlPolicy,
     DecisionDisposition, DecisionEvidenceState, DecisionExplanation, DecisionNextAction,
     DecisionObservedRevision, DecisionOwner, DecisionOwnership, DecisionPrerequisite,
     DecisionSubject, FailedSessionStopBinding, HumanCommand, NativePromptDismissal,
@@ -6811,8 +6812,10 @@ const TASK_CONTENT_RECORD_LIMIT: usize = 50;
 const TASK_CONTENT_BYTE_LIMIT: usize = 512 * 1024;
 
 /// Changes whenever the current attempt gains a report, its review state
-/// changes, rework feedback is recorded or a report is superseded; the
-/// dashboard refetches the task content when it differs.
+/// changes, rework feedback is recorded, a report is superseded, or anything
+/// that decides the current input source changes: a hold is recorded or
+/// released, the held attempt changes, or a role generation is added or
+/// replaced. The dashboard refetches the task content when it differs.
 const TASK_CONTENT_REVISION_SQL: &str = "(SELECT COUNT(*)||':'||COALESCE(MAX(rr.created_at),'')
       FROM role_results rr JOIN role_generations rg ON rg.id=rr.role_generation_id
       WHERE rg.attempt_id=a.id)
@@ -6821,12 +6824,95 @@ const TASK_CONTENT_REVISION_SQL: &str = "(SELECT COUNT(*)||':'||COALESCE(MAX(rr.
     ||'|'||(SELECT COUNT(*) FROM role_result_supersessions superseded
       JOIN role_generations superseded_generation
         ON superseded_generation.id=superseded.role_generation_id
-      WHERE superseded_generation.attempt_id=a.id)";
+      WHERE superseded_generation.attempt_id=a.id)
+    ||'|'||(SELECT COUNT(*) FROM audit_events hold
+      WHERE hold.entity_kind='attempt' AND hold.entity_id=a.id
+        AND hold.event_code IN ('attempt.attention.changed','single_agent.attempt.held'))
+    ||'|'||CASE WHEN a.status='needs_input'
+                 AND (SELECT attention FROM tasks WHERE id=a.task_id)='needs_input'
+               THEN a.updated_at ELSE '' END
+    ||'|'||(SELECT COUNT(*)||':'||COALESCE(SUM(g.status IN ('replaced','revoked')),0)
+      FROM role_generations g WHERE g.attempt_id=a.id)";
+
+const TASK_CONTENT_REPORT_SQL: &str = "SELECT rr.id,rr.created_at,rg.role,rr.outcome,rr.summary,
+        CASE WHEN json_type(rr.metadata_json,'$.plan')='text'
+             THEN json_extract(rr.metadata_json,'$.plan') END,
+        json_extract(rr.metadata_json,'$.review_kind'),
+        superseded.superseding_hook_event_id,superseded.created_at
+ FROM role_results rr JOIN role_generations rg ON rg.id=rr.role_generation_id
+ LEFT JOIN role_result_supersessions superseded ON superseded.role_result_id=rr.id";
+
+fn task_content_report(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
+    let superseded_by_native_turn = row
+        .get::<_, Option<String>>(7)?
+        .zip(row.get::<_, Option<String>>(8)?)
+        .map(|(hook_event_id, superseded_at)| {
+            serde_json::json!({"hook_event_id":hook_event_id,"superseded_at":superseded_at})
+        });
+    Ok(serde_json::json!({
+        "kind":"report",
+        "id":row.get::<_, String>(0)?,
+        "created_at":row.get::<_, String>(1)?,
+        "role":row.get::<_, String>(2)?,
+        "outcome":row.get::<_, String>(3)?,
+        "summary":row.get::<_, String>(4)?,
+        "plan":row.get::<_, Option<String>>(5)?,
+        "review_kind":row.get::<_, Option<String>>(6)?,
+        "superseded_by_native_turn":superseded_by_native_turn,
+    }))
+}
+
+/// The report behind the attempt's current input hold, resolved by its exact
+/// recorded ID only after the coordinator has verified it as the hold's
+/// source. Only the bounded question fields are kept: plan text belongs to the
+/// plan viewer, and `review_kind` is free metadata irrelevant to a question.
+fn current_input_source(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<Option<CurrentInputSourceDto>> {
+    let Some(hold) = crate::coordinator::current_input_hold(connection, attempt_id)? else {
+        return Ok(None);
+    };
+    let source = match (hold.source, hold.result_id.as_deref()) {
+        (Ok(()), Some(result_id)) => connection
+            .query_row(
+                &format!("{TASK_CONTENT_REPORT_SQL} WHERE rr.id=?1"),
+                params![result_id],
+                task_content_report,
+            )
+            .optional()?
+            .map_or(
+                CurrentInputSourceState::Unavailable {
+                    unavailable_reason: CurrentInputUnavailableReason::Missing,
+                },
+                |mut report| {
+                    report["plan"] = serde_json::Value::Null;
+                    report["review_kind"] = serde_json::Value::Null;
+                    CurrentInputSourceState::Available { report }
+                },
+            ),
+        (Ok(()), None) => CurrentInputSourceState::Unavailable {
+            unavailable_reason: CurrentInputUnavailableReason::NotRecorded,
+        },
+        (Err(unavailable_reason), _) => CurrentInputSourceState::Unavailable { unavailable_reason },
+    };
+    Ok(Some(CurrentInputSourceDto {
+        attempt_id: attempt_id.to_owned(),
+        kind: hold.kind,
+        role: hold.role,
+        result_id: hold.result_id,
+        role_generation_id: hold.role_generation_id,
+        source,
+    }))
+}
 
 /// Readable plans, agent reports and rework feedback for a task's current
-/// attempt, oldest first. Only presentation text is returned: no metadata
-/// beyond the plan, no transcripts, permission details or other attempts. The
-/// newest records are kept when the record or byte bound is reached.
+/// attempt, oldest first, plus the exact report behind its current input
+/// hold. Only presentation text is returned: no metadata beyond the plan, no
+/// transcripts, permission details or other attempts. The hold's report is
+/// kept first and counts toward the record bound; the serialized response,
+/// including that report, never exceeds the byte bound, and history keeps its
+/// newest records within what remains.
 pub fn task_content(store: &Store, task_id: &str) -> Result<serde_json::Value> {
     let connection = store.lock()?;
     let current: Option<(String, String)> = connection
@@ -6842,40 +6928,37 @@ pub fn task_content(store: &Store, task_id: &str) -> Result<serde_json::Value> {
     let Some((attempt_id, content_revision)) = current else {
         return Ok(serde_json::json!({
             "task_id":task_id,"attempt_id":null,"content_revision":"",
-            "records":[],"truncated":false,
+            "records":[],"truncated":false,"current_input":null,
         }));
     };
+    let current_input = current_input_source(&connection, &attempt_id)?;
+    let bound_report = matches!(
+        current_input,
+        Some(CurrentInputSourceDto {
+            source: CurrentInputSourceState::Available { .. },
+            ..
+        })
+    );
+    let mut content = serde_json::json!({
+        "task_id":task_id,
+        "attempt_id":attempt_id,
+        "content_revision":content_revision,
+        "records":[],
+        "truncated":false,
+        "current_input":serde_json::to_value(current_input)?,
+    });
+    let envelope_bytes = content.to_string().len();
+    if envelope_bytes > TASK_CONTENT_BYTE_LIMIT {
+        bail!("the report behind this task's question is too large to show");
+    }
+    let record_limit = TASK_CONTENT_RECORD_LIMIT - usize::from(bound_report);
+    let byte_limit = TASK_CONTENT_BYTE_LIMIT - envelope_bytes;
     let mut records = Vec::new();
     {
-        let mut statement = connection.prepare(
-            "SELECT rr.id,rr.created_at,rg.role,rr.outcome,rr.summary,
-                    CASE WHEN json_type(rr.metadata_json,'$.plan')='text'
-                         THEN json_extract(rr.metadata_json,'$.plan') END,
-                    json_extract(rr.metadata_json,'$.review_kind'),
-                    superseded.superseding_hook_event_id,superseded.created_at
-             FROM role_results rr JOIN role_generations rg ON rg.id=rr.role_generation_id
-             LEFT JOIN role_result_supersessions superseded ON superseded.role_result_id=rr.id
-             WHERE rg.attempt_id=?1 ORDER BY rr.created_at,rr.id",
-        )?;
-        let rows = statement.query_map(params![attempt_id], |row| {
-            let superseded_by_native_turn = row
-                .get::<_, Option<String>>(7)?
-                .zip(row.get::<_, Option<String>>(8)?)
-                .map(|(hook_event_id, superseded_at)| {
-                    serde_json::json!({"hook_event_id":hook_event_id,"superseded_at":superseded_at})
-                });
-            Ok(serde_json::json!({
-                "kind":"report",
-                "id":row.get::<_, String>(0)?,
-                "created_at":row.get::<_, String>(1)?,
-                "role":row.get::<_, String>(2)?,
-                "outcome":row.get::<_, String>(3)?,
-                "summary":row.get::<_, String>(4)?,
-                "plan":row.get::<_, Option<String>>(5)?,
-                "review_kind":row.get::<_, Option<String>>(6)?,
-                "superseded_by_native_turn":superseded_by_native_turn,
-            }))
-        })?;
+        let mut statement = connection.prepare(&format!(
+            "{TASK_CONTENT_REPORT_SQL} WHERE rg.attempt_id=?1 ORDER BY rr.created_at,rr.id"
+        ))?;
+        let rows = statement.query_map(params![attempt_id], task_content_report)?;
         for row in rows {
             records.push(row?);
         }
@@ -6895,12 +6978,13 @@ pub fn task_content(store: &Store, task_id: &str) -> Result<serde_json::Value> {
             json_text(left, "created_at").cmp(&json_text(right, "created_at"))
         });
     }
-    let mut truncated = records.len() > TASK_CONTENT_RECORD_LIMIT;
+    let mut truncated = records.len() > record_limit;
     let mut kept = Vec::new();
     let mut bytes = 0;
-    for record in records.into_iter().rev().take(TASK_CONTENT_RECORD_LIMIT) {
-        let size = record.to_string().len();
-        if bytes + size > TASK_CONTENT_BYTE_LIMIT {
+    for record in records.into_iter().rev().take(record_limit) {
+        let separator = usize::from(!kept.is_empty());
+        let size = record.to_string().len() + separator;
+        if bytes + size > byte_limit {
             truncated = true;
             break;
         }
@@ -6908,13 +6992,9 @@ pub fn task_content(store: &Store, task_id: &str) -> Result<serde_json::Value> {
         kept.push(record);
     }
     kept.reverse();
-    Ok(serde_json::json!({
-        "task_id":task_id,
-        "attempt_id":attempt_id,
-        "content_revision":content_revision,
-        "records":kept,
-        "truncated":truncated,
-    }))
+    content["records"] = serde_json::Value::Array(kept);
+    content["truncated"] = serde_json::Value::Bool(truncated);
+    Ok(content)
 }
 
 /// What happened to a held automatic step and what the user can do next.

@@ -142,7 +142,7 @@ export function DiagnosticsPanel(
             </div>
           )))}
         <p>
-          To verify an agent, use Project setup or the task's Agent settings.
+          To verify an agent, use Project setup or the task's Roles tab.
           They show how many agent calls the check will make and wait for your
           approval before starting it in a separate throwaway workspace. You
           can follow it in Workspace and the approvals list. After it passes

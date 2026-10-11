@@ -482,6 +482,16 @@ export function WorkflowControls(
     decision
       ? decision.control_policy.allowed_controls.includes(controlName)
       : !projectedControlsBlocked;
+  const taskControls: Array<[string, string]> = [
+    ["continue", "Continue"],
+    ["run_next", task.lifecycle === "ready" ? "Prepare task" : "Run next"],
+    ["pause_after_role", "Pause after this step"],
+    ["pause_now", "Pause now"],
+    ["retry", "Retry"],
+    ["cancel", "Cancel"],
+  ];
+  const unavailableControls = taskControls.filter(([name]) => !allows(name))
+    .map(([, label]) => label);
   const actionValue = (action: ContinuationAction, key: string) => {
     const value = action.binding[key];
     return typeof value === "string" ? value : undefined;
@@ -807,6 +817,17 @@ export function WorkflowControls(
             </button>
           </div>
         )}
+      {decision && !terminal && task.lifecycle !== "backlog" &&
+        unavailableControls.length > 0 && (
+        <p className="hint">
+          {unavailableControls.length === taskControls.length
+            ? "None of these controls is available right now"
+            : `Not available right now: ${unavailableControls.join(", ")}`}
+          {decision.primary_blocker?.message
+            ? ", because of what the task is waiting on above."
+            : ". LLMRelay does not offer them in the task's current state; refresh if this looks out of date."}
+        </p>
+      )}
       {!terminal && task.lifecycle !== "backlog" && !singleAgent && (
         <div className="inline-form">
           <strong>Manager</strong>

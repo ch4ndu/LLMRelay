@@ -26,7 +26,82 @@ export interface PlanView {
   plan_hash: string | null;
   content_revision: string | null;
   text: string;
+  /**
+   * Present only when the task's current decision request names exactly this
+   * task, attempt and plan. The viewer rechecks it against the current task
+   * and actions; without it the plan is only context.
+   */
+  decision?: PlanDecision;
 }
+
+export interface PlanDecision {
+  phase: string;
+  title: string;
+}
+
+const planDecisionTitle = (task: Task) => {
+  switch (task.active_attempt?.phase) {
+    case "awaiting_plan_approval":
+      return `Review the plan for “${task.title}”`;
+    case "awaiting_implementation_authorization":
+      return `Ready to start work on “${task.title}”`;
+    default:
+      return undefined;
+  }
+};
+
+const offeredAuthorization = (task: Task, actions: ContinuationAction[]) =>
+  actions.find((action) =>
+    action.kind === "authorize_implementation" &&
+    (action.binding.task_id === task.id ||
+      action.binding.attempt_id === task.active_attempt?.id)
+  );
+
+const authorizationNamesShownPlan = (
+  task: Task,
+  action: ContinuationAction | undefined,
+) => {
+  const attempt = task.active_attempt;
+  return !!attempt?.plan_hash && action?.binding.task_id === task.id &&
+    action.binding.attempt_id === attempt.id &&
+    action.binding.plan_hash === attempt.plan_hash;
+};
+
+/**
+ * The plan decision whose request names the plan the task shows now. Plan
+ * approval sends the shown plan's hash; implementation authorization only
+ * counts when its offered action names this task, attempt and plan.
+ */
+export const currentPlanDecision = (
+  task: Task,
+  actions: ContinuationAction[],
+): PlanDecision | undefined => {
+  const attempt = task.active_attempt;
+  const title = planDecisionTitle(task);
+  if (!attempt?.plan || !attempt.plan_hash || !title) return undefined;
+  if (
+    attempt.phase === "awaiting_implementation_authorization" &&
+    !authorizationNamesShownPlan(task, offeredAuthorization(task, actions))
+  ) return undefined;
+  return { phase: attempt.phase, title };
+};
+
+export const currentPlanView = (
+  task: Task,
+  decision?: PlanDecision,
+): PlanView | undefined => {
+  const attempt = task.active_attempt;
+  return attempt?.plan
+    ? {
+      task_id: task.id,
+      attempt_id: attempt.id,
+      plan_hash: attempt.plan_hash ?? null,
+      content_revision: attempt.content_revision ?? null,
+      text: attempt.plan,
+      decision,
+    }
+    : undefined;
+};
 
 export function ReviewPanel(
   { task, verification = [], actions = [], onChanged, onOpenPlan }: {
@@ -123,9 +198,7 @@ export function ReviewPanel(
     action.binding.task_id === task.id ||
     action.binding.attempt_id === attempt?.id
   );
-  const implementationAuthorization = relevantActions.find((action) =>
-    action.kind === "authorize_implementation"
-  );
+  const implementationAuthorization = offeredAuthorization(task, actions);
   const migration = relevantActions.find((action) =>
     action.kind === "migrate_attempt"
   );
@@ -177,6 +250,19 @@ export function ReviewPanel(
     const value = action?.binding[key];
     return typeof value === "string" ? value : undefined;
   };
+  const decisionTitle = planDecisionTitle(task) ??
+    `Review the result for “${task.title}”`;
+  const planDecision = currentPlanDecision(task, actions);
+  const authorizationPlan = bindingString(implementationAuthorization, "plan_hash");
+  const authorizationUnavailable = !implementationAuthorization
+    ? "LLMRelay is not offering Allow implementation right now. Refresh to see the current state."
+    : !authorizationNamesShownPlan(task, implementationAuthorization)
+    ? "This request is not for the task and plan shown here. Refresh to review the current request before allowing implementation."
+    : !implementationAuthorization.enabled
+    ? `Allow implementation is not available right now.${
+      implementationAuthorization.reason ? ` ${implementationAuthorization.reason}` : ""
+    }`
+    : undefined;
   return (
     <section
       className="panel review-panel"
@@ -184,18 +270,12 @@ export function ReviewPanel(
       tabIndex={-1}
     >
       <span className="eyebrow">Your decision</span>
-      <h3>
-        {implementation
-          ? "Allow implementation of this plan"
-          : plan
-          ? "Approve the reviewed plan"
-          : "Accept the reviewed result"}
-      </h3>
+      <h3>{decisionTitle}</h3>
       <p>
         {implementation
-          ? "Approving the plan and allowing implementation are separate decisions. This allows implementation of this exact plan only."
+          ? "Allowing implementation lets the implementer change files according to the approved plan. Approving the plan and allowing implementation are separate decisions."
           : plan
-          ? "The plan passed its independent review. Read it before approving."
+          ? "Independent review is complete. Approving confirms the whole plan; implementation still needs your separate permission."
           : "The result passed its selected checks and final review."}
       </p>
       {!plan && !implementation && (
@@ -216,16 +296,16 @@ export function ReviewPanel(
                   <button
                     type="button"
                     className="plan-open"
-                    onClick={() =>
-                      attempt.plan && onOpenPlan({
-                        task_id: task.id,
-                        attempt_id: attempt.id,
-                        plan_hash: attempt.plan_hash ?? null,
-                        content_revision: attempt.content_revision ?? null,
-                        text: attempt.plan,
-                      })}
+                    onClick={() => {
+                      const view = currentPlanView(task, planDecision);
+                      if (view) onOpenPlan(view);
+                    }}
                   >
-                    Open plan
+                    {!planDecision
+                      ? "Open the task's current plan"
+                      : implementation
+                      ? "Open approved plan"
+                      : "Open plan"}
                   </button>
                 </div>
               )}
@@ -242,7 +322,11 @@ export function ReviewPanel(
       <TechnicalDetails>
         <p>
           {plan || implementation
-            ? `Plan ${attempt.plan_hash || "unavailable"}`
+            ? `Plan ${attempt.plan_hash || "unavailable"}${
+              implementation
+                ? ` · authorization request plan ${authorizationPlan ?? "not offered"}`
+                : ""
+            }`
             : `Candidate ${attempt.candidate_hash || "unavailable"} · manager conformance revision ${attempt.manager_conformance_revision ?? "none"}`}
         </p>
       </TechnicalDetails>
@@ -279,8 +363,7 @@ export function ReviewPanel(
           ? (
             <button
               className="primary"
-              disabled={pending || !implementationAuthorization?.enabled ||
-                !bindingString(implementationAuthorization, "plan_hash")}
+              disabled={pending || authorizationUnavailable !== undefined}
               onClick={() =>
                 void invoke({
                   kind: "trip",
@@ -288,10 +371,7 @@ export function ReviewPanel(
                   task_id: task.id,
                   attempt_id: attempt.id,
                   expected_task_version: task.version,
-                  plan_hash: bindingString(
-                    implementationAuthorization,
-                    "plan_hash",
-                  ),
+                  plan_hash: authorizationPlan,
                 })}
             >
               Allow implementation
@@ -307,6 +387,9 @@ export function ReviewPanel(
             </button>
           )}
       </div>
+      {implementation && authorizationUnavailable && (
+        <p className="hint" role="status">{authorizationUnavailable}</p>
+      )}
       {migration && (
         <section className="review-row">
           <strong>Move this task to the current workflow</strong>
@@ -473,6 +556,7 @@ function SingleAgentRunPanel(
       setFeedback("");
     }
   };
+  const held = run.stage === "needs_action" || run.stage === "blocked";
   const resumeKey = run.resume
     ? `resume:${run.attempt_id}:${run.resume.session_id}:${run.resume.transcript_epoch}`
     : "";
@@ -752,7 +836,9 @@ function SingleAgentRunPanel(
           ? (
             <div className="inline-form">
               <label>
-                Message for the agent (optional)
+                {held
+                  ? "Your answer for the agent"
+                  : "Message for the agent (optional)"}
                 <textarea
                   disabled={commands.busy || resumeUncertain}
                   value={resumeMessage}
@@ -763,12 +849,14 @@ function SingleAgentRunPanel(
                 Resume agent
               </button>
               <small>
+                {held &&
+                  "Resume agent is how this run's agent receives your answer: it continues the agent's own conversation with this message. It does not accept the result or approve anything else. "}
                 Continues this run's own agent conversation once. It never
                 starts a different conversation in its place.
               </small>
             </div>
           )
-          : ["needs_action", "blocked"].includes(run.stage) && (
+          : held && (
             <div className="hint">
               Resume agent is not available for this run right now.
               {run.resume.reason && (

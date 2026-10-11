@@ -1597,19 +1597,54 @@ export interface TaskContentRecord {
   kind: "report" | "rework_request";
   id: string;
   created_at: string;
-  role?: Role;
+  role?: ExecutionActor;
   outcome?: string;
   summary: string;
   plan?: string | null;
   review_kind?: string | null;
   superseded_by_native_turn?: { hook_event_id: string; superseded_at: string } | null;
 }
+export type CurrentInputKind = "question" | "blocked";
+export type CurrentInputUnavailableReason =
+  | "not_recorded"
+  | "missing"
+  | "mismatched"
+  | "superseded"
+  | "generation_replaced";
+interface CurrentInputSourceBinding {
+  attempt_id: string;
+  kind: CurrentInputKind;
+  /** The reporting generation's actor, when it belongs to this attempt. */
+  role: ExecutionActor | null;
+  result_id: string | null;
+  role_generation_id: string | null;
+}
+/**
+ * The exact report behind the current attempt's input hold. It is context
+ * only: it names no reply target and grants no approval or resume. An
+ * unavailable source must not be replaced by any other record.
+ */
+export type CurrentInputSource =
+  | (CurrentInputSourceBinding & {
+    state: "available";
+    /** Never carries plan text; plans open in the plan viewer. */
+    report: TaskContentRecord;
+  })
+  | (CurrentInputSourceBinding & {
+    state: "unavailable";
+    unavailable_reason: CurrentInputUnavailableReason;
+  });
 export interface TaskContent {
   task_id: string;
   attempt_id: string | null;
   content_revision: string;
   records: TaskContentRecord[];
   truncated: boolean;
+  /**
+   * Null when no agent report holds the current attempt for input. Absent
+   * from older services, which cannot identify the hold's report.
+   */
+  current_input?: CurrentInputSource | null;
 }
 /** Revisions are opaque canonical decimals, comparable only within one incarnation. */
 export interface StateCursor {

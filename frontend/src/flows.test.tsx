@@ -73,7 +73,7 @@ const { WorkflowControls } = await import("./components/WorkflowControls");
 const { ModelSelector } = await import("./components/ModelSelector");
 const { Workspace } = await import("./components/Workspace");
 const { SessionTree } = await import("./components/SessionTree");
-const { ApiError, ProtocolError, command, getState, waitForState, transportTimeouts } = await import("./api");
+const { ApiError, ProtocolError, command, getState, getTaskContent, waitForState, transportTimeouts } = await import("./api");
 const { liveEnvironment, liveTiming, startLiveState } = await import(
   "./liveState"
 );
@@ -8249,6 +8249,52 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
     check(live.reads.length > reads, "the stale binding did not request the latest state");
     unmount();
 
+    // Open plan opens the decision's exact plan over its panel, decides
+    // nothing, and refuses a request for a replaced plan.
+    const planLive = liveHarness();
+    liveEnvironment.transport = planLive.environment.transport;
+    liveEnvironment.scheduler = planLive.environment.scheduler;
+    localStorage.clear();
+    localStorage.setItem("agenticjira.page", "workspace");
+    mount(<App />);
+    await settle();
+    planLive.reads[0].resolve(snapshotAt("service-a", "63", { ...base, task_actions: [] }));
+    await settle();
+    const openPlanFor = (itemId: string) =>
+      [...(document.querySelector(`[data-attention-id="${itemId}"]`)?.querySelectorAll("button") ?? [])]
+        .find((candidate) => candidate.textContent?.startsWith("Open plan"));
+    const viewer = () => document.querySelector(".plan-viewer");
+    const mutationsBefore = mutations.length;
+    for (const round of ["first", "repeated"]) {
+      act(() => openPlanFor("attempt:a1:awaiting_plan_approval")!.click());
+      await settle();
+      await settle();
+      check(
+        viewer()?.textContent?.includes("Reviewed plan text") &&
+          viewer()!.textContent!.includes("Opened for: Review the plan for “Existing”") &&
+          document.activeElement?.getAttribute("aria-label") === "Close plan",
+        `${round} Open plan did not open the exact plan as the focused window`,
+      );
+      act(() => document.querySelector<HTMLButtonElement>('[aria-label="Close plan"]')!.click());
+      check(
+        !viewer() && focused() === "attempt:a1",
+        `${round} closing the plan did not return to its decision; focused ${focused()}`,
+      );
+      act(() => document.querySelector<HTMLButtonElement>('[aria-label="Close task details"]')!.click());
+      await settle();
+    }
+    const planReads = planLive.reads.length;
+    act(() => openPlanFor("attempt:a1:stale_plan")!.click());
+    await settle();
+    check(
+      !viewer() && !document.querySelector('[role="dialog"]') &&
+        document.body.textContent?.includes("changed before it could open") &&
+        planLive.reads.length > planReads,
+      "a request for a replaced plan opened a plan or was not refused",
+    );
+    check(mutations.length === mutationsBefore, "opening a plan sent a mutation");
+    unmount();
+
     // An item with no current destination offers Refresh, never a false route.
     const refreshLive = liveHarness();
     liveEnvironment.transport = refreshLive.environment.transport;
@@ -8533,6 +8579,563 @@ Deno.test("Task content shows only the current revision when responses arrive ou
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
+  }
+});
+
+const heldQuestion = {
+  kind: "report" as const,
+  id: "r-question",
+  created_at: "2026-10-11T00:00:00Z",
+  role: "implementer" as const,
+  outcome: "needs_input",
+  summary: "Should the migration keep the **old column**?",
+  plan: null,
+  review_kind: null,
+  superseded_by_native_turn: null,
+};
+const heldSource = {
+  attempt_id: "a1",
+  kind: "question",
+  role: "implementer",
+  result_id: "r-question",
+  role_generation_id: "g-impl",
+  state: "available",
+  report: heldQuestion,
+};
+
+Deno.test("Task content accepts only a current-input source bound to its exact report and attempt", async () => {
+  let body: unknown;
+  globalThis.fetch = (async () => new Response(JSON.stringify(body))) as typeof fetch;
+  const content = (currentInput?: unknown) => ({
+    task_id: "AJ-1",
+    attempt_id: "a1",
+    content_revision: "c1",
+    truncated: false,
+    records: [],
+    ...(currentInput === undefined ? {} : { current_input: currentInput }),
+  });
+  try {
+    body = content();
+    check(
+      (await getTaskContent("AJ-1")).current_input === undefined,
+      "content from an older service without a source was refused",
+    );
+    body = content(heldSource);
+    check(
+      (await getTaskContent("AJ-1")).current_input?.state === "available",
+      "an exact source was refused",
+    );
+    body = content({
+      attempt_id: "a1", kind: "question", role: null, result_id: null,
+      role_generation_id: null, state: "unavailable", unavailable_reason: "not_recorded",
+    });
+    check(
+      (await getTaskContent("AJ-1")).current_input?.state === "unavailable",
+      "an unavailable source was refused",
+    );
+    const malformed: Array<[string, unknown]> = [
+      ["another report", { ...heldSource, report: { ...heldQuestion, id: "r-later" } }],
+      ["another attempt", { ...heldSource, attempt_id: "a0" }],
+      ["another outcome", { ...heldSource, kind: "blocked" }],
+      ["another author", { ...heldSource, report: { ...heldQuestion, role: "manager" } }],
+      ["a report retired by a later turn", {
+        ...heldSource,
+        report: {
+          ...heldQuestion,
+          superseded_by_native_turn: { hook_event_id: "h1", superseded_at: "2026-10-11T00:01:00Z" },
+        },
+      }],
+      ["an unknown reason", {
+        ...heldSource, state: "unavailable", report: undefined, unavailable_reason: "expired",
+      }],
+      ["an unknown state", { ...heldSource, state: "pending" }],
+    ];
+    for (const [name, value] of malformed) {
+      body = content(value);
+      let refused = false;
+      try {
+        await getTaskContent("AJ-1");
+      } catch (cause) {
+        refused = cause instanceof Error && cause.message.includes("unsupported task content");
+      }
+      check(refused, `a source naming ${name} was accepted`);
+    }
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("A waiting task shows only the exact report behind its hold and keeps reply, plan and history separate", async () => {
+  localStorage.clear();
+  const sent: Record<string, unknown>[] = [];
+  let currentInput: unknown = heldSource;
+  let revision = "c1";
+  let contentRequests = 0;
+  const later = {
+    ...heldQuestion,
+    id: "r-later",
+    created_at: "2026-10-11T00:05:00Z",
+    role: "plan_reviewer",
+    outcome: "blocked",
+    summary: "Unrelated later blocker",
+  };
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).includes("/content")) {
+      contentRequests += 1;
+      return new Response(JSON.stringify({
+        task_id: "AJ-1",
+        attempt_id: "a1",
+        content_revision: revision,
+        truncated: false,
+        records: [heldQuestion, later],
+        ...(currentInput === undefined ? {} : { current_input: currentInput }),
+      }));
+    }
+    if (init?.method === "POST") sent.push(JSON.parse(String(init.body)));
+    return new Response(JSON.stringify({ result: {} }));
+  }) as typeof fetch;
+  const waitingAt = (contentRevision: string, attemptId = "a1"): Task => ({
+    ...task,
+    attention: "needs_input",
+    active_attempt: {
+      ...task.active_attempt!,
+      id: attemptId,
+      plan: "# Plan\n- Keep existing data",
+      plan_hash: "plan-1",
+      content_revision: contentRevision,
+    },
+  });
+  const waiting = waitingAt("c1");
+  const state: AppState = {
+    ...liveBase,
+    tasks: [waiting],
+    active_sessions: [managerSession],
+    attention: [{
+      id: "task:AJ-1:needs_input",
+      category: "decision",
+      title: "Needs your input",
+      reason: "The implementer asked a question and is waiting for your answer.",
+      task_title: "Existing",
+      role: null,
+      action: { kind: "answer_question", label: "Answer question" },
+      target: {
+        kind: "session",
+        project_id: "p1",
+        task_id: "AJ-1",
+        attempt_id: "a1",
+        session_id: "s1",
+        role_generation_id: "g1",
+      },
+      held_tasks: [],
+    }],
+  };
+  const detail = (value: Task) => (
+    <TaskDetail task={value} state={{ ...state, tasks: [value] }} onClose={noop} onChanged={noop} />
+  );
+  const title = () => document.getElementById("task-question-title")?.textContent;
+  const panel = () =>
+    document.querySelector('[aria-labelledby="task-question-title"]')?.textContent ?? "";
+  try {
+    mount(detail(waiting));
+    await settle();
+    await settle();
+    check(title() === "The implementer needs a decision", `question heading reads ${title()}`);
+    check(
+      panel().includes("old column") && !panel().includes("Unrelated later blocker"),
+      "the question area did not show exactly the report behind the hold",
+    );
+    check(
+      panel().includes("Replies go to the manager, not directly to the implementer") &&
+        panel().includes("Retry is not available right now"),
+      "the reply does not say who receives it or what still continues the work",
+    );
+
+    change(document.querySelector<HTMLTextAreaElement>(".next-step textarea")!, "Keep it for one release");
+    click("Send reply");
+    await settle();
+    check(
+      sent.length === 1 && sent[0].kind === "guidance" &&
+        sent[0].role_generation_id === "g1" && sent[0].body === "Keep it for one release",
+      `the reply sent ${JSON.stringify(sent)} instead of only guidance to the manager`,
+    );
+
+    click("Activity");
+    await settle();
+    const reports = document.querySelector(".report-list")?.textContent ?? "";
+    check(
+      reports.includes("old column") && reports.includes("Unrelated later blocker"),
+      "report history lost a record",
+    );
+    click("Overview");
+
+    // A later native turn retires the report; the service's content revision moves.
+    currentInput = {
+      ...heldSource, state: "unavailable", report: undefined, unavailable_reason: "superseded",
+    };
+    revision = "c2";
+    const superseded = waitingAt("c2");
+    rerender(detail(superseded));
+    await settle();
+    await settle();
+    check(
+      title() === "The agent's question is not available" &&
+        panel().includes("continued working") && panel().includes("No other report is shown") &&
+        !panel().includes("old column") && !panel().includes("Unrelated later blocker"),
+      "an unavailable source was replaced by another report",
+    );
+
+    currentInput = undefined;
+    const before = contentRequests;
+    click("Refresh");
+    await settle();
+    await settle();
+    check(contentRequests > before, "Refresh did not reload the task's reports");
+    check(
+      panel().includes("does not identify which report") && !panel().includes("Unrelated later blocker"),
+      "an older service's content was presented as a known question",
+    );
+    click("Open Activity");
+    check(
+      document.getElementById("task-tab-activity")?.getAttribute("aria-selected") === "true",
+      "Open Activity did not open the report history",
+    );
+    click("Overview");
+
+    currentInput = heldSource;
+    click("Refresh");
+    await settle();
+    await settle();
+    check(
+      panel().includes("cannot tell which plan this report refers to"),
+      "the question area implied it knows which plan the report means",
+    );
+    click("Open the task's current plan");
+    const viewer = () => document.querySelector(".plan-viewer")?.textContent ?? "";
+    check(
+      viewer().includes("Keep existing data") && viewer().includes("shown as context") &&
+        !viewer().includes("Opened for"),
+      "the current plan was presented as the plan the question refers to",
+    );
+    rerender(detail(waitingAt("c2", "a2")));
+    check(
+      !viewer().includes("Keep existing data") && viewer().includes("This plan changed after you opened it"),
+      "a plan opened for one attempt stayed visible under another",
+    );
+    check(sent.length === 1, "reading the question or plan sent a request");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Allow implementation is offered only for the plan shown and opens that approved plan", async () => {
+  localStorage.clear();
+  const sent: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") sent.push(JSON.parse(String(init.body)));
+    return new Response(JSON.stringify({ result: {} }));
+  }) as typeof fetch;
+  const ready: Task = {
+    ...task,
+    active_attempt: {
+      id: "a1",
+      phase: "awaiting_implementation_authorization",
+      status: "running",
+      base_revision: "abc",
+      plan_hash: "plan-2",
+      content_revision: "content-2",
+      plan: "# Approved plan\n- Add the index",
+    },
+  };
+  const detail = (attemptId: string, planHash: string) => (
+    <TaskDetail
+      task={ready}
+      state={{
+        ...liveBase,
+        tasks: [ready],
+        continuation_actions: [{
+          kind: "authorize_implementation",
+          enabled: true,
+          reason: "The approved plan is waiting for your permission.",
+          owner: "human",
+          operation: "authorize_implementation",
+          binding: { task_id: "AJ-1", attempt_id: attemptId, plan_hash: planHash },
+        }],
+      }}
+      onClose={noop}
+      onChanged={noop}
+    />
+  );
+  const decision = () => document.querySelector(".review-panel")?.textContent ?? "";
+  const viewer = () => document.querySelector(".plan-viewer")?.textContent ?? "";
+  const closePlan = () =>
+    act(() => document.querySelector<HTMLButtonElement>('[aria-label="Close plan"]')!.click());
+  try {
+    // Another plan, or the same plan hash for another attempt: the shown plan
+    // is offered only as context, never as the plan this request authorizes.
+    for (const [attemptId, planHash] of [["a1", "plan-1"], ["a0", "plan-2"]]) {
+      mount(detail(attemptId, planHash));
+      await settle();
+      check(
+        findButton("Allow implementation").disabled &&
+          decision().includes("not for the task and plan shown here") &&
+          !decision().includes("Open approved plan"),
+        `a request for ${attemptId}/${planHash} was offered or opened as this plan's decision`,
+      );
+      click("Open the task's current plan");
+      check(
+        viewer().includes("Add the index") && viewer().includes("shown as context") &&
+          !viewer().includes("Opened for"),
+        `a request for ${attemptId}/${planHash} labelled the shown plan as its own`,
+      );
+      closePlan();
+      unmount();
+    }
+
+    mount(detail("a1", "plan-2"));
+    await settle();
+    click("Open approved plan");
+    check(
+      viewer().includes("Opened for: Ready to start work on “Existing”") && viewer().includes("Add the index"),
+      "Open approved plan did not show the exact plan with its decision",
+    );
+    closePlan();
+    check(
+      !findButton("Allow implementation").disabled && !decision().includes("not for the task"),
+      "Allow implementation stayed refused for the plan shown",
+    );
+    click("Allow implementation");
+    await settle();
+    check(
+      sent.length === 1 && sent[0].action === "authorize_implementation" &&
+        sent[0].plan_hash === "plan-2",
+      `implementation was authorized with ${JSON.stringify(sent)}`,
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("A held Single agent run shows its own report and answers only through Resume agent", async () => {
+  localStorage.clear();
+  const bodies: Record<string, unknown>[] = [];
+  const held = singleAgentTask(singleAgentRun({
+    stage: "needs_action",
+    stage_reason: "The agent is waiting for you.",
+    result: null,
+    available_actions: ["resume_run", "cancel"],
+    resume: {
+      session_id: "sa-session",
+      transcript_epoch: "epoch-1",
+      resume_count: 0,
+      available: true,
+      reason: null,
+    },
+  }), { attention: "needs_input" });
+  const report = {
+    ...heldQuestion,
+    id: "r-blocked",
+    role: "single_agent",
+    outcome: "blocked",
+    summary: "The fixture database is missing.",
+  };
+  let currentInput: unknown = {
+    attempt_id: "sa-attempt", kind: "blocked", role: "single_agent",
+    result_id: "r-blocked", role_generation_id: "g-sa", state: "available", report,
+  };
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).includes("/content")) {
+      return new Response(JSON.stringify({
+        task_id: "SA-1",
+        attempt_id: "sa-attempt",
+        content_revision: "c1",
+        truncated: false,
+        records: [report],
+        current_input: currentInput,
+      }));
+    }
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    bodies.push(body);
+    return workflowResult(body);
+  }) as typeof fetch;
+  try {
+    mount(
+      <TaskDetail task={held} state={{ ...liveBase, tasks: [held] }} onClose={noop} onChanged={noop} />,
+    );
+    await settle();
+    await settle();
+    const panel = document.querySelector('[aria-labelledby="task-question-title"]');
+    check(
+      document.getElementById("task-question-title")?.textContent === "The agent is blocked" &&
+        panel?.textContent?.includes("fixture database is missing") &&
+        panel.textContent.includes("Resume agent is available now") &&
+        !panel.querySelector("textarea"),
+      "the held run did not show its report and its actual answer route",
+    );
+    field("Your answer for the agent", "Use the seeded copy");
+    click("Resume agent");
+    await settle();
+    const commands = workflowCommands(bodies);
+    check(
+      commands.length === 1 && commands[0].kind === "resume_run" &&
+        commands[0].message === "Use the seeded copy",
+      `the answer was sent as ${JSON.stringify(commands)}`,
+    );
+
+    const shown = async () => {
+      mount(
+        <TaskDetail task={held} state={{ ...liveBase, tasks: [held] }} onClose={noop} onChanged={noop} />,
+      );
+      await settle();
+      await settle();
+      return {
+        title: document.getElementById("task-question-title")?.textContent,
+        text: document.querySelector('[aria-labelledby="task-question-title"]')?.textContent ?? "",
+      };
+    };
+    // A legacy hold recorded before holds named their report.
+    currentInput = {
+      attempt_id: "sa-attempt", kind: "question", role: null, result_id: null,
+      role_generation_id: null, state: "unavailable", unavailable_reason: "not_recorded",
+    };
+    const legacy = await shown();
+    check(
+      legacy.title === "The agent's question is not available" &&
+        legacy.text.includes("recorded before LLMRelay linked requests") &&
+        legacy.text.includes("No other report is shown") &&
+        !legacy.text.includes("fixture database is missing"),
+      "a source-less legacy hold was not explained, or another report stood in for it",
+    );
+    // A wait with no linked report makes no claim about whether a question exists.
+    currentInput = null;
+    const unlinked = await shown();
+    check(
+      unlinked.title === "No question is linked to this wait" &&
+        unlinked.text.includes("Why it is waiting") &&
+        !unlinked.text.includes("fixture database is missing"),
+      `an unlinked wait read ${unlinked.title}`,
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Setup installation review explains the files and steps plainly and keeps exact bindings", async () => {
+  localStorage.clear();
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ result: {} }));
+  }) as typeof fetch;
+  const fresh: Project = {
+    ...initialized,
+    trip: { ...initialized.trip!, readiness: "setup_in_progress", detected_installation: "absent" },
+  };
+  const finalized: TripSetupState = {
+    setup_operation_id: "install-review",
+    project_id: fresh.id,
+    state: "finalized",
+    proposal_hash: "proposal-hash-1",
+    approved_preimages_hash: "preimages-hash-1",
+    final_source_set_hash: "source-set-hash-1",
+    target_inventory: {},
+    destination_preview: [{
+      relative_path: "AGENTS.md", source_sha256: "source-sha", preimage_sha256: "preimage-sha",
+    }],
+    final_files: [{
+      relative_path: "AGENTS.md",
+      source_sha256: "source-sha",
+      preimage_sha256: "preimage-sha",
+      content: "# New workflow guidance",
+      preimage_content: "# Old guidance",
+    }],
+    installation_source_binding_complete: true,
+    installation_source_binding_reason: "Exact post-preflight bytes and destination preimages are frozen",
+    selected_profiles: [],
+    probe_receipts: ROLES.map((role) => ({
+      id: `receipt-${role}`, profile_id: role, profile_hash: role, provider: "codex" as const, role,
+      authority: role === "implementer" ? "workspace-write" as const : "read-only" as const,
+      session_mode: role === "final_verifier" ? "fresh" as const : "retained" as const,
+      generation_id: `generation-${role}`, result: "success", model_evidence: "fixture",
+      evidence: {}, created_at: "", capability_key: `capability-${role}`, adapter_hash: "adapter",
+    })),
+    sessions: [],
+    runtime_admissions: [],
+    agents_file: {},
+    created_at: "",
+    updated_at: "",
+  };
+  const step = () =>
+    [...document.querySelectorAll("fieldset.setup-step")].find((fieldset) =>
+      fieldset.querySelector("legend")?.textContent === "Review the files setup will write"
+    );
+  try {
+    mount(<ProjectSetup project={fresh} setup={finalized} onChanged={noop} onViewSession={cmuxFixture} />);
+    check(!!step(), "the installation review is not shown");
+    const primary = [...step()!.querySelectorAll("legend, p, small, summary, button")]
+      .filter((node) => !node.closest(".technical-details"))
+      .map((node) => node.textContent).join(" ");
+    check(
+      primary.includes(fresh.repository_path) && primary.includes("Apply staged authorized installation") &&
+        !/hash-1|preimage-sha|source-sha/.test(primary),
+      `the review's primary copy is not plain: ${primary}`,
+    );
+    check(
+      step()!.textContent?.includes("# Old guidance") &&
+        step()!.textContent?.includes("# New workflow guidance") &&
+        step()!.querySelector(".technical-details")?.textContent?.includes("preimages-hash-1"),
+      "the review lost the exact before/after content or its diagnostics",
+    );
+    click("Approve installation");
+    await settle();
+    check(
+      requests.at(-1)?.action === "authorize_installation" &&
+        requests.at(-1)?.proposal_hash === "proposal-hash-1" &&
+        requests.at(-1)?.approved_preimages_hash === "preimages-hash-1" &&
+        requests.at(-1)?.final_source_set_hash === "source-set-hash-1",
+      `approval lost its exact binding: ${JSON.stringify(requests.at(-1))}`,
+    );
+    unmount();
+
+    localStorage.clear();
+    mount(
+      <ProjectSetup
+        project={fresh}
+        setup={{
+          ...finalized,
+          state: "preflight_complete",
+          approved_preimages_hash: null,
+          final_source_set_hash: null,
+          final_files: [],
+          installation_source_binding_complete: false,
+          installation_source_binding_reason: "Finalize the post-preflight installation bytes before human approval",
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    check(
+      findButton("Approve installation").disabled &&
+        step()?.textContent?.includes("becomes available after the final preview is prepared"),
+      "approval was offered, or left unexplained, before the preview exists",
+    );
+    const sent = requests.length;
+    click("Prepare final file preview");
+    await settle();
+    check(
+      requests.length === sent + 1 && requests.at(-1)?.action === "finalize_installation" &&
+        requests.at(-1)?.proposal_hash === "proposal-hash-1",
+      "preparing the preview did not request only the exact finalization",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
   }
 });
 
@@ -12072,10 +12675,10 @@ Deno.test("Roles holds agent settings, Activity keeps output, and the full plan 
     },
   };
   let closed = 0;
-  const detail = (value: Task) => (
+  const detail = (value: Task, actions: ContinuationAction[] = []) => (
     <TaskDetail
       task={value}
-      state={{ ...liveBase, tasks: [value] }}
+      state={{ ...liveBase, tasks: [value], continuation_actions: actions }}
       onClose={() => closed++}
       onChanged={noop}
     />
@@ -12141,9 +12744,65 @@ Deno.test("Roles holds agent settings, Activity keeps output, and the full plan 
       "a changed plan kept showing the earlier text",
     );
     click("Show the current plan");
+    const viewerText = () => document.querySelector(".plan-viewer")?.textContent ?? "";
     check(
-      document.querySelector(".plan-viewer")?.textContent?.includes("New step"),
-      "the current plan could not be reopened",
+      viewerText().includes("New step") &&
+        viewerText().includes("Opened for: Review the plan for “Existing”"),
+      "the current plan could not be reopened under its current decision",
+    );
+    const closePlan = () =>
+      act(() => document.querySelector<HTMLButtonElement>('[aria-label="Close plan"]')!.click());
+    closePlan();
+
+    // Phase-only changes: attempt, plan hash, text and content revision stay
+    // identical, yet the decision the plan was opened for has ended.
+    const inPhase = (phase: string): Task => ({
+      ...planning,
+      active_attempt: { ...planning.active_attempt!, phase },
+    });
+    const exactAuthorization: ContinuationAction = {
+      kind: "authorize_implementation",
+      enabled: true,
+      reason: "The approved plan is waiting for your permission.",
+      owner: "human",
+      operation: "authorize_implementation",
+      binding: { task_id: "AJ-1", attempt_id: "a1", plan_hash: "plan-1" },
+    };
+    rerender(detail(planning));
+    act(() => {
+      findButton("Open plan").focus();
+      findButton("Open plan").click();
+    });
+    check(
+      viewerText().includes("Opened for: Review the plan for “Existing”"),
+      "the approval decision did not label its plan",
+    );
+    rerender(detail(inPhase("awaiting_implementation_authorization"), [exactAuthorization]));
+    check(
+      viewerText().includes("Step 150") && !viewerText().includes("Opened for") &&
+        viewerText().includes("no longer waiting for you"),
+      "approval → authorization kept the ended approval decision",
+    );
+    closePlan();
+    check(
+      document.activeElement?.textContent === "Open approved plan",
+      `closing returned focus to ${document.activeElement?.textContent}`,
+    );
+    click("Open approved plan");
+    check(
+      viewerText().includes("Opened for: Ready to start work on “Existing”"),
+      "the authorization decision did not label its plan",
+    );
+    rerender(detail(inPhase("implementation")));
+    check(
+      viewerText().includes("Step 150") && !viewerText().includes("Opened for") &&
+        viewerText().includes("no longer waiting for you"),
+      "authorization → implementation kept the ended authorization decision",
+    );
+    closePlan();
+    check(
+      document.activeElement?.getAttribute("aria-label") === "Close task details",
+      "closing a plan whose decision panel disappeared did not return focus to the task",
     );
     check(sent.length === 0, "reading the plan or switching tabs sent a request");
     unmount();

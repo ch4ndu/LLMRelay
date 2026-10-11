@@ -278,7 +278,7 @@ authorize a replacement or bypass an approval.
 
 | Situation | Next action and boundary |
 | --- | --- |
-| Agent asks a question or reports a blocker | Read its report in **Activity**, answer or resolve the issue, then choose **Retry** if the task still needs input. Releasing this hold preserves already accepted candidate reports; it does not require another Implementer report or change the plan, review budgets or approval gates. |
+| Agent asks a question or reports a blocker | Read the report shown in the task’s **Overview**. In TRIP, **Send reply** sends guidance to the manager, including when another role asked the question; it does not approve or continue work. Check the reply’s delivery state and choose **Retry** in Controls when offered and the issue is resolved. For a Single agent run, enter the answer beside **Resume agent** and use that action when offered. Existing candidate reports, review budgets and approval gates are preserved. |
 | Exact native resume rejected after runtime identity changes | Review the reason. **Start a fresh session** is available only if the same role profile and current authority still qualify. It consumes a fresh call; it is not native resume. |
 | Role, candidate, configuration, hook trust, native history or invocation provenance changed | Review the current role authority or prepare corrected verification. Old approval evidence cannot be reused as replacement authority. |
 | Resume or review authority already spent | New explicit authorization is required; the dashboard cannot reset the allowance. Unknown permanent rejections remain terminal with their reason. |
@@ -290,6 +290,8 @@ authorize a replacement or bypass an approval.
 | Service cannot prove process exit | Resolve exact process ownership before resuming or replacing work. A quiet terminal is not proof of exit. |
 | Graceful stop exceeds 30 seconds | The service records recovery for the exact managed process. Choose **Ask it to stop again** or explicitly **Force stop this process** when offered. |
 | Browser request times out | Refresh and reconcile. The operation may have succeeded; retain its operation ID until a definitive result rather than submit a new operation blindly. |
+
+The question panel uses the exact report linked to the current input hold. A later report from another role does not replace it. If its source is missing, superseded or belongs to a replaced session, the panel explains that and offers **Refresh** and **Open Activity**. Activity retains report history. A report without a recorded plan link can open the task’s current plan only as context; the agent’s own wording identifies any intended section.
 
 A default Implementer that reported `needs_input` or `blocked` may leave its CLI
 open after completing the turn. Once that hold is resolved, the service can stop

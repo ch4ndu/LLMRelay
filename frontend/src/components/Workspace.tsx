@@ -19,7 +19,7 @@ import {
 } from "../types";
 import { ActivityTimeline } from "./ActivityTimeline";
 import { ApprovalInbox, pendingApprovalCount } from "./ApprovalInbox";
-import { AttentionInbox } from "./AttentionInbox";
+import { AttentionInbox, type AttentionIntent } from "./AttentionInbox";
 import { ResourceStatus } from "./ResourceStatus";
 import { SessionTree, useSessionAccess } from "./SessionTree";
 import { TaskSections } from "./TaskBoard";
@@ -59,6 +59,7 @@ export function Workspace(
     onNavigateAttention?: (
       item: AttentionItem,
       target: AttentionTarget,
+      intent?: AttentionIntent,
     ) => string | undefined;
     onTaskAction?: (action: TaskAction) => void;
     onOpenPermission?: (request: PermissionRequest) => void;
