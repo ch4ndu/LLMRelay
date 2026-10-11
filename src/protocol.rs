@@ -4,6 +4,11 @@ pub const GENERATION: u32 = 1;
 pub const HTTP_HEADER: &str = "x-llmrelay-protocol";
 pub const MAX_DECLARATION_BYTES: usize = 512;
 pub const GUIDANCE: &str = "Reload the dashboard or use a CLI built for this service version. Do not restart the service automatically.";
+/// Browser operations added after generation 1 are typed and refused unless
+/// the request declares the feature, so an older dashboard keeps its behavior.
+pub const HISTORY_VIEW_FEATURE: &str = "history_view_v1";
+pub const PROVIDER_VALIDATION_FEATURE: &str = "provider_validation_v1";
+pub const MULTI_WORKFLOW_FEATURE: &str = "multi_workflow_v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,7 +21,12 @@ pub enum ClientKind {
 impl ClientKind {
     pub fn features(self) -> &'static [&'static str] {
         match self {
-            Self::Browser => &["http_operational_v1"],
+            Self::Browser => &[
+                "http_operational_v1",
+                HISTORY_VIEW_FEATURE,
+                PROVIDER_VALIDATION_FEATURE,
+                MULTI_WORKFLOW_FEATURE,
+            ],
             Self::HumanCli => &["control_requests_v1"],
             Self::Attachment => &["control_requests_v1", "attachment_v1"],
         }
@@ -145,6 +155,20 @@ mod tests {
                 .unwrap_err()
                 .reason,
             "missing_required_feature"
+        );
+        value["required_features"] = serde_json::json!([
+            "http_operational_v1",
+            HISTORY_VIEW_FEATURE,
+            PROVIDER_VALIDATION_FEATURE
+        ]);
+        assert!(
+            parse_declaration(&serde_json::to_vec(&value).unwrap(), ClientKind::Browser).is_ok()
+        );
+        assert_eq!(
+            parse_declaration(&serde_json::to_vec(&value).unwrap(), ClientKind::HumanCli)
+                .unwrap_err()
+                .reason,
+            "wrong_client_kind"
         );
         value["required_features"] = serde_json::json!([]);
         value["extra"] = true.into();

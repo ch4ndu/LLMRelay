@@ -300,6 +300,157 @@ fn permission_lifecycle_event(
     Ok(())
 }
 
+/// The bounded, reviewable form of one native permission request.
+struct ParsedRequest {
+    tool_name: String,
+    tool_name_complete: bool,
+    raw_input: serde_json::Value,
+    raw_bytes: Vec<u8>,
+    input_digest: String,
+    bounded_input: serde_json::Value,
+    requested_access: Option<serde_json::Value>,
+    reason: Option<String>,
+    invocation_nonce: String,
+}
+
+impl ParsedRequest {
+    fn from_payload(payload: &serde_json::Value) -> Result<Self> {
+        let source_tool_name = payload
+            .get("tool_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim);
+        let raw_input = payload
+            .get("tool_input")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let raw_bytes = serde_json::to_vec(&raw_input)?;
+        let input_digest = hex::encode(Sha256::digest(&raw_bytes));
+        let bounded_input = if raw_bytes.len() <= MAX_INPUT_BYTES {
+            raw_input.clone()
+        } else {
+            serde_json::json!({"omitted":true,"reason":"provider input exceeded 64 KiB","sha256":input_digest})
+        };
+        let requested_access = payload
+            .get("requested_access")
+            .or_else(|| payload.get("permission_suggestions"))
+            .or_else(|| raw_input.get("sandbox_permissions"))
+            .cloned()
+            .map(|value| {
+                if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= 8192) {
+                    value
+                } else {
+                    serde_json::json!({
+                        "omitted":true,
+                        "reason":"provider requested-access field exceeded 8 KiB"
+                    })
+                }
+            });
+        let reason = payload
+            .get("reason")
+            .or_else(|| raw_input.get("reason"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| value.len() <= 8192)
+            .map(str::to_owned);
+        let invocation_nonce = payload
+            .get("hook_invocation_nonce")
+            .or_else(|| payload.get("hook_id"))
+            .or_else(|| payload.get("invocation_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        Ok(Self {
+            tool_name_complete: source_tool_name
+                .is_some_and(|value| !value.is_empty() && value.len() <= 256),
+            tool_name: source_tool_name
+                .unwrap_or("unknown")
+                .chars()
+                .take(256)
+                .collect(),
+            raw_input,
+            raw_bytes,
+            input_digest,
+            bounded_input,
+            requested_access,
+            reason,
+            invocation_nonce,
+        })
+    }
+}
+
+/// The running invocation a native permission request belongs to, resolved
+/// from that invocation's own credential. Only a workspace-writing actor can
+/// receive a human grant: the TRIP Implementer, or a Single agent bound to the
+/// compiled workspace-writer policy. Every other actor's request is recorded
+/// and denied, and no actor can decide its own request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionActor {
+    pub project_id: String,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub session_id: String,
+    pub role_generation_id: String,
+    pub credential_id: String,
+    pub transcript_epoch: String,
+    pub provider: Provider,
+    /// The stored actor key: a TRIP role name or `single_agent`.
+    pub actor: String,
+    pub writer: bool,
+    pub configuration_revision: i64,
+    pub lane_id: String,
+    pub permissions: Vec<String>,
+}
+
+impl From<&RoleContext> for PermissionActor {
+    fn from(context: &RoleContext) -> Self {
+        Self {
+            project_id: context.project_id.clone(),
+            task_id: context.task_id.clone(),
+            attempt_id: context.attempt_id.clone(),
+            session_id: context.session_id.clone(),
+            role_generation_id: context.role_generation_id.clone(),
+            credential_id: context.credential_id.clone(),
+            transcript_epoch: context.transcript_epoch.clone(),
+            provider: context.provider,
+            actor: context.role.to_string(),
+            writer: context.role == RoleKind::Implementer,
+            configuration_revision: context.configuration_revision,
+            lane_id: context.lane_id.clone(),
+            permissions: context.permissions.clone(),
+        }
+    }
+}
+
+impl PermissionActor {
+    pub fn single_agent(
+        store: &Store,
+        context: &crate::domain::SingleAgentContext,
+    ) -> Result<Self> {
+        let configuration_revision: i64 = store.lock()?.query_row(
+            "SELECT configuration_revision FROM attempts WHERE id=?1",
+            params![context.attempt_id],
+            |row| row.get(0),
+        )?;
+        let compiled =
+            crate::provider_compatibility::ExecutionPolicy::single_agent_writer(context.provider);
+        Ok(Self {
+            project_id: context.project_id.clone(),
+            task_id: context.task_id.clone(),
+            attempt_id: context.attempt_id.clone(),
+            session_id: context.session_id.clone(),
+            role_generation_id: context.role_generation_id.clone(),
+            credential_id: context.credential_id.clone(),
+            transcript_epoch: context.transcript_epoch.clone(),
+            provider: context.provider,
+            actor: crate::domain::ExecutionActor::SINGLE_AGENT_KEY.to_owned(),
+            writer: compiled.worktree_write && compiled.content_hash() == context.policy_hash,
+            configuration_revision,
+            lane_id: "default".to_owned(),
+            permissions: context.channel_operations.clone(),
+        })
+    }
+}
+
 pub fn begin_request(
     store: &Store,
     context: &RoleContext,
@@ -307,51 +458,35 @@ pub fn begin_request(
     service_boot_id: &str,
     connection_nonce: &str,
 ) -> Result<BridgeStart> {
+    begin_actor_request(
+        store,
+        &PermissionActor::from(context),
+        payload,
+        service_boot_id,
+        connection_nonce,
+    )
+}
+
+pub fn begin_actor_request(
+    store: &Store,
+    context: &PermissionActor,
+    payload: &serde_json::Value,
+    service_boot_id: &str,
+    connection_nonce: &str,
+) -> Result<BridgeStart> {
     store.require_execution_unheld("permission requests")?;
-    let source_tool_name = payload
-        .get("tool_name")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim);
-    let tool_name_complete =
-        source_tool_name.is_some_and(|value| !value.is_empty() && value.len() <= 256);
-    let tool_name = source_tool_name
-        .unwrap_or("unknown")
-        .chars()
-        .take(256)
-        .collect::<String>();
-    let raw_input = payload
-        .get("tool_input")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let raw_bytes = serde_json::to_vec(&raw_input)?;
-    let input_digest = hex::encode(Sha256::digest(&raw_bytes));
-    let bounded_input = if raw_bytes.len() <= MAX_INPUT_BYTES {
-        raw_input.clone()
-    } else {
-        serde_json::json!({"omitted":true,"reason":"provider input exceeded 64 KiB","sha256":input_digest})
-    };
-    let requested_access = payload
-        .get("requested_access")
-        .or_else(|| payload.get("permission_suggestions"))
-        .or_else(|| raw_input.get("sandbox_permissions"))
-        .cloned()
-        .map(|value| {
-            if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= 8192) {
-                value
-            } else {
-                serde_json::json!({
-                    "omitted":true,
-                    "reason":"provider requested-access field exceeded 8 KiB"
-                })
-            }
-        });
-    let reason = payload
-        .get("reason")
-        .or_else(|| raw_input.get("reason"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| value.len() <= 8192)
-        .map(str::to_owned);
-    let (request_context, context_error) = if context.role == RoleKind::Implementer {
+    let ParsedRequest {
+        tool_name,
+        tool_name_complete,
+        raw_input,
+        raw_bytes,
+        input_digest,
+        bounded_input,
+        requested_access,
+        reason,
+        invocation_nonce,
+    } = ParsedRequest::from_payload(payload)?;
+    let (request_context, context_error) = if context.writer {
         match request_context(store, context, payload) {
             Ok(value) => (Some(value), None),
             Err(error) => (None, Some(format!("{error:#}"))),
@@ -383,7 +518,13 @@ pub fn begin_request(
     let (family, family_error, mut command_display) =
         match (request_context.as_ref(), review_error.as_ref()) {
             (Some(request_context), None) => {
-                match classify_family(context.provider, &tool_name, &raw_input, request_context) {
+                match classify_family(
+                    context.provider,
+                    &context.actor,
+                    &tool_name,
+                    &raw_input,
+                    request_context,
+                ) {
                     Ok((candidate, display)) => (Some(candidate), None, display),
                     Err(error) => (
                         None,
@@ -417,23 +558,17 @@ pub fn begin_request(
     let now = Utc::now();
     let deadline = now + Duration::seconds(APPLICATION_DECISION_SECONDS);
     let request_id = uuid::Uuid::new_v4().to_string();
-    let invocation_nonce = payload
-        .get("hook_invocation_nonce")
-        .or_else(|| payload.get("hook_id"))
-        .or_else(|| payload.get("invocation_id"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty() && value.len() <= 256)
-        .map(str::to_owned)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let actionable = context.role == RoleKind::Implementer
-        && request_context.is_some()
-        && review_error.is_none();
+    let actionable = context.writer && request_context.is_some() && review_error.is_none();
     let initial_state = if actionable {
         "pending"
     } else {
         "policy_denied"
     };
-    let initial_reason = if context.role != RoleKind::Implementer {
+    let initial_reason = if !context.writer
+        && context.actor == crate::domain::ExecutionActor::SINGLE_AGENT_KEY
+    {
+        Some("This Single agent is not bound to the workspace-writer policy, so it cannot receive a human-granted action permission".to_owned())
+    } else if !context.writer {
         Some("Only the Implementer role may receive a human-granted action permission".to_owned())
     } else if let Some(error) = context_error {
         Some(format!(
@@ -481,7 +616,7 @@ pub fn begin_request(
             context.attempt_id,
             context.session_id,
             context.role_generation_id,
-            context.role.to_string(),
+            context.actor,
             service_boot_id,
             native_session_id,
             workspace,
@@ -545,7 +680,7 @@ pub fn begin_request(
             request_id,
             serde_json::json!({
                 "provider":context.provider,
-                "role":context.role,
+                "role":context.actor,
                 "tool_name":tool_name,
                 "input_digest":input_digest,
                 "request_hook_event_id":request_hook_event_id
@@ -600,7 +735,7 @@ pub(crate) const ACTIONABLE_REQUEST_SQL: &str = "(pr.state='pending' AND NOT EXI
 /// candidate exists; concurrent identical requests stay unlinked.
 fn link_request_hook(
     transaction: &Transaction<'_>,
-    context: &RoleContext,
+    context: &PermissionActor,
     request_id: &str,
     payload: &serde_json::Value,
     now: &str,
@@ -682,7 +817,7 @@ impl InvocationToolHook {
 /// same-action call was in flight when the request's own hook arrived.
 pub(crate) fn record_native_resolution(
     transaction: &Transaction<'_>,
-    context: &RoleContext,
+    context: &crate::domain::HookInvocation,
     terminal_hook_event_id: &str,
     terminal_rowid: i64,
     payload: &serde_json::Value,
@@ -947,6 +1082,24 @@ pub fn consume_ready_response(
     credential: &str,
     credential_context: &RoleContext,
 ) -> Result<Option<serde_json::Value>> {
+    consume_actor_response(
+        store,
+        request_id,
+        service_boot_id,
+        connection_nonce,
+        credential,
+        &PermissionActor::from(credential_context),
+    )
+}
+
+pub fn consume_actor_response(
+    store: &Store,
+    request_id: &str,
+    service_boot_id: &str,
+    connection_nonce: &str,
+    credential: &str,
+    credential_context: &PermissionActor,
+) -> Result<Option<serde_json::Value>> {
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
     let transaction =
@@ -1075,8 +1228,9 @@ pub fn consume_ready_response(
         || !credential_current
         || row.boot != service_boot_id
         || row.connection != connection_nonce
-        || row.role != "implementer"
-        || row.generation_role != "implementer"
+        || !credential_context.writer
+        || row.role != credential_context.actor
+        || row.generation_role != credential_context.actor
         || row.provider != row.session_provider
         || row.provider != row.generation_provider
         || row.native.is_empty()
@@ -1092,7 +1246,6 @@ pub fn consume_ready_response(
         || row.session != credential_context.session_id
         || row.generation != credential_context.role_generation_id
         || row.provider != credential_context.provider.to_string()
-        || credential_context.role != RoleKind::Implementer
         || row.configuration_revision != credential_context.configuration_revision;
     if invalid && state == "pending" {
         state = "expired".to_owned();
@@ -1366,7 +1519,7 @@ pub fn mark_response_delivery_unknown(
 fn matching_rule_current(
     transaction: &Transaction<'_>,
     rule_id: &str,
-    context: &RoleContext,
+    context: &PermissionActor,
     request: &RequestContext,
     family: &FamilyCandidate,
 ) -> Result<bool> {
@@ -1391,7 +1544,7 @@ fn matching_rule_current(
                 rule_id,
                 context.project_id,
                 context.provider.to_string(),
-                context.role.to_string(),
+                context.actor,
                 request.policy_fingerprint
             ],
             |row| {
@@ -1513,7 +1666,8 @@ pub fn apply_human_decision(
              FROM permission_requests pr JOIN projects p ON p.id=pr.project_id
              JOIN sessions s ON s.id=pr.session_id JOIN role_generations rg ON rg.id=pr.role_generation_id
              JOIN attempts a ON a.id=pr.attempt_id JOIN workspaces w ON w.attempt_id=a.id
-             WHERE pr.id=?1 AND pr.revision=?2 AND pr.state='pending' AND pr.role='implementer'
+             WHERE pr.id=?1 AND pr.revision=?2 AND pr.state='pending'
+               AND pr.role IN ('implementer','single_agent') AND rg.role=pr.role
                AND rg.id=s.role_generation_id AND rg.status NOT IN ('replaced','revoked')
                AND s.status='running' AND s.native_session_id=pr.native_session_id
                AND s.capability_key=pr.policy_fingerprint AND w.state='ready'
@@ -1720,7 +1874,8 @@ pub fn state_rows(
                 attempt_id: row.get(3)?,
                 session_id: row.get(4)?,
                 role_generation_id: row.get(5)?,
-                role: role.parse().unwrap_or(RoleKind::Implementer),
+                role: role.parse().ok(),
+                actor: role,
                 provider: provider.parse().unwrap_or(Provider::Codex),
                 native_session_id: row.get(8)?,
                 tool_name: row.get(9)?,
@@ -1779,7 +1934,8 @@ pub fn state_rows(
                 id: row.get(0)?,
                 provider: provider.parse().unwrap_or(Provider::Codex),
                 project_id: row.get(2)?,
-                role: role.parse().unwrap_or(RoleKind::Implementer),
+                role: role.parse().ok(),
+                actor: role,
                 lifetime: if lifetime == "project" {
                     PermissionLifetime::Project
                 } else {
@@ -1817,7 +1973,7 @@ pub fn state_rows(
 
 fn request_context(
     store: &Store,
-    context: &RoleContext,
+    context: &PermissionActor,
     payload: &serde_json::Value,
 ) -> Result<RequestContext> {
     let (
@@ -1907,6 +2063,7 @@ fn request_context(
 
 fn classify_family(
     provider: Provider,
+    actor: &str,
     tool_name: &str,
     input: &serde_json::Value,
     context: &RequestContext,
@@ -1942,7 +2099,7 @@ fn classify_family(
         "command_family":display_family,
         "arguments":"all",
         "provider":provider,
-        "role":"implementer",
+        "role":actor,
         "native_session":context.native_session_id,
         "worktree":context.workspace,
         "coverage":"this exact managed role/native session and worktree",
@@ -1954,7 +2111,7 @@ fn classify_family(
         "command_family":display_family,
         "arguments":"all",
         "provider":provider,
-        "role":"implementer",
+        "role":actor,
         "registered_root":context.registered_root,
         "coverage":"current and future ready engine-owned worktrees with the same project and Git common-directory identity",
         "configuration_binding":"The complete validated frozen configuration fingerprint must remain compatible, including model and effort.",
@@ -2511,7 +2668,7 @@ fn resolve_executable_in_root(
 
 fn matching_rule(
     transaction: &Transaction<'_>,
-    context: &RoleContext,
+    context: &PermissionActor,
     request: &RequestContext,
     family: &FamilyCandidate,
 ) -> Result<Option<String>> {
@@ -2526,7 +2683,7 @@ fn matching_rule(
             params![
                 context.project_id,
                 context.provider.to_string(),
-                context.role.to_string(),
+                context.actor,
                 request.policy_fingerprint
             ],
             |row| {

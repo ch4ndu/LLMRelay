@@ -551,7 +551,17 @@ fn m4a_restore_revokes_old_authority_and_persists_execution_hold() {
          VALUES('a',1,'m4a-check',1,'m4a-generation','2026-01-01T00:00:00Z');
          INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,reason,created_at)
          VALUES('m4a-guidance','a','m4a-generation','old pending guidance','delivery_unknown',
-           'ambiguous before restore','2026-01-01T00:00:00Z')",
+           'ambiguous before restore','2026-01-01T00:00:00Z');
+         INSERT INTO provider_validation_batches(id,operation_id,request_hash,preview_hash,selection_json,
+           max_fresh_calls,native_calls_authorized,state,created_at,updated_at)
+         VALUES('pv-uncertain','pv-op-1','h','p','[]',2,1,'cancel_requested','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'),
+               ('pv-settled','pv-op-2','h','p','[]',2,1,'running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+         INSERT INTO provider_validation_invocations(id,batch_id,ordinal,provider,model,effort,evidence_key,
+           state,created_at,updated_at)
+         VALUES('pv-running','pv-uncertain',0,'codex','model','low','k0','running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'),
+               ('pv-unstarted','pv-uncertain',1,'codex','model','low','k1','pending','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'),
+               ('pv-done','pv-settled',0,'codex','model','low','k2','succeeded','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'),
+               ('pv-waiting','pv-settled',1,'codex','model','low','k3','pending','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
     );
     source.execute(
         "INSERT INTO restart_candidates(session_id,attempt_id,task_id,source,state,reason,requested_by,result_json,created_at,updated_at)
@@ -764,6 +774,21 @@ fn m4a_restore_revokes_old_authority_and_persists_execution_hold() {
             )
             .unwrap(),
         "abandoned:database restore invalidated ambiguous or in-flight delivery"
+    );
+    // An uncertain check keeps its batch open with the cancellation intact;
+    // only a batch whose checks all settled is finished.
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT group_concat(id || ':' || state, ',') FROM (
+                   SELECT id,state FROM provider_validation_batches
+                   UNION ALL SELECT id,state FROM provider_validation_invocations ORDER BY id)",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "pv-done:succeeded,pv-running:delivery_unknown,pv-settled:finished,\
+         pv-uncertain:cancel_requested,pv-unstarted:cancelled,pv-waiting:cancelled"
     );
     database::recover_interrupted_restore_locked(&target).unwrap();
     assert_eq!(
@@ -33866,6 +33891,2020 @@ fn t18_permission_rules_match_only_current_verified_scope_and_reservation() {
 }
 
 #[test]
+fn codex_provider_check_account_is_allowlisted_and_never_carries_credentials() {
+    install_synthetic_codex_home();
+    let scope = std::env::temp_dir().join(format!(
+        "agenticjira-provider-check-scope-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&scope).unwrap();
+    let account = providers::codex::inspect_observation_account(
+        &scope,
+        providers::codex::EXACT_CODEX_VERSION,
+    )
+    .unwrap();
+    assert_eq!(
+        account.account_identity.as_deref(),
+        Some("chatgpt:synthetic-account")
+    );
+    assert_eq!(account.authentication, "chatgpt_pro");
+    let serialized = serde_json::to_string(&account).unwrap();
+    for secret in [
+        "synthetic-refresh-token",
+        ".synthetic",
+        "eyJ",
+        "access_token",
+    ] {
+        assert!(
+            !serialized.contains(secret),
+            "{secret} leaked: {serialized}"
+        );
+    }
+    assert!(
+        providers::codex::inspect_observation_account(&scope, "codex-cli 0.0.1")
+            .unwrap_err()
+            .to_string()
+            .contains("exact")
+    );
+    std::fs::remove_dir_all(scope).unwrap();
+}
+
+/// A static argument contract only; it is not evidence that the native
+/// provider honors these options, which stays with native qualification.
+#[test]
+fn provider_check_candidate_arguments_request_no_tools_and_no_customization() {
+    install_synthetic_codex_home();
+    let scope = std::env::temp_dir().join(format!(
+        "agenticjira-provider-check-argv-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&scope).unwrap();
+    let bundles = agenticjira::provider_compatibility::BundleSet::embedded();
+    let launch = |provider: Provider, version: &str| {
+        let installation = providers::ProviderInstallation {
+            provider,
+            executable: agenticjira::domain::ExecutableFingerprint {
+                canonical_path: format!("/synthetic/{provider}").into(),
+                device: 1,
+                inode: 2,
+                bytes: 3,
+                modified_seconds: 4,
+                modified_nanos: 5,
+            },
+            executable_version: version.to_owned(),
+        };
+        let policy = bundles
+            .resolve_policy(
+                provider,
+                version,
+                agenticjira::provider_compatibility::PolicyMode::ProviderObservation,
+            )
+            .unwrap();
+        assert!(
+            policy.native_calls_disabled_reason().is_some(),
+            "the shipped contract stays unqualified"
+        );
+        providers::prepare_observation_launch(
+            &installation,
+            policy,
+            "model-a",
+            "low",
+            &scope,
+            "check prompt",
+            std::path::Path::new("/synthetic/llmrelay"),
+        )
+        .unwrap()
+    };
+    let has = |arguments: &[String], expected: &[&str]| {
+        arguments.windows(expected.len()).any(|window| {
+            window
+                .iter()
+                .map(String::as_str)
+                .eq(expected.iter().copied())
+        })
+    };
+
+    let codex = launch(Provider::Codex, providers::codex::EXACT_CODEX_VERSION);
+    for expected in [
+        &["--disable", "shell_tool"][..],
+        &["--disable", "unified_exec"],
+        &["--sandbox", "read-only"],
+        &["--config", "features.hooks=false"],
+    ] {
+        assert!(
+            has(&codex.arguments, expected),
+            "{expected:?}: {:?}",
+            codex.arguments
+        );
+    }
+    assert!(codex.environment.is_empty());
+
+    let claude = launch(Provider::Claude, providers::claude::EXACT_CLAUDE_VERSION);
+    for expected in [
+        &["--safe-mode"][..],
+        &["--no-session-persistence"],
+        &["--tools", ""],
+        &["--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}"],
+        &["--disable-slash-commands"],
+    ] {
+        assert!(
+            has(&claude.arguments, expected),
+            "{expected:?}: {:?}",
+            claude.arguments
+        );
+    }
+    for launch in [&codex, &claude] {
+        assert_eq!(
+            launch.arguments.last().map(String::as_str),
+            Some("check prompt")
+        );
+        assert!(launch
+            .environment
+            .iter()
+            .all(|(key, _)| !key.starts_with("AGENTICJIRA_")));
+        assert_eq!(launch.process().cwd, scope.as_path());
+    }
+    std::fs::remove_dir_all(scope).unwrap();
+}
+
+/// A synthetic store whose Single agent writer contracts are qualified. It
+/// proves service-owned transitions only; native spawn still refuses it.
+fn single_agent_fixture(name: &str) -> (Fixture, PathBuf) {
+    let mut fixture = Fixture::new(name);
+    fixture.root = fixture.root.canonicalize().unwrap();
+    fixture.store = fixture
+        .store
+        .clone()
+        .with_synthetic_bundles_for_tests(single_agent_bundles())
+        .unwrap();
+    let repository = fixture.repository("single-agent-repo");
+    (fixture, repository)
+}
+
+fn single_agent_bundles() -> agenticjira::provider_compatibility::BundleSet {
+    let qualify = |manifest: &str| {
+        let mut pack: serde_json::Value = serde_json::from_str(manifest).unwrap();
+        for selector in pack["selectors"].as_array_mut().unwrap() {
+            for contract in selector["contracts"].as_array_mut().unwrap() {
+                if contract["mode"] == "single_agent_writer" {
+                    contract["qualification"] = serde_json::json!({
+                        "state": "qualified",
+                        "evidence_reference": "synthetic-single-agent-review"
+                    });
+                }
+            }
+        }
+        pack.to_string()
+    };
+    agenticjira::provider_compatibility::BundleSet::embedded().with_policy_packs_for_tests(
+        &qualify(include_str!(
+            "../resources/provider-compatibility/single-agent-codex.json"
+        )),
+        &qualify(include_str!(
+            "../resources/provider-compatibility/single-agent-claude.json"
+        )),
+    )
+}
+
+fn workflow_command(
+    fixture: &Fixture,
+    command: serde_json::Value,
+) -> anyhow::Result<agenticjira::domain::OperationResult> {
+    workflow::execute_workflow_command(&fixture.store, &serde_json::from_value(command).unwrap())
+}
+
+struct SingleAgentSetup {
+    project_id: String,
+    config_id: String,
+    profile_revision_id: String,
+}
+
+fn admitted_single_agent_project(
+    fixture: &Fixture,
+    repository: &std::path::Path,
+) -> SingleAgentSetup {
+    admitted_single_agent_project_with(fixture, repository, serde_json::json!([]))
+}
+
+/// Registers the project and an admitted Single agent profile without any
+/// TRIP installation, role settings or six-role readiness.
+fn admitted_single_agent_project_with(
+    fixture: &Fixture,
+    repository: &std::path::Path,
+    checks: serde_json::Value,
+) -> SingleAgentSetup {
+    let project_id = workflow::execute(
+        &fixture.store,
+        &HumanCommand::AddProject {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            path: repository.to_path_buf(),
+            display_name: "Single agent fixture".into(),
+        },
+    )
+    .unwrap()
+    .entity_id;
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::SetQueuePaused {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.clone(),
+            expected_version: 1,
+            paused: false,
+        },
+    )
+    .unwrap();
+    let config_id = workflow_command(
+        fixture,
+        serde_json::json!({
+            "kind":"save_execution_configuration","operation_id":"config-1","project_id":project_id,
+            "expected_revision":0,
+            "configuration":{"guidance_paths":["fixture.txt"],"testing_coverage":"moderate",
+                "documentation_policy":"none","checks":checks}
+        }),
+    )
+    .unwrap()
+    .entity_id;
+    let profile = workflow_command(fixture, serde_json::json!({
+        "kind":"save_agent_profile","operation_id":"profile-1","project_id":project_id,
+        "profile":{"display_name":"Writer","provider":"codex","model":"gpt-fixture","effort":"medium",
+            "instructions_text":"Keep changes small."}
+    }))
+    .unwrap();
+    let profile_revision_id = profile.detail["profile_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let pending = workflow_command(
+        fixture,
+        serde_json::json!({
+            "kind":"prepare_profile_admission","operation_id":"admission-1","project_id":project_id,
+            "profile_revision_id":profile_revision_id,"execution_config_revision_id":config_id
+        }),
+    )
+    .unwrap();
+    assert_eq!(pending.state, "pending");
+    let refused = workflow_command(
+        fixture,
+        serde_json::json!({
+            "kind":"activate_profile_admission","operation_id":"activate-without-evidence",
+            "project_id":project_id,"admission_id":pending.entity_id
+        }),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        refused.contains("no recorded native Single agent capability evidence"),
+        "{refused}"
+    );
+    prove_single_agent_admission(fixture, &project_id, &pending.entity_id);
+    assert_eq!(
+        workflow_command(
+            fixture,
+            serde_json::json!({
+                "kind":"activate_profile_admission","operation_id":"activate-1",
+                "project_id":project_id,"admission_id":pending.entity_id
+            })
+        )
+        .unwrap()
+        .state,
+        "activated"
+    );
+    SingleAgentSetup {
+        project_id,
+        config_id,
+        profile_revision_id,
+    }
+}
+
+fn single_agent_task(fixture: &Fixture, setup: &SingleAgentSetup) -> (String, i64) {
+    let task_id = workflow::execute(
+        &fixture.store,
+        &HumanCommand::CreateTask {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            project_id: setup.project_id.clone(),
+            title: "Say done".into(),
+            description: "Write DONE into the fixture".into(),
+            acceptance_criteria: vec!["The fixture says done".into()],
+            priority: 0,
+            ready: false,
+            role_overrides: serde_json::Value::Null,
+        },
+    )
+    .unwrap()
+    .entity_id;
+    let selected = workflow_command(
+        fixture,
+        serde_json::json!({
+            "kind":"set_task_workflow","operation_id":format!("select-{task_id}"),"task_id":task_id,
+            "expected_version":1,
+            "selection":{"family":"single_agent","execution_config_revision_id":setup.config_id,
+                "profile_revision_id":setup.profile_revision_id,"check_ids":[]}
+        }),
+    )
+    .unwrap();
+    (task_id, selected.version.unwrap())
+}
+
+fn make_ready(fixture: &Fixture, task_id: &str, version: i64) -> anyhow::Result<i64> {
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::MakeReady {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            task_id: task_id.into(),
+            expected_version: version,
+        },
+    )
+    .map(|result| result.version.unwrap())
+}
+
+const SINGLE_AGENT_PROCESS: &str =
+    "{\"pid\":4242,\"process_group_id\":4242,\"native_start_marker\":\"fixture\",\"observed_started_at\":\"2026-01-01T00:00:00Z\"}";
+
+/// Claims the task and launches its writer through the production launch
+/// preparation and reservation, standing in only for the native process.
+fn running_single_agent(
+    fixture: &Fixture,
+    task_id: &str,
+) -> (agenticjira::store::SingleAgentLaunchContext, PathBuf) {
+    let artifacts = fixture.root.join("artifacts");
+    let plan = scheduler(fixture, artifacts.clone())
+        .claim_next()
+        .unwrap()
+        .expect("the Ready Single agent task is claimed");
+    assert_eq!(plan.task_id, task_id);
+    let context = fixture
+        .store
+        .single_agent_launch_context(&plan.attempt_id)
+        .unwrap();
+    let hooks = test_hooks(fixture);
+    let executable = std::env::current_exe().unwrap();
+    let bundles = single_agent_bundles();
+    let launch = providers::prepare_single_agent_launch(&providers::SingleAgentLaunchRequest {
+        provider: context.provider,
+        model: &context.model,
+        effort: &context.effort,
+        cwd: &context.workspace,
+        prompt: "fixture",
+        role_socket: &fixture.root.join("role.sock"),
+        token: &context.token,
+        role_generation_id: &context.role_generation_id,
+        session_id: &context.session_id,
+        native_session_id: None,
+        assets: &hooks,
+        executable_path: &executable,
+        bundles: &bundles,
+    })
+    .unwrap();
+    assert!(
+        launch
+            .arguments
+            .iter()
+            .all(|argument| !argument.contains("implementer")),
+        "the writer launch carries no TRIP role contract: {:?}",
+        launch.arguments
+    );
+    fixture
+        .store
+        .reserve_single_agent_invocation(&context, &launch)
+        .unwrap();
+    fixture
+        .store
+        .mark_session_spawning(
+            &context.session_id,
+            &context.transcript_epoch,
+            "fixture-boot",
+        )
+        .unwrap();
+    fixture
+        .store
+        .update_session_running(
+            &context.session_id,
+            &context.transcript_epoch,
+            SINGLE_AGENT_PROCESS,
+        )
+        .unwrap();
+    (context, artifacts)
+}
+
+fn single_agent_report(
+    operation_id: &str,
+    attempt_id: &str,
+    profile: &str,
+    criterion: &str,
+    status: &str,
+) -> RoleResultReport {
+    RoleResultReport {
+        operation_id: operation_id.into(),
+        outcome: "result_ready".into(),
+        summary: "Wrote DONE".into(),
+        evidence: vec![],
+        metadata: serde_json::json!({
+            "run_binding_id": attempt_id,
+            "profile_revision_id": profile,
+            "acceptance_rows": [{"criterion": criterion, "status": status,
+                "evidence": [{"kind": "source", "detail": "fixture.txt now says DONE"}]}],
+            "claimed_changes": ["fixture.txt"]
+        }),
+    }
+}
+
+fn exit_single_agent(fixture: &Fixture, context: &agenticjira::store::SingleAgentLaunchContext) {
+    assert!(fixture
+        .store
+        .update_session_exit(
+            &context.session_id,
+            &context.transcript_epoch,
+            SINGLE_AGENT_PROCESS,
+            &serde_json::json!({"success":true,"process_group_quiescent":true}).to_string(),
+        )
+        .unwrap());
+}
+
+fn single_agent_run(fixture: &Fixture, task_id: &str) -> agenticjira::domain::SingleAgentRunDto {
+    workflow::state(&fixture.store)
+        .unwrap()
+        .tasks
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .and_then(|task| task.workflow)
+        .and_then(|workflow| workflow.run)
+        .expect("the task has a Single agent run")
+}
+
+fn single_agent_channel(
+    fixture: &Fixture,
+    context: &agenticjira::store::SingleAgentLaunchContext,
+) -> agenticjira::domain::SingleAgentContext {
+    let agenticjira::domain::ExecutionContext::SingleAgent(agent) =
+        fixture.store.execution_context(&context.token).unwrap()
+    else {
+        panic!("a Single agent credential must resolve to the Single agent branch")
+    };
+    agent
+}
+
+/// Records the writer's SessionStart hook, which names its native
+/// conversation, through the Single agent hook bridge.
+fn single_agent_session_start(
+    fixture: &Fixture,
+    context: &agenticjira::store::SingleAgentLaunchContext,
+) -> String {
+    let native = uuid::Uuid::new_v4().to_string();
+    let recorded = fixture
+        .store
+        .save_single_agent_hook_event(
+            &single_agent_channel(fixture, context),
+            &HookEnvelope {
+                provider: context.provider,
+                payload: serde_json::json!({
+                    "hook_event_name":"SessionStart","session_id":native,"cwd":context.workspace
+                }),
+            },
+            &RolePeerProvenance {
+                peer_pid: 4242,
+                peer_process_group_id: 4242,
+                peer_start_marker: "single-agent-peer".into(),
+                managed_root_pid: 4242,
+                managed_root_start_marker: "fixture".into(),
+                state: "managed_process_group_untrusted_payload".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(recorded["native_identity_candidate"], true, "{recorded}");
+    native
+}
+
+fn single_agent_application(fixture: &Fixture) -> Application {
+    let mut paths = instance_paths(fixture);
+    paths.role_socket = fixture.root.join("role.sock");
+    Application::new_with_synthetic_compatibility_for_tests(
+        paths,
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+        test_hooks(fixture),
+    )
+    .unwrap()
+}
+
+/// Ticks the coordinator until it reports `action` or gives up.
+fn tick_until(fixture: &Fixture, app: &Application, action: &str) -> serde_json::Value {
+    let mut outcomes = Vec::new();
+    for _ in 0..8 {
+        let outcome = app.coordinator_tick().unwrap();
+        if outcome["action"] == action {
+            return outcome;
+        }
+        outcomes.push(outcome);
+    }
+    let recovery_details = {
+        let connection = fixture.connection();
+        let mut statement = connection
+            .prepare("SELECT detail_json FROM recovery_records WHERE state='attention_required'")
+            .unwrap();
+        let details = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        details
+    };
+    panic!("the coordinator never reported {action}: {outcomes:?}; recovery details: {recovery_details:?}")
+}
+
+/// Proves a pending admission through its real probe run: the probe task is
+/// claimed and launched through the production path, reports through the
+/// channel and hooks, and the coordinator captures and settles it. Only the
+/// native process is stood in for.
+fn prove_single_agent_admission(fixture: &Fixture, project_id: &str, admission_id: &str) {
+    let probe_availability = || {
+        let admission = workflow::state(&fixture.store)
+            .unwrap()
+            .workflow_execution
+            .into_iter()
+            .find(|execution| execution.project_id == project_id)
+            .and_then(|execution| {
+                execution
+                    .admissions
+                    .into_iter()
+                    .find(|admission| admission.id == admission_id)
+            })
+            .unwrap();
+        (
+            admission.probe_available,
+            admission.probe_unavailable_reason,
+        )
+    };
+    let probe = |operation: &str| {
+        workflow_command(
+            fixture,
+            serde_json::json!({
+                "kind":"probe_profile_admission","operation_id":operation,
+                "project_id":project_id,"admission_id":admission_id
+            }),
+        )
+    };
+    assert_eq!(probe_availability(), (true, None));
+    let queued = probe(&format!("probe-{admission_id}")).unwrap();
+    assert_eq!(queued.state, "probe_queued");
+    let probe_task = queued.detail["probe_task_id"].as_str().unwrap().to_owned();
+    // While its probe task is open, the dashboard and the command agree that
+    // no second probe can start.
+    let refused = format!(
+        "{:#}",
+        probe(&format!("probe-again-{admission_id}")).unwrap_err()
+    );
+    assert!(refused.contains("still open"), "{refused}");
+    assert_eq!(probe_availability(), (false, Some(refused)));
+    let (context, _) = running_single_agent(fixture, &probe_task);
+    let agent = single_agent_channel(fixture, &context);
+    single_agent_session_start(fixture, &context);
+    let criterion: String = fixture.scalar(&format!(
+        "SELECT json_extract(acceptance_criteria_json,'$[0]') FROM tasks WHERE id='{probe_task}'"
+    ));
+    let value = criterion.rsplit(' ').next().unwrap().to_owned();
+    std::fs::write(context.workspace.join(".llmrelay-probe"), &value).unwrap();
+    fixture
+        .store
+        .save_single_agent_result(
+            &agent,
+            &single_agent_report(
+                &format!("probe-result-{probe_task}"),
+                &context.attempt_id,
+                &context.profile_revision_id,
+                &criterion,
+                "met",
+            ),
+        )
+        .unwrap();
+    exit_single_agent(fixture, &context);
+    let app = single_agent_application(fixture);
+    tick_until(&fixture, &app, "single_agent_probe_settled");
+    fixture.assert_scalar(
+        &format!("SELECT lifecycle||':'||(SELECT state FROM profile_admissions WHERE id='{admission_id}') FROM tasks WHERE id='{probe_task}'"),
+        "done:pending".to_owned(),
+    );
+}
+
+#[test]
+fn single_agent_runs_without_trip_and_completes_only_on_exact_acceptance() {
+    let (fixture, repository) = single_agent_fixture("single-agent-lifecycle");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task_id, version) = single_agent_task(&fixture, &setup);
+
+    // TRIP is not installed in this repository, yet the Single agent task
+    // becomes Ready; a Ready edit invalidates that admission exactly once.
+    let version = make_ready(&fixture, &task_id, version).unwrap();
+    let edited = workflow::execute(
+        &fixture.store,
+        &HumanCommand::UpdateTask {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            task_id: task_id.clone(),
+            expected_version: version,
+            title: "Say done".into(),
+            description: "Write DONE into the fixture file".into(),
+            acceptance_criteria: vec!["The fixture says done".into()],
+            priority: 0,
+            manual_order: 0,
+            role_overrides: serde_json::Value::Null,
+        },
+    )
+    .unwrap();
+    assert_eq!(edited.state, "admission_invalidated");
+    fixture.assert_scalar(
+        &format!("SELECT lifecycle||':'||(SELECT admission_state FROM task_workflow_selections WHERE task_id=tasks.id) FROM tasks WHERE id='{task_id}'"),
+        "backlog:invalidated".to_owned(),
+    );
+    make_ready(&fixture, &task_id, edited.version.unwrap()).unwrap();
+
+    let (context, artifacts) = running_single_agent(&fixture, &task_id);
+    fixture.assert_scalar(
+        &format!("SELECT phase||':'||(SELECT COUNT(*) FROM review_budgets WHERE attempt_id=attempts.id)||':'||(SELECT COUNT(*) FROM trip_attempt_profiles WHERE attempt_id=attempts.id) FROM attempts WHERE id='{}'", context.attempt_id),
+        "agent_execution:0:0".to_owned(),
+    );
+    let relaunch = fixture
+        .store
+        .single_agent_launch_context(&context.attempt_id)
+        .unwrap_err()
+        .to_string();
+    assert!(relaunch.contains("retained conversation"), "{relaunch}");
+
+    // The credential authenticates only as the Single agent, never as a TRIP role.
+    let trip = fixture
+        .store
+        .role_context(&context.token)
+        .unwrap_err()
+        .to_string();
+    assert!(trip.contains("belongs to a Single agent run"), "{trip}");
+    let agenticjira::domain::ExecutionContext::SingleAgent(agent) =
+        fixture.store.execution_context(&context.token).unwrap()
+    else {
+        panic!("a Single agent credential must resolve to the Single agent branch")
+    };
+    let payload = fixture.store.single_agent_context_payload(&agent).unwrap();
+    assert_eq!(payload["run_binding_id"], context.attempt_id);
+    assert_eq!(
+        payload["task"]["acceptance_criteria"][0],
+        "The fixture says done"
+    );
+
+    for (criterion, status, expected) in [
+        ("A different criterion", "met", "repeat its task criterion"),
+        (
+            "The fixture says done",
+            "unmet",
+            "every criterion to be met",
+        ),
+    ] {
+        let error = fixture
+            .store
+            .save_single_agent_result(
+                &agent,
+                &single_agent_report(
+                    "bad",
+                    &context.attempt_id,
+                    &context.profile_revision_id,
+                    criterion,
+                    status,
+                ),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+    let report = single_agent_report(
+        "result-1",
+        &context.attempt_id,
+        &context.profile_revision_id,
+        "The fixture says done",
+        "met",
+    );
+    let recorded = fixture
+        .store
+        .save_single_agent_result(&agent, &report)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .save_single_agent_result(&agent, &report)
+            .unwrap(),
+        recorded
+    );
+    let mut changed = report.clone();
+    changed.summary = "Different".into();
+    assert!(fixture
+        .store
+        .save_single_agent_result(&agent, &changed)
+        .unwrap_err()
+        .to_string()
+        .contains("different input"));
+    let binding_id = recorded["result_binding_id"].as_str().unwrap().to_owned();
+
+    // A reported result is not acceptance and cannot be captured while the
+    // writer still runs.
+    let reviews = ReviewService::new(fixture.store.clone(), artifacts);
+    assert!(reviews
+        .freeze_single_agent_result(&context.attempt_id)
+        .unwrap_err()
+        .to_string()
+        .contains("writer is active"));
+    std::fs::write(
+        fixture
+            .root
+            .join("artifacts")
+            .join("worktrees")
+            .join(&context.attempt_id)
+            .join("fixture.txt"),
+        "DONE\n",
+    )
+    .unwrap();
+    exit_single_agent(&fixture, &context);
+    let captured = reviews
+        .freeze_single_agent_result(&context.attempt_id)
+        .unwrap();
+    assert_eq!(captured["state"], "awaiting_human");
+    let candidate = captured["manifest_hash"].as_str().unwrap().to_owned();
+    let version: i64 = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task_id}'"));
+    fixture.assert_scalar(
+        &format!("SELECT lifecycle FROM tasks WHERE id='{task_id}'"),
+        "awaiting_review".to_owned(),
+    );
+
+    // fixture.txt is approved guidance, so accepting binds the exact change.
+    let run = single_agent_run(&fixture, &task_id);
+    assert_eq!(run.guidance_changes.len(), 1);
+    assert_eq!(run.guidance_changes[0].path, "fixture.txt");
+    assert!(run.available_actions.contains(&"accept_result".to_owned()));
+    let guidance = run
+        .guidance_change_hash
+        .expect("the candidate changed approved guidance");
+    let unreviewed = workflow_command(
+        &fixture,
+        serde_json::json!({
+            "kind":"accept_result","operation_id":"accept-unreviewed-guidance","task_id":task_id,
+            "attempt_id":context.attempt_id,"expected_version":version,
+            "result_binding_id":binding_id,"candidate_hash":candidate
+        }),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        unreviewed.contains("changes approved guidance"),
+        "{unreviewed}"
+    );
+    let accept = |operation: &str, version: i64, candidate: &str| {
+        workflow_command(
+            &fixture,
+            serde_json::json!({
+                "kind":"accept_result","operation_id":operation,"task_id":task_id,
+                "attempt_id":context.attempt_id,"expected_version":version,
+                "result_binding_id":binding_id,"candidate_hash":candidate,
+                "guidance_change_hash":guidance
+            }),
+        )
+    };
+    assert!(accept("accept-wrong-candidate", version, "0000").is_err());
+    assert!(accept("accept-stale", version - 1, &candidate).is_err());
+    let trip_review = workflow::execute(
+        &fixture.store,
+        &HumanCommand::HumanReview {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            task_id: task_id.clone(),
+            attempt_id: context.attempt_id.clone(),
+            expected_version: version,
+            decision: "accept".into(),
+            feedback: String::new(),
+            carry_plan_approval: false,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(trip_review.contains("Accept result"), "{trip_review}");
+    fixture.assert_scalar(
+        &format!("SELECT lifecycle FROM tasks WHERE id='{task_id}'"),
+        "awaiting_review".to_owned(),
+    );
+    let accepted = accept("accept-1", version, &candidate).unwrap();
+    assert_eq!(accepted.state, "accepted");
+    assert_eq!(
+        accept("accept-1", version, &candidate).unwrap().version,
+        accepted.version
+    );
+    fixture.assert_scalar(
+        &format!("SELECT t.lifecycle||':'||a.status||':'||(a.human_acceptance_at IS NOT NULL)||':'||r.state FROM tasks t JOIN attempts a ON a.task_id=t.id JOIN workflow_result_bindings r ON r.attempt_id=a.id WHERE t.id='{task_id}'"),
+        "done:done:1:accepted".to_owned(),
+    );
+    fixture.assert_scalar(
+        &format!("SELECT COUNT(*) FROM task_dependencies WHERE depends_on_task_id='{task_id}' AND integration_commit IS NOT NULL"),
+        0_i64,
+    );
+}
+
+#[test]
+fn single_agent_rework_links_a_fresh_child_and_keeps_the_parent_result() {
+    let (fixture, repository) = single_agent_fixture("single-agent-rework");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task_id, version) = single_agent_task(&fixture, &setup);
+    make_ready(&fixture, &task_id, version).unwrap();
+    let (context, artifacts) = running_single_agent(&fixture, &task_id);
+    let agenticjira::domain::ExecutionContext::SingleAgent(agent) =
+        fixture.store.execution_context(&context.token).unwrap()
+    else {
+        panic!("a Single agent credential must resolve to the Single agent branch")
+    };
+    let recorded = fixture
+        .store
+        .save_single_agent_result(
+            &agent,
+            &single_agent_report(
+                "result-1",
+                &context.attempt_id,
+                &context.profile_revision_id,
+                "The fixture says done",
+                "met",
+            ),
+        )
+        .unwrap();
+    exit_single_agent(&fixture, &context);
+    let captured = ReviewService::new(fixture.store.clone(), artifacts)
+        .freeze_single_agent_result(&context.attempt_id)
+        .unwrap();
+    let version: i64 = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task_id}'"));
+    let request = |operation: &str, feedback: &str| {
+        workflow_command(
+            &fixture,
+            serde_json::json!({
+                "kind":"request_rework","operation_id":operation,"task_id":task_id,
+                "attempt_id":context.attempt_id,"expected_version":version,
+                "result_binding_id":recorded["result_binding_id"],
+                "candidate_hash":captured["manifest_hash"],"feedback":feedback
+            }),
+        )
+    };
+    assert!(request("rework-blank", "  ").is_err());
+    let staged = request("rework-1", "Also mention the date").unwrap();
+    assert_eq!(staged.state, "rework_created");
+    assert_eq!(
+        request("rework-1", "Also mention the date")
+            .unwrap()
+            .entity_id,
+        staged.entity_id
+    );
+    let child = staged.entity_id;
+    fixture.assert_scalar(
+        &format!(
+            "SELECT a.status||':'||a.phase||':'||b.parent_attempt_id||':'||(b.source_snapshot_id='{}')||':'||
+               (SELECT COUNT(*) FROM role_generations WHERE attempt_id=a.id)||':'||
+               (SELECT state FROM rework_intents WHERE new_attempt_id=a.id)
+             FROM attempts a JOIN workflow_run_bindings b ON b.attempt_id=a.id WHERE a.id='{child}'",
+            captured["snapshot_id"].as_str().unwrap()
+        ),
+        format!("materialization_pending:agent_execution:{}:1:0:reserved", context.attempt_id),
+    );
+    fixture.assert_scalar(
+        &format!("SELECT a.status||':'||r.state||':'||(r.snapshot_id IS NOT NULL) FROM attempts a JOIN workflow_result_bindings r ON r.attempt_id=a.id WHERE a.id='{}'", context.attempt_id),
+        "rework_staging:changes_requested:1".to_owned(),
+    );
+    // A decided result cannot be accepted afterwards.
+    assert!(workflow_command(&fixture, serde_json::json!({
+        "kind":"accept_result","operation_id":"accept-after-rework","task_id":task_id,
+        "attempt_id":context.attempt_id,"expected_version":version + 1,
+        "result_binding_id":recorded["result_binding_id"],"candidate_hash":captured["manifest_hash"]
+    }))
+    .is_err());
+    // The workflow of a task with work cannot change in place.
+    let current: i64 = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task_id}'"));
+    let error = workflow_command(
+        &fixture,
+        serde_json::json!({
+            "kind":"set_task_workflow","operation_id":"switch-after-work","task_id":task_id,
+            "expected_version":current,"selection":{"family":"trip"}
+        }),
+    );
+    assert!(error.is_err());
+}
+
+#[test]
+fn single_agent_selection_admission_and_profiles_are_exact() {
+    let (fixture, repository) = single_agent_fixture("single-agent-admission");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    // Renaming keeps the revision; a semantic change makes a new one that is
+    // not admitted and cannot make a selection Ready.
+    let profile_id: String = fixture.scalar("SELECT id FROM agent_profiles");
+    let renamed = workflow_command(&fixture, serde_json::json!({
+        "kind":"save_agent_profile","operation_id":"rename","project_id":setup.project_id,
+        "profile_id":profile_id,"expected_version":1,
+        "profile":{"display_name":"Renamed writer","provider":"codex","model":"gpt-fixture","effort":"medium",
+            "instructions_text":"Keep changes small."}
+    }))
+    .unwrap();
+    assert_eq!(renamed.state, "renamed");
+    assert_eq!(
+        renamed.detail["profile_revision_id"],
+        setup.profile_revision_id
+    );
+    let revised = workflow_command(&fixture, serde_json::json!({
+        "kind":"save_agent_profile","operation_id":"revise","project_id":setup.project_id,
+        "profile_id":profile_id,"expected_version":2,
+        "profile":{"display_name":"Renamed writer","provider":"codex","model":"gpt-fixture","effort":"high",
+            "instructions_text":"Keep changes small."}
+    }))
+    .unwrap();
+    assert_eq!(revised.state, "revised");
+    let new_revision = revised.detail["profile_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(new_revision, setup.profile_revision_id);
+
+    let (task_id, version) = single_agent_task(&fixture, &setup);
+    let reselected = workflow_command(&fixture, serde_json::json!({
+        "kind":"set_task_workflow","operation_id":"reselect","task_id":task_id,"expected_version":version,
+        "selection":{"family":"single_agent","execution_config_revision_id":setup.config_id,
+            "profile_revision_id":new_revision,"check_ids":[]}
+    }))
+    .unwrap();
+    let error = make_ready(&fixture, &task_id, reselected.version.unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not admitted"), "{error}");
+    let unknown_check = workflow_command(
+        &fixture,
+        serde_json::json!({
+            "kind":"set_task_workflow","operation_id":"bad-check","task_id":task_id,
+            "expected_version":reselected.version.unwrap(),
+            "selection":{"family":"single_agent","execution_config_revision_id":setup.config_id,
+                "profile_revision_id":setup.profile_revision_id,"check_ids":["not-a-check"]}
+        }),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        unknown_check.contains("not a distinct check"),
+        "{unknown_check}"
+    );
+
+    // A changed guidance file at the registered commit blocks the claim.
+    let (task_id, version) = single_agent_task(&fixture, &setup);
+    make_ready(&fixture, &task_id, version).unwrap();
+    std::fs::write(repository.join("fixture.txt"), "changed\n").unwrap();
+    for args in [
+        &["add", "fixture.txt"][..],
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "change guidance",
+        ],
+    ] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let head = output(&repository, &["rev-parse", "HEAD"]);
+    fixture.execute(
+        "UPDATE projects SET base_revision=?1 WHERE id=?2",
+        params![head.trim(), setup.project_id],
+    );
+    assert!(scheduler(&fixture, fixture.root.join("artifacts"))
+        .claim_next()
+        .unwrap()
+        .is_none());
+    fixture.assert_scalar(
+        &format!("SELECT COUNT(*) FROM attempts WHERE task_id='{task_id}'"),
+        0_i64,
+    );
+
+    // The project default is recorded for new drafts; existing selections
+    // keep their own family.
+    let default = workflow_command(&fixture, serde_json::json!({
+        "kind":"set_project_workflow_default","operation_id":"default-1","project_id":setup.project_id,
+        "expected_version":0,"family":"single_agent"
+    }))
+    .unwrap();
+    assert_eq!(default.version, Some(1));
+    assert!(workflow_command(&fixture, serde_json::json!({
+        "kind":"set_project_workflow_default","operation_id":"default-stale","project_id":setup.project_id,
+        "expected_version":0,"family":"trip"
+    }))
+    .is_err());
+}
+
+/// Writes `contents` into `file`, reports a completing result and stops the
+/// writer, then lets the coordinator capture the candidate.
+fn finish_single_agent_writer(
+    fixture: &Fixture,
+    app: &Application,
+    context: &agenticjira::store::SingleAgentLaunchContext,
+    file: &str,
+    contents: &str,
+) -> serde_json::Value {
+    std::fs::write(context.workspace.join(file), contents).unwrap();
+    let recorded = fixture
+        .store
+        .save_single_agent_result(
+            &single_agent_channel(fixture, context),
+            &single_agent_report(
+                &format!("result-{}", context.attempt_id),
+                &context.attempt_id,
+                &context.profile_revision_id,
+                "The fixture says done",
+                "met",
+            ),
+        )
+        .unwrap();
+    exit_single_agent(fixture, context);
+    tick_until(fixture, app, "single_agent_result_captured");
+    recorded
+}
+
+#[test]
+fn single_agent_selected_checks_run_only_under_exact_human_authorization() {
+    let (fixture, repository) = single_agent_fixture("single-agent-checks");
+    let setup = admitted_single_agent_project_with(
+        &fixture,
+        &repository,
+        serde_json::json!([{
+            "check_key":"says-done","command_kind":"exact_shell",
+            "shell_command":"grep -q DONE result.txt","cwd":".","timeout_seconds":30,
+            "original_text":"result.txt says DONE"
+        }]),
+    );
+    let check_id: String = fixture.scalar(&format!(
+        "SELECT id FROM execution_verification_checks WHERE execution_config_revision_id='{}'",
+        setup.config_id
+    ));
+    let created = workflow_command(
+        &fixture,
+        serde_json::json!({
+            "kind":"create_task","operation_id":"create-checked","project_id":setup.project_id,
+            "title":"Say done","description":"Write DONE","acceptance_criteria":["The fixture says done"],
+            "priority":0,
+            "selection":{"family":"single_agent","execution_config_revision_id":setup.config_id,
+                "profile_revision_id":setup.profile_revision_id,"check_ids":[check_id]}
+        }),
+    )
+    .unwrap();
+    let task_id = created.entity_id;
+    make_ready(&fixture, &task_id, created.version.unwrap()).unwrap();
+    let (context, _) = running_single_agent(&fixture, &task_id);
+    single_agent_session_start(&fixture, &context);
+    let app = single_agent_application(&fixture);
+    let recorded = finish_single_agent_writer(&fixture, &app, &context, "result.txt", "DONE\n");
+
+    // Selected checks are mandatory and run only under a person's exact decision.
+    let held = tick_until(&fixture, &app, "held");
+    assert!(
+        held["reason"]
+            .as_str()
+            .unwrap()
+            .contains("needs your authorization"),
+        "{held}"
+    );
+    let run_state = single_agent_run(&fixture, &task_id);
+    assert!(run_state
+        .available_actions
+        .contains(&"authorize_check".to_owned()));
+    assert!(!run_state
+        .available_actions
+        .contains(&"accept_result".to_owned()));
+    let check = run_state.checks[0].clone();
+    assert_eq!(check.authorization, "missing");
+    let authorize = |operation: &str, command_hash: &str, decision: &str, lifetime: &str| {
+        workflow_command(
+            &fixture,
+            serde_json::json!({
+                "kind":"authorize_check","operation_id":operation,"task_id":task_id,
+                "attempt_id":context.attempt_id,"check_id":check_id,
+                "exact_command_hash":command_hash,"scope_hash":check.scope_hash,
+                "decision":decision,"lifetime":lifetime
+            }),
+        )
+    };
+    let stale = authorize("authorize-stale", "0000", "authorized", "once")
+        .unwrap_err()
+        .to_string();
+    assert!(stale.contains("changed since you reviewed"), "{stale}");
+    let denied = authorize("deny-1", &check.exact_command_hash, "denied", "once").unwrap();
+    assert_eq!(denied.detail["hold_released"], false);
+    assert_eq!(
+        single_agent_run(&fixture, &task_id).checks[0].authorization,
+        "denied"
+    );
+    let authorized = authorize(
+        "authorize-1",
+        &check.exact_command_hash,
+        "authorized",
+        "once",
+    )
+    .unwrap();
+    assert_eq!(authorized.detail["hold_released"], true);
+
+    let finished = tick_until(&fixture, &app, "single_agent_check_finished");
+    assert_eq!(finished["result"]["passed"], true, "{finished}");
+    tick_until(&fixture, &app, "single_agent_checks_passed");
+    let run_state = single_agent_run(&fixture, &task_id);
+    assert_eq!(run_state.checks[0].latest_run_passed, Some(true));
+    assert!(run_state
+        .available_actions
+        .contains(&"accept_result".to_owned()));
+    // The waiting decision is a notice, and the task's status names it.
+    let review_notice = format!("attempt:{}:awaiting_human", context.attempt_id);
+    let state = workflow::state(&fixture.store).unwrap();
+    let notice = state
+        .attention
+        .iter()
+        .find(|item| item.id == review_notice)
+        .expect("a checked result waiting for a person is a notice");
+    assert_eq!(notice.action.kind, AttentionActionKind::ReviewResult);
+    let progress = state
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .and_then(|task| task.progress.clone())
+        .unwrap();
+    assert_eq!(progress.responsible, "you");
+    assert_eq!(
+        progress.next_operation.as_deref(),
+        Some(notice.action.label.as_str())
+    );
+    // The one-time authorization was consumed by that run_state.
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM workflow_check_authorizations WHERE consumed_at IS NOT NULL",
+        1_i64,
+    );
+    let version: i64 = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task_id}'"));
+    let candidate: String = fixture.scalar(&format!(
+        "SELECT candidate_hash FROM attempts WHERE id='{}'",
+        context.attempt_id
+    ));
+    let accepted = workflow_command(
+        &fixture,
+        serde_json::json!({
+            "kind":"accept_result","operation_id":"accept-checked","task_id":task_id,
+            "attempt_id":context.attempt_id,"expected_version":version,
+            "result_binding_id":recorded["result_binding_id"],"candidate_hash":candidate
+        }),
+    )
+    .unwrap();
+    assert_eq!(accepted.state, "accepted");
+    fixture.assert_scalar(
+        "SELECT json_array_length(check_receipts_json,'$.check_runs') FROM workflow_result_acceptances",
+        1_i64,
+    );
+    assert!(!single_agent_run(&fixture, &task_id).integration_recorded);
+    assert!(!workflow::state(&fixture.store)
+        .unwrap()
+        .attention
+        .iter()
+        .any(|item| item.id == review_notice));
+
+    // Only verified integration of this accepted manifest counts.
+    let (dependent, version) = single_agent_task(&fixture, &setup);
+    let version = workflow::execute(
+        &fixture.store,
+        &HumanCommand::AddDependency {
+            operation_id: "depend".into(),
+            task_id: dependent.clone(),
+            depends_on_task_id: task_id.clone(),
+            expected_version: version,
+        },
+    )
+    .unwrap()
+    .version
+    .unwrap();
+    fixture
+        .connection()
+        .execute(
+            "UPDATE task_dependencies SET integration_commit=?1,verified_at='2026-01-01T00:00:00Z',
+               integration_manifest_hash='unrelated-manifest' WHERE task_id=?2",
+            params![
+                output(&repository, &["rev-parse", "HEAD"]).trim(),
+                dependent
+            ],
+        )
+        .unwrap();
+    assert!(!single_agent_run(&fixture, &task_id).integration_recorded);
+    std::fs::write(repository.join("result.txt"), "DONE\n").unwrap();
+    run(&repository, &["add", "result.txt"]);
+    run(
+        &repository,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "Integrate the accepted result",
+        ],
+    );
+    let integrated = workflow::execute(
+        &fixture.store,
+        &HumanCommand::RecordIntegration {
+            operation_id: "integrate".into(),
+            task_id: dependent.clone(),
+            depends_on_task_id: task_id.clone(),
+            git_ref: "HEAD".into(),
+            expected_version: version,
+        },
+    )
+    .unwrap();
+    assert_eq!(integrated.state, "integration_recorded");
+    fixture.assert_scalar(
+        &format!(
+            "SELECT json_extract(verification_json,'$.changed_paths') FROM task_dependencies WHERE task_id='{dependent}'"
+        ),
+        r#"["result.txt"]"#.to_owned(),
+    );
+    assert!(single_agent_run(&fixture, &task_id).integration_recorded);
+}
+
+#[test]
+fn single_agent_failed_check_reruns_only_after_a_newer_authorization() {
+    let (fixture, repository) = single_agent_fixture("single-agent-check-failure");
+    let setup = admitted_single_agent_project_with(
+        &fixture,
+        &repository,
+        serde_json::json!([{
+            "check_key":"says-done","command_kind":"exact_shell",
+            "shell_command":"grep -q DONE result.txt","cwd":".","timeout_seconds":30,
+            "original_text":"result.txt says DONE"
+        }]),
+    );
+    let check_id: String = fixture.scalar("SELECT id FROM execution_verification_checks");
+    let (task_id, version) = single_agent_task(&fixture, &setup);
+    let reselected = workflow_command(&fixture, serde_json::json!({
+        "kind":"set_task_workflow","operation_id":"select-check","task_id":task_id,"expected_version":version,
+        "selection":{"family":"single_agent","execution_config_revision_id":setup.config_id,
+            "profile_revision_id":setup.profile_revision_id,"check_ids":[check_id]}
+    }))
+    .unwrap();
+    make_ready(&fixture, &task_id, reselected.version.unwrap()).unwrap();
+    let (context, _) = running_single_agent(&fixture, &task_id);
+    let app = single_agent_application(&fixture);
+    finish_single_agent_writer(&fixture, &app, &context, "result.txt", "not yet\n");
+    tick_until(&fixture, &app, "held");
+    let check = single_agent_run(&fixture, &task_id).checks[0].clone();
+    workflow_command(
+        &fixture,
+        serde_json::json!({
+            "kind":"authorize_check","operation_id":"authorize-run","task_id":task_id,
+            "attempt_id":context.attempt_id,"check_id":check_id,
+            "exact_command_hash":check.exact_command_hash,"scope_hash":check.scope_hash,
+            "decision":"authorized","lifetime":"run"
+        }),
+    )
+    .unwrap();
+    let finished = tick_until(&fixture, &app, "single_agent_check_finished");
+    assert_eq!(finished["result"]["passed"], false, "{finished}");
+    // A run-long authorization does not retry a failure on its own.
+    let held = tick_until(&fixture, &app, "held");
+    assert!(
+        held["reason"].as_str().unwrap().contains("did not pass"),
+        "{held}"
+    );
+    let run = single_agent_run(&fixture, &task_id);
+    assert!(!run.available_actions.contains(&"accept_result".to_owned()));
+    assert!(run.available_actions.contains(&"request_rework".to_owned()));
+    let check_runs = || -> i64 {
+        fixture.scalar(&format!(
+            "SELECT COUNT(*) FROM check_runs WHERE attempt_id='{}'",
+            context.attempt_id
+        ))
+    };
+    assert_eq!(check_runs(), 1);
+    // The held run stays held; nothing reruns on the earlier decision.
+    for _ in 0..2 {
+        app.coordinator_tick().unwrap();
+    }
+    assert_eq!(check_runs(), 1);
+
+    // A newer explicit decision reruns the same command on the same frozen
+    // candidate exactly once; a repeated failure needs yet another decision.
+    let rerun = workflow_command(
+        &fixture,
+        serde_json::json!({
+            "kind":"authorize_check","operation_id":"authorize-rerun","task_id":task_id,
+            "attempt_id":context.attempt_id,"check_id":check_id,
+            "exact_command_hash":check.exact_command_hash,"scope_hash":check.scope_hash,
+            "decision":"authorized","lifetime":"once"
+        }),
+    )
+    .unwrap();
+    assert_eq!(rerun.detail["hold_released"], true);
+    let candidate_before: String = fixture.scalar(&format!(
+        "SELECT candidate_hash FROM attempts WHERE id='{}'",
+        context.attempt_id
+    ));
+    let finished = tick_until(&fixture, &app, "single_agent_check_finished");
+    assert_eq!(finished["result"]["passed"], false, "{finished}");
+    let held = tick_until(&fixture, &app, "held");
+    assert!(
+        held["reason"].as_str().unwrap().contains("did not pass"),
+        "{held}"
+    );
+    assert_eq!(check_runs(), 2);
+    fixture.assert_scalar(
+        &format!(
+            "SELECT candidate_hash FROM attempts WHERE id='{}'",
+            context.attempt_id
+        ),
+        candidate_before,
+    );
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM workflow_check_authorizations WHERE lifetime='once' AND consumed_at IS NOT NULL",
+        1_i64,
+    );
+    for _ in 0..2 {
+        app.coordinator_tick().unwrap();
+    }
+    assert_eq!(check_runs(), 2);
+}
+
+#[test]
+fn single_agent_writer_resumes_only_its_exact_retained_conversation() {
+    let (fixture, repository) = single_agent_fixture("single-agent-resume");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task_id, version) = single_agent_task(&fixture, &setup);
+    make_ready(&fixture, &task_id, version).unwrap();
+    let (context, _) = running_single_agent(&fixture, &task_id);
+    let native = single_agent_session_start(&fixture, &context);
+    let app = single_agent_application(&fixture);
+
+    // A planned shutdown records the working writer, which then resumes on
+    // its own, in the same session and native conversation.
+    agenticjira::recovery::capture_desired_running_before_drain(&fixture.store).unwrap();
+    exit_single_agent(&fixture, &context);
+    let resumed = tick_until(&fixture, &app, "single_agent_resumed");
+    assert_eq!(resumed["session_id"], context.session_id);
+    assert_ne!(resumed["transcript_epoch"], context.transcript_epoch);
+    fixture.assert_scalar(
+        &format!(
+            "SELECT s.resume_count||':'||s.native_session_id||':'||s.desired_running||':'||
+               (SELECT COUNT(*) FROM resume_invocations WHERE session_id=s.id)||':'||
+               (SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}')
+             FROM sessions s WHERE s.id='{}'",
+            context.attempt_id, context.session_id
+        ),
+        format!("1:{native}:0:1:1"),
+    );
+    // The earlier turn's credential no longer authorizes anything.
+    assert!(fixture.store.execution_context(&context.token).is_err());
+
+    // A writer that stops on its own without a result waits for a person.
+    let (epoch, process): (String, String) = fixture
+        .connection()
+        .query_row(
+            "SELECT transcript_epoch,process_identity_json FROM sessions WHERE id=?1",
+            params![context.session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(fixture
+        .store
+        .update_session_exit(
+            &context.session_id,
+            &epoch,
+            &process,
+            &serde_json::json!({"success":true,"process_group_quiescent":true}).to_string(),
+        )
+        .unwrap());
+    let held = tick_until(&fixture, &app, "held");
+    assert!(
+        held["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Resume its retained conversation"),
+        "{held}"
+    );
+    let run = single_agent_run(&fixture, &task_id);
+    let resume = run.resume.clone().unwrap();
+    assert!(resume.available, "{resume:?}");
+    assert!(run.available_actions.contains(&"resume_run".to_owned()));
+    assert!(run.available_actions.contains(&"cancel".to_owned()));
+    let decision = workflow::state(&fixture.store)
+        .unwrap()
+        .decisions
+        .into_iter()
+        .find(|decision| {
+            decision.subject.attempt_id.as_deref() == Some(context.attempt_id.as_str())
+        })
+        .expect("the held Single agent run has a current decision");
+    assert_eq!(decision.reason_code, "workflow.single_agent.needs_person");
+    assert_eq!(
+        decision
+            .next_action
+            .as_ref()
+            .map(|action| action.operation.as_str()),
+        Some("resume_run")
+    );
+    assert!(decision
+        .control_policy
+        .allowed_controls
+        .contains(&"cancel".to_owned()));
+
+    let version: i64 = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task_id}'"));
+    let resume_command = |operation: &str, epoch: &str| {
+        app.execute_workflow_command(
+            &serde_json::from_value(serde_json::json!({
+                "kind":"resume_run","operation_id":operation,"task_id":task_id,
+                "attempt_id":context.attempt_id,"expected_version":version,
+                "session_id":context.session_id,"transcript_epoch":epoch,
+                "message":"Use the existing fixture file."
+            }))
+            .unwrap(),
+        )
+    };
+    assert!(resume_command("resume-stale", &context.transcript_epoch).is_err());
+    let first = resume_command("resume-1", &resume.transcript_epoch).unwrap();
+    assert_eq!(first.state, "resume_reserved");
+    assert_eq!(
+        resume_command("resume-1", &resume.transcript_epoch)
+            .unwrap()
+            .detail,
+        first.detail
+    );
+    fixture.assert_scalar(
+        &format!(
+            "SELECT s.status||':'||s.resume_count||':'||a.status||':'||t.attention FROM sessions s
+             JOIN role_generations g ON g.id=s.role_generation_id JOIN attempts a ON a.id=g.attempt_id
+             JOIN tasks t ON t.id=a.task_id WHERE s.id='{}'",
+            context.session_id
+        ),
+        "running:2:running:none".to_owned(),
+    );
+
+    // A person's resume stays bound to what they reviewed up to the
+    // reservation itself: a later turn or a newer task version refuses it
+    // there, before any credential, session, report or receipt changes.
+    let (current_epoch, process): (String, String) = fixture
+        .connection()
+        .query_row(
+            "SELECT transcript_epoch,process_identity_json FROM sessions WHERE id=?1",
+            params![context.session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(fixture
+        .store
+        .update_session_exit(
+            &context.session_id,
+            &current_epoch,
+            &process,
+            &serde_json::json!({"success":true,"process_group_quiescent":true}).to_string(),
+        )
+        .unwrap());
+    let stopped_version: i64 =
+        fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task_id}'"));
+    tick_until(&fixture, &app, "held");
+    let held_version: i64 =
+        fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task_id}'"));
+    assert_eq!(held_version, stopped_version + 1);
+    // The context the service resolves for the conversation as it is now.
+    let next = agenticjira::store::SingleAgentLaunchContext {
+        transcript_epoch: uuid::Uuid::new_v4().to_string(),
+        credential_id: uuid::Uuid::new_v4().to_string(),
+        token: uuid::Uuid::new_v4().to_string(),
+        resume: Some(agenticjira::workflow::SingleAgentResumeTarget {
+            session_id: context.session_id.clone(),
+            role_generation_id: context.role_generation_id.clone(),
+            transcript_epoch: current_epoch.clone(),
+            native_session_id: native.clone(),
+            resume_count: 2,
+        }),
+        ..context.clone()
+    };
+    let hooks = test_hooks(&fixture);
+    let executable = std::env::current_exe().unwrap();
+    let bundles = single_agent_bundles();
+    let launch = providers::prepare_single_agent_launch(&providers::SingleAgentLaunchRequest {
+        provider: next.provider,
+        model: &next.model,
+        effort: &next.effort,
+        cwd: &next.workspace,
+        prompt: "fixture",
+        role_socket: &fixture.root.join("role.sock"),
+        token: &next.token,
+        role_generation_id: &next.role_generation_id,
+        session_id: &next.session_id,
+        native_session_id: Some(native.as_str()),
+        assets: &hooks,
+        executable_path: &executable,
+        bundles: &bundles,
+    })
+    .unwrap();
+    let untouched = || -> String {
+        fixture.scalar(&format!(
+            "SELECT s.status||':'||s.transcript_epoch||':'||s.resume_count||':'||t.version||':'||a.status||':'||
+               (SELECT COUNT(*) FROM role_credentials WHERE role_generation_id=s.role_generation_id AND revoked_at IS NULL)||':'||
+               (SELECT COUNT(*) FROM resume_invocations WHERE session_id=s.id)||':'||
+               (SELECT COUNT(*) FROM operation_receipts WHERE operation_id LIKE 'resume-reviewed-%')||':'||
+               (SELECT COUNT(*) FROM audit_events WHERE event_code='single_agent.resume.reserved')
+             FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+             JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id WHERE s.id='{}'",
+            context.session_id
+        ))
+    };
+    let before = untouched();
+    for (operation, reviewed_epoch, reviewed_version) in [
+        // Reviewed the earlier turn; the conversation has moved on since.
+        (
+            "resume-reviewed-earlier-turn",
+            resume.transcript_epoch.as_str(),
+            held_version,
+        ),
+        // Same session and turn, but reviewed before the task changed.
+        (
+            "resume-reviewed-older-version",
+            current_epoch.as_str(),
+            stopped_version,
+        ),
+    ] {
+        let refused = fixture
+            .store
+            .reserve_single_agent_resume(
+                &next,
+                agenticjira::workflow::SingleAgentResumeMode::Explicit,
+                &launch,
+                Some(&agenticjira::store::SingleAgentResumeBinding {
+                    operation_id: operation,
+                    request_hash: "reviewed-request",
+                    task_id: &task_id,
+                    attempt_id: &context.attempt_id,
+                    expected_version: reviewed_version,
+                    session_id: &context.session_id,
+                    transcript_epoch: reviewed_epoch,
+                }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("changed since you reviewed"),
+            "{operation}: {refused}"
+        );
+        assert_eq!(untouched(), before, "{operation}");
+    }
+    // The exact current review still resumes.
+    let resumed = app
+        .execute_workflow_command(
+            &serde_json::from_value(serde_json::json!({
+                "kind":"resume_run","operation_id":"resume-2","task_id":task_id,
+                "attempt_id":context.attempt_id,"expected_version":held_version,
+                "session_id":context.session_id,"transcript_epoch":current_epoch,
+                "message":"Continue."
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(resumed.state, "resume_reserved");
+    assert_eq!(resumed.detail["prior_transcript_epoch"], current_epoch);
+}
+
+fn single_agent_question(
+    fixture: &Fixture,
+    context: &agenticjira::store::SingleAgentLaunchContext,
+    operation: &str,
+) {
+    fixture
+        .store
+        .save_single_agent_result(
+            &single_agent_channel(fixture, context),
+            &RoleResultReport {
+                operation_id: operation.into(),
+                outcome: "needs_input".into(),
+                summary: "Which file should say done?".into(),
+                evidence: vec![],
+                metadata: serde_json::json!({}),
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn single_agent_question_stops_its_own_turn_once() {
+    let (fixture, repository) = single_agent_fixture("single-agent-stop");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let app = single_agent_application(&fixture);
+    let stop_reservations = || -> i64 {
+        fixture.scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE event_code='single_agent.report.stop_reserved'",
+        )
+    };
+    let (first_task, version) = single_agent_task(&fixture, &setup);
+    make_ready(&fixture, &first_task, version).unwrap();
+    let (first, _) = running_single_agent(&fixture, &first_task);
+    single_agent_question(&fixture, &first, "question-1");
+    let stop = tick_until(&fixture, &app, "single_agent_writer_stop");
+    assert_eq!(stop["session_id"], first.session_id);
+    assert_eq!(stop["transcript_epoch"], first.transcript_epoch);
+    fixture.assert_scalar(
+        &format!(
+            "SELECT status FROM sessions WHERE id='{}'",
+            first.session_id
+        ),
+        "interrupt_requested".to_owned(),
+    );
+    assert_eq!(stop_reservations(), 1);
+    app.coordinator_tick().unwrap();
+    assert_eq!(stop_reservations(), 1);
+    exit_single_agent(&fixture, &first);
+    tick_until(&fixture, &app, "held");
+    assert_eq!(stop_reservations(), 1);
+}
+
+#[test]
+fn single_agent_project_is_not_asked_to_install_trip_it_does_not_run() {
+    let (fixture, repository) = single_agent_fixture("single-agent-setup-notice");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let setup_notice = || {
+        workflow::state(&fixture.store)
+            .unwrap()
+            .attention
+            .into_iter()
+            .any(|item| item.id == format!("project_setup:{}", setup.project_id))
+    };
+    assert!(setup_notice(), "TRIP is still this project's default");
+    workflow_command(
+        &fixture,
+        serde_json::json!({
+            "kind":"set_project_workflow_default","operation_id":"default-single",
+            "project_id":setup.project_id,"expected_version":0,"family":"single_agent"
+        }),
+    )
+    .unwrap();
+    assert!(!setup_notice());
+    // Single agent work keeps it that way; the notice never needs dismissing.
+    let (task_id, version) = single_agent_task(&fixture, &setup);
+    make_ready(&fixture, &task_id, version).unwrap();
+    assert!(!setup_notice());
+}
+
+#[test]
+fn single_agent_native_permission_is_granted_only_by_a_person_and_delivered_once() {
+    use agenticjira::permissions::{
+        begin_actor_request, consume_actor_response, BridgeStart, PermissionActor,
+    };
+    let (fixture, repository) = single_agent_fixture("single-agent-permission");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task_id, version) = single_agent_task(&fixture, &setup);
+    make_ready(&fixture, &task_id, version).unwrap();
+    let (context, _) = running_single_agent(&fixture, &task_id);
+    let native = single_agent_session_start(&fixture, &context);
+    let agent = single_agent_channel(&fixture, &context);
+    // The writer's credential reaches only its own channel; a decision is a
+    // human command it has no operation for.
+    assert_eq!(
+        agent.channel_operations,
+        ["context", "report", "hook", "permission_request"]
+    );
+    let actor = PermissionActor::single_agent(&fixture.store, &agent).unwrap();
+    assert!(actor.writer, "{actor:?}");
+    let cwd = context.workspace.to_string_lossy().into_owned();
+    let begin = |actor: &PermissionActor, hook: &str, connection: &str| {
+        begin_actor_request(
+            &fixture.store,
+            actor,
+            &permission_payload(
+                &native,
+                hook,
+                serde_json::json!({"command":"ls","cwd":cwd}),
+                None,
+            ),
+            "boot",
+            connection,
+        )
+        .unwrap()
+    };
+    let pending = |start: BridgeStart| match start {
+        BridgeStart::Pending { request_id } => request_id,
+        BridgeStart::Immediate(response) => panic!("expected a pending request, got {response}"),
+    };
+    let consume = |request_id: &str, connection: &str, actor: &PermissionActor| {
+        consume_actor_response(
+            &fixture.store,
+            request_id,
+            "boot",
+            connection,
+            &context.token,
+            actor,
+        )
+        .unwrap()
+        .map(|response| response_behavior(&response).to_owned())
+    };
+    let request_state = |request_id: &str| -> String {
+        fixture.scalar(&format!(
+            "SELECT state||':'||role||':'||delivery_state FROM permission_requests WHERE id='{request_id}'"
+        ))
+    };
+    let decide = |operation: &str, request_id: &str, revision: i64| {
+        workflow::execute(
+            &fixture.store,
+            &HumanCommand::DecidePermission {
+                operation_id: operation.into(),
+                request_id: request_id.into(),
+                expected_revision: revision,
+                decision: PermissionDecision::ApproveOnce,
+                lifetime: None,
+                reason: String::new(),
+            },
+        )
+    };
+
+    // A person's one-time grant is delivered exactly once.
+    let granted = pending(begin(&actor, "grant", "grant-connection"));
+    assert_eq!(consume(&granted, "grant-connection", &actor), None);
+    let projected = workflow::state(&fixture.store)
+        .unwrap()
+        .permission_requests
+        .into_iter()
+        .find(|request| request.id == granted)
+        .unwrap();
+    assert_eq!(
+        (projected.role, projected.actor.as_str()),
+        (None, "single_agent")
+    );
+    assert_eq!(
+        decide_permission(
+            &fixture,
+            "grant",
+            &granted,
+            PermissionDecision::ApproveOnce,
+            None,
+            ""
+        )
+        .state,
+        "approved_once"
+    );
+    assert_eq!(
+        consume(&granted, "grant-connection", &actor).as_deref(),
+        Some("allow")
+    );
+    assert_eq!(
+        agenticjira::permissions::mark_response_delivered(&fixture.store, "grant-connection")
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        request_state(&granted),
+        "approved_once:single_agent:delivered"
+    );
+    assert_eq!(
+        consume(&granted, "grant-connection", &actor).as_deref(),
+        Some("deny")
+    );
+
+    // An explicit denial is delivered as a denial.
+    let denied = pending(begin(&actor, "deny", "deny-connection"));
+    decide_permission(
+        &fixture,
+        "deny",
+        &denied,
+        PermissionDecision::Deny,
+        None,
+        "Not needed",
+    );
+    assert_eq!(
+        consume(&denied, "deny-connection", &actor).as_deref(),
+        Some("deny")
+    );
+
+    // A request read back over another connection has lost its delivery
+    // fence: it expires and can no longer be granted.
+    let stale = pending(begin(&actor, "stale", "first-connection"));
+    assert_eq!(
+        consume(&stale, "replacement-connection", &actor).as_deref(),
+        Some("deny")
+    );
+    assert!(request_state(&stale).starts_with("expired:"));
+    assert!(decide("grant-stale", &stale, 2).is_err());
+
+    // A grant never reaches a different actor binding.
+    let misbound = pending(begin(&actor, "misbound", "misbound-connection"));
+    decide("grant-misbound", &misbound, 1).unwrap();
+    let implementer = PermissionActor {
+        actor: "implementer".into(),
+        ..actor.clone()
+    };
+    assert_eq!(
+        consume(&misbound, "misbound-connection", &implementer).as_deref(),
+        Some("deny")
+    );
+
+    // A writer not bound to the compiled workspace-writer policy is refused
+    // before any person is asked, and nobody can grant it afterwards.
+    let read_only = PermissionActor {
+        writer: false,
+        ..actor.clone()
+    };
+    let BridgeStart::Immediate(response) = begin(&read_only, "read-only", "read-only-connection")
+    else {
+        panic!("a read-only Single agent request must not wait for a person")
+    };
+    assert_eq!(response_behavior(&response), "deny");
+    let (read_only_id, reason): (String, String) = fixture
+        .connection()
+        .query_row(
+            "SELECT id,state||':'||decision_reason FROM permission_requests
+             WHERE hook_invocation_nonce='read-only'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        reason.starts_with("policy_denied:This Single agent is not bound"),
+        "{reason}"
+    );
+    assert!(decide("grant-read-only", &read_only_id, 1).is_err());
+}
+
+#[test]
+fn single_agent_cancel_stops_a_held_run_and_retires_its_authority() {
+    let (fixture, repository) = single_agent_fixture("single-agent-cancel");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task_id, version) = single_agent_task(&fixture, &setup);
+    make_ready(&fixture, &task_id, version).unwrap();
+    let (context, _) = running_single_agent(&fixture, &task_id);
+    let app = single_agent_application(&fixture);
+    exit_single_agent(&fixture, &context);
+    tick_until(&fixture, &app, "held");
+    let version: i64 = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task_id}'"));
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            task_id: task_id.clone(),
+            expected_version: version,
+            action: "cancel".into(),
+            payload: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    tick_until(&fixture, &app, "cancel");
+    fixture.assert_scalar(
+        &format!(
+            "SELECT t.lifecycle||':'||a.status||':'||(SELECT COUNT(*) FROM role_credentials rc
+               JOIN role_generations g ON g.id=rc.role_generation_id
+               WHERE g.attempt_id=a.id AND rc.revoked_at IS NULL)||':'||
+               (SELECT state FROM claims WHERE attempt_id=a.id)
+             FROM tasks t JOIN attempts a ON a.task_id=t.id WHERE t.id='{task_id}'"
+        ),
+        "cancelled:cancelled:0:cancelled".to_owned(),
+    );
+    assert!(single_agent_run(&fixture, &task_id)
+        .available_actions
+        .is_empty());
+}
+
+#[test]
+fn single_agent_new_task_resolves_the_default_only_at_creation() {
+    let (fixture, repository) = single_agent_fixture("single-agent-create");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let create = |operation: &str, selection: serde_json::Value| {
+        let mut command = serde_json::json!({
+            "kind":"create_task","operation_id":operation,"project_id":setup.project_id,
+            "title":"Draft","description":"","acceptance_criteria":["Done"],"priority":0
+        });
+        if !selection.is_null() {
+            command["selection"] = selection;
+        }
+        workflow_command(&fixture, command)
+    };
+    let trip = create("create-trip-default", serde_json::Value::Null).unwrap();
+    assert_eq!(trip.detail["family"], "trip");
+    fixture.assert_scalar(
+        &format!(
+            "SELECT COUNT(*) FROM task_workflow_selections WHERE task_id='{}'",
+            trip.entity_id
+        ),
+        0_i64,
+    );
+    workflow_command(&fixture, serde_json::json!({
+        "kind":"set_project_workflow_default","operation_id":"default-single","project_id":setup.project_id,
+        "expected_version":0,"family":"single_agent"
+    }))
+    .unwrap();
+    let tasks_before: i64 = fixture.scalar("SELECT COUNT(*) FROM tasks");
+    let refused = create("create-missing-selection", serde_json::Value::Null)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("Single agent tasks by default"),
+        "{refused}"
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM tasks", tasks_before);
+    let single = create(
+        "create-single",
+        serde_json::json!({"family":"single_agent","execution_config_revision_id":setup.config_id,
+            "profile_revision_id":setup.profile_revision_id,"check_ids":[]}),
+    )
+    .unwrap();
+    assert_eq!(single.version, Some(2));
+    fixture.assert_scalar(
+        &format!(
+            "SELECT family||':'||admission_state FROM task_workflow_selections WHERE task_id='{}'",
+            single.entity_id
+        ),
+        "single_agent:draft".to_owned(),
+    );
+    // The earlier draft keeps the family it was created with.
+    fixture.assert_scalar(
+        &format!(
+            "SELECT COUNT(*) FROM task_workflow_selections WHERE task_id='{}'",
+            trip.entity_id
+        ),
+        0_i64,
+    );
+}
+
+#[test]
+fn single_agent_probe_is_refused_while_the_writer_contract_is_unqualified() {
+    let fixture = Fixture::new("single-agent-unqualified-probe");
+    let repository = fixture.repository("single-agent-repo");
+    let project_id = workflow::execute(
+        &fixture.store,
+        &HumanCommand::AddProject {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            path: repository.clone(),
+            display_name: "Unqualified".into(),
+        },
+    )
+    .unwrap()
+    .entity_id;
+    let config_id = workflow_command(&fixture, serde_json::json!({
+        "kind":"save_execution_configuration","operation_id":"config-u","project_id":project_id,
+        "expected_revision":0,
+        "configuration":{"guidance_paths":[],"testing_coverage":"minimal","documentation_policy":"none","checks":[]}
+    }))
+    .unwrap()
+    .entity_id;
+    let revision = workflow_command(&fixture, serde_json::json!({
+        "kind":"save_agent_profile","operation_id":"profile-u","project_id":project_id,
+        "profile":{"display_name":"Writer","provider":"claude","model":"fixture-model","effort":"high"}
+    }))
+    .unwrap()
+    .detail["profile_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let pending = workflow_command(
+        &fixture,
+        serde_json::json!({
+            "kind":"prepare_profile_admission","operation_id":"admission-u","project_id":project_id,
+            "profile_revision_id":revision,"execution_config_revision_id":config_id
+        }),
+    )
+    .unwrap();
+    // The embedded release's own policy keeps the probe unavailable, and the
+    // dashboard shows exactly the refusal the command gives.
+    let admission = workflow::state(&fixture.store)
+        .unwrap()
+        .workflow_execution
+        .into_iter()
+        .find(|execution| execution.project_id == project_id)
+        .and_then(|execution| {
+            execution
+                .admissions
+                .into_iter()
+                .find(|admission| admission.id == pending.entity_id)
+        })
+        .unwrap();
+    assert!(!admission.probe_available);
+    let refused = workflow_command(
+        &fixture,
+        serde_json::json!({
+            "kind":"probe_profile_admission","operation_id":"probe-u","project_id":project_id,
+            "admission_id":pending.entity_id
+        }),
+    )
+    .unwrap_err();
+    let refused = format!("{refused:#}");
+    assert!(refused.contains("not qualified"), "{refused}");
+    assert_eq!(admission.probe_unavailable_reason, Some(refused));
+    fixture.assert_scalar("SELECT COUNT(*) FROM tasks", 0_i64);
+    let coverage = workflow_command(&fixture, serde_json::json!({
+        "kind":"save_execution_configuration","operation_id":"config-bad-coverage","project_id":project_id,
+        "expected_revision":1,
+        "configuration":{"guidance_paths":[],"testing_coverage":"thorough","documentation_policy":"none","checks":[]}
+    }))
+    .unwrap_err()
+    .to_string();
+    assert!(
+        coverage.contains("minimal, moderate or extensive"),
+        "{coverage}"
+    );
+}
+
+#[test]
 fn c8_codex_native_policy_identity_and_current_admission_are_fail_closed() {
     let floor = Fixture::new("c8-codex-denied-read-floor");
     let floor_repo = floor.repository("repo");
@@ -37019,7 +39058,9 @@ fn mb14_stale_exit_cannot_mutate_reserved_or_running_replacement_generation() {
 }
 
 /// Tables read directly or through helper decisions by `workflow::state`.
-const STATE_PROJECTED_TABLES: [&str; 71] = [
+const STATE_PROJECTED_TABLES: [&str; 90] = [
+    "agent_profile_revisions",
+    "agent_profiles",
     "attempts",
     "attention_observations",
     "audit_events",
@@ -37030,8 +39071,12 @@ const STATE_PROJECTED_TABLES: [&str; 71] = [
     "cmux_session_surfaces",
     "codex_usage_observations",
     "controls",
+    "execution_bindings",
+    "execution_config_revisions",
+    "execution_verification_checks",
     "freeze_intents",
     "guidance_messages",
+    "history_pane_views",
     "hook_events",
     "implementation_lanes",
     "input_leases",
@@ -37042,10 +39087,15 @@ const STATE_PROJECTED_TABLES: [&str; 71] = [
     "permission_request_hooks",
     "permission_requests",
     "permission_rules",
+    "profile_admissions",
     "project_profile_set_revisions",
     "project_profile_sets",
+    "project_workflow_defaults",
     "projects",
     "provider_failure_holds",
+    "provider_observations",
+    "provider_validation_batches",
+    "provider_validation_invocations",
     "recipe_schedule_fires",
     "recipe_schedules",
     "recovery_records",
@@ -37068,6 +39118,7 @@ const STATE_PROJECTED_TABLES: [&str; 71] = [
     "task_recipe_bindings",
     "task_recipe_revisions",
     "task_recipes",
+    "task_workflow_selections",
     "tasks",
     "trip_attempt_profiles",
     "trip_check_authorizations",
@@ -37090,6 +39141,13 @@ const STATE_PROJECTED_TABLES: [&str; 71] = [
     "trip_structured_plans",
     "trip_task_profile_activations",
     "trip_verification_checks",
+    "workflow_check_authorizations",
+    "workflow_check_selections",
+    "workflow_definitions",
+    "workflow_result_acceptances",
+    "workflow_result_bindings",
+    "workflow_run_bindings",
+    "workflow_run_profiles",
     "workspaces",
 ];
 
@@ -37411,7 +39469,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 38_i64);
+    fixture.assert_scalar("PRAGMA user_version", 39_i64);
     fixture.assert_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%'",
         i64::try_from(triggers.len()).unwrap(),
@@ -37446,7 +39504,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 38_i64);
+    fixture.assert_scalar("PRAGMA user_version", 39_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -37639,6 +39697,21 @@ fn m6_attention_projection_orders_exact_targets_and_folds_duplicate_reasons() {
         None,
         "a record of a superseded attempt never targets the newer attempt"
     );
+    let earlier = item("recovery_record:rv0");
+    assert!(
+        earlier.reason.contains("earlier attempt"),
+        "{}",
+        earlier.reason
+    );
+    assert!(
+        earlier
+            .details
+            .as_deref()
+            .is_some_and(|details| details.starts_with("Recovery record rv0 · attempt va0")),
+        "{:?}",
+        earlier.details
+    );
+    assert!(item("recovery_record:rv").details.is_none());
     assert_eq!(
         item("project_setup:q").target,
         Some(AttentionTarget::ProjectSetup {
@@ -42285,6 +44358,50 @@ fn guidance_preview_preserves_authority_and_approval_rechecks_the_displayed_cont
     assert_eq!(preview["files"][0]["sha256"], sha256(changed.as_bytes()));
     assert_eq!(guidance_policy(&fixture), policy);
     fixture.assert_scalar("SELECT version FROM tasks WHERE id='t'", version);
+    let worktree = workspace.canonicalize().unwrap();
+    assert_eq!(
+        preview["workspace"],
+        serde_json::json!({"path":worktree,"base_revision":"base"})
+    );
+    // Without a base commit nothing earlier is offered as the reviewed bytes.
+    assert_eq!(preview["files"][0]["baseline"]["source"], "unavailable");
+    assert!(preview["files"][0]["baseline"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("complete current content is shown"));
+    assert!(preview["files"][0]["diff"].is_null());
+
+    // With the reviewed bytes committed at the workspace's base, the diff
+    // compares exactly those pinned bytes with the content shown.
+    std::fs::write(workspace.join("README.md"), "# Project\n").unwrap();
+    run(&workspace, &["init", "-q"]);
+    commit_all(&workspace, "Pinned guidance");
+    let base = output(&workspace, &["rev-parse", "HEAD"]).trim().to_owned();
+    fixture.execute(
+        "UPDATE workspaces SET base_revision=?1,worktree_head=?1 WHERE id='w'",
+        params![base],
+    );
+    std::fs::write(workspace.join("README.md"), changed).unwrap();
+    let compared =
+        agenticjira::trip::guidance_reauthorization_preview(&fixture.store, "t").unwrap();
+    let file = &compared["files"][0];
+    assert_eq!(compared["workspace"]["base_revision"], base);
+    assert_eq!(file["content"], changed);
+    assert_eq!(file["sha256"], sha256(changed.as_bytes()));
+    assert_eq!(
+        file["baseline"],
+        serde_json::json!({"source":"pinned","revision":base,
+            "sha256":file["previous_sha256"],"reason":null})
+    );
+    assert_eq!(
+        file["diff"],
+        serde_json::json!([
+            {"kind":"context","text":"# Project\n"},
+            {"kind":"added","text":"\n"},
+            {"kind":"added","text":"Approved architecture link.\n"},
+        ])
+    );
+    assert_eq!(guidance_policy(&fixture), policy);
     // A changed file after preview cannot inherit approval of the displayed text.
     std::fs::write(workspace.join("README.md"), "Different content\n").unwrap();
     let file = &preview["files"][0];
@@ -42317,6 +44434,86 @@ fn guidance_preview_preserves_authority_and_approval_rechecks_the_displayed_cont
             .contains("docs/UNOWNED.md")
     );
     assert_eq!(guidance_policy(&fixture), policy);
+    std::fs::write(workspace.join("docs/UNOWNED.md"), "Unowned\n").unwrap();
+
+    // Once an approved edit moves the pin away from the base commit, the base
+    // version is labelled only as that, and its bytes cannot be approved.
+    let approved_pin = sha256(changed.as_bytes());
+    reauthorize_guidance(
+        &fixture,
+        "approve-readme",
+        version,
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        compared["policy_hash"].as_str().unwrap(),
+        &[(
+            "README.md",
+            compared["files"][0]["previous_sha256"].as_str().unwrap(),
+            &approved_pin,
+        )],
+    )
+    .unwrap();
+    assert_eq!(guidance_pin(&fixture, "README.md"), approved_pin);
+    let edited = "# Project\n\nApproved architecture link.\nFurther note.\n";
+    std::fs::write(workspace.join("README.md"), edited).unwrap();
+    let rebased = agenticjira::trip::guidance_reauthorization_preview(&fixture.store, "t").unwrap();
+    let file = &rebased["files"][0];
+    let base_bytes = sha256(b"# Project\n");
+    assert_eq!(file["previous_sha256"], approved_pin);
+    assert_eq!(file["content"], edited);
+    assert_eq!(file["sha256"], sha256(edited.as_bytes()));
+    assert_eq!(
+        file["baseline"],
+        serde_json::json!({"source":"base_commit","revision":base,"sha256":base_bytes,"reason":null})
+    );
+    assert_eq!(
+        file["diff"],
+        serde_json::json!([
+            {"kind":"context","text":"# Project\n"},
+            {"kind":"added","text":"\n"},
+            {"kind":"added","text":"Approved architecture link.\n"},
+            {"kind":"added","text":"Further note.\n"},
+        ])
+    );
+    let approved_policy = guidance_policy(&fixture);
+    assert!(reauthorize_guidance(
+        &fixture,
+        "approve-base-bytes",
+        rebased["expected_version"].as_i64().unwrap(),
+        "plan-hash",
+        GUIDANCE_CONFIG_REVISION,
+        rebased["policy_hash"].as_str().unwrap(),
+        &[("README.md", &base_bytes, &sha256(edited.as_bytes()))],
+    )
+    .is_err());
+    assert_eq!(guidance_policy(&fixture), approved_policy);
+
+    // A base version beyond the read bound is never buffered whole; the
+    // preview keeps the exact current bytes and offers no comparison.
+    std::fs::write(workspace.join("README.md"), "x".repeat(257 * 1024)).unwrap();
+    commit_all(&workspace, "Oversized base guidance");
+    let oversized = output(&workspace, &["rev-parse", "HEAD"]).trim().to_owned();
+    fixture.execute(
+        "UPDATE workspaces SET base_revision=?1,worktree_head=?1 WHERE id='w'",
+        params![oversized],
+    );
+    std::fs::write(workspace.join("README.md"), edited).unwrap();
+    let bounded = agenticjira::trip::guidance_reauthorization_preview(&fixture.store, "t").unwrap();
+    let file = &bounded["files"][0];
+    assert_eq!(file["previous_sha256"], approved_pin);
+    assert_eq!(file["content"], edited);
+    assert_eq!(file["sha256"], sha256(edited.as_bytes()));
+    assert_eq!(file["baseline"]["source"], "unavailable");
+    assert!(
+        file["baseline"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("256 KiB comparison limit"),
+        "{}",
+        file["baseline"]
+    );
+    assert!(file["diff"].is_null());
+    assert_eq!(guidance_policy(&fixture), approved_policy);
 }
 
 #[test]
@@ -42373,6 +44570,54 @@ fn a_settled_guidance_subject_does_not_release_an_unchanged_readiness_failure() 
     let original = std::fs::read(workspace.join("README.md")).unwrap();
     std::fs::write(workspace.join("README.md"), "Changed guidance\n").unwrap();
     let version: i64 = fixture.scalar("SELECT version FROM tasks WHERE id='t'");
+    // The projection and the handler use the same known prerequisite, so
+    // Retry is neither offered nor accepted while the cause is unchanged.
+    let retry_offer = || {
+        let state = workflow::state(&fixture.store).unwrap();
+        let prerequisite = state
+            .recovery
+            .iter()
+            .find(|record| record["id"] == "readiness-hold")
+            .and_then(|record| record["retry_prerequisite"].as_str().map(str::to_owned));
+        let action = state
+            .continuation_actions
+            .into_iter()
+            .find(|action| action.binding["recovery_id"] == "readiness-hold")
+            .expect("the failed step has a recovery action");
+        (
+            prerequisite,
+            action.binding["retry_enabled"].as_bool().unwrap(),
+            action.reason,
+        )
+    };
+    let (prerequisite, retry_enabled, reason) = retry_offer();
+    assert!(
+        prerequisite
+            .as_deref()
+            .is_some_and(|cause| cause.contains("README.md")),
+        "{prerequisite:?}"
+    );
+    assert!(!retry_enabled);
+    assert!(reason.contains("Retry step stays unavailable"), "{reason}");
+    let refused = resolve_failed_step(
+        &fixture,
+        "retry-unchanged",
+        "t",
+        "a",
+        "readiness-hold",
+        "retry_failed_step",
+        version,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        refused.contains("reviewed instruction files are not ready"),
+        "{refused}"
+    );
+    fixture.assert_scalar::<String>(
+        "SELECT state||':'||(json_extract(detail_json,'$.resolution') IS NULL) FROM recovery_records WHERE id='readiness-hold'",
+        "attention_required:1".into(),
+    );
     let app = synthetic_coordinator(&fixture);
     for _ in 0..3 {
         app.coordinator_tick().unwrap();
@@ -42382,7 +44627,12 @@ fn a_settled_guidance_subject_does_not_release_an_unchanged_readiness_failure() 
         );
         fixture.assert_scalar("SELECT version FROM tasks WHERE id='t'", version);
     }
+    assert_eq!(retry_offer(), (prerequisite, false, reason));
+
     std::fs::write(workspace.join("README.md"), original).unwrap();
+    let (prerequisite, retry_enabled, _) = retry_offer();
+    assert_eq!(prerequisite, None);
+    assert!(retry_enabled);
     let settled = app.coordinator_tick().unwrap();
     assert_eq!(
         settled["action"], "coordinator_failure_released",
@@ -42392,6 +44642,7 @@ fn a_settled_guidance_subject_does_not_release_an_unchanged_readiness_failure() 
         "SELECT state FROM recovery_records WHERE id='readiness-hold'",
         "resolved_retry".into(),
     );
+    fixture.assert_scalar("SELECT version FROM tasks WHERE id='t'", version + 1);
 }
 
 #[test]
@@ -44319,14 +46570,14 @@ fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordina
 #[test]
 fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
-    fixture.assert_scalar("PRAGMA user_version", 38_i64);
+    fixture.assert_scalar("PRAGMA user_version", 39_i64);
     let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
     fixture.execute_batch(&format!(
         "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; PRAGMA user_version=30;"
     ));
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 38_i64);
+    fixture.assert_scalar("PRAGMA user_version", 39_i64);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
@@ -45094,7 +47345,50 @@ fn stale_restart_candidate_cancellation_refuses_live_sessions_and_pending_admiss
 }
 
 const MIGRATION_031_SQL: &str = include_str!("../migrations/031_final_repair_recheck.sql");
-const DROP_AFTER_SCHEMA_32: &str = "DROP TABLE codex_usage_observations;
+/// Undoes 039 first (its tables and the sessions owner rebuild); every fixture
+/// upgrades afterwards and 039 recreates the sessions indexes and triggers.
+const DROP_AFTER_SCHEMA_32: &str = "PRAGMA foreign_keys=OFF;
+     DROP TABLE history_pane_views;
+     DROP TABLE workflow_result_acceptances; DROP TABLE workflow_result_bindings;
+     DROP TABLE workflow_check_authorizations; DROP TABLE workflow_check_selections;
+     DROP TABLE execution_bindings; DROP TABLE workflow_run_profiles;
+     DROP TABLE workflow_run_bindings; DROP TABLE task_workflow_selections;
+     DROP TABLE project_workflow_defaults; DROP TABLE profile_admissions;
+     DROP TABLE agent_profile_revisions; DROP TABLE agent_profiles;
+     DROP TABLE execution_verification_checks; DROP TABLE execution_config_revisions;
+     DROP TABLE workflow_definitions;
+     CREATE TABLE sessions_schema_38 (
+         id TEXT PRIMARY KEY, role_generation_id TEXT NOT NULL REFERENCES role_generations(id),
+         provider TEXT NOT NULL, validation_cell TEXT, status TEXT NOT NULL,
+         launch_config_json TEXT NOT NULL, executable_version TEXT NOT NULL,
+         native_session_id TEXT, native_identity_source TEXT, process_identity_json TEXT,
+         transcript_epoch TEXT NOT NULL, transcript_last_sequence INTEGER NOT NULL DEFAULT 0,
+         capture_state TEXT NOT NULL DEFAULT 'capturing', capture_error TEXT,
+         hook_trust_state TEXT NOT NULL DEFAULT 'pending_observation', exit_json TEXT,
+         created_at TEXT NOT NULL, updated_at TEXT NOT NULL, native_identity_verified_at TEXT,
+         readiness_state TEXT NOT NULL DEFAULT 'unknown', invocation_input_json TEXT,
+         workflow_version TEXT NOT NULL DEFAULT 'trip-v1', workflow_hash TEXT NOT NULL DEFAULT '',
+         prompt_hash TEXT NOT NULL DEFAULT '', launch_state TEXT NOT NULL DEFAULT 'reserved',
+         launch_error TEXT, resume_count INTEGER NOT NULL DEFAULT 0, capability_key TEXT,
+         capability_identity_json TEXT, recovery_root_pid INTEGER, recovery_process_group_id INTEGER,
+         desired_running INTEGER NOT NULL DEFAULT 0, launch_boot_identity TEXT,
+         recovery_anchor_json TEXT, initial_hook_event_boundary_rowid INTEGER NOT NULL DEFAULT 0,
+         lane_id TEXT NOT NULL DEFAULT 'default', setup_permit_id TEXT, interrupt_requested_at TEXT);
+     INSERT INTO sessions_schema_38 SELECT id,role_generation_id,provider,validation_cell,status,
+         launch_config_json,executable_version,native_session_id,native_identity_source,
+         process_identity_json,transcript_epoch,transcript_last_sequence,capture_state,capture_error,
+         hook_trust_state,exit_json,created_at,updated_at,native_identity_verified_at,readiness_state,
+         invocation_input_json,workflow_version,workflow_hash,prompt_hash,launch_state,launch_error,
+         resume_count,capability_key,capability_identity_json,recovery_root_pid,
+         recovery_process_group_id,desired_running,launch_boot_identity,recovery_anchor_json,
+         initial_hook_event_boundary_rowid,lane_id,setup_permit_id,interrupt_requested_at
+       FROM sessions;
+     DROP TABLE sessions;
+     DROP TABLE provider_observations; DROP TABLE provider_validation_invocations;
+     DROP TABLE provider_validation_batches;
+     ALTER TABLE sessions_schema_38 RENAME TO sessions;
+     PRAGMA foreign_keys=ON;
+     DROP TABLE codex_usage_observations;
      DROP TABLE attention_observations; DROP INDEX role_results_session_generation;
      DROP TABLE provider_failure_holds;
      DROP TRIGGER guidance_submitted_form_paired;
@@ -45199,7 +47493,7 @@ fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
     fixture.assert_scalar("PRAGMA user_version", 31_i64);
 
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 38_i64);
+    fixture.assert_scalar("PRAGMA user_version", 39_i64);
     assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(

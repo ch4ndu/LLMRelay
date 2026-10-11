@@ -23,6 +23,26 @@ const sameTarget = (left: AttentionTarget, right: AttentionTarget) => {
     entries.every(([key, value]) => Reflect.get(right, key) === value);
 };
 
+/**
+ * Groups items that open the same exact target for the same action under one
+ * navigation button. This is presentation only: each item may still be a
+ * separate obligation, so every ID and reason stays listed. Items without a
+ * target are never grouped, so unresolved holds stay individually visible.
+ */
+const groupedByDestination = (items: AttentionItem[]) =>
+  items.reduce<AttentionItem[][]>((groups, item) => {
+    const index = item.target === null ? -1 : groups.findIndex(([first]) =>
+      first.target !== null && item.target !== null &&
+      sameTarget(first.target, item.target) &&
+      first.action?.kind === item.action?.kind
+    );
+    return index < 0
+      ? [...groups, [item]]
+      : groups.map((group, position) =>
+        position === index ? [...group, item] : group
+      );
+  }, []);
+
 function unresolvedTarget(
   state: AppState,
   target: AttentionTarget,
@@ -256,7 +276,7 @@ export function AttentionInbox(
               {label} <span className="count">{items.length}</span>
             </h3>
             {sharedReason && <p className="hint">{sharedReason}</p>}
-            {items.map((item) => {
+            {groupedByDestination(items).map(([item, ...related]) => {
               const { target: destination } = item;
               const project = destination && "project_id" in destination
                 ? projectName(destination.project_id)
@@ -278,6 +298,28 @@ export function AttentionInbox(
                       <TechnicalDetails>
                         <pre>{item.details}</pre>
                       </TechnicalDetails>
+                    )}
+                    {related.length > 0 && (
+                      <details className="attention-related">
+                        <summary>
+                          {related.length === 1
+                            ? "1 more notice about the same step"
+                            : `${related.length} more notices about the same step`}
+                        </summary>
+                        <ul>
+                          {related.map((other) => (
+                            <li key={other.id} data-attention-id={other.id}>
+                              <strong>{other.title}</strong>
+                              {!sharedReason && other.reason && <p>{other.reason}</p>}
+                              {other.details && (
+                                <TechnicalDetails>
+                                  <pre>{other.details}</pre>
+                                </TechnicalDetails>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
                     )}
                   </div>
                   {destination

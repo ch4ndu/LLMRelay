@@ -6,6 +6,7 @@ import {
   type Project,
   roleLabel,
   type Session,
+  type SingleAgentStage,
   type Task,
   type TaskAction,
 } from "../types";
@@ -139,6 +140,26 @@ const attentionStatus: Record<string, Omit<TaskStatus, "completed">> = {
   },
 };
 
+// Labels only; the explanation is always the service's own `stage_reason`.
+const singleAgentStatus: Record<
+  SingleAgentStage,
+  { label: string; tone: StatusTone }
+> = {
+  waiting_to_start: { label: "Waiting to start", tone: "waiting" },
+  writing: { label: "Agent working", tone: "active" },
+  result_submitted_waiting_for_stop: {
+    label: "Result submitted",
+    tone: "active",
+  },
+  awaiting_selected_checks: { label: "Waiting for checks", tone: "waiting" },
+  awaiting_human: { label: "Awaiting your review", tone: "attention" },
+  accepted: { label: "Completed", tone: "done" },
+  probe_evidence_recorded: { label: "Probe finished", tone: "done" },
+  changes_requested: { label: "Changes requested", tone: "active" },
+  needs_action: { label: "Needs your action", tone: "attention" },
+  blocked: { label: "Blocked", tone: "danger" },
+};
+
 export const isCompletedTask = (task: Task) =>
   task.archived || task.lifecycle === "done" || task.lifecycle === "cancelled";
 
@@ -151,11 +172,21 @@ export function taskStatus(
   context: { project?: Project; sessions?: Session[] } = {},
 ): TaskStatus {
   const completed = isCompletedTask(task);
+  const run = task.workflow?.family === "single_agent"
+    ? task.workflow.run
+    : null;
   if (task.archived) {
     return {
       label: "Archived",
       tone: "neutral",
       detail: "Hidden from active work. Restore it from History to use it again.",
+      completed,
+    };
+  }
+  if (task.lifecycle === "done" && run) {
+    return {
+      ...singleAgentStatus[run.stage],
+      detail: run.stage_reason,
       completed,
     };
   }
@@ -222,7 +253,14 @@ export function taskStatus(
     };
   }
   const attention = attentionStatus[task.attention];
-  if (attention) return { ...attention, completed };
+  // A Single agent run's stage already explains its holds and decisions;
+  // only pauses and capacity waits are task-level facts it does not carry.
+  if (
+    attention &&
+    (!run ||
+      ["paused", "pause_requested", "queued_capacity", "restart_parked"]
+        .includes(task.attention))
+  ) return { ...attention, completed };
   if (task.permission_waiting) {
     return {
       label: "Waiting for your approval",
@@ -272,6 +310,13 @@ export function taskStatus(
       completed,
     };
   }
+  if (run) {
+    return {
+      ...singleAgentStatus[run.stage],
+      detail: run.stage_reason,
+      completed,
+    };
+  }
   const phase = attempt && phaseStatus[attempt.phase];
   if (attempt?.phase === "checks" &&
     task.progress?.reason_code.startsWith("workflow.manager_conformance_")) {
@@ -300,6 +345,20 @@ export function taskStatus(
       completed,
     };
   }
+  const submitted = attempt?.phase === "implementation" &&
+    running.some((session) =>
+      session.role === "implementer" &&
+      (session.reported_in_latest_invocation === true ||
+        session.reported_in_latest_invocation === 1)
+    );
+  if (submitted) {
+    return {
+      label: "Implementation submitted",
+      tone: "waiting",
+      detail: "The implementer reported its work for this step. The manager decides what happens next.",
+      completed,
+    };
+  }
   if (phase) return { ...phase, completed };
   return {
     label: lifecycleLabels[task.lifecycle] || "In progress",
@@ -310,6 +369,37 @@ export function taskStatus(
 }
 
 export const PHASE_STEPS = ["Plan", "Build", "Verify", "Review"] as const;
+export const SINGLE_AGENT_STEPS = [
+  "Agent work",
+  "Result",
+  "Checks",
+  "Your review",
+] as const;
+
+/**
+ * The step list for the task's workflow and the index of its current step,
+ * as `phaseStep` counts it; Single agent steps follow the run's stage.
+ */
+export function taskSteps(
+  task: Task,
+): { steps: readonly string[]; current: number } {
+  if (task.workflow?.family !== "single_agent") {
+    return { steps: PHASE_STEPS, current: phaseStep(task) };
+  }
+  const order: Partial<Record<SingleAgentStage, number>> = {
+    waiting_to_start: 0,
+    writing: 0,
+    result_submitted_waiting_for_stop: 1,
+    awaiting_selected_checks: 2,
+    awaiting_human: 3,
+    accepted: SINGLE_AGENT_STEPS.length,
+  };
+  const stage = task.workflow.run?.stage;
+  return {
+    steps: SINGLE_AGENT_STEPS,
+    current: stage === undefined ? -1 : order[stage] ?? -1,
+  };
+}
 
 /** Index of the current step in `PHASE_STEPS`, 4 when finished, -1 before planning. */
 export function phaseStep(task: Task): number {
@@ -544,12 +634,13 @@ export function TaskBoard(
           <small>
             {project?.display_name || "Unknown project"}
             {priorityLabel(task) ? ` · ${priorityLabel(task)}` : ""}
+            {task.workflow?.family === "single_agent" ? " · Single agent" : ""}
           </small>
           {task.recipe_provenance && (
             <small>
               {task.recipe_provenance.schedule_id
-                ? "Scheduled draft"
-                : "Recipe draft"} · {task.recipe_provenance.recipe_name}{" "}
+                ? "Scheduled TRIP draft"
+                : "TRIP recipe draft"} · {task.recipe_provenance.recipe_name}{" "}
               revision {task.recipe_provenance.recipe_revision}
             </small>
           )}
@@ -663,11 +754,13 @@ export function TaskBoard(
                     <small>
                       {project?.display_name || "Unknown project"} ·{" "}
                       {lifecycleLabels[task.lifecycle] || task.lifecycle}
+                      {task.workflow?.family === "single_agent" &&
+                        " · Single agent"}
                       {task.recipe_provenance &&
                         ` · ${
                           task.recipe_provenance.schedule_id
-                            ? "Scheduled draft"
-                            : "Recipe draft"
+                            ? "Scheduled TRIP draft"
+                            : "TRIP recipe draft"
                         } from ${task.recipe_provenance.recipe_name}`}
                     </small>
                   </button>

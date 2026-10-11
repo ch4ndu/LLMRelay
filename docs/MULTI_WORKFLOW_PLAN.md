@@ -1,6 +1,18 @@
 # Shared workflow architecture: TRIP plus Single agent
 
-**Status:** MW-01 documentation candidate; Single agent is a future implementation.
+**Status:** MW-01 design record, retained as written below. The Single agent
+workflow has since been implemented in source in one consolidated delivery
+rather than the MW-02 to MW-04 sequence: workflow selection and project
+default, execution configurations, profiles and admissions, the run,
+structured result, selected checks, acceptance, linked rework, resume and the
+dashboard controls, together with app-wide provider checks. Gate A and B
+evidence is limited to the automated Rust and dashboard tests. Gate C has not
+started: the Single agent writer modes remain unqualified, so no Single agent
+profile can be activated on a real installation, and browser validation is
+pending. Gate D follows the usual review and acceptance. Current behavior is
+described in [Tasks, agents, and verification](WORKFLOWS.md#single-agent-workflow).
+Where this record names future tasks, file paths or migration names, the
+implementation's own source is authoritative.
 
 **Task:** AJ-4FCAAAE2, replacement MW-01.
 

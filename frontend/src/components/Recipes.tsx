@@ -419,8 +419,9 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
           <span className="eyebrow">{project.display_name}</span>
           <h1>Recipes</h1>
           <p>
-            Saved configurations copy into ordinary editable drafts. A draft
-            is queued only when you choose Make Ready.
+            Saved TRIP configurations copy into ordinary editable TRIP drafts.
+            A draft is queued only when you choose Make Ready. Recipes and
+            schedules do not create Single agent tasks.
           </p>
         </div>
       </header>

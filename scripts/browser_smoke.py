@@ -58,6 +58,14 @@ class Browser:
     def fill(self, label, value):
         self.call("fill", self.label(label), value)
 
+    def nav(self, page):
+        # Match the label span: the button text also holds the icon and,
+        # for Workspace, a waiting count.
+        self.call("click", self.selector(
+            "[...document.querySelectorAll(\"nav[aria-label='Main navigation'] button\")]"
+            f".find(e => e.querySelector('.nav-label')?.textContent === {json.dumps(page)})"
+        ))
+
     def expect(self, expression):
         if self.evaluate(expression) is not True:
             raise AssertionError(expression)
@@ -114,11 +122,9 @@ UNTESTED_BOUNDARIES = [
     "(need live agents; covered by Rust contract tests)",
 ]
 
-# The dashboard has no theme switch; it follows prefers-color-scheme. cmux
-# cannot emulate that preference, and this suite does not change system
-# settings, so each run verifies the browser's native appearance and records
-# the other one as untested. Browser page zoom has no cmux command either;
-# only the root text size is scaled, and it is reported as text scaling.
+# Each run checks only the browser's current native appearance and scales
+# only the root text size. It does not exercise the other appearance or
+# browser page zoom, and records both as untested.
 NATIVE_SCHEME = "matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'"
 
 HOSTILE_MARKDOWN = "\n".join([
@@ -176,18 +182,20 @@ def smoke(args):
             observer.call("reload")
             observer.wait(f"!!({project})")
             observer.call("click", observer.selector(project))
-            observer.call("click", "nav[aria-label='Main navigation'] button:nth-child(2)")
+            observer.nav("Board")
         passed("project registered with pickup paused")
 
-        for index, heading in enumerate([
-            "What's happening", "Tasks", "Recipes", "Projects",
-            "Completed and archived tasks", "Diagnostics and setup",
-        ], 1):
-            browser.call("click", f"nav[aria-label='Main navigation'] button:nth-child({index})")
+        # Opening Providers only renders the page; it starts no check.
+        for page, heading in [
+            ("Workspace", "What's happening"), ("Board", "Tasks"), ("Recipes", "Recipes"),
+            ("Projects", "Projects"), ("Providers", "Providers"),
+            ("History", "Completed and archived tasks"), ("Diagnostics", "Diagnostics and setup"),
+        ]:
+            browser.nav(page)
             browser.wait(f"[...document.querySelectorAll('h1')].some(e => e.textContent === {json.dumps(heading)})")
             passed(f"navigation: {heading}")
 
-        browser.call("click", "nav[aria-label='Main navigation'] button:nth-child(2)")
+        browser.nav("Board")
         browser.click("＋ New task")
         browser.wait("!!document.querySelector('#task-form-title')")
         browser.fill("Title", "")
@@ -269,7 +277,7 @@ def smoke(args):
         passed("task dialog closes with Escape and returns focus to its card")
         browser.call("click", browser.selector(f"({card()}).querySelector('.card-body')"))
         browser.wait("!!document.querySelector('[role=dialog]')")
-        for tab in ["Changes", "Checks", "Activity", "Overview"]:
+        for tab in ["Changes", "Checks", "Roles", "Activity", "Overview"]:
             browser.click(tab, "document.querySelector('[role=dialog]')")
             browser.wait(f"[...document.querySelectorAll('[role=tab]')].some(e => e.textContent === {json.dumps(tab)} && e.getAttribute('aria-selected') === 'true')")
         passed("task dialog tabs")
@@ -279,12 +287,12 @@ def smoke(args):
         if observer:
             observer.wait(f"!({card()})")
         browser.call("click", "button[aria-label='Close task details']")
-        browser.call("click", "nav[aria-label='Main navigation'] button:nth-child(5)")
+        browser.nav("History")
         history_row = "[...document.querySelectorAll('.history-list article')].find(e => e.textContent.includes(" + json.dumps(title) + "))"
         browser.wait(f"!!({history_row})")
         browser.click("Restore", history_row)
         browser.wait(f"!({history_row})")
-        browser.call("click", "nav[aria-label='Main navigation'] button:nth-child(2)")
+        browser.nav("Board")
         browser.wait(f"!!({card()})")
         passed("archive and restore through History")
         if observer:
@@ -342,18 +350,19 @@ def smoke(args):
         results["native_color_scheme"] = theme
         browser.expect(f"getComputedStyle(document.documentElement).colorScheme.includes({json.dumps(theme)})")
         results["untested_boundaries"].append(
-            f"{other} appearance: cmux cannot emulate prefers-color-scheme and this suite does not "
-            f"change system settings; rerun with the system set to {other} appearance")
+            f"{other} appearance: this runner checks only the current native appearance; "
+            f"it does not exercise {other} appearance")
         results["untested_boundaries"].append(
-            "browser page zoom: cmux exposes no zoom command; only root text size was scaled")
+            "browser page zoom: this runner does not exercise it; only root text size was scaled")
         for width, height, scale in [("1440", "1000", "100%"), ("900", "800", "100%"),
                                      ("390", "844", "100%"), ("1440", "1000", "200%")]:
             browser.call("viewport", width, height)
             browser.evaluate(f"document.documentElement.style.fontSize = {json.dumps(scale)}")
             label = f"text-{scale.rstrip('%')}"
-            for index, name in [(1, "workspace"), (2, "board"), (4, "projects"), (1, "workspace")]:
+            for page, name in [("Workspace", "workspace"), ("Board", "board"),
+                               ("Projects", "projects"), ("Workspace", "workspace")]:
                 browser.evaluate(open_menu)
-                browser.call("click", f"nav[aria-label='Main navigation'] button:nth-child({index})")
+                browser.nav(page)
                 browser.wait("!!document.querySelector('h1')")
                 browser.expect(no_overflow)
                 if name == "board":
@@ -382,14 +391,13 @@ def smoke(args):
         # overflowed. Check the edit fields at 407px and 193px.
         browser.call("viewport", "1440", "1000")
         browser.evaluate(open_menu)
-        browser.call("click", "nav[aria-label='Main navigation'] button:nth-child(2)")
+        browser.nav("Board")
         browser.wait(f"!!({card()})")
         browser.call("click", browser.selector(f"({card()}).querySelector('.card-body')"))
         browser.wait("!!document.querySelector('[role=dialog]')")
-        browser.call("click", browser.selector("[...document.querySelectorAll('[role=tab]')].find(e => e.textContent === 'Activity')"))
-        settings = "[...document.querySelectorAll('[role=dialog] details')].find(e => e.querySelector('summary')?.textContent === 'Agent settings')"
-        browser.wait(f"!!({settings})")
-        browser.evaluate(f"(({settings}).open = true, true)")
+        browser.call("click", browser.selector("[...document.querySelectorAll('[role=tab]')].find(e => e.textContent === 'Roles')"))
+        settings = "document.querySelector('[role=dialog] section.role-settings')"
+        browser.wait(f"{settings}?.querySelector('h3')?.textContent === 'Agent roles'")
         browser.click("Edit", f"({settings}).querySelector('.role-list article')")
         fields = "document.querySelector('[role=dialog] .role-edit-fields')"
         browser.wait(f"!!{fields}")
@@ -416,7 +424,7 @@ def smoke(args):
         browser.wait("!document.querySelector('[role=dialog]')")
         browser.call("viewport", "390", "844")
         browser.evaluate(open_menu)
-        browser.call("click", "nav[aria-label='Main navigation'] button:nth-child(2)")
+        browser.nav("Board")
         browser.wait(f"!!({card()})")
         browser.call("click", browser.selector(f"({card()}).querySelector('.card-body')"))
         browser.wait("!!document.querySelector('[role=dialog]')")

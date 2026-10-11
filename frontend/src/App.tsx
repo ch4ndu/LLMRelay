@@ -32,6 +32,7 @@ import {
   type Task,
   type TaskAction,
   type TripSetupState,
+  type ValidationProvider,
 } from "./types";
 import {
   nativePromptLabel,
@@ -52,15 +53,79 @@ import { History } from "./components/History";
 import { Recipes } from "./components/Recipes";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { CompatibilityDetails, RoleSettings } from "./components/RoleSettings";
-type Page = "workspace" | "board" | "recipes" | "roles" | "history" | "diagnostics";
+import { ProviderSettings } from "./components/ProviderSettings";
+type Page =
+  | "workspace"
+  | "board"
+  | "recipes"
+  | "roles"
+  | "providers"
+  | "history"
+  | "diagnostics";
 const pages: Array<{ id: Page; label: string; icon: string }> = [
   { id: "workspace", label: "Workspace", icon: "◫" },
   { id: "board", label: "Board", icon: "▦" },
   { id: "recipes", label: "Recipes", icon: "▤" },
   { id: "roles", label: "Projects", icon: "▣" },
+  { id: "providers", label: "Providers", icon: "◇" },
   { id: "history", label: "History", icon: "◴" },
   { id: "diagnostics", label: "Diagnostics", icon: "⚙" },
 ];
+const isPage = (value: unknown): value is Page =>
+  pages.some((item) => item.id === value);
+
+const knownProviderModels = (state: AppState) => {
+  const models: Record<ValidationProvider, string[]> = { codex: [], claude: [] };
+  for (const execution of state.workflow_execution ?? []) {
+    for (const { current_revision: revision } of execution.profiles) {
+      if (revision) models[revision.provider].push(revision.model);
+    }
+  }
+  for (const proof of state.provider_validation?.proofs ?? []) {
+    models[proof.provider].push(proof.model);
+  }
+  return models;
+};
+
+const TASK_OPERATIONS_PREFIX = "llmrelay.task.operations.";
+/**
+ * Settles stored draft deletions against a complete snapshot, which lists
+ * every task: a task that is gone was deleted, and one at a strictly newer
+ * version can no longer be deleted by the older request. A task at or below
+ * the requested version (for example after a restored database) proves
+ * nothing, and an unreadable request is never settled; both stay stored for
+ * an exact replay. Other stored requests are kept untouched.
+ */
+function settleDraftDeletions(state: AppState) {
+  for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+    const storageKey = localStorage.key(index);
+    if (!storageKey?.startsWith(TASK_OPERATIONS_PREFIX)) continue;
+    const taskId = storageKey.slice(TASK_OPERATIONS_PREFIX.length);
+    let entries: unknown;
+    try {
+      entries = JSON.parse(localStorage.getItem(storageKey) || "[]");
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(entries)) continue;
+    const task = state.tasks.find((item) => item.id === taskId);
+    const deletePrefix = `delete_draft_task:${taskId}:`;
+    const kept = entries.filter((entry: unknown) => {
+      if (!Array.isArray(entry) || typeof entry[0] !== "string") return true;
+      const key: string = entry[0];
+      if (!key.startsWith(deletePrefix)) return true;
+      const versionText = key.slice(deletePrefix.length).split(":")[0];
+      const version = Number(versionText);
+      if (!/^(0|[1-9][0-9]*)$/.test(versionText) || !Number.isSafeInteger(version)) {
+        return true;
+      }
+      return task !== undefined && task.version <= version;
+    });
+    if (kept.length === entries.length) continue;
+    if (kept.length) localStorage.setItem(storageKey, JSON.stringify(kept));
+    else localStorage.removeItem(storageKey);
+  }
+}
 export type Appearance = "system" | "light" | "dark";
 const appearanceKey = "llmrelay.appearance";
 const isAppearance = (value: unknown): value is Appearance =>
@@ -263,12 +328,8 @@ const empty: AppState = {
 export function App() {
   const [state, setState] = useState<AppState>(empty);
   const [page, setPage] = useState<Page>(() => {
-    const saved = localStorage.getItem("agenticjira.page") as Page;
-    return ["workspace", "board", "recipes", "roles", "history", "diagnostics"].includes(
-        saved,
-      )
-      ? saved
-      : "workspace";
+    const saved = localStorage.getItem("agenticjira.page");
+    return isPage(saved) ? saved : "workspace";
   });
   const [project, setProject] = useState<string | undefined>(() =>
     localStorage.getItem("agenticjira.project") || undefined
@@ -470,6 +531,9 @@ export function App() {
     }
   }, [state, browserAlerts]);
   useEffect(() => {
+    if (state.incarnation) settleDraftDeletions(state);
+  }, [state]);
+  useEffect(() => {
     localStorage.setItem("agenticjira.page", page);
   }, [page]);
   useEffect(() => {
@@ -553,14 +617,13 @@ export function App() {
       void refresh();
       return `${item.title} changed before it could open: ${problem} The latest state was requested; nothing was executed.`;
     }
-    // Live output and Agent settings are on the Activity tab; every other
-    // exact destination is on Overview.
     routeTo(
       latest,
       item.title,
       target,
-      item.action?.kind === "open_agent_output" ||
-        target.kind === "role_settings"
+      target.kind === "role_settings"
+        ? "roles"
+        : item.action?.kind === "open_agent_output"
         ? "activity"
         : "overview",
     );
@@ -1003,6 +1066,10 @@ export function App() {
                           item.trip?.active_config_revision_id
                       )}
                       cmuxSurfaces={cmuxSurfaces}
+                      execution={state.workflow_execution?.find((execution) =>
+                        execution.project_id === item.id
+                      )}
+                      tasks={state.tasks}
                       onChanged={refresh}
                       onViewSession={viewCmuxSession}
                     />
@@ -1028,12 +1095,16 @@ export function App() {
                   setup.project_id === task.project_id
                 ).flatMap((setup) => setup.runtime_admissions)}
                 actions={state.continuation_actions}
+                execution={state.workflow_execution?.find((execution) =>
+                  execution.project_id === task.project_id
+                )}
+                tasks={state.tasks}
                 onChanged={refresh}
               />
             ))}
             {!tasks.length && (
               <p className="empty">
-                Create a task to see and change its six agent roles.
+                Create a task to see and change its agent settings.
               </p>
             )}
             <section className="panel capabilities">
@@ -1063,6 +1134,25 @@ export function App() {
                 </div>
               ))}
             </section>
+          </section>
+        )}
+        {page === "providers" && (
+          <section>
+            <header className="page-heading">
+              <div>
+                <span className="eyebrow">App-wide</span>
+                <h1>Providers</h1>
+                <p>
+                  Installed agent providers and the models your accounts can
+                  use. These checks are not tied to any project.
+                </p>
+              </div>
+            </header>
+            <ProviderSettings
+              validation={state.provider_validation}
+              knownModels={knownProviderModels(state)}
+              onChanged={() => void refresh()}
+            />
           </section>
         )}
         {page === "history" && (
@@ -1126,6 +1216,7 @@ export function App() {
             void refresh();
           }}
           onOpenSetup={openSetup}
+          workflowExecution={state.workflow_execution}
         />
       )}
     </div>

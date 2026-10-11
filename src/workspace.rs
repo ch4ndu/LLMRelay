@@ -127,6 +127,27 @@ pub fn committed_files(
     revision: &str,
     paths: &[&str],
 ) -> Result<Vec<Option<Vec<u8>>>> {
+    read_committed_files(root, revision, paths, None)?
+        .context("an unbounded git cat-file read cannot exceed a bound")
+}
+
+/// Reads one extra byte to detect overflow, then kills and reaps the exact
+/// child before returning `None` instead of buffering a large historical blob.
+pub(crate) fn committed_files_within(
+    root: &Path,
+    revision: &str,
+    paths: &[&str],
+    max_output_bytes: usize,
+) -> Result<Option<Vec<Option<Vec<u8>>>>> {
+    read_committed_files(root, revision, paths, Some(max_output_bytes))
+}
+
+fn read_committed_files(
+    root: &Path,
+    revision: &str,
+    paths: &[&str],
+    max_output_bytes: Option<usize>,
+) -> Result<Option<Vec<Option<Vec<u8>>>>> {
     use std::io::{Read, Write};
     let mut child = Command::new("git")
         .arg("-C")
@@ -149,11 +170,26 @@ pub fn committed_files(
         }
     }
     let mut output = Vec::new();
-    child
-        .stdout
-        .take()
-        .context("git cat-file stdout")?
-        .read_to_end(&mut output)?;
+    let mut stdout = child.stdout.take().context("git cat-file stdout")?;
+    match max_output_bytes {
+        None => {
+            stdout.read_to_end(&mut output)?;
+        }
+        Some(limit) => {
+            let limit_u64 = u64::try_from(limit).context("git cat-file read bound")?;
+            (&mut stdout)
+                .take(limit_u64.saturating_add(1))
+                .read_to_end(&mut output)?;
+            if output.len() > limit {
+                drop(stdout);
+                let killed = child.kill();
+                child.wait()?;
+                killed.context("stop git cat-file at its read bound")?;
+                return Ok(None);
+            }
+        }
+    }
+    drop(stdout);
     if !child.wait()?.success() {
         bail!("git cat-file failed in {}", root.display())
     }
@@ -177,13 +213,16 @@ pub fn committed_files(
             bail!("unexpected git cat-file header")
         };
         let size: usize = size.parse()?;
+        let end = cursor
+            .checked_add(size)
+            .context("git cat-file object size is out of range")?;
         let content = output
-            .get(cursor..cursor + size)
+            .get(cursor..end)
             .context("git cat-file object was truncated")?;
         files.push((*kind == "blob").then(|| content.to_vec()));
-        cursor += size + 1;
+        cursor = end + 1;
     }
-    Ok(files)
+    Ok(Some(files))
 }
 
 pub fn commit_exists(repository: &RepositoryInfo, commit: &str) -> Result<bool> {

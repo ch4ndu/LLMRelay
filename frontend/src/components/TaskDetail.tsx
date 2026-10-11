@@ -27,8 +27,12 @@ import {
   type TaskContent,
   type TaskProgress,
 } from "../types";
-import { projectSetupProblem, WorkflowControls } from "./WorkflowControls";
-import { ReviewPanel } from "./ReviewPanel";
+import {
+  isSingleAgentTask,
+  projectSetupProblem,
+  WorkflowControls,
+} from "./WorkflowControls";
+import { type PlanView, ReviewPanel } from "./ReviewPanel";
 import { RoleSettings } from "./RoleSettings";
 import { RecoveryPanel } from "./RecoveryPanel";
 import { GuidanceRecovery } from "./GuidanceRecovery";
@@ -38,35 +42,44 @@ import { MarkdownContent } from "./MarkdownContent";
 import { guidanceState } from "./AttentionInbox";
 import { ActivityTimeline } from "./ActivityTimeline";
 import { ObservedUsageDetails, SessionTree, useSessionAccess } from "./SessionTree";
-import { PHASE_STEPS, phaseStep, StatusBadge, taskStatus } from "./TaskBoard";
+import { StatusBadge, taskStatus, taskSteps } from "./TaskBoard";
 
-export type TaskTab = "overview" | "changes" | "checks" | "activity";
+export type TaskTab = "overview" | "changes" | "checks" | "roles" | "activity";
 const TABS: Array<{ id: TaskTab; label: string }> = [
   { id: "overview", label: "Overview" },
   { id: "changes", label: "Changes" },
   { id: "checks", label: "Checks" },
+  { id: "roles", label: "Roles" },
   { id: "activity", label: "Activity" },
 ];
 
 const focusableSelector =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])';
 
+// Open dialogs, innermost last. Only the innermost answers Escape, and the
+// page stays scroll-locked until the last of them closes.
+const openDialogs: symbol[] = [];
+
 /**
  * Modal focus handling: focus moves into the dialog, Tab stays inside it,
- * Escape closes it from any control unless something inside already handled
- * that key, and focus returns to what opened it.
+ * Escape closes the innermost dialog unless something inside already handled
+ * that key, and focus returns to `returnFocus` or to what opened it.
  */
 function useDialogFocus(
   dialog: RefObject<HTMLElement | null>,
   initial: RefObject<HTMLElement | null>,
   onClose: () => void,
+  returnFocus?: RefObject<HTMLElement | null>,
 ) {
   const close = useRef(onClose);
   close.current = onClose;
   useEffect(() => {
-    const opener = document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : undefined;
+    const token = Symbol("dialog");
+    openDialogs.push(token);
+    const opener = returnFocus?.current ??
+      (document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : undefined);
     const target = initial.current ?? dialog.current;
     target?.focus({ preventScroll: true });
     if (document.activeElement !== target) {
@@ -74,17 +87,21 @@ function useDialogFocus(
     }
     document.body.classList.add("dialog-open");
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || event.defaultPrevented) return;
+      if (
+        event.key !== "Escape" || event.defaultPrevented ||
+        openDialogs.at(-1) !== token
+      ) return;
       event.preventDefault();
       close.current();
     };
     document.addEventListener("keydown", onKeyDown);
     return () => {
       document.removeEventListener("keydown", onKeyDown);
-      document.body.classList.remove("dialog-open");
+      openDialogs.splice(openDialogs.indexOf(token), 1);
+      if (!openDialogs.length) document.body.classList.remove("dialog-open");
       if (opener?.isConnected) opener.focus({ preventScroll: true });
     };
-  }, [dialog, initial]);
+  }, [dialog, initial, returnFocus]);
   return (event: ReactKeyboardEvent<HTMLElement>) => {
     if (event.key !== "Tab" || !dialog.current) return;
     const focusable = [
@@ -147,11 +164,11 @@ function useTaskContent(task: Task, enabled: boolean) {
 }
 
 function PhaseProgress({ task }: { task: Task }) {
-  const current = phaseStep(task);
-  if (current < 0 && task.lifecycle !== "done") return null;
+  const { steps, current } = taskSteps(task);
+  if (current < 0) return null;
   return (
     <ol className="phase-progress" aria-label="Progress">
-      {PHASE_STEPS.map((step, index) => {
+      {steps.map((step, index) => {
         const state = index < current
           ? "complete"
           : index === current
@@ -307,6 +324,112 @@ const when = (value: string | null) => {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 };
 
+/**
+ * The complete plan the person chose to open, read-only. It shows only the
+ * exact snapshot it was opened with; once the task's attempt, plan or content
+ * revision moves on, the old text is withdrawn rather than shown under the
+ * newer identity.
+ */
+function PlanViewer(
+  { view, task, returnFocus, onReopen, onClose }: {
+    view: PlanView;
+    task: Task;
+    returnFocus: RefObject<HTMLElement | null>;
+    onReopen: (view: PlanView) => void;
+    onClose: () => void;
+  },
+) {
+  const dialog = useRef<HTMLElement>(null);
+  const closeButton = useRef<HTMLButtonElement>(null);
+  const trapTab = useDialogFocus(dialog, closeButton, onClose, returnFocus);
+  const attempt = task.active_attempt;
+  const current = attempt && attempt.plan
+    ? {
+      task_id: task.id,
+      attempt_id: attempt.id,
+      plan_hash: attempt.plan_hash ?? null,
+      content_revision: attempt.content_revision ?? null,
+      text: attempt.plan,
+    }
+    : undefined;
+  const unchanged = !!current && current.task_id === view.task_id &&
+    current.attempt_id === view.attempt_id &&
+    current.plan_hash === view.plan_hash &&
+    current.content_revision === view.content_revision &&
+    current.text === view.text;
+  return (
+    <div className="plan-viewer-backdrop">
+      <section
+        ref={dialog}
+        className="plan-viewer"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="plan-viewer-title"
+        tabIndex={-1}
+        onKeyDown={trapTab}
+      >
+        <header className="plan-viewer-header">
+          <div>
+            <span className="eyebrow">Plan · read only</span>
+            <h2 id="plan-viewer-title">{task.title}</h2>
+          </div>
+          <button
+            ref={closeButton}
+            className="icon-button plan-viewer-close"
+            aria-label="Close plan"
+            onClick={onClose}
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        </header>
+        <div className="plan-viewer-body">
+          {unchanged
+            ? <MarkdownContent className="plan-content" text={view.text} />
+            : (
+              <div className="warning" role="status">
+                <p>
+                  This plan changed after you opened it, so the earlier text is
+                  no longer shown. Open the current plan to read it.
+                </p>
+                {current && (
+                  <button onClick={() => onReopen(current)}>
+                    Show the current plan
+                  </button>
+                )}
+              </div>
+            )}
+        </div>
+        <footer className="plan-viewer-footer">
+          <span className="hint">
+            Reading the plan does not approve it. Decide in the task's Your
+            decision panel.
+          </span>
+          <TechnicalDetails>
+            <dl className="technical-list">
+              <div>
+                <dt>Task</dt>
+                <dd>{view.task_id}</dd>
+              </div>
+              <div>
+                <dt>Attempt</dt>
+                <dd>{view.attempt_id}</dd>
+              </div>
+              <div>
+                <dt>Plan</dt>
+                <dd>{view.plan_hash ?? "not reported"}</dd>
+              </div>
+              <div>
+                <dt>Content revision</dt>
+                <dd>{view.content_revision ?? "not reported"}</dd>
+              </div>
+            </dl>
+          </TechnicalDetails>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
 /** Who the task waits on, since when, and whether anything is advancing. */
 function ProgressFacts({ progress }: { progress: TaskProgress }) {
   return (
@@ -413,14 +536,22 @@ export function TaskDetail(
   },
 ) {
   const [localTab, setLocalTab] = useState<TaskTab>("overview");
-  // Opening a role's settings from an attention item expands Agent settings
-  // before the focus moves there; the user can still collapse it afterwards.
-  const [settingsOpen, setSettingsOpen] = useState(!!settingsFocus);
-  const [openedFor, setOpenedFor] = useState(settingsFocus);
-  if (settingsFocus !== openedFor) {
-    setOpenedFor(settingsFocus);
-    if (settingsFocus) setSettingsOpen(true);
+  // A role-settings route shows Roles in the same render, so the focus that
+  // follows the route finds the role; choosing any tab ends that override.
+  const [rolesFocus, setRolesFocus] = useState(settingsFocus);
+  const [seenFocus, setSeenFocus] = useState(settingsFocus);
+  if (settingsFocus !== seenFocus) {
+    setSeenFocus(settingsFocus);
+    setRolesFocus(settingsFocus);
   }
+  const [planView, setPlanView] = useState<PlanView>();
+  const planOpener = useRef<HTMLElement | null>(null);
+  const openPlan = (view: PlanView) => {
+    planOpener.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    setPlanView(view);
+  };
   const nextAction = state.task_actions?.find((action) =>
     action.task_id === task.id
   );
@@ -430,9 +561,14 @@ export function TaskDetail(
   const headerPermission = nextAction?.action.kind === "review_request"
     ? undefined
     : waitingPermissions[0];
-  const tab = controlledTab ?? localTab;
-  const chooseTab = (next: TaskTab) =>
-    onTabChange ? onTabChange(next) : setLocalTab(next);
+  const tab = settingsFocus && rolesFocus === settingsFocus
+    ? "roles"
+    : controlledTab ?? localTab;
+  const chooseTab = (next: TaskTab) => {
+    setRolesFocus(undefined);
+    if (onTabChange) onTabChange(next);
+    else setLocalTab(next);
+  };
   const [dependency, setDependency] = useState("");
   const [integrationRef, setIntegrationRef] = useState("");
   const [answer, setAnswer] = useState("");
@@ -625,11 +761,19 @@ export function TaskDetail(
       ?.primary_blocker
     : undefined;
   const waitingReason = waitingBlocker?.message;
-  const guidanceConflict = task.progress?.reason_code === "workflow.attempt_readiness_stale" ||
+  const singleAgent = isSingleAgentTask(task);
+  const singleAgentRun = singleAgent ? task.workflow?.run ?? null : null;
+  // A failed step with a retry prerequisite is the service's own finding that
+  // an instruction file still differs, so its review path is offered too.
+  const guidanceConflict = !singleAgent && (
+    task.progress?.reason_code === "workflow.attempt_readiness_stale" ||
     state.recovery.some((record) => record.attempt_id === attempt?.id &&
-      record.state === "attention_required" && typeof record.detail === "object" &&
-      record.detail !== null && "cause" in record.detail && typeof record.detail.cause === "string" &&
-      record.detail.cause.includes("worktree policy file changed after verified materialization:"));
+      record.state === "attention_required" && (
+        typeof record.retry_prerequisite === "string" ||
+        (typeof record.detail === "object" && record.detail !== null &&
+          "cause" in record.detail && typeof record.detail.cause === "string" &&
+          record.detail.cause.includes("worktree policy file changed after verified materialization:"))
+      )));
   // Follows whichever explanation the panel would otherwise show.
   const setupProblem = !terminal
     ? projectSetupProblem(
@@ -682,7 +826,11 @@ export function TaskDetail(
     if (next < 0) return;
     event.preventDefault();
     chooseTab(TABS[next].id);
-    document.getElementById(`task-tab-${TABS[next].id}`)?.focus();
+    const target = document.getElementById(`task-tab-${TABS[next].id}`);
+    target?.focus();
+    // Focusing alone can leave a tab at the end of the horizontally scrolling
+    // strip partly outside it on narrow windows.
+    target?.scrollIntoView({ block: "nearest", inline: "nearest" });
   };
 
   const overview = (
@@ -737,9 +885,13 @@ export function TaskDetail(
         {(task.progress || waitingReason) && (
           <section className="panel next-step" aria-labelledby="task-waiting-title">
             <h3 id="task-waiting-title">Why it is waiting</h3>
-            <p>
-              {setupProblem || task.progress?.waiting_reason || waitingReason}
-            </p>
+            {/* A Single agent stage reason is already the header's status. */}
+            {!(singleAgent &&
+              (task.progress?.waiting_reason || waitingReason) === status.detail) && (
+              <p>
+                {setupProblem || task.progress?.waiting_reason || waitingReason}
+              </p>
+            )}
             {setupProblem && (
               <>
                 <button
@@ -804,6 +956,13 @@ export function TaskDetail(
                   resolved what it asked for.
                 </p>
               )
+              : singleAgent
+              ? (
+                <p className="hint">
+                  To answer the agent, use Resume agent with a message in the
+                  Single agent run panel below when it is offered.
+                </p>
+              )
               : (
                 <p className="hint">
                   This wait is not a question the manager can take a reply
@@ -828,6 +987,7 @@ export function TaskDetail(
           verification={selectedChecks}
           actions={continuationActions}
           onChanged={onChanged}
+          onOpenPlan={openPlan}
         />
         <WorkflowControls
           task={task}
@@ -848,24 +1008,42 @@ export function TaskDetail(
             value.state === "attention_required"
           )}
           sessions={state.active_sessions}
+          actions={continuationActions}
           selectedRecordId={selectedRecoveryId}
           onChanged={onChanged}
         />
         {guidanceConflict &&
           <GuidanceRecovery key={attempt?.id} task={task} onChanged={onChanged} />}
-        <section className="panel verification-summary">
-          <h3>Verification</h3>
-          <p>
-            {selectedChecks.length
-              ? `${passedChecks} of ${selectedChecks.length} selected checks passed on the current result.`
-              : attempt
-              ? "No verification checks are selected yet."
-              : "Checks are selected when the plan is written."}
-          </p>
-          <button className="link-button" onClick={() => chooseTab("checks")}>
-            Open Checks
-          </button>
-        </section>
+        {singleAgent
+          ? (
+            <section className="panel verification-summary">
+              <h3>Verification</h3>
+              <p>
+                {!singleAgentRun || !singleAgentRun.selected_check_ids.length
+                  ? "No checks are selected for this run. Your review of the result is the only verification."
+                  : `${
+                    singleAgentRun.checks.filter((check) =>
+                      check.latest_run_passed === true
+                    ).length
+                  } of ${singleAgentRun.selected_check_ids.length} selected checks passed on the captured result. Every selected check must pass before you can accept it.`}
+              </p>
+            </section>
+          )
+          : (
+            <section className="panel verification-summary">
+              <h3>Verification</h3>
+              <p>
+                {selectedChecks.length
+                  ? `${passedChecks} of ${selectedChecks.length} selected checks passed on the current result.`
+                  : attempt
+                  ? "No verification checks are selected yet."
+                  : "Checks are selected when the plan is written."}
+              </p>
+              <button className="link-button" onClick={() => chooseTab("checks")}>
+                Open Checks
+              </button>
+            </section>
+          )}
       </div>
     </div>
   );
@@ -974,7 +1152,23 @@ export function TaskDetail(
     </div>
   );
 
-  const checksTab = (
+  const checksTab = singleAgent
+    ? (
+      <div className="task-tab-stack">
+        <section className="panel">
+          <h3>Selected checks</h3>
+          <p className="hint">
+            This Single agent run's checks are listed with the run on Overview,
+            where you can review and authorize each exact command. TRIP review
+            rounds do not apply to Single agent work.
+          </p>
+          <button className="link-button" onClick={() => chooseTab("overview")}>
+            Open Overview
+          </button>
+        </section>
+      </div>
+    )
+    : (
     <div className="task-tab-stack">
       <section className="panel">
         <h3>Verification checks</h3>
@@ -1185,7 +1379,7 @@ export function TaskDetail(
         </details>
       )}
       <section className="panel">
-        <h3>Reviews</h3>
+        <h3>TRIP reviews</h3>
         {task.review_budgets.filter((budget) =>
           budget.attempt_id === attempt?.id
         ).map((budget) => (
@@ -1232,7 +1426,7 @@ export function TaskDetail(
         )}
       </section>
     </div>
-  );
+    );
 
   const activity = (
     <div className="task-tab-stack">
@@ -1267,85 +1461,6 @@ export function TaskDetail(
           ))}
         </details>
       )}
-      <details
-        className="panel"
-        open={settingsOpen}
-        onToggle={(event) => setSettingsOpen(event.currentTarget.open)}
-      >
-        <summary>Agent settings</summary>
-        <RoleSettings
-          task={task}
-          project={project}
-          sessions={state.active_sessions}
-          switches={state.switches}
-          lanes={tripLanes}
-          productionRestrictions={state.production_role_restrictions}
-          capabilities={state.capabilities}
-          runtimeAdmissions={(state.trip_setups || []).filter((setup) => setup.project_id === task.project_id)
-            .flatMap((setup) => setup.runtime_admissions)}
-          actions={continuationActions}
-          onChanged={onChanged}
-        />
-      </details>
-      <details className="panel">
-        <summary>Explorer and implementation lanes</summary>
-        {tripExplorer.filter((item) => item.attempt_id === attempt?.id).map((
-          decision,
-        ) => (
-          <article className="review-row" key={decision.id}>
-            <strong>
-              Explorer ·{" "}
-              {decision.stage === "planning"
-                ? "planning"
-                : decision.stage === "rescue"
-                ? "extra call"
-                : "final check"}
-            </strong>
-            <span>
-              {decision.activated
-                ? decision.outcome ? "Findings recorded" : "Findings pending"
-                : "Not used"}
-            </span>
-            <small>
-              Explorer findings inform the manager; they never approve a plan,
-              change, review or result.
-            </small>
-            <TechnicalDetails>
-              <pre>
-                {JSON.stringify(
-                  { trigger: decision.trigger, limits: decision.limits, census: decision.census },
-                  null,
-                  2,
-                )}
-              </pre>
-            </TechnicalDetails>
-          </article>
-        ))}
-        {tripLanes.filter((item) => item.attempt_id === attempt?.id).map((
-          lane,
-        ) => (
-          <article className="review-row" key={lane.id}>
-            <strong>Lane {lane.lane_key} · {lane.state}</strong>
-            <span>Owns {lane.owned_paths.join(", ")}</span>
-            <TechnicalDetails>
-              <p>
-                Shared: {lane.shared_paths.join(", ") || "none"} · protected:
-                {" "}
-                {lane.protected_paths.join(", ") || "none"} · dependencies:{" "}
-                {lane.dependencies.join(", ") || "none"} · effective generation
-                {" "}
-                {lane.effective_generation_id || "pending"}
-              </p>
-            </TechnicalDetails>
-          </article>
-        ))}
-        {!tripLanes.some((item) => item.attempt_id === attempt?.id) && (
-          <p className="hint">
-            The implementer works in a single lane unless the plan splits the
-            work.
-          </p>
-        )}
-      </details>
       <details className="panel">
         <summary>Task history</summary>
         <ActivityTimeline
@@ -1358,7 +1473,7 @@ export function TaskDetail(
       </details>
       {task.recipe_provenance && (
         <section className="panel">
-          <h3>Created from a recipe</h3>
+          <h3>Created from a TRIP recipe</h3>
           <p>
             {task.recipe_provenance.recipe_name} · recipe revision{" "}
             {task.recipe_provenance.recipe_revision}
@@ -1430,10 +1545,94 @@ export function TaskDetail(
     </div>
   );
 
+  const roles = (
+    <div className="task-tab-stack">
+      <RoleSettings
+        task={task}
+        project={project}
+        sessions={state.active_sessions}
+        switches={state.switches}
+        lanes={tripLanes}
+        productionRestrictions={state.production_role_restrictions}
+        capabilities={state.capabilities}
+        runtimeAdmissions={(state.trip_setups || []).filter((setup) => setup.project_id === task.project_id)
+          .flatMap((setup) => setup.runtime_admissions)}
+        actions={continuationActions}
+        execution={state.workflow_execution?.find((item) =>
+          item.project_id === task.project_id
+        )}
+        tasks={state.tasks}
+        onChanged={onChanged}
+      />
+      {!singleAgent && (
+      <details className="panel">
+        <summary>Explorer and implementation lanes</summary>
+        {tripExplorer.filter((item) => item.attempt_id === attempt?.id).map((
+          decision,
+        ) => (
+          <article className="review-row" key={decision.id}>
+            <strong>
+              Explorer ·{" "}
+              {decision.stage === "planning"
+                ? "planning"
+                : decision.stage === "rescue"
+                ? "extra call"
+                : "final check"}
+            </strong>
+            <span>
+              {decision.activated
+                ? decision.outcome ? "Findings recorded" : "Findings pending"
+                : "Not used"}
+            </span>
+            <small>
+              Explorer findings inform the manager; they never approve a plan,
+              change, review or result.
+            </small>
+            <TechnicalDetails>
+              <pre>
+                {JSON.stringify(
+                  { trigger: decision.trigger, limits: decision.limits, census: decision.census },
+                  null,
+                  2,
+                )}
+              </pre>
+            </TechnicalDetails>
+          </article>
+        ))}
+        {tripLanes.filter((item) => item.attempt_id === attempt?.id).map((
+          lane,
+        ) => (
+          <article className="review-row" key={lane.id}>
+            <strong>Lane {lane.lane_key} · {lane.state}</strong>
+            <span>Owns {lane.owned_paths.join(", ")}</span>
+            <TechnicalDetails>
+              <p>
+                Shared: {lane.shared_paths.join(", ") || "none"} · protected:
+                {" "}
+                {lane.protected_paths.join(", ") || "none"} · dependencies:{" "}
+                {lane.dependencies.join(", ") || "none"} · effective generation
+                {" "}
+                {lane.effective_generation_id || "pending"}
+              </p>
+            </TechnicalDetails>
+          </article>
+        ))}
+        {!tripLanes.some((item) => item.attempt_id === attempt?.id) && (
+          <p className="hint">
+            The implementer works in a single lane unless the plan splits the
+            work.
+          </p>
+        )}
+      </details>
+      )}
+    </div>
+  );
+
   return (
     <div className="task-dialog-backdrop">
       <section
         ref={dialog}
+        inert={planView !== undefined}
         className="task-dialog"
         role="dialog"
         aria-modal="true"
@@ -1544,6 +1743,7 @@ export function TaskDetail(
           {tab === "overview" && overview}
           {tab === "changes" && changes}
           {tab === "checks" && checksTab}
+          {tab === "roles" && roles}
           {tab === "activity" && activity}
           {queueBusy && (
             <p role="status">
@@ -1653,6 +1853,15 @@ export function TaskDetail(
           <span className="hint">No automatic approvals</span>
         </footer>
       </section>
+      {planView && (
+        <PlanViewer
+          view={planView}
+          task={task}
+          returnFocus={planOpener}
+          onReopen={setPlanView}
+          onClose={() => setPlanView(undefined)}
+        />
+      )}
     </div>
   );
 }

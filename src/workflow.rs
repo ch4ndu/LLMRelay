@@ -185,6 +185,16 @@ pub(crate) fn ordinary_control_allowed(
     let Some(status) = attempt_status else {
         return false;
     };
+    // Single agent runs take only Cancel here; resume and result decisions
+    // are their own typed commands.
+    if matches!(
+        attempt_phase,
+        Some("agent_execution" | "result_submitted" | "awaiting_checks" | "awaiting_human")
+    ) {
+        return action == "cancel"
+            && !rework.is_some_and(|(_, cancellation_pending)| cancellation_pending)
+            && !matches!(status, "done" | "cancelled" | "failed");
+    }
     if !matches!(
         attempt_phase,
         Some(
@@ -679,6 +689,24 @@ fn require_settled_for_exact_cancel(
     Ok(())
 }
 
+/// Why a failed step would fail again for a known, unchanged cause. A failed
+/// guidance delivery cannot succeed while the attempt's reviewed instruction
+/// files are still not ready, so that prerequisite blocks Retry in the
+/// projection, the handler and automatic release alike. Restoring or
+/// reauthorizing the files removes it; other causes stay retryable.
+pub(crate) fn failed_step_prerequisite(
+    connection: &Connection,
+    attempt_id: &str,
+    operation: Option<&str>,
+) -> Option<String> {
+    if operation != Some("guidance_delivery") {
+        return None;
+    }
+    crate::trip::require_attempt_ready(connection, attempt_id, None)
+        .err()
+        .map(|error| format!("{error:#}"))
+}
+
 /// Releases one failed automatic step so a later tick re-evaluates its attempt
 /// from current state. Nothing is repeated here and no other hold changes. A
 /// step that may have started an external effect stays held until every
@@ -694,18 +722,24 @@ fn release_failed_step(
     evidence: &str,
     now: &str,
 ) -> Result<OperationResult> {
-    let effect: Option<String> = transaction
+    let (effect, operation): (Option<String>, Option<String>) = transaction
         .query_row(
-            "SELECT json_extract(detail_json,'$.effect_certainty') FROM recovery_records
+            "SELECT json_extract(detail_json,'$.effect_certainty'),json_extract(detail_json,'$.operation')
+             FROM recovery_records
              WHERE id=?1 AND attempt_id=?2 AND session_id IS NULL AND state='attention_required'
                AND json_extract(detail_json,'$.kind')='coordinator_failure'",
             params![recovery_id, attempt_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
         .ok_or_else(|| {
             anyhow!("only a failed automatic step can be released with retry_failed_step")
         })?;
+    if let Some(cause) = failed_step_prerequisite(transaction, attempt_id, operation.as_deref()) {
+        bail!(
+            "retrying would fail the same way because the task's reviewed instruction files are not ready ({cause}); restore them to their approved content or approve the change under Review changed instruction files first"
+        )
+    }
     if effect.as_deref() != Some("none") {
         let unsettled = unsettled_effects(transaction, attempt_id)?;
         if !unsettled.is_empty() {
@@ -1861,31 +1895,51 @@ pub fn execute_with_runtime(
                         params![uuid::Uuid::new_v4().to_string(),task_id,role,revision,serde_json::to_string(&config)?,now])?;
                 }
             }
-            let profile_pending = was_ready
-                && runtime
-                    .ok_or_else(|| {
-                        anyhow!("Ready admission requires the service capability runtime")
-                    })
-                    .and_then(|runtime| {
-                        crate::trip::require_task_profiles_activated(&transaction, task_id, runtime)
-                    })
-                    .is_err();
-            if profile_pending {
-                transaction.execute(
-                    "UPDATE tasks SET lifecycle='backlog',attention='needs_input',ready_at=NULL WHERE id=?1",
-                    params![task_id],
-                )?;
-            }
+            let state = if task_family(&transaction, task_id)?
+                == crate::domain::WorkflowFamily::SingleAgent
+            {
+                if was_ready
+                    && invalidate_single_agent_ready(
+                        &transaction,
+                        task_id,
+                        "The task changed after Make Ready; make it Ready again",
+                        &now,
+                    )?
+                {
+                    "admission_invalidated"
+                } else {
+                    "updated"
+                }
+            } else {
+                let profile_pending = was_ready
+                    && runtime
+                        .ok_or_else(|| {
+                            anyhow!("Ready admission requires the service capability runtime")
+                        })
+                        .and_then(|runtime| {
+                            crate::trip::require_task_profiles_activated(
+                                &transaction,
+                                task_id,
+                                runtime,
+                            )
+                        })
+                        .is_err();
+                if profile_pending {
+                    transaction.execute(
+                        "UPDATE tasks SET lifecycle='backlog',attention='needs_input',ready_at=NULL WHERE id=?1",
+                        params![task_id],
+                    )?;
+                    "profile_pending"
+                } else {
+                    "updated"
+                }
+            };
             result(
                 operation_id,
                 "task",
                 task_id.clone(),
                 Some(expected_version + 1),
-                if profile_pending {
-                    "profile_pending"
-                } else {
-                    "updated"
-                },
+                state,
             )
         }
         HumanCommand::DeleteDraftTask {
@@ -1911,6 +1965,10 @@ pub fn execute_with_runtime(
             )?;
             transaction.execute(
                 "DELETE FROM task_recipe_bindings WHERE task_id=?1",
+                params![task_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM task_workflow_selections WHERE task_id=?1",
                 params![task_id],
             )?;
             transaction.execute(
@@ -1944,33 +2002,50 @@ pub fn execute_with_runtime(
                 params![task_id],
                 |row| row.get(0),
             )?;
-            crate::trip::require_project_ready(&transaction, &project_id)?;
-            if let Some(problem) =
-                crate::trip::start_baseline_problem(&transaction, &project_id, true)?
-            {
-                bail!("{problem}")
+            if task_family(&transaction, task_id)? == crate::domain::WorkflowFamily::SingleAgent {
+                crate::recipes::require_binding_current(&transaction, task_id)?;
+                let (title, criteria): (String, String) = transaction.query_row(
+                    "SELECT title,acceptance_criteria_json FROM tasks WHERE id=?1",
+                    params![task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                validate_task(&title, &serde_json::from_str::<Vec<String>>(&criteria)?)?;
+                admit_single_agent_ready(
+                    &transaction,
+                    &store.compatibility_bundles,
+                    task_id,
+                    expected_version + 1,
+                    &now,
+                )?;
+            } else {
+                crate::trip::require_project_ready(&transaction, &project_id)?;
+                if let Some(problem) =
+                    crate::trip::start_baseline_problem(&transaction, &project_id, true)?
+                {
+                    bail!("{problem}")
+                }
+                crate::recipes::require_binding_current(&transaction, task_id)?;
+                let (title, criteria, configured): (String, String, i64) = transaction.query_row(
+                    "SELECT title,acceptance_criteria_json,
+                       (SELECT COUNT(DISTINCT role) FROM role_settings WHERE task_id=tasks.id
+                        AND role IN ('manager','explorer','plan_reviewer','implementer','code_reviewer','final_verifier'))
+                     FROM tasks WHERE id=?1",
+                    params![task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                let criteria: Vec<String> = serde_json::from_str(&criteria)?;
+                validate_task(&title, &criteria)?;
+                if configured != 6 {
+                    bail!("Ready tasks require current provider, model, and effort settings for all six app roles")
+                }
+                crate::trip::require_task_profiles_activated(
+                    &transaction,
+                    task_id,
+                    runtime.ok_or_else(|| {
+                        anyhow!("Ready admission requires the service capability runtime")
+                    })?,
+                )?;
             }
-            crate::recipes::require_binding_current(&transaction, task_id)?;
-            let (title, criteria, configured): (String, String, i64) = transaction.query_row(
-                "SELECT title,acceptance_criteria_json,
-                   (SELECT COUNT(DISTINCT role) FROM role_settings WHERE task_id=tasks.id
-                    AND role IN ('manager','explorer','plan_reviewer','implementer','code_reviewer','final_verifier'))
-                 FROM tasks WHERE id=?1",
-                params![task_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
-            let criteria: Vec<String> = serde_json::from_str(&criteria)?;
-            validate_task(&title, &criteria)?;
-            if configured != 6 {
-                bail!("Ready tasks require current provider, model, and effort settings for all six app roles")
-            }
-            crate::trip::require_task_profiles_activated(
-                &transaction,
-                task_id,
-                runtime.ok_or_else(|| {
-                    anyhow!("Ready admission requires the service capability runtime")
-                })?,
-            )?;
             let changed = transaction.execute(
                 "UPDATE tasks SET lifecycle='ready',ready_at=?1,attention='none',version=version+1,updated_at=?1
                  WHERE id=?2 AND version=?3 AND lifecycle='backlog' AND archived_at IS NULL",
@@ -2984,6 +3059,11 @@ pub fn execute_with_runtime(
                 *expected_version,
                 &["awaiting_review"],
             )?;
+            if attempt_family(&transaction, attempt_id)?
+                == crate::domain::WorkflowFamily::SingleAgent
+            {
+                bail!("A Single agent result is decided with Accept result or Request rework")
+            }
             crate::trip::require_attempt_ready(&transaction, attempt_id, None)?;
             match decision.as_str() {
                 "accept" => {
@@ -4321,6 +4401,7 @@ mod m7_setup_projection_tests {
             legacy: json!({}),
             progress: None,
             observed_usage: None,
+            workflow: None,
         };
         let session = json!({"id":"session","task_id":"task","attempt_id":"attempt","role":"manager","role_generation_id":"generation","generation_status":"exited","config_revision":1,"provider":"codex","status":"exited","resume_count":0,"transcript_epoch":"epoch","capability_current":false});
         let rejection = json!({"category":"provider_compatibility_invalid_manifest"});
@@ -4504,7 +4585,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
     let mut migration_actions = Vec::new();
     for id in task_ids {
         let mut task = connection.query_row(&format!("SELECT id,project_id,title,description,acceptance_criteria_json,priority,manual_order,lifecycle,attention,version,archived_at,role_overrides_json,legacy_json,EXISTS(SELECT 1 FROM permission_requests pr WHERE pr.task_id=tasks.id AND {}),(archived_at IS NULL AND (lifecycle='done' OR (lifecycle='backlog' AND ready_at IS NULL AND NOT EXISTS(SELECT 1 FROM attempts WHERE task_id=tasks.id)))) FROM tasks WHERE id=?1", crate::permissions::ACTIONABLE_REQUEST_SQL),
-            params![id], |row| Ok(TaskDto { id:row.get(0)?,project_id:row.get(1)?,title:row.get(2)?,description:row.get(3)?,acceptance_criteria:serde_json::from_str(&row.get::<_,String>(4)?).unwrap_or_default(),priority:row.get(5)?,manual_order:row.get(6)?,lifecycle:row.get(7)?,attention:row.get(8)?,version:row.get(9)?,archived:row.get::<_,Option<String>>(10)?.is_some(),can_archive:row.get(14)?,draft_deletion:None,recipe_provenance:None,role_overrides:parse(row.get(11)?),legacy:parse(row.get(12)?),permission_waiting:row.get(13)?,dependencies:vec![],active_attempt:None,role_settings:vec![],reviews:vec![],snapshots:vec![],review_budgets:vec![],progress:None,observed_usage:None }))?;
+            params![id], |row| Ok(TaskDto { id:row.get(0)?,project_id:row.get(1)?,title:row.get(2)?,description:row.get(3)?,acceptance_criteria:serde_json::from_str(&row.get::<_,String>(4)?).unwrap_or_default(),priority:row.get(5)?,manual_order:row.get(6)?,lifecycle:row.get(7)?,attention:row.get(8)?,version:row.get(9)?,archived:row.get::<_,Option<String>>(10)?.is_some(),can_archive:row.get(14)?,draft_deletion:None,recipe_provenance:None,role_overrides:parse(row.get(11)?),legacy:parse(row.get(12)?),permission_waiting:row.get(13)?,dependencies:vec![],active_attempt:None,role_settings:vec![],reviews:vec![],snapshots:vec![],review_budgets:vec![],progress:None,observed_usage:None,workflow:None }))?;
         if task.lifecycle == "backlog" {
             let reason = draft_deletion_blocker(&connection, &id)?;
             task.draft_deletion = Some(crate::domain::DraftDeletion {
@@ -4944,17 +5025,29 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
     )?);
     for record in &mut recovery {
         let detail = record.get("detail");
-        let possible_effects = json_text(record, "state") == Some("attention_required")
-            && detail.and_then(|detail| json_text(detail, "kind")) == Some("coordinator_failure")
-            && detail.and_then(|detail| json_text(detail, "effect_certainty")) != Some("none");
-        if !possible_effects {
+        let failed_step = json_text(record, "state") == Some("attention_required")
+            && detail.and_then(|detail| json_text(detail, "kind")) == Some("coordinator_failure");
+        if !failed_step {
             continue;
         }
-        let blocked_by = match json_text(record, "attempt_id") {
-            Some(attempt_id) => unsettled_effects(&connection, attempt_id)?,
-            None => Vec::new(),
-        };
-        record["retry_blocked_by"] = serde_json::json!(blocked_by);
+        let possible_effects =
+            detail.and_then(|detail| json_text(detail, "effect_certainty")) != Some("none");
+        let operation = detail
+            .and_then(|detail| json_text(detail, "operation"))
+            .map(str::to_owned);
+        let attempt_id = json_text(record, "attempt_id").map(str::to_owned);
+        if possible_effects {
+            let blocked_by = match attempt_id.as_deref() {
+                Some(attempt_id) => unsettled_effects(&connection, attempt_id)?,
+                None => Vec::new(),
+            };
+            record["retry_blocked_by"] = serde_json::json!(blocked_by);
+        }
+        if let Some(cause) = attempt_id.as_deref().and_then(|attempt_id| {
+            failed_step_prerequisite(&connection, attempt_id, operation.as_deref())
+        }) {
+            record["retry_prerequisite"] = serde_json::json!(cause);
+        }
     }
     let history=json_rows_no_param(&connection,"SELECT json_object('id',id,'operation_id',operation_id,'actor_kind',actor_kind,'actor_id',actor_id,'event_code',event_code,'entity_kind',entity_kind,'entity_id',entity_id,'old_version',old_version,'new_version',new_version,'detail',json(detail_json),'created_at',created_at) FROM audit_events WHERE event_code IN ('session.resume.rejected','session.resume.fresh_route.reserved') OR rowid IN (SELECT rowid FROM audit_events ORDER BY created_at DESC LIMIT 500) ORDER BY created_at DESC")?;
     let process_observations = resource_observations(&connection)?;
@@ -5225,8 +5318,20 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         }
     }
     let observations = crate::store::open_attention_observations(&connection)?;
+    for task in &mut tasks {
+        task.workflow = task_workflow_projection(&connection, &task.id)?;
+    }
+    let workflow_execution = workflow_execution_projection(
+        &connection,
+        &store.compatibility_bundles,
+        &projects
+            .iter()
+            .map(|project| project.id.clone())
+            .collect::<Vec<_>>(),
+    )?;
     let attention = AttentionSources {
         projects: &projects,
+        workflow_execution: &workflow_execution,
         tasks: &tasks,
         sessions: &active_sessions,
         recovery: &recovery,
@@ -5253,6 +5358,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         "processes":process_observations,
     });
     let (profile_sets, task_recipes, recipe_schedules) = crate::recipes::projection(&connection)?;
+    let provider_validation = crate::store::provider_validation_state_in(&connection)?;
     Ok(AppStateDto {
         schema: 8,
         generated_at: Utc::now().to_rfc3339(),
@@ -5286,6 +5392,8 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         continuation_actions,
         task_actions,
         attention,
+        provider_validation,
+        workflow_execution,
     })
 }
 
@@ -6810,7 +6918,14 @@ pub fn task_content(store: &Store, task_id: &str) -> Result<serde_json::Value> {
 }
 
 /// What happened to a held automatic step and what the user can do next.
-fn failed_step_reason(detail: &serde_json::Value, blocked_by: &[serde_json::Value]) -> String {
+fn failed_step_reason(
+    detail: &serde_json::Value,
+    blocked_by: &[serde_json::Value],
+    guidance_not_ready: bool,
+) -> String {
+    if guidance_not_ready {
+        return "LLMRelay could not deliver instructions to the agent because the task's reviewed instruction files changed or are not ready. Retrying would fail the same way, so Retry step stays unavailable. Restore the files to their approved content, or approve a planned documentation update under Review changed instruction files; Retry step becomes available once they are ready. You can also cancel the task.".into();
+    }
     if json_text(detail, "effect_certainty") == Some("none") {
         return "An automatic step for this task failed before it could start any agent action, so LLMRelay stopped advancing the task. Describe what you checked, then choose Retry step to let LLMRelay re-check the task, or Cancel task.".into();
     }
@@ -7116,14 +7231,19 @@ fn continuation_actions(
                 .and_then(serde_json::Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            let prerequisite = record
+                .get("retry_prerequisite")
+                .and_then(serde_json::Value::as_str);
             let mut binding = binding;
             binding["decisions"] = serde_json::json!(["retry_failed_step", "cancel"]);
-            binding["retry_enabled"] = serde_json::json!(blocked_by.is_empty());
+            binding["retry_enabled"] =
+                serde_json::json!(blocked_by.is_empty() && prerequisite.is_none());
             binding["retry_blocked_by"] = serde_json::json!(blocked_by);
+            binding["retry_prerequisite"] = serde_json::json!(prerequisite);
             actions.push(continuation(
                 ContinuationActionKind::RecoverFailedStep,
                 true,
-                failed_step_reason(&detail, &blocked_by),
+                failed_step_reason(&detail, &blocked_by, prerequisite.is_some()),
                 "human",
                 None,
                 record.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
@@ -7753,6 +7873,9 @@ fn next_operation_label(operation: &str) -> Option<&'static str> {
         "approve_plan" | "review_plan" => "Review plan",
         "resolve_recovery" => "Resolve issue",
         "release_provider_failure_hold" => "Release provider hold",
+        "resume_run" => "Resume agent",
+        "authorize_check" => "Review check",
+        "accept_result" | "request_rework" => "Review result",
         _ => return None,
     })
 }
@@ -7882,6 +8005,7 @@ fn task_progress(
 /// the dashboard shows under the same cursor.
 struct AttentionSources<'a> {
     projects: &'a [ProjectDto],
+    workflow_execution: &'a [crate::domain::ProjectExecutionDto],
     tasks: &'a [TaskDto],
     sessions: &'a [serde_json::Value],
     recovery: &'a [serde_json::Value],
@@ -7928,6 +8052,9 @@ impl AttentionSources<'_> {
     }
 
     fn permission_items(&self) -> impl Iterator<Item = AttentionItem> + '_ {
+        fn permission_actor_label(request: &crate::domain::PermissionRequestDto) -> &'static str {
+            request.role.map_or("The Single agent", |role| role.label())
+        }
         self.permission_requests
             .iter()
             .filter(|request| request.actionable)
@@ -7941,11 +8068,11 @@ impl AttentionSources<'_> {
                     category: AttentionCategory::Blocked,
                     title: format!(
                         "{}'s permission request outlived its session",
-                        request.role.label()
+                        permission_actor_label(request)
                     ),
                     reason: "The agent's session exited while this request was still waiting for an answer, so no answer can reach the agent now. Open agent output to see where it stopped.".into(),
                     task_title: self.task(&request.task_id).map(|task| task.title.clone()),
-                    role: Some(request.role),
+                    role: request.role,
                     action: AttentionActionKind::OpenAgentOutput.into(),
                     target: self.observed_session_target(observation),
                     held_tasks: Vec::new(),
@@ -7966,12 +8093,12 @@ impl AttentionSources<'_> {
                     category: AttentionCategory::Permission,
                     title: format!(
                         "{} is asking to use {}",
-                        request.role.label(),
+                        permission_actor_label(request),
                         request.tool_name
                     ),
                     reason: "The agent is waiting for you to approve or deny this request. Nothing runs until you decide.".into(),
                     task_title: self.task(&request.task_id).map(|task| task.title.clone()),
-                    role: Some(request.role),
+                    role: request.role,
                     action: AttentionActionKind::ReviewRequest.into(),
                     target: Some(AttentionTarget::PermissionRequest {
                         project_id: request.project_id.clone(),
@@ -8108,17 +8235,34 @@ impl AttentionSources<'_> {
                         ),
                     },
                 };
-                let reason = self
-                    .continuation_actions
-                    .iter()
-                    .find(|action| json_text(&action.binding, "recovery_id") == Some(recovery_id))
-                    .map_or_else(
-                        || {
-                            "LLMRelay must confirm what happened before automatic work can continue."
-                                .to_owned()
-                        },
-                        |action| action.reason.clone(),
-                    );
+                // A record of a replaced attempt has no page that can resolve
+                // it, so its notice says so and carries the record read-only
+                // instead of repeating the current attempt's instructions.
+                let earlier_attempt = self.setup_owning_recovery(recovery_id).is_none()
+                    && attempt_id.is_some_and(|id| self.task_with_active_attempt(id).is_none());
+                let reason = if earlier_attempt {
+                    "This unresolved record belongs to an earlier attempt of the task, so no current page can resolve it. LLMRelay keeps it as a safety record; its details are below.".to_owned()
+                } else {
+                    self.continuation_actions
+                        .iter()
+                        .find(|action| {
+                            json_text(&action.binding, "recovery_id") == Some(recovery_id)
+                        })
+                        .map_or_else(
+                            || {
+                                "LLMRelay must confirm what happened before automatic work can continue."
+                                    .to_owned()
+                            },
+                            |action| action.reason.clone(),
+                        )
+                };
+                let details = earlier_attempt.then(|| {
+                    format!(
+                        "Recovery record {recovery_id} · attempt {} · {kind} · updated {}",
+                        attempt_id.unwrap_or("unknown"),
+                        json_text(record, "updated_at").unwrap_or("unknown")
+                    )
+                });
                 Some(AttentionItem {
                     id: format!("recovery_record:{recovery_id}"),
                     category: AttentionCategory::Recovery,
@@ -8129,8 +8273,32 @@ impl AttentionSources<'_> {
                     action: AttentionActionKind::ResolveIssue.into(),
                     target,
                     held_tasks: Vec::new(),
-                    details: None,
+                    details,
                 })
+            })
+    }
+
+    /// A TRIP installation nobody has started is an obligation only for a
+    /// project that runs TRIP work: its default family, or a live TRIP task.
+    /// A started setup stays visible whatever the project runs.
+    fn trip_setup_needed(&self, project: &ProjectDto) -> bool {
+        use crate::domain::WorkflowFamily;
+        !matches!(
+            json_text(&project.trip, "readiness"),
+            Some("not_initialized") | None
+        ) || self
+            .workflow_execution
+            .iter()
+            .find(|execution| execution.project_id == project.id)
+            .is_none_or(|execution| execution.default_family == WorkflowFamily::Trip)
+            || self.tasks.iter().any(|task| {
+                task.project_id == project.id
+                    && !task.archived
+                    && !matches!(task.lifecycle.as_str(), "done" | "cancelled")
+                    && task
+                        .workflow
+                        .as_ref()
+                        .is_none_or(|workflow| workflow.family == WorkflowFamily::Trip)
             })
     }
 
@@ -8138,6 +8306,7 @@ impl AttentionSources<'_> {
         self.projects
             .iter()
             .filter(|project| json_text(&project.trip, "readiness") != Some("ready"))
+            .filter(|project| self.trip_setup_needed(project))
             .map(|project| {
                 let readiness = json_text(&project.trip, "readiness");
                 AttentionItem {
@@ -8358,6 +8527,21 @@ impl AttentionSources<'_> {
                 AttentionActionKind::ReviewResult,
                 attempt_target(task, attempt_id?),
             ),
+            (Some(phase @ "awaiting_human"), "none") => {
+                let run = task.workflow.as_ref()?.run.as_ref()?;
+                // A probe's result is admission evidence LLMRelay settles itself.
+                if run.probe_admission_id.is_some() {
+                    return None;
+                }
+                (
+                    format!("attempt:{}:{phase}", attempt_id?),
+                    AttentionCategory::AwaitingAcceptance,
+                    "Result ready for your review".to_owned(),
+                    run.stage_reason.clone(),
+                    AttentionActionKind::ReviewResult,
+                    attempt_target(task, attempt_id?),
+                )
+            }
             (_, "none") => {
                 // Automatic waits (capacity, queue order, admission) are shown
                 // on the task; only a hold the user can act on is attention.
@@ -9486,6 +9670,3351 @@ pub(crate) fn insert_task_rows(
             params![uuid::Uuid::new_v4().to_string(),id,role,serde_json::to_string(&config)?,now])?;
     }
     Ok(id)
+}
+
+const SINGLE_AGENT_SLOT: &str = "single_agent";
+const MAX_GUIDANCE_PATHS: usize = 32;
+const MAX_GUIDANCE_FILE_BYTES: usize = 256 * 1024;
+const MAX_EXECUTION_CHECKS: usize = 32;
+const MAX_PROFILE_INSTRUCTIONS_BYTES: usize = 32 * 1024;
+const MAX_REWORK_FEEDBACK_BYTES: usize = 16 * 1024;
+const WORKFLOW_COMMAND_RECEIPT: &str = "workflow_command";
+
+/// The family the task's next attempt uses. Ready, claim and recovery all
+/// resolve it here, so no caller infers it from a display label.
+pub(crate) fn task_family(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<crate::domain::WorkflowFamily> {
+    connection
+        .query_row(
+            "SELECT family FROM task_workflow_selections WHERE task_id=?1",
+            params![task_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map_or(Ok(crate::domain::WorkflowFamily::Trip), |family| {
+            family.parse().map_err(|error: String| anyhow!(error))
+        })
+}
+
+/// The family an attempt was bound to when it was claimed. Attempts without a
+/// run binding, including every historical attempt, are TRIP.
+pub(crate) fn attempt_family(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<crate::domain::WorkflowFamily> {
+    connection
+        .query_row(
+            "SELECT family FROM workflow_run_bindings WHERE attempt_id=?1",
+            params![attempt_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map_or(Ok(crate::domain::WorkflowFamily::Trip), |family| {
+            family.parse().map_err(|error: String| anyhow!(error))
+        })
+}
+
+/// Records this release's bundled Single agent definition, refusing a stored
+/// row under the same identity with different bytes.
+pub(crate) fn ensure_single_agent_definition(
+    connection: &Connection,
+    now: &str,
+) -> Result<(String, String)> {
+    use crate::workflow_resources as resources;
+    let id = resources::SINGLE_AGENT_DEFINITION_ID;
+    let hash = resources::single_agent_definition_hash();
+    let stored: Option<(String, String)> = connection
+        .query_row(
+            "SELECT content_hash,definition_text FROM workflow_definitions WHERE id=?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match stored {
+        Some((stored_hash, text))
+            if stored_hash == hash && text == resources::SINGLE_AGENT_DEFINITION => {}
+        Some(_) => bail!(
+            "The stored Single agent definition {id} differs from the definition bundled with this release, so it cannot be used"
+        ),
+        None => {
+            connection.execute(
+                "INSERT INTO workflow_definitions(id,family,version,content_hash,definition_text,evaluator_id,
+                   evaluator_revision,result_schema_revision,check_requirement,provenance,created_at)
+                 VALUES(?1,'single_agent',?2,?3,?4,?5,?6,?7,'selected','bundled',?8)",
+                params![
+                    id,
+                    resources::SINGLE_AGENT_DEFINITION_VERSION,
+                    hash,
+                    resources::SINGLE_AGENT_DEFINITION,
+                    resources::SINGLE_AGENT_EVALUATOR_ID,
+                    resources::SINGLE_AGENT_EVALUATOR_REVISION,
+                    resources::SINGLE_AGENT_RESULT_SCHEMA_REVISION,
+                    now
+                ],
+            )?;
+        }
+    }
+    Ok((id.to_owned(), hash))
+}
+
+fn contained_relative_path(path: &str, allow_current: bool) -> Result<String> {
+    let trimmed = path.trim();
+    if allow_current && trimmed == "." {
+        return Ok(".".into());
+    }
+    let unsafe_path = trimmed.is_empty()
+        || trimmed.len() > 512
+        || trimmed.starts_with('/')
+        || trimmed.contains('\\')
+        || trimmed.chars().any(char::is_control)
+        || trimmed
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || trimmed.split('/').next() == Some(".git");
+    if unsafe_path {
+        bail!("{path:?} must be a plain relative path inside the repository")
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn bounded_text(label: &str, value: &str, limit: usize) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > limit {
+        bail!("{label} is required and limited to {limit} bytes")
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_execution_check(check: &crate::domain::ExecutionCheckInput) -> Result<()> {
+    let key_valid = !check.check_key.is_empty()
+        && check.check_key.len() <= 64
+        && check.check_key.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
+        });
+    if !key_valid {
+        bail!(
+            "check key {:?} must be 1-64 lowercase letters, digits, - or _",
+            check.check_key
+        )
+    }
+    match check.command_kind.as_str() {
+        "exact_argv" => {
+            let executable = check.executable.as_deref().unwrap_or_default();
+            if executable.trim().is_empty() || check.shell_command.is_some() {
+                bail!(
+                    "check {} runs an exact executable with arguments and no shell command",
+                    check.check_key
+                )
+            }
+        }
+        "exact_shell" => {
+            let shell = check.shell_command.as_deref().unwrap_or_default();
+            if shell.trim().is_empty() || check.executable.is_some() || !check.arguments.is_empty()
+            {
+                bail!(
+                    "check {} runs one exact shell command and nothing else",
+                    check.check_key
+                )
+            }
+        }
+        other => bail!(
+            "check {} has unsupported command kind {other:?}",
+            check.check_key
+        ),
+    }
+    contained_relative_path(&check.cwd, true)?;
+    if !(1..=3600).contains(&check.timeout_seconds) {
+        bail!(
+            "check {} timeout must be between 1 and 3600 seconds",
+            check.check_key
+        )
+    }
+    bounded_text("check description", &check.original_text, 4096)?;
+    let bounded_list = |items: &[String]| {
+        items.len() <= 64
+            && items
+                .iter()
+                .all(|item| !item.trim().is_empty() && item.len() <= 2048)
+    };
+    if check.arguments.len() > 64
+        || !bounded_list(&check.acceptance_rows)
+        || !bounded_list(&check.relevant_inputs)
+    {
+        bail!(
+            "check {} lists are bounded to 64 non-empty items",
+            check.check_key
+        )
+    }
+    Ok(())
+}
+
+/// Repository facts an execution configuration binds, read before the write
+/// transaction so no repository command runs while the store is locked.
+struct PreparedExecutionConfiguration {
+    base_revision: String,
+    guidance: Vec<serde_json::Value>,
+}
+
+fn prepare_execution_configuration(
+    store: &Store,
+    project_id: &str,
+    configuration: &crate::domain::ExecutionConfigurationInput,
+) -> Result<PreparedExecutionConfiguration> {
+    if configuration.guidance_paths.len() > MAX_GUIDANCE_PATHS
+        || configuration.checks.len() > MAX_EXECUTION_CHECKS
+    {
+        bail!("An execution configuration lists at most {MAX_GUIDANCE_PATHS} guidance files and {MAX_EXECUTION_CHECKS} checks")
+    }
+    let mut paths = Vec::new();
+    for path in &configuration.guidance_paths {
+        let path = contained_relative_path(path, false)?;
+        if paths.contains(&path) {
+            bail!("guidance file {path} is listed twice")
+        }
+        paths.push(path);
+    }
+    let mut keys = HashSet::new();
+    for check in &configuration.checks {
+        validate_execution_check(check)?;
+        if !keys.insert(check.check_key.as_str()) {
+            bail!("check key {} is listed twice", check.check_key)
+        }
+    }
+    if !matches!(
+        configuration.testing_coverage.as_str(),
+        "minimal" | "moderate" | "extensive"
+    ) {
+        bail!("testing coverage must be minimal, moderate or extensive")
+    }
+    bounded_text(
+        "documentation policy",
+        &configuration.documentation_policy,
+        4096,
+    )?;
+    let (repository_path, base_revision): (String, String) = {
+        let connection = store.lock()?;
+        connection
+            .query_row(
+                "SELECT repository_path,base_revision FROM projects WHERE id=?1 AND internal_purpose IS NULL",
+                params![project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("unknown project {project_id}"))?
+    };
+    let guidance = committed_guidance(&repository_path, &base_revision, &paths)?;
+    Ok(PreparedExecutionConfiguration {
+        base_revision,
+        guidance,
+    })
+}
+
+/// The exact identity of each guidance file at the registered commit. Only
+/// committed regular files qualify; working-tree edits are never read.
+fn committed_guidance(
+    repository_path: &str,
+    base_revision: &str,
+    paths: &[String],
+) -> Result<Vec<serde_json::Value>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let repository = crate::workspace::inspect(std::path::Path::new(repository_path))?;
+    let references = paths.iter().map(String::as_str).collect::<Vec<_>>();
+    let files = crate::workspace::committed_files(&repository.root, base_revision, &references)?;
+    paths
+        .iter()
+        .zip(files)
+        .map(|(path, content)| {
+            let regular = crate::workspace::tree_entry(&repository, base_revision, path)?
+                .is_some_and(|entry| entry.starts_with("100644 ") || entry.starts_with("100755 "));
+            let content = content.filter(|_| regular).ok_or_else(|| {
+                anyhow!("guidance file {path} is not a committed regular file at the registered commit {base_revision}")
+            })?;
+            if content.len() > MAX_GUIDANCE_FILE_BYTES {
+                bail!("guidance file {path} exceeds {MAX_GUIDANCE_FILE_BYTES} bytes")
+            }
+            Ok(serde_json::json!({
+                "path": path,
+                "sha256": hex::encode(Sha256::digest(&content)),
+                "bytes": content.len(),
+            }))
+        })
+        .collect()
+}
+
+/// The profile fields that decide execution. A change to any of them makes a
+/// new immutable revision; the display name is not among them.
+struct ProfileRevisionValues {
+    provider: crate::domain::Provider,
+    adapter_id: String,
+    adapter_hash: String,
+    model: String,
+    effort: String,
+    instructions_text: String,
+    instructions_hash: String,
+    policy: crate::provider_compatibility::ExecutionPolicy,
+    policy_hash: String,
+    profile_hash: String,
+}
+
+fn profile_revision_values(
+    profile: &crate::domain::AgentProfileInput,
+) -> Result<ProfileRevisionValues> {
+    crate::providers::require_observation_selection(&profile.model, &profile.effort)?;
+    if profile.instructions_text.len() > MAX_PROFILE_INSTRUCTIONS_BYTES {
+        bail!("profile instructions are limited to {MAX_PROFILE_INSTRUCTIONS_BYTES} bytes")
+    }
+    let policy =
+        crate::provider_compatibility::ExecutionPolicy::single_agent_writer(profile.provider);
+    let policy_hash = policy.content_hash();
+    let adapter_hash = policy.adapter_hash();
+    let instructions_hash = hex::encode(Sha256::digest(profile.instructions_text.as_bytes()));
+    let profile_hash = json_hash(&serde_json::json!({
+        "provider": profile.provider,
+        "adapter_hash": adapter_hash,
+        "model": profile.model,
+        "effort": profile.effort,
+        "instructions_hash": instructions_hash,
+        "policy_id": policy.policy_id,
+        "policy_revision": policy.revision,
+        "policy_hash": policy_hash,
+        "session_contract": policy.session_contract,
+    }))?;
+    Ok(ProfileRevisionValues {
+        provider: profile.provider,
+        adapter_id: format!("llmrelay-{}-single-agent", profile.provider),
+        adapter_hash,
+        model: profile.model.clone(),
+        effort: profile.effort.clone(),
+        instructions_text: profile.instructions_text.clone(),
+        instructions_hash,
+        policy,
+        policy_hash,
+        profile_hash,
+    })
+}
+
+fn insert_profile_revision(
+    transaction: &Transaction<'_>,
+    profile_id: &str,
+    revision: i64,
+    values: &ProfileRevisionValues,
+    now: &str,
+) -> Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let authority = match values.policy.authority {
+        crate::provider_compatibility::PolicyAuthority::WorkspaceWrite => "workspace_write",
+        crate::provider_compatibility::PolicyAuthority::NoWorkspace => "read_only",
+    };
+    let session_contract = match values.policy.session_contract {
+        crate::provider_compatibility::SessionContract::Retained => "retained",
+        crate::provider_compatibility::SessionContract::Fresh => "fresh",
+    };
+    transaction.execute(
+        "INSERT INTO agent_profile_revisions(id,profile_id,revision,provider,adapter_id,adapter_hash,model,effort,
+           instructions_text,instructions_hash,policy_id,policy_revision,policy_hash,authority,session_contract,
+           profile_hash,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+        params![
+            id,
+            profile_id,
+            revision,
+            values.provider.to_string(),
+            values.adapter_id,
+            values.adapter_hash,
+            values.model,
+            values.effort,
+            values.instructions_text,
+            values.instructions_hash,
+            values.policy.policy_id,
+            values.policy.revision,
+            values.policy_hash,
+            authority,
+            session_contract,
+            values.profile_hash,
+            now
+        ],
+    )?;
+    Ok(id)
+}
+
+struct BoundProfileRevision {
+    provider: crate::domain::Provider,
+    policy_hash: String,
+    adapter_hash: String,
+    profile_hash: String,
+}
+
+/// A project's profile revision that Single agent may bind: a workspace
+/// writer with a retained session.
+fn writer_profile_revision(
+    connection: &Connection,
+    project_id: &str,
+    profile_revision_id: &str,
+) -> Result<BoundProfileRevision> {
+    let (provider, policy_hash, adapter_hash, profile_hash, authority, session_contract): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = connection
+        .query_row(
+            "SELECT r.provider,r.policy_hash,r.adapter_hash,r.profile_hash,r.authority,r.session_contract
+             FROM agent_profile_revisions r JOIN agent_profiles p ON p.id=r.profile_id
+             WHERE r.id=?1 AND p.project_id=?2",
+            params![profile_revision_id, project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("agent profile revision {profile_revision_id} does not belong to this project"))?;
+    if authority != "workspace_write" || session_contract != "retained" {
+        bail!("Single agent needs a workspace-writing agent profile with a retained session")
+    }
+    Ok(BoundProfileRevision {
+        provider: provider.parse().map_err(|error: String| anyhow!(error))?,
+        policy_hash,
+        adapter_hash,
+        profile_hash,
+    })
+}
+
+fn execution_configuration_hash(
+    connection: &Connection,
+    project_id: &str,
+    revision_id: &str,
+) -> Result<String> {
+    connection
+        .query_row(
+            "SELECT content_hash FROM execution_config_revisions WHERE id=?1 AND project_id=?2",
+            params![revision_id, project_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            anyhow!("execution configuration {revision_id} does not belong to this project")
+        })
+}
+
+/// Binds an admission to the repository, profile and configuration it was
+/// prepared for; a change to any of them invalidates the admission.
+fn admission_scope_hash(
+    connection: &Connection,
+    project_id: &str,
+    profile_revision_id: &str,
+    profile: &BoundProfileRevision,
+    config_revision_id: &str,
+    config_hash: &str,
+) -> Result<String> {
+    let repository_identity: String = connection.query_row(
+        "SELECT repository_identity FROM projects WHERE id=?1",
+        params![project_id],
+        |row| row.get(0),
+    )?;
+    json_hash(&serde_json::json!({
+        "project_id": project_id,
+        "repository_identity": repository_identity,
+        "profile_revision_id": profile_revision_id,
+        "profile_hash": profile.profile_hash,
+        "policy_hash": profile.policy_hash,
+        "adapter_hash": profile.adapter_hash,
+        "execution_config_revision_id": config_revision_id,
+        "execution_config_hash": config_hash,
+    }))
+}
+
+pub struct SingleAgentProfileIdentity<'a> {
+    pub provider: crate::domain::Provider,
+    pub policy_hash: &'a str,
+    pub adapter_hash: &'a str,
+    pub profile_hash: &'a str,
+    pub prepared_scope_hash: &'a str,
+}
+
+/// The key Single agent proof is recorded and checked under: the exact
+/// profile and prepared project scope plus the native identity the writer
+/// actually ran with. Proof from another project, configuration, executable,
+/// account or local provider configuration never matches, and TRIP
+/// Implementer proof is keyed differently.
+pub fn single_agent_capability_key(
+    profile: &SingleAgentProfileIdentity<'_>,
+    native: &crate::providers::SingleAgentNativeIdentity,
+) -> Result<String> {
+    if native.provider != profile.provider {
+        bail!("the native identity belongs to another provider than the profile")
+    }
+    json_hash(&serde_json::json!({
+        "actor": crate::domain::ExecutionActor::SINGLE_AGENT_KEY,
+        "provider": profile.provider,
+        "policy_hash": profile.policy_hash,
+        "adapter_hash": profile.adapter_hash,
+        "profile_hash": profile.profile_hash,
+        "prepared_scope_hash": profile.prepared_scope_hash,
+        "native": native,
+    }))
+}
+
+fn exact_provider_version(provider: crate::domain::Provider) -> &'static str {
+    match provider {
+        crate::domain::Provider::Codex => crate::providers::codex::EXACT_CODEX_VERSION,
+        crate::domain::Provider::Claude => crate::providers::claude::EXACT_CLAUDE_VERSION,
+    }
+}
+
+/// Why a Single agent profile cannot run yet, in the release's own words.
+fn admission_pending_reason(
+    bundles: &crate::provider_compatibility::BundleSet,
+    provider: crate::domain::Provider,
+) -> String {
+    match bundles.resolve_policy(
+        provider,
+        exact_provider_version(provider),
+        crate::provider_compatibility::PolicyMode::SingleAgentWriter,
+    ) {
+        Ok(binding) => binding.native_calls_disabled_reason().map_or_else(
+            || "Waiting for recorded native Single agent capability evidence for this exact profile.".to_owned(),
+            str::to_owned,
+        ),
+        Err(error) => error.explanation().message.clone(),
+    }
+}
+
+fn selection_hash(
+    definition: &(String, String),
+    config: (&str, &str),
+    profile: (&str, &str),
+    check_ids: &[String],
+) -> Result<String> {
+    json_hash(&serde_json::json!({
+        "family": crate::domain::WorkflowFamily::SingleAgent,
+        "definition_id": definition.0,
+        "definition_hash": definition.1,
+        "execution_config_revision_id": config.0,
+        "execution_config_hash": config.1,
+        "profile_revision_id": profile.0,
+        "profile_hash": profile.1,
+        "check_ids": check_ids,
+    }))
+}
+
+/// Pins a Single agent task's selection for Ready. Admission is exact: the
+/// definition, configuration, profile and activated native admission must all
+/// still be the ones selected.
+fn admit_single_agent_ready(
+    transaction: &Transaction<'_>,
+    bundles: &crate::provider_compatibility::BundleSet,
+    task_id: &str,
+    ready_version: i64,
+    now: &str,
+) -> Result<()> {
+    let (project_id, definition_id, config_id, profile_id, checks_json, stored_hash, criteria): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        String,
+    ) = transaction.query_row(
+        "SELECT t.project_id,s.definition_id,s.execution_config_revision_id,s.profile_revision_id,
+                s.check_ids_json,s.selection_hash,t.acceptance_criteria_json
+         FROM task_workflow_selections s JOIN tasks t ON t.id=s.task_id
+         WHERE s.task_id=?1 AND s.family='single_agent'",
+        params![task_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        },
+    )?;
+    if serde_json::from_str::<Vec<String>>(&criteria)?.is_empty() {
+        bail!("A Single agent task needs at least one acceptance criterion so its result can account for it")
+    }
+    let (Some(config_id), Some(profile_id)) = (config_id, profile_id) else {
+        bail!("Choose an execution configuration and an agent profile before Make Ready")
+    };
+    let definition = ensure_single_agent_definition(transaction, now)?;
+    if definition_id.as_deref() != Some(definition.0.as_str()) {
+        bail!("This task selected a Single agent definition this release does not provide; choose the workflow again")
+    }
+    let config_hash = execution_configuration_hash(transaction, &project_id, &config_id)?;
+    let profile = writer_profile_revision(transaction, &project_id, &profile_id)?;
+    let check_ids: Vec<String> = serde_json::from_str(&checks_json)?;
+    if selection_hash(
+        &definition,
+        (&config_id, &config_hash),
+        (&profile_id, &profile.profile_hash),
+        &check_ids,
+    )? != stored_hash
+    {
+        bail!("The selected configuration or profile changed after it was chosen; choose the workflow again")
+    }
+    let admission: Option<String> = transaction
+        .query_row(
+            "SELECT prepared_scope_hash FROM profile_admissions
+             WHERE profile_revision_id=?1 AND execution_config_revision_id=?2 AND state='activated'",
+            params![profile_id, config_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(admitted_scope) = admission else {
+        bail!(
+            "The selected agent profile is not admitted for this execution configuration. {}",
+            admission_pending_reason(bundles, profile.provider)
+        )
+    };
+    let scope = admission_scope_hash(
+        transaction,
+        &project_id,
+        &profile_id,
+        &profile,
+        &config_id,
+        &config_hash,
+    )?;
+    if scope != admitted_scope {
+        bail!("The profile admission no longer matches this project; prepare and activate admission again")
+    }
+    transaction.execute(
+        "UPDATE task_workflow_selections SET admission_state='admitted',admitted_task_version=?1,
+           admission_reason=NULL,updated_at=?2 WHERE task_id=?3",
+        params![ready_version, now, task_id],
+    )?;
+    Ok(())
+}
+
+/// Why a Ready Single agent task cannot be claimed now, rechecking the same
+/// exact bindings Make Ready granted without writing anything.
+pub(crate) fn single_agent_admission_problem(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Option<String>> {
+    let row: Option<(String, String, Option<i64>, Option<String>, Option<String>, Option<String>, String, String, i64)> = connection
+        .query_row(
+            "SELECT t.project_id,s.admission_state,s.admitted_task_version,s.definition_id,
+                    s.execution_config_revision_id,s.profile_revision_id,s.check_ids_json,s.selection_hash,t.version
+             FROM task_workflow_selections s JOIN tasks t ON t.id=s.task_id
+             WHERE s.task_id=?1 AND s.family='single_agent'",
+            params![task_id],
+            |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?,
+                    row.get(6)?, row.get(7)?, row.get(8)?))
+            },
+        )
+        .optional()?;
+    let Some((
+        project_id,
+        state,
+        admitted_version,
+        definition_id,
+        config_id,
+        profile_id,
+        checks_json,
+        stored_hash,
+        version,
+    )) = row
+    else {
+        return Ok(Some("The task has no Single agent selection".into()));
+    };
+    if state != "admitted" || admitted_version != Some(version) {
+        return Ok(Some(
+            "The task changed after Make Ready; make it Ready again".into(),
+        ));
+    }
+    let (Some(definition_id), Some(config_id), Some(profile_id)) =
+        (definition_id, config_id, profile_id)
+    else {
+        return Ok(Some("The Single agent selection is incomplete".into()));
+    };
+    let definition_hash = crate::workflow_resources::single_agent_definition_hash();
+    let available: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_definitions WHERE id=?1 AND content_hash=?2 AND definition_text=?3)",
+        params![definition_id, definition_hash, crate::workflow_resources::SINGLE_AGENT_DEFINITION],
+        |row| row.get(0),
+    )?;
+    if !available || definition_id != crate::workflow_resources::SINGLE_AGENT_DEFINITION_ID {
+        return Ok(Some(
+            "The selected Single agent definition is not available in this release".into(),
+        ));
+    }
+    let config_hash = match execution_configuration_hash(connection, &project_id, &config_id) {
+        Ok(hash) => hash,
+        Err(error) => return Ok(Some(format!("{error:#}"))),
+    };
+    let profile = match writer_profile_revision(connection, &project_id, &profile_id) {
+        Ok(profile) => profile,
+        Err(error) => return Ok(Some(format!("{error:#}"))),
+    };
+    let check_ids: Vec<String> = serde_json::from_str(&checks_json)?;
+    let hash = selection_hash(
+        &(definition_id, definition_hash),
+        (&config_id, &config_hash),
+        (&profile_id, &profile.profile_hash),
+        &check_ids,
+    )?;
+    if hash != stored_hash {
+        return Ok(Some(
+            "The selected configuration or profile changed after Make Ready".into(),
+        ));
+    }
+    let admitted_scope =
+        run_admission(connection, task_id, &profile_id, &config_id)?.map(|(_, scope)| scope);
+    let scope = admission_scope_hash(
+        connection,
+        &project_id,
+        &profile_id,
+        &profile,
+        &config_id,
+        &config_hash,
+    )?;
+    if admitted_scope.as_deref() != Some(scope.as_str()) {
+        return Ok(Some(
+            "The selected agent profile is no longer admitted for this configuration".into(),
+        ));
+    }
+    Ok(None)
+}
+
+/// The admission a task's run binds: the activated one, or for the
+/// disposable probe task of a pending admission, that pending admission.
+/// Returns its id and prepared scope.
+fn run_admission(
+    connection: &Connection,
+    task_id: &str,
+    profile_id: &str,
+    config_id: &str,
+) -> Result<Option<(String, String)>> {
+    Ok(connection
+        .query_row(
+            "SELECT id,prepared_scope_hash FROM profile_admissions
+             WHERE profile_revision_id=?1 AND execution_config_revision_id=?2
+               AND (state='activated' OR (state='pending' AND probe_task_id=?3))
+             ORDER BY state='pending' DESC LIMIT 1",
+            params![profile_id, config_id, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SingleAgentResumeTarget {
+    pub session_id: String,
+    pub role_generation_id: String,
+    pub transcript_epoch: String,
+    pub native_session_id: String,
+    pub resume_count: i64,
+}
+
+/// Who asks for a resume. `None` checks only what the run itself allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SingleAgentResumeMode {
+    /// The coordinator, for a writer the service stopped at a planned
+    /// shutdown and nothing has held since.
+    Automatic,
+    /// A person, for a writer held waiting on them.
+    Explicit,
+}
+
+const MAX_AUTOMATIC_SINGLE_AGENT_RESUMES: i64 = 3;
+
+/// Ownership that keeps a stopped Single agent writer from resuming. `?1` is
+/// the attempt.
+const SINGLE_AGENT_RESUME_FENCES: &[(&str, &str)] = &[
+    ("a control is pending",
+     "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1 AND kind!='transition_proposal'
+        AND state NOT IN ('finished','cancelled','superseded','rejected','failed','abandoned'))"),
+    ("a recovery is open",
+     "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=?1 AND state='attention_required')"),
+    ("a capture is in progress",
+     "SELECT EXISTS(SELECT 1 FROM freeze_intents WHERE attempt_id=?1
+        AND state IN ('reserved','capturing','recovery_required'))"),
+    ("a check is running or needs recovery",
+     "SELECT EXISTS(SELECT 1 FROM check_runs WHERE attempt_id=?1
+        AND status IN ('launch_reserved','running','recovery_required','launch_ambiguous'))"),
+    ("a result is already recorded",
+     "SELECT EXISTS(SELECT 1 FROM workflow_result_bindings WHERE attempt_id=?1
+        AND state IN ('pending_quiescence','awaiting_checks','awaiting_human'))"),
+    ("the repository claim is uncertain",
+     "SELECT EXISTS(SELECT 1 FROM claims WHERE attempt_id=?1 AND state IN ('unknown','stopping'))"),
+];
+
+/// The one rule preview, explicit and automatic resume share: the run's
+/// exact retained conversation (session, epoch, native conversation,
+/// compiled policy and admission), stopped with recorded process-group
+/// quiescence, with nothing else owning the attempt. There is no fallback to
+/// a fresh conversation.
+pub(crate) fn single_agent_resume_target(
+    connection: &Connection,
+    attempt_id: &str,
+    mode: Option<SingleAgentResumeMode>,
+) -> Result<std::result::Result<SingleAgentResumeTarget, String>> {
+    type ResumeRow = (
+        (String, String, String, String, bool),
+        (String, Option<String>, String, String),
+        (String, String, String, String, i64, bool, bool),
+        (String, String, String, bool),
+    );
+    let row: Option<ResumeRow> = connection
+        .query_row(
+            "SELECT a.status,a.phase,t.lifecycle,t.attention,t.archived_at IS NOT NULL,
+                    b.definition_state,b.definition_hash,g.provider,g.status,
+                    s.id,s.role_generation_id,s.status,s.transcript_epoch,s.resume_count,
+                    COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)=1,s.desired_running=1,
+                    COALESCE(s.native_session_id,''),eb.session_contract,eb.policy_hash,
+                    eb.policy_hash=rp.policy_hash AND EXISTS(SELECT 1 FROM profile_admissions pa WHERE pa.id=rp.admission_id
+                      AND (pa.state='activated' OR (pa.state='pending' AND pa.probe_task_id=a.task_id)))
+             FROM attempts a JOIN tasks t ON t.id=a.task_id
+             JOIN workflow_run_bindings b ON b.attempt_id=a.id AND b.family='single_agent'
+             JOIN execution_bindings eb ON eb.attempt_id=a.id AND eb.actor='single_agent'
+             JOIN workflow_run_profiles rp ON rp.attempt_id=a.id AND rp.slot_key=eb.slot_key
+             JOIN role_generations g ON g.id=eb.role_generation_id AND g.attempt_id=a.id
+             JOIN sessions s ON s.role_generation_id=g.id
+             WHERE a.id=?1",
+            params![attempt_id],
+            |row| {
+                Ok((
+                    (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?),
+                    (row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?),
+                    (row.get(9)?, row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?, row.get(15)?),
+                    (row.get(16)?, row.get(17)?, row.get(18)?, row.get(19)?),
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        (status, phase, lifecycle, attention, archived),
+        (definition_state, definition_hash, provider, generation_status),
+        (
+            session_id,
+            role_generation_id,
+            session_status,
+            transcript_epoch,
+            resume_count,
+            quiescent,
+            desired_running,
+        ),
+        (native_session_id, session_contract, policy_hash, admission_current),
+    )) = row
+    else {
+        return Ok(Err(
+            "The run has no retained writer conversation to resume".into()
+        ));
+    };
+    let refuse = |reason: &str| -> Result<std::result::Result<SingleAgentResumeTarget, String>> {
+        Ok(Err(reason.to_owned()))
+    };
+    if archived || lifecycle != "in_progress" {
+        return refuse("The task is not in progress");
+    }
+    if phase != "agent_execution" {
+        return refuse("Only a writer that has not submitted its result can be resumed");
+    }
+    match mode {
+        Some(SingleAgentResumeMode::Automatic) => {
+            if status != "running" || attention != "none" || !desired_running {
+                return refuse(
+                    "Only a writer LLMRelay stopped at a planned shutdown resumes on its own",
+                );
+            }
+            if resume_count >= MAX_AUTOMATIC_SINGLE_AGENT_RESUMES {
+                return refuse(
+                    "The writer was already resumed automatically too often; a person must decide",
+                );
+            }
+        }
+        Some(SingleAgentResumeMode::Explicit) => {
+            if status != "needs_input" || attention != "needs_input" {
+                return refuse("The run is not waiting for you to resume it");
+            }
+        }
+        None => {}
+    }
+    if definition_state != "available"
+        || definition_hash.as_deref()
+            != Some(crate::workflow_resources::single_agent_definition_hash().as_str())
+    {
+        return refuse("The run's Single agent definition is unavailable in this release");
+    }
+    if session_contract != "retained" {
+        return refuse("The run's session contract does not retain its conversation");
+    }
+    let provider: crate::domain::Provider =
+        provider.parse().map_err(|error: String| anyhow!(error))?;
+    if policy_hash
+        != crate::provider_compatibility::ExecutionPolicy::single_agent_writer(provider)
+            .content_hash()
+        || !admission_current
+    {
+        return refuse("The run's compiled policy or profile admission is no longer current; request changes or create a new task");
+    }
+    if generation_status != "exited" || session_status != "exited" || !quiescent {
+        return refuse("The writer has not stopped with recorded process-group quiescence");
+    }
+    if native_session_id.is_empty() {
+        return refuse(
+            "The writer's native conversation was never identified, so it cannot be continued",
+        );
+    }
+    for (blocker, sql) in SINGLE_AGENT_RESUME_FENCES {
+        if connection.query_row(sql, params![attempt_id], |row| row.get::<_, bool>(0))? {
+            return refuse(&format!("The writer cannot resume while {blocker}"));
+        }
+    }
+    if crate::store::failure_stop_fence(connection, attempt_id)?.is_some() {
+        return refuse("The failed-session stop keeps this task paused");
+    }
+    Ok(Ok(SingleAgentResumeTarget {
+        session_id,
+        role_generation_id,
+        transcript_epoch,
+        native_session_id,
+        resume_count,
+    }))
+}
+
+pub(crate) fn single_agent_stopped_reason(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<String> {
+    Ok(match single_agent_resume_target(connection, attempt_id, None)? {
+        Ok(_) => "The agent stopped without submitting a result. Resume its retained conversation with any guidance, or cancel the task.".into(),
+        Err(reason) => format!("The agent stopped without submitting a result and cannot be resumed: {reason}. Cancel the task or create a new one."),
+    })
+}
+
+/// The admission a task's runs prove, when the task is a profile probe.
+pub(crate) fn single_agent_probe_admission(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Option<String>> {
+    Ok(connection
+        .query_row(
+            "SELECT id FROM profile_admissions WHERE probe_task_id=?1
+             UNION ALL SELECT entity_id FROM audit_events WHERE event_code='single_agent.probe.queued'
+               AND entity_kind='profile_admission' AND json_extract(detail_json,'$.probe_task_id')=?1
+             LIMIT 1",
+            params![task_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// The value a probe run writes into its worktree, bound to the admission
+/// and the probe task so no other run's file can stand in for it.
+pub(crate) fn single_agent_probe_value(admission_id: &str, task_id: &str) -> Result<String> {
+    Ok(
+        json_hash(&serde_json::json!({"admission_id": admission_id, "probe_task_id": task_id}))?
+            [..32]
+            .to_owned(),
+    )
+}
+
+const SINGLE_AGENT_PROBE_FILE: &str = ".llmrelay-probe";
+
+struct ProbeInputs {
+    profile_revision_id: String,
+    config_id: String,
+    config_hash: String,
+    profile: BoundProfileRevision,
+}
+
+/// Every precondition of starting a native probe of an admission, each
+/// failure in plain words. The probe command and the projected availability
+/// share it, so the dashboard never offers a probe the command refuses.
+fn single_agent_probe_inputs(
+    connection: &Connection,
+    bundles: &crate::provider_compatibility::BundleSet,
+    project_id: &str,
+    admission_id: &str,
+) -> Result<ProbeInputs> {
+    let (profile_revision_id, config_id, stored_scope, state, probe_task): (String, String, String, String, Option<String>) =
+        connection
+            .query_row(
+                "SELECT profile_revision_id,execution_config_revision_id,prepared_scope_hash,state,probe_task_id
+                 FROM profile_admissions WHERE id=?1 AND project_id=?2",
+                params![admission_id, project_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("unknown profile admission {admission_id}"))?;
+    if state != "pending" {
+        bail!("Only a pending admission can be probed; this one is {state}")
+    }
+    if let Some(task) = probe_task {
+        let finished: bool = connection.query_row(
+            "SELECT lifecycle IN ('done','cancelled') FROM tasks WHERE id=?1",
+            params![task],
+            |row| row.get(0),
+        )?;
+        if !finished {
+            bail!(
+                "The probe task {task} of this admission is still open; finish or cancel it first"
+            )
+        }
+    }
+    let profile = writer_profile_revision(connection, project_id, &profile_revision_id)?;
+    let config_hash = execution_configuration_hash(connection, project_id, &config_id)?;
+    let scope = admission_scope_hash(
+        connection,
+        project_id,
+        &profile_revision_id,
+        &profile,
+        &config_id,
+        &config_hash,
+    )?;
+    if scope != stored_scope {
+        bail!("The project, profile or configuration changed after this admission was prepared; prepare admission again")
+    }
+    let binding = bundles
+        .resolve_policy(
+            profile.provider,
+            exact_provider_version(profile.provider),
+            crate::provider_compatibility::PolicyMode::SingleAgentWriter,
+        )
+        .map_err(|error| anyhow!(error.explanation().message.clone()))?;
+    if let Some(reason) = binding.native_calls_disabled_reason() {
+        bail!("{reason}")
+    }
+    Ok(ProbeInputs {
+        profile_revision_id,
+        config_id,
+        config_hash,
+        profile,
+    })
+}
+
+/// Creates the Ready disposable probe task of a pending admission. Its run
+/// uses the ordinary claim, launch, report and capture path; settlement
+/// records the evidence and a person still activates the admission.
+fn start_single_agent_probe(
+    transaction: &Transaction<'_>,
+    bundles: &crate::provider_compatibility::BundleSet,
+    operation_id: &str,
+    project_id: &str,
+    admission_id: &str,
+    now: &str,
+) -> Result<OperationResult> {
+    let ProbeInputs {
+        profile_revision_id,
+        config_id,
+        config_hash,
+        profile,
+    } = single_agent_probe_inputs(transaction, bundles, project_id, admission_id)?;
+    let definition = ensure_single_agent_definition(transaction, now)?;
+    let task_id = insert_task_rows(
+        transaction,
+        project_id,
+        "Single agent profile probe",
+        "",
+        &["pending".to_owned()],
+        0,
+        &serde_json::Value::Null,
+        None,
+        false,
+        now,
+    )?;
+    let value = single_agent_probe_value(admission_id, &task_id)?;
+    let criteria = vec![format!(
+        "The file {SINGLE_AGENT_PROBE_FILE} at the worktree root contains exactly {value}"
+    )];
+    transaction.execute(
+        "UPDATE tasks SET description=?1,acceptance_criteria_json=?2,lifecycle='ready',ready_at=?3 WHERE id=?4",
+        params![
+            format!("Disposable profile probe; never a production task. Write {value} into {SINGLE_AGENT_PROBE_FILE} at the worktree root, change nothing else, then report your result."),
+            serde_json::to_string(&criteria)?,
+            now,
+            task_id
+        ],
+    )?;
+    let selection = selection_hash(
+        &definition,
+        (&config_id, &config_hash),
+        (&profile_revision_id, &profile.profile_hash),
+        &[],
+    )?;
+    transaction.execute(
+        "INSERT INTO task_workflow_selections(task_id,family,definition_id,execution_config_revision_id,
+           profile_revision_id,check_ids_json,selection_revision,selection_hash,admission_state,
+           admitted_task_version,created_at,updated_at)
+         VALUES(?1,'single_agent',?2,?3,?4,'[]',1,?5,'admitted',1,?6,?6)",
+        params![task_id, definition.0, config_id, profile_revision_id, selection, now],
+    )?;
+    transaction.execute(
+        "UPDATE profile_admissions SET probe_task_id=?1,state_reason=?2,updated_at=?3 WHERE id=?4 AND state='pending'",
+        params![
+            task_id,
+            "A probe run is queued; its recorded evidence lets you activate this profile",
+            now,
+            admission_id
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+         VALUES(?1,?2,'human','single_agent.probe.queued','profile_admission',?3,?4,?5)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            operation_id,
+            admission_id,
+            serde_json::json!({"probe_task_id": task_id}).to_string(),
+            now
+        ],
+    )?;
+    let mut started = result(
+        operation_id,
+        "profile_admission",
+        admission_id.to_owned(),
+        None,
+        "probe_queued",
+    );
+    started.detail = serde_json::json!({"probe_task_id": task_id});
+    Ok(started)
+}
+
+/// Records native evidence from a finished probe run: the captured candidate
+/// holds the probe value only in the worktree, the session's hooks named one
+/// native conversation, its process group stopped, and the key recomputes
+/// from the identity the writer ran with. The probe task closes; a person
+/// still activates the admission.
+pub(crate) fn settle_single_agent_probe(store: &Store, attempt_id: &str) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let mut connection = store.lock()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    type ProbeRow = (
+        (String, String, String, String, String),
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        ),
+        (String, String, String),
+    );
+    let row: Option<ProbeRow> = transaction
+        .query_row(
+            "SELECT pa.id,pa.prepared_scope_hash,a.task_id,r.id,r.snapshot_id,
+                    s.id,s.native_session_id,s.capability_key,s.capability_identity_json,s.executable_version,
+                    p.repository_path,rp.profile_revision_id,t.project_id
+             FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
+             JOIN workflow_run_profiles rp ON rp.attempt_id=a.id AND rp.slot_key='single_agent'
+             JOIN profile_admissions pa ON pa.id=rp.admission_id AND pa.state='pending' AND pa.probe_task_id=a.task_id
+             JOIN workflow_result_bindings r ON r.attempt_id=a.id AND r.state='awaiting_human'
+             JOIN sessions s ON s.id=r.session_id AND s.role_generation_id=r.role_generation_id
+             WHERE a.id=?1 AND a.phase='awaiting_human' AND a.status='running'",
+            params![attempt_id],
+            |row| {
+                Ok((
+                    (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?),
+                    (row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?),
+                    (row.get(10)?, row.get(11)?, row.get(12)?),
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        (admission_id, scope, task_id, binding_id, snapshot_id),
+        (session_id, native_session_id, session_key, identity_json, executable_version),
+        (repository_path, profile_revision_id, project_id),
+    )) = row
+    else {
+        return Ok(false);
+    };
+    for (blocker, sql) in SINGLE_AGENT_QUIESCENCE_FENCES {
+        if transaction.query_row(sql, params![attempt_id], |row| row.get::<_, bool>(0))? {
+            bail!("the probe cannot settle because {blocker}")
+        }
+    }
+    let native_session_id = native_session_id
+        .ok_or_else(|| anyhow!("the probe's hooks never named its native conversation"))?;
+    let session_started: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM hook_events WHERE session_id=?1 AND event_name='SessionStart'
+           AND native_session_id=?2)",
+        params![session_id, native_session_id],
+        |row| row.get(0),
+    )?;
+    if !session_started {
+        bail!("the probe has no trusted SessionStart hook for its native conversation")
+    }
+    let manifest_json: String = transaction.query_row(
+        "SELECT manifest_json FROM snapshots WHERE id=?1 AND attempt_id=?2 AND complete=1",
+        params![snapshot_id, attempt_id],
+        |row| row.get(0),
+    )?;
+    let manifest: crate::snapshot::SnapshotManifest = serde_json::from_str(&manifest_json)?;
+    let value = single_agent_probe_value(&admission_id, &task_id)?;
+    let accepted = [
+        hex::encode(Sha256::digest(value.as_bytes())),
+        hex::encode(Sha256::digest(format!("{value}\n").as_bytes())),
+    ];
+    let written = manifest.entries.iter().any(|entry| {
+        entry.path == SINGLE_AGENT_PROBE_FILE
+            && entry.kind == "file"
+            && entry
+                .hash
+                .as_ref()
+                .is_some_and(|hash| accepted.contains(hash))
+    });
+    if !written {
+        bail!("the probe's captured worktree does not hold its probe value")
+    }
+    if std::fs::symlink_metadata(
+        std::path::Path::new(&repository_path).join(SINGLE_AGENT_PROBE_FILE),
+    )
+    .is_ok()
+    {
+        bail!("the probe file also exists in the original repository, so worktree confinement is unproven")
+    }
+    let native: crate::providers::SingleAgentNativeIdentity = serde_json::from_str(
+        identity_json
+            .as_deref()
+            .ok_or_else(|| anyhow!("the probe session has no recorded native identity"))?,
+    )?;
+    let profile = writer_profile_revision(&transaction, &project_id, &profile_revision_id)?;
+    let key = single_agent_capability_key(
+        &SingleAgentProfileIdentity {
+            provider: profile.provider,
+            policy_hash: &profile.policy_hash,
+            adapter_hash: &profile.adapter_hash,
+            profile_hash: &profile.profile_hash,
+            prepared_scope_hash: &scope,
+        },
+        &native,
+    )?;
+    if session_key.as_deref() != Some(key.as_str())
+        || native.executable_version != executable_version
+    {
+        bail!("the probe session's recorded identity is inconsistent with its admission")
+    }
+    let proof = serde_json::json!({
+        "admission_id": admission_id,
+        "prepared_scope_hash": scope,
+        "native_identity": native,
+        "probe_task_id": task_id,
+        "attempt_id": attempt_id,
+        "session_id": session_id,
+        "native_session_id": native_session_id,
+        "snapshot_id": snapshot_id,
+    });
+    transaction.execute(
+        "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
+         VALUES(?1,?2,?3,?4,'single_agent_writer',?5,'supported',?6,'[]',?7,?8)
+         ON CONFLICT(provider,executable_version,role,mode,config_hash) DO UPDATE SET status='supported',
+           evidence_reference=excluded.evidence_reference,gaps_json='[]',checked_at=excluded.checked_at,
+           proof_json=excluded.proof_json",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            profile.provider.to_string(),
+            executable_version,
+            crate::domain::ExecutionActor::SINGLE_AGENT_KEY,
+            key,
+            format!("single_agent_probe:{attempt_id}"),
+            now,
+            proof.to_string()
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE workflow_result_bindings SET state='superseded',state_reason='The probe result became admission evidence',updated_at=?1
+         WHERE id=?2 AND state='awaiting_human'",
+        params![now, binding_id],
+    )?;
+    transaction.execute(
+        "UPDATE attempts SET status='done',updated_at=?1 WHERE id=?2",
+        params![now, attempt_id],
+    )?;
+    transaction.execute(
+        "UPDATE tasks SET lifecycle='done',attention='none',version=version+1,updated_at=?1 WHERE id=?2",
+        params![now, task_id],
+    )?;
+    transaction.execute(
+        "UPDATE claims SET state='complete',updated_at=?1 WHERE attempt_id=?2 AND state='running'",
+        params![now, attempt_id],
+    )?;
+    transaction.execute(
+        "UPDATE role_credentials SET revoked_at=?1 WHERE revoked_at IS NULL
+           AND role_generation_id IN (SELECT id FROM role_generations WHERE attempt_id=?2)",
+        params![now, attempt_id],
+    )?;
+    transaction.execute(
+        "UPDATE profile_admissions SET state_reason=?1,updated_at=?2 WHERE id=?3 AND state='pending'",
+        params![
+            "Native probe evidence is recorded; activate this admission to use the profile",
+            now,
+            admission_id
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+         VALUES(?1,?2,'service','single_agent.probe.settled','profile_admission',?3,?4,?5)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            admission_id,
+            proof.to_string(),
+            now
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(true)
+}
+
+/// Compares the approved guidance identities with the project's registered
+/// commit. A changed or missing file blocks the claim; nothing is rewritten.
+pub(crate) fn single_agent_guidance_problem(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Option<String>> {
+    let (repository_path, base_revision, config_json): (String, String, String) = connection.query_row(
+        "SELECT p.repository_path,p.base_revision,c.config_json
+         FROM task_workflow_selections s JOIN tasks t ON t.id=s.task_id JOIN projects p ON p.id=t.project_id
+         JOIN execution_config_revisions c ON c.id=s.execution_config_revision_id
+         WHERE s.task_id=?1 AND s.family='single_agent'",
+        params![task_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let config: serde_json::Value = serde_json::from_str(&config_json)?;
+    let approved = config["guidance"].as_array().cloned().unwrap_or_default();
+    let paths = approved
+        .iter()
+        .filter_map(|item| item["path"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let current = match committed_guidance(&repository_path, &base_revision, &paths) {
+        Ok(current) => current,
+        Err(error) => {
+            return Ok(Some(format!(
+                "Approved guidance cannot be read at the registered commit: {error:#}"
+            )))
+        }
+    };
+    for (approved, current) in approved.iter().zip(&current) {
+        if approved["sha256"] != current["sha256"] {
+            return Ok(Some(format!(
+                "Guidance file {} changed at the registered commit {base_revision} after the execution configuration was approved; review and save the configuration again",
+                approved["path"].as_str().unwrap_or_default()
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Records a claimed attempt's immutable Single agent run: definition,
+/// configuration, profile admission and the human check selection.
+pub(crate) fn bind_single_agent_run(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    attempt_id: &str,
+    scope_hash: &str,
+    now: &str,
+) -> Result<()> {
+    if let Some(problem) = single_agent_admission_problem(transaction, task_id)? {
+        bail!("{problem}")
+    }
+    let (project_id, definition_id, config_id, profile_id, checks_json, stored_hash): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = transaction.query_row(
+        "SELECT t.project_id,s.definition_id,s.execution_config_revision_id,s.profile_revision_id,
+                s.check_ids_json,s.selection_hash
+         FROM task_workflow_selections s JOIN tasks t ON t.id=s.task_id WHERE s.task_id=?1",
+        params![task_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+    let config_hash = execution_configuration_hash(transaction, &project_id, &config_id)?;
+    let profile = writer_profile_revision(transaction, &project_id, &profile_id)?;
+    let (admission_id, _) = run_admission(transaction, task_id, &profile_id, &config_id)?
+        .ok_or_else(|| anyhow!("the selected agent profile is not admitted"))?;
+    transaction.execute(
+        "INSERT INTO workflow_run_bindings(attempt_id,family,definition_id,definition_hash,definition_state,
+           evaluator_revision,execution_config_revision_id,execution_config_hash,selection_hash,scope_hash,
+           parent_attempt_id,source_snapshot_id,created_at)
+         VALUES(?1,'single_agent',?2,?3,'available',?4,?5,?6,?7,?8,NULL,NULL,?9)",
+        params![
+            attempt_id,
+            definition_id,
+            crate::workflow_resources::single_agent_definition_hash(),
+            crate::workflow_resources::SINGLE_AGENT_EVALUATOR_REVISION,
+            config_id,
+            config_hash,
+            stored_hash,
+            scope_hash,
+            now
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO workflow_run_profiles(attempt_id,slot_key,profile_revision_id,admission_id,policy_hash,
+           session_contract,profile_hash,created_at)
+         VALUES(?1,?2,?3,?4,?5,'retained',?6,?7)",
+        params![attempt_id, SINGLE_AGENT_SLOT, profile_id, admission_id, profile.policy_hash, profile.profile_hash, now],
+    )?;
+    for check_id in serde_json::from_str::<Vec<String>>(&checks_json)? {
+        transaction.execute(
+            "INSERT INTO workflow_check_selections(attempt_id,revision,check_id,selected_by,created_at)
+             VALUES(?1,1,?2,'human',?3)",
+            params![attempt_id, check_id, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// The task's workflow selection and, for Single agent, the state of its
+/// latest run in the words the board and detail views show.
+pub(crate) fn task_workflow_projection(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Option<crate::domain::TaskWorkflowDto>> {
+    use crate::domain::{
+        SingleAgentResultDto, SingleAgentRunDto, SingleAgentStage, TaskWorkflowDto,
+    };
+    let selection: Option<(String, Option<String>, Option<String>, Option<String>, String, i64, String, Option<String>)> = connection
+        .query_row(
+            "SELECT family,definition_id,execution_config_revision_id,profile_revision_id,check_ids_json,
+                    selection_revision,admission_state,admission_reason
+             FROM task_workflow_selections WHERE task_id=?1",
+            params![task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+        )
+        .optional()?;
+    let Some((
+        family,
+        definition_id,
+        config_id,
+        profile_id,
+        checks_json,
+        revision,
+        admission_state,
+        admission_reason,
+    )) = selection
+    else {
+        return Ok(None);
+    };
+    let run_row: Option<(String, Option<String>, String, Option<String>, Option<String>, String, String, Option<String>)> = connection
+        .query_row(
+            "SELECT a.id,b.definition_id,b.definition_state,b.execution_config_revision_id,a.parent_attempt_id,
+                    a.phase,a.status,(SELECT rp.profile_revision_id FROM workflow_run_profiles rp WHERE rp.attempt_id=a.id)
+             FROM attempts a JOIN workflow_run_bindings b ON b.attempt_id=a.id AND b.family='single_agent'
+             WHERE a.task_id=?1 ORDER BY a.created_at DESC,a.rowid DESC LIMIT 1",
+            params![task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+        )
+        .optional()?;
+    let run = match run_row {
+        None => None,
+        Some((
+            attempt_id,
+            run_definition,
+            definition_state,
+            run_config,
+            parent,
+            phase,
+            status,
+            run_profile,
+        )) => {
+            let result = connection
+                .query_row(
+                    "SELECT r.id,r.state,rr.summary,rr.metadata_json,r.snapshot_id,r.candidate_hash,
+                            r.selected_check_revision,r.created_at,r.state_reason
+                     FROM workflow_result_bindings r JOIN role_results rr ON rr.id=r.role_result_id
+                     WHERE r.attempt_id=?1 ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1",
+                    params![attempt_id],
+                    |row| {
+                        let metadata: String = row.get(3)?;
+                        Ok((
+                            SingleAgentResultDto {
+                                id: row.get(0)?,
+                                state: row.get(1)?,
+                                summary: row.get(2)?,
+                                acceptance_rows: serde_json::from_str::<serde_json::Value>(&metadata)
+                                    .ok()
+                                    .and_then(|value| serde_json::from_value(value["acceptance_rows"].clone()).ok())
+                                    .unwrap_or_default(),
+                                snapshot_id: row.get(4)?,
+                                candidate_hash: row.get(5)?,
+                                selected_check_revision: row.get(6)?,
+                                created_at: row.get(7)?,
+                            },
+                            row.get::<_, Option<String>>(8)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let started: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM role_generations WHERE attempt_id=?1)",
+                params![attempt_id],
+                |row| row.get(0),
+            )?;
+            let held_reason: Option<String> = connection
+                .query_row(
+                    "SELECT json_extract(detail_json,'$.reason') FROM audit_events
+                     WHERE event_code='single_agent.attempt.held' AND entity_id=?1
+                     ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                    params![attempt_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let result_state = result.as_ref().map(|(dto, _)| dto.state.as_str());
+            let probe_admission_id = single_agent_probe_admission(connection, task_id)?;
+            let (stage, stage_reason) = match (status.as_str(), phase.as_str(), result_state) {
+                ("done", _, _) if probe_admission_id.is_some() => (
+                    SingleAgentStage::ProbeEvidenceRecorded,
+                    "This profile probe recorded native evidence. Nothing was accepted; activate the admission to use the profile.".to_owned(),
+                ),
+                ("done", _, _) => (SingleAgentStage::Accepted, "You accepted this result. Integration into the repository is recorded separately.".to_owned()),
+                (_, _, Some("changes_requested")) => (SingleAgentStage::ChangesRequested, "You requested changes; a linked new run continues the work.".to_owned()),
+                ("needs_input", _, _) => (
+                    SingleAgentStage::NeedsAction,
+                    held_reason.unwrap_or_else(|| "The run needs your decision.".into()),
+                ),
+                ("needs_recovery" | "held" | "restart_parked" | "failed" | "cancelled", _, _) => {
+                    (SingleAgentStage::Blocked, format!("The run is {status}; open its recovery details."))
+                }
+                (_, "agent_execution", _) if !started => (SingleAgentStage::WaitingToStart, "Waiting to start the agent.".into()),
+                (_, "agent_execution", _) => (SingleAgentStage::Writing, "The agent is working in its worktree.".into()),
+                (_, "result_submitted", _) => (
+                    SingleAgentStage::ResultSubmittedWaitingForStop,
+                    "The agent submitted its result; waiting for its processes to stop before capturing the worktree.".into(),
+                ),
+                (_, "awaiting_checks", _) => (SingleAgentStage::AwaitingSelectedChecks, "The selected checks must pass against the captured candidate.".into()),
+                (_, "awaiting_human", _) if probe_admission_id.is_some() => (
+                    SingleAgentStage::ResultSubmittedWaitingForStop,
+                    "The probe's result was captured; LLMRelay is checking it as admission evidence.".into(),
+                ),
+                (_, "awaiting_human", _) => (SingleAgentStage::AwaitingHuman, "Waiting for you to accept the result or request changes.".into()),
+                _ => (SingleAgentStage::Blocked, format!("The run is {status} in {phase}.")),
+            };
+            let mut available_actions = Vec::new();
+            let checks = match result.as_ref() {
+                Some((dto, _)) => single_agent_check_projection(connection, &attempt_id, dto)?,
+                None => Vec::new(),
+            };
+            let (guidance_changes, guidance_change_hash) = match result
+                .as_ref()
+                .and_then(|(dto, _)| dto.snapshot_id.as_deref())
+            {
+                Some(snapshot_id) => {
+                    single_agent_guidance_changes(connection, &attempt_id, snapshot_id)?
+                }
+                None => (Vec::new(), None),
+            };
+            let writer: Option<(String, String, i64)> = connection
+                .query_row(
+                    "SELECT s.id,s.transcript_epoch,s.resume_count FROM execution_bindings eb
+                     JOIN sessions s ON s.role_generation_id=eb.role_generation_id
+                     WHERE eb.attempt_id=?1 AND eb.actor='single_agent'",
+                    params![attempt_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let resume = match writer {
+                Some((session_id, transcript_epoch, resume_count)) => {
+                    let eligibility = single_agent_resume_target(
+                        connection,
+                        &attempt_id,
+                        Some(SingleAgentResumeMode::Explicit),
+                    )?;
+                    if eligibility.is_ok() {
+                        available_actions.push("resume_run".to_owned());
+                    }
+                    Some(crate::domain::SingleAgentResumeDto {
+                        session_id,
+                        transcript_epoch,
+                        resume_count,
+                        available: eligibility.is_ok(),
+                        reason: eligibility.err(),
+                    })
+                }
+                None => None,
+            };
+            if ordinary_control_policy(connection, task_id, Some(&attempt_id))?
+                .iter()
+                .any(|control| control == "cancel")
+            {
+                available_actions.push("cancel".to_owned());
+            }
+            if let Some((
+                SingleAgentResultDto {
+                    id,
+                    candidate_hash: Some(candidate_hash),
+                    ..
+                },
+                _,
+            )) = result.as_ref()
+            {
+                let task_version: i64 = connection.query_row(
+                    "SELECT version FROM tasks WHERE id=?1",
+                    params![task_id],
+                    |row| row.get(0),
+                )?;
+                let decision = SingleAgentDecision {
+                    task_id,
+                    attempt_id: &attempt_id,
+                    expected_version: task_version,
+                    result_binding_id: id,
+                    candidate_hash,
+                };
+                if acceptance_basis(connection, &decision).is_ok() {
+                    available_actions.push("accept_result".to_owned());
+                }
+                if rework_basis(connection, &decision).is_ok() {
+                    available_actions.push("request_rework".to_owned());
+                }
+                if phase == "awaiting_checks"
+                    && matches!(status.as_str(), "running" | "needs_input")
+                    && !checks.is_empty()
+                {
+                    available_actions.push("authorize_check".to_owned());
+                }
+            }
+            let selected_check_ids = {
+                let mut statement = connection.prepare(
+                    "SELECT check_id FROM workflow_check_selections WHERE attempt_id=?1 ORDER BY check_id",
+                )?;
+                let rows = statement
+                    .query_map(params![attempt_id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            // Only verified integration of this attempt's accepted manifest counts;
+            // evidence recorded for an older accepted result must not carry over.
+            let accepted_manifest: Option<String> = connection
+                .query_row(
+                    "SELECT s.manifest_json FROM attempts a JOIN snapshots s ON s.id=a.accepted_snapshot_id
+                     WHERE a.id=?1 AND a.status='done'",
+                    params![attempt_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let integration_recorded = match accepted_manifest {
+                Some(manifest_json) => {
+                    let manifest: crate::snapshot::SnapshotManifest =
+                        serde_json::from_str(&manifest_json)?;
+                    connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM task_dependencies WHERE depends_on_task_id=?1
+                           AND integration_commit IS NOT NULL AND verified_at IS NOT NULL
+                           AND integration_manifest_hash=?2)",
+                        params![task_id, json_hash(&manifest)?],
+                        |row| row.get(0),
+                    )?
+                }
+                None => false,
+            };
+            Some(SingleAgentRunDto {
+                attempt_id,
+                definition_id: run_definition,
+                definition_state,
+                profile_revision_id: run_profile,
+                execution_config_revision_id: run_config,
+                parent_attempt_id: parent,
+                probe_admission_id,
+                stage,
+                stage_reason,
+                selected_check_ids,
+                checks,
+                guidance_changes,
+                guidance_change_hash,
+                resume,
+                result: result.map(|(dto, _)| dto),
+                available_actions,
+                integration_recorded,
+            })
+        }
+    };
+    Ok(Some(TaskWorkflowDto {
+        family: family.parse().map_err(|error: String| anyhow!(error))?,
+        definition_id,
+        execution_config_revision_id: config_id,
+        profile_revision_id: profile_id,
+        check_ids: serde_json::from_str(&checks_json)?,
+        selection_revision: revision,
+        admission_state,
+        admission_reason,
+        run,
+    }))
+}
+
+fn single_agent_check_projection(
+    connection: &Connection,
+    attempt_id: &str,
+    result: &crate::domain::SingleAgentResultDto,
+) -> Result<Vec<crate::domain::SingleAgentCheckDto>> {
+    use crate::checks::SingleAgentCheckAuthorization;
+    let selected = {
+        let mut statement = connection.prepare(
+            "SELECT s.check_id,c.check_key,c.original_text FROM workflow_check_selections s
+             JOIN execution_verification_checks c ON c.id=s.check_id
+             WHERE s.attempt_id=?1 AND s.revision=?2 ORDER BY c.check_key",
+        )?;
+        let rows = statement
+            .query_map(params![attempt_id, result.selected_check_revision], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let mut checks = Vec::new();
+    for (check_id, check_key, original_text) in selected {
+        let Some(identity) =
+            crate::checks::single_agent_check_identity(connection, attempt_id, &check_id)?
+        else {
+            continue;
+        };
+        let authorization = match crate::checks::single_agent_check_authorization(
+            connection, attempt_id, &check_id, &identity,
+        )? {
+            SingleAgentCheckAuthorization::Authorized(_) => "authorized",
+            SingleAgentCheckAuthorization::Denied => "denied",
+            SingleAgentCheckAuthorization::Missing => "missing",
+        };
+        let latest: Option<(String, String, Option<i64>, String)> = connection
+            .query_row(
+                "SELECT id,status,exit_code,freshness_state FROM check_runs
+                 WHERE attempt_id=?1 AND candidate_hash=?2 AND check_id=?3
+                 ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                params![attempt_id, identity.candidate_hash, check_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        checks.push(crate::domain::SingleAgentCheckDto {
+            check_id,
+            check_key,
+            original_text,
+            command_kind: identity.command_kind,
+            executable: identity.executable,
+            arguments: serde_json::from_str(identity.arguments.as_deref().unwrap_or("[]"))?,
+            shell_command: identity.shell,
+            cwd: identity.cwd,
+            exact_command_hash: identity.command_hash,
+            scope_hash: identity.scope_hash,
+            authorization: authorization.to_owned(),
+            latest_run_passed: latest.as_ref().map(|(_, status, exit_code, freshness)| {
+                status == "finished" && *exit_code == Some(0) && freshness == "current"
+            }),
+            latest_run_status: latest.as_ref().map(|(_, status, _, _)| status.clone()),
+            latest_run_id: latest.map(|(id, _, _, _)| id),
+        });
+    }
+    Ok(checks)
+}
+
+/// Each project's Single agent setup, independent of TRIP readiness.
+fn workflow_execution_projection(
+    connection: &Connection,
+    bundles: &crate::provider_compatibility::BundleSet,
+    project_ids: &[String],
+) -> Result<Vec<crate::domain::ProjectExecutionDto>> {
+    use crate::domain::{
+        AgentProfileDto, AgentProfileRevisionDto, ExecutionConfigurationDto, ProfileAdmissionDto,
+        ProjectExecutionDto,
+    };
+    let mut projects = Vec::new();
+    for project_id in project_ids {
+        let (family, version): (String, i64) = connection
+            .query_row(
+                "SELECT family,version FROM project_workflow_defaults WHERE project_id=?1",
+                params![project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or_else(|| ("trip".into(), 0));
+        let configurations = {
+            let mut statement = connection.prepare(
+                "SELECT id,revision,content_hash,config_json,approved_at FROM execution_config_revisions
+                 WHERE project_id=?1 ORDER BY revision DESC LIMIT 10",
+            )?;
+            let rows = statement
+                .query_map(params![project_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let configurations = configurations
+            .into_iter()
+            .map(|(id, revision, content_hash, config_json, approved_at)| {
+                let mut statement = connection.prepare(
+                    "SELECT json_object('id',id,'check_key',check_key,'command_kind',command_kind,
+                       'executable',executable,'arguments',json(arguments_json),'shell_command',shell_command,
+                       'cwd',cwd,'timeout_seconds',timeout_seconds,'acceptance_rows',json(acceptance_rows_json),
+                       'relevant_inputs',json(relevant_inputs_json),'original_text',original_text)
+                     FROM execution_verification_checks WHERE execution_config_revision_id=?1 ORDER BY check_key",
+                )?;
+                let checks = statement
+                    .query_map(params![id], |row| row.get::<_, String>(0))?
+                    .map(|row| Ok(serde_json::from_str(&row?)?))
+                    .collect::<Result<Vec<serde_json::Value>>>()?;
+                Ok(ExecutionConfigurationDto {
+                    id,
+                    revision,
+                    content_hash,
+                    configuration: serde_json::from_str(&config_json)?,
+                    checks,
+                    approved_at,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let profiles = {
+            let mut statement = connection.prepare(
+                "SELECT p.id,p.display_name,p.version,r.id,r.revision,r.provider,r.model,r.effort,r.instructions_hash,
+                        r.policy_id,r.policy_hash,r.adapter_hash,r.authority,r.session_contract,r.profile_hash,r.created_at
+                 FROM agent_profiles p LEFT JOIN agent_profile_revisions r ON r.id=p.current_revision_id
+                 WHERE p.project_id=?1 ORDER BY p.display_name,p.id",
+            )?;
+            let rows = statement
+                .query_map(params![project_id], |row| {
+                    let revision_id: Option<String> = row.get(3)?;
+                    let current_revision = match revision_id {
+                        Some(id) => {
+                            let provider: String = row.get(5)?;
+                            Some(AgentProfileRevisionDto {
+                                id,
+                                revision: row.get(4)?,
+                                provider: provider.parse().map_err(|error: String| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        5,
+                                        rusqlite::types::Type::Text,
+                                        error.into(),
+                                    )
+                                })?,
+                                model: row.get(6)?,
+                                effort: row.get(7)?,
+                                instructions_hash: row.get(8)?,
+                                policy_id: row.get(9)?,
+                                policy_hash: row.get(10)?,
+                                adapter_hash: row.get(11)?,
+                                authority: row.get(12)?,
+                                session_contract: row.get(13)?,
+                                profile_hash: row.get(14)?,
+                                created_at: row.get(15)?,
+                            })
+                        }
+                        None => None,
+                    };
+                    Ok(AgentProfileDto {
+                        id: row.get(0)?,
+                        display_name: row.get(1)?,
+                        version: row.get(2)?,
+                        current_revision,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut admissions = {
+            let mut statement = connection.prepare(
+                "SELECT id,profile_revision_id,execution_config_revision_id,state,state_reason,activated_at,updated_at,
+                        probe_task_id
+                 FROM profile_admissions WHERE project_id=?1 ORDER BY updated_at DESC LIMIT 50",
+            )?;
+            let rows = statement
+                .query_map(params![project_id], |row| {
+                    Ok(ProfileAdmissionDto {
+                        id: row.get(0)?,
+                        profile_revision_id: row.get(1)?,
+                        execution_config_revision_id: row.get(2)?,
+                        state: row.get(3)?,
+                        state_reason: row.get(4)?,
+                        probe_task_id: row.get(7)?,
+                        probe_available: false,
+                        probe_unavailable_reason: None,
+                        activated_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for admission in &mut admissions {
+            if let Err(blocker) =
+                single_agent_probe_inputs(connection, bundles, project_id, &admission.id)
+            {
+                admission.probe_unavailable_reason = Some(format!("{blocker:#}"));
+            } else {
+                admission.probe_available = true;
+            }
+        }
+        projects.push(ProjectExecutionDto {
+            project_id: project_id.clone(),
+            default_family: family.parse().map_err(|error: String| anyhow!(error))?,
+            default_version: version,
+            configurations,
+            profiles,
+            admissions,
+        });
+    }
+    Ok(projects)
+}
+
+/// Moves an edited Ready Single agent task back to the drafts. A Ready
+/// admission binds the exact task version it was granted for.
+fn invalidate_single_agent_ready(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    reason: &str,
+    now: &str,
+) -> Result<bool> {
+    let invalidated = transaction.execute(
+        "UPDATE task_workflow_selections SET admission_state='invalidated',admission_reason=?1,
+           admitted_task_version=NULL,updated_at=?2
+         WHERE task_id=?3 AND family='single_agent' AND admission_state='admitted'",
+        params![reason, now, task_id],
+    )?;
+    if invalidated == 1 {
+        transaction.execute(
+            "UPDATE tasks SET lifecycle='backlog',attention='needs_input',ready_at=NULL
+             WHERE id=?1 AND lifecycle='ready'",
+            params![task_id],
+        )?;
+    }
+    Ok(invalidated == 1)
+}
+
+/// Human operations of the multi-workflow feature. Each has its own receipt;
+/// replaying an operation returns its first outcome and changed input under
+/// the same operation ID is refused.
+pub fn execute_workflow_command(
+    store: &Store,
+    command: &crate::domain::WorkflowCommand,
+) -> Result<OperationResult> {
+    use crate::domain::WorkflowCommand;
+    let operation_id = command.operation_id();
+    if operation_id.trim().is_empty() || operation_id.len() > 128 {
+        bail!("operation_id is required")
+    }
+    let request_hash = json_hash(command)?;
+    if let Some(result) = store.operation_receipt(
+        operation_id,
+        "human_control",
+        WORKFLOW_COMMAND_RECEIPT,
+        &request_hash,
+    )? {
+        return Ok(serde_json::from_value(result)?);
+    }
+    if matches!(
+        command,
+        WorkflowCommand::ActivateProfileAdmission { .. }
+            | WorkflowCommand::ProbeProfileAdmission { .. }
+            | WorkflowCommand::AcceptResult { .. }
+            | WorkflowCommand::RequestRework { .. }
+            | WorkflowCommand::AuthorizeCheck { .. }
+    ) {
+        store.require_execution_unheld("Single agent decisions")?;
+    }
+    let prepared = match command {
+        WorkflowCommand::SaveExecutionConfiguration {
+            project_id,
+            configuration,
+            ..
+        } => Some(prepare_execution_configuration(
+            store,
+            project_id,
+            configuration,
+        )?),
+        _ => None,
+    };
+    let mut connection = store.lock()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some((stored_hash, result)) = transaction
+        .query_row(
+            "SELECT request_hash,result_json FROM operation_receipts
+             WHERE operation_id=?1 AND actor_key='human_control' AND operation_kind=?2",
+            params![operation_id, WORKFLOW_COMMAND_RECEIPT],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        if stored_hash != request_hash {
+            bail!("operation ID was already used with different input")
+        }
+        return Ok(serde_json::from_str(&result)?);
+    }
+    let now = Utc::now().to_rfc3339();
+    let result = match command {
+        WorkflowCommand::SaveExecutionConfiguration {
+            project_id,
+            expected_revision,
+            configuration,
+            ..
+        } => {
+            let prepared = prepared
+                .as_ref()
+                .ok_or_else(|| anyhow!("execution configuration was not prepared"))?;
+            let (latest, base_revision): (i64, String) = transaction.query_row(
+                "SELECT COALESCE((SELECT MAX(revision) FROM execution_config_revisions WHERE project_id=p.id),0),
+                        p.base_revision
+                 FROM projects p WHERE p.id=?1",
+                params![project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if latest != *expected_revision {
+                bail!("The execution configuration changed since you opened it; reload and review it again")
+            }
+            if base_revision != prepared.base_revision {
+                bail!("The project's registered commit changed while the guidance files were read; save again")
+            }
+            let config = serde_json::json!({
+                "schema": 1,
+                "base_revision": prepared.base_revision,
+                "guidance": prepared.guidance,
+                "testing_coverage": configuration.testing_coverage.trim(),
+                "documentation_policy": configuration.documentation_policy.trim(),
+            });
+            let content_hash = json_hash(&serde_json::json!({
+                "configuration": config,
+                "checks": configuration.checks,
+            }))?;
+            let id = uuid::Uuid::new_v4().to_string();
+            let revision = latest + 1;
+            transaction.execute(
+                "INSERT INTO execution_config_revisions(id,project_id,revision,config_json,content_hash,approved_at,created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?6)",
+                params![id, project_id, revision, config.to_string(), content_hash, now],
+            )?;
+            for check in &configuration.checks {
+                transaction.execute(
+                    "INSERT INTO execution_verification_checks(id,execution_config_revision_id,check_key,command_kind,
+                       executable,arguments_json,shell_command,cwd,timeout_seconds,acceptance_rows_json,
+                       relevant_inputs_json,invalidation_json,original_text)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'[]',?12)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        id,
+                        check.check_key,
+                        check.command_kind,
+                        check.executable,
+                        serde_json::to_string(&check.arguments)?,
+                        check.shell_command,
+                        contained_relative_path(&check.cwd, true)?,
+                        check.timeout_seconds,
+                        serde_json::to_string(&check.acceptance_rows)?,
+                        serde_json::to_string(&check.relevant_inputs)?,
+                        check.original_text.trim()
+                    ],
+                )?;
+            }
+            let mut saved = result(
+                operation_id,
+                "execution_configuration",
+                id,
+                Some(revision),
+                "saved",
+            );
+            saved.detail = serde_json::json!({"content_hash": content_hash});
+            saved
+        }
+        WorkflowCommand::SaveAgentProfile {
+            project_id,
+            profile_id,
+            expected_version,
+            profile,
+            ..
+        } => {
+            let project_known: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1 AND internal_purpose IS NULL)",
+                params![project_id],
+                |row| row.get(0),
+            )?;
+            if !project_known {
+                bail!("unknown project {project_id}")
+            }
+            let display_name = profile.display_name.trim();
+            if display_name.is_empty() || display_name.chars().count() > 120 {
+                bail!("A profile name of at most 120 characters is required")
+            }
+            let values = profile_revision_values(profile)?;
+            match profile_id {
+                None => {
+                    if expected_version.is_some() {
+                        bail!("A new agent profile has no expected version")
+                    }
+                    let id = uuid::Uuid::new_v4().to_string();
+                    transaction.execute(
+                        "INSERT INTO agent_profiles(id,project_id,display_name,current_revision_id,version,created_at,updated_at)
+                         VALUES(?1,?2,?3,NULL,1,?4,?4)",
+                        params![id, project_id, display_name, now],
+                    )?;
+                    let revision_id = insert_profile_revision(&transaction, &id, 1, &values, &now)?;
+                    transaction.execute(
+                        "UPDATE agent_profiles SET current_revision_id=?1 WHERE id=?2",
+                        params![revision_id, id],
+                    )?;
+                    let mut created = result(operation_id, "agent_profile", id, Some(1), "created");
+                    created.detail = serde_json::json!({"profile_revision_id": revision_id});
+                    created
+                }
+                Some(id) => {
+                    let expected = expected_version.ok_or_else(|| {
+                        anyhow!("Editing an agent profile requires its expected version")
+                    })?;
+                    let (current_revision_id, current_hash, current_number): (String, String, i64) =
+                        transaction
+                            .query_row(
+                                "SELECT r.id,r.profile_hash,r.revision FROM agent_profiles p
+                             JOIN agent_profile_revisions r ON r.id=p.current_revision_id
+                             WHERE p.id=?1 AND p.project_id=?2 AND p.version=?3",
+                                params![id, project_id, expected],
+                                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                            )
+                            .optional()?
+                            .ok_or_else(|| {
+                                anyhow!("The agent profile changed since you opened it; reload it")
+                            })?;
+                    let (revision_id, state) = if current_hash == values.profile_hash {
+                        (current_revision_id, "renamed")
+                    } else {
+                        (
+                            insert_profile_revision(
+                                &transaction,
+                                id,
+                                current_number + 1,
+                                &values,
+                                &now,
+                            )?,
+                            "revised",
+                        )
+                    };
+                    transaction.execute(
+                        "UPDATE agent_profiles SET display_name=?1,current_revision_id=?2,version=version+1,updated_at=?3
+                         WHERE id=?4 AND version=?5",
+                        params![display_name, revision_id, now, id, expected],
+                    )?;
+                    let mut saved = result(
+                        operation_id,
+                        "agent_profile",
+                        id.clone(),
+                        Some(expected + 1),
+                        state,
+                    );
+                    saved.detail = serde_json::json!({"profile_revision_id": revision_id});
+                    saved
+                }
+            }
+        }
+        WorkflowCommand::PrepareProfileAdmission {
+            project_id,
+            profile_revision_id,
+            execution_config_revision_id,
+            ..
+        } => {
+            let profile = writer_profile_revision(&transaction, project_id, profile_revision_id)?;
+            let config_hash = execution_configuration_hash(
+                &transaction,
+                project_id,
+                execution_config_revision_id,
+            )?;
+            let scope = admission_scope_hash(
+                &transaction,
+                project_id,
+                profile_revision_id,
+                &profile,
+                execution_config_revision_id,
+                &config_hash,
+            )?;
+            let existing: Option<(String, String, Option<String>)> = transaction
+                .query_row(
+                    "SELECT id,state,state_reason FROM profile_admissions
+                     WHERE profile_revision_id=?1 AND execution_config_revision_id=?2
+                       AND prepared_scope_hash=?3 AND state IN ('pending','activated')
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![profile_revision_id, execution_config_revision_id, scope],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let (id, state, reason) = match existing {
+                Some(existing) => existing,
+                None => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let reason =
+                        admission_pending_reason(&store.compatibility_bundles, profile.provider);
+                    transaction.execute(
+                        "INSERT INTO profile_admissions(id,project_id,profile_revision_id,execution_config_revision_id,
+                           policy_hash,adapter_hash,session_contract,prepared_scope_hash,state,state_reason,created_at,updated_at)
+                         VALUES(?1,?2,?3,?4,?5,?6,'retained',?7,'pending',?8,?9,?9)",
+                        params![
+                            id,
+                            project_id,
+                            profile_revision_id,
+                            execution_config_revision_id,
+                            profile.policy_hash,
+                            profile.adapter_hash,
+                            scope,
+                            reason,
+                            now
+                        ],
+                    )?;
+                    (id, "pending".to_owned(), Some(reason))
+                }
+            };
+            let mut prepared = result(operation_id, "profile_admission", id, None, &state);
+            prepared.detail = serde_json::json!({"reason": reason});
+            prepared
+        }
+        WorkflowCommand::ProbeProfileAdmission {
+            project_id,
+            admission_id,
+            ..
+        } => start_single_agent_probe(
+            &transaction,
+            &store.compatibility_bundles,
+            operation_id,
+            project_id,
+            admission_id,
+            &now,
+        )?,
+        WorkflowCommand::ActivateProfileAdmission {
+            project_id,
+            admission_id,
+            ..
+        } => {
+            let (profile_revision_id, config_id, stored_scope, state): (String, String, String, String) =
+                transaction
+                    .query_row(
+                        "SELECT profile_revision_id,execution_config_revision_id,prepared_scope_hash,state
+                         FROM profile_admissions WHERE id=?1 AND project_id=?2",
+                        params![admission_id, project_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()?
+                    .ok_or_else(|| anyhow!("unknown profile admission {admission_id}"))?;
+            if state != "pending" {
+                bail!("Only a pending admission can be activated; this one is {state}")
+            }
+            let profile = writer_profile_revision(&transaction, project_id, &profile_revision_id)?;
+            let config_hash = execution_configuration_hash(&transaction, project_id, &config_id)?;
+            let scope = admission_scope_hash(
+                &transaction,
+                project_id,
+                &profile_revision_id,
+                &profile,
+                &config_id,
+                &config_hash,
+            )?;
+            if scope != stored_scope {
+                bail!("The project, profile or configuration changed after this admission was prepared; prepare admission again")
+            }
+            // Only a settled probe of this admission counts. Its key covers
+            // the profile, this prepared scope and the native identity the
+            // probe ran with; every later launch recomputes it from the
+            // current installation, so stale proof cannot start a writer.
+            let evidence: Option<(String, String, String)> = transaction
+                .query_row(
+                    "SELECT executable_version,config_hash,proof_json FROM capabilities
+                     WHERE provider=?1 AND role=?2 AND mode='single_agent_writer' AND status='supported'
+                       AND json_extract(proof_json,'$.admission_id')=?3
+                       AND json_extract(proof_json,'$.prepared_scope_hash')=?4
+                     ORDER BY checked_at DESC,rowid DESC LIMIT 1",
+                    params![
+                        profile.provider.to_string(),
+                        crate::domain::ExecutionActor::SINGLE_AGENT_KEY,
+                        admission_id,
+                        stored_scope
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((executable_version, capability_key, proof)) = evidence else {
+                bail!(
+                    "This exact agent profile has no recorded native Single agent capability evidence, so it cannot be activated. {}",
+                    admission_pending_reason(&store.compatibility_bundles, profile.provider)
+                )
+            };
+            let proof_value: serde_json::Value = serde_json::from_str(&proof)?;
+            let native: crate::providers::SingleAgentNativeIdentity =
+                serde_json::from_value(proof_value["native_identity"].clone())?;
+            let recomputed = single_agent_capability_key(
+                &SingleAgentProfileIdentity {
+                    provider: profile.provider,
+                    policy_hash: &profile.policy_hash,
+                    adapter_hash: &profile.adapter_hash,
+                    profile_hash: &profile.profile_hash,
+                    prepared_scope_hash: &stored_scope,
+                },
+                &native,
+            )?;
+            if recomputed != capability_key || native.executable_version != executable_version {
+                bail!("The recorded probe evidence does not match this profile and scope; probe the profile again")
+            }
+            let binding = store
+                .compatibility_bundles
+                .resolve_policy(
+                    profile.provider,
+                    &executable_version,
+                    crate::provider_compatibility::PolicyMode::SingleAgentWriter,
+                )
+                .map_err(|error| anyhow!(error.explanation().message.clone()))?;
+            if let Some(reason) = binding.native_calls_disabled_reason() {
+                bail!("{reason}")
+            }
+            transaction.execute(
+                "UPDATE profile_admissions SET state='invalidated',state_reason='Replaced by a newer activation',updated_at=?1
+                 WHERE profile_revision_id=?2 AND execution_config_revision_id=?3 AND state='activated'",
+                params![now, profile_revision_id, config_id],
+            )?;
+            let changed = transaction.execute(
+                "UPDATE profile_admissions SET state='activated',state_reason=NULL,capability_key=?1,proof_hash=?2,
+                   activated_at=?3,updated_at=?3 WHERE id=?4 AND state='pending'",
+                params![capability_key, json_hash(&proof)?, now, admission_id],
+            )?;
+            if changed != 1 {
+                bail!("profile admission changed during activation")
+            }
+            result(
+                operation_id,
+                "profile_admission",
+                admission_id.clone(),
+                None,
+                "activated",
+            )
+        }
+        WorkflowCommand::SetProjectWorkflowDefault {
+            project_id,
+            expected_version,
+            family,
+            ..
+        } => {
+            let current: i64 = transaction.query_row(
+                "SELECT COALESCE((SELECT version FROM project_workflow_defaults WHERE project_id=p.id),0)
+                 FROM projects p WHERE p.id=?1 AND p.internal_purpose IS NULL",
+                params![project_id],
+                |row| row.get(0),
+            ).optional()?.ok_or_else(|| anyhow!("unknown project {project_id}"))?;
+            if current != *expected_version {
+                bail!("The project's default workflow changed since you opened it; reload it")
+            }
+            let definition = match family {
+                crate::domain::WorkflowFamily::Trip => None,
+                crate::domain::WorkflowFamily::SingleAgent => {
+                    Some(ensure_single_agent_definition(&transaction, &now)?.0)
+                }
+            };
+            transaction.execute(
+                "INSERT INTO project_workflow_defaults(project_id,family,definition_id,version,updated_at)
+                 VALUES(?1,?2,?3,1,?4)
+                 ON CONFLICT(project_id) DO UPDATE SET family=excluded.family,
+                   definition_id=excluded.definition_id,version=project_workflow_defaults.version+1,
+                   updated_at=excluded.updated_at",
+                params![project_id, family.as_str(), definition, now],
+            )?;
+            result(
+                operation_id,
+                "project_workflow_default",
+                project_id.clone(),
+                Some(current + 1),
+                family.as_str(),
+            )
+        }
+        WorkflowCommand::SetTaskWorkflow {
+            task_id,
+            expected_version,
+            selection,
+            ..
+        } => set_task_workflow(&transaction, task_id, *expected_version, selection, &now).map(
+            |state| {
+                result(
+                    operation_id,
+                    "task",
+                    task_id.clone(),
+                    Some(expected_version + 1),
+                    state,
+                )
+            },
+        )?,
+        WorkflowCommand::AcceptResult {
+            task_id,
+            attempt_id,
+            expected_version,
+            result_binding_id,
+            candidate_hash,
+            guidance_change_hash,
+            ..
+        } => {
+            let decision = SingleAgentDecision {
+                task_id,
+                attempt_id,
+                expected_version: *expected_version,
+                result_binding_id,
+                candidate_hash,
+            };
+            accept_single_agent_result(
+                &transaction,
+                operation_id,
+                &request_hash,
+                &decision,
+                guidance_change_hash.as_deref(),
+                &now,
+            )?;
+            result(
+                operation_id,
+                "task",
+                task_id.clone(),
+                Some(expected_version + 1),
+                "accepted",
+            )
+        }
+        WorkflowCommand::RequestRework {
+            task_id,
+            attempt_id,
+            expected_version,
+            result_binding_id,
+            candidate_hash,
+            feedback,
+            ..
+        } => {
+            let decision = SingleAgentDecision {
+                task_id,
+                attempt_id,
+                expected_version: *expected_version,
+                result_binding_id,
+                candidate_hash,
+            };
+            let child = stage_single_agent_rework(
+                &transaction,
+                operation_id,
+                &request_hash,
+                &decision,
+                feedback,
+                &now,
+            )?;
+            let mut staged = result(
+                operation_id,
+                "attempt",
+                child.clone(),
+                Some(expected_version + 1),
+                "rework_created",
+            );
+            staged.detail =
+                serde_json::json!({"parent_attempt_id": attempt_id, "child_attempt_id": child});
+            staged
+        }
+        WorkflowCommand::CreateTask {
+            project_id,
+            title,
+            description,
+            acceptance_criteria,
+            priority,
+            selection,
+            ..
+        } => {
+            let (settings, default_family): (String, String) = transaction
+                .query_row(
+                    "SELECT p.settings_json,COALESCE(d.family,'trip') FROM projects p
+                     LEFT JOIN project_workflow_defaults d ON d.project_id=p.id
+                     WHERE p.id=?1 AND p.internal_purpose IS NULL",
+                    params![project_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| anyhow!("unknown project {project_id}"))?;
+            let family = match selection {
+                Some(selection) => selection.family,
+                None => default_family
+                    .parse()
+                    .map_err(|error: String| anyhow!(error))?,
+            };
+            let selection = match (selection, family) {
+                (Some(selection), _) => Some(selection),
+                (None, crate::domain::WorkflowFamily::Trip) => None,
+                (None, crate::domain::WorkflowFamily::SingleAgent) => bail!(
+                    "This project creates Single agent tasks by default; choose the execution configuration and agent profile for the new task"
+                ),
+            };
+            let defaults: serde_json::Value = serde_json::from_str(&settings)?;
+            let id = insert_task_rows(
+                &transaction,
+                project_id,
+                title,
+                description,
+                acceptance_criteria,
+                *priority,
+                &serde_json::Value::Null,
+                Some(&defaults),
+                false,
+                &now,
+            )?;
+            let version = match selection {
+                Some(selection) => {
+                    set_task_workflow(&transaction, &id, 1, selection, &now)?;
+                    2
+                }
+                None => 1,
+            };
+            let mut created = result(operation_id, "task", id, Some(version), "created");
+            created.detail = serde_json::json!({"family": family});
+            created
+        }
+        WorkflowCommand::ResumeRun { .. } => {
+            bail!("Resuming a writer launches its process, so only the running service can do it")
+        }
+        WorkflowCommand::AuthorizeCheck {
+            task_id,
+            attempt_id,
+            check_id,
+            exact_command_hash,
+            scope_hash,
+            decision,
+            lifetime,
+            ..
+        } => authorize_single_agent_check(
+            &transaction,
+            SingleAgentCheckDecision {
+                operation_id,
+                task_id,
+                attempt_id,
+                check_id,
+                exact_command_hash,
+                scope_hash,
+                decision: *decision,
+                lifetime: *lifetime,
+            },
+            &now,
+        )?,
+    };
+    transaction.execute(
+        "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,new_version,detail_json,created_at)
+         VALUES(?1,?2,'human','workflow.command.applied',?3,?4,?5,?6,?7)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            operation_id,
+            result.entity_kind,
+            result.entity_id,
+            result.version,
+            serde_json::to_string(&result)?,
+            now
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at)
+         VALUES(?1,'human_control',?2,?3,?4,?5)",
+        params![
+            operation_id,
+            WORKFLOW_COMMAND_RECEIPT,
+            request_hash,
+            serde_json::to_string(&result)?,
+            now
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+fn set_task_workflow(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    expected_version: i64,
+    selection: &crate::domain::TaskWorkflowSelectionInput,
+    now: &str,
+) -> Result<&'static str> {
+    require_task_state(
+        transaction,
+        task_id,
+        expected_version,
+        &["backlog", "ready"],
+    )?;
+    let (project_id, was_ready, attempted, previous_revision): (String, bool, bool, i64) = transaction.query_row(
+        "SELECT t.project_id,t.lifecycle='ready',EXISTS(SELECT 1 FROM attempts WHERE task_id=t.id),
+                COALESCE((SELECT selection_revision FROM task_workflow_selections WHERE task_id=t.id),0)
+         FROM tasks t WHERE t.id=?1",
+        params![task_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if attempted {
+        bail!("The workflow cannot change after work has started; create a new task to use a different workflow")
+    }
+    let revision = previous_revision + 1;
+    match selection.family {
+        crate::domain::WorkflowFamily::Trip => {
+            if selection.execution_config_revision_id.is_some()
+                || selection.profile_revision_id.is_some()
+                || !selection.check_ids.is_empty()
+            {
+                bail!("TRIP uses its own role settings; it takes no Single agent configuration, profile or checks")
+            }
+            let hash =
+                json_hash(&serde_json::json!({"family": crate::domain::WorkflowFamily::Trip}))?;
+            transaction.execute(
+                "INSERT INTO task_workflow_selections(task_id,family,definition_id,execution_config_revision_id,
+                   profile_revision_id,check_ids_json,selection_revision,selection_hash,admission_state,created_at,updated_at)
+                 VALUES(?1,'trip',NULL,NULL,NULL,'[]',?2,?3,'draft',?4,?4)
+                 ON CONFLICT(task_id) DO UPDATE SET family='trip',definition_id=NULL,execution_config_revision_id=NULL,
+                   profile_revision_id=NULL,check_ids_json='[]',selection_revision=excluded.selection_revision,
+                   selection_hash=excluded.selection_hash,admission_state='draft',admitted_task_version=NULL,
+                   admission_reason=NULL,updated_at=excluded.updated_at",
+                params![task_id, revision, hash, now],
+            )?;
+        }
+        crate::domain::WorkflowFamily::SingleAgent => {
+            let definition = ensure_single_agent_definition(transaction, now)?;
+            let config_id = selection
+                .execution_config_revision_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("Choose an execution configuration for the Single agent"))?;
+            let profile_id = selection
+                .profile_revision_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("Choose an agent profile for the Single agent"))?;
+            let config_hash = execution_configuration_hash(transaction, &project_id, config_id)?;
+            let profile = writer_profile_revision(transaction, &project_id, profile_id)?;
+            if selection.check_ids.len() > MAX_EXECUTION_CHECKS {
+                bail!("At most {MAX_EXECUTION_CHECKS} checks can be selected")
+            }
+            let mut unique = HashSet::new();
+            for check_id in &selection.check_ids {
+                let known: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM execution_verification_checks
+                     WHERE id=?1 AND execution_config_revision_id=?2)",
+                    params![check_id, config_id],
+                    |row| row.get(0),
+                )?;
+                if !known || !unique.insert(check_id.as_str()) {
+                    bail!("check {check_id} is not a distinct check of the selected execution configuration")
+                }
+            }
+            let hash = selection_hash(
+                &definition,
+                (config_id, &config_hash),
+                (profile_id, &profile.profile_hash),
+                &selection.check_ids,
+            )?;
+            transaction.execute(
+                "INSERT INTO task_workflow_selections(task_id,family,definition_id,execution_config_revision_id,
+                   profile_revision_id,check_ids_json,selection_revision,selection_hash,admission_state,created_at,updated_at)
+                 VALUES(?1,'single_agent',?2,?3,?4,?5,?6,?7,'draft',?8,?8)
+                 ON CONFLICT(task_id) DO UPDATE SET family='single_agent',definition_id=excluded.definition_id,
+                   execution_config_revision_id=excluded.execution_config_revision_id,
+                   profile_revision_id=excluded.profile_revision_id,check_ids_json=excluded.check_ids_json,
+                   selection_revision=excluded.selection_revision,selection_hash=excluded.selection_hash,
+                   admission_state='draft',admitted_task_version=NULL,admission_reason=NULL,
+                   updated_at=excluded.updated_at",
+                params![
+                    task_id,
+                    definition.0,
+                    config_id,
+                    profile_id,
+                    serde_json::to_string(&selection.check_ids)?,
+                    revision,
+                    hash,
+                    now
+                ],
+            )?;
+        }
+    }
+    let changed = transaction.execute(
+        "UPDATE tasks SET version=version+1,updated_at=?1,
+           attention=CASE WHEN lifecycle='ready' THEN 'needs_input' ELSE attention END,
+           ready_at=CASE WHEN lifecycle='ready' THEN NULL ELSE ready_at END,
+           lifecycle=CASE WHEN lifecycle='ready' THEN 'backlog' ELSE lifecycle END
+         WHERE id=?2 AND version=?3",
+        params![now, task_id, expected_version],
+    )?;
+    if changed != 1 {
+        bail!("task version is stale")
+    }
+    Ok(if was_ready {
+        "selection_changed_make_ready_again"
+    } else {
+        "selected"
+    })
+}
+
+struct SingleAgentDecision<'a> {
+    task_id: &'a str,
+    attempt_id: &'a str,
+    expected_version: i64,
+    result_binding_id: &'a str,
+    candidate_hash: &'a str,
+}
+
+struct DecidableResult {
+    snapshot_id: String,
+    criteria_hash: String,
+    profile_binding_hash: String,
+    definition_hash: String,
+    execution_config_hash: Option<String>,
+    selected_check_revision: i64,
+    result_state: String,
+}
+
+/// The exact current result a human decision binds: the task version, the
+/// task's latest Single agent attempt, its one current result binding and the
+/// frozen candidate. Any drift refuses the decision.
+fn decidable_single_agent_result(
+    connection: &Connection,
+    decision: &SingleAgentDecision<'_>,
+    allowed_states: &[&str],
+) -> Result<DecidableResult> {
+    let row: Option<(String, String, String, String, String, Option<String>, i64, String, String)> = connection
+        .query_row(
+            "SELECT r.snapshot_id,r.criteria_hash,r.profile_binding_hash,b.definition_hash,
+                    a.candidate_hash,b.execution_config_hash,r.selected_check_revision,r.state,t.lifecycle
+             FROM tasks t JOIN attempts a ON a.task_id=t.id
+             JOIN workflow_run_bindings b ON b.attempt_id=a.id AND b.family='single_agent'
+               AND b.definition_state='available'
+             JOIN workflow_result_bindings r ON r.attempt_id=a.id
+             JOIN snapshots s ON s.id=r.snapshot_id AND s.attempt_id=a.id AND s.complete=1
+               AND s.manifest_hash=r.candidate_hash
+             WHERE t.id=?1 AND a.id=?2 AND t.version=?3 AND r.id=?4 AND r.candidate_hash=?5
+               AND t.archived_at IS NULL AND a.status IN ('running','held','needs_input')
+               AND a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=t.id
+                 ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)",
+            params![
+                decision.task_id,
+                decision.attempt_id,
+                decision.expected_version,
+                decision.result_binding_id,
+                decision.candidate_hash
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                    row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        snapshot_id,
+        criteria_hash,
+        profile_binding_hash,
+        definition_hash,
+        attempt_candidate,
+        execution_config_hash,
+        selected_check_revision,
+        result_state,
+        lifecycle,
+    )) = row
+    else {
+        bail!("The task, its current Single agent attempt, result or candidate changed; reload before deciding")
+    };
+    if single_agent_probe_admission(connection, decision.task_id)?.is_some() {
+        bail!("A profile probe's result is admission evidence; LLMRelay settles it and a person activates the admission instead")
+    }
+    if attempt_candidate != decision.candidate_hash {
+        bail!("The attempt's frozen candidate differs from the result being decided")
+    }
+    if !allowed_states.contains(&result_state.as_str()) {
+        bail!("This result is {result_state}, so that decision is not available")
+    }
+    if !matches!(lifecycle.as_str(), "awaiting_review" | "in_progress") {
+        bail!("task state {lifecycle} does not allow a result decision")
+    }
+    Ok(DecidableResult {
+        snapshot_id,
+        criteria_hash,
+        profile_binding_hash,
+        definition_hash,
+        execution_config_hash,
+        selected_check_revision,
+        result_state,
+    })
+}
+
+/// Every selected check's latest run against the exact candidate must have
+/// passed, be current, and have started under a human authorization of the
+/// check's current command and scope. Returns the run identities bound.
+pub(crate) fn selected_check_receipts(
+    connection: &Connection,
+    attempt_id: &str,
+    candidate_hash: &str,
+    revision: i64,
+) -> Result<Vec<String>> {
+    let selected = {
+        let mut statement = connection.prepare(
+            "SELECT check_id FROM workflow_check_selections WHERE attempt_id=?1 AND revision=?2 ORDER BY check_id",
+        )?;
+        let rows = statement
+            .query_map(params![attempt_id, revision], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let mut receipts = Vec::new();
+    for check_id in selected {
+        let identity = crate::checks::single_agent_check_identity(connection, attempt_id, &check_id)?
+            .filter(|identity| {
+                identity.candidate_hash == candidate_hash && identity.selected_revision == revision
+            })
+            .ok_or_else(|| anyhow!("selected check {check_id} no longer matches this run's candidate and configuration"))?;
+        let run: Option<String> = connection
+            .query_row(
+                "SELECT cr.id FROM check_runs cr
+                 WHERE cr.id=(SELECT latest.id FROM check_runs latest WHERE latest.attempt_id=?1
+                     AND latest.candidate_hash=?2 AND latest.check_id=?3
+                   ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)
+                   AND cr.selected_check_revision=?4 AND cr.status='finished' AND cr.exit_code=0
+                   AND cr.freshness_state='current' AND cr.inputs_hash IS NOT NULL
+                   AND (SELECT wa.decision FROM workflow_check_authorizations wa
+                        WHERE wa.attempt_id=cr.attempt_id AND wa.check_id=cr.check_id
+                          AND wa.selected_revision=cr.selected_check_revision
+                          AND wa.exact_command_hash=?5 AND wa.scope_hash=?6 AND wa.created_at<=cr.created_at
+                        ORDER BY wa.created_at DESC,wa.rowid DESC LIMIT 1)='authorized'",
+                params![
+                    attempt_id,
+                    candidate_hash,
+                    check_id,
+                    revision,
+                    identity.command_hash,
+                    identity.scope_hash
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        receipts.push(run.ok_or_else(|| {
+            anyhow!("selected check {check_id} has no current authorized passing run against this exact candidate")
+        })?);
+    }
+    Ok(receipts)
+}
+
+/// Approved guidance files the frozen candidate changes, against the
+/// identities the run's configuration approved at its base. A person
+/// accepting the result repeats the returned hash; nothing is restored.
+pub(crate) fn single_agent_guidance_changes(
+    connection: &Connection,
+    attempt_id: &str,
+    snapshot_id: &str,
+) -> Result<(
+    Vec<crate::domain::SingleAgentGuidanceChangeDto>,
+    Option<String>,
+)> {
+    let (config_json, base_revision, manifest_json, candidate_hash): (
+        Option<String>,
+        String,
+        String,
+        String,
+    ) = connection.query_row(
+        "SELECT c.config_json,a.base_revision,s.manifest_json,s.manifest_hash
+             FROM attempts a JOIN workflow_run_bindings b ON b.attempt_id=a.id
+             LEFT JOIN execution_config_revisions c ON c.id=b.execution_config_revision_id
+             JOIN snapshots s ON s.id=?2 AND s.attempt_id=a.id
+             WHERE a.id=?1",
+        params![attempt_id, snapshot_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let Some(config_json) = config_json else {
+        return Ok((Vec::new(), None));
+    };
+    let config: serde_json::Value = serde_json::from_str(&config_json)?;
+    let manifest: crate::snapshot::SnapshotManifest = serde_json::from_str(&manifest_json)?;
+    let mut changes = Vec::new();
+    for approved in config["guidance"].as_array().into_iter().flatten() {
+        let (Some(path), Some(approved_sha256)) =
+            (approved["path"].as_str(), approved["sha256"].as_str())
+        else {
+            bail!("the run's execution configuration has a malformed guidance identity")
+        };
+        let candidate_sha256 = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == path && !entry.deleted && entry.kind == "file")
+            .and_then(|entry| entry.hash.clone());
+        if candidate_sha256.as_deref() != Some(approved_sha256) {
+            changes.push(crate::domain::SingleAgentGuidanceChangeDto {
+                path: path.to_owned(),
+                base_revision: base_revision.clone(),
+                approved_sha256: approved_sha256.to_owned(),
+                candidate_sha256,
+            });
+        }
+    }
+    if changes.is_empty() {
+        return Ok((changes, None));
+    }
+    let hash = json_hash(&serde_json::json!({
+        "attempt_id": attempt_id,
+        "snapshot_id": snapshot_id,
+        "candidate_hash": candidate_hash,
+        "changes": changes,
+    }))?;
+    Ok((changes, Some(hash)))
+}
+
+/// Moves a Single agent result from its selected checks to the person once
+/// every selected check has a current authorized pass. Returns false when the
+/// result is no longer awaiting checks.
+pub(crate) fn complete_single_agent_checks(store: &Store, attempt_id: &str) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let mut connection = store.lock()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: Option<(String, String, String, i64)> = transaction
+        .query_row(
+            "SELECT r.id,a.task_id,a.candidate_hash,r.selected_check_revision
+             FROM attempts a JOIN workflow_result_bindings r ON r.attempt_id=a.id AND r.state='awaiting_checks'
+               AND r.candidate_hash=a.candidate_hash
+             WHERE a.id=?1 AND a.phase='awaiting_checks' AND a.status='running'",
+            params![attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((binding_id, task_id, candidate_hash, revision)) = current else {
+        return Ok(false);
+    };
+    for (blocker, sql) in SINGLE_AGENT_QUIESCENCE_FENCES {
+        if transaction.query_row(sql, params![attempt_id], |row| row.get::<_, bool>(0))? {
+            bail!("the selected checks cannot complete because {blocker}")
+        }
+    }
+    let receipts = selected_check_receipts(&transaction, attempt_id, &candidate_hash, revision)?;
+    transaction.execute(
+        "UPDATE workflow_result_bindings SET state='awaiting_human',state_reason=?1,updated_at=?2
+         WHERE id=?3 AND state='awaiting_checks'",
+        params![
+            "Every selected check passed against this candidate; waiting for you to accept the result or request changes",
+            now,
+            binding_id
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE attempts SET phase='awaiting_human',updated_at=?1 WHERE id=?2 AND phase='awaiting_checks'",
+        params![now, attempt_id],
+    )?;
+    if transaction.execute(
+        "UPDATE tasks SET lifecycle='awaiting_review',attention='none',version=version+1,updated_at=?1
+         WHERE id=?2 AND lifecycle='in_progress'",
+        params![now, task_id],
+    )? != 1
+    {
+        bail!("the task changed before its checked Single agent result could await review")
+    }
+    transaction.execute(
+        "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+         VALUES(?1,?2,'service','single_agent.checks.passed','attempt',?3,?4,?5)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            attempt_id,
+            serde_json::json!({"result_binding_id": binding_id, "check_runs": receipts}).to_string(),
+            now
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(true)
+}
+
+/// Ownership that keeps a Single agent attempt from being decided. `?1` is the
+/// attempt. Exit alone is not enough: the supervisor must have recorded that
+/// the session's whole process group stopped.
+const SINGLE_AGENT_QUIESCENCE_FENCES: &[(&str, &str)] = &[
+    ("the agent is still live",
+     "SELECT EXISTS(SELECT 1 FROM role_generations WHERE attempt_id=?1
+        AND status NOT IN ('exited','launch_failed','replaced','revoked'))"),
+    ("an agent session has not exited with proven process-group quiescence",
+     "SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+        WHERE g.attempt_id=?1 AND NOT (s.status='launch_failed'
+          OR (s.status='exited' AND COALESCE(CASE WHEN json_valid(s.exit_json)
+            THEN json_extract(s.exit_json,'$.process_group_quiescent') END,0)=1)))"),
+    ("a check is running or needs recovery",
+     "SELECT EXISTS(SELECT 1 FROM check_runs WHERE attempt_id=?1
+        AND status IN ('launch_reserved','running','recovery_required','launch_ambiguous'))"),
+    ("a capture is in progress",
+     "SELECT EXISTS(SELECT 1 FROM freeze_intents WHERE attempt_id=?1
+        AND state IN ('reserved','capturing','recovery_required'))"),
+    ("a recovery is open",
+     "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=?1 AND state='attention_required')"),
+];
+
+/// The recorded quiescence a human decision binds, refusing while any fence
+/// above holds.
+fn single_agent_quiescence(connection: &Connection, attempt_id: &str) -> Result<serde_json::Value> {
+    for (blocker, sql) in SINGLE_AGENT_QUIESCENCE_FENCES {
+        let blocked: bool = connection.query_row(sql, params![attempt_id], |row| row.get(0))?;
+        if blocked {
+            bail!("No decision can be recorded yet because {blocker}")
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT s.id,s.transcript_epoch,s.status,s.process_identity_json FROM sessions s
+         JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id=?1 ORDER BY s.created_at,s.id",
+    )?;
+    let sessions = statement
+        .query_map(params![attempt_id], |row| {
+            Ok(serde_json::json!({
+                "session_id": row.get::<_, String>(0)?,
+                "transcript_epoch": row.get::<_, String>(1)?,
+                "status": row.get::<_, String>(2)?,
+                "process_identity": row.get::<_, Option<String>>(3)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(
+        serde_json::json!({"source":"supervisor_recorded_process_group_quiescence","sessions":sessions}),
+    )
+}
+
+/// Everything an acceptance binds. The projection offers Accept only when
+/// this succeeds, so the button and the handler share one predicate.
+fn acceptance_basis(
+    connection: &Connection,
+    decision: &SingleAgentDecision<'_>,
+) -> Result<(
+    DecidableResult,
+    serde_json::Value,
+    Vec<String>,
+    Option<String>,
+)> {
+    let result = decidable_single_agent_result(connection, decision, &["awaiting_human"])?;
+    let quiescence = single_agent_quiescence(connection, decision.attempt_id)?;
+    let receipts = selected_check_receipts(
+        connection,
+        decision.attempt_id,
+        decision.candidate_hash,
+        result.selected_check_revision,
+    )?;
+    let (_, guidance_change_hash) =
+        single_agent_guidance_changes(connection, decision.attempt_id, &result.snapshot_id)?;
+    Ok((result, quiescence, receipts, guidance_change_hash))
+}
+
+/// What a rework request binds, shared with the projection's Request changes.
+fn rework_basis(
+    connection: &Connection,
+    decision: &SingleAgentDecision<'_>,
+) -> Result<(DecidableResult, serde_json::Value)> {
+    let result = decidable_single_agent_result(
+        connection,
+        decision,
+        &["awaiting_human", "awaiting_checks"],
+    )?;
+    let quiescence = single_agent_quiescence(connection, decision.attempt_id)?;
+    let admission_current: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_run_profiles rp JOIN profile_admissions pa ON pa.id=rp.admission_id
+           WHERE rp.attempt_id=?1 AND rp.slot_key=?2 AND pa.state='activated')",
+        params![decision.attempt_id, SINGLE_AGENT_SLOT],
+        |row| row.get(0),
+    )?;
+    if !admission_current {
+        bail!("The run's agent profile admission is no longer active; admit the profile again and create a new task")
+    }
+    Ok((result, quiescence))
+}
+
+fn accept_single_agent_result(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+    request_hash: &str,
+    decision: &SingleAgentDecision<'_>,
+    reviewed_guidance_change: Option<&str>,
+    now: &str,
+) -> Result<()> {
+    let (result, quiescence, receipts, guidance_change) = acceptance_basis(transaction, decision)?;
+    match (guidance_change.as_deref(), reviewed_guidance_change) {
+        (Some(current), Some(reviewed)) if current == reviewed => {}
+        (Some(_), Some(_)) => bail!("The result's guidance changes differ from the ones you reviewed; reload and review them again"),
+        (Some(_), None) => bail!("This result changes approved guidance files; review those changes and accept them explicitly, or request changes"),
+        (None, Some(_)) => bail!("The guidance changes you reviewed are no longer part of this result; reload it"),
+        (None, None) => {}
+    }
+    transaction.execute(
+        "INSERT INTO workflow_result_acceptances(id,result_binding_id,operation_id,request_hash,decision,
+           expected_task_version,candidate_hash,definition_hash,profile_binding_hash,criteria_hash,
+           check_receipts_json,feedback,child_attempt_id,created_at)
+         VALUES(?1,?2,?3,?4,'accepted',?5,?6,?7,?8,?9,?10,NULL,NULL,?11)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            decision.result_binding_id,
+            operation_id,
+            request_hash,
+            decision.expected_version,
+            decision.candidate_hash,
+            result.definition_hash,
+            result.profile_binding_hash,
+            result.criteria_hash,
+            serde_json::json!({
+                "check_runs": receipts,
+                "execution_config_hash": result.execution_config_hash,
+                "guidance_change_hash": guidance_change,
+                "quiescence": quiescence,
+            })
+            .to_string(),
+            now
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE workflow_result_bindings SET state='accepted',updated_at=?1 WHERE id=?2 AND state='awaiting_human'",
+        params![now, decision.result_binding_id],
+    )?;
+    transaction.execute(
+        "UPDATE attempts SET status='done',human_acceptance_at=?1,accepted_snapshot_id=?2,updated_at=?1 WHERE id=?3",
+        params![now, result.snapshot_id, decision.attempt_id],
+    )?;
+    if transaction.execute(
+        "UPDATE tasks SET lifecycle='done',attention='none',version=version+1,updated_at=?1 WHERE id=?2 AND version=?3",
+        params![now, decision.task_id, decision.expected_version],
+    )? != 1
+    {
+        bail!("task version is stale")
+    }
+    transaction.execute("UPDATE role_credentials SET revoked_at=?1 WHERE role_generation_id IN (SELECT id FROM role_generations WHERE attempt_id=?2) AND revoked_at IS NULL", params![now, decision.attempt_id])?;
+    transaction.execute(
+        "UPDATE claims SET state='complete',updated_at=?1 WHERE attempt_id=?2 AND state='running'",
+        params![now, decision.attempt_id],
+    )?;
+    Ok(())
+}
+
+struct SingleAgentCheckDecision<'a> {
+    operation_id: &'a str,
+    task_id: &'a str,
+    attempt_id: &'a str,
+    check_id: &'a str,
+    exact_command_hash: &'a str,
+    scope_hash: &'a str,
+    decision: crate::domain::CheckAuthorizationDecision,
+    lifetime: crate::domain::CheckAuthorizationLifetime,
+}
+
+/// Records a person's decision on one selected check of the task's current
+/// Single agent result. An authorization also releases the check hold it
+/// answers, so the coordinator runs the check on its next pass.
+fn authorize_single_agent_check(
+    transaction: &Transaction<'_>,
+    decision: SingleAgentCheckDecision<'_>,
+    now: &str,
+) -> Result<OperationResult> {
+    use crate::domain::{CheckAuthorizationDecision, CheckAuthorizationLifetime};
+    let current: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
+           WHERE a.id=?1 AND t.id=?2 AND t.archived_at IS NULL AND a.phase='awaiting_checks'
+             AND a.status IN ('running','needs_input')
+             AND a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=t.id
+               ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1))",
+        params![decision.attempt_id, decision.task_id],
+        |row| row.get(0),
+    )?;
+    if !current {
+        bail!("This run's result is no longer waiting for its selected checks; reload the task")
+    }
+    let identity = crate::checks::single_agent_check_identity(
+        transaction,
+        decision.attempt_id,
+        decision.check_id,
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "check {} is not selected for this result",
+            decision.check_id
+        )
+    })?;
+    if identity.command_hash != decision.exact_command_hash
+        || identity.scope_hash != decision.scope_hash
+    {
+        bail!("The check's command, configuration or candidate changed since you reviewed it; reload and review it again")
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO workflow_check_authorizations(id,attempt_id,check_id,selected_revision,exact_command_hash,
+           scope_hash,decision,lifetime,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            id,
+            decision.attempt_id,
+            decision.check_id,
+            identity.selected_revision,
+            identity.command_hash,
+            identity.scope_hash,
+            match decision.decision {
+                CheckAuthorizationDecision::Authorized => "authorized",
+                CheckAuthorizationDecision::Denied => "denied",
+            },
+            match decision.lifetime {
+                CheckAuthorizationLifetime::Once => "once",
+                CheckAuthorizationLifetime::Run => "run",
+            },
+            now
+        ],
+    )?;
+    let released = decision.decision == CheckAuthorizationDecision::Authorized
+        && transaction.execute(
+            "UPDATE attempts SET status='running',updated_at=?1
+             WHERE id=?2 AND status='needs_input' AND phase='awaiting_checks'
+               AND NOT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=?2 AND state='attention_required')",
+            params![now, decision.attempt_id],
+        )? == 1;
+    if released {
+        transaction.execute(
+            "UPDATE tasks SET attention='none',version=version+1,updated_at=?1 WHERE id=?2",
+            params![now, decision.task_id],
+        )?;
+    }
+    let version: i64 = transaction.query_row(
+        "SELECT version FROM tasks WHERE id=?1",
+        params![decision.task_id],
+        |row| row.get(0),
+    )?;
+    let mut recorded = result(
+        decision.operation_id,
+        "check_authorization",
+        id,
+        Some(version),
+        match decision.decision {
+            CheckAuthorizationDecision::Authorized => "authorized",
+            CheckAuthorizationDecision::Denied => "denied",
+        },
+    );
+    recorded.detail = serde_json::json!({
+        "attempt_id": decision.attempt_id,
+        "check_id": decision.check_id,
+        "hold_released": released,
+    });
+    Ok(recorded)
+}
+
+/// Stages the linked child for an explicit human rework request. The parent's
+/// result, snapshot and history stay unchanged; the child pins the same
+/// definition, profile admission, configuration and check selection and
+/// starts a fresh native conversation once its workspace is materialized.
+fn stage_single_agent_rework(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+    request_hash: &str,
+    decision: &SingleAgentDecision<'_>,
+    feedback: &str,
+    now: &str,
+) -> Result<String> {
+    let feedback = feedback.trim();
+    if feedback.is_empty() || feedback.len() > MAX_REWORK_FEEDBACK_BYTES {
+        bail!("Describe the changes you want (at most {MAX_REWORK_FEEDBACK_BYTES} bytes)")
+    }
+    let (result, quiescence) = rework_basis(transaction, decision)?;
+    let (base_revision, configuration_revision, configuration_hash): (String, i64, Option<String>) =
+        transaction.query_row(
+            "SELECT s.snapshot_base,a.configuration_revision,a.configuration_hash FROM attempts a
+             JOIN snapshots s ON s.id=?2 WHERE a.id=?1",
+            params![decision.attempt_id, result.snapshot_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let scope: (String, String, String) = transaction.query_row(
+        "SELECT title,description,acceptance_criteria_json FROM tasks WHERE id=?1",
+        params![decision.task_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let scope_hash = json_hash(&serde_json::json!({
+        "title": scope.0,
+        "description": scope.1,
+        "acceptance_criteria": serde_json::from_str::<serde_json::Value>(&scope.2)?,
+        "base_revision": base_revision,
+    }))?;
+    let child = uuid::Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at,
+           parent_attempt_id,scope_hash,configuration_hash,workflow_version,workflow_hash,legacy_migration_required)
+         SELECT ?1,a.task_id,?2,'agent_execution',?3,?4,'materialization_pending',?5,?5,a.id,?6,?7,
+                a.workflow_version,a.workflow_hash,0
+         FROM attempts a WHERE a.id=?8",
+        params![
+            child,
+            uuid::Uuid::new_v4().to_string(),
+            base_revision,
+            configuration_revision,
+            now,
+            scope_hash,
+            configuration_hash,
+            decision.attempt_id
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO workflow_run_bindings(attempt_id,family,definition_id,definition_hash,definition_state,
+           evaluator_revision,execution_config_revision_id,execution_config_hash,selection_hash,scope_hash,
+           parent_attempt_id,source_snapshot_id,created_at)
+         SELECT ?1,family,definition_id,definition_hash,definition_state,evaluator_revision,
+                execution_config_revision_id,execution_config_hash,selection_hash,?2,attempt_id,?3,?4
+         FROM workflow_run_bindings WHERE attempt_id=?5",
+        params![child, scope_hash, result.snapshot_id, now, decision.attempt_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO workflow_run_profiles(attempt_id,slot_key,profile_revision_id,admission_id,policy_hash,
+           session_contract,profile_hash,created_at)
+         SELECT ?1,slot_key,profile_revision_id,admission_id,policy_hash,session_contract,profile_hash,?2
+         FROM workflow_run_profiles WHERE attempt_id=?3",
+        params![child, now, decision.attempt_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO workflow_check_selections(attempt_id,revision,check_id,selected_by,created_at)
+         SELECT ?1,1,check_id,selected_by,?2 FROM workflow_check_selections WHERE attempt_id=?3 AND revision=?4",
+        params![child, now, decision.attempt_id, result.selected_check_revision],
+    )?;
+    transaction.execute(
+        "INSERT INTO workflow_result_acceptances(id,result_binding_id,operation_id,request_hash,decision,
+           expected_task_version,candidate_hash,definition_hash,profile_binding_hash,criteria_hash,
+           check_receipts_json,feedback,child_attempt_id,created_at)
+         VALUES(?1,?2,?3,?4,'changes_requested',?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            decision.result_binding_id,
+            operation_id,
+            request_hash,
+            decision.expected_version,
+            decision.candidate_hash,
+            result.definition_hash,
+            result.profile_binding_hash,
+            result.criteria_hash,
+            serde_json::json!({"quiescence": quiescence}).to_string(),
+            feedback,
+            child,
+            now
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE workflow_result_bindings SET state='changes_requested',updated_at=?1 WHERE id=?2 AND state=?3",
+        params![now, decision.result_binding_id, result.result_state],
+    )?;
+    transaction.execute(
+        "UPDATE attempts SET status='rework_staging',updated_at=?1 WHERE id=?2",
+        params![now, decision.attempt_id],
+    )?;
+    transaction.execute("UPDATE role_credentials SET revoked_at=?1 WHERE role_generation_id IN (SELECT id FROM role_generations WHERE attempt_id=?2) AND revoked_at IS NULL", params![now, decision.attempt_id])?;
+    transaction.execute(
+        "INSERT INTO rework_intents(id,operation_id,parent_attempt_id,new_attempt_id,snapshot_id,feedback,
+           carry_plan_approval,scope_hash,configuration_hash,state,created_at,updated_at)
+         VALUES(?1,?2,?3,?4,?5,?6,0,?7,?8,'reserved',?9,?9)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            operation_id,
+            decision.attempt_id,
+            child,
+            result.snapshot_id,
+            feedback,
+            scope_hash,
+            configuration_hash,
+            now
+        ],
+    )?;
+    if transaction.execute(
+        "UPDATE tasks SET lifecycle='in_progress',attention='none',version=version+1,updated_at=?1 WHERE id=?2 AND version=?3",
+        params![now, decision.task_id, decision.expected_version],
+    )? != 1
+    {
+        bail!("task version is stale")
+    }
+    Ok(child)
 }
 
 fn validate_task(title: &str, criteria: &[String]) -> Result<()> {

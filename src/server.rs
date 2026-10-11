@@ -5,7 +5,8 @@ use crate::database::{
     BackupOptions, BackupPublication, InstanceLock, OnlineBackupControl, PublishedBackup,
 };
 use crate::domain::{
-    AppStateDto, CapabilityProofInput, CmuxKeyboardControlAction, HumanCommand, RoleKind,
+    AppStateDto, CapabilityProofInput, CmuxKeyboardControlAction, HumanCommand,
+    ProviderValidationSelection, RoleKind, WorkflowCommand,
 };
 use crate::operations::Application;
 use crate::protocol::{self, ClientKind};
@@ -301,6 +302,100 @@ enum WebOperation {
     CapabilityRecordProof {
         proof: CapabilityProofInput,
     },
+    HistoryPage {
+        session_id: String,
+        transcript_epoch: String,
+        after_sequence: u64,
+        limit_bytes: usize,
+    },
+    HistoryExportText {
+        session_id: String,
+        transcript_epoch: String,
+    },
+    HistoryPaneOpen {
+        operation_id: String,
+        session_id: String,
+        transcript_epoch: String,
+        #[serde(default)]
+        acknowledged_unknown_view_id: Option<String>,
+    },
+    HistoryPaneViews {
+        session_id: String,
+        transcript_epoch: String,
+    },
+    ProviderValidationPreview {
+        selections: Vec<ProviderValidationSelection>,
+    },
+    ProviderValidationStart {
+        operation_id: String,
+        preview_hash: String,
+        selections: Vec<ProviderValidationSelection>,
+        authorize_model_calls: bool,
+        max_model_calls: u32,
+    },
+    /// The exact start request whose outcome is unknown; never starts checks.
+    ProviderValidationReconcile {
+        operation_id: String,
+        preview_hash: String,
+        selections: Vec<ProviderValidationSelection>,
+        authorize_model_calls: bool,
+        max_model_calls: u32,
+    },
+    ProviderValidationInspect {
+        batch_id: String,
+    },
+    ProviderValidationCancel {
+        batch_id: String,
+    },
+    Workflow {
+        command: WorkflowCommand,
+    },
+}
+
+impl WebOperation {
+    fn required_feature(&self) -> Option<&'static str> {
+        match self {
+            Self::Workflow { .. } => Some(protocol::MULTI_WORKFLOW_FEATURE),
+            Self::HistoryPage { .. }
+            | Self::HistoryExportText { .. }
+            | Self::HistoryPaneOpen { .. }
+            | Self::HistoryPaneViews { .. } => Some(protocol::HISTORY_VIEW_FEATURE),
+            Self::ProviderValidationPreview { .. }
+            | Self::ProviderValidationStart { .. }
+            | Self::ProviderValidationReconcile { .. }
+            | Self::ProviderValidationInspect { .. }
+            | Self::ProviderValidationCancel { .. } => Some(protocol::PROVIDER_VALIDATION_FEATURE),
+            Self::SchedulerRunOnce
+            | Self::SnapshotFreeze { .. }
+            | Self::SnapshotVerify { .. }
+            | Self::RoleDispatch { .. }
+            | Self::TripSetupDispatch { .. }
+            | Self::RuntimeProbeLaunch { .. }
+            | Self::RuntimeProbeResume { .. }
+            | Self::GuidanceDeliver { .. }
+            | Self::SwitchRoleRequest { .. }
+            | Self::SwitchRoleFinish { .. }
+            | Self::RoleResume { .. }
+            | Self::RestartResume { .. }
+            | Self::CheckRun { .. }
+            | Self::LegacyPreview { .. }
+            | Self::LegacyImport { .. }
+            | Self::Transcript { .. }
+            | Self::CmuxView { .. }
+            | Self::CmuxSetKeyboardControl { .. }
+            | Self::CmuxDiscardUnknown { .. }
+            | Self::Interrupt { .. }
+            | Self::CapabilityRecordProof { .. } => None,
+        }
+    }
+}
+
+fn declared_features(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get(protocol::HTTP_HEADER)
+        .and_then(|value| protocol::parse_declaration(value.as_bytes(), ClientKind::Browser).ok())
+        .map(|declaration| declaration.required_features)
+        .unwrap_or_default()
 }
 
 struct ScheduledBackup {
@@ -476,7 +571,13 @@ pub(crate) async fn serve(
     let restore_held = crate::database::hold_active(&app.store)?;
     let retired_cmux_presentations = app
         .store
-        .retire_prior_cmux_presentation_boots(app.service_boot_id())?;
+        .retire_prior_cmux_presentation_boots(app.service_boot_id())?
+        + app
+            .store
+            .retire_prior_boot_history_views(app.service_boot_id())?;
+    if let Err(error) = crate::transcript::reclaim_history_exports(&paths.artifacts) {
+        tracing::warn!(error = %format!("{error:#}"), "disposable history exports were not reclaimed");
+    }
     let (recovery, restart_candidates, restart_reconciliation, interrupted_applies) =
         if restore_held {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
@@ -1337,6 +1438,22 @@ async fn api_operation(
     if let Err(response) = require_browser(&state, &headers) {
         return response;
     }
+    if let Some(feature) = operation.required_feature() {
+        if !declared_features(&headers)
+            .iter()
+            .any(|declared| declared == feature)
+        {
+            let error = protocol::ProtocolError::new(
+                "missing_required_feature",
+                Some(protocol::GENERATION),
+            );
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error":error.guidance,"protocol_error":error})),
+            )
+                .into_response();
+        }
+    }
     let permit = match Arc::clone(&state.app.blocking_operations)
         .acquire_owned()
         .await
@@ -1544,6 +1661,111 @@ async fn api_operation(
             WebOperation::CapabilityRecordProof { proof } => {
                 state.app.store.record_capability_proof(&proof)
             }
+            WebOperation::HistoryPage {
+                session_id,
+                transcript_epoch,
+                after_sequence,
+                limit_bytes,
+            } => {
+                state.app.store.session_json(&session_id)?;
+                Ok(serde_json::to_value(crate::transcript::read_history_page(
+                    &state.app.paths.transcripts,
+                    &session_id,
+                    &transcript_epoch,
+                    after_sequence,
+                    limit_bytes,
+                )?)?)
+            }
+            WebOperation::HistoryExportText {
+                session_id,
+                transcript_epoch,
+            } => {
+                state.app.store.session_json(&session_id)?;
+                let export = crate::transcript::write_history_export(
+                    &state.app.paths.transcripts,
+                    &state.app.paths.artifacts,
+                    &session_id,
+                    &transcript_epoch,
+                )?;
+                Ok(serde_json::json!({
+                    "session_id": session_id,
+                    "transcript_epoch": transcript_epoch,
+                    "export_hash": export.export_hash,
+                    "high_water_sequence": export.high_water_sequence,
+                    "retention": export.retention,
+                    "text": export.text,
+                }))
+            }
+            WebOperation::HistoryPaneOpen {
+                operation_id,
+                session_id,
+                transcript_epoch,
+                acknowledged_unknown_view_id,
+            } => Ok(serde_json::to_value(crate::cmux::open_history_pane(
+                &state.app,
+                &state.boot_id,
+                &crate::store::HistoryPaneRequest {
+                    operation_id: &operation_id,
+                    session_id: &session_id,
+                    transcript_epoch: &transcript_epoch,
+                    acknowledged_unknown_view_id: acknowledged_unknown_view_id.as_deref(),
+                },
+            )?)?),
+            WebOperation::HistoryPaneViews {
+                session_id,
+                transcript_epoch,
+            } => Ok(serde_json::to_value(
+                state
+                    .app
+                    .store
+                    .history_pane_views(&session_id, &transcript_epoch)?,
+            )?),
+            WebOperation::ProviderValidationPreview { selections } => Ok(serde_json::to_value(
+                state.app.preview_provider_validation(
+                    &crate::domain::ProviderValidationPreviewRequest { selections },
+                )?,
+            )?),
+            WebOperation::ProviderValidationStart {
+                operation_id,
+                preview_hash,
+                selections,
+                authorize_model_calls,
+                max_model_calls,
+            } => Ok(serde_json::to_value(state.app.start_provider_validation(
+                &crate::domain::ProviderValidationStartRequest {
+                    operation_id,
+                    preview_hash,
+                    selections,
+                    authorize_model_calls,
+                    max_model_calls,
+                },
+            )?)?),
+            WebOperation::ProviderValidationReconcile {
+                operation_id,
+                preview_hash,
+                selections,
+                authorize_model_calls,
+                max_model_calls,
+            } => Ok(serde_json::to_value(
+                state.app.reconcile_provider_validation_start(
+                    &crate::domain::ProviderValidationStartRequest {
+                        operation_id,
+                        preview_hash,
+                        selections,
+                        authorize_model_calls,
+                        max_model_calls,
+                    },
+                )?,
+            )?),
+            WebOperation::ProviderValidationInspect { batch_id } => Ok(serde_json::to_value(
+                state.app.inspect_provider_validation(&batch_id)?,
+            )?),
+            WebOperation::ProviderValidationCancel { batch_id } => Ok(serde_json::to_value(
+                state.app.cancel_provider_validation(&batch_id)?,
+            )?),
+            WebOperation::Workflow { command } => Ok(serde_json::to_value(
+                state.app.execute_workflow_command(&command)?,
+            )?),
         }
     })
     .await
@@ -2483,6 +2705,124 @@ mod web_operation_tests {
         assert_eq!(
             body["result"]["frames"][0]["epoch"],
             target.transcript_epoch
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn history_operations_require_their_declared_feature_and_read_one_exact_epoch() {
+        let (root, app, target, other) = server_test_application();
+        let (state, mut headers, _) = browser_state(app.clone());
+        let sink = crate::transcript::TranscriptSink::create(
+            &app.paths.transcripts,
+            &target.session_id,
+            &target.transcript_epoch,
+        )
+        .unwrap();
+        sink.append(b"exact epoch history\n").unwrap();
+        let page = |epoch: &str| WebOperation::HistoryPage {
+            session_id: target.session_id.clone(),
+            transcript_epoch: epoch.to_owned(),
+            after_sequence: 0,
+            limit_bytes: 4096,
+        };
+
+        let (status, body) = invoke_operation(
+            state.clone(),
+            headers.clone(),
+            page(target.transcript_epoch.as_str()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["protocol_error"]["reason"], "missing_required_feature");
+
+        headers.insert(
+            protocol::HTTP_HEADER,
+            HeaderValue::from_str(
+                &serde_json::json!({
+                    "generation": 1,
+                    "client_kind": "browser",
+                    "required_features": ["http_operational_v1", protocol::HISTORY_VIEW_FEATURE],
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
+        let (status, body) = invoke_operation(
+            state.clone(),
+            headers.clone(),
+            page(target.transcript_epoch.as_str()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["result"]["frames"][0]["epoch"],
+            target.transcript_epoch
+        );
+        assert_eq!(body["result"]["has_more"], false);
+
+        // Another session's epoch names no frame in this session's transcript.
+        let (status, body) = invoke_operation(
+            state.clone(),
+            headers.clone(),
+            page(other.transcript_epoch.as_str()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let frames = body["result"]["frames"].as_array().unwrap();
+        assert!(
+            frames.iter().all(|frame| frame["gap"] == true),
+            "{frames:?}"
+        );
+
+        let (status, body) = invoke_operation(
+            state,
+            headers,
+            WebOperation::HistoryExportText {
+                session_id: target.session_id.clone(),
+                transcript_epoch: target.transcript_epoch.clone(),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["result"]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with("exact epoch history\n"));
+        assert_eq!(body["result"]["retention"]["complete"], true);
+        drop(sink);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn provider_validation_operations_require_their_declared_feature() {
+        let (root, app, _, _) = server_test_application();
+        let (state, mut headers, _) = browser_state(app);
+        let inspect = || WebOperation::ProviderValidationInspect {
+            batch_id: "missing".into(),
+        };
+        let (status, body) = invoke_operation(state.clone(), headers.clone(), inspect()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["protocol_error"]["reason"], "missing_required_feature");
+
+        headers.insert(
+            protocol::HTTP_HEADER,
+            HeaderValue::from_str(
+                &serde_json::json!({
+                    "generation": 1,
+                    "client_kind": "browser",
+                    "required_features": ["http_operational_v1", protocol::PROVIDER_VALIDATION_FEATURE],
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
+        let (status, body) = invoke_operation(state, headers, inspect()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.get("protocol_error").is_none(), "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("no longer exists"),
+            "{body}"
         );
         let _ = std::fs::remove_dir_all(root);
     }

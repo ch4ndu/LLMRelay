@@ -75,12 +75,14 @@ The runner focuses its selected browser pane before each operation; keep its
 dedicated workspace available while the suite runs.
 Login consumes that service's one-use URL without printing it. The run registers
 the selected repository if needed, requires its queue to be paused, and exercises
-navigation, empty-title validation, unsaved draft recovery, creation, editing,
+navigation to every main page (Workspace, Board, Recipes, Projects, Providers,
+History and Diagnostics; opening Providers starts no check), empty-title validation, unsaved draft recovery, creation, editing,
 reload persistence, filtering, archive and restore. It leaves a uniquely named
 backlog draft in the isolated database. JSON results, snapshots, screenshots and
 browser error output are saved in the artifact directory. Reruns create another
 draft. The run also opens a task's details dialog and checks Escape closes it and
-returns focus, walks its tabs, switches the board between Active and Completed,
+returns focus, walks its Overview, Changes, Checks, Roles and Activity tabs,
+switches the board between Active and Completed,
 and checks that the page never scrolls sideways at 1440px, 900px and 390px
 widths and at 200% text size, with Approvals reachable from the top bar. At
 390px it checks that task details open full screen and close with the same
@@ -88,11 +90,11 @@ icon-only close button. The
 draft's description is hostile Markdown, and the run checks that its heading,
 table and task list render while the raw HTML image and the `javascript:` link
 stay inert, and that Tab and Shift+Tab never leave the open dialog.
-The layout checks use the browser's native appearance and record which theme
-was exercised. The other theme and browser page zoom remain explicitly untested:
-cmux exposes neither color-scheme emulation nor a page-zoom command. The 200%
-check enlarges root text, not browser zoom. The suite also checks configured
-agent-setting controls at 407px and 193px widths, using a draft override without
+The layout checks use the browser's current native appearance and record which
+appearance was exercised. The runner does not exercise the other appearance or
+browser page zoom and lists both as untested. The 200% check enlarges root
+text, not browser zoom. The suite also checks the role edit controls in the task's
+**Roles** tab at 407px and 193px widths, using a draft override without
 launching an agent. Screenshots are saved per appearance, page and width.
 `smoke-results.json` lists paths the run cannot create without live agents,
 including pending approvals, recovery and output control. Separate DOM and Rust

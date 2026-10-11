@@ -837,7 +837,7 @@ pub(crate) fn restore_prerequisites(
     let mut prerequisites = Vec::new();
     let mut statement = connection.prepare(
         "SELECT 'session',s.id,s.status,a.task_id FROM sessions s
-           JOIN role_generations rg ON rg.id=s.role_generation_id JOIN attempts a ON a.id=rg.attempt_id
+           LEFT JOIN role_generations rg ON rg.id=s.role_generation_id LEFT JOIN attempts a ON a.id=rg.attempt_id
            WHERE s.status IN ('launch_reserved','launching','running','recovery_required')
          UNION ALL SELECT 'claim',id,state,task_id FROM claims WHERE state IN ('reserved','launching','running','unknown','stopping')
          UNION ALL SELECT 'check',c.id,c.status,a.task_id FROM check_runs c JOIN attempts a ON a.id=c.attempt_id
@@ -1161,6 +1161,17 @@ fn establish_restore_hold(paths: &InstancePaths, journal: &RestoreJournal) -> Re
     tx.execute("UPDATE freeze_intents SET state='recovery_required',error='database restore requires explicit recovery',updated_at=?1 WHERE state IN ('reserved','capturing')", [&now])?;
     tx.execute("UPDATE cmux_session_surfaces SET surface_state='lost',attachment_state='ended',actual_input_state='lost',last_error='database restore invalidated prior presentation binding',updated_at=?1 WHERE surface_state IN ('opening','open','unknown')", [&now])?;
     tx.execute("UPDATE cmux_task_workspaces SET state='retired',last_error='database restore invalidated prior workspace binding',updated_at=?1 WHERE state IN ('opening','open','unknown')", [&now])?;
+    if require_maintenance_schema(&tx)? >= 39 {
+        tx.execute(
+            "UPDATE workflow_check_authorizations SET consumed_at=COALESCE(consumed_at,?1)",
+            [&now],
+        )?;
+        tx.execute("UPDATE provider_validation_invocations SET state='cancelled',failure_reason='database restore cancelled a provider check that had not started',updated_at=?1,finished_at=?1 WHERE state='pending'", [&now])?;
+        // A restored record cannot prove whether its provider call ran.
+        tx.execute("UPDATE provider_validation_invocations SET state='delivery_unknown',failure_reason='database restore cannot show whether this provider check ran; check the provider before validating again',updated_at=?1 WHERE state IN ('reserved','running','cancel_requested')", [&now])?;
+        crate::store::finish_settled_provider_batches_in(&tx, &now)?;
+        tx.execute("UPDATE history_pane_views SET state='unknown',failure_reason='database restore cannot show whether this history pane opened; check cmux before opening another history pane',updated_at=?1 WHERE state='reserved'", [&now])?;
+    }
     tx.commit()?;
     Ok(())
 }

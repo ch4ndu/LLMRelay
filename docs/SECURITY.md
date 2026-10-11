@@ -156,6 +156,37 @@ bundle metadata is separate from authority. Missing historical bindings remain
 visible but do not authorize current execution. Synthetic compatibility contexts
 are restricted to fixture constructors and cannot launch provider processes.
 
+Single agent writer policies are separate compiled contracts with their own
+identity; they never reuse TRIP Implementer proof, and the existing TRIP
+compatibility manifests are unchanged. A Single agent receives native permission
+grants only from your decisions in **Approvals**, and only while its run is bound
+to the compiled writer policy; it cannot select or remove checks or accept its
+own result. These writer modes are unqualified until exact native evidence is
+accepted.
+
+## App-wide provider checks
+
+**Providers** checks provider installations and model access outside any project.
+Opening the page makes no request; refreshing model suggestions reads only the
+local model catalog. **Preview checks** inspects the local installation and plans
+each check without contacting a model. Model calls happen only after you allow the
+displayed number of calls and choose **Start these checks**; they are short
+requests with no project files and no tools, are never retried automatically and
+never switch models. A start whose outcome is unknown keeps its request identity.
+**Check or close the earlier request** retrieves its recorded batch, including
+older results, or closes a request that never started so a delayed delivery
+cannot start it afterward. This action makes no model call. An uncertain response
+keeps the same identity for another check. **Send the identical request again**
+reuses the original identity and cannot start a second batch.
+
+A confirmation shows only that the observed account could call that model when
+checked. It is not repository access: it never satisfies a project's setup,
+hook, permission-delivery, session or profile admission requirements. When the
+provider cannot supply a trustworthy account identity, the page says so and the
+confirmation is not reused across projects. LLMRelay does not edit, trust or
+enable provider hooks or settings for these checks, and stores no credential
+contents.
+
 ## Local transport compatibility gate
 
 Protocol generation and feature declarations supplement authentication. Browser

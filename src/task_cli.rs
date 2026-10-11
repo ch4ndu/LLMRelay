@@ -264,12 +264,78 @@ async fn handle(
     Ok(())
 }
 
+/// A Single agent credential reaches its own context, result report, native
+/// hooks and permission requests, which wait for a person's decision. TRIP
+/// manager, setup, lane and check operations and every human control are not
+/// part of its channel.
+async fn dispatch_single_agent(
+    request: RoleRequest,
+    app: &Application,
+    peer_pid: u32,
+    initial: crate::domain::SingleAgentContext,
+    connection_nonce: &str,
+) -> Result<serde_json::Value> {
+    app.supervisor
+        .await_role_attachment(&initial.session_id, &initial.role_generation_id)
+        .await?;
+    let crate::domain::ExecutionContext::SingleAgent(context) =
+        app.store.execution_context(&request.credential)?
+    else {
+        bail!("role credential changed execution branch during supervisor attachment")
+    };
+    if context.session_id != initial.session_id
+        || context.role_generation_id != initial.role_generation_id
+        || context.credential_id != initial.credential_id
+        || context.transcript_epoch != initial.transcript_epoch
+    {
+        bail!("role credential changed session, generation, or invocation during supervisor attachment")
+    }
+    let provenance = app.supervisor.validate_role_peer(
+        &context.session_id,
+        &context.role_generation_id,
+        peer_pid,
+    )?;
+    match request.operation {
+        RoleOperation::Context => app.store.single_agent_context_payload(&context),
+        RoleOperation::Report { report } => app.store.save_single_agent_result(&context, &report),
+        RoleOperation::Hook { envelope } => {
+            app.store
+                .save_single_agent_hook_event(&context, &envelope, &provenance)
+        }
+        RoleOperation::PermissionRequest { envelope } => {
+            if envelope
+                .payload
+                .get("hook_event_name")
+                .and_then(serde_json::Value::as_str)
+                != Some("PermissionRequest")
+            {
+                bail!("permission bridge accepts only PermissionRequest hook events")
+            }
+            app.store
+                .save_single_agent_hook_event(&context, &envelope, &provenance)?;
+            app.permission_request(
+                &crate::permissions::PermissionActor::single_agent(&app.store, &context)?,
+                &request.credential,
+                &envelope.payload,
+                connection_nonce,
+            )
+            .await
+        }
+        _ => bail!("A Single agent can only read its context, report its result and send its native hooks and permission requests through the role channel"),
+    }
+}
+
 async fn dispatch(
     request: RoleRequest,
     app: &Application,
     peer_pid: u32,
     connection_nonce: &str,
 ) -> Result<serde_json::Value> {
+    if let crate::domain::ExecutionContext::SingleAgent(initial) =
+        app.store.execution_context(&request.credential)?
+    {
+        return dispatch_single_agent(request, app, peer_pid, initial, connection_nonce).await;
+    }
     let initial_context = app.store.role_context(&request.credential)?;
     app.supervisor
         .await_role_attachment(
@@ -308,7 +374,7 @@ async fn dispatch(
             app.store
                 .save_hook_event(&context, &envelope, &provenance)?;
             app.permission_request(
-                &context,
+                &crate::permissions::PermissionActor::from(&context),
                 &request.credential,
                 &envelope.payload,
                 connection_nonce,

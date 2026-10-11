@@ -1,9 +1,9 @@
 use crate::domain::{
     same_process_start, AttachmentBinding, ExecutableFingerprint, LaunchHandshake,
     ObservedProcessIdentity, PeerProcessIdentity, ProcessGenerationAnchor, ProcessIdentity,
-    Provider, RolePeerProvenance,
+    Provider, RolePeerProvenance, SessionOwner,
 };
-use crate::providers::PreparedLaunch;
+use crate::providers::{PreparedLaunch, ProviderProcess};
 use crate::store::{InputLeasePurpose, Store};
 use crate::transcript::{self, TranscriptSink};
 use anyhow::{anyhow, bail, Context, Result};
@@ -72,7 +72,7 @@ pub(crate) enum ProcessSnapshot {
 
 pub(crate) struct LiveInvocation {
     pub(crate) session_id: String,
-    pub(crate) role_generation_id: String,
+    pub(crate) owner: SessionOwner,
     pub(crate) transcript_epoch: String,
     pub(crate) process_identity_json: String,
 }
@@ -109,7 +109,7 @@ enum AttachedReconciliation {
 
 struct SessionHandle {
     session_id: String,
-    role_generation_id: String,
+    owner: SessionOwner,
     transcript_epoch: String,
     process: ProcessIdentity,
     group_leader: ProcessGenerationAnchor,
@@ -128,7 +128,7 @@ fn setup_stop_timeout_receipt_matches_handle(
     handle: &SessionHandle,
 ) -> bool {
     handle.session_id == receipt.session_id
-        && handle.role_generation_id == receipt.generation_id
+        && handle.owner.is_role_generation(&receipt.generation_id)
         && handle.transcript_epoch == receipt.transcript_epoch
         && serde_json::to_string(&handle.process).ok().as_deref()
             == Some(receipt.process_identity_json.as_str())
@@ -423,14 +423,38 @@ impl Supervisor {
     pub fn spawn(
         &self,
         session_id: &str,
-        role_generation_id: &str,
+        owner: &SessionOwner,
         transcript_epoch: &str,
         launch: &PreparedLaunch,
+    ) -> std::result::Result<ProcessIdentity, SpawnFailure> {
+        self.spawn_process(session_id, owner, transcript_epoch, &launch.process())
+    }
+
+    pub(crate) fn spawn_process(
+        &self,
+        session_id: &str,
+        requested_owner: &SessionOwner,
+        transcript_epoch: &str,
+        launch: &ProviderProcess<'_>,
     ) -> std::result::Result<ProcessIdentity, SpawnFailure> {
         if self.store.compatibility_bundles.is_synthetic() {
             return Err(SpawnFailure::proven(
                 "synthetic compatibility context cannot spawn a native provider",
             ));
+        }
+        // The handle's owner comes from the reserved row, never from the caller.
+        let owner = self
+            .store
+            .session_owner(session_id)
+            .map_err(SpawnFailure::proven)?;
+        if &owner != requested_owner {
+            return Err(SpawnFailure::proven(format!(
+                "session {session_id} is reserved for {} {}, not {} {}",
+                owner.kind(),
+                owner.id(),
+                requested_owner.kind(),
+                requested_owner.id()
+            )));
         }
         let transcript =
             TranscriptSink::create(&self.transcripts_root, session_id, transcript_epoch)
@@ -735,7 +759,7 @@ impl Supervisor {
         // cmux may expose Codex through a script shim.  By this point the
         // handshake has bound the final provider PID, so use its OS-backed
         // executable path as the fallback source for the exact helper image.
-        let codex_helper_image = (launch.config.provider == Provider::Codex)
+        let codex_helper_image = (launch.provider == Provider::Codex)
             .then(|| Mutex::new(codex_helper_image(launch, pid)));
         if let Err(error) = self.store.record_session_process(
             session_id,
@@ -759,7 +783,7 @@ impl Supervisor {
         known_members.insert(pid, native_start_marker);
         let handle = Arc::new(SessionHandle {
             session_id: session_id.to_owned(),
-            role_generation_id: role_generation_id.to_owned(),
+            owner,
             transcript_epoch: transcript_epoch.to_owned(),
             process: process.clone(),
             group_leader: leader_anchor.clone(),
@@ -1137,7 +1161,7 @@ impl Supervisor {
             if root_alive {
                 live.push(LiveInvocation {
                     session_id: handle.session_id.clone(),
-                    role_generation_id: handle.role_generation_id.clone(),
+                    owner: handle.owner.clone(),
                     transcript_epoch: handle.transcript_epoch.clone(),
                     process_identity_json: serde_json::to_string(&handle.process)?,
                 });
@@ -1865,12 +1889,45 @@ impl Supervisor {
         })
     }
 
+    /// Stops the Single agent writer turn that made the receipt's report, and
+    /// nothing newer: the live handle must still be that generation, epoch and
+    /// process, and the store must still find the report current.
+    pub(crate) fn interrupt_single_agent_report(
+        &self,
+        receipt: &crate::store::SingleAgentStopReceipt,
+    ) -> Result<bool> {
+        self.interrupt_exact_turn(
+            &receipt.session_id,
+            &receipt.generation_id,
+            &receipt.transcript_epoch,
+            Some(&receipt.process),
+            |store| store.reserve_single_agent_stop(receipt),
+        )
+    }
+
     fn interrupt_completed_turn(
         &self,
         receipt: &crate::store::StoppedTurnReceipt,
         reserve: impl FnOnce(&Store) -> Result<bool>,
     ) -> Result<bool> {
-        let handle = self.handle(&receipt.session_id)?;
+        self.interrupt_exact_turn(
+            &receipt.session_id,
+            &receipt.generation_id,
+            &receipt.transcript_epoch,
+            None,
+            reserve,
+        )
+    }
+
+    fn interrupt_exact_turn(
+        &self,
+        session_id: &str,
+        generation_id: &str,
+        transcript_epoch: &str,
+        process: Option<&ProcessIdentity>,
+        reserve: impl FnOnce(&Store) -> Result<bool>,
+    ) -> Result<bool> {
+        let handle = self.handle(session_id)?;
         let _boundary = handle
             .io_boundary
             .lock()
@@ -1880,8 +1937,9 @@ impl Supervisor {
             .lock()
             .map_err(|_| anyhow!("session stop-state lock poisoned"))?;
         if first_stop.is_some()
-            || handle.role_generation_id != receipt.generation_id
-            || handle.transcript_epoch != receipt.transcript_epoch
+            || !handle.owner.is_role_generation(generation_id)
+            || handle.transcript_epoch != transcript_epoch
+            || process.is_some_and(|process| *process != handle.process)
         {
             return Ok(false);
         }
@@ -1962,7 +2020,7 @@ impl Supervisor {
         )? {
             return Ok(serde_json::from_value(receipt)?);
         }
-        if handle.role_generation_id != binding.role_generation_id
+        if !handle.owner.is_role_generation(&binding.role_generation_id)
             || handle.transcript_epoch != binding.transcript_epoch
             || handle.process != binding.process_identity
         {
@@ -2104,7 +2162,7 @@ impl Supervisor {
         receipt: &crate::store::ManagerServiceStopReceipt,
     ) -> Result<InterruptOutcome> {
         let handle = self.handle(&receipt.session_id)?;
-        if handle.role_generation_id != receipt.generation_id
+        if !handle.owner.is_role_generation(&receipt.generation_id)
             || handle.transcript_epoch != receipt.transcript_epoch
         {
             return Ok(InterruptOutcome::Stale);
@@ -2141,7 +2199,7 @@ impl Supervisor {
         receipt: &crate::store::SetupRetainedFirstTurnStopReceipt,
     ) -> Result<InterruptOutcome> {
         let handle = self.handle(&receipt.session_id)?;
-        if handle.role_generation_id != receipt.generation_id
+        if !handle.owner.is_role_generation(&receipt.generation_id)
             || handle.transcript_epoch != receipt.transcript_epoch
         {
             return Ok(InterruptOutcome::Stale);
@@ -2266,7 +2324,7 @@ impl Supervisor {
         peer_pid: u32,
     ) -> Result<RolePeerProvenance> {
         let handle = self.handle(session_id)?;
-        if handle.role_generation_id != role_generation_id {
+        if !handle.owner.is_role_generation(role_generation_id) {
             bail!("session {session_id} is attached to a different role generation")
         }
         let inventory = process_inventory()?;
@@ -2349,7 +2407,7 @@ impl Supervisor {
         guidance_id: Option<&str>,
     ) -> Result<Arc<SessionHandle>> {
         let handle = self.handle(&binding.session_id)?;
-        if handle.role_generation_id != binding.role_generation_id
+        if !handle.owner.is_role_generation(&binding.role_generation_id)
             || handle.transcript_epoch != binding.transcript_epoch
             || handle.process != binding.process
         {
@@ -2372,10 +2430,14 @@ impl Supervisor {
         handle: &SessionHandle,
         guidance_id: Option<&str>,
     ) -> Result<AttachmentBinding> {
+        let role_generation_id = handle
+            .owner
+            .require_role_generation("terminal attachment")
+            .map_err(|error| anyhow!(error))?;
         self.verify_process(handle)?;
         let binding = AttachmentBinding {
             session_id: handle.session_id.clone(),
-            role_generation_id: handle.role_generation_id.clone(),
+            role_generation_id: role_generation_id.to_owned(),
             transcript_epoch: handle.transcript_epoch.clone(),
             process: handle.process.clone(),
         };
@@ -2391,7 +2453,7 @@ impl Supervisor {
         guidance_id: Option<&str>,
     ) -> Result<()> {
         if handle.session_id != binding.session_id
-            || handle.role_generation_id != binding.role_generation_id
+            || !handle.owner.is_role_generation(&binding.role_generation_id)
             || handle.transcript_epoch != binding.transcript_epoch
             || handle.process != binding.process
         {
@@ -2472,7 +2534,7 @@ impl Supervisor {
             .read()
             .map_err(|_| anyhow!("supervisor session map poisoned"))?
             .get(session_id)
-            .map(|handle| handle.role_generation_id == role_generation_id))
+            .map(|handle| handle.owner.is_role_generation(role_generation_id)))
     }
 
     fn verify_process(&self, handle: &SessionHandle) -> Result<()> {
@@ -2598,12 +2660,15 @@ fn service_stop_is_settling(
     })
 }
 
-fn codex_helper_image(launch: &PreparedLaunch, provider_pid: u32) -> Option<ExecutableFingerprint> {
-    if launch.config.provider != Provider::Codex {
+fn codex_helper_image(
+    launch: &ProviderProcess<'_>,
+    provider_pid: u32,
+) -> Option<ExecutableFingerprint> {
+    if launch.provider != Provider::Codex {
         return None;
     }
     codex_helper_image_from_paths(
-        &launch.executable,
+        launch.executable,
         process_executable_path(provider_pid).ok().as_deref(),
     )
 }
@@ -2984,13 +3049,68 @@ mod tests {
         let error = supervisor
             .spawn(
                 "fixture-session",
-                "fixture-generation",
+                &SessionOwner::RoleGeneration("fixture-generation".into()),
                 "fixture-epoch",
                 &fixture_launch(&root),
             )
             .unwrap_err();
         assert!(error.reason().contains("synthetic compatibility context"));
         assert!(!transcripts.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn spawn_refuses_an_owner_other_than_the_reserved_row_before_any_effect() {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-owner-spawn-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&root.join("state.sqlite3")).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO provider_validation_batches(id,operation_id,request_hash,preview_hash,selection_json,
+                   max_fresh_calls,native_calls_authorized,state,created_at,updated_at)
+                   VALUES('b','op','h','p','[]',1,1,'running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO provider_validation_invocations(id,batch_id,ordinal,provider,model,effort,evidence_key,
+                   state,created_at,updated_at)
+                   VALUES('shared-id','b',0,'codex','model','low','key','reserved','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO sessions(id,role_generation_id,provider_validation_invocation_id,provider,status,
+                   launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+                   VALUES('s',NULL,'shared-id','codex','launch_reserved','{}','fixture','epoch',
+                   '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        let transcripts = root.join("transcripts");
+        let supervisor = Supervisor::new(store.clone(), transcripts.clone());
+        for wrong in [
+            SessionOwner::RoleGeneration("shared-id".into()),
+            SessionOwner::ProviderValidationInvocation("other-id".into()),
+        ] {
+            let error = supervisor
+                .spawn("s", &wrong, "epoch", &fixture_launch(&root))
+                .unwrap_err();
+            assert!(matches!(error, SpawnFailure::ProvenNondelivery { .. }));
+            assert!(
+                error
+                    .reason()
+                    .contains("is reserved for provider_validation_invocation shared-id"),
+                "{}",
+                error.reason()
+            );
+        }
+        let launch_state: String = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT launch_state FROM sessions WHERE id='s'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(launch_state, "reserved", "no spawn intent was recorded");
+        assert!(!transcripts.exists());
+        assert!(supervisor.handles().unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3390,7 +3510,7 @@ mod tests {
             "s".into(),
             Arc::new(SessionHandle {
                 session_id: "s".into(),
-                role_generation_id: "g".into(),
+                owner: SessionOwner::RoleGeneration("g".into()),
                 transcript_epoch: "epoch".into(),
                 process: process.clone(),
                 group_leader: ProcessGenerationAnchor {
@@ -3418,7 +3538,7 @@ mod tests {
             "unrelated".into(),
             Arc::new(SessionHandle {
                 session_id: "unrelated".into(),
-                role_generation_id: "unrelated-generation".into(),
+                owner: SessionOwner::RoleGeneration("unrelated-generation".into()),
                 transcript_epoch: "unrelated-epoch".into(),
                 process: ProcessIdentity {
                     pid: 43,
@@ -3601,7 +3721,7 @@ mod tests {
             .supervisor
             .spawn(
                 "s-launch",
-                "g-launch",
+                &SessionOwner::RoleGeneration("g-launch".into()),
                 "launch-epoch",
                 &fixture_launch(&root),
             )
@@ -3626,7 +3746,7 @@ mod tests {
         let pty = native_pty_system().openpty(PtySize::default()).unwrap();
         let handle = Arc::new(SessionHandle {
             session_id: "s".into(),
-            role_generation_id: "g".into(),
+            owner: SessionOwner::RoleGeneration("g".into()),
             transcript_epoch: "epoch".into(),
             process: ProcessIdentity {
                 pid: 42,
@@ -3844,7 +3964,7 @@ mod tests {
                     session.into(),
                     Arc::new(SessionHandle {
                         session_id: session.into(),
-                        role_generation_id: generation.into(),
+                        owner: SessionOwner::RoleGeneration(generation.into()),
                         transcript_epoch: "epoch".into(),
                         process: process.clone(),
                         group_leader: anchor,
@@ -5270,7 +5390,7 @@ mod tests {
                 session.into(),
                 Arc::new(SessionHandle {
                     session_id: session.into(),
-                    role_generation_id: generation.into(),
+                    owner: SessionOwner::RoleGeneration(generation.into()),
                     transcript_epoch: epoch.into(),
                     process: process.clone(),
                     group_leader: ProcessGenerationAnchor {
@@ -5863,7 +5983,7 @@ mod tests {
             session.into(),
             Arc::new(SessionHandle {
                 session_id: session.into(),
-                role_generation_id: generation.into(),
+                owner: SessionOwner::RoleGeneration(generation.into()),
                 transcript_epoch: epoch.into(),
                 process: process.clone(),
                 group_leader: ProcessGenerationAnchor {

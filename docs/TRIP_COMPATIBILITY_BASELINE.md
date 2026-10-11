@@ -205,6 +205,8 @@ ed8602a401935aaf21852e9cf5053d26928277df7ea62b6b28cb3fc3a3a86127  resources/prom
 
 ## Qualification still required
 
+Since this baseline, the Single agent workflow has been implemented in source with separate policy manifests; the TRIP compatibility manifests, workflow and overlay resources listed above were left unchanged by that delivery. Its native qualification below remains outstanding.
+
 Source inspection, historical proof hashes and documentation do not demonstrate new policy behavior, native permission denial, migration execution, Single agent admission/result handling, actual retained resume or browser clicks. Gate A uses isolated causal tests, Gate B uses service-owned host checks, Gate C observes authorized native/dashboard behavior, and Gate D requires independent code review, manager conformance and fresh final verification before human acceptance. Codex qualifies first; Claude remains visibly unqualified for Single agent until separately proved. No new paid native budget is authorized here.
 
 The selected MW-01 checks are revision 1 under configuration `b4147f19-6849-4fb6-a3aa-ec9c1176ab1e`: build/Rust check `3449578b-7d7c-4574-a040-5ff0c2942871` and DOM check `133320df-738c-4bdb-8f3a-3d7ea36fe8c0`. The lane did not execute either. Their authoritative output and exact frozen-candidate receipts belong to the service's one build/check slot.

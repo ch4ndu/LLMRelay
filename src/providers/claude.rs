@@ -8,6 +8,64 @@ pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-claude-launch-v2";
 pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-claude-resume-v2";
 pub const CREDENTIAL_CONTRACT_REVISION: &str = "llmrelay-local-credential-v1";
 pub const EXACT_CLAUDE_VERSION: &str = "2.1.289 (Claude Code)";
+pub const OBSERVATION_LAUNCH_REVISION: &str = "llmrelay-claude-observation-launch-v1";
+pub const OBSERVATION_POLICY_REVISION: &str = "claude-observation-no-tools-v1";
+pub const SINGLE_AGENT_LAUNCH_REVISION: &str = "llmrelay-claude-single-agent-launch-v1";
+pub const SINGLE_AGENT_POLICY_REVISION: &str = "claude-single-agent-writer-v1";
+
+/// Claude Code exposes no reviewed account-identity source for this version,
+/// so the identity is reported unavailable rather than inferred from the
+/// presence of credentials or a generic signed-in state.
+pub fn inspect_observation_account() -> super::ProviderAccountObservation {
+    super::ProviderAccountObservation {
+        account_identity: None,
+        authentication: super::AUTHENTICATION_NOT_INSPECTED.to_owned(),
+        config_identity: serde_json::json!({
+            "revision": OBSERVATION_POLICY_REVISION,
+            "user_configuration": "not_inspected",
+        }),
+    }
+}
+
+/// Candidate arguments for the provider-observation contract: one print-mode
+/// turn in safe mode with every tool denied, an explicitly empty MCP
+/// configuration, no slash commands, browser or saved session, and updates
+/// disabled through the environment rather than user settings. Whether safe
+/// mode also suppresses every user hook and customization in the pinned build
+/// is unproven until native qualification.
+pub(crate) fn observation_arguments(model: &str, effort: &str, prompt: &str) -> Vec<String> {
+    let settings = serde_json::json!({
+        "permissions": {
+            "defaultMode": "dontAsk",
+            "allow": [],
+            "deny": [
+                "Bash", "Read", "Edit", "Write", "Glob", "Grep", "NotebookEdit",
+                "WebFetch", "WebSearch", "Task", "Agent"
+            ]
+        }
+    });
+    vec![
+        "--print".to_owned(),
+        "--safe-mode".to_owned(),
+        "--no-session-persistence".to_owned(),
+        "--model".to_owned(),
+        model.to_owned(),
+        "--effort".to_owned(),
+        effort.to_owned(),
+        "--permission-mode".to_owned(),
+        "dontAsk".to_owned(),
+        "--tools".to_owned(),
+        String::new(),
+        "--settings".to_owned(),
+        settings.to_string(),
+        "--strict-mcp-config".to_owned(),
+        "--mcp-config".to_owned(),
+        serde_json::json!({"mcpServers": {}}).to_string(),
+        "--disable-slash-commands".to_owned(),
+        "--no-chrome".to_owned(),
+        prompt.to_owned(),
+    ]
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn prepare(
@@ -331,6 +389,137 @@ pub(crate) fn prepare_with_bundles(
         arguments,
         environment,
         supervision_executable: executable_path.to_path_buf(),
+    })
+}
+
+/// The Single agent writer's native Claude invocation under its own compiled
+/// policy: worktree edits in the native sandbox, the channel's context and
+/// report commands, and permission prompts a person decides through LLMRelay.
+pub(crate) fn single_agent_native(
+    request: &super::SingleAgentLaunchRequest<'_>,
+) -> Result<super::SingleAgentNative> {
+    use sha2::Digest;
+    let (executable, version) = if request.bundles.is_synthetic() {
+        (
+            request.executable_path.to_path_buf(),
+            EXACT_CLAUDE_VERSION.to_owned(),
+        )
+    } else {
+        super::executable_and_version(Provider::Claude)?
+    };
+    let canonical_role_socket = canonical_role_socket(request.role_socket)?;
+    let settings_argument = native_sandbox_settings_argument(
+        &request.assets.claude_implementer_settings,
+        &canonical_role_socket,
+        &[],
+        None,
+    )?;
+    let channel = request.executable_path.display();
+    let relative = request
+        .cwd
+        .strip_prefix("/")
+        .unwrap_or(request.cwd)
+        .display();
+    let tools = "Read,Grep,Glob,Edit,Write,Bash";
+    let denied = "NotebookEdit,WebFetch,WebSearch,Task,Agent";
+    let allowed = vec![
+        format!("Read(//{relative}/**)"),
+        format!("Grep(//{relative}/**)"),
+        format!("Glob(//{relative}/**)"),
+        format!("Edit(//{relative}/**)"),
+        format!("Bash({channel} role context)"),
+        format!("Bash({channel} role report:*)"),
+    ];
+    let mut arguments = vec![
+        "--model".to_owned(),
+        request.model.to_owned(),
+        "--effort".to_owned(),
+        request.effort.to_owned(),
+        "--restricted".to_owned(),
+        "--permission-mode".to_owned(),
+        "default".to_owned(),
+        "--tools".to_owned(),
+        tools.to_owned(),
+        "--allowedTools".to_owned(),
+    ];
+    arguments.extend(allowed.iter().cloned());
+    arguments.extend([
+        "--disallowedTools".to_owned(),
+        denied.to_owned(),
+        "--settings".to_owned(),
+        settings_argument.clone(),
+        "--strict-mcp-config".to_owned(),
+        "--disable-slash-commands".to_owned(),
+        "--no-chrome".to_owned(),
+        "--prompt-suggestions".to_owned(),
+        "false".to_owned(),
+    ]);
+    match request.native_session_id {
+        Some(native_id) => arguments.extend(["--resume".to_owned(), native_id.to_owned()]),
+        None => arguments.extend(["--session-id".to_owned(), request.session_id.to_owned()]),
+    }
+    let environment = vec![
+        ("DISABLE_AUTOUPDATER".to_owned(), "1".to_owned()),
+        ("DISABLE_UPDATES".to_owned(), "1".to_owned()),
+        (
+            "AGENTICJIRA_PROVIDER".to_owned(),
+            Provider::Claude.to_string(),
+        ),
+        (
+            "AGENTICJIRA_ROLE_SOCKET".to_owned(),
+            canonical_role_socket.to_string_lossy().into_owned(),
+        ),
+        (
+            "AGENTICJIRA_ROLE_TOKEN".to_owned(),
+            request.token.to_owned(),
+        ),
+        (
+            "AGENTICJIRA_ROLE_GENERATION_ID".to_owned(),
+            request.role_generation_id.to_owned(),
+        ),
+        (
+            "AGENTICJIRA_SESSION_ID".to_owned(),
+            request.session_id.to_owned(),
+        ),
+    ];
+    // The identity names the worktree generically so proof carries across runs.
+    let worktree = relative.to_string();
+    let allowed_identity = allowed
+        .iter()
+        .map(|rule| rule.replace(&worktree, "<worktree>"))
+        .collect::<Vec<_>>();
+    let security_policy = serde_json::json!({
+        "restricted": true,
+        "permission_mode": "default",
+        "permission_request_timeout_seconds": crate::permissions::PROVIDER_PERMISSION_TIMEOUT_SECONDS,
+        "tools": tools,
+        "allowed_operations": allowed_identity,
+        "denied": denied,
+        "mcp": "strict_empty",
+        "native_sandbox": {
+            "policy_revision": NATIVE_SANDBOX_POLICY_REVISION,
+            "fail_if_unavailable": true,
+            "allow_unsandboxed_commands": false,
+            "network_allow_unix_sockets": [&canonical_role_socket],
+        },
+        "hooks": "native_explicit_trust",
+    });
+    Ok(super::SingleAgentNative {
+        executable,
+        executable_version: version,
+        arguments,
+        environment,
+        role_socket: canonical_role_socket,
+        account_identity: inspect_observation_account().account_identity,
+        config_identity: serde_json::json!({
+            "revision": NATIVE_SANDBOX_POLICY_REVISION,
+            "settings_sha256": hex::encode(sha2::Sha256::digest(settings_argument.as_bytes())),
+        }),
+        security_policy,
+        hook_revision: format!(
+            "{CLAUDE_HOOK_REVISION}:{}",
+            request.assets.claude_implementer_revision_hash
+        ),
     })
 }
 

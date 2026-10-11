@@ -46,8 +46,37 @@ pub struct PreparedLaunch {
 }
 
 impl PreparedLaunch {
+    pub fn process(&self) -> ProviderProcess<'_> {
+        ProviderProcess {
+            provider: self.config.provider,
+            executable: &self.executable,
+            arguments: &self.arguments,
+            environment: &self.environment,
+            cwd: &self.config.cwd,
+            supervision_executable: &self.supervision_executable,
+        }
+    }
+
     pub fn command(&self, anchor_path: &Path) -> CommandBuilder {
-        let mut command = CommandBuilder::new(&self.supervision_executable);
+        self.process().command(anchor_path)
+    }
+}
+
+/// Everything the supervisor needs to start one provider process, shared by
+/// role launches and app-owned provider checks.
+#[derive(Clone, Copy, Debug)]
+pub struct ProviderProcess<'a> {
+    pub provider: Provider,
+    pub executable: &'a Path,
+    pub arguments: &'a [String],
+    pub environment: &'a [(String, String)],
+    pub cwd: &'a Path,
+    pub supervision_executable: &'a Path,
+}
+
+impl ProviderProcess<'_> {
+    pub fn command(&self, anchor_path: &Path) -> CommandBuilder {
+        let mut command = CommandBuilder::new(self.supervision_executable);
         command.env_clear();
         for (key, value) in std::env::vars_os() {
             let key_text = key.to_string_lossy();
@@ -78,13 +107,177 @@ impl PreparedLaunch {
             "--".to_owned(),
         ];
         command.args(&wrapper_arguments);
-        command.args(&self.arguments);
-        command.cwd(&self.config.cwd);
-        for (key, value) in &self.environment {
+        command.args(self.arguments);
+        command.cwd(self.cwd);
+        for (key, value) in self.environment {
             command.env(key, value);
         }
         command
     }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ProviderInstallation {
+    pub provider: Provider,
+    pub executable: ExecutableFingerprint,
+    pub executable_version: String,
+}
+
+/// Locates the provider on PATH and binds its canonical file identity and
+/// self-reported version; no model is contacted.
+pub fn inspect_installation(provider: Provider) -> Result<ProviderInstallation> {
+    let (path, executable_version) = executable_and_version(provider)?;
+    Ok(ProviderInstallation {
+        provider,
+        executable: executable_fingerprint(&path)?,
+        executable_version,
+    })
+}
+
+fn executable_fingerprint(path: &Path) -> Result<ExecutableFingerprint> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("resolve provider executable {}", path.display()))?;
+    let metadata = canonical.metadata()?;
+    Ok(ExecutableFingerprint {
+        canonical_path: canonical,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        bytes: metadata.size(),
+        modified_seconds: metadata.mtime(),
+        modified_nanos: metadata.mtime_nsec(),
+    })
+}
+
+/// Non-secret local sign-in facts for an app-wide check. `account_identity`
+/// is set only from a provider-specific allowlisted field.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderAccountObservation {
+    pub account_identity: Option<String>,
+    pub authentication: String,
+    pub config_identity: serde_json::Value,
+}
+
+/// Reported when no reviewed local sign-in inspection exists for a provider.
+pub const AUTHENTICATION_NOT_INSPECTED: &str = "not_inspected";
+
+impl ProviderAccountObservation {
+    pub fn authentication_inspected(&self) -> bool {
+        self.authentication != AUTHENTICATION_NOT_INSPECTED
+    }
+}
+
+/// One app-owned provider check. It carries no role socket, token,
+/// generation, hook or project path; its scope is an empty app directory.
+#[derive(Clone, Debug)]
+pub struct ObservationLaunch {
+    pub provider: Provider,
+    pub executable: PathBuf,
+    pub executable_version: String,
+    pub model: String,
+    pub effort: String,
+    pub arguments: Vec<String>,
+    pub environment: Vec<(String, String)>,
+    pub scope: PathBuf,
+    pub supervision_executable: PathBuf,
+    pub policy: crate::provider_compatibility::PolicyBinding,
+}
+
+impl ObservationLaunch {
+    pub fn process(&self) -> ProviderProcess<'_> {
+        ProviderProcess {
+            provider: self.provider,
+            executable: &self.executable,
+            arguments: &self.arguments,
+            environment: &self.environment,
+            cwd: &self.scope,
+            supervision_executable: &self.supervision_executable,
+        }
+    }
+
+    /// The session record omits the prompt, which carries the check value.
+    pub fn record(&self) -> serde_json::Value {
+        let mut arguments = self.arguments.clone();
+        if let Some(prompt) = arguments.last_mut() {
+            *prompt = "<provider-check-prompt>".to_owned();
+        }
+        json!({
+            "kind": "provider_observation",
+            "provider": self.provider,
+            "executable": self.executable,
+            "executable_version": self.executable_version,
+            "model": self.model,
+            "effort": self.effort,
+            "argv": arguments,
+            "environment_keys": self.environment.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            "scope": self.scope,
+            "policy": self.policy,
+        })
+    }
+}
+
+/// Model and effort become separate argv elements, never shell text; a
+/// leading dash or whitespace is still refused so neither can become a flag.
+fn require_provider_word(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.starts_with('-')
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/' | b'[' | b']')
+        })
+    {
+        bail!("{label} must be a plain provider identifier")
+    }
+    Ok(())
+}
+
+pub(crate) fn require_observation_selection(model: &str, effort: &str) -> Result<()> {
+    require_provider_word("model", model)?;
+    require_provider_word("effort", effort)
+}
+
+pub fn prepare_observation_launch(
+    installation: &ProviderInstallation,
+    policy: crate::provider_compatibility::PolicyBinding,
+    model: &str,
+    effort: &str,
+    scope: &Path,
+    prompt: &str,
+    supervision_executable: &Path,
+) -> Result<ObservationLaunch> {
+    require_observation_selection(model, effort)?;
+    if policy.mode != crate::provider_compatibility::PolicyMode::ProviderObservation
+        || policy.provider != installation.provider
+        || policy.exact_version != installation.executable_version
+    {
+        bail!("provider check launch requires the observation contract for this exact installation")
+    }
+    let (arguments, environment) = match installation.provider {
+        Provider::Codex => (
+            codex::observation_arguments(model, effort, scope, prompt)?,
+            Vec::new(),
+        ),
+        Provider::Claude => (
+            claude::observation_arguments(model, effort, prompt),
+            vec![
+                ("DISABLE_AUTOUPDATER".to_owned(), "1".to_owned()),
+                ("DISABLE_UPDATES".to_owned(), "1".to_owned()),
+            ],
+        ),
+    };
+    Ok(ObservationLaunch {
+        provider: installation.provider,
+        executable: installation.executable.canonical_path.clone(),
+        executable_version: installation.executable_version.clone(),
+        model: model.to_owned(),
+        effort: effort.to_owned(),
+        arguments,
+        environment,
+        scope: scope.to_path_buf(),
+        supervision_executable: supervision_executable.to_path_buf(),
+        policy,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -428,7 +621,155 @@ pub fn prepare_runtime_probe_role_launch_with_bundles(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Everything one Single agent writer turn is prepared from. A retained turn
+/// names the native conversation it continues; a first turn names none.
+pub struct SingleAgentLaunchRequest<'a> {
+    pub provider: Provider,
+    pub model: &'a str,
+    pub effort: &'a str,
+    pub cwd: &'a Path,
+    pub prompt: &'a str,
+    pub role_socket: &'a Path,
+    pub token: &'a str,
+    pub role_generation_id: &'a str,
+    pub session_id: &'a str,
+    pub native_session_id: Option<&'a str>,
+    pub assets: &'a HookAssets,
+    pub executable_path: &'a Path,
+    pub bundles: &'a crate::provider_compatibility::BundleSet,
+}
+
+/// A provider's part of a Single agent launch, before the policy binding.
+pub(crate) struct SingleAgentNative {
+    executable: PathBuf,
+    executable_version: String,
+    arguments: Vec<String>,
+    environment: Vec<(String, String)>,
+    role_socket: PathBuf,
+    account_identity: Option<String>,
+    config_identity: serde_json::Value,
+    security_policy: serde_json::Value,
+    hook_revision: String,
+}
+
+/// The native facts a Single agent capability proof binds besides the
+/// profile and its prepared scope. Any change makes earlier proof stale.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SingleAgentNativeIdentity {
+    pub provider: Provider,
+    pub executable: ExecutableFingerprint,
+    pub executable_version: String,
+    pub account_identity: Option<String>,
+    pub config_identity: serde_json::Value,
+    pub security_policy: serde_json::Value,
+    pub hook_revision: String,
+    pub policy_binding_hash: String,
+}
+
+/// One prepared Single agent writer turn and the record its session stores.
+/// It binds the separately compiled Single agent policy; no TRIP role
+/// contract, role prompt or role capability takes part.
+pub struct SingleAgentLaunch {
+    pub provider: Provider,
+    pub executable: PathBuf,
+    pub arguments: Vec<String>,
+    pub environment: Vec<(String, String)>,
+    pub cwd: PathBuf,
+    pub supervision_executable: PathBuf,
+    pub identity: SingleAgentNativeIdentity,
+    pub record: serde_json::Value,
+}
+
+impl SingleAgentLaunch {
+    pub fn process(&self) -> ProviderProcess<'_> {
+        ProviderProcess {
+            provider: self.provider,
+            executable: &self.executable,
+            arguments: &self.arguments,
+            environment: &self.environment,
+            cwd: &self.cwd,
+            supervision_executable: &self.supervision_executable,
+        }
+    }
+}
+
+/// Prepares one Single agent writer turn, refused while the installed
+/// version's Single agent writer contract is unqualified.
+pub fn prepare_single_agent_launch(
+    request: &SingleAgentLaunchRequest<'_>,
+) -> Result<SingleAgentLaunch> {
+    require_provider_word("model", request.model)?;
+    require_provider_word("effort", request.effort)?;
+    let native = match request.provider {
+        Provider::Codex => codex::single_agent_native(request)?,
+        Provider::Claude => claude::single_agent_native(request)?,
+    };
+    let binding = request.bundles.resolve_policy(
+        request.provider,
+        &native.executable_version,
+        crate::provider_compatibility::PolicyMode::SingleAgentWriter,
+    )?;
+    if let Some(reason) = binding.native_calls_disabled_reason() {
+        bail!("{reason}")
+    }
+    let identity = SingleAgentNativeIdentity {
+        provider: request.provider,
+        executable: executable_fingerprint(&native.executable)?,
+        executable_version: native.executable_version,
+        account_identity: native.account_identity,
+        config_identity: native.config_identity,
+        security_policy: native.security_policy,
+        hook_revision: native.hook_revision,
+        policy_binding_hash: binding.effective_hash.clone(),
+    };
+    let policy =
+        crate::provider_compatibility::ExecutionPolicy::single_agent_writer(request.provider);
+    let mut arguments = native.arguments;
+    arguments.push(format!(
+        "{}\n\n{}",
+        request.prompt,
+        single_agent_channel_instructions(request.executable_path, &native.role_socket)
+    ));
+    let mut recorded_arguments = arguments.clone();
+    if let Some(prompt) = recorded_arguments.last_mut() {
+        *prompt = "<single-agent-prompt>".to_owned();
+    }
+    let record = json!({
+        "schema": 1,
+        "actor": crate::domain::ExecutionActor::SINGLE_AGENT_KEY,
+        "provider": request.provider,
+        "executable": native.executable,
+        "executable_version": identity.executable_version,
+        "model": request.model,
+        "effort": request.effort,
+        "cwd": request.cwd,
+        "argv": recorded_arguments,
+        "environment_keys": native.environment.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+        "native_session_id": request.native_session_id,
+        "execution_policy": policy,
+        "execution_policy_hash": policy.content_hash(),
+        "policy_binding": binding,
+    });
+    Ok(SingleAgentLaunch {
+        provider: request.provider,
+        executable: native.executable,
+        arguments,
+        environment: native.environment,
+        cwd: request.cwd.to_path_buf(),
+        supervision_executable: request.executable_path.to_path_buf(),
+        identity,
+        record,
+    })
+}
+
+fn single_agent_channel_instructions(executable: &Path, socket: &Path) -> String {
+    let executable = shell_quote(executable.to_string_lossy().as_ref());
+    format!(
+        "Use `{executable} role context` to read your task, guidance and result contract, and `{executable} role report` to report as that context describes. Terminal prose is not a result. The channel is scoped at `{}`.",
+        socket.display()
+    )
+}
+
 fn prepare_role_launch_with_policies(
     provider: Provider,
     role: RoleKind,
@@ -451,10 +792,14 @@ fn prepare_role_launch_with_policies(
         let role_executable = executable_path
             .canonicalize()
             .context("resolve role-channel executable for setup confinement")?;
-        if read_denials.iter().any(|denied| {
+        if let Some(denied) = read_denials.iter().find(|denied| {
             role_executable.as_path() == denied.as_path() || role_executable.starts_with(denied)
         }) {
-            bail!("setup read isolation requires the LLMRelay executable to be installed outside the target repository and Git common directory")
+            bail!(
+                "launch preflight refused this setup launch before contacting the provider: the LLMRelay executable {} is inside the denied target path {}. Setup read isolation requires the executable to be installed outside the target repository and Git common directory",
+                role_executable.display(),
+                denied.display()
+            )
         }
     }
     match provider {
@@ -505,23 +850,9 @@ pub fn capability_identity(config: &LaunchConfig) -> Result<CapabilityIdentity> 
     if config.security_policy.is_null() {
         bail!("capability identity requires an explicit effective security policy")
     }
-    let canonical = config.executable.canonicalize().with_context(|| {
-        format!(
-            "resolve provider executable {}",
-            config.executable.display()
-        )
-    })?;
-    let metadata = canonical.metadata()?;
     Ok(CapabilityIdentity {
         provider: config.provider,
-        executable: ExecutableFingerprint {
-            canonical_path: canonical,
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            bytes: metadata.size(),
-            modified_seconds: metadata.mtime(),
-            modified_nanos: metadata.mtime_nsec(),
-        },
+        executable: executable_fingerprint(&config.executable)?,
         executable_version: config.executable_version.clone(),
         role: config.role,
         model: config.model.clone(),
@@ -785,14 +1116,15 @@ pub fn executable_and_version(provider: Provider) -> Result<(PathBuf, String)> {
         Provider::Codex => "codex",
         Provider::Claude => "claude",
     };
-    let path_output = Command::new("/usr/bin/env")
-        .args(["which", name])
-        .output()
-        .with_context(|| format!("locate {name}"))?;
-    if !path_output.status.success() {
+    let (located, path_output) = bounded_inspection(
+        Command::new("/usr/bin/env").args(["which", name]),
+        &format!("locate {name}"),
+        INSPECTION_TIMEOUT,
+    )?;
+    if !located.success() {
         bail!("{name} executable was not found on PATH")
     }
-    let path = PathBuf::from(String::from_utf8(path_output.stdout)?.trim());
+    let path = PathBuf::from(String::from_utf8(path_output)?.trim());
     let mut version_command = Command::new(&path);
     version_command.arg("--version");
     if provider == Provider::Claude {
@@ -800,17 +1132,92 @@ pub fn executable_and_version(provider: Provider) -> Result<(PathBuf, String)> {
             .env("DISABLE_AUTOUPDATER", "1")
             .env("DISABLE_UPDATES", "1");
     }
-    let version_output = version_command
-        .output()
-        .with_context(|| format!("read {} version", path.display()))?;
-    if !version_output.status.success() {
+    let (status, version_output) = bounded_inspection(
+        &mut version_command,
+        &format!("read {} version", path.display()),
+        INSPECTION_TIMEOUT,
+    )?;
+    if !status.success() {
         bail!("{} --version failed", path.display())
     }
-    let version = String::from_utf8(version_output.stdout)?.trim().to_owned();
+    let version = String::from_utf8(version_output)?.trim().to_owned();
     if version.is_empty() {
         bail!("{} returned an empty version", path.display())
     }
     Ok((path, version))
+}
+
+const INSPECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const INSPECTION_OUTPUT_LIMIT: usize = 64 * 1024;
+
+/// Runs one short local inspection command with bounded time and stdout. It
+/// runs in its own process group so a timeout or oversized output kills
+/// every process it started before the child is reaped.
+fn bounded_inspection(
+    command: &mut Command,
+    label: &str,
+    timeout: std::time::Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>)> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("{label}: could not start"))?;
+    let stop = |child: &mut std::process::Child| {
+        // The child leads its own group, so this reaches its descendants too.
+        unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+        let _ = child.wait();
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        stop(&mut child);
+        bail!("{label}: output was not captured")
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = (&mut stdout)
+            .take(INSPECTION_OUTPUT_LIMIT as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send(read);
+    });
+    let output = match receiver.recv_timeout(timeout) {
+        Ok(Ok(bytes)) if bytes.len() <= INSPECTION_OUTPUT_LIMIT => bytes,
+        Ok(Ok(_)) => {
+            stop(&mut child);
+            bail!("{label}: printed more than {INSPECTION_OUTPUT_LIMIT} bytes")
+        }
+        Ok(Err(error)) => {
+            stop(&mut child);
+            return Err(error).with_context(|| format!("{label}: could not read output"));
+        }
+        Err(_) => {
+            stop(&mut child);
+            bail!(
+                "{label}: did not finish within {} seconds",
+                timeout.as_secs_f32()
+            )
+        }
+    };
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok((status, output));
+        }
+        if std::time::Instant::now() >= deadline {
+            stop(&mut child);
+            bail!(
+                "{label}: did not exit within {} seconds",
+                timeout.as_secs_f32()
+            )
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 pub fn shell_quote(value: &str) -> String {
@@ -828,5 +1235,62 @@ pub fn role_channel_instructions(role: RoleKind, executable: &Path, socket: &Pat
         format!("{common} Manager-only commands are `role propose-transition --operation-id <UUID> --phase <PHASE> --evidence <TEXT>` and `role acknowledge-guidance --guidance <ID>`. Read context again after guidance, role completion, or a review.")
     } else {
         common
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_inspection_is_bounded_in_time_and_output() {
+        let generous = std::time::Duration::from_secs(5);
+        let (status, output) = bounded_inspection(
+            Command::new("/bin/sh").args(["-c", "echo 'codex-cli 0.160.0'"]),
+            "fixture version",
+            generous,
+        )
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            String::from_utf8(output).unwrap().trim(),
+            "codex-cli 0.160.0"
+        );
+
+        let pid_file =
+            std::env::temp_dir().join(format!("llmrelay-inspection-{}", uuid::Uuid::new_v4()));
+        let started = std::time::Instant::now();
+        let error = bounded_inspection(
+            Command::new("/bin/sh")
+                .args(["-c", "echo $$ > \"$0\"; exec sleep 30"])
+                .arg(&pid_file),
+            "fixture hang",
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("did not finish"), "{error:#}");
+        assert!(started.elapsed() < generous);
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "the hung inspection was killed and reaped"
+        );
+        std::fs::remove_file(pid_file).unwrap();
+
+        let error = bounded_inspection(
+            Command::new("/bin/sh").args(["-c", "head -c 70000 /dev/zero; sleep 30"]),
+            "fixture flood",
+            generous,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("printed more than 65536 bytes"),
+            "{error:#}"
+        );
     }
 }

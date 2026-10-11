@@ -25,6 +25,10 @@ pub const EXACT_CODEX_VERSION: &str = "codex-cli 0.160.0";
 pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-codex-launch-v2";
 pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-codex-resume-v2";
 pub const CREDENTIAL_CONTRACT_REVISION: &str = "llmrelay-local-credential-v1";
+pub const OBSERVATION_LAUNCH_REVISION: &str = "llmrelay-codex-observation-launch-v1";
+pub const OBSERVATION_POLICY_REVISION: &str = "codex-observation-empty-scope-v1";
+pub const SINGLE_AGENT_LAUNCH_REVISION: &str = "llmrelay-codex-single-agent-launch-v1";
+pub const SINGLE_AGENT_POLICY_REVISION: &str = "codex-single-agent-writer-v1";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_AUTH_BYTES: u64 = 256 * 1024;
 const ACCESS_TOKEN_MARGIN_SECONDS: i64 = 15 * 60;
@@ -54,10 +58,23 @@ const DISABLED_FEATURES: &[&str] = &[
     "use_xaa",
 ];
 
+/// Built-in tools the pinned version enables by default. A read-only sandbox
+/// still lets them read files, so the observation contract turns them off.
+const OBSERVATION_DISABLED_TOOLS: &[&str] = &["shell_tool", "unified_exec"];
+
 #[derive(Debug)]
 struct NativeCompatibility {
     disabled_mcp_servers: BTreeSet<String>,
     identity: serde_json::Value,
+    account: CodexAccount,
+}
+
+/// Only these validated fields leave the bounded auth parser; token and JWT
+/// contents never do.
+#[derive(Debug)]
+struct CodexAccount {
+    account_id: Option<String>,
+    plan: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -130,81 +147,18 @@ pub(crate) fn prepare_with_bundles(
     } else {
         "never"
     };
-    let mut arguments = vec![
-        "--strict-config".to_owned(),
-        "--no-daemon".to_owned(),
-        "--no-alt-screen".to_owned(),
-        "--cd".to_owned(),
-        cwd.to_string_lossy().into_owned(),
-        "--model".to_owned(),
-        model.to_owned(),
-        "--ask-for-approval".to_owned(),
-        approval.to_owned(),
-        "--config".to_owned(),
-        "approvals_reviewer=\"user\"".to_owned(),
-        "--config".to_owned(),
-        format!("model_reasoning_effort={}", toml_string(effort)?),
-        "--config".to_owned(),
-        role_profile,
-        "--config".to_owned(),
-        format!("default_permissions=\"{DENIED_READ_FLOOR_PROFILE}\""),
-        "--config".to_owned(),
-        "features.exec_permission_approvals=false".to_owned(),
-        "--config".to_owned(),
-        "features.request_permissions_tool=false".to_owned(),
-        "--config".to_owned(),
-        "cli_auth_credentials_store=\"file\"".to_owned(),
-        "--config".to_owned(),
-        "features.multi_agent=false".to_owned(),
-        "--config".to_owned(),
-        "features.multi_agent_v2=false".to_owned(),
-        "--config".to_owned(),
-        "features.hooks=true".to_owned(),
-        "--config".to_owned(),
+    let mut arguments = native_arguments(&NativeArguments {
+        cwd,
+        model,
+        effort,
+        approval,
+        permission_profile: role_profile,
         network_proxy,
-    ];
-    for event in [
-        "SessionStart",
-        "UserPromptSubmit",
-        "PreToolUse",
-        "PermissionRequest",
-        "PostToolUse",
-        "Stop",
-        "Interrupt",
-        "SubagentStart",
-        "SubagentStop",
-        "SessionEnd",
-    ] {
-        let timeout = if role == RoleKind::Implementer && event == "PermissionRequest" {
-            crate::permissions::PROVIDER_PERMISSION_TIMEOUT_SECONDS
-        } else {
-            2
-        };
-        let event_hook_command = format!("{hook_command} --event {}", shell_quote(event));
-        // Codex keys hook trust by source/event/group/handler position. Reserve
-        // group zero for read-only roles so their shorter timeout cannot replace
-        // the Implementer's trusted PermissionRequest definition.
-        let reserved_group = if role == RoleKind::Implementer && event == "PermissionRequest" {
-            "{hooks=[]},"
-        } else {
-            ""
-        };
-        let hook_value = format!(
-            "[{reserved_group}{{hooks=[{{type=\"command\",command={},timeout={timeout}}}]}}]",
-            toml_string(&event_hook_command)?
-        );
-        arguments.extend(["--config".to_owned(), format!("hooks.{event}={hook_value}")]);
-    }
-    for feature in DISABLED_FEATURES {
-        arguments.extend(["--disable".to_owned(), (*feature).to_owned()]);
-    }
-    arguments.extend([
-        "--config".to_owned(),
-        mcp_servers_override(&compatibility.disabled_mcp_servers)?,
-    ]);
-    if let Some(native_id) = native_session_id {
-        arguments.extend(["resume".to_owned(), native_id.to_owned()]);
-    }
+        hook_command: &hook_command,
+        writer: role == RoleKind::Implementer,
+        disabled_mcp_servers: &compatibility.disabled_mcp_servers,
+        native_session_id,
+    })?;
     arguments.push(augmented_prompt(
         prompt,
         role,
@@ -316,6 +270,183 @@ pub(crate) fn prepare_with_bundles(
             session_id,
         ),
         supervision_executable: executable_path.to_path_buf(),
+    })
+}
+
+struct NativeArguments<'a> {
+    cwd: &'a Path,
+    model: &'a str,
+    effort: &'a str,
+    approval: &'a str,
+    permission_profile: String,
+    network_proxy: String,
+    hook_command: &'a str,
+    writer: bool,
+    disabled_mcp_servers: &'a BTreeSet<String>,
+    native_session_id: Option<&'a str>,
+}
+
+/// Every interactive Codex argument except the prompt, shared by TRIP roles
+/// and the Single agent writer so neither drifts from the reviewed floor.
+fn native_arguments(spec: &NativeArguments<'_>) -> Result<Vec<String>> {
+    let mut arguments = vec![
+        "--strict-config".to_owned(),
+        "--no-daemon".to_owned(),
+        "--no-alt-screen".to_owned(),
+        "--cd".to_owned(),
+        spec.cwd.to_string_lossy().into_owned(),
+        "--model".to_owned(),
+        spec.model.to_owned(),
+        "--ask-for-approval".to_owned(),
+        spec.approval.to_owned(),
+        "--config".to_owned(),
+        "approvals_reviewer=\"user\"".to_owned(),
+        "--config".to_owned(),
+        format!("model_reasoning_effort={}", toml_string(spec.effort)?),
+        "--config".to_owned(),
+        spec.permission_profile.clone(),
+        "--config".to_owned(),
+        format!("default_permissions=\"{DENIED_READ_FLOOR_PROFILE}\""),
+        "--config".to_owned(),
+        "features.exec_permission_approvals=false".to_owned(),
+        "--config".to_owned(),
+        "features.request_permissions_tool=false".to_owned(),
+        "--config".to_owned(),
+        "cli_auth_credentials_store=\"file\"".to_owned(),
+        "--config".to_owned(),
+        "features.multi_agent=false".to_owned(),
+        "--config".to_owned(),
+        "features.multi_agent_v2=false".to_owned(),
+        "--config".to_owned(),
+        "features.hooks=true".to_owned(),
+        "--config".to_owned(),
+        spec.network_proxy.clone(),
+    ];
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PermissionRequest",
+        "PostToolUse",
+        "Stop",
+        "Interrupt",
+        "SubagentStart",
+        "SubagentStop",
+        "SessionEnd",
+    ] {
+        let timeout = if spec.writer && event == "PermissionRequest" {
+            crate::permissions::PROVIDER_PERMISSION_TIMEOUT_SECONDS
+        } else {
+            2
+        };
+        let event_hook_command = format!("{} --event {}", spec.hook_command, shell_quote(event));
+        // Codex keys hook trust by source/event/group/handler position. Reserve
+        // group zero for read-only roles so their shorter timeout cannot replace
+        // the writer's trusted PermissionRequest definition.
+        let reserved_group = if spec.writer && event == "PermissionRequest" {
+            "{hooks=[]},"
+        } else {
+            ""
+        };
+        let hook_value = format!(
+            "[{reserved_group}{{hooks=[{{type=\"command\",command={},timeout={timeout}}}]}}]",
+            toml_string(&event_hook_command)?
+        );
+        arguments.extend(["--config".to_owned(), format!("hooks.{event}={hook_value}")]);
+    }
+    for feature in DISABLED_FEATURES {
+        arguments.extend(["--disable".to_owned(), (*feature).to_owned()]);
+    }
+    arguments.extend([
+        "--config".to_owned(),
+        mcp_servers_override(spec.disabled_mcp_servers)?,
+    ]);
+    if let Some(native_id) = spec.native_session_id {
+        arguments.extend(["resume".to_owned(), native_id.to_owned()]);
+    }
+    Ok(arguments)
+}
+
+/// The Single agent writer's native Codex invocation under its own compiled
+/// policy: the workspace-write floor, approval requests a person decides
+/// through LLMRelay, and no TRIP role contract, role prompt or capability.
+pub(crate) fn single_agent_native(
+    request: &super::SingleAgentLaunchRequest<'_>,
+) -> Result<super::SingleAgentNative> {
+    let synthetic = request.bundles.is_synthetic();
+    let (executable, version) = if synthetic {
+        (
+            request.executable_path.to_path_buf(),
+            EXACT_CODEX_VERSION.to_owned(),
+        )
+    } else {
+        super::executable_and_version(Provider::Codex)?
+    };
+    let (disabled_mcp_servers, config_identity, account_identity) = if synthetic {
+        // Synthetic preparation never reads the person's Codex configuration.
+        (
+            BTreeSet::new(),
+            serde_json::json!({"synthetic": true}),
+            None,
+        )
+    } else {
+        let compatibility = inspect_native_compatibility(request.cwd, &version)?;
+        (
+            compatibility.disabled_mcp_servers,
+            compatibility.identity,
+            compatibility
+                .account
+                .account_id
+                .map(|account| format!("chatgpt:{account}")),
+        )
+    };
+    let (canonical_role_socket, canonical_control_socket) =
+        canonical_socket_endpoints(request.role_socket)?;
+    let arguments = native_arguments(&NativeArguments {
+        cwd: request.cwd,
+        model: request.model,
+        effort: request.effort,
+        approval: "on-request",
+        permission_profile: permission_profile(":workspace", &canonical_control_socket, &[])?,
+        network_proxy: network_proxy(&canonical_role_socket)?,
+        hook_command: &shell_quote(&request.assets.runner.to_string_lossy()),
+        writer: true,
+        disabled_mcp_servers: &disabled_mcp_servers,
+        native_session_id: request.native_session_id,
+    })?;
+    let security_policy = serde_json::json!({
+        "permission_profile": {
+            "name": DENIED_READ_FLOOR_PROFILE,
+            "extends": ":workspace",
+            "filesystem": {"deny": [&canonical_control_socket], "temporary_directories": "read-only"},
+        },
+        "network_proxy": {"unix_sockets": [{"path": &canonical_role_socket, "access": "allow"}], "domains": {}},
+        "approval": "on-request",
+        "approval_reviewer": "user",
+        "permission_request_timeout_seconds": crate::permissions::PROVIDER_PERMISSION_TIMEOUT_SECONDS,
+        "delegation": false,
+        "local_mcp_coverage": &config_identity,
+        "hooks": "native_explicit_trust",
+    });
+    Ok(super::SingleAgentNative {
+        executable,
+        executable_version: version,
+        arguments,
+        environment: environment(
+            Provider::Codex,
+            &canonical_role_socket,
+            request.token,
+            request.role_generation_id,
+            request.session_id,
+        ),
+        role_socket: canonical_role_socket,
+        account_identity,
+        config_identity,
+        security_policy,
+        hook_revision: format!(
+            "{CODEX_HOOK_REVISION}:{}",
+            request.assets.codex_revision_hash
+        ),
     })
 }
 
@@ -787,7 +918,7 @@ fn inspect_native_compatibility(cwd: &Path, version: &str) -> Result<NativeCompa
             bail!("Codex project-layer MCP configuration introduces a conditional server name; v1 supports only names already present in unconditional system/user layers")
         }
     }
-    classify_file_auth(&codex_home.join("auth.json"))?;
+    let account = classify_file_auth(&codex_home.join("auth.json"))?;
     let identity = serde_json::json!({
         "revision": MCP_COVERAGE_REVISION,
         "class": MCP_COVERAGE_CLASS,
@@ -809,7 +940,71 @@ fn inspect_native_compatibility(cwd: &Path, version: &str) -> Result<NativeCompa
     Ok(NativeCompatibility {
         disabled_mcp_servers: unconditional,
         identity,
+        account,
     })
+}
+
+/// Local eligibility for an app-wide model check, inspected in the empty app
+/// scope. The account is the validated ChatGPT account ID only; a missing or
+/// unrecognized ID leaves the identity unavailable instead of guessing.
+pub fn inspect_observation_account(
+    scope: &Path,
+    version: &str,
+) -> Result<super::ProviderAccountObservation> {
+    let compatibility = inspect_native_compatibility(scope, version)?;
+    Ok(super::ProviderAccountObservation {
+        account_identity: compatibility
+            .account
+            .account_id
+            .map(|account| format!("chatgpt:{account}")),
+        authentication: format!("chatgpt_{}", compatibility.account.plan),
+        config_identity: compatibility.identity,
+    })
+}
+
+/// Candidate arguments for the provider-observation contract: one non-interactive
+/// turn in the empty scope with a read-only sandbox, no shell or exec tool,
+/// approvals, hooks, configured MCP servers or excluded features, and no role
+/// environment. Whether the pinned build then exposes no tool at all is
+/// unproven until native qualification.
+pub(crate) fn observation_arguments(
+    model: &str,
+    effort: &str,
+    scope: &Path,
+    prompt: &str,
+) -> Result<Vec<String>> {
+    let compatibility = inspect_native_compatibility(scope, EXACT_CODEX_VERSION)?;
+    let mut arguments = vec![
+        "exec".to_owned(),
+        "--skip-git-repo-check".to_owned(),
+        "--cd".to_owned(),
+        scope.to_string_lossy().into_owned(),
+        "--model".to_owned(),
+        model.to_owned(),
+        "--sandbox".to_owned(),
+        "read-only".to_owned(),
+        "--config".to_owned(),
+        "approval_policy=\"never\"".to_owned(),
+        "--config".to_owned(),
+        format!("model_reasoning_effort={}", toml_string(effort)?),
+        "--config".to_owned(),
+        "cli_auth_credentials_store=\"file\"".to_owned(),
+        "--config".to_owned(),
+        "features.hooks=false".to_owned(),
+        "--config".to_owned(),
+        "features.multi_agent=false".to_owned(),
+        "--config".to_owned(),
+        "features.multi_agent_v2=false".to_owned(),
+    ];
+    for feature in DISABLED_FEATURES.iter().chain(OBSERVATION_DISABLED_TOOLS) {
+        arguments.extend(["--disable".to_owned(), (*feature).to_owned()]);
+    }
+    arguments.extend([
+        "--config".to_owned(),
+        mcp_servers_override(&compatibility.disabled_mcp_servers)?,
+        prompt.to_owned(),
+    ]);
+    Ok(arguments)
 }
 
 fn require_local_executor_home(codex_home: &Path) -> Result<()> {
@@ -1689,7 +1884,7 @@ fn mcp_servers_override(names: &BTreeSet<String>) -> Result<String> {
     Ok(format!("mcp_servers={rendered}"))
 }
 
-fn classify_file_auth(path: &Path) -> Result<()> {
+fn classify_file_auth(path: &Path) -> Result<CodexAccount> {
     let bytes = read_bounded(path, MAX_AUTH_BYTES, "auth")?.ok_or_else(|| {
         anyhow::anyhow!("Codex native setup requires existing file-backed ChatGPT credentials")
     })?;
@@ -1751,9 +1946,10 @@ fn classify_file_auth(path: &Path) -> Result<()> {
                 .and_then(serde_json::Value::as_str)
         })
         .map(str::to_ascii_lowercase);
-    if !matches!(plan.as_deref(), Some("free" | "plus" | "pro")) {
+    let Some(plan @ ("free" | "plus" | "pro")) = plan.as_deref() else {
         bail!("Codex ChatGPT credentials are managed, workspace-scoped, or use an unknown plan classification")
-    }
+    };
+    let plan = plan.to_owned();
     let access_claims = jwt_claims(access_token, "access")?;
     let expires = access_claims
         .get("exp")
@@ -1768,7 +1964,18 @@ fn classify_file_auth(path: &Path) -> Result<()> {
             "Codex access token is expired or inside the native refresh window plus safety margin"
         )
     }
-    Ok(())
+    let account_id = tokens
+        .get("account_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|account| {
+            !account.is_empty()
+                && account.len() <= 64
+                && account
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        .map(str::to_owned);
+    Ok(CodexAccount { account_id, plan })
 }
 
 fn bounded_token<'a>(

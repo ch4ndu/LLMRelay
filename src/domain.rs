@@ -172,6 +172,757 @@ pub(crate) fn same_process_start(left: &str, right: &str) -> bool {
     !left.trim().is_empty() && left.split_whitespace().eq(right.split_whitespace())
 }
 
+/// The record a managed provider process belongs to, resolved from its
+/// reserved session row. Comparisons include the kind, so equal ID text under
+/// different owners never matches. Role context, credentials, hooks, resume,
+/// guidance, attachment and reports exist only for a role generation.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum SessionOwner {
+    RoleGeneration(String),
+    ProviderValidationInvocation(String),
+}
+
+impl SessionOwner {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::RoleGeneration(_) => "role_generation",
+            Self::ProviderValidationInvocation(_) => "provider_validation_invocation",
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::RoleGeneration(id) | Self::ProviderValidationInvocation(id) => id,
+        }
+    }
+
+    pub fn role_generation_id(&self) -> Option<&str> {
+        match self {
+            Self::RoleGeneration(id) => Some(id),
+            Self::ProviderValidationInvocation(_) => None,
+        }
+    }
+
+    pub fn is_role_generation(&self, role_generation_id: &str) -> bool {
+        self.role_generation_id() == Some(role_generation_id)
+    }
+
+    pub fn require_role_generation(&self, operation: &str) -> Result<&str, String> {
+        self.role_generation_id().ok_or_else(|| {
+            format!("{operation} is available only for workflow role sessions, not provider validation checks")
+        })
+    }
+
+    /// Exactly one of the two nullable `sessions` owner columns is set; the
+    /// table CHECK enforces it, and this refuses a row that escaped it.
+    pub fn from_columns(
+        role_generation_id: Option<String>,
+        provider_validation_invocation_id: Option<String>,
+    ) -> Result<Self, String> {
+        match (role_generation_id, provider_validation_invocation_id) {
+            (Some(id), None) => Ok(Self::RoleGeneration(id)),
+            (None, Some(id)) => Ok(Self::ProviderValidationInvocation(id)),
+            _ => Err("session must have exactly one owner".to_owned()),
+        }
+    }
+}
+
+/// One provider, model and effort the user asked LLMRelay to check.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderValidationSelection {
+    pub provider: Provider,
+    pub model: String,
+    pub effort: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderValidationPreviewRequest {
+    pub selections: Vec<ProviderValidationSelection>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderValidationStartRequest {
+    pub operation_id: String,
+    pub preview_hash: String,
+    pub selections: Vec<ProviderValidationSelection>,
+    /// Explicit consent to contact models; without it only reusable proof applies.
+    pub authorize_model_calls: bool,
+    pub max_model_calls: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderValidationBatchRequest {
+    pub batch_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCheckPlan {
+    ReuseProof,
+    ModelCall,
+    Unavailable,
+}
+
+/// What LLMRelay found locally for one provider without contacting a model.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderInstallationDto {
+    pub provider: Provider,
+    pub ready: bool,
+    pub executable_path: Option<String>,
+    pub executable_version: Option<String>,
+    /// Allowlisted non-secret account name; `None` when it cannot be validated.
+    pub account_identity: Option<String>,
+    pub authentication: Option<String>,
+    pub model_calls_disabled_reason: Option<String>,
+    pub guidance: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderCheckPreviewDto {
+    pub ordinal: u32,
+    pub provider: Provider,
+    pub model: String,
+    pub effort: String,
+    pub plan: ProviderCheckPlan,
+    pub reason: String,
+    pub proof_observed_at: Option<String>,
+    pub proof_expires_at: Option<String>,
+    /// Advisory only: whether the provider's local catalog lists this model.
+    pub model_listed: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderValidationPreviewDto {
+    pub preview_hash: String,
+    pub installations: Vec<ProviderInstallationDto>,
+    pub checks: Vec<ProviderCheckPreviewDto>,
+    pub model_calls_required: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderCheckDto {
+    pub id: String,
+    pub ordinal: u32,
+    pub provider: Provider,
+    pub model: String,
+    pub effort: String,
+    pub state: String,
+    /// Set when an unexpired proof for the same exact inputs was reused instead of a model call.
+    pub reused_proof: bool,
+    pub reason: Option<String>,
+    pub proof_observed_at: Option<String>,
+    pub proof_expires_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderValidationBatchDto {
+    pub id: String,
+    pub operation_id: String,
+    pub state: String,
+    pub model_calls_authorized: bool,
+    pub max_model_calls: u32,
+    pub created_at: String,
+    pub updated_at: String,
+    pub finished_at: Option<String>,
+    pub checks: Vec<ProviderCheckDto>,
+}
+
+/// The settled outcome of one exact provider-check start request: the batch
+/// it started, or proof that it never started and never will.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ProviderValidationStartOutcome {
+    Started {
+        batch: ProviderValidationBatchDto,
+    },
+    ClosedWithoutStart {
+        operation_id: String,
+        closed_at: String,
+    },
+}
+
+/// A current model-access proof. It is app-wide evidence only and never grants
+/// a project capability or runtime scope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderProofDto {
+    pub provider: Provider,
+    pub model: String,
+    pub effort: String,
+    pub executable_version: Option<String>,
+    pub account_identity: Option<String>,
+    pub observed_at: String,
+    pub expires_at: String,
+    pub expired: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderValidationStateDto {
+    pub batches: Vec<ProviderValidationBatchDto>,
+    pub proofs: Vec<ProviderProofDto>,
+}
+
+/// The bundled workflow a task runs. A task without a selection row, and
+/// every historical attempt, is TRIP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowFamily {
+    Trip,
+    SingleAgent,
+}
+
+impl WorkflowFamily {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trip => "trip",
+            Self::SingleAgent => "single_agent",
+        }
+    }
+}
+
+impl fmt::Display for WorkflowFamily {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for WorkflowFamily {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "trip" => Ok(Self::Trip),
+            "single_agent" => Ok(Self::SingleAgent),
+            _ => Err(format!(
+                "unsupported workflow {value:?}; expected trip or single_agent"
+            )),
+        }
+    }
+}
+
+/// Who a role generation acts as. TRIP keeps its six exact role keys; the
+/// Single agent has its own `single_agent` slot and never borrows Implementer
+/// authority, context or report rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionActor {
+    TripRole(RoleKind),
+    SingleAgent,
+}
+
+impl ExecutionActor {
+    pub const SINGLE_AGENT_KEY: &'static str = "single_agent";
+
+    pub fn key(self) -> String {
+        match self {
+            Self::TripRole(role) => role.to_string(),
+            Self::SingleAgent => Self::SINGLE_AGENT_KEY.to_owned(),
+        }
+    }
+
+    pub fn from_key(value: &str) -> Result<Self, String> {
+        if value == Self::SINGLE_AGENT_KEY {
+            return Ok(Self::SingleAgent);
+        }
+        value.parse().map(Self::TripRole)
+    }
+}
+
+/// The authenticated Single agent channel binding. It is resolved from the
+/// generation's execution binding before any context or report is served.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SingleAgentContext {
+    pub project_id: String,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub role_generation_id: String,
+    pub session_id: String,
+    pub credential_id: String,
+    pub transcript_epoch: String,
+    pub provider: Provider,
+    pub profile_revision_id: String,
+    pub admission_id: String,
+    pub policy_hash: String,
+    pub session_contract: String,
+    pub definition_hash: String,
+    pub scope_hash: String,
+    pub channel_operations: Vec<String>,
+}
+
+/// The running invocation a native hook belongs to. Each execution branch
+/// resolves it from its own credential; recording a hook needs nothing else
+/// and grants nothing.
+#[derive(Clone, Debug)]
+pub struct HookInvocation {
+    pub project_id: String,
+    pub attempt_id: String,
+    pub role_generation_id: String,
+    pub session_id: String,
+    pub credential_id: String,
+    pub transcript_epoch: String,
+    pub provider: Provider,
+}
+
+impl From<&RoleContext> for HookInvocation {
+    fn from(context: &RoleContext) -> Self {
+        Self {
+            project_id: context.project_id.clone(),
+            attempt_id: context.attempt_id.clone(),
+            role_generation_id: context.role_generation_id.clone(),
+            session_id: context.session_id.clone(),
+            credential_id: context.credential_id.clone(),
+            transcript_epoch: context.transcript_epoch.clone(),
+            provider: context.provider,
+        }
+    }
+}
+
+impl From<&SingleAgentContext> for HookInvocation {
+    fn from(context: &SingleAgentContext) -> Self {
+        Self {
+            project_id: context.project_id.clone(),
+            attempt_id: context.attempt_id.clone(),
+            role_generation_id: context.role_generation_id.clone(),
+            session_id: context.session_id.clone(),
+            credential_id: context.credential_id.clone(),
+            transcript_epoch: context.transcript_epoch.clone(),
+            provider: context.provider,
+        }
+    }
+}
+
+/// A role credential resolves to exactly one branch; neither can reach the
+/// other's operations.
+#[derive(Clone, Debug)]
+pub enum ExecutionContext {
+    Trip(RoleContext),
+    SingleAgent(SingleAgentContext),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptanceEvidenceKind {
+    Source,
+    Check,
+    Manual,
+    NotRun,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceEvidence {
+    pub kind: AcceptanceEvidenceKind,
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptanceRowStatus {
+    Met,
+    Unmet,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceRow {
+    pub criterion: String,
+    pub status: AcceptanceRowStatus,
+    pub evidence: Vec<AcceptanceEvidence>,
+}
+
+/// The `metadata` of a Single agent `result_ready` report. Claimed changes are
+/// diagnostics only; the service snapshot is the authoritative candidate.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SingleAgentResultMetadata {
+    pub run_binding_id: String,
+    pub profile_revision_id: String,
+    pub acceptance_rows: Vec<AcceptanceRow>,
+    #[serde(default)]
+    pub claimed_changes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionCheckInput {
+    pub check_key: String,
+    pub command_kind: String,
+    #[serde(default)]
+    pub executable: Option<String>,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    #[serde(default)]
+    pub shell_command: Option<String>,
+    pub cwd: String,
+    pub timeout_seconds: i64,
+    #[serde(default)]
+    pub acceptance_rows: Vec<String>,
+    #[serde(default)]
+    pub relevant_inputs: Vec<String>,
+    pub original_text: String,
+}
+
+/// A human-reviewed Single agent execution configuration. Saving a revision
+/// records what a person approved; it grants no launch authority by itself.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionConfigurationInput {
+    #[serde(default)]
+    pub guidance_paths: Vec<String>,
+    pub testing_coverage: String,
+    pub documentation_policy: String,
+    #[serde(default)]
+    pub checks: Vec<ExecutionCheckInput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProfileInput {
+    pub display_name: String,
+    pub provider: Provider,
+    pub model: String,
+    pub effort: String,
+    #[serde(default)]
+    pub instructions_text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskWorkflowSelectionInput {
+    pub family: WorkflowFamily,
+    #[serde(default)]
+    pub execution_config_revision_id: Option<String>,
+    #[serde(default)]
+    pub profile_revision_id: Option<String>,
+    #[serde(default)]
+    pub check_ids: Vec<String>,
+}
+
+/// Human operations of the multi-workflow feature. Older TRIP commands keep
+/// their own `HumanCommand` shapes and receipts unchanged.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkflowCommand {
+    SaveExecutionConfiguration {
+        operation_id: String,
+        project_id: String,
+        /// The project's current latest revision, or 0 for the first.
+        expected_revision: i64,
+        configuration: ExecutionConfigurationInput,
+    },
+    SaveAgentProfile {
+        operation_id: String,
+        project_id: String,
+        #[serde(default)]
+        profile_id: Option<String>,
+        #[serde(default)]
+        expected_version: Option<i64>,
+        profile: AgentProfileInput,
+    },
+    PrepareProfileAdmission {
+        operation_id: String,
+        project_id: String,
+        profile_revision_id: String,
+        execution_config_revision_id: String,
+    },
+    /// Queues a disposable probe run proving a pending admission natively.
+    /// Refused while the release has not qualified the writer contract.
+    ProbeProfileAdmission {
+        operation_id: String,
+        project_id: String,
+        admission_id: String,
+    },
+    ActivateProfileAdmission {
+        operation_id: String,
+        project_id: String,
+        admission_id: String,
+    },
+    SetProjectWorkflowDefault {
+        operation_id: String,
+        project_id: String,
+        /// The current default's version, or 0 when the project has none.
+        expected_version: i64,
+        family: WorkflowFamily,
+    },
+    SetTaskWorkflow {
+        operation_id: String,
+        task_id: String,
+        expected_version: i64,
+        selection: TaskWorkflowSelectionInput,
+    },
+    AcceptResult {
+        operation_id: String,
+        task_id: String,
+        attempt_id: String,
+        expected_version: i64,
+        result_binding_id: String,
+        candidate_hash: String,
+        /// Required exactly when the candidate changes approved guidance.
+        #[serde(default)]
+        guidance_change_hash: Option<String>,
+    },
+    RequestRework {
+        operation_id: String,
+        task_id: String,
+        attempt_id: String,
+        expected_version: i64,
+        result_binding_id: String,
+        candidate_hash: String,
+        feedback: String,
+    },
+    /// Creates a draft and its workflow selection together. An omitted
+    /// selection resolves the project's default at creation time only.
+    CreateTask {
+        operation_id: String,
+        project_id: String,
+        title: String,
+        description: String,
+        acceptance_criteria: Vec<String>,
+        priority: i64,
+        #[serde(default)]
+        selection: Option<TaskWorkflowSelectionInput>,
+    },
+    /// Continues a held Single agent writer's exact retained conversation,
+    /// bound to the session and transcript epoch the person reviewed.
+    ResumeRun {
+        operation_id: String,
+        task_id: String,
+        attempt_id: String,
+        expected_version: i64,
+        session_id: String,
+        transcript_epoch: String,
+        #[serde(default)]
+        message: Option<String>,
+    },
+    /// A person's decision on one selected check of a Single agent result.
+    /// The hashes are the ones the person was shown; any change refuses it.
+    AuthorizeCheck {
+        operation_id: String,
+        task_id: String,
+        attempt_id: String,
+        check_id: String,
+        exact_command_hash: String,
+        scope_hash: String,
+        decision: CheckAuthorizationDecision,
+        lifetime: CheckAuthorizationLifetime,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckAuthorizationDecision {
+    Authorized,
+    Denied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckAuthorizationLifetime {
+    Once,
+    Run,
+}
+
+impl WorkflowCommand {
+    pub fn operation_id(&self) -> &str {
+        match self {
+            Self::SaveExecutionConfiguration { operation_id, .. }
+            | Self::SaveAgentProfile { operation_id, .. }
+            | Self::PrepareProfileAdmission { operation_id, .. }
+            | Self::ProbeProfileAdmission { operation_id, .. }
+            | Self::ActivateProfileAdmission { operation_id, .. }
+            | Self::SetProjectWorkflowDefault { operation_id, .. }
+            | Self::SetTaskWorkflow { operation_id, .. }
+            | Self::AcceptResult { operation_id, .. }
+            | Self::RequestRework { operation_id, .. }
+            | Self::CreateTask { operation_id, .. }
+            | Self::ResumeRun { operation_id, .. }
+            | Self::AuthorizeCheck { operation_id, .. } => operation_id,
+        }
+    }
+}
+
+/// Where a Single agent run is, in the words the board and detail views show.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SingleAgentStage {
+    WaitingToStart,
+    Writing,
+    ResultSubmittedWaitingForStop,
+    AwaitingSelectedChecks,
+    AwaitingHuman,
+    Accepted,
+    /// A profile probe recorded its admission evidence; nothing was accepted.
+    ProbeEvidenceRecorded,
+    ChangesRequested,
+    NeedsAction,
+    Blocked,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SingleAgentResultDto {
+    pub id: String,
+    pub state: String,
+    pub summary: String,
+    pub acceptance_rows: Vec<AcceptanceRow>,
+    pub snapshot_id: Option<String>,
+    pub candidate_hash: Option<String>,
+    pub selected_check_revision: i64,
+    pub created_at: String,
+}
+
+/// The retained conversation a resume would continue and whether a person
+/// can resume it now.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SingleAgentResumeDto {
+    pub session_id: String,
+    pub transcript_epoch: String,
+    pub resume_count: i64,
+    pub available: bool,
+    /// Why resume is unavailable, in plain language.
+    pub reason: Option<String>,
+}
+
+/// An approved guidance file the result's frozen candidate changed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SingleAgentGuidanceChangeDto {
+    pub path: String,
+    pub base_revision: String,
+    pub approved_sha256: String,
+    /// Absent when the candidate deleted the file or it is not a regular file.
+    pub candidate_sha256: Option<String>,
+}
+
+/// A selected check as a person authorizes it: the exact command and the
+/// hashes an `authorize_check` decision must repeat.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SingleAgentCheckDto {
+    pub check_id: String,
+    pub check_key: String,
+    pub original_text: String,
+    pub command_kind: String,
+    pub executable: Option<String>,
+    pub arguments: Vec<String>,
+    pub shell_command: Option<String>,
+    pub cwd: String,
+    pub exact_command_hash: String,
+    pub scope_hash: String,
+    /// `authorized`, `denied` or `missing`.
+    pub authorization: String,
+    pub latest_run_id: Option<String>,
+    pub latest_run_status: Option<String>,
+    pub latest_run_passed: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SingleAgentRunDto {
+    pub attempt_id: String,
+    pub definition_id: Option<String>,
+    pub definition_state: String,
+    pub profile_revision_id: Option<String>,
+    pub execution_config_revision_id: Option<String>,
+    pub parent_attempt_id: Option<String>,
+    /// Set when the task is the disposable probe of this profile admission.
+    pub probe_admission_id: Option<String>,
+    pub stage: SingleAgentStage,
+    /// Plain-language explanation of the stage and what happens next.
+    pub stage_reason: String,
+    pub selected_check_ids: Vec<String>,
+    /// Each selected check against the current candidate, once one exists.
+    pub checks: Vec<SingleAgentCheckDto>,
+    /// Approved guidance the candidate changes; accepting repeats the hash.
+    pub guidance_changes: Vec<SingleAgentGuidanceChangeDto>,
+    pub guidance_change_hash: Option<String>,
+    /// The writer's retained conversation, once it has started.
+    pub resume: Option<SingleAgentResumeDto>,
+    pub result: Option<SingleAgentResultDto>,
+    /// Human operations currently accepted for this run.
+    pub available_actions: Vec<String>,
+    /// Result acceptance never records Git integration; that stays separate.
+    pub integration_recorded: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskWorkflowDto {
+    pub family: WorkflowFamily,
+    pub definition_id: Option<String>,
+    pub execution_config_revision_id: Option<String>,
+    pub profile_revision_id: Option<String>,
+    pub check_ids: Vec<String>,
+    pub selection_revision: i64,
+    pub admission_state: String,
+    pub admission_reason: Option<String>,
+    pub run: Option<SingleAgentRunDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutionConfigurationDto {
+    pub id: String,
+    pub revision: i64,
+    pub content_hash: String,
+    pub configuration: serde_json::Value,
+    pub checks: Vec<serde_json::Value>,
+    pub approved_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentProfileRevisionDto {
+    pub id: String,
+    pub revision: i64,
+    pub provider: Provider,
+    pub model: String,
+    pub effort: String,
+    pub instructions_hash: String,
+    pub policy_id: String,
+    pub policy_hash: String,
+    pub adapter_hash: String,
+    pub authority: String,
+    pub session_contract: String,
+    pub profile_hash: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentProfileDto {
+    pub id: String,
+    pub display_name: String,
+    pub version: i64,
+    pub current_revision: Option<AgentProfileRevisionDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProfileAdmissionDto {
+    pub id: String,
+    pub profile_revision_id: String,
+    pub execution_config_revision_id: String,
+    pub state: String,
+    pub state_reason: Option<String>,
+    /// The disposable task whose run proves this admission, once started.
+    pub probe_task_id: Option<String>,
+    pub activated_at: Option<String>,
+    pub updated_at: String,
+    /// Whether `probe_profile_admission` would start a native probe now,
+    /// judged by the same checks the command enforces against the current
+    /// bundled policy. The command still refuses on its own.
+    pub probe_available: bool,
+    /// Why no probe can start now; set exactly when `probe_available` is false.
+    pub probe_unavailable_reason: Option<String>,
+}
+
+/// Project-level Single agent setup. It is independent of TRIP installation
+/// and six-role readiness.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectExecutionDto {
+    pub project_id: String,
+    pub default_family: WorkflowFamily,
+    pub default_version: i64,
+    pub configurations: Vec<ExecutionConfigurationDto>,
+    pub profiles: Vec<AgentProfileDto>,
+    pub admissions: Vec<ProfileAdmissionDto>,
+}
+
 /// Identity retained for the lifetime of one accepted human-control socket.
 /// The native connector establishes the PID/start pair before the supervisor
 /// consults process ancestry, so a later inventory row cannot silently stand
@@ -344,6 +1095,69 @@ pub struct CmuxViewOutcome {
     pub surface: Option<CmuxSessionSurface>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recorded_output: Option<TranscriptPage>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryPaneViewState {
+    Reserved,
+    Opened,
+    Unknown,
+    Failed,
+    Closed,
+}
+
+impl HistoryPaneViewState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Opened => "opened",
+            Self::Unknown => "unknown",
+            Self::Failed => "failed",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+impl FromStr for HistoryPaneViewState {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "reserved" => Ok(Self::Reserved),
+            "opened" => Ok(Self::Opened),
+            "unknown" => Ok(Self::Unknown),
+            "failed" => Ok(Self::Failed),
+            "closed" => Ok(Self::Closed),
+            _ => Err(format!("unsupported history pane state {value:?}")),
+        }
+    }
+}
+
+/// A read-only cmux history pane request. It carries no lease, input state or
+/// provider route; the pane shows a generated export of one exact epoch.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoryPaneView {
+    pub id: String,
+    pub operation_id: String,
+    pub session_id: String,
+    pub role_generation_id: Option<String>,
+    pub transcript_epoch: String,
+    pub high_water_sequence: u64,
+    pub export_hash: Option<String>,
+    pub service_boot_id: String,
+    pub workspace_id: Option<String>,
+    pub surface_id: Option<String>,
+    pub state: HistoryPaneViewState,
+    pub failure_reason: Option<String>,
+    pub retry_allowed: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoryPaneOutcome {
+    pub view: HistoryPaneView,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -902,6 +1716,9 @@ pub struct TaskDto {
     pub progress: Option<TaskProgress>,
     #[serde(default)]
     pub observed_usage: Option<ObservedUsage>,
+    /// Absent for tasks without a workflow selection, which are TRIP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<TaskWorkflowDto>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1658,7 +2475,10 @@ pub struct PermissionRequestDto {
     pub attempt_id: String,
     pub session_id: String,
     pub role_generation_id: String,
-    pub role: RoleKind,
+    /// Absent for a Single agent request, which is no TRIP role.
+    pub role: Option<RoleKind>,
+    /// The requesting actor's key: a TRIP role name or `single_agent`.
+    pub actor: String,
     pub provider: Provider,
     pub native_session_id: String,
     pub tool_name: String,
@@ -1973,7 +2793,9 @@ pub struct PermissionRuleDto {
     pub id: String,
     pub provider: Provider,
     pub project_id: String,
-    pub role: RoleKind,
+    /// Absent for a Single agent rule, which is no TRIP role.
+    pub role: Option<RoleKind>,
+    pub actor: String,
     pub lifetime: PermissionLifetime,
     pub session_id: Option<String>,
     pub display_family: String,
@@ -2168,6 +2990,13 @@ pub struct AppStateDto {
     /// and its header offer the same next step. Derived from `attention`.
     #[serde(default)]
     pub task_actions: Vec<TaskAction>,
+    /// App-wide provider checks, outside every project.
+    #[serde(default)]
+    pub provider_validation: ProviderValidationStateDto,
+    /// Per-project Single agent setup: default workflow, execution
+    /// configurations, agent profiles and their admissions.
+    #[serde(default)]
+    pub workflow_execution: Vec<ProjectExecutionDto>,
 }
 
 /// The next step a task offers, taken from the first of its attention items in

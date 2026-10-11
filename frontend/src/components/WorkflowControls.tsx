@@ -4,8 +4,10 @@ import {
   ApiError,
   command,
   operation,
+  operationId as newOperationId,
   operationIntent,
   reuseOperationIdentity,
+  submitWorkflowCommand,
 } from "../api";
 import { TechnicalDetails } from "./ErrorNotice";
 import {
@@ -18,8 +20,191 @@ import {
   type Session,
   type SwitchIntent,
   type Task,
+  type WorkflowCommand,
+  type WorkflowCommandResult,
   type WorkflowControl,
 } from "../types";
+
+type StoredIdentity = { body: string; id: string };
+
+const storedIdentity = (value: unknown): StoredIdentity | undefined => {
+  if (typeof value !== "object" || value === null) return undefined;
+  const body: unknown = Reflect.get(value, "body");
+  const id: unknown = Reflect.get(value, "id");
+  return typeof body === "string" && typeof id === "string"
+    ? { body, id }
+    : undefined;
+};
+
+const readIdentities = (storageKey: string): Map<string, StoredIdentity> => {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(storageKey) || "[]");
+    if (!Array.isArray(value)) return new Map();
+    return new Map(value.flatMap((entry: unknown) => {
+      if (!Array.isArray(entry)) return [];
+      const name: unknown = entry[0];
+      const identity = storedIdentity(entry[1]);
+      if (typeof name !== "string" || !identity) return [];
+      const pair: [string, StoredIdentity] = [name, identity];
+      return [pair];
+    }));
+  } catch {
+    return new Map();
+  }
+};
+
+export interface WorkflowCommandRunner {
+  /**
+   * Submits `build(id)` once at a time. An identical earlier request whose
+   * outcome is unknown keeps its operation ID, so the service applies it at
+   * most once. A changed request (for example after the task version moved)
+   * is held once for review instead; only the next explicit click sends it as
+   * a new request, which the service then checks against current state.
+   * With `keepUnresolved`, a changed request is never sent while an earlier
+   * one is unresolved: commands without a version fence, such as creating a
+   * profile, would otherwise apply both. Any failed resend of that earlier
+   * request leaves it unresolved.
+   */
+  submit: (
+    key: string,
+    build: (operationId: string) => WorkflowCommand,
+    options?: { keepUnresolved?: boolean },
+  ) => Promise<WorkflowCommandResult | undefined>;
+  /** The stored request whose outcome is still unknown, if any. */
+  unresolved: (key: string) => { body: string } | undefined;
+  busy: boolean;
+  error: string;
+  /** Keys whose last request may or may not have been applied. */
+  uncertain: ReadonlySet<string>;
+  /** Uncertain keys whose next click sends a changed, new request. */
+  reviewed: ReadonlySet<string>;
+}
+
+/**
+ * Typed multi-workflow commands with persisted, replay-safe identities.
+ * Storage is re-read on every change because several panels of one task can
+ * share its key.
+ */
+export function useWorkflowCommands(
+  storageKey: string,
+  onChanged: () => void,
+): WorkflowCommandRunner {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [uncertain, setUncertain] = useState<ReadonlySet<string>>(
+    () => new Set(readIdentities(storageKey).keys()),
+  );
+  const [reviewed, setReviewed] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const inFlight = useRef(false);
+  const update = (change: (identities: Map<string, StoredIdentity>) => void) => {
+    const identities = readIdentities(storageKey);
+    change(identities);
+    localStorage.setItem(storageKey, JSON.stringify([...identities]));
+  };
+  const mark = (key: string, unknown: boolean) =>
+    setUncertain((current) => {
+      const next = new Set(current);
+      if (unknown) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  const submit = async (
+    key: string,
+    build: (operationId: string) => WorkflowCommand,
+    options: { keepUnresolved?: boolean } = {},
+  ) => {
+    if (inFlight.current) return undefined;
+    const body = JSON.stringify(build(""));
+    const prior = readIdentities(storageKey).get(key);
+    if (prior && prior.body !== body && options.keepUnresolved) {
+      mark(key, true);
+      return undefined;
+    }
+    if (prior && prior.body !== body && !reviewed.has(key)) {
+      setReviewed((current) => new Set(current).add(key));
+      mark(key, true);
+      return undefined;
+    }
+    setReviewed((current) => {
+      const next = new Set(current);
+      next.delete(key);
+      return next;
+    });
+    const id = prior?.body === body ? prior.id : newOperationId();
+    // A refused replay (for example an expired sign-in rejected before the
+    // service looks the operation up) says nothing about the stored original,
+    // so only its own success settles it.
+    const replayingUnresolved = options.keepUnresolved === true &&
+      prior?.body === body;
+    update((identities) => identities.set(key, { body, id }));
+    const forget = () =>
+      update((identities) => {
+        if (identities.get(key)?.id === id) identities.delete(key);
+      });
+    inFlight.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await submitWorkflowCommand(build(id));
+      forget();
+      mark(key, false);
+      onChanged();
+      return result;
+    } catch (cause) {
+      const unknown = replayingUnresolved ||
+        (cause instanceof ApiError && cause.ambiguous);
+      if (!unknown) forget();
+      mark(key, unknown);
+      setError(cause instanceof Error ? cause.message : String(cause));
+      onChanged();
+      return undefined;
+    } finally {
+      inFlight.current = false;
+      setBusy(false);
+    }
+  };
+  const unresolved = (key: string) => readIdentities(storageKey).get(key);
+  return { submit, unresolved, busy, error, uncertain, reviewed };
+}
+
+export function UncertainRequestNotice(
+  { changed = false }: { changed?: boolean },
+) {
+  return (
+    <p className="warning" role="status">
+      {changed
+        ? "An earlier request for this action may already have been applied, and the page has changed since. Review the current state shown here. Choosing the action again sends a new request for what is shown now; LLMRelay refuses it if it no longer applies."
+        : "An earlier request for this action may already have been applied. Refresh and check the current state first. Trying again without other changes sends the same request, which LLMRelay applies at most once."}
+    </p>
+  );
+}
+
+/**
+ * Whether a TRIP role's effective session and generation agree on a settled
+ * state. An exited session whose generation is still stopping is not settled:
+ * replacing or probing the role then would race the old generation's stop.
+ */
+export function generationSettled(session: Session | undefined): boolean {
+  // An older snapshot without these fields is never treated as settled.
+  if (!session?.generation_status || session.has_newer_generation === undefined) {
+    return false;
+  }
+  if (session.has_newer_generation === true || session.has_newer_generation === 1) {
+    return false;
+  }
+  const quiescent = session.process_group_quiescent === true ||
+    session.process_group_quiescent === 1;
+  return (session.status === "running" &&
+    session.generation_status === "running") ||
+    (session.status === "exited" && session.generation_status === "exited" &&
+      quiescent);
+}
+
+/** The backend's family resolver treats a task without a selection as TRIP. */
+export const isSingleAgentTask = (task: Task) =>
+  task.workflow?.family === "single_agent";
 
 /** Who is expected to act, in plain words. */
 export const ownerLabel = (owner: DecisionOwner | string) =>
@@ -244,8 +429,14 @@ export function WorkflowControls(
     value.attempt_id === attemptId && value.role === "manager" &&
     value.old_generation_id === effectiveManager?.effective_generation_id
   );
+  const singleAgent = isSingleAgentTask(task);
   const pendingManagerChange = !!requestedManager && !!effectiveManager &&
     requestedManager.revision !== effectiveManager.revision;
+  // The service also accepts a stopping manager whose earlier switch needs
+  // recovery; any other unsettled stop would race the old manager.
+  const managerReplaceable = generationSettled(managerSession) ||
+    (managerSession?.generation_status === "stopping" &&
+      managerSwitch?.state === "recovery_required");
   const managerControlCanBeReplaced = !managerControl ||
     managerControl.state === "failed";
   const managerStopQuiescent = managerControl?.kind === "manager_stop" &&
@@ -553,15 +744,16 @@ export function WorkflowControls(
               title={decision?.control_policy.disabled_reason_code
                 ? setupProblem || decision.primary_blocker?.message ||
                   decision.control_policy.disabled_reason_code
-                : project?.trip?.readiness !== "ready"
+                : !singleAgent && project?.trip?.readiness !== "ready"
                 ? projectSetupProblem(project, "task.project_ready")
                 : undefined}
               onClick={() => send("make_ready")}
             >
               Make Ready
             </button>
-            {project && (project.trip?.readiness !== "ready" ||
-              decision?.next_action?.operation === "inspect_project") &&
+            {project &&
+              ((!singleAgent && project.trip?.readiness !== "ready") ||
+                decision?.next_action?.operation === "inspect_project") &&
               (
                 <button
                   onClick={() =>
@@ -615,7 +807,7 @@ export function WorkflowControls(
             </button>
           </div>
         )}
-      {!terminal && task.lifecycle !== "backlog" && (
+      {!terminal && task.lifecycle !== "backlog" && !singleAgent && (
         <div className="inline-form">
           <strong>Manager</strong>
           <small>
@@ -681,7 +873,14 @@ export function WorkflowControls(
               </button>
             )}
             {managerControlsAllowed && managerChangeCanStart &&
-              pendingManagerChange && requestedManager && (
+              pendingManagerChange && requestedManager && !managerReplaceable && (
+              <small className="hint">
+                The manager is still stopping. Changing it becomes available
+                once LLMRelay confirms the current manager has fully stopped.
+              </small>
+            )}
+            {managerControlsAllowed && managerChangeCanStart &&
+              pendingManagerChange && requestedManager && managerReplaceable && (
               <>
                 <button
                   disabled={!!busy}
@@ -762,6 +961,10 @@ export function WorkflowControls(
           ? "The saved candidate still needs code review, and this attempt has reached its review limit. Leave it held to inspect the work, or choose Cancel to stop the task and keep its history."
           : decision?.reason_code === "workflow.review_session_exited"
           ? "Use Resume the stopped session above to continue the existing review. Continue and Retry do not recover this session."
+          : task.lifecycle === "backlog" && singleAgent
+          ? "Make Ready checks this task's Single agent selection and that its agent profile is admitted for the project, then queues it."
+          : singleAgent
+          ? "Continue resumes automatic work. Cancel stops this Single agent run and keeps its history. Accepting or reworking a result happens in the run panel above."
           : task.lifecycle === "backlog"
           ? project?.trip?.readiness === "ready"
             ? "Make Ready checks the task and all six agent roles, then queues it. Queued tasks start automatically when an agent slot is free."

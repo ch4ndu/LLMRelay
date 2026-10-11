@@ -5,8 +5,8 @@ use crate::coordinator::StepEffect;
 use crate::diagnostics::DiagnosticSink;
 use crate::domain::{
     HumanCommand, LaunchConfig, OperationResult, ProcessIdentity, RestartAdmissionV1,
-    RestartBatchMembership, RestartBatchV1, RestartCandidateResult, RoleContext, TripHumanAction,
-    ValidationLaunchRequest, ValidationLaunchResult, WorkflowValidationRequest,
+    RestartBatchMembership, RestartBatchV1, RestartCandidateResult, RoleContext, SessionOwner,
+    TripHumanAction, ValidationLaunchRequest, ValidationLaunchResult, WorkflowValidationRequest,
     ROLE_RESULT_REPORT_CONTRACT,
 };
 use crate::providers::{self, HookAssets};
@@ -397,6 +397,17 @@ impl Application {
         }
     }
 
+    pub(crate) fn interrupt_single_agent_report(
+        &self,
+        receipt: &crate::store::SingleAgentStopReceipt,
+    ) -> Result<bool> {
+        if self.synthetic_dispatch_for_tests {
+            self.store.reserve_single_agent_stop(receipt)
+        } else {
+            self.supervisor.interrupt_single_agent_report(receipt)
+        }
+    }
+
     pub(crate) fn manager_control_native_idle_ready(&self, session_id: &str) -> Result<bool> {
         // Synthetic dispatch has no provider process to inventory. Its tests still
         // require the durable hook/authority boundary before reaching this seam.
@@ -534,14 +545,30 @@ impl Application {
         }))
     }
 
+    /// The permission actor a credential currently resolves to, from either
+    /// execution branch.
+    pub(crate) fn permission_actor(
+        &self,
+        credential: &str,
+    ) -> Result<crate::permissions::PermissionActor> {
+        match self.store.execution_context(credential)? {
+            crate::domain::ExecutionContext::Trip(context) => {
+                Ok(crate::permissions::PermissionActor::from(&context))
+            }
+            crate::domain::ExecutionContext::SingleAgent(context) => {
+                crate::permissions::PermissionActor::single_agent(&self.store, &context)
+            }
+        }
+    }
+
     pub async fn permission_request(
         &self,
-        context: &crate::domain::RoleContext,
+        context: &crate::permissions::PermissionActor,
         credential: &str,
         payload: &serde_json::Value,
         connection_nonce: &str,
     ) -> Result<serde_json::Value> {
-        match crate::permissions::begin_request(
+        match crate::permissions::begin_actor_request(
             &self.store,
             context,
             payload,
@@ -555,23 +582,8 @@ impl Application {
                 {
                     return Ok(response);
                 }
-                let current_context = match self.store.role_context(credential) {
-                    Ok(current)
-                        if current.project_id == context.project_id
-                            && current.task_id == context.task_id
-                            && current.attempt_id == context.attempt_id
-                            && current.role_generation_id == context.role_generation_id
-                            && current.session_id == context.session_id
-                            && current.credential_id == context.credential_id
-                            && current.transcript_epoch == context.transcript_epoch
-                            && current.role == context.role
-                            && current.provider == context.provider
-                            && current.configuration_revision == context.configuration_revision
-                            && current.lane_id == context.lane_id
-                            && current.permissions == context.permissions =>
-                    {
-                        current
-                    }
+                let current_context = match self.permission_actor(credential) {
+                    Ok(current) if current == *context => current,
                     Ok(_) => {
                         crate::permissions::reserve_connection_denial(
                             &self.store,
@@ -595,7 +607,7 @@ impl Application {
                         ));
                     }
                 };
-                if let Some(response) = crate::permissions::consume_ready_response(
+                if let Some(response) = crate::permissions::consume_actor_response(
                     &self.store,
                     &request_id,
                     self.permission_boot_id.as_str(),
@@ -2615,7 +2627,7 @@ impl Application {
             .bind_invocation_input(&session_id, &request.prompt, None)?;
         let process = match self.supervisor.spawn(
             &session_id,
-            &role_generation_id,
+            &SessionOwner::RoleGeneration(role_generation_id.clone()),
             &transcript_epoch,
             &launch,
         ) {
@@ -2872,10 +2884,12 @@ impl Application {
                 observed_started_at: Utc::now().to_rfc3339(),
             }
         } else {
-            match self
-                .supervisor
-                .spawn(session_id, generation, &epoch, &launch)
-            {
+            match self.supervisor.spawn(
+                session_id,
+                &SessionOwner::RoleGeneration(generation.to_owned()),
+                &epoch,
+                &launch,
+            ) {
                 Ok(process) => process,
                 Err(error) => {
                     self.record_spawn_failure(session_id, &error, true)?;
@@ -3529,10 +3543,12 @@ impl Application {
                 observed_started_at: Utc::now().to_rfc3339(),
             }
         } else {
-            match self
-                .supervisor
-                .spawn(session_id, &generation, &epoch, &launch)
-            {
+            match self.supervisor.spawn(
+                session_id,
+                &SessionOwner::RoleGeneration(generation.clone()),
+                &epoch,
+                &launch,
+            ) {
                 Ok(process) => process,
                 Err(error) => {
                     self.record_spawn_failure(session_id, &error, true)?;
@@ -4222,7 +4238,7 @@ impl Application {
         } else {
             match self.supervisor.spawn(
                 &context.session_id,
-                &context.role_generation_id,
+                &SessionOwner::RoleGeneration(context.role_generation_id.clone()),
                 &context.transcript_epoch,
                 &launch,
             ) {
@@ -4973,9 +4989,18 @@ impl Application {
             transaction.commit()?;
             bail!("rework workspace outcome requires recovery: {reason}")
         }
-        if let Err(error) =
+        let trip_policy = {
+            let connection = self.store.lock()?;
+            crate::workflow::attempt_family(&connection, attempt_id)?
+                == crate::domain::WorkflowFamily::Trip
+        };
+        let materialized = if trip_policy {
             crate::trip::materialize_project_policy(&self.store, attempt_id, &destination)
-        {
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+        if let Err(error) = materialized {
             let reason = format!("TRIP policy materialization failed: {error:#}");
             let now = chrono::Utc::now().to_rfc3339();
             let connection = self.store.lock()?;
@@ -5036,7 +5061,9 @@ impl Application {
             params![attempt_id],
             |row| row.get(0),
         )?;
-        crate::trip::validate_materialized_policy(&policy_json)?;
+        if trip_policy {
+            crate::trip::validate_materialized_policy(&policy_json)?;
+        }
         let workspace_changed = transaction.execute(
             "UPDATE workspaces SET state='ready',updated_at=?1 WHERE attempt_id=?2 AND state='reserved'",
             params![finished, attempt_id],
@@ -5590,6 +5617,949 @@ fn git(cwd: &Path, arguments: &[&str]) -> Result<String> {
         )
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+impl Application {
+    pub fn execute_workflow_command(
+        &self,
+        command: &crate::domain::WorkflowCommand,
+    ) -> Result<OperationResult> {
+        if let crate::domain::WorkflowCommand::ResumeRun { .. } = command {
+            return self.resume_single_agent_command(command);
+        }
+        crate::workflow::execute_workflow_command(&self.store, command)
+    }
+
+    /// A person's resume of a held writer, bound to the exact task version,
+    /// session and transcript epoch they reviewed. Replaying the operation
+    /// returns its first outcome.
+    fn resume_single_agent_command(
+        &self,
+        command: &crate::domain::WorkflowCommand,
+    ) -> Result<OperationResult> {
+        let crate::domain::WorkflowCommand::ResumeRun {
+            operation_id,
+            task_id,
+            attempt_id,
+            expected_version,
+            session_id,
+            transcript_epoch,
+            message,
+        } = command
+        else {
+            bail!("not a resume command")
+        };
+        if operation_id.trim().is_empty() || operation_id.len() > 128 {
+            bail!("operation_id is required")
+        }
+        if message.as_ref().is_some_and(|text| text.len() > 16 * 1024) {
+            bail!("The resume message is limited to 16 KiB")
+        }
+        let request_hash = json_hash(command)?;
+        if let Some(existing) = self.store.operation_receipt(
+            operation_id,
+            "human_control",
+            "workflow_command",
+            &request_hash,
+        )? {
+            return Ok(serde_json::from_value(existing)?);
+        }
+        {
+            let connection = self.store.lock()?;
+            let current: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks t JOIN attempts a ON a.task_id=t.id
+                   JOIN sessions s ON s.id=?3 AND s.transcript_epoch=?4
+                   JOIN execution_bindings eb ON eb.role_generation_id=s.role_generation_id AND eb.attempt_id=a.id
+                   WHERE t.id=?1 AND a.id=?2 AND t.version=?5)",
+                rusqlite::params![task_id, attempt_id, session_id, transcript_epoch, expected_version],
+                |row| row.get(0),
+            )?;
+            if !current {
+                bail!("The task, its writer session or transcript changed since you reviewed it; reload before resuming")
+            }
+        }
+        self.launch_single_agent_turn(
+            attempt_id,
+            Some(crate::workflow::SingleAgentResumeMode::Explicit),
+            message.as_deref(),
+            Some(&crate::store::SingleAgentResumeBinding {
+                operation_id,
+                request_hash: &request_hash,
+                task_id,
+                attempt_id,
+                expected_version: *expected_version,
+                session_id,
+                transcript_epoch,
+            }),
+        )?;
+        let stored = self
+            .store
+            .operation_receipt(
+                operation_id,
+                "human_control",
+                "workflow_command",
+                &request_hash,
+            )?
+            .ok_or_else(|| anyhow!("the resume receipt was not recorded"))?;
+        Ok(serde_json::from_value(stored)?)
+    }
+
+    /// Continues the run's retained writer conversation for the coordinator
+    /// after a planned shutdown.
+    pub fn resume_single_agent(
+        &self,
+        attempt_id: &str,
+        message: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        self.launch_single_agent_turn(
+            attempt_id,
+            Some(crate::workflow::SingleAgentResumeMode::Automatic),
+            message,
+            None,
+        )
+    }
+
+    /// Launches a claimed Single agent run's one writer in a fresh native
+    /// conversation. The reservation rechecks every launch condition; a later
+    /// launch of the same run is refused because its conversation is retained.
+    pub fn dispatch_single_agent(&self, attempt_id: &str) -> Result<serde_json::Value> {
+        self.launch_single_agent_turn(attempt_id, None, None, None)
+    }
+
+    fn launch_single_agent_turn(
+        &self,
+        attempt_id: &str,
+        resume: Option<crate::workflow::SingleAgentResumeMode>,
+        message: Option<&str>,
+        human: Option<&crate::store::SingleAgentResumeBinding<'_>>,
+    ) -> Result<serde_json::Value> {
+        self.store
+            .require_execution_unheld("Single agent launches")?;
+        if !self.dispatch_enabled() {
+            bail!("service is draining; new agent launches are disabled")
+        }
+        {
+            let connection = self.store.lock()?;
+            crate::store::require_failure_stop_released(&connection, attempt_id)?;
+        }
+        let context = match resume {
+            Some(mode) => self.store.single_agent_resume_context(attempt_id, mode)?,
+            None => self.store.single_agent_launch_context(attempt_id)?,
+        };
+        let prompt = match (
+            &context.resume,
+            message.map(str::trim).filter(|text| !text.is_empty()),
+        ) {
+            (Some(_), Some(text)) => format!("A person answered while you were stopped:\n{text}"),
+            (Some(_), None) => HOST_RESTART_RESUME_NOTICE.to_owned(),
+            (None, _) => {
+                let mut prompt = format!(
+                    "{}\n\nRun binding: {}\nProfile revision: {}\nRead your full task context with the role context command before starting.",
+                    crate::workflow_resources::SINGLE_AGENT_PROMPT.trim(),
+                    context.attempt_id,
+                    context.profile_revision_id
+                );
+                if !context.instructions_text.trim().is_empty() {
+                    prompt.push_str("\n\nProfile instructions:\n");
+                    prompt.push_str(context.instructions_text.trim());
+                }
+                prompt
+            }
+        };
+        let mut prepared =
+            providers::prepare_single_agent_launch(&providers::SingleAgentLaunchRequest {
+                provider: context.provider,
+                model: &context.model,
+                effort: &context.effort,
+                cwd: &context.workspace,
+                prompt: &prompt,
+                role_socket: &self.paths.role_socket,
+                token: &context.token,
+                role_generation_id: &context.role_generation_id,
+                session_id: &context.session_id,
+                native_session_id: context
+                    .resume
+                    .as_ref()
+                    .map(|target| target.native_session_id.as_str()),
+                assets: &self.hooks,
+                executable_path: &self.executable,
+                bundles: &self.store.compatibility_bundles,
+            })?;
+        prepared.record["prompt_hash"] = serde_json::json!(json_hash(&prompt)?);
+        match resume {
+            Some(mode) => self
+                .store
+                .reserve_single_agent_resume(&context, mode, &prepared, human)?,
+            None => self
+                .store
+                .reserve_single_agent_invocation(&context, &prepared)?,
+        }
+        let process = if self.synthetic_dispatch_for_tests {
+            self.store.mark_session_spawning(
+                &context.session_id,
+                &context.transcript_epoch,
+                "synthetic-dispatch-no-process",
+            )?;
+            ProcessIdentity {
+                pid: std::process::id(),
+                process_group_id: 0,
+                native_start_marker: "synthetic-dispatch-no-process".into(),
+                observed_started_at: Utc::now().to_rfc3339(),
+            }
+        } else {
+            match self.supervisor.spawn_process(
+                &context.session_id,
+                &SessionOwner::RoleGeneration(context.role_generation_id.clone()),
+                &context.transcript_epoch,
+                &prepared.process(),
+            ) {
+                Ok(process) => process,
+                Err(error) => {
+                    self.record_spawn_failure(&context.session_id, &error, resume.is_some())?;
+                    return Err(error.into());
+                }
+            }
+        };
+        if let Err(error) = self.store.update_session_running(
+            &context.session_id,
+            &context.transcript_epoch,
+            &serde_json::to_string(&process)?,
+        ) {
+            let stop = match self.supervisor.interrupt(&context.session_id) {
+                Ok(()) => String::new(),
+                Err(stop) => format!("; the stop signal was not confirmed ({stop:#})"),
+            };
+            self.store.mark_session_delivery_ambiguous(
+                &context.session_id,
+                &format!("{error:#}{stop}"),
+            )?;
+            return Err(
+                error.context("the agent started but its durable running state is ambiguous")
+            );
+        }
+        self.role_tokens
+            .write()
+            .map_err(|_| anyhow!("role token map poisoned"))?
+            .insert(context.session_id.clone(), context.token);
+        Ok(serde_json::json!({
+            "action": if resume.is_some() { "single_agent_resumed" } else { "single_agent_dispatched" },
+            "attempt_id": attempt_id,
+            "task_id": context.task_id,
+            "session_id": context.session_id,
+            "role_generation_id": context.role_generation_id,
+            "transcript_epoch": context.transcript_epoch,
+        }))
+    }
+}
+
+const PROVIDER_CHECK_PREFIX: &str = "LLMRELAY-CHECK-";
+const MAX_PROVIDER_CHECK_PAGES: usize = 32;
+
+fn provider_name(provider: crate::domain::Provider) -> &'static str {
+    match provider {
+        crate::domain::Provider::Codex => "Codex",
+        crate::domain::Provider::Claude => "Claude Code",
+    }
+}
+
+/// An unsupported Codex version is reported as such before any account read;
+/// no other failure is presented as something signing in would fix.
+fn codex_observation_account(
+    scope: &Path,
+    installed_version: &str,
+) -> std::result::Result<providers::ProviderAccountObservation, String> {
+    let supported = providers::codex::EXACT_CODEX_VERSION;
+    if installed_version != supported {
+        return Err(format!(
+            "This LLMRelay release checks only {supported}, but {installed_version} is installed. Install {supported}, or use an LLMRelay release that supports {installed_version}, then preview again."
+        ));
+    }
+    providers::codex::inspect_observation_account(scope, installed_version)
+        .map_err(|error| codex_setup_unconfirmed(&error))
+}
+
+fn codex_setup_unconfirmed(error: &anyhow::Error) -> String {
+    format!("Codex's local setup could not be confirmed for checks: {error:#}. Fix what this reports, then preview again.")
+}
+
+/// App-wide provider checks: local inspection, an optional nonce-only model
+/// call from an empty app folder, and settlement. They share the supervisor
+/// and session capacity with roles but belong to no project.
+impl Application {
+    fn provider_validation_root(&self) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = self.paths.artifacts.join("provider-validation");
+        std::fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+        Ok(root)
+    }
+
+    fn inspect_provider(
+        &self,
+        provider: crate::domain::Provider,
+        scope: &Path,
+    ) -> crate::store::ProviderLocalInspection {
+        let name = provider_name(provider);
+        let installation = providers::inspect_installation(provider).map_err(|error| {
+            format!("{name} was not found or its version could not be read ({error:#}). Install it or fix PATH, then preview again.")
+        });
+        let account = match (&installation, provider) {
+            (Err(reason), _) => Err(reason.clone()),
+            (Ok(installation), crate::domain::Provider::Codex) => {
+                codex_observation_account(scope, &installation.executable_version)
+            }
+            (Ok(_), crate::domain::Provider::Claude) => {
+                Ok(providers::claude::inspect_observation_account())
+            }
+        };
+        let policy = installation
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|installation| {
+                self.store
+                    .compatibility_bundles
+                    .resolve_policy(
+                        provider,
+                        &installation.executable_version,
+                        crate::provider_compatibility::PolicyMode::ProviderObservation,
+                    )
+                    .map_err(|error| error.explanation().message.clone())
+            });
+        let catalog = crate::model_catalog::read(&provider.to_string());
+        crate::store::ProviderLocalInspection {
+            provider,
+            installation,
+            account,
+            policy,
+            catalog: (catalog.state != "unavailable").then(|| {
+                catalog
+                    .models
+                    .into_iter()
+                    .map(|model| (model.slug, model.efforts))
+                    .collect()
+            }),
+        }
+    }
+
+    fn inspect_selected_providers(
+        &self,
+        selections: &[crate::domain::ProviderValidationSelection],
+    ) -> Result<Vec<crate::store::ProviderLocalInspection>> {
+        let scope = self.provider_validation_root()?;
+        let mut inspections: Vec<crate::store::ProviderLocalInspection> = Vec::new();
+        for selection in selections {
+            if !inspections
+                .iter()
+                .any(|inspection| inspection.provider == selection.provider)
+            {
+                inspections.push(self.inspect_provider(selection.provider, &scope));
+            }
+        }
+        Ok(inspections)
+    }
+
+    /// Inspects locally and plans each check; it never contacts a model.
+    pub fn preview_provider_validation(
+        &self,
+        request: &crate::domain::ProviderValidationPreviewRequest,
+    ) -> Result<crate::domain::ProviderValidationPreviewDto> {
+        let inspections = self.inspect_selected_providers(&request.selections)?;
+        self.store
+            .preview_provider_validation(&request.selections, &inspections)
+    }
+
+    pub fn start_provider_validation(
+        &self,
+        request: &crate::domain::ProviderValidationStartRequest,
+    ) -> Result<crate::domain::ProviderValidationBatchDto> {
+        // A replay settles first: local inspection may fail now even though
+        // the exact request already has an outcome.
+        if let Some(outcome) = self.store.provider_validation_start_outcome(request)? {
+            return crate::store::started_provider_batch(outcome);
+        }
+        let inspections = self.inspect_selected_providers(&request.selections)?;
+        self.store
+            .start_provider_validation(request, &inspections, self.dispatch_enabled())
+    }
+
+    /// Returns the exact request's batch, or closes a request that never
+    /// started so it never can. It inspects nothing and contacts no model.
+    pub fn reconcile_provider_validation_start(
+        &self,
+        request: &crate::domain::ProviderValidationStartRequest,
+    ) -> Result<crate::domain::ProviderValidationStartOutcome> {
+        self.store.reconcile_provider_validation_start(request)
+    }
+
+    pub fn inspect_provider_validation(
+        &self,
+        batch_id: &str,
+    ) -> Result<crate::domain::ProviderValidationBatchDto> {
+        self.store.provider_validation_batch(batch_id)
+    }
+
+    pub fn cancel_provider_validation(
+        &self,
+        batch_id: &str,
+    ) -> Result<crate::domain::ProviderValidationBatchDto> {
+        let (_, running) = self.store.cancel_provider_validation(batch_id)?;
+        for session_id in running {
+            if let Err(error) = self.supervisor.interrupt(&session_id) {
+                self.store.record_provider_check_stop_failure(
+                    &session_id,
+                    &format!(
+                        "Cancel was requested, but LLMRelay could not confirm the stop reached this check ({error:#}). It stays cancel-requested until its processes are confirmed stopped; nothing is retried automatically."
+                    ),
+                )?;
+            }
+        }
+        self.store.provider_validation_batch(batch_id)
+    }
+
+    /// Launches at most one pending check. The coordinator calls this only
+    /// after service-wide holds and inventory checks; project task-pickup
+    /// pauses never apply to it.
+    pub(crate) fn dispatch_one_provider_check(&self) -> Result<Option<serde_json::Value>> {
+        let pending = self.store.pending_provider_checks()?;
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        let scope_root = self.provider_validation_root()?;
+        for check in pending {
+            if !self
+                .store
+                .provider_check_capacity_available(check.provider)?
+            {
+                continue;
+            }
+            let inspection = self.inspect_provider(check.provider, &scope_root);
+            if let Some(value) = self.dispatch_provider_check(&check, &inspection)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Runs one check with the exact inputs the user previewed. Any changed
+    /// input or missing qualification skips it; nothing is substituted.
+    pub(crate) fn dispatch_provider_check(
+        &self,
+        check: &crate::store::PendingProviderCheck,
+        inspection: &crate::store::ProviderLocalInspection,
+    ) -> Result<Option<serde_json::Value>> {
+        let skip = |reason: &str| -> Result<Option<serde_json::Value>> {
+            Ok(self
+                .store
+                .skip_provider_check(&check.invocation_id, reason)?
+                .then(|| serde_json::json!({"action":"provider_check_skipped","provider_validation_invocation_id":check.invocation_id,"reason":reason})))
+        };
+        let evidence = match inspection.evidence() {
+            Ok(evidence) => evidence,
+            Err(reason) => return skip(&reason),
+        };
+        let (Ok(installation), Ok(policy)) = (&inspection.installation, &inspection.policy) else {
+            bail!("provider evidence exists without its installation and policy")
+        };
+        if let Some(reason) = policy.native_calls_disabled_reason() {
+            return skip(reason);
+        }
+        if evidence.model_access_key(&check.model, &check.effort)? != check.evidence_key {
+            return skip("The provider's installation, sign-in or configuration changed after the preview. Preview again to check it.");
+        }
+        let scope = self.provider_validation_root()?.join(&check.invocation_id);
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            match std::fs::DirBuilder::new().mode(0o700).create(&scope) {
+                Ok(()) => {}
+                // Only an interrupted earlier dispatch of this check left it, still empty.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+                        && std::fs::read_dir(&scope)?.next().is_none() => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("create empty provider check folder {}", scope.display())
+                    })
+                }
+            }
+        }
+        // Only the model can turn the lowercase nonce in the prompt into the
+        // uppercase answer, so an echoed prompt never counts as a reply.
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let answer = format!("{PROVIDER_CHECK_PREFIX}{nonce}").to_ascii_uppercase();
+        let prompt = format!(
+            "This is an LLMRelay connectivity check. Do not use any tools. Reply with exactly one line: the text {} written entirely in uppercase letters.",
+            answer.to_ascii_lowercase()
+        );
+        let launch = match providers::prepare_observation_launch(
+            installation,
+            policy.clone(),
+            &check.model,
+            &check.effort,
+            &scope,
+            &prompt,
+            &self.executable,
+        ) {
+            Ok(launch) => launch,
+            Err(error) => {
+                let _ = std::fs::remove_dir(&scope);
+                return skip(&format!("LLMRelay could not prepare this check: {error:#}"));
+            }
+        };
+        let mut record = launch.record();
+        record["evidence"] = serde_json::to_value(&evidence)?;
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let transcript_epoch = uuid::Uuid::new_v4().to_string();
+        let reserved = self.store.reserve_provider_validation_session(
+            &crate::store::ProviderValidationSessionReservation {
+                invocation_id: &check.invocation_id,
+                session_id: &session_id,
+                transcript_epoch: &transcript_epoch,
+                provider: check.provider,
+                executable_version: &installation.executable_version,
+                launch_json: &record.to_string(),
+                scope_root: &scope.to_string_lossy(),
+                nonce_hash: &hex::encode(sha2::Sha256::digest(answer.as_bytes())),
+            },
+        );
+        if !matches!(reserved, Ok(true)) {
+            let _ = std::fs::remove_dir(&scope);
+            return reserved.map(|_| None);
+        }
+        let owner = SessionOwner::ProviderValidationInvocation(check.invocation_id.clone());
+        let process = match self.supervisor.spawn_process(
+            &session_id,
+            &owner,
+            &transcript_epoch,
+            &launch.process(),
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                self.record_spawn_failure(&session_id, &error, false)?;
+                return Ok(Some(
+                    serde_json::json!({"action":"provider_check_launch_failed","provider_validation_invocation_id":check.invocation_id,"session_id":session_id,"reason":error.reason()}),
+                ));
+            }
+        };
+        // A cancel committed during spawn makes this fail; the call is then
+        // stopped and stays uncertain until its processes are gone.
+        if let Err(error) = self.store.update_session_running(
+            &session_id,
+            &transcript_epoch,
+            &serde_json::to_string(&process)?,
+        ) {
+            let stop = match self.supervisor.interrupt(&session_id) {
+                Ok(()) => String::new(),
+                Err(stop) => format!("; the stop signal was not confirmed ({stop:#})"),
+            };
+            self.store
+                .mark_session_delivery_ambiguous(&session_id, &format!("{error:#}{stop}"))?;
+            return Ok(Some(
+                serde_json::json!({"action":"provider_check_delivery_unknown","provider_validation_invocation_id":check.invocation_id,"session_id":session_id}),
+            ));
+        }
+        Ok(Some(
+            serde_json::json!({"action":"provider_check_started","provider_validation_invocation_id":check.invocation_id,"session_id":session_id}),
+        ))
+    }
+
+    /// Settles at most one launched check whose session stopped. An uncertain
+    /// session settles only after fresh proof that its processes are gone.
+    pub(crate) fn settle_one_provider_check(&self) -> Result<Option<serde_json::Value>> {
+        use crate::store::ProviderCheckOutcome;
+        for check in self.store.unsettled_provider_checks()? {
+            let mut exit_success = check.exit_success;
+            if !check.quiescent {
+                let Ok(verification) =
+                    crate::recovery::verify_session_quiescent(&self.store, &check.session_id)
+                else {
+                    continue;
+                };
+                if !self.store.record_provider_check_quiescent(
+                    &check.session_id,
+                    &check.invocation_id,
+                    &verification,
+                )? {
+                    continue;
+                }
+                exit_success &= check.session_exited;
+            }
+            let outcome = if check.cancel_requested {
+                ProviderCheckOutcome::Cancelled("Cancelled. No result was recorded for this check.")
+            } else if !exit_success && !check.session_exited {
+                ProviderCheckOutcome::Failed("LLMRelay could not confirm this check finished normally. It was not retried; run the check again.")
+            } else if !exit_success {
+                ProviderCheckOutcome::Failed("The provider exited with an error before answering. Check its sign-in and the model name, then run the check again.")
+            } else {
+                match self.provider_check_answered(&check) {
+                    Ok(true) => ProviderCheckOutcome::Succeeded,
+                    Ok(false) => ProviderCheckOutcome::Failed("The provider finished but did not return the expected answer. This model may not be available to this account."),
+                    Err(_) => ProviderCheckOutcome::Failed("LLMRelay could not read this check's output. Run the check again."),
+                }
+            };
+            if self
+                .store
+                .settle_provider_check(&check.invocation_id, &check.session_id, outcome)?
+            {
+                return Ok(Some(
+                    serde_json::json!({"action":"provider_check_settled","provider_validation_invocation_id":check.invocation_id,"session_id":check.session_id}),
+                ));
+            }
+        }
+        if self.store.finish_settled_provider_batches()? > 0 {
+            return Ok(Some(
+                serde_json::json!({"action":"provider_validation_finished"}),
+            ));
+        }
+        Ok(None)
+    }
+
+    fn provider_check_answered(
+        &self,
+        check: &crate::store::UnsettledProviderCheck,
+    ) -> Result<bool> {
+        let Some(expected) = check.nonce_hash.as_deref() else {
+            return Ok(false);
+        };
+        let mut frames = Vec::new();
+        let mut after = 0;
+        for _ in 0..MAX_PROVIDER_CHECK_PAGES {
+            let page = crate::transcript::read_history_page(
+                &self.paths.transcripts,
+                &check.session_id,
+                &check.transcript_epoch,
+                after,
+                crate::transcript::MAX_HISTORY_PAGE_BYTES,
+            )?;
+            frames.extend(page.frames);
+            if !page.has_more {
+                break;
+            }
+            after = page.next_sequence;
+        }
+        let text = crate::transcript::recorded_history_text(&frames);
+        let length = PROVIDER_CHECK_PREFIX.len() + 32;
+        Ok(text.match_indices(PROVIDER_CHECK_PREFIX).any(|(index, _)| {
+            text.get(index..index + length).is_some_and(|candidate| {
+                hex::encode(sha2::Sha256::digest(candidate.as_bytes())) == expected
+            })
+        }))
+    }
+}
+
+#[cfg(test)]
+mod provider_validation_tests {
+    use super::*;
+    use crate::domain::Provider;
+    use crate::store::provider_validation_tests::{
+        inspection, launch, policy_bundles, reserve_expecting, select, start,
+    };
+    use crate::store::ProviderLocalInspection;
+
+    fn synthetic_app(label: &str) -> (PathBuf, Application, ProviderLocalInspection) {
+        let root = std::env::temp_dir().join(format!(
+            "llmrelay-provider-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = InstancePaths::resolve(Some(root.clone())).unwrap();
+        paths.create().unwrap();
+        let mut store = Store::open(&paths.database).unwrap();
+        store.compatibility_bundles = Arc::new(policy_bundles(true));
+        let claude = inspection(&store.compatibility_bundles, Provider::Claude, None);
+        let hooks = HookAssets {
+            runner: root.join("hook"),
+            claude_settings: root.join("claude-settings.json"),
+            claude_implementer_settings: root.join("claude-implementer-settings.json"),
+            codex_revision_hash: "synthetic".into(),
+            claude_revision_hash: "synthetic".into(),
+            claude_implementer_revision_hash: "synthetic".into(),
+        };
+        let app = Application::new_with_synthetic_compatibility_for_tests(
+            paths,
+            store,
+            std::env::current_exe().unwrap(),
+            hooks,
+        )
+        .unwrap();
+        (root, app, claude)
+    }
+
+    fn model_proofs(app: &Application) -> i64 {
+        app.store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM provider_observations WHERE kind='model_access'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn codex_check_reasons_name_the_actual_blocker_without_sign_in_advice() {
+        // Never created: a version mismatch is decided before the scope or any
+        // account is read.
+        let scope =
+            std::env::temp_dir().join(format!("llmrelay-unused-scope-{}", uuid::Uuid::new_v4()));
+        let mismatch = codex_observation_account(&scope, "codex-cli 0.162.0").unwrap_err();
+        assert!(
+            mismatch.contains(providers::codex::EXACT_CODEX_VERSION)
+                && mismatch.contains("codex-cli 0.162.0"),
+            "{mismatch}"
+        );
+        let other = codex_setup_unconfirmed(&anyhow!(
+            "Codex local compatibility does not support managed Codex configuration"
+        ));
+        assert!(
+            other.contains("does not support managed Codex configuration"),
+            "{other}"
+        );
+        for reason in [mismatch, other] {
+            assert!(!reason.to_ascii_lowercase().contains("sign"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn recorded_answer_publishes_proof_only_for_the_exact_nonce_and_a_normal_exit() {
+        let (root, app, claude) = synthetic_app("answer");
+        let process = r#"{"pid":7}"#;
+        let answer =
+            format!("{PROVIDER_CHECK_PREFIX}0123456789abcdef0123456789abcdef").to_ascii_uppercase();
+        let expected = hex::encode(sha2::Sha256::digest(answer.as_bytes()));
+        let echo = format!(
+            "Reply with exactly one line: the text {} written entirely in uppercase letters.\r\n",
+            answer.to_ascii_lowercase()
+        );
+        let wrong = format!("{PROVIDER_CHECK_PREFIX}{}\r\n", "F".repeat(32));
+        let check_output = |session: &str, output: &str| {
+            let batch = start(
+                &app.store,
+                session,
+                &[select(Provider::Claude, "model-a")],
+                &[claude.clone()],
+                1,
+            );
+            let check = app.store.pending_provider_checks().unwrap().remove(0);
+            let epoch = uuid::Uuid::new_v4().to_string();
+            let launch = serde_json::json!({
+                "kind": "provider_observation", "evidence": claude.evidence().unwrap()
+            });
+            assert!(app
+                .store
+                .reserve_provider_validation_session(
+                    &crate::store::ProviderValidationSessionReservation {
+                        invocation_id: &check.invocation_id,
+                        session_id: session,
+                        transcript_epoch: &epoch,
+                        provider: check.provider,
+                        executable_version: "synthetic",
+                        launch_json: &launch.to_string(),
+                        scope_root: "/synthetic/scope",
+                        nonce_hash: &expected,
+                    }
+                )
+                .unwrap());
+            app.store
+                .mark_session_spawning(session, &epoch, "boot")
+                .unwrap();
+            app.store
+                .update_session_running(session, &epoch, process)
+                .unwrap();
+            crate::transcript::TranscriptSink::create(&app.paths.transcripts, session, &epoch)
+                .unwrap()
+                .append(output.as_bytes())
+                .unwrap();
+            (batch.id, epoch)
+        };
+        for (session, output, normal_exit, expected_state) in [
+            ("exact", format!("{echo}{answer}\r\n"), true, "succeeded"),
+            ("echo-only", echo.clone(), true, "failed"),
+            ("wrong-nonce", wrong, true, "failed"),
+            ("abnormal-exit", format!("{answer}\r\n"), false, "failed"),
+        ] {
+            let (batch_id, epoch) = check_output(session, &output);
+            let exit = serde_json::json!({
+                "success": normal_exit, "process_group_quiescent": true
+            });
+            assert!(app
+                .store
+                .update_session_exit(session, &epoch, process, &exit.to_string())
+                .unwrap());
+            assert_eq!(
+                app.settle_one_provider_check().unwrap().unwrap()["action"],
+                "provider_check_settled"
+            );
+            let settled = app.store.provider_validation_batch(&batch_id).unwrap();
+            assert_eq!(settled.checks[0].state, expected_state, "{session}");
+            assert_eq!(settled.state, "finished");
+        }
+        assert_eq!(model_proofs(&app), 1, "only the exact answer is proof");
+
+        // A matching answer from a session whose processes are unproven stays unknown.
+        let (batch_id, _) = check_output("uncertain", &format!("{answer}\r\n"));
+        app.store
+            .mark_session_delivery_ambiguous(
+                "uncertain",
+                "provider root exited with live descendants",
+            )
+            .unwrap();
+        assert_eq!(app.settle_one_provider_check().unwrap(), None);
+        let uncertain = app.store.provider_validation_batch(&batch_id).unwrap();
+        assert_eq!(uncertain.checks[0].state, "delivery_unknown");
+        assert_eq!(uncertain.state, "running");
+        assert_eq!(model_proofs(&app), 1);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unconfirmed_cancel_stop_stays_visible_on_the_check() {
+        let (root, app, claude) = synthetic_app("cancel-stop");
+        let batch = start(
+            &app.store,
+            "cancel-stop",
+            &[select(Provider::Claude, "model-a")],
+            &[claude.clone()],
+            1,
+        );
+        let check = app.store.pending_provider_checks().unwrap().remove(0);
+        assert!(reserve_expecting(
+            &app.store,
+            &check,
+            &claude,
+            "unattached",
+            "hash"
+        ));
+        // Running in the store with no supervised handle, so the stop cannot be delivered.
+        launch(&app.store, "unattached");
+        let cancelled = app.cancel_provider_validation(&batch.id).unwrap();
+        assert_eq!(cancelled.state, "cancel_requested");
+        assert_eq!(cancelled.checks[0].state, "cancel_requested");
+        let reason = cancelled.checks[0].reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("could not confirm the stop"), "{reason}");
+        assert!(
+            reason.contains("not attached to this service boot"),
+            "{reason}"
+        );
+        let status: String = app
+            .store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM sessions WHERE id='unattached'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "running",
+            "a failed stop is not reported as stopped"
+        );
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_check_dispatch_refuses_synthetic_spawn_and_skips_changed_inputs() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, app, claude) = synthetic_app("dispatch");
+        let paths = app.paths.clone();
+
+        let batch = start(
+            &app.store,
+            "spawn",
+            &[select(Provider::Claude, "model-a")],
+            &[claude.clone()],
+            1,
+        );
+        let pending = app.store.pending_provider_checks().unwrap();
+        let launched = app
+            .dispatch_provider_check(&pending[0], &claude)
+            .unwrap()
+            .unwrap();
+        assert_eq!(launched["action"], "provider_check_launch_failed");
+        assert!(
+            launched["reason"]
+                .as_str()
+                .unwrap()
+                .contains("synthetic compatibility"),
+            "{launched}"
+        );
+        let scope = paths
+            .artifacts
+            .join("provider-validation")
+            .join(&pending[0].invocation_id);
+        assert_eq!(
+            std::fs::metadata(&scope).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(std::fs::read_dir(&scope).unwrap().count(), 0);
+        let failed = app.store.provider_validation_batch(&batch.id).unwrap();
+        assert_eq!(failed.checks[0].state, "failed");
+        assert_eq!(
+            app.settle_one_provider_check().unwrap().unwrap()["action"],
+            "provider_validation_finished"
+        );
+        assert_eq!(
+            app.store
+                .provider_validation_batch(&batch.id)
+                .unwrap()
+                .state,
+            "finished"
+        );
+
+        let batch = start(
+            &app.store,
+            "changed",
+            &[
+                select(Provider::Claude, "model-a"),
+                select(Provider::Claude, "model-b"),
+            ],
+            &[claude.clone()],
+            2,
+        );
+        let pending = app.store.pending_provider_checks().unwrap();
+        let unqualified = inspection(&policy_bundles(false), Provider::Claude, None);
+        let mut changed = claude.clone();
+        if let Ok(account) = &mut changed.account {
+            account.config_identity = serde_json::json!({"revision": "edited"});
+        }
+        for (check, current, expected) in [
+            (&pending[0], &unqualified, "not qualified"),
+            (&pending[1], &changed, "changed after the preview"),
+        ] {
+            let skipped = app
+                .dispatch_provider_check(check, current)
+                .unwrap()
+                .unwrap();
+            assert_eq!(skipped["action"], "provider_check_skipped");
+            assert!(
+                skipped["reason"].as_str().unwrap().contains(expected),
+                "{skipped}"
+            );
+        }
+        let batch = app.store.provider_validation_batch(&batch.id).unwrap();
+        assert_eq!(batch.state, "finished");
+        assert!(batch.checks.iter().all(|check| check.state == "skipped"));
+
+        let connection = app.store.lock().unwrap();
+        let sessions: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sessions, 1, "skipped checks reserve no session");
+        let workflow: i64 = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM projects)+(SELECT COUNT(*) FROM role_generations)
+                   +(SELECT COUNT(*) FROM role_credentials)+(SELECT COUNT(*) FROM capabilities)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(workflow, 0);
+        drop(connection);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]

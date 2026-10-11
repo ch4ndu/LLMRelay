@@ -67,6 +67,221 @@ enum SelectedCheckAuthority {
         revision: i64,
         origin_authorization_id: Option<String>,
     },
+    /// A `workflow_check_authorizations` row of a Single agent run.
+    SingleAgent(String),
+}
+
+struct SelectedCommand<'a> {
+    workspace: &'a str,
+    kind: &'a str,
+    executable: Option<String>,
+    arguments: Option<&'a str>,
+    shell: Option<String>,
+    cwd: &'a str,
+    timeout_seconds: i64,
+    revision: i64,
+    relevant_inputs: &'a str,
+}
+
+fn escapes_root(path: &Path) -> bool {
+    path.is_absolute()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+}
+
+/// The contained spec of an exact selected command and the hash of its
+/// relevant inputs as they are now in the worktree.
+fn selected_check_spec(command: &SelectedCommand<'_>) -> Result<(CheckSpec, String)> {
+    let cwd_path = PathBuf::from(command.cwd);
+    if escapes_root(&cwd_path) {
+        bail!("selected check cwd must remain inside the worktree")
+    }
+    let workspace_path = PathBuf::from(command.workspace);
+    let resolved_cwd = crate::trip::contained_path(&workspace_path, command.cwd, true)?;
+    if !resolved_cwd.is_dir() {
+        bail!("selected check working directory must be a contained directory")
+    }
+    let inputs: Vec<String> = serde_json::from_str(command.relevant_inputs)?;
+    let mut input_hashes = Vec::new();
+    for relative in inputs {
+        if escapes_root(Path::new(&relative)) {
+            bail!("check relevant input escapes the worktree")
+        }
+        let path = crate::trip::contained_path(&workspace_path, &relative, true)?;
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect check input {relative}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("check relevant input must be a regular non-symlink file: {relative}")
+        }
+        input_hashes.push(serde_json::json!({"path":relative,"sha256":hex::encode(sha2::Sha256::digest(std::fs::read(path)?))}));
+    }
+    let inputs_hash = crate::store::json_hash(&input_hashes)?;
+    let spec = match command.kind {
+        "structured_argv" | "exact_argv" => CheckSpec {
+            executable: command
+                .executable
+                .clone()
+                .ok_or_else(|| anyhow!("structured check executable is missing"))?
+                .into(),
+            arguments: serde_json::from_str(command.arguments.unwrap_or("[]"))?,
+            timeout_seconds: command.timeout_seconds as u64,
+            suite_version: command.revision,
+            cwd: cwd_path,
+        },
+        "exact_shell" => CheckSpec {
+            executable: PathBuf::from("/bin/sh"),
+            arguments: vec![
+                "-lc".into(),
+                command
+                    .shell
+                    .clone()
+                    .ok_or_else(|| anyhow!("exact shell command is missing"))?,
+            ],
+            timeout_seconds: command.timeout_seconds as u64,
+            suite_version: command.revision,
+            cwd: cwd_path,
+        },
+        _ => bail!("unsupported selected check command kind"),
+    };
+    Ok((spec, inputs_hash))
+}
+
+/// One selected check of a Single agent run bound to the run's current
+/// frozen candidate, while the result awaits checks or a person.
+/// Authorization, reservation and acceptance all derive the hashes here, so a
+/// changed command, configuration or candidate never matches an earlier
+/// decision.
+pub(crate) struct SingleAgentCheckIdentity {
+    pub workspace: String,
+    pub candidate_hash: String,
+    pub selected_revision: i64,
+    pub command_kind: String,
+    pub executable: Option<String>,
+    pub arguments: Option<String>,
+    pub shell: Option<String>,
+    pub cwd: String,
+    pub timeout_seconds: i64,
+    pub acceptance: String,
+    pub relevant_inputs: String,
+    pub command_hash: String,
+    pub scope_hash: String,
+}
+
+pub(crate) fn single_agent_check_identity(
+    connection: &rusqlite::Connection,
+    attempt: &str,
+    check_id: &str,
+) -> Result<Option<SingleAgentCheckIdentity>> {
+    let row = connection
+        .query_row(
+            "SELECT w.path,a.candidate_hash,r.selected_check_revision,c.command_kind,c.executable,
+                    c.arguments_json,c.shell_command,c.cwd,c.timeout_seconds,c.acceptance_rows_json,
+                    c.relevant_inputs_json,b.execution_config_hash
+             FROM attempts a JOIN workspaces w ON w.attempt_id=a.id AND w.state='ready'
+             JOIN workflow_run_bindings b ON b.attempt_id=a.id AND b.family='single_agent'
+               AND b.definition_state='available'
+             JOIN workflow_result_bindings r ON r.attempt_id=a.id AND r.state=a.phase
+               AND r.candidate_hash=a.candidate_hash
+             JOIN workflow_check_selections s ON s.attempt_id=a.id AND s.revision=r.selected_check_revision
+               AND s.check_id=?2
+             JOIN execution_verification_checks c ON c.id=s.check_id
+               AND c.execution_config_revision_id=b.execution_config_revision_id
+             WHERE a.id=?1 AND a.phase IN ('awaiting_checks','awaiting_human')",
+            params![attempt, check_id],
+            |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?),
+                    (
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ),
+                    (row.get::<_, String>(9)?, row.get::<_, String>(10)?, row.get::<_, Option<String>>(11)?),
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        (workspace, candidate_hash, selected_revision),
+        (command_kind, executable, arguments, shell, cwd, timeout_seconds),
+        (acceptance, relevant_inputs, configuration_hash),
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let command_hash = crate::store::json_hash(&serde_json::json!({
+        "kind": command_kind, "executable": executable, "arguments": arguments,
+        "shell": shell, "cwd": cwd, "timeout_seconds": timeout_seconds,
+    }))?;
+    let scope_hash = crate::store::json_hash(&serde_json::json!({
+        "family": "single_agent", "attempt_id": attempt, "candidate_hash": candidate_hash,
+        "check_id": check_id, "selected_revision": selected_revision, "cwd": cwd,
+        "execution_config_hash": configuration_hash,
+    }))?;
+    Ok(Some(SingleAgentCheckIdentity {
+        workspace,
+        candidate_hash,
+        selected_revision,
+        command_kind,
+        executable,
+        arguments,
+        shell,
+        cwd,
+        timeout_seconds,
+        acceptance,
+        relevant_inputs,
+        command_hash,
+        scope_hash,
+    }))
+}
+
+pub(crate) enum SingleAgentCheckAuthorization {
+    Authorized(String),
+    Denied,
+    Missing,
+}
+
+/// The latest human decision for this exact check identity. A later denial
+/// replaces an earlier authorization; a consumed one-time authorization no
+/// longer authorizes another run.
+pub(crate) fn single_agent_check_authorization(
+    connection: &rusqlite::Connection,
+    attempt: &str,
+    check_id: &str,
+    identity: &SingleAgentCheckIdentity,
+) -> Result<SingleAgentCheckAuthorization> {
+    let latest: Option<(String, String, String, Option<String>)> = connection
+        .query_row(
+            "SELECT id,decision,lifetime,consumed_at FROM workflow_check_authorizations
+             WHERE attempt_id=?1 AND check_id=?2 AND selected_revision=?3
+               AND exact_command_hash=?4 AND scope_hash=?5
+             ORDER BY created_at DESC,rowid DESC LIMIT 1",
+            params![
+                attempt,
+                check_id,
+                identity.selected_revision,
+                identity.command_hash,
+                identity.scope_hash
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    Ok(match latest {
+        Some((_, decision, _, _)) if decision == "denied" => SingleAgentCheckAuthorization::Denied,
+        Some((id, _, lifetime, consumed)) if lifetime == "run" || consumed.is_none() => {
+            SingleAgentCheckAuthorization::Authorized(id)
+        }
+        _ => SingleAgentCheckAuthorization::Missing,
+    })
 }
 
 #[derive(Clone)]
@@ -245,71 +460,17 @@ impl CheckService {
                 anyhow!("selected check is denied or awaiting a service-check permission decision")
             })?
         };
-        let cwd_path = PathBuf::from(&cwd);
-        if cwd_path.is_absolute()
-            || cwd_path.components().any(|part| {
-                matches!(
-                    part,
-                    std::path::Component::ParentDir
-                        | std::path::Component::RootDir
-                        | std::path::Component::Prefix(_)
-                )
-            })
-        {
-            bail!("selected check cwd must remain inside the worktree")
-        }
-        let workspace_path = PathBuf::from(&workspace);
-        let resolved_cwd = crate::trip::contained_path(&workspace_path, &cwd, true)?;
-        if !resolved_cwd.is_dir() {
-            bail!("selected check working directory must be a contained directory")
-        }
-        let inputs: Vec<String> = serde_json::from_str(&relevant)?;
-        let mut input_hashes = Vec::new();
-        for relative in inputs {
-            let relative_path = PathBuf::from(&relative);
-            if relative_path.is_absolute()
-                || relative_path.components().any(|part| {
-                    matches!(
-                        part,
-                        std::path::Component::ParentDir
-                            | std::path::Component::RootDir
-                            | std::path::Component::Prefix(_)
-                    )
-                })
-            {
-                bail!("check relevant input escapes the worktree")
-            }
-            let path = crate::trip::contained_path(&workspace_path, &relative, true)?;
-            let metadata = std::fs::symlink_metadata(&path)
-                .with_context(|| format!("inspect check input {relative}"))?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                bail!("check relevant input must be a regular non-symlink file: {relative}")
-            }
-            input_hashes.push(serde_json::json!({"path":relative,"sha256":hex::encode(sha2::Sha256::digest(std::fs::read(path)?))}));
-        }
-        let inputs_hash = crate::store::json_hash(&input_hashes)?;
-        let spec = match kind.as_str() {
-            "structured_argv" => CheckSpec {
-                executable: executable
-                    .ok_or_else(|| anyhow!("structured check executable is missing"))?
-                    .into(),
-                arguments: serde_json::from_str(arguments.as_deref().unwrap_or("[]"))?,
-                timeout_seconds: timeout as u64,
-                suite_version: revision,
-                cwd: cwd_path,
-            },
-            "exact_shell" => CheckSpec {
-                executable: PathBuf::from("/bin/sh"),
-                arguments: vec![
-                    "-lc".into(),
-                    shell.ok_or_else(|| anyhow!("exact shell command is missing"))?,
-                ],
-                timeout_seconds: timeout as u64,
-                suite_version: revision,
-                cwd: cwd_path,
-            },
-            _ => bail!("unsupported selected check command kind"),
-        };
+        let (spec, inputs_hash) = selected_check_spec(&SelectedCommand {
+            workspace: &workspace,
+            kind: &kind,
+            executable,
+            arguments: arguments.as_deref(),
+            shell,
+            cwd: &cwd,
+            timeout_seconds: timeout,
+            revision,
+            relevant_inputs: &relevant,
+        })?;
         self.run(
             attempt,
             check_id,
@@ -326,6 +487,58 @@ impl CheckService {
             background,
             browser_receipt,
         )
+    }
+
+    /// Runs one selected check of a Single agent run against its frozen
+    /// candidate under the run's own exact human authorization.
+    pub fn run_single_agent_check(
+        &self,
+        attempt: &str,
+        check_id: &str,
+    ) -> Result<serde_json::Value> {
+        self.store
+            .require_execution_unheld("selected check execution")?;
+        let (identity, authorization) = {
+            let connection = self.store.lock()?;
+            let identity = single_agent_check_identity(&connection, attempt, check_id)?
+                .ok_or_else(|| {
+                    anyhow!("the selected check is not current for this run's frozen candidate")
+                })?;
+            let authorization =
+                single_agent_check_authorization(&connection, attempt, check_id, &identity)?;
+            (identity, authorization)
+        };
+        let SingleAgentCheckAuthorization::Authorized(authorization_id) = authorization else {
+            bail!("the selected check is not authorized for this exact command and candidate")
+        };
+        let (spec, inputs_hash) = selected_check_spec(&SelectedCommand {
+            workspace: &identity.workspace,
+            kind: &identity.command_kind,
+            executable: identity.executable.clone(),
+            arguments: identity.arguments.as_deref(),
+            shell: identity.shell.clone(),
+            cwd: &identity.cwd,
+            timeout_seconds: identity.timeout_seconds,
+            revision: identity.selected_revision,
+            relevant_inputs: &identity.relevant_inputs,
+        })?;
+        self.run(
+            attempt,
+            check_id,
+            &spec,
+            Some(SelectedCheckBinding {
+                check_id: check_id.to_owned(),
+                selected_revision: identity.selected_revision,
+                inputs_hash,
+                acceptance_coverage: identity.acceptance,
+                authority: SelectedCheckAuthority::SingleAgent(authorization_id),
+                exact_command_hash: identity.command_hash,
+                scope_hash: identity.scope_hash,
+            }),
+            false,
+            None,
+        )
+        .and_then(browser_check_run_result)
     }
 
     pub fn selected_authorized(&self, attempt: &str, check_id: &str) -> Result<bool> {
@@ -876,14 +1089,23 @@ impl CheckService {
                 return Ok(CheckReservation::Existing(existing));
             }
         }
+        let single_agent = selected
+            .is_some_and(|value| matches!(value.authority, SelectedCheckAuthority::SingleAgent(_)));
+        let phase = if single_agent {
+            "awaiting_checks"
+        } else {
+            "checks"
+        };
         let row:(String,String,String,bool,bool)=tx.query_row(
-            "SELECT w.path,a.candidate_hash,s.id,EXISTS(SELECT 1 FROM sessions x JOIN role_generations rg ON rg.id=x.role_generation_id WHERE rg.attempt_id=a.id AND rg.role!='manager' AND x.status NOT IN ('exited','launch_failed')),EXISTS(SELECT 1 FROM check_runs cr WHERE cr.attempt_id=a.id AND cr.status IN ('launch_reserved','running','recovery_required')) FROM attempts a JOIN workspaces w ON w.attempt_id=a.id JOIN snapshots s ON s.attempt_id=a.id AND s.kind='candidate' AND s.manifest_hash=a.candidate_hash WHERE a.id=?1 AND a.phase='checks' AND a.status='running' AND w.state='ready' ORDER BY s.created_at DESC LIMIT 1",
-            params![attempt],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))
+            "SELECT w.path,a.candidate_hash,s.id,EXISTS(SELECT 1 FROM sessions x JOIN role_generations rg ON rg.id=x.role_generation_id WHERE rg.attempt_id=a.id AND rg.role!='manager' AND x.status NOT IN ('exited','launch_failed')),EXISTS(SELECT 1 FROM check_runs cr WHERE cr.attempt_id=a.id AND cr.status IN ('launch_reserved','running','recovery_required')) FROM attempts a JOIN workspaces w ON w.attempt_id=a.id JOIN snapshots s ON s.attempt_id=a.id AND s.kind='candidate' AND s.manifest_hash=a.candidate_hash WHERE a.id=?1 AND a.phase=?2 AND a.status='running' AND w.state='ready' ORDER BY s.created_at DESC LIMIT 1",
+            params![attempt,phase],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))
         ).optional()?.ok_or_else(||anyhow!("running checks phase, workspace, or exact frozen candidate is unavailable"))?;
         if row.3 || row.4 {
             bail!("check ownership conflicts with an active role or check")
         }
-        crate::trip::require_attempt_ready(&tx, attempt, None)?;
+        if !single_agent {
+            crate::trip::require_attempt_ready(&tx, attempt, None)?;
+        }
         let cwd = crate::trip::contained_path(
             Path::new(&row.0),
             spec.cwd.to_string_lossy().as_ref(),
@@ -892,7 +1114,17 @@ impl CheckService {
         if !cwd.is_dir() {
             bail!("selected check working directory does not exist")
         }
-        if let Some(selected) = selected {
+        if let Some(selected) = selected.filter(|_| single_agent) {
+            let current = single_agent_check_identity(&tx, attempt, &selected.check_id)?
+                .ok_or_else(|| anyhow!("selected check changed before reservation"))?;
+            if current.selected_revision != selected.selected_revision
+                || current.command_hash != selected.exact_command_hash
+                || current.scope_hash != selected.scope_hash
+                || current.candidate_hash != row.1
+            {
+                bail!("selected check command, selection, configuration or candidate changed before reservation")
+            }
+        } else if let Some(selected) = selected {
             let (revision,kind,executable,arguments,shell,current_cwd):(i64,String,Option<String>,Option<String>,Option<String>,String)=tx.query_row(
                 "SELECT a.selected_checks_revision,c.command_kind,c.executable,c.arguments_json,c.shell_command,c.cwd
                  FROM attempts a JOIN trip_selected_checks s ON s.attempt_id=a.id AND s.revision=a.selected_checks_revision
@@ -911,14 +1143,33 @@ impl CheckService {
         }
         tx.execute("INSERT INTO check_runs(id,attempt_id,candidate_hash,executable,arguments_json,cwd,status,evidence_json,created_at,suite_name,check_suite_version,launch_state,check_id,selected_check_revision,inputs_hash,acceptance_coverage_json,freshness_state) VALUES(?1,?2,?3,?4,?5,?6,'launch_reserved',?7,?8,?9,?10,'reserved',?11,?12,?13,?14,'reserved')",params![id,attempt,row.1,spec.executable.to_string_lossy(),serde_json::to_string(&spec.arguments)?,cwd.to_string_lossy(),serde_json::json!({"suite":suite,"ownership":"reserved"}).to_string(),Utc::now().to_rfc3339(),suite,spec.suite_version,selected.map(|value|value.check_id.as_str()),selected.map(|value|value.selected_revision),selected.map(|value|value.inputs_hash.as_str()),selected.map(|value|value.acceptance_coverage.as_str()).unwrap_or("[]")])?;
         if let Some(selected) = selected {
-            let current_scope = crate::store::json_hash(&serde_json::json!({
-                "attempt_id":attempt,"candidate_hash":row.1,"check_id":selected.check_id,
-                "selected_revision":selected.selected_revision,"cwd":spec.cwd.to_string_lossy()
-            }))?;
-            if current_scope != selected.scope_hash {
-                bail!("selected check candidate or working-directory scope changed before reservation")
+            if !single_agent {
+                let current_scope = crate::store::json_hash(&serde_json::json!({
+                    "attempt_id":attempt,"candidate_hash":row.1,"check_id":selected.check_id,
+                    "selected_revision":selected.selected_revision,"cwd":spec.cwd.to_string_lossy()
+                }))?;
+                if current_scope != selected.scope_hash {
+                    bail!("selected check candidate or working-directory scope changed before reservation")
+                }
             }
             match &selected.authority {
+                SelectedCheckAuthority::SingleAgent(authorization_id) => {
+                    let changed = tx.execute(
+                        "UPDATE workflow_check_authorizations SET consumed_at=CASE WHEN lifetime='once' THEN ?1 ELSE consumed_at END
+                         WHERE id=?2 AND attempt_id=?3 AND check_id=?4 AND selected_revision=?5
+                           AND exact_command_hash=?6 AND scope_hash=?7 AND decision='authorized'
+                           AND (lifetime='run' OR consumed_at IS NULL)
+                           AND id=(SELECT latest.id FROM workflow_check_authorizations latest
+                             WHERE latest.attempt_id=?3 AND latest.check_id=?4 AND latest.selected_revision=?5
+                               AND latest.exact_command_hash=?6 AND latest.scope_hash=?7
+                             ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)",
+                        params![Utc::now().to_rfc3339(),authorization_id,attempt,selected.check_id,
+                            selected.selected_revision,selected.exact_command_hash,selected.scope_hash],
+                    )?;
+                    if changed != 1 {
+                        bail!("the selected check's authorization changed or was used before reservation")
+                    }
+                }
                 SelectedCheckAuthority::Exact(authorization_id) => {
                     let changed=tx.execute(
                         "UPDATE trip_check_authorizations SET consumed_at=CASE WHEN lifetime='once' THEN ?1 ELSE consumed_at END
@@ -1012,6 +1263,10 @@ impl CheckService {
             let selected_authority = selected.map(|selected| match &selected.authority {
                 SelectedCheckAuthority::Exact(id) => serde_json::json!({
                     "kind":"exact",
+                    "authorization_id":id,
+                }),
+                SelectedCheckAuthority::SingleAgent(id) => serde_json::json!({
+                    "kind":"single_agent",
                     "authorization_id":id,
                 }),
                 SelectedCheckAuthority::Family {

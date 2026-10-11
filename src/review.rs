@@ -23,6 +23,19 @@ pub(crate) fn ordinary_code_review_cap_reached(
     ).map_err(Into::into)
 }
 
+/// Writer authority comes from the TRIP implementer role or from the
+/// workspace-write authority of a generation's bound execution policy. A bound
+/// policy whose authority cannot be read counts as a writer, so an unknown
+/// policy never lets a capture race it. `?1` is the attempt.
+pub(crate) const ACTIVE_WRITER_SQL: &str = "SELECT EXISTS(SELECT 1 FROM sessions s
+    JOIN role_generations rg ON rg.id=s.role_generation_id
+    WHERE rg.attempt_id=?1 AND s.status NOT IN ('exited','launch_failed')
+      AND (rg.role='implementer' OR EXISTS(SELECT 1 FROM execution_bindings eb
+        WHERE eb.role_generation_id=rg.id
+          AND COALESCE((SELECT r.authority FROM workflow_run_profiles rp
+            JOIN agent_profile_revisions r ON r.id=rp.profile_revision_id AND r.policy_hash=eb.policy_hash
+            WHERE rp.attempt_id=eb.attempt_id AND rp.slot_key=eb.slot_key),'workspace_write')='workspace_write')))";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnansweredReview {
     pub attempt_id: String,
@@ -111,16 +124,197 @@ impl ReviewService {
         }
     }
 
+    /// Captures the candidate of a Single agent run after its writer reported
+    /// `result_ready` and its process group is recorded as stopped. The
+    /// service snapshot, not any path or hash the agent claimed, becomes the
+    /// result's immutable candidate.
+    pub fn freeze_single_agent_result(&self, attempt_id: &str) -> Result<serde_json::Value> {
+        let (freeze_id, binding_id) = {
+            let mut connection = self.store.lock()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let active_writer: bool =
+                transaction.query_row(ACTIVE_WRITER_SQL, params![attempt_id], |row| row.get(0))?;
+            if active_writer {
+                bail!("the Single agent result cannot be captured while its writer is active or unresolved")
+            }
+            let source: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT r.id,r.role_generation_id FROM workflow_result_bindings r
+                     JOIN attempts a ON a.id=r.attempt_id AND a.phase='result_submitted' AND a.status='running'
+                     JOIN role_generations g ON g.id=r.role_generation_id AND g.status='exited'
+                     JOIN sessions s ON s.id=r.session_id AND s.role_generation_id=g.id
+                       AND s.transcript_epoch=r.transcript_epoch AND s.status='exited'
+                       AND COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)=1
+                     WHERE r.attempt_id=?1 AND r.state='pending_quiescence'",
+                    params![attempt_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (binding_id, generation) = source.ok_or_else(|| {
+                anyhow!(
+                    "the Single agent result has no stopped, process-group-quiescent writer yet"
+                )
+            })?;
+            let id = uuid::Uuid::new_v4().to_string();
+            let now = Utc::now().to_rfc3339();
+            transaction.execute("INSERT INTO freeze_intents(id,attempt_id,kind,source_role_generation_id,state,created_at,updated_at) VALUES(?1,?2,'candidate',?3,'capturing',?4,?4)",params![id,attempt_id,generation,now])?;
+            transaction.commit()?;
+            (id, binding_id)
+        };
+        match self.publish_single_agent_candidate(attempt_id, &freeze_id, &binding_id) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let connection = self.store.lock()?;
+                connection.execute(
+                    "UPDATE freeze_intents SET state='abandoned',error=?1,updated_at=?2 WHERE id=?3 AND state IN ('reserved','capturing')",
+                    params![format!("{error:#}"), Utc::now().to_rfc3339(), freeze_id],
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn publish_single_agent_candidate(
+        &self,
+        attempt_id: &str,
+        freeze_id: &str,
+        binding_id: &str,
+    ) -> Result<serde_json::Value> {
+        let (workspace_path, repository_path, repository_identity, attempt_base): (
+            String,
+            String,
+            String,
+            String,
+        ) = {
+            let connection = self.store.lock()?;
+            connection.query_row(
+                "SELECT w.path,p.repository_path,p.repository_identity,a.base_revision
+                 FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
+                 JOIN workspaces w ON w.attempt_id=a.id WHERE a.id=?1",
+                params![attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?
+        };
+        let mut repository = crate::workspace::inspect(Path::new(&repository_path))?;
+        if repository.identity != repository_identity {
+            bail!("physical repository identity changed")
+        }
+        if !crate::workspace::commit_exists(&repository, &attempt_base)? {
+            bail!("original attempt base is no longer reachable")
+        }
+        repository.head = attempt_base;
+        let snapshot_id = uuid::Uuid::new_v4().to_string();
+        let destination = self.snapshots_root.join(&snapshot_id);
+        let (manifest, hash) =
+            crate::snapshot::capture(&repository, Path::new(&workspace_path), &destination)?;
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.store.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(String, String, i64, String, i64, i64)> = transaction
+            .query_row(
+                "SELECT r.role_result_id,a.task_id,r.selected_check_revision,w.id,g.config_revision,t.version
+                 FROM freeze_intents fi JOIN workflow_result_bindings r ON r.id=?2 AND r.attempt_id=fi.attempt_id
+                   AND r.state='pending_quiescence' AND r.role_generation_id=fi.source_role_generation_id
+                 JOIN attempts a ON a.id=fi.attempt_id AND a.phase='result_submitted' AND a.status='running'
+                 JOIN tasks t ON t.id=a.task_id JOIN workspaces w ON w.attempt_id=a.id
+                 JOIN role_generations g ON g.id=r.role_generation_id AND g.status='exited'
+                 JOIN sessions s ON s.id=r.session_id AND s.role_generation_id=g.id
+                   AND s.transcript_epoch=r.transcript_epoch AND s.status='exited'
+                   AND COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)=1
+                 WHERE fi.id=?1 AND fi.state='capturing'",
+                params![freeze_id, binding_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()?;
+        // A retained turn started during capture would make these bytes stale.
+        let active_writer: bool =
+            transaction.query_row(ACTIVE_WRITER_SQL, params![attempt_id], |row| row.get(0))?;
+        if active_writer {
+            bail!("a workspace writer became active while the Single agent result was captured")
+        }
+        let Some((
+            result_id,
+            task_id,
+            check_revision,
+            workspace_id,
+            settings_revision,
+            task_version,
+        )) = current
+        else {
+            bail!("the Single agent result or its capture changed before publication")
+        };
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM snapshots WHERE attempt_id=?1 AND kind='candidate' AND manifest_hash=?2",
+                params![attempt_id, hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let persisted_id = existing.unwrap_or(snapshot_id);
+        let generation: String = transaction.query_row(
+            "SELECT source_role_generation_id FROM freeze_intents WHERE id=?1",
+            params![freeze_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute("INSERT OR IGNORE INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at,original_base,candidate_head,source_role_generation_id,source_settings_revision,workspace_id,workspace_hash) VALUES(?1,?2,'candidate',?3,?4,?5,1,?6,?7,?8,?9,?10,?11,?4)",
+            params![persisted_id,attempt_id,manifest.snapshot_base,hash,serde_json::to_string(&manifest)?,now,manifest.original_base,manifest.candidate_head,generation,settings_revision,workspace_id])?;
+        let checks_selected: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_check_selections WHERE attempt_id=?1 AND revision=?2)",
+            params![attempt_id, check_revision],
+            |row| row.get(0),
+        )?;
+        let (state, phase, reason) = if checks_selected {
+            ("awaiting_checks", "awaiting_checks", "The selected checks must pass against this exact candidate before you can accept it")
+        } else {
+            (
+                "awaiting_human",
+                "awaiting_human",
+                "Waiting for you to accept the result or request changes",
+            )
+        };
+        transaction.execute(
+            "UPDATE workflow_result_bindings SET snapshot_id=?1,candidate_hash=?2,state=?3,state_reason=?4,updated_at=?5
+             WHERE id=?6 AND state='pending_quiescence'",
+            params![persisted_id, hash, state, reason, now, binding_id],
+        )?;
+        transaction.execute(
+            "UPDATE attempts SET candidate_hash=?1,phase=?2,updated_at=?3 WHERE id=?4 AND phase='result_submitted'",
+            params![hash, phase, now, attempt_id],
+        )?;
+        transaction.execute(
+            "UPDATE role_results SET consumed_at=?1 WHERE id=?2 AND consumed_at IS NULL",
+            params![now, result_id],
+        )?;
+        if !checks_selected
+            && transaction.execute(
+                "UPDATE tasks SET lifecycle='awaiting_review',attention='none',version=version+1,updated_at=?1
+                 WHERE id=?2 AND version=?3 AND lifecycle='in_progress'",
+                params![now, task_id, task_version],
+            )? != 1
+        {
+            bail!("the task changed before the Single agent result could await review")
+        }
+        if transaction.execute("UPDATE freeze_intents SET state='complete',result_snapshot_id=?1,updated_at=?2 WHERE id=?3 AND state='capturing'",params![persisted_id,now,freeze_id])? != 1 {
+            bail!("Single agent capture intent changed before publication")
+        }
+        transaction.commit()?;
+        Ok(serde_json::json!({
+            "snapshot_id": persisted_id,
+            "kind": "candidate",
+            "manifest_hash": hash,
+            "result_binding_id": binding_id,
+            "state": state,
+        }))
+    }
+
     fn reserve_freeze(&self, attempt_id: &str, kind: &str) -> Result<String> {
         let mut connection = self.store.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let active_writer: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id WHERE rg.attempt_id=?1 AND rg.role='implementer' AND s.status NOT IN ('exited','launch_failed'))",
-            params![attempt_id],
-            |row| row.get(0),
-        )?;
+        let active_writer: bool =
+            transaction.query_row(ACTIVE_WRITER_SQL, params![attempt_id], |row| row.get(0))?;
         if active_writer {
-            bail!("snapshot cannot be frozen while the implementer writer is active or unresolved")
+            bail!("snapshot cannot be frozen while a workspace writer is active or unresolved")
         }
         let source_generation: Option<String> = match kind {
             "plan" => crate::store::eligible_manager_plan(&transaction, attempt_id, true)?
@@ -154,12 +348,16 @@ impl ReviewService {
             bool,
         ) = {
             let connection = self.store.lock()?;
-            connection.query_row("SELECT w.path,p.repository_path,p.repository_identity,a.base_revision,EXISTS(SELECT 1 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id WHERE rg.attempt_id=a.id AND rg.role='implementer' AND s.status NOT IN ('exited','launch_failed'))
-                FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id JOIN workspaces w ON w.attempt_id=a.id WHERE a.id=?1",
-                params![attempt_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?
+            let (workspace, repository, identity, base): (String, String, String, String) = connection.query_row(
+                "SELECT w.path,p.repository_path,p.repository_identity,a.base_revision
+                 FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id JOIN workspaces w ON w.attempt_id=a.id WHERE a.id=?1",
+                params![attempt_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+            let active: bool =
+                connection.query_row(ACTIVE_WRITER_SQL, params![attempt_id], |row| row.get(0))?;
+            (workspace, repository, identity, base, active)
         };
         if active_writer {
-            bail!("snapshot cannot be frozen while the implementer writer is active or unresolved")
+            bail!("snapshot cannot be frozen while a workspace writer is active or unresolved")
         }
         if kind == "plan" {
             let (result_id, generation_id, plan, base, task_version): (
@@ -478,7 +676,24 @@ impl ReviewService {
         if kind == "accepted" {
             return self.verify_materialized(&snapshot_id, destination);
         }
-        let manifest_json = terminal_manifest.ok_or_else(|| {
+        let single_agent_manifest: Option<String> = {
+            let connection = self.store.lock()?;
+            connection
+                .query_row(
+                    "SELECT s.manifest_json FROM rework_intents ri
+                     JOIN snapshots s ON s.id=ri.snapshot_id AND s.attempt_id=ri.parent_attempt_id
+                       AND s.kind='candidate' AND s.complete=1
+                     JOIN workflow_result_bindings r ON r.snapshot_id=s.id AND r.attempt_id=ri.parent_attempt_id
+                       AND r.state='changes_requested' AND r.candidate_hash=s.manifest_hash
+                     JOIN workflow_result_acceptances d ON d.result_binding_id=r.id
+                       AND d.decision='changes_requested' AND d.child_attempt_id=ri.new_attempt_id
+                     WHERE ri.id=?1",
+                    params![intent_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+        };
+        let manifest_json = single_agent_manifest.or(terminal_manifest).ok_or_else(|| {
             anyhow!("the rework source is not the exact rejected candidate of a recorded terminal replan")
         })?;
         let manifest: SnapshotManifest = serde_json::from_str(&manifest_json)?;

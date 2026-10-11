@@ -27,6 +27,9 @@ fn tick_steps(app: &Application) -> Result<serde_json::Value> {
     }
     let inventory = app.supervisor.reconcile_inventory()?;
     crate::permissions::expire_deadlines(&app.store)?;
+    if let Some(value) = app.settle_one_provider_check()? {
+        return Ok(value);
+    }
     if !app.dispatch_enabled() {
         return Ok(serde_json::json!({"action":"draining","status":app.drain_status()?}));
     }
@@ -37,6 +40,12 @@ fn tick_steps(app: &Application) -> Result<serde_json::Value> {
         return Ok(value);
     }
     if let Some(value) = release_one_settled_hold(&app.store)? {
+        return Ok(value);
+    }
+    if let Some(value) = app.dispatch_one_provider_check()? {
+        return Ok(value);
+    }
+    if let Some(value) = advance_one_single_agent_attempt(app)? {
         return Ok(value);
     }
     if let Some(value) = reconcile_one_codex_stop_idle(app)? {
@@ -536,6 +545,8 @@ fn attempts_from_connection(
                 t.acceptance_criteria_json,a.plan_hash,a.candidate_hash
          FROM attempts a JOIN tasks t ON t.id=a.task_id
          WHERE t.lifecycle IN ('in_progress','validation','awaiting_review')
+           AND NOT EXISTS(SELECT 1 FROM workflow_run_bindings run
+             WHERE run.attempt_id=a.id AND run.family='single_agent')
            AND (?1=1 OR {})
            AND (a.status IN ('running','workspace_reserved','needs_input')
              OR (?1=1 AND a.status='materialization_pending'
@@ -787,8 +798,203 @@ pub(crate) fn read_only_decisions(connection: &Connection) -> Result<Vec<Decisio
         .into_iter()
         .map(|attempt| Ok(evaluate_attempt(connection, &attempt)?.explanation))
         .collect::<Result<Vec<_>>>()?;
+    decisions.extend(single_agent_decisions(connection)?);
     decisions.extend(crate::recovery::read_only_restart_decisions(connection)?);
     Ok(decisions)
+}
+
+/// The current decision of each Single agent run: the step the coordinator
+/// would take next, or the person's decision the run waits on, offered only
+/// when its command's own predicate holds.
+fn single_agent_decisions(connection: &Connection) -> Result<Vec<DecisionExplanation>> {
+    let attempts = {
+        let mut statement = connection.prepare(
+            "SELECT a.id,a.task_id,t.project_id,a.phase,a.status,t.attention,t.version,
+                    a.configuration_revision,a.selected_checks_revision,t.title,t.description,
+                    t.acceptance_criteria_json,a.plan_hash,a.candidate_hash
+             FROM attempts a JOIN tasks t ON t.id=a.task_id
+             JOIN workflow_run_bindings b ON b.attempt_id=a.id AND b.family='single_agent'
+             WHERE t.lifecycle IN ('in_progress','awaiting_review') AND t.archived_at IS NULL
+               AND a.status IN ('running','needs_input','needs_recovery','held','materialization_pending','workspace_reserved')
+               AND a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=t.id
+                 ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)
+             ORDER BY a.created_at",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(Attempt {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    project_id: row.get(2)?,
+                    phase: row.get(3)?,
+                    status: row.get(4)?,
+                    attention: row.get(5)?,
+                    task_version: row.get(6)?,
+                    configuration_revision: row.get(7)?,
+                    selected_checks_revision: row.get(8)?,
+                    title: row.get(9)?,
+                    description: row.get(10)?,
+                    criteria: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
+                    plan_hash: row.get(12)?,
+                    candidate_hash: row.get(13)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let mut decisions = Vec::new();
+    for attempt in attempts {
+        let mut decision = single_agent_decision(connection, &attempt)?;
+        decision.explanation.control_policy.allowed_controls =
+            crate::workflow::ordinary_control_policy(
+                connection,
+                &attempt.task_id,
+                Some(&attempt.id),
+            )?;
+        decisions.push(decision.explanation);
+    }
+    Ok(decisions)
+}
+
+fn single_agent_decision(connection: &Connection, attempt: &Attempt) -> Result<AttemptDecision> {
+    let legacy =
+        serde_json::json!({"action":"waiting","attempt_id":attempt.id,"workflow":"single_agent"});
+    if let Some((recovery_id, operation, effect)) =
+        open_coordinator_failure(connection, &attempt.id)?
+    {
+        return Ok(blocked_attempt_decision(
+            attempt,
+            "workflow.coordinator_failure_hold",
+            DecisionDisposition::Held,
+            DecisionEvidenceState::Pending,
+            DecisionOwner::Human,
+            serde_json::json!({"recovery_id":recovery_id,"operation":operation,"effect_certainty":effect}),
+            Some("An automatic step for this run failed, so LLMRelay stopped advancing it. Open the task's recovery item to retry that step or cancel the task.".into()),
+            Vec::new(),
+            legacy,
+            AttemptDecisionFlow::Skip,
+            Some(DecisionNextAction {
+                operation: "resolve_recovery".into(),
+                enabled: true,
+                owner: DecisionOwner::Human,
+                binding: DecisionActionBinding {
+                    recovery_id: Some(recovery_id),
+                    ..attempt_binding(attempt)
+                },
+                accounting_note: None,
+            }),
+            vec!["resolve_recovery".into()],
+        ));
+    }
+    let run = crate::workflow::task_workflow_projection(connection, &attempt.task_id)?
+        .and_then(|workflow| workflow.run)
+        .filter(|run| run.attempt_id == attempt.id);
+    let human_action = run.as_ref().and_then(|run| {
+        [
+            "resume_run",
+            "authorize_check",
+            "accept_result",
+            "request_rework",
+        ]
+        .into_iter()
+        .find(|action| {
+            run.available_actions
+                .iter()
+                .any(|available| available == action)
+        })
+    });
+    let stage_reason = run.as_ref().map(|run| run.stage_reason.clone());
+    let waiting_on_person = |reason_code: &str, message: Option<String>| {
+        blocked_attempt_decision(
+            attempt,
+            reason_code,
+            DecisionDisposition::Held,
+            DecisionEvidenceState::Pending,
+            DecisionOwner::Human,
+            serde_json::json!({"phase":attempt.phase,"status":attempt.status}),
+            message,
+            Vec::new(),
+            legacy.clone(),
+            AttemptDecisionFlow::Skip,
+            human_action.map(|operation| DecisionNextAction {
+                operation: operation.into(),
+                enabled: true,
+                owner: DecisionOwner::Human,
+                binding: attempt_binding(attempt),
+                accounting_note: None,
+            }),
+            human_action.into_iter().map(str::to_owned).collect(),
+        )
+    };
+    let waiting = |code: &str, owner: DecisionOwner, message: &str| {
+        blocked_attempt_decision(
+            attempt,
+            code,
+            DecisionDisposition::Waiting,
+            DecisionEvidenceState::Pending,
+            owner,
+            serde_json::json!({"phase":attempt.phase}),
+            Some(message.into()),
+            Vec::new(),
+            legacy.clone(),
+            AttemptDecisionFlow::Observe,
+            None,
+            Vec::new(),
+        )
+    };
+    match attempt.status.as_str() {
+        "running" => {}
+        "materialization_pending" | "workspace_reserved" => {
+            return Ok(waiting(
+                "workflow.single_agent.preparing_workspace",
+                DecisionOwner::Service,
+                "LLMRelay is preparing the run's worktree.",
+            ))
+        }
+        "needs_recovery" | "held" => {
+            return Ok(waiting_on_person(
+                "workflow.single_agent.recovery",
+                stage_reason,
+            ))
+        }
+        _ => {
+            return Ok(waiting_on_person(
+                "workflow.single_agent.needs_person",
+                stage_reason,
+            ))
+        }
+    }
+    let ready = |code: &str| ready_attempt_decision(attempt, Vec::new(), code);
+    Ok(match single_agent_step(connection, &attempt.id)? {
+        SingleAgentStep::Dispatch => ready("coordinator.single_agent.start_writer"),
+        SingleAgentStep::Resume => ready("coordinator.single_agent.resume_writer"),
+        SingleAgentStep::StopWriter(_) => ready("coordinator.single_agent.stop_writer"),
+        SingleAgentStep::FreezeResult => ready("coordinator.single_agent.capture_result"),
+        SingleAgentStep::RunCheck { .. } => ready("coordinator.single_agent.run_check"),
+        SingleAgentStep::CompleteChecks => ready("coordinator.single_agent.checks_passed"),
+        SingleAgentStep::SettleProbe => ready("coordinator.single_agent.settle_probe"),
+        SingleAgentStep::Hold { reason } => {
+            waiting_on_person("workflow.single_agent.needs_person", Some(reason))
+        }
+        SingleAgentStep::Wait => match attempt.phase.as_str() {
+            "agent_execution" => waiting(
+                "workflow.single_agent.writing",
+                DecisionOwner::Provider,
+                "The agent is working in its worktree.",
+            ),
+            "result_submitted" => waiting(
+                "workflow.single_agent.result_stop",
+                DecisionOwner::Service,
+                "The agent submitted its result; waiting for its processes to stop before capture.",
+            ),
+            "awaiting_checks" => waiting(
+                "workflow.single_agent.check_running",
+                DecisionOwner::Service,
+                "A selected check is running or waiting for its own recovery.",
+            ),
+            _ => waiting_on_person("workflow.single_agent.awaiting_decision", stage_reason),
+        },
+    })
 }
 
 fn evaluate_attempt(connection: &Connection, attempt: &Attempt) -> Result<AttemptDecision> {
@@ -4855,8 +5061,12 @@ fn release_one_settled_hold(store: &crate::store::Store) -> Result<Option<serde_
         };
         // A finished recipient does not repair changed instruction files. Keep
         // the hold stable until the prerequisite that failed is ready again.
-        if operation == "guidance_delivery"
-            && crate::trip::require_attempt_ready(&transaction, &attempt, None).is_err()
+        if crate::workflow::failed_step_prerequisite(
+            &transaction,
+            &attempt,
+            Some(operation.as_str()),
+        )
+        .is_some()
         {
             continue;
         }
@@ -5367,6 +5577,389 @@ pub fn reconcile_superseded_role_hold(
     Ok(None)
 }
 
+/// What the fixed Single agent sequence does next for one running attempt.
+enum SingleAgentStep {
+    Dispatch,
+    Resume,
+    StopWriter(crate::store::SingleAgentStopReceipt),
+    FreezeResult,
+    RunCheck { check_id: String },
+    CompleteChecks,
+    SettleProbe,
+    Hold { reason: String },
+    Wait,
+}
+
+/// The run's one writer session: status, recorded process-group quiescence.
+type WriterSession = (String, String, bool);
+
+fn single_agent_step(connection: &Connection, attempt_id: &str) -> Result<SingleAgentStep> {
+    let phase: String = connection.query_row(
+        "SELECT phase FROM attempts WHERE id=?1",
+        params![attempt_id],
+        |row| row.get(0),
+    )?;
+    match phase.as_str() {
+        "agent_execution" => agent_execution_step(connection, attempt_id),
+        "result_submitted" => {
+            // Only the session and transcript epoch that reported the result
+            // are stopped or captured; a later retained turn never is.
+            let reporter: Option<WriterSession> = connection
+                .query_row(
+                    "SELECT s.id,s.status,COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)=1
+                     FROM workflow_result_bindings r JOIN sessions s ON s.id=r.session_id
+                       AND s.role_generation_id=r.role_generation_id AND s.transcript_epoch=r.transcript_epoch
+                     WHERE r.attempt_id=?1 AND r.state='pending_quiescence'",
+                    params![attempt_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            Ok(match reporter {
+                Some((_, status, _)) if status == "running" => {
+                    match crate::store::eligible_single_agent_stop(connection, attempt_id)? {
+                        Some(receipt) => SingleAgentStep::StopWriter(receipt),
+                        None => SingleAgentStep::Wait,
+                    }
+                }
+                Some((_, status, true)) if status == "exited" => SingleAgentStep::FreezeResult,
+                Some(_) => SingleAgentStep::Wait,
+                None => SingleAgentStep::Hold {
+                    reason: "The submitted result no longer matches the session that reported it; open its recovery details.".into(),
+                },
+            })
+        }
+        "awaiting_checks" => selected_checks_step(connection, attempt_id),
+        "awaiting_human" => {
+            let probe: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempts a
+                   JOIN workflow_run_profiles rp ON rp.attempt_id=a.id
+                   JOIN profile_admissions pa ON pa.id=rp.admission_id
+                   WHERE a.id=?1 AND pa.state='pending' AND pa.probe_task_id=a.task_id)",
+                params![attempt_id],
+                |row| row.get(0),
+            )?;
+            Ok(if probe {
+                SingleAgentStep::SettleProbe
+            } else {
+                SingleAgentStep::Wait
+            })
+        }
+        _ => Ok(SingleAgentStep::Wait),
+    }
+}
+
+fn agent_execution_step(connection: &Connection, attempt_id: &str) -> Result<SingleAgentStep> {
+    let writer: Option<WriterSession> = connection
+        .query_row(
+            "SELECT s.id,s.status,COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)=1
+             FROM execution_bindings eb JOIN sessions s ON s.role_generation_id=eb.role_generation_id
+             WHERE eb.attempt_id=?1 AND eb.actor='single_agent'",
+            params![attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((session_id, status, quiescent)) = writer else {
+        return Ok(SingleAgentStep::Dispatch);
+    };
+    let reported: Option<(String, String)> = connection
+        .query_row(
+            "SELECT rr.outcome,rr.summary FROM role_results rr
+             WHERE rr.session_id=?1 AND rr.outcome IN ('blocked','needs_input') AND rr.consumed_at IS NULL
+             ORDER BY rr.created_at DESC,rr.rowid DESC LIMIT 1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let stopped = status == "launch_failed" || (status == "exited" && quiescent);
+    Ok(match reported {
+        Some(_) if status == "running" => {
+            match crate::store::eligible_single_agent_stop(connection, attempt_id)? {
+                Some(receipt) => SingleAgentStep::StopWriter(receipt),
+                None => SingleAgentStep::Wait,
+            }
+        }
+        Some((outcome, summary)) if stopped => SingleAgentStep::Hold {
+            reason: format!("The agent reported {outcome}: {summary}"),
+        },
+        None if stopped
+            && crate::workflow::single_agent_resume_target(
+                connection,
+                attempt_id,
+                Some(crate::workflow::SingleAgentResumeMode::Automatic),
+            )?
+            .is_ok() =>
+        {
+            SingleAgentStep::Resume
+        }
+        None if stopped => SingleAgentStep::Hold {
+            reason: crate::workflow::single_agent_stopped_reason(connection, attempt_id)?,
+        },
+        _ => SingleAgentStep::Wait,
+    })
+}
+
+/// The next selected check to run, or why the run needs a person. Checks run
+/// one at a time in key order; a running or unresolved check waits for its
+/// own owner.
+fn selected_checks_step(connection: &Connection, attempt_id: &str) -> Result<SingleAgentStep> {
+    use crate::checks::SingleAgentCheckAuthorization;
+    let selected = {
+        let mut statement = connection.prepare(
+            "SELECT s.check_id,c.check_key FROM workflow_result_bindings r
+             JOIN workflow_check_selections s ON s.attempt_id=r.attempt_id AND s.revision=r.selected_check_revision
+             JOIN execution_verification_checks c ON c.id=s.check_id
+             WHERE r.attempt_id=?1 AND r.state='awaiting_checks' ORDER BY c.check_key",
+        )?;
+        let rows = statement
+            .query_map(params![attempt_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (check_id, check_key) in selected {
+        let Some(identity) =
+            crate::checks::single_agent_check_identity(connection, attempt_id, &check_id)?
+        else {
+            return Ok(SingleAgentStep::Hold {
+                reason: format!("The selected check {check_key} no longer matches this run's configuration or candidate; request changes."),
+            });
+        };
+        let latest: Option<(String, Option<i64>, String, String)> = connection
+            .query_row(
+                "SELECT status,exit_code,freshness_state,created_at FROM check_runs
+                 WHERE attempt_id=?1 AND candidate_hash=?2 AND check_id=?3
+                 ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                params![attempt_id, identity.candidate_hash, check_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let failed_at = match latest {
+            Some((status, _, _, _))
+                if matches!(
+                    status.as_str(),
+                    "launch_reserved" | "running" | "recovery_required" | "launch_ambiguous"
+                ) =>
+            {
+                return Ok(SingleAgentStep::Wait)
+            }
+            Some((status, Some(0), freshness, _))
+                if status == "finished" && freshness == "current" =>
+            {
+                continue
+            }
+            Some((_, _, _, created_at)) => Some(created_at),
+            None => None,
+        };
+        let authorization = crate::checks::single_agent_check_authorization(
+            connection, attempt_id, &check_id, &identity,
+        )?;
+        return Ok(match authorization {
+            SingleAgentCheckAuthorization::Denied => SingleAgentStep::Hold {
+                reason: format!("You denied the check {check_key}, so this result cannot be accepted. Authorize it or request changes."),
+            },
+            SingleAgentCheckAuthorization::Authorized(id) => {
+                let authorized_at: String = connection.query_row(
+                    "SELECT created_at FROM workflow_check_authorizations WHERE id=?1",
+                    params![id],
+                    |row| row.get(0),
+                )?;
+                // A failed run is retried only under a decision made after it.
+                if failed_at.is_some_and(|failed| failed >= authorized_at) {
+                    SingleAgentStep::Hold {
+                        reason: format!("The check {check_key} did not pass against this result. Read its output, then authorize a rerun or request changes."),
+                    }
+                } else {
+                    SingleAgentStep::RunCheck { check_id }
+                }
+            }
+            SingleAgentCheckAuthorization::Missing if failed_at.is_some() => SingleAgentStep::Hold {
+                reason: format!("The check {check_key} did not pass against this result. Read its output, then authorize a rerun or request changes."),
+            },
+            SingleAgentCheckAuthorization::Missing => SingleAgentStep::Hold {
+                reason: format!("The check {check_key} needs your authorization before it runs against this result."),
+            },
+        });
+    }
+    Ok(SingleAgentStep::CompleteChecks)
+}
+
+/// Advances at most one running Single agent attempt through its fixed
+/// sequence: launch the writer, stop it after its result, capture the
+/// candidate, then wait for a person. Anything else needing a person holds
+/// the attempt once instead of retrying it every tick.
+fn advance_one_single_agent_attempt(app: &Application) -> Result<Option<serde_json::Value>> {
+    let attempts = {
+        let connection = app.store.lock()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT a.id FROM attempts a JOIN tasks t ON t.id=a.task_id
+             JOIN workflow_run_bindings b ON b.attempt_id=a.id AND b.family='single_agent'
+             WHERE a.status='running' AND t.lifecycle IN ('in_progress','awaiting_review')
+               AND t.archived_at IS NULL AND t.attention='none' AND {}
+             ORDER BY COALESCE(a.last_coordinator_at,''),a.created_at",
+            coordinator_hold_absent("a.id")
+        ))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for attempt_id in attempts {
+        let step = {
+            let connection = app.store.lock()?;
+            single_agent_step(&connection, &attempt_id)?
+        };
+        let failure = |error: anyhow::Error, effect: StepEffect| {
+            subject_failure(
+                error,
+                &attempt_id,
+                SubjectStep::AttemptAdvance,
+                effect,
+                serde_json::json!({"workflow":"single_agent"}),
+            )
+        };
+        match step {
+            SingleAgentStep::Wait => continue,
+            SingleAgentStep::Dispatch => match app.dispatch_single_agent(&attempt_id) {
+                Ok(value) => return Ok(Some(value)),
+                Err(error) if error.is::<crate::store::RoleLaunchCapacityError>() => continue,
+                Err(error) => {
+                    // An uncertain launch is already held by its recorded
+                    // session; only a proven refusal holds the attempt here.
+                    let launched: bool = {
+                        let connection = app.store.lock()?;
+                        connection.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM role_generations WHERE attempt_id=?1)",
+                            params![attempt_id],
+                            |row| row.get(0),
+                        )?
+                    };
+                    if launched {
+                        return Err(failure(error, StepEffect::Possible));
+                    }
+                    return hold_single_agent_attempt(
+                        app,
+                        &attempt_id,
+                        &format!("The agent could not start: {error:#}"),
+                    )
+                    .map_err(|error| failure(error, StepEffect::None));
+                }
+            },
+            SingleAgentStep::Resume => match app.resume_single_agent(&attempt_id, None) {
+                Ok(value) => return Ok(Some(value)),
+                Err(error) if error.is::<crate::store::RoleLaunchCapacityError>() => continue,
+                Err(error) => return Err(failure(error, StepEffect::Possible)),
+            },
+            SingleAgentStep::StopWriter(receipt) => {
+                let stopped = app
+                    .interrupt_single_agent_report(&receipt)
+                    .map_err(|error| failure(error, StepEffect::Possible))?;
+                if stopped {
+                    return Ok(Some(serde_json::json!({
+                        "action":"single_agent_writer_stop","attempt_id":attempt_id,
+                        "session_id":receipt.session_id,"transcript_epoch":receipt.transcript_epoch,
+                        "role_result_id":receipt.role_result_id
+                    })));
+                }
+            }
+            SingleAgentStep::FreezeResult => {
+                let captured = app
+                    .reviews
+                    .freeze_single_agent_result(&attempt_id)
+                    .map_err(|error| failure(error, StepEffect::None))?;
+                return Ok(Some(serde_json::json!({
+                    "action":"single_agent_result_captured","attempt_id":attempt_id,"capture":captured
+                })));
+            }
+            SingleAgentStep::RunCheck { check_id } => {
+                let result = app
+                    .checks
+                    .run_single_agent_check(&attempt_id, &check_id)
+                    .map_err(|error| failure(error, StepEffect::Possible))?;
+                return Ok(Some(serde_json::json!({
+                    "action":"single_agent_check_finished","attempt_id":attempt_id,
+                    "check_id":check_id,"result":result
+                })));
+            }
+            SingleAgentStep::SettleProbe => {
+                match crate::workflow::settle_single_agent_probe(&app.store, &attempt_id) {
+                    Ok(true) => {
+                        return Ok(Some(serde_json::json!({
+                            "action":"single_agent_probe_settled","attempt_id":attempt_id
+                        })))
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return hold_single_agent_attempt(
+                            app,
+                            &attempt_id,
+                            &format!("The probe did not prove the profile: {error:#}"),
+                        )
+                        .map_err(|error| failure(error, StepEffect::None));
+                    }
+                }
+            }
+            SingleAgentStep::CompleteChecks => {
+                let completed =
+                    crate::workflow::complete_single_agent_checks(&app.store, &attempt_id)
+                        .map_err(|error| failure(error, StepEffect::None))?;
+                if completed {
+                    return Ok(Some(serde_json::json!({
+                        "action":"single_agent_checks_passed","attempt_id":attempt_id
+                    })));
+                }
+            }
+            SingleAgentStep::Hold { reason } => {
+                return hold_single_agent_attempt(app, &attempt_id, &reason)
+                    .map_err(|error| failure(error, StepEffect::None));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn hold_single_agent_attempt(
+    app: &Application,
+    attempt_id: &str,
+    reason: &str,
+) -> Result<Option<serde_json::Value>> {
+    let now = Utc::now().to_rfc3339();
+    let mut connection = app.store.lock()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = transaction.execute(
+        "UPDATE attempts SET status='needs_input',updated_at=?1 WHERE id=?2 AND status='running'",
+        params![now, attempt_id],
+    )?;
+    if changed != 1 {
+        return Ok(None);
+    }
+    transaction.execute(
+        "UPDATE tasks SET attention='needs_input',version=version+1,updated_at=?1
+         WHERE id=(SELECT task_id FROM attempts WHERE id=?2)",
+        params![now, attempt_id],
+    )?;
+    transaction.execute(
+        "UPDATE workflow_result_bindings SET state_reason=?1,updated_at=?2
+         WHERE attempt_id=?3 AND state IN ('pending_quiescence','awaiting_checks','awaiting_human')",
+        params![reason, now, attempt_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+         VALUES(?1,?2,'service','single_agent.attempt.held','attempt',?3,?4,?5)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            attempt_id,
+            serde_json::json!({"reason": reason}).to_string(),
+            now
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(Some(serde_json::json!({
+        "action":"held","hold_recorded":true,"attempt_id":attempt_id,"reason":reason
+    })))
+}
+
 fn retry_one_rework(app: &Application) -> Result<Option<serde_json::Value>> {
     let id = {
         let connection = app.store.lock()?;
@@ -5384,6 +5977,11 @@ fn retry_one_rework(app: &Application) -> Result<Option<serde_json::Value>> {
     };
     (|| -> Result<()> {
         let connection = app.store.lock()?;
+        if crate::workflow::attempt_family(&connection, &id)?
+            == crate::domain::WorkflowFamily::SingleAgent
+        {
+            return Ok(());
+        }
         let project: String = connection.query_row(
             "SELECT t.project_id FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1",
             params![id],
@@ -8168,6 +8766,18 @@ fn finish_control_in_transaction(
     if status == "cancelled" {
         tx.execute(
             "UPDATE claims SET state='cancelled',updated_at=?1 WHERE attempt_id=?2 AND state NOT IN ('unknown','stopping')",
+            params![now, attempt],
+        )?;
+        // A cancelled Single agent run keeps its result as history, but the
+        // result no longer awaits a decision and its writer cannot report.
+        tx.execute(
+            "UPDATE workflow_result_bindings SET state='superseded',state_reason='The run was cancelled',updated_at=?1
+             WHERE attempt_id=?2 AND state IN ('pending_quiescence','awaiting_checks','awaiting_human')",
+            params![now, attempt],
+        )?;
+        tx.execute(
+            "UPDATE role_credentials SET revoked_at=?1 WHERE revoked_at IS NULL
+               AND role_generation_id IN (SELECT role_generation_id FROM execution_bindings WHERE attempt_id=?2)",
             params![now, attempt],
         )?;
         dispose_coordinator_failures(tx, &[attempt], id, now)?;

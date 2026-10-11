@@ -5,6 +5,7 @@ export type Role =
   | "implementer"
   | "code_reviewer"
   | "final_verifier";
+export type ExecutionActor = Role | "single_agent";
 export type Provider = "codex" | "claude";
 export interface ProtocolDescriptor {
   generation: number;
@@ -572,6 +573,8 @@ export interface ReviewBudget {
 }
 export interface Task {
   observed_usage?: ObservedUsage | null;
+  /** Absent for tasks without a workflow selection, which are TRIP. */
+  workflow?: TaskWorkflow;
   id: string;
   project_id: string;
   title: string;
@@ -724,6 +727,15 @@ export interface ObservedUsage {
   reason: string | null;
 }
 
+export type RoleGenerationStatus =
+  | "launch_reserved"
+  | "running"
+  | "stopping"
+  | "exited"
+  | "launch_failed"
+  | "recovery_required"
+  | "replaced"
+  | "revoked";
 export interface Session {
   observed_usage?: { current_turn: ObservedUsage; session: ObservedUsage } | null;
   id: string;
@@ -749,8 +761,15 @@ export interface Session {
   updated_at: string;
   task_id: string;
   attempt_id: string;
-  role: Role;
+  role: ExecutionActor;
   generation: number;
+  /** Absent from older services; consumers treat absence as not switchable. */
+  generation_status?: RoleGenerationStatus;
+  /**
+   * A newer effective generation of the same role and lane exists, so this
+   * session can no longer be switched or probed. Absent from older services.
+   */
+  has_newer_generation?: boolean | number;
   transcript_epoch?: string;
   process_identity?: Record<string, unknown> | null;
   interrupt_requested_at?: string | null;
@@ -835,6 +854,444 @@ export interface CmuxKeyboardControlOutcome {
   state: "pending" | "control" | "view_only" | "blocked" | "retired";
   message: string;
   surface: CmuxSessionSurface;
+}
+/** One exact session epoch whose retained output is being read. */
+export interface HistorySelection {
+  session_id: string;
+  transcript_epoch: string;
+}
+export interface HistoryRetention {
+  first_retained_sequence: number | null;
+  high_water_sequence: number;
+  gap_count: number;
+  complete: boolean;
+}
+/** The complete retained selection as the service exported it. */
+export interface HistoryExportText extends HistorySelection {
+  export_hash: string;
+  high_water_sequence: number;
+  retention: HistoryRetention;
+  text: string;
+}
+export type HistoryPaneViewState =
+  | "reserved"
+  | "opened"
+  | "unknown"
+  | "failed"
+  | "closed";
+export interface HistoryPaneView extends HistorySelection {
+  id: string;
+  operation_id: string;
+  role_generation_id: string | null;
+  high_water_sequence: number;
+  export_hash: string | null;
+  service_boot_id: string;
+  workspace_id: string | null;
+  surface_id: string | null;
+  state: HistoryPaneViewState;
+  failure_reason: string | null;
+  retry_allowed: boolean;
+  created_at: string;
+  updated_at: string;
+}
+export interface HistoryPaneOutcome {
+  view: HistoryPaneView;
+  message: string;
+}
+export type WorkflowFamily = "trip" | "single_agent";
+export type SingleAgentStage =
+  | "waiting_to_start"
+  | "writing"
+  | "result_submitted_waiting_for_stop"
+  | "awaiting_selected_checks"
+  | "awaiting_human"
+  | "accepted"
+  | "probe_evidence_recorded"
+  | "changes_requested"
+  | "needs_action"
+  | "blocked";
+export interface AcceptanceEvidence {
+  kind: "source" | "check" | "manual" | "not_run";
+  detail: string;
+}
+export interface AcceptanceRow {
+  criterion: string;
+  status: "met" | "unmet";
+  evidence: AcceptanceEvidence[];
+}
+export interface SingleAgentResult {
+  id: string;
+  state: string;
+  summary: string;
+  acceptance_rows: AcceptanceRow[];
+  snapshot_id: string | null;
+  candidate_hash: string | null;
+  selected_check_revision: number;
+  created_at: string;
+}
+export type SingleAgentAction =
+  | "accept_result"
+  | "request_rework"
+  | "authorize_check"
+  | "resume_run"
+  | "cancel";
+/** The writer's retained conversation and whether a person can resume it. */
+export interface SingleAgentResume {
+  session_id: string;
+  transcript_epoch: string;
+  resume_count: number;
+  available: boolean;
+  reason: string | null;
+}
+export interface SingleAgentGuidanceChange {
+  path: string;
+  base_revision: string;
+  approved_sha256: string;
+  /** Null when the candidate deleted the file or it is not a regular file. */
+  candidate_sha256: string | null;
+}
+/** A selected check as a person authorizes it; decisions repeat both hashes. */
+export interface SingleAgentCheck {
+  check_id: string;
+  check_key: string;
+  original_text: string;
+  command_kind: "exact_argv" | "exact_shell";
+  executable: string | null;
+  arguments: string[];
+  shell_command: string | null;
+  cwd: string;
+  exact_command_hash: string;
+  scope_hash: string;
+  authorization: "authorized" | "denied" | "missing";
+  latest_run_id: string | null;
+  latest_run_status: string | null;
+  latest_run_passed: boolean | null;
+}
+export interface SingleAgentRun {
+  attempt_id: string;
+  definition_id: string | null;
+  definition_state: string;
+  profile_revision_id: string | null;
+  execution_config_revision_id: string | null;
+  parent_attempt_id: string | null;
+  /** Set when the task is the disposable probe of this profile admission. */
+  probe_admission_id: string | null;
+  stage: SingleAgentStage;
+  /** Plain-language explanation of the stage and what happens next. */
+  stage_reason: string;
+  selected_check_ids: string[];
+  /** Each selected check against the current candidate, once one exists. */
+  checks: SingleAgentCheck[];
+  /** Approved guidance the candidate changes; accepting repeats the hash. */
+  guidance_changes: SingleAgentGuidanceChange[];
+  guidance_change_hash: string | null;
+  resume: SingleAgentResume | null;
+  result: SingleAgentResult | null;
+  available_actions: SingleAgentAction[];
+  /** Acceptance never records Git integration; that stays separate. */
+  integration_recorded: boolean;
+}
+export interface TaskWorkflow {
+  family: WorkflowFamily;
+  definition_id: string | null;
+  execution_config_revision_id: string | null;
+  profile_revision_id: string | null;
+  check_ids: string[];
+  selection_revision: number;
+  admission_state: "draft" | "admitted" | "invalidated";
+  admission_reason: string | null;
+  run: SingleAgentRun | null;
+}
+export interface ExecutionConfiguration {
+  id: string;
+  revision: number;
+  content_hash: string;
+  configuration: Record<string, unknown>;
+  checks: Array<Record<string, unknown>>;
+  approved_at: string;
+}
+export interface AgentProfileRevision {
+  id: string;
+  revision: number;
+  provider: ValidationProvider;
+  model: string;
+  effort: string;
+  instructions_hash: string;
+  policy_id: string;
+  policy_hash: string;
+  adapter_hash: string;
+  authority: string;
+  session_contract: string;
+  profile_hash: string;
+  created_at: string;
+}
+export interface AgentProfile {
+  id: string;
+  display_name: string;
+  version: number;
+  current_revision: AgentProfileRevision | null;
+}
+export interface ProfileAdmission {
+  id: string;
+  profile_revision_id: string;
+  execution_config_revision_id: string;
+  state: "pending" | "activated" | "invalidated";
+  /** Why the profile cannot run yet, when it is not activated. */
+  state_reason: string | null;
+  /** The disposable task whose run proves this admission, once started. */
+  probe_task_id: string | null;
+  activated_at: string | null;
+  updated_at: string;
+  /**
+   * Whether `probe_profile_admission` would start a native probe now, by the
+   * command's own checks; the command still refuses on its own.
+   */
+  probe_available: boolean;
+  /** Why no probe can start now; set exactly when `probe_available` is false. */
+  probe_unavailable_reason: string | null;
+}
+export interface ProjectExecution {
+  project_id: string;
+  default_family: WorkflowFamily;
+  default_version: number;
+  configurations: ExecutionConfiguration[];
+  profiles: AgentProfile[];
+  admissions: ProfileAdmission[];
+}
+export interface ExecutionCheckInput {
+  check_key: string;
+  command_kind: "exact_argv" | "exact_shell";
+  executable?: string | null;
+  arguments?: string[];
+  shell_command?: string | null;
+  cwd: string;
+  timeout_seconds: number;
+  acceptance_rows?: string[];
+  relevant_inputs?: string[];
+  original_text: string;
+}
+export interface ExecutionConfigurationInput {
+  guidance_paths: string[];
+  testing_coverage: "minimal" | "moderate" | "extensive";
+  documentation_policy: string;
+  checks: ExecutionCheckInput[];
+}
+export interface AgentProfileInput {
+  display_name: string;
+  provider: ValidationProvider;
+  model: string;
+  effort: string;
+  instructions_text: string;
+}
+export interface TaskWorkflowSelectionInput {
+  family: WorkflowFamily;
+  execution_config_revision_id?: string | null;
+  profile_revision_id?: string | null;
+  check_ids?: string[];
+}
+export type WorkflowCommand =
+  | {
+    kind: "save_execution_configuration";
+    operation_id: string;
+    project_id: string;
+    expected_revision: number;
+    configuration: ExecutionConfigurationInput;
+  }
+  | {
+    kind: "save_agent_profile";
+    operation_id: string;
+    project_id: string;
+    profile_id?: string | null;
+    expected_version?: number | null;
+    profile: AgentProfileInput;
+  }
+  | {
+    kind: "prepare_profile_admission";
+    operation_id: string;
+    project_id: string;
+    profile_revision_id: string;
+    execution_config_revision_id: string;
+  }
+  | {
+    /** Queues a disposable probe run; refused while the contract is unqualified. */
+    kind: "probe_profile_admission";
+    operation_id: string;
+    project_id: string;
+    admission_id: string;
+  }
+  | {
+    kind: "activate_profile_admission";
+    operation_id: string;
+    project_id: string;
+    admission_id: string;
+  }
+  | {
+    kind: "set_project_workflow_default";
+    operation_id: string;
+    project_id: string;
+    expected_version: number;
+    family: WorkflowFamily;
+  }
+  | {
+    kind: "set_task_workflow";
+    operation_id: string;
+    task_id: string;
+    expected_version: number;
+    selection: TaskWorkflowSelectionInput;
+  }
+  | {
+    kind: "accept_result";
+    operation_id: string;
+    task_id: string;
+    attempt_id: string;
+    expected_version: number;
+    result_binding_id: string;
+    candidate_hash: string;
+    /** Required exactly when the run reports guidance changes. */
+    guidance_change_hash?: string | null;
+  }
+  | {
+    kind: "request_rework";
+    operation_id: string;
+    task_id: string;
+    attempt_id: string;
+    expected_version: number;
+    result_binding_id: string;
+    candidate_hash: string;
+    feedback: string;
+  }
+  | {
+    /** An omitted selection resolves the project default at creation. */
+    kind: "create_task";
+    operation_id: string;
+    project_id: string;
+    title: string;
+    description: string;
+    acceptance_criteria: string[];
+    priority: number;
+    selection?: TaskWorkflowSelectionInput | null;
+  }
+  | {
+    /** Bound to the session and transcript epoch the person reviewed. */
+    kind: "resume_run";
+    operation_id: string;
+    task_id: string;
+    attempt_id: string;
+    expected_version: number;
+    session_id: string;
+    transcript_epoch: string;
+    message?: string | null;
+  }
+  | {
+    kind: "authorize_check";
+    operation_id: string;
+    task_id: string;
+    attempt_id: string;
+    check_id: string;
+    exact_command_hash: string;
+    scope_hash: string;
+    decision: "authorized" | "denied";
+    lifetime: "once" | "run";
+  };
+export interface WorkflowCommandResult {
+  operation_id: string;
+  entity_kind: string;
+  entity_id: string;
+  version: number | null;
+  state: string;
+  detail: Record<string, unknown>;
+}
+export type ValidationProvider = "codex" | "claude";
+export interface ProviderValidationSelection {
+  provider: ValidationProvider;
+  model: string;
+  effort: string;
+}
+export type ProviderCheckPlan = "reuse_proof" | "model_call" | "unavailable";
+/** What the service found locally for one provider; no model was contacted. */
+export interface ProviderInstallation {
+  provider: ValidationProvider;
+  ready: boolean;
+  executable_path: string | null;
+  executable_version: string | null;
+  account_identity: string | null;
+  authentication: string | null;
+  model_calls_disabled_reason: string | null;
+  guidance: string | null;
+}
+export interface ProviderCheckPreview {
+  ordinal: number;
+  provider: ValidationProvider;
+  model: string;
+  effort: string;
+  plan: ProviderCheckPlan;
+  reason: string;
+  proof_observed_at: string | null;
+  proof_expires_at: string | null;
+  /** Advisory only; never decides whether a check runs. */
+  model_listed: boolean | null;
+}
+export interface ProviderValidationPreview {
+  preview_hash: string;
+  installations: ProviderInstallation[];
+  checks: ProviderCheckPreview[];
+  model_calls_required: number;
+}
+export type ProviderCheckState =
+  | "pending"
+  | "reserved"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "delivery_unknown"
+  | "cancel_requested"
+  | "cancelled"
+  | "skipped";
+export interface ProviderCheck {
+  id: string;
+  ordinal: number;
+  provider: ValidationProvider;
+  model: string;
+  effort: string;
+  state: ProviderCheckState;
+  reused_proof: boolean;
+  reason: string | null;
+  proof_observed_at: string | null;
+  proof_expires_at: string | null;
+  updated_at: string;
+}
+export interface ProviderValidationBatch {
+  id: string;
+  operation_id: string;
+  state: "running" | "cancel_requested" | "finished" | "cancelled";
+  model_calls_authorized: boolean;
+  max_model_calls: number;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+  checks: ProviderCheck[];
+}
+/**
+ * The settled outcome of one exact start request: the batch it started, or
+ * proof that it never started and never will. Settling contacts no model.
+ */
+export type ProviderValidationStartOutcome =
+  | { outcome: "started"; batch: ProviderValidationBatch }
+  | { outcome: "closed_without_start"; operation_id: string; closed_at: string };
+/** App-wide evidence only; it never grants a project capability. */
+export interface ProviderProof {
+  provider: ValidationProvider;
+  model: string;
+  effort: string;
+  executable_version: string | null;
+  account_identity: string | null;
+  observed_at: string;
+  expires_at: string;
+  expired: boolean;
+}
+export interface ProviderValidationState {
+  batches: ProviderValidationBatch[];
+  proofs: ProviderProof[];
 }
 export interface CheckRun {
   [key: string]: unknown;
@@ -1087,6 +1544,33 @@ export interface TaskProgress {
   last_agent_activity_at: string | null;
   activity: "no_live_agent" | "agent_live_idle" | "agent_active_without_progress";
 }
+/**
+ * What a changed instruction file is compared with. `pinned` bytes hash to the
+ * file's `previous_sha256`; `base_commit` bytes are only the workspace's base
+ * commit version and are never the reviewed pin; `unavailable` explains why
+ * no comparison is offered.
+ */
+export interface GuidancePreviewBaseline {
+  source: "pinned" | "base_commit" | "unavailable";
+  revision: string;
+  sha256: string | null;
+  reason: string | null;
+}
+/** Lines keep their newline; long unchanged runs collapse to a count. */
+export type GuidanceDiffLine =
+  | { kind: "context" | "removed" | "added"; text: string }
+  | { kind: "unchanged"; lines: number };
+export interface GuidancePreviewFile {
+  path: string;
+  previous_sha256: string;
+  sha256: string;
+  /** The complete current content whose hash is `sha256`. */
+  content: string;
+  /** Absent from older services, which offer no comparison. */
+  baseline?: GuidancePreviewBaseline;
+  /** Present exactly when the baseline is not `unavailable`. */
+  diff?: GuidanceDiffLine[] | null;
+}
 export interface GuidanceReauthorizationPreview {
   task_id: string;
   attempt_id: string;
@@ -1094,7 +1578,9 @@ export interface GuidanceReauthorizationPreview {
   plan_hash: string;
   config_revision_id: string;
   policy_hash: string;
-  files: { path: string; previous_sha256: string; sha256: string; content: string }[];
+  /** The worktree the files were read from; absent from older services. */
+  workspace?: { path: string; base_revision: string };
+  files: GuidancePreviewFile[];
 }
 /**
  * The next step a task offers on its board card and in its header: the first
@@ -1179,6 +1665,10 @@ export interface AppState extends StateCursor {
   attention: AttentionItem[];
   /** Absent from older services; derived from `attention` by the host. */
   task_actions?: TaskAction[];
+  /** Absent from older services; app-wide and outside every project. */
+  provider_validation?: ProviderValidationState;
+  /** Absent from older services; per-project Single agent setup. */
+  workflow_execution?: ProjectExecution[];
   resources: {
     active_sessions: number;
     active_controls: number;
@@ -1295,7 +1785,10 @@ export interface PermissionRequest {
   attempt_id: string;
   session_id: string;
   role_generation_id: string;
-  role: Role;
+  /** Null for a Single agent request, which is no TRIP role. */
+  role: Role | null;
+  /** Absent from older services. */
+  actor?: ExecutionActor;
   provider: Provider;
   native_session_id: string;
   tool_name: string;
@@ -1333,7 +1826,7 @@ export interface PermissionScopePreview {
   command_family: string;
   arguments: string;
   provider: Provider;
-  role: Role;
+  role: ExecutionActor;
   native_session?: string;
   worktree?: string;
   registered_root?: string;
@@ -1345,7 +1838,10 @@ export interface PermissionRule {
   id: string;
   provider: Provider;
   project_id: string;
-  role: Role;
+  /** Null for a Single agent rule, which is no TRIP role. */
+  role: Role | null;
+  /** Absent from older services. */
+  actor?: ExecutionActor;
   lifetime: "session" | "project";
   session_id?: string;
   display_family: string;
@@ -1531,7 +2027,9 @@ export const ROLES: Role[] = [
   "code_reviewer",
   "final_verifier",
 ];
-export const roleLabel = (role: Role) =>
-  role.split("_").map((part) => part[0].toUpperCase() + part.slice(1)).join(
-    " ",
-  );
+/** A permission DTO's null role is the Single agent, the only other actor. */
+export const roleLabel = (role: ExecutionActor | null) =>
+  role === null || role === "single_agent"
+    ? "Single agent"
+    : role.split("_").map((part) => part[0].toUpperCase() + part.slice(1))
+      .join(" ");

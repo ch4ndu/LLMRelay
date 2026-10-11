@@ -1821,10 +1821,21 @@ pub fn guidance_reauthorization_preview(store: &Store, task_id: &str) -> Result<
     const MAX_CONTENT_BYTES: usize = 256 * 1024;
     let mut connection = store.lock()?;
     let transaction = connection.transaction()?;
-    let row: Option<(i64, String, String, String, String, String, String, String)> = transaction
+    type PreviewRow = (
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    );
+    let row: Option<PreviewRow> = transaction
         .query_row(
             "SELECT t.version,a.id,a.plan_hash,r.id,p.plan_json,
-                    json_extract(r.config_json,'$.guidance'),w.path,w.policy_json
+                    json_extract(r.config_json,'$.guidance'),w.path,w.policy_json,w.base_revision
              FROM tasks t JOIN attempts a ON a.id=(SELECT latest.id FROM attempts latest
                WHERE latest.task_id=t.id ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)
              JOIN trip_structured_plans p ON p.id=a.structured_plan_id AND p.plan_hash=a.plan_hash
@@ -1845,11 +1856,12 @@ pub fn guidance_reauthorization_preview(store: &Store, task_id: &str) -> Result<
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )
         .optional()?;
-    let (version, attempt, plan_hash, config, plan, guidance, root, policy_json) =
+    let (version, attempt, plan_hash, config, plan, guidance, root, policy_json, base_revision) =
         row.ok_or_else(|| anyhow!("no current approved implementation plan and ready workspace"))?;
     let root = PathBuf::from(root).canonicalize()?;
     let named = approved_documentation_paths(&serde_json::from_str(&plan)?);
@@ -1902,17 +1914,192 @@ pub fn guidance_reauthorization_preview(store: &Store, task_id: &str) -> Result<
         }
         let content =
             String::from_utf8(bytes).context("documentation preview requires UTF-8 text")?;
-        files.push(serde_json::json!({"path":relative,"previous_sha256":previous,"sha256":hash,"content":content}));
         policy["files"][relative] = serde_json::json!(hash);
+        files.push((relative.clone(), previous, hash, content));
     }
     // A preview cannot offer approval while another pinned file has drifted.
     verified_policy_paths(&root, &policy)?;
+    // Only bytes are compared, read from the object database without
+    // filters, so the diff belongs to exactly the content and hash shown.
+    let committed = if !files.is_empty()
+        && base_revision.len() >= 40
+        && base_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        let paths = files
+            .iter()
+            .map(|(relative, ..)| relative.as_str())
+            .collect::<Vec<_>>();
+        // The comparison budget plus each object's header line, which echoes
+        // at most the revision and path; Git's output beyond it is never read.
+        let read_bound = MAX_CONTENT_BYTES
+            + paths
+                .iter()
+                .map(|path| base_revision.len() + path.len() + 128)
+                .sum::<usize>();
+        match crate::workspace::committed_files_within(&root, &base_revision, &paths, read_bound) {
+            Ok(Some(blobs)) => Ok(blobs),
+            Ok(None) => Err(
+                "The base commit's versions of the changed files exceed the preview's 256 KiB comparison limit"
+                    .to_owned(),
+            ),
+            Err(_) => Err("LLMRelay could not read the workspace's base commit".to_owned()),
+        }
+    } else {
+        Err("The workspace has no recorded base commit to compare with".to_owned())
+    };
+    let mut baseline_bytes = 0;
+    let files = files
+        .into_iter()
+        .enumerate()
+        .map(|(index, (relative, previous, hash, content))| {
+            let compared = match committed.as_ref().map(|blobs| blobs[index].as_deref()) {
+                Err(reason) => Err(reason.clone()),
+                Ok(None) => Err(format!(
+                    "The base commit has no version of {relative} to compare with"
+                )),
+                Ok(Some(before)) if before.len() > MAX_FILE_BYTES => Err(format!(
+                    "The base commit's version of {relative} exceeds the 64 KiB preview limit"
+                )),
+                Ok(Some(before)) => {
+                    baseline_bytes += before.len();
+                    if baseline_bytes > MAX_CONTENT_BYTES {
+                        Err("The preview's comparison limit was reached".to_owned())
+                    } else {
+                        std::str::from_utf8(before)
+                            .map_err(|_| {
+                                format!("The base commit's version of {relative} is not UTF-8 text")
+                            })
+                            .map(|text| (sha256(before), guidance_line_diff(text, &content)))
+                    }
+                }
+            };
+            let (baseline, diff) = match compared {
+                // The pinned hash names the reviewed bytes; a base commit
+                // version with another hash is labelled as only that.
+                Ok((baseline_sha256, diff)) => {
+                    let source = if baseline_sha256 == previous {
+                        "pinned"
+                    } else {
+                        "base_commit"
+                    };
+                    (
+                        serde_json::json!({
+                            "source": source,
+                            "revision": base_revision,
+                            "sha256": baseline_sha256,
+                            "reason": null,
+                        }),
+                        serde_json::json!(diff),
+                    )
+                }
+                Err(reason) => (
+                    serde_json::json!({
+                        "source": "unavailable",
+                        "revision": base_revision,
+                        "sha256": null,
+                        "reason": format!("{reason}; the complete current content is shown instead"),
+                    }),
+                    serde_json::Value::Null,
+                ),
+            };
+            serde_json::json!({"path":relative,"previous_sha256":previous,"sha256":hash,
+                "content":content,"baseline":baseline,"diff":diff})
+        })
+        .collect::<Vec<_>>();
     transaction.commit()?;
     Ok(
         serde_json::json!({"task_id":task_id,"attempt_id":attempt,"expected_version":version,
         "plan_hash":plan_hash,"config_revision_id":config,"policy_hash":sha256(policy_json.as_bytes()),
-        "files":files}),
+        "workspace":{"path":root,"base_revision":base_revision},"files":files}),
     )
+}
+
+/// A line diff of `before` against `after` for review: lines that differ, with
+/// three lines of context, and longer unchanged runs collapsed to a count.
+/// Lines keep their newline. A changed region too large to align is shown
+/// removed then added, which is still exact.
+fn guidance_line_diff(before: &str, after: &str) -> Vec<serde_json::Value> {
+    const CONTEXT: usize = 3;
+    const MAX_ALIGNED_CELLS: usize = 1 << 20;
+    let before = before.split_inclusive('\n').collect::<Vec<_>>();
+    let after = after.split_inclusive('\n').collect::<Vec<_>>();
+    let prefix = before
+        .iter()
+        .zip(&after)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = before[prefix..]
+        .iter()
+        .rev()
+        .zip(after[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let old = &before[prefix..before.len() - suffix];
+    let new = &after[prefix..after.len() - suffix];
+    let mut lines = before[..prefix]
+        .iter()
+        .map(|line| ("context", *line))
+        .collect::<Vec<_>>();
+    if old.len().saturating_mul(new.len()) <= MAX_ALIGNED_CELLS {
+        let width = new.len() + 1;
+        let mut common = vec![0_u32; (old.len() + 1) * width];
+        for i in (0..old.len()).rev() {
+            for j in (0..new.len()).rev() {
+                common[i * width + j] = if old[i] == new[j] {
+                    common[(i + 1) * width + j + 1] + 1
+                } else {
+                    common[(i + 1) * width + j].max(common[i * width + j + 1])
+                };
+            }
+        }
+        let (mut i, mut j) = (0, 0);
+        while i < old.len() || j < new.len() {
+            if i < old.len() && j < new.len() && old[i] == new[j] {
+                lines.push(("context", old[i]));
+                (i, j) = (i + 1, j + 1);
+            } else if i < old.len()
+                && (j == new.len() || common[(i + 1) * width + j] >= common[i * width + j + 1])
+            {
+                lines.push(("removed", old[i]));
+                i += 1;
+            } else {
+                lines.push(("added", new[j]));
+                j += 1;
+            }
+        }
+    } else {
+        lines.extend(old.iter().map(|line| ("removed", *line)));
+        lines.extend(new.iter().map(|line| ("added", *line)));
+    }
+    lines.extend(
+        before[before.len() - suffix..]
+            .iter()
+            .map(|line| ("context", *line)),
+    );
+    let mut visible = vec![false; lines.len()];
+    for (index, (kind, _)) in lines.iter().enumerate() {
+        if *kind != "context" {
+            let end = (index + CONTEXT + 1).min(lines.len());
+            visible[index.saturating_sub(CONTEXT)..end].fill(true);
+        }
+    }
+    let mut diff = Vec::new();
+    let mut hidden = 0;
+    for ((kind, text), shown) in lines.into_iter().zip(visible) {
+        if !shown {
+            hidden += 1;
+            continue;
+        }
+        if hidden > 0 {
+            diff.push(serde_json::json!({"kind":"unchanged","lines":hidden}));
+            hidden = 0;
+        }
+        diff.push(serde_json::json!({"kind":kind,"text":text}));
+    }
+    if hidden > 0 {
+        diff.push(serde_json::json!({"kind":"unchanged","lines":hidden}));
+    }
+    diff
 }
 
 /// Applies your explicit approval that listed guidance files in the active
@@ -9206,11 +9393,15 @@ pub(crate) fn require_setup_session_confinement(
     let target = crate::workspace::inspect(Path::new(&target_path))?;
     let workspace = PathBuf::from(workspace_path).canonicalize()?;
     let expected = BTreeSet::from([target.root, target.common_directory]);
-    if expected
+    if let Some(denied) = expected
         .iter()
-        .any(|path| workspace.as_path() == path.as_path() || workspace.starts_with(path))
+        .find(|path| workspace.as_path() == path.as_path() || workspace.starts_with(path))
     {
-        bail!("setup fixture workspace overlaps a target read-denial root")
+        bail!(
+            "setup fixture workspace {} overlaps the target read-denial root {}",
+            workspace.display(),
+            denied.display()
+        )
     }
     let configured = match identity.provider {
         Provider::Codex => {
@@ -9446,11 +9637,15 @@ pub fn setup_target_read_denials(store: &Store, attempt_id: &str) -> Result<Vec<
     };
     let target = crate::workspace::inspect(Path::new(&target_path))?;
     let workspace = PathBuf::from(workspace_path).canonicalize()?;
-    if [target.root.as_path(), target.common_directory.as_path()]
+    if let Some(denied) = [target.root.as_path(), target.common_directory.as_path()]
         .into_iter()
-        .any(|denied| workspace == denied || workspace.starts_with(denied))
+        .find(|denied| workspace == *denied || workspace.starts_with(denied))
     {
-        bail!("setup fixture workspace overlaps the target repository or Git common directory; use an application data directory outside the target so provider read denial can be enforced")
+        bail!(
+            "launch preflight refused this setup launch before contacting the provider: the setup fixture workspace {} overlaps the target path {}. Use an application data directory outside the target repository and Git common directory so provider read denial can be enforced",
+            workspace.display(),
+            denied.display()
+        )
     }
     let denied = BTreeSet::from([target.root, target.common_directory]);
     Ok(denied.into_iter().collect())

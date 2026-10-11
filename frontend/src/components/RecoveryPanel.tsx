@@ -2,6 +2,7 @@ import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import { useRef, useState } from "react";
 import { command, operationId } from "../api";
 import {
+  type ContinuationAction,
   type FailedStepDetail,
   roleLabel,
   type Session,
@@ -52,10 +53,12 @@ function failedStepDetail(
 }
 
 export function RecoveryPanel(
-  { task, records, sessions = [], selectedRecordId, onChanged }: {
+  { task, records, sessions = [], actions = [], selectedRecordId, onChanged }: {
     task: Task;
     records: Array<Record<string, unknown>>;
     sessions?: Session[];
+    /** Current continuation actions; a failed step's Retry follows its own. */
+    actions?: ContinuationAction[];
     /** An exact record opened from attention; no other record replaces it. */
     selectedRecordId?: string;
     onChanged: () => void;
@@ -75,6 +78,10 @@ export function RecoveryPanel(
         attemptId={attempt.id}
         record={record}
         session={sessions.find((session) => session.id === record.session_id)}
+        continuation={actions.find((action) =>
+          action.kind === "recover_failed_step" &&
+          action.binding.recovery_id === record.id
+        )}
         onChanged={onChanged}
       />
     );
@@ -113,11 +120,12 @@ export function RecoveryPanel(
 }
 
 function RecoveryDecision(
-  { task, attemptId, record, session, onChanged }: {
+  { task, attemptId, record, session, continuation, onChanged }: {
     task: Task;
     attemptId: string;
     record: Record<string, unknown>;
     session?: Session;
+    continuation?: ContinuationAction;
     onChanged: () => void;
   },
 ) {
@@ -186,8 +194,19 @@ function RecoveryDecision(
       : undefined;
     // A possible effect is retried only once the service lists no unsettled
     // outcome; a missing list counts as unsettled.
-    const retryBlocked = hold?.effect_certainty !== "none" &&
+    const unsettled = hold?.effect_certainty !== "none" &&
       (blockedBy === undefined || blockedBy.length > 0);
+    // A known unchanged cause would fail the same way, so Retry stays off
+    // until the service stops reporting it.
+    const continuationPrerequisite = continuation?.binding.retry_prerequisite;
+    const prerequisite = typeof record.retry_prerequisite === "string"
+      ? record.retry_prerequisite
+      : typeof continuationPrerequisite === "string"
+      ? continuationPrerequisite
+      : undefined;
+    const serviceRefusesRetry = continuation?.binding.retry_enabled === false;
+    const retryBlocked = unsettled || prerequisite !== undefined ||
+      serviceRefusesRetry;
     return (
       <section
         className="panel recovery"
@@ -205,11 +224,18 @@ function RecoveryDecision(
         <p>
           {!exact
             ? "The details of this failed step do not match the task shown here. Refresh to see the current state."
-            : retryBlocked
+            : prerequisite !== undefined
+            ? "Retry failed step is unavailable because its cause has not changed: an instruction file this task depends on still differs from its approved content, so retrying would fail the same way. Your edits are kept. Either restore the file yourself, or, if the approved plan includes this documentation change, choose Review planned documentation update under Review changed instruction files. Retry becomes available once the files are in order."
+            : unsettled
             ? "Retry failed step becomes available after LLMRelay records the outcome of the agent action this step may have started. Check the task's Activity tab in the meantime. To stop the task instead, choose Cancel in Controls."
+            : serviceRefusesRetry
+            ? `LLMRelay does not offer Retry failed step right now.${
+              continuation?.reason ? ` ${continuation.reason}` : ""
+            }`
             : "Check the task's Activity tab, describe what you found below, then choose Retry failed step. LLMRelay then evaluates the task again from its current state. It never repeats a step whose outcome is unknown, and other holds on this task stay in place. To stop the task instead, choose Cancel in Controls."}
         </p>
         <TechnicalDetails>
+          {prerequisite !== undefined && <pre>{prerequisite}</pre>}
           <p>
             {hold
               ? `${hold.operation} · effect ${hold.effect_certainty} · `
@@ -295,7 +321,7 @@ function RecoveryDecision(
           : materialization
           ? "Rework materialization needs a decision for this exact intent. Retry uses its recorded intent ID; cancellation verifies the whole parent and child lineage."
           : genericResolver
-          ? "Process ownership is unresolved. Your note annotates the decision; the service still verifies every recorded PID and start identity. After reconciliation, use the exact session Resume action in the task's agent settings."
+          ? "Process ownership is unresolved. Your note annotates the decision; the service still verifies every recorded PID and start identity. After reconciliation, use the exact session Resume action in the task's Roles tab."
           : "This historical control record has no exact process, check, workspace, or claim tuple. It was definitively rejected, so generic recovery would be guaranteed to fail; refresh and submit a corrected versioned control."}
       </p>
       <p>Recovery record {String(record.id || "unknown")}{sessionId ? ` · session ${sessionId}` : ""}</p>

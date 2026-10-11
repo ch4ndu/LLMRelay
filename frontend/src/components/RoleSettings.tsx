@@ -14,7 +14,9 @@ import {
   type CompatibilityExplanation,
   type ContinuationAction,
   type ProductionRoleRestriction,
+  type ProfileAdmission,
   type Project,
+  type ProjectExecution,
   type Provider,
   type Role,
   type RoleConfig,
@@ -26,12 +28,19 @@ import {
   type SwitchIntent,
   type Task,
   type TripLaneState,
+  type WorkflowFamily,
 } from "../types";
+import {
+  generationSettled,
+  UncertainRequestNotice,
+  type WorkflowCommandRunner,
+  useWorkflowCommands,
+} from "./WorkflowControls";
 
 const compatibilityActions: Record<CompatibilityExplanation["action"], string> = {
   install_supported_provider_version: "Install the supported agent version shown below, or update LLMRelay, then verify the profile again.",
   update_llmrelay_release: "Update LLMRelay to a release that supports this agent version, then verify the profile again.",
-  requalify_exact_profile: "Use Project setup or Agent settings to run verification for these agent settings before starting work.",
+  requalify_exact_profile: "Use Project setup or the task's Roles tab to run verification for these agent settings before starting work.",
   inspect_local_provider_configuration: "Review the agent setting named in Technical details and correct it before verifying again.",
   contact_operator: "Ask the person who manages this LLMRelay installation to review Technical details and update or repair it.",
 };
@@ -80,6 +89,493 @@ export function CompatibilityDetails({
   );
 }
 
+export interface SingleAgentSelection {
+  execution_config_revision_id: string;
+  profile_revision_id: string;
+  check_ids: string[];
+}
+
+export const emptySingleAgentSelection = (
+  execution?: ProjectExecution,
+): SingleAgentSelection => ({
+  execution_config_revision_id: execution?.configurations[0]?.id ?? "",
+  profile_revision_id: "",
+  check_ids: [],
+});
+
+const providerName = (provider: Provider) =>
+  provider === "claude" ? "Claude" : "Codex";
+
+// Configuration checks arrive as untyped records; only an ID makes one
+// selectable.
+const configurationChecks = (
+  execution: ProjectExecution | undefined,
+  configId: string,
+) =>
+  (execution?.configurations.find((item) => item.id === configId)?.checks ?? [])
+    .flatMap((check) => {
+      const id = check.id;
+      const text = check.original_text;
+      const key = check.check_key;
+      if (typeof id !== "string") return [];
+      return [{
+        id,
+        label: typeof text === "string" && text.trim()
+          ? text
+          : typeof key === "string"
+          ? key
+          : "Check",
+      }];
+    });
+
+export const latestAdmission = (
+  execution: ProjectExecution | undefined,
+  profileRevisionId: string,
+  configId: string,
+): ProfileAdmission | undefined =>
+  execution?.admissions.filter((admission) =>
+    admission.profile_revision_id === profileRevisionId &&
+    admission.execution_config_revision_id === configId
+  ).sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0];
+
+const admissionSummary = (admission: ProfileAdmission | undefined) =>
+  !admission
+    ? "Not admitted yet. Prepare its admission before a task can use this profile with this configuration."
+    : admission.state === "activated"
+    ? "Admitted for this project with this configuration."
+    : admission.state === "pending"
+    ? `Admission pending${
+      admission.state_reason ? `: ${admission.state_reason}` : "."
+    }`
+    : `Admission no longer valid${
+      admission.state_reason ? `: ${admission.state_reason}` : "."
+    } Prepare it again.`;
+
+export function SingleAgentSelectionFields(
+  { execution, value, onChange, disabled = false }: {
+    execution?: ProjectExecution;
+    value: SingleAgentSelection;
+    onChange: (value: SingleAgentSelection) => void;
+    disabled?: boolean;
+  },
+) {
+  const profiles = (execution?.profiles ?? []).flatMap((profile) =>
+    profile.current_revision ? [{ profile, revision: profile.current_revision }] : []
+  );
+  if (!execution?.configurations.length || !profiles.length) {
+    return (
+      <p className="hint">
+        This project has no Single agent setup yet. Add an execution
+        configuration and an agent profile in Project settings first.
+      </p>
+    );
+  }
+  const checks = configurationChecks(execution, value.execution_config_revision_id);
+  const chosen = !!value.execution_config_revision_id &&
+    !!value.profile_revision_id;
+  return (
+    <fieldset className="single-agent-selection" disabled={disabled}>
+      <legend>Single agent setup</legend>
+      <label>
+        Execution configuration
+        <select
+          value={value.execution_config_revision_id}
+          onChange={(event) =>
+            onChange({
+              ...value,
+              execution_config_revision_id: event.target.value,
+              check_ids: [],
+            })}
+        >
+          <option value="">Choose a configuration</option>
+          {execution.configurations.map((configuration) => (
+            <option key={configuration.id} value={configuration.id}>
+              Revision {configuration.revision} · approved{" "}
+              {new Date(configuration.approved_at).toLocaleString()}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Agent profile
+        <select
+          value={value.profile_revision_id}
+          onChange={(event) =>
+            onChange({ ...value, profile_revision_id: event.target.value })}
+        >
+          <option value="">Choose a profile</option>
+          {profiles.map(({ profile, revision }) => (
+            <option key={revision.id} value={revision.id}>
+              {profile.display_name} · {providerName(revision.provider)} ·{" "}
+              {revision.model} · {revision.effort}
+            </option>
+          ))}
+        </select>
+      </label>
+      {checks.length > 0 && (
+        <fieldset>
+          <legend>Checks the result must pass</legend>
+          {checks.map((check) => (
+            <label className="toggle" key={check.id}>
+              <input
+                type="checkbox"
+                checked={value.check_ids.includes(check.id)}
+                onChange={(event) =>
+                  onChange({
+                    ...value,
+                    check_ids: event.target.checked
+                      ? [...value.check_ids, check.id]
+                      : value.check_ids.filter((id) => id !== check.id),
+                  })}
+              />
+              {check.label}
+            </label>
+          ))}
+        </fieldset>
+      )}
+      {chosen && (
+        <p className="hint">
+          {admissionSummary(
+            latestAdmission(
+              execution,
+              value.profile_revision_id,
+              value.execution_config_revision_id,
+            ),
+          )}
+        </p>
+      )}
+    </fieldset>
+  );
+}
+
+/**
+ * Prepare, probe and activate one profile revision's admission with one
+ * configuration. Probing queues a paid model run, so it needs a second,
+ * explicit confirmation; nothing here runs on its own.
+ */
+export function AdmissionControls(
+  { projectId, execution, profileRevisionId, configId, tasks, commands }: {
+    projectId: string;
+    execution?: ProjectExecution;
+    profileRevisionId: string;
+    configId: string;
+    tasks: Task[];
+    commands: WorkflowCommandRunner;
+  },
+) {
+  const [confirmProbe, setConfirmProbe] = useState(false);
+  const admission = latestAdmission(execution, profileRevisionId, configId);
+  const probeTask = admission?.probe_task_id
+    ? tasks.find((task) => task.id === admission.probe_task_id)
+    : undefined;
+  const probeRun = probeTask?.workflow?.run ?? null;
+  const probeOpen = !!probeTask && !probeTask.archived &&
+    !["done", "cancelled"].includes(probeTask.lifecycle);
+  const evidenceRecorded = probeRun?.stage === "probe_evidence_recorded";
+  const key = `${profileRevisionId}:${configId}`;
+  const prepare = () =>
+    void commands.submit(`prepare:${key}`, (operation_id) => ({
+      kind: "prepare_profile_admission",
+      operation_id,
+      project_id: projectId,
+      profile_revision_id: profileRevisionId,
+      execution_config_revision_id: configId,
+    }));
+  const probe = async (admissionId: string) => {
+    await commands.submit(`probe:${admissionId}`, (operation_id) => ({
+      kind: "probe_profile_admission",
+      operation_id,
+      project_id: projectId,
+      admission_id: admissionId,
+    }));
+    setConfirmProbe(false);
+  };
+  const activate = (admissionId: string) =>
+    void commands.submit(`activate:${admissionId}`, (operation_id) => ({
+      kind: "activate_profile_admission",
+      operation_id,
+      project_id: projectId,
+      admission_id: admissionId,
+    }));
+  const keys = [`prepare:${key}`, ...(admission
+    ? [`probe:${admission.id}`, `activate:${admission.id}`]
+    : [])];
+  const uncertain = keys.some((item) => commands.uncertain.has(item));
+  const changedSince = keys.some((item) => commands.reviewed.has(item));
+  return (
+    <div className="admission-controls">
+      <p>{admissionSummary(admission)}</p>
+      {(!admission || admission.state === "invalidated") && (
+        <>
+          <button disabled={commands.busy} onClick={prepare}>
+            Prepare admission
+          </button>
+          <small>
+            Preparing records exactly what would be admitted. It starts
+            nothing and makes no model call.
+          </small>
+        </>
+      )}
+      {admission?.state === "pending" && !probeOpen && !evidenceRecorded && (
+        !admission.probe_available
+          ? (
+            <>
+              <button disabled>Probe this profile…</button>
+              <small>
+                A probe cannot start now:{" "}
+                {admission.probe_unavailable_reason ??
+                  "LLMRelay did not report why."}
+              </small>
+            </>
+          )
+          : confirmProbe
+          ? (
+            <div className="warning">
+              <p>
+                A probe queues one disposable task that runs this agent once in
+                its own worktree, which is a paid model call. Its result is
+                evidence for this admission only.
+              </p>
+              <div className="button-row">
+                <button
+                  disabled={commands.busy}
+                  onClick={() => void probe(admission.id)}
+                >
+                  Queue the probe run
+                </button>
+                <button onClick={() => setConfirmProbe(false)}>
+                  Don't probe
+                </button>
+              </div>
+            </div>
+          )
+          : (
+            <button
+              disabled={commands.busy}
+              onClick={() => setConfirmProbe(true)}
+            >
+              Probe this profile…
+            </button>
+          )
+      )}
+      {probeOpen && probeTask && (
+        <p className="hint">
+          Probe task “{probeTask.title}”:{" "}
+          {probeRun?.stage_reason ?? "waiting to start."}
+        </p>
+      )}
+      {admission?.state === "pending" && evidenceRecorded && (
+        <button
+          className="primary"
+          disabled={commands.busy}
+          onClick={() => activate(admission.id)}
+        >
+          Activate admission
+        </button>
+      )}
+      {admission?.state === "activated" && admission.activated_at && (
+        <small>
+          Activated {new Date(admission.activated_at).toLocaleString()}.
+        </small>
+      )}
+      {uncertain && <UncertainRequestNotice changed={changedSince} />}
+    </div>
+  );
+}
+
+/**
+ * The workflow choice of a task that has not started. A Ready task returns
+ * to the drafts when its choice changes, so Make Ready rechecks it.
+ */
+function WorkflowChoice(
+  { task, execution, commands }: {
+    task: Task;
+    execution?: ProjectExecution;
+    commands: WorkflowCommandRunner;
+  },
+) {
+  const current = task.workflow;
+  const [family, setFamily] = useState<WorkflowFamily>(
+    current?.family ?? "trip",
+  );
+  const [selection, setSelection] = useState<SingleAgentSelection>(() =>
+    current?.family === "single_agent"
+      ? {
+        execution_config_revision_id: current.execution_config_revision_id ??
+          "",
+        profile_revision_id: current.profile_revision_id ?? "",
+        check_ids: current.check_ids,
+      }
+      : emptySingleAgentSelection(execution)
+  );
+  const unchanged = family === (current?.family ?? "trip") &&
+    (family === "trip" ||
+      (selection.execution_config_revision_id ===
+          current?.execution_config_revision_id &&
+        selection.profile_revision_id === current?.profile_revision_id &&
+        [...selection.check_ids].sort().join() ===
+          [...(current?.check_ids ?? [])].sort().join()));
+  const incomplete = family === "single_agent" &&
+    (!selection.execution_config_revision_id || !selection.profile_revision_id);
+  const key = `selection:${task.id}`;
+  const save = () =>
+    void commands.submit(key, (operation_id) => ({
+      kind: "set_task_workflow",
+      operation_id,
+      task_id: task.id,
+      expected_version: task.version,
+      selection: family === "trip" ? { family } : { family, ...selection },
+    }));
+  return (
+    <section className="panel workflow-choice">
+      <h3>Workflow</h3>
+      <div className="button-row" role="radiogroup" aria-label="Workflow">
+        {(["trip", "single_agent"] as const).map((option) => (
+          <label className="toggle" key={option}>
+            <input
+              type="radio"
+              name={`workflow-${task.id}`}
+              checked={family === option}
+              disabled={commands.busy}
+              onChange={() => setFamily(option)}
+            />
+            {option === "trip"
+              ? "TRIP (manager and five delegated roles)"
+              : "Single agent (one agent writes the whole task)"}
+          </label>
+        ))}
+      </div>
+      {family === "single_agent" && (
+        <SingleAgentSelectionFields
+          execution={execution}
+          value={selection}
+          onChange={setSelection}
+          disabled={commands.busy}
+        />
+      )}
+      {current?.admission_state === "invalidated" && current.admission_reason && (
+        <p className="hint">
+          The earlier admission of this task no longer applies:{" "}
+          {current.admission_reason}
+        </p>
+      )}
+      {task.lifecycle === "ready" && !unchanged && (
+        <p className="hint">
+          Saving moves this Ready task back to the drafts. Choose Make Ready
+          again afterwards.
+        </p>
+      )}
+      <button
+        disabled={commands.busy || unchanged || incomplete}
+        onClick={save}
+      >
+        Save workflow choice
+      </button>
+      {commands.uncertain.has(key) && (
+        <UncertainRequestNotice changed={commands.reviewed.has(key)} />
+      )}
+    </section>
+  );
+}
+
+/** A Single agent task's own actor, profile and admission; no TRIP roles. */
+function SingleAgentSettings(
+  { task, sessions, execution, tasks, commands }: {
+    task: Task;
+    sessions: Session[];
+    execution?: ProjectExecution;
+    tasks: Task[];
+    commands: WorkflowCommandRunner;
+  },
+) {
+  const workflow = task.workflow;
+  const terminal = task.archived ||
+    ["done", "cancelled"].includes(task.lifecycle);
+  const profileRevisionId = workflow?.run?.profile_revision_id ??
+    workflow?.profile_revision_id ?? "";
+  const configId = workflow?.run?.execution_config_revision_id ??
+    workflow?.execution_config_revision_id ?? "";
+  const profile = execution?.profiles.find((item) =>
+    item.current_revision?.id === profileRevisionId
+  );
+  const configuration = execution?.configurations.find((item) =>
+    item.id === configId
+  );
+  const writer = sessions.find((session) =>
+    session.task_id === task.id && session.role === "single_agent" &&
+    session.attempt_id === task.active_attempt?.id
+  );
+  return (
+    <section className="panel role-settings single-agent-settings">
+      <header>
+        <h3>Single agent</h3>
+        <span>One agent writes the whole task</span>
+      </header>
+      <dl className="progress-facts">
+        <dt>Agent profile</dt>
+        <dd>
+          {profile?.current_revision
+            ? `${profile.display_name} · ${
+              providerName(profile.current_revision.provider)
+            } · ${profile.current_revision.model} · ${profile.current_revision.effort}`
+            : profileRevisionId
+            ? "An earlier revision of a profile; its current settings may differ."
+            : "Not chosen yet"}
+        </dd>
+        <dt>Execution configuration</dt>
+        <dd>
+          {configuration
+            ? `Revision ${configuration.revision}`
+            : configId
+            ? "An earlier revision"
+            : "Not chosen yet"}
+        </dd>
+        <dt>Required checks</dt>
+        <dd>
+          {(workflow?.run?.selected_check_ids ?? workflow?.check_ids ?? [])
+            .length || "None"}
+        </dd>
+        <dt>Agent session</dt>
+        <dd>
+          {writer
+            ? writer.status === "running" ? "Running now" : "Not running"
+            : "Not started yet"}
+        </dd>
+      </dl>
+      {workflow && !workflow.run && (
+        <p className="hint">
+          {workflow.admission_state === "admitted"
+            ? "This task's selection is admitted and queued."
+            : workflow.admission_state === "invalidated"
+            ? `This task's admission no longer applies${
+              workflow.admission_reason ? `: ${workflow.admission_reason}` : "."
+            }`
+            : "This task is a draft. Make Ready checks its selection and admission."}
+        </p>
+      )}
+      {!terminal && profileRevisionId && configId && (
+        <AdmissionControls
+          projectId={task.project_id}
+          execution={execution}
+          profileRevisionId={profileRevisionId}
+          configId={configId}
+          tasks={tasks}
+          commands={commands}
+        />
+      )}
+      <TechnicalDetails>
+        <p>
+          profile revision {profileRevisionId || "none"} · configuration{" "}
+          {configId || "none"} · selection revision{" "}
+          {workflow?.selection_revision ?? "none"} · admission{" "}
+          {workflow?.admission_state ?? "none"}
+          {writer ? ` · session ${writer.id} · ${writer.status}` : ""}
+        </p>
+      </TechnicalDetails>
+    </section>
+  );
+}
+
 export function RoleSettings(
   {
     task,
@@ -91,6 +587,8 @@ export function RoleSettings(
     capabilities = [],
     runtimeAdmissions = [],
     actions = [],
+    execution,
+    tasks = [],
     onChanged,
   }: {
     task: Task;
@@ -102,11 +600,22 @@ export function RoleSettings(
     capabilities?: CapabilityEvidence[];
     runtimeAdmissions?: RuntimeAdmissionState[];
     actions?: ContinuationAction[];
+    /** This task's project Single agent setup; absent from older services. */
+    execution?: ProjectExecution;
+    /** Every task, so an admission's probe task can be found. */
+    tasks?: Task[];
     onChanged: () => void;
   },
 ) {
   const terminal = task.archived ||
     ["done", "cancelled"].includes(task.lifecycle);
+  const singleAgent = task.workflow?.family === "single_agent";
+  const workflowCommands = useWorkflowCommands(
+    `llmrelay.workflow.commands.${task.id}`,
+    onChanged,
+  );
+  const workflowEditable = !terminal && !task.active_attempt &&
+    ["backlog", "ready"].includes(task.lifecycle) && execution !== undefined;
   const [editing, setEditing] = useState<Role>();
   const [config, setConfig] = useState<RoleConfig>();
   const [error, setError] = useState("");
@@ -216,6 +725,7 @@ export function RoleSettings(
     version: number;
     state: "saving" | "saved" | "unknown";
   }>();
+  const [defaultsNotice, setDefaultsNotice] = useState("");
   const defaultsBlocked = defaultsState?.state === "saving" ||
     defaultsState?.version === task.version;
   const settings = (role: Role) =>
@@ -276,7 +786,7 @@ export function RoleSettings(
   const [preparationError, setPreparationError] = useState("");
   const [preparationRefresh, setPreparationRefresh] = useState(0);
   useEffect(() => {
-    if (terminal) {
+    if (terminal || singleAgent) {
       setPreparations([]);
       setPreparationError("");
       return;
@@ -296,19 +806,46 @@ export function RoleSettings(
     return () => {
       cancelled = true;
     };
-  }, [task.id, task.version, preparationRevisionKey, preparationEvidenceKey, preparationRefresh, terminal]);
+  }, [task.id, task.version, preparationRevisionKey, preparationEvidenceKey, preparationRefresh, terminal, singleAgent]);
   const refresh = () => {
     setPreparationRefresh((value) => value + 1);
     onChanged();
   };
+  // Decides an unknown save from one authoritative read: the requested role
+  // choices either match the project defaults (saved) or the task is still
+  // at the version the save was sent for (not applied, safe to send again).
   const checkDefaultsOutcome = async () => {
+    const pending = defaultsState;
+    if (pending?.state !== "unknown") return;
     try {
-      await getState();
-      refresh();
-      setDefaultsState((current) =>
-        current?.state === "unknown" ? undefined : current
+      const latest = (await getState()).tasks.find((item) =>
+        item.id === task.id
+      );
+      const latestRequested = (role: Role) =>
+        latest?.role_settings.filter((setting) => setting.role === role)
+          .sort((left, right) => right.revision - left.revision)[0]?.config;
+      const saved = !!latest && ROLES.every((role) => {
+        const requested = latestRequested(role);
+        const wanted = projectRoles[role];
+        return !!requested && !!wanted &&
+          requested.provider === wanted.provider &&
+          requested.model === wanted.model &&
+          requested.effort === wanted.effort;
+      });
+      setDefaultsState(
+        saved && latest ? { version: latest.version, state: "saved" } : undefined,
       );
       setError("");
+      setDefaultsNotice(
+        saved
+          ? ""
+          : !latest
+          ? "This task is no longer shown, so the save outcome cannot be checked here. Refresh the dashboard."
+          : latest.version === pending.version
+          ? "The project role choices were not applied. You can choose Use project defaults again."
+          : "This task changed since the save was sent, but its role choices do not match the project defaults. Review the role settings before trying again.",
+      );
+      refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -337,6 +874,7 @@ export function RoleSettings(
     ) return;
     defaultsPending.current = true;
     setDefaultsState({ version: task.version, state: "saving" });
+    setDefaultsNotice("");
     setError("");
     try {
       await runCommand(`project-defaults:${task.version}`, {
@@ -504,7 +1042,34 @@ export function RoleSettings(
     }
   };
 
+  const workflowChoice = workflowEditable && (
+    <WorkflowChoice
+      key={`${task.id}:${task.version}`}
+      task={task}
+      execution={execution}
+      commands={workflowCommands}
+    />
+  );
+  if (singleAgent) {
+    return (
+      <>
+        {workflowChoice}
+        <SingleAgentSettings
+          task={task}
+          sessions={sessions}
+          execution={execution}
+          tasks={tasks}
+          commands={workflowCommands}
+        />
+        {workflowCommands.error && <ErrorNotice error={workflowCommands.error} />}
+      </>
+    );
+  }
+
   return (
+    <>
+    {workflowChoice}
+    {workflowCommands.error && <ErrorNotice error={workflowCommands.error} />}
     <section className="panel role-settings">
       <header>
         <h3>Agent roles</h3>
@@ -529,16 +1094,21 @@ export function RoleSettings(
           {defaultsState && (
             <p role="status">
               {defaultsState.state === "unknown"
-                ? "The save outcome is unknown. Refresh role settings and check the requested revisions before retrying."
+                ? "The save outcome is unknown. Check it before trying again."
                 : defaultsState.state === "saved"
                 ? "Project role choices saved. Refresh role settings to see their current verification status."
                 : "Saving the project role choices…"}
               {" "}<button
                 disabled={defaultsState.state === "saving"}
                 onClick={defaultsState.state === "unknown" ? () => void checkDefaultsOutcome() : refresh}
-              >Refresh role settings</button>
+              >
+                {defaultsState.state === "unknown"
+                  ? "Check whether it was saved"
+                  : "Refresh role settings"}
+              </button>
             </p>
           )}
+          {defaultsNotice && <p role="status">{defaultsNotice}</p>}
         </div>
       )}
       <div className="role-list">
@@ -556,10 +1126,11 @@ export function RoleSettings(
             action.binding.session_id === session.id
           );
           const running = session?.status === "running" ? session : undefined;
-          const switchable = session &&
-              (session.status === "running" || session.status === "exited")
-            ? session
-            : undefined;
+          const switchable = generationSettled(session) ? session : undefined;
+          // Between the session's exit and its generation's settled stop,
+          // a probe or replacement would race the old generation.
+          const stopping = session?.status === "exited" &&
+            !generationSettled(session);
           const value = editing === role
             ? config
             : requested?.config || task.role_overrides[role] ||
@@ -819,7 +1390,7 @@ export function RoleSettings(
                     ? "Verification required: "
                     : "Cannot start: "}
                   {productionRestriction.status === "unverified"
-                    ? "Run verification for this agent profile in Project setup or Agent settings before starting work."
+                    ? "Run verification for this agent profile in Project setup or the task's Roles tab before starting work."
                     : "This agent cannot run with the current settings. Review Technical details and choose a supported configuration."}
                   <TechnicalDetails>{productionRestriction.reason}</TechnicalDetails>
                 </div>
@@ -857,9 +1428,16 @@ export function RoleSettings(
                       </small>
                     </>
                   )}
+                  {stopping && (
+                    <small>
+                      The {roleLabel(role).toLowerCase()} has exited, but
+                      LLMRelay has not yet confirmed that it fully stopped.
+                      Verification becomes available once it has.
+                    </small>
+                  )}
                   {!runtimeAdmission && (
                     <button
-                      disabled={!project}
+                      disabled={!project || stopping}
                       onClick={() =>
                         void prepareRuntime(role, requested.revision)}
                     >
@@ -875,6 +1453,7 @@ export function RoleSettings(
                         Nothing has started yet.
                       </small>
                       <button
+                        disabled={stopping}
                         onClick={() =>
                           void authorizeRuntime(
                             runtimeAdmission.id,
@@ -887,6 +1466,7 @@ export function RoleSettings(
                   )}
                   {runtimeAdmission?.probe_state === "authorized" && (
                     <button
+                      disabled={stopping}
                       onClick={() =>
                         void runRuntime(runtimeAdmission.id, role, "launch")}
                     >
@@ -898,7 +1478,7 @@ export function RoleSettings(
                       runtimeAdmission.probe_state || runtimeAdmission.state,
                     ) && (
                     <button
-                      disabled={!project}
+                      disabled={!project || stopping}
                       onClick={() =>
                         void prepareRuntime(role, requested.revision)}
                     >
@@ -988,6 +1568,15 @@ export function RoleSettings(
                   onChanged={onChanged}
                 />
               )}
+              {!terminal && stopping && requested && effective &&
+                pendingReplacement && replacementEligible &&
+                role !== "explorer" && role !== "manager" && (
+                <small className="badge waiting">
+                  The checkpoint switch becomes available once LLMRelay
+                  confirms the current {roleLabel(role).toLowerCase()} has
+                  fully stopped.
+                </small>
+              )}
               {!terminal && role === "explorer" && requested && effective &&
                 pendingReplacement && (
                 <small className="badge waiting">
@@ -1013,6 +1602,7 @@ export function RoleSettings(
         Approvals shows the requests it sends to LLMRelay.
       </p>
     </section>
+    </>
   );
 }
 

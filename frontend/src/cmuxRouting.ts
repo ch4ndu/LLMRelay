@@ -373,42 +373,53 @@ const base64Bytes = (value: string) =>
 /**
  * This is intentionally a bounded plain-text transcript reader, not a
  * terminal renderer. It keeps UTF-8 and escape-sequence state across adjacent
- * retained frames, then resets that state only at an explicit retention gap or
- * epoch boundary.
+ * retained frames and across pages, then resets that state only at an
+ * explicit retention gap or epoch boundary.
  */
-export const recordedOutputText = (outcome?: CmuxViewOutcome) => {
-  const frames = outcome?.recorded_output?.frames || [];
-  const plain = new PlainRecordedBytes();
-  let epoch: string | undefined;
-  let output = "";
-  const reset = () => {
-    output += plain.finish();
-    plain.reset();
-  };
+export class RecordedTextReader {
+  private readonly plain = new PlainRecordedBytes();
+  private epoch?: string;
 
-  for (const frame of frames) {
-    if (epoch && frame.epoch !== epoch) {
-      reset();
-      output += recordedBoundary(frame, "changed");
+  /** An incomplete trailing sequence is held for the next page, not replaced. */
+  push(frames: TranscriptFrame[]) {
+    let output = "";
+    const reset = () => {
+      output += this.plain.finish();
+      this.plain.reset();
+    };
+    for (const frame of frames) {
+      if (this.epoch && frame.epoch !== this.epoch) {
+        reset();
+        output += recordedBoundary(frame, "changed");
+      }
+      if (frame.gap) {
+        reset();
+        output += recordedBoundary(frame, "gap");
+      }
+      this.epoch = frame.epoch;
+      if (frame.encoding !== "base64") {
+        output += this.plain.pushText(frame.data);
+        continue;
+      }
+      try {
+        output += this.plain.pushBytes(base64Bytes(frame.data));
+      } catch {
+        reset();
+        output += "[recorded output frame could not be decoded]\n";
+      }
     }
-    if (frame.gap) {
-      reset();
-      output += recordedBoundary(frame, "gap");
-    }
-    epoch = frame.epoch;
-    if (frame.encoding !== "base64") {
-      output += plain.pushText(frame.data);
-      continue;
-    }
-    try {
-      output += plain.pushBytes(base64Bytes(frame.data));
-    } catch {
-      reset();
-      output += "[recorded output frame could not be decoded]\n";
-    }
+    return output;
   }
-  output += plain.finish();
-  return output;
+
+  /** Call only once no later frame can follow, such as a stopped epoch's end. */
+  finish() {
+    return this.plain.finish();
+  }
+}
+
+export const recordedOutputText = (outcome?: CmuxViewOutcome) => {
+  const reader = new RecordedTextReader();
+  return reader.push(outcome?.recorded_output?.frames || []) + reader.finish();
 };
 
 export function terminalGuidance(outcome: CmuxViewOutcome): string {

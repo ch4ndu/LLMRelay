@@ -3023,3 +3023,252 @@ details.panel > summary,
 .verification-row > .button-row {
   flex-basis: 100%;
 }
+
+/* Full plan: a read-only window above the task, in the task window's style.
+   It sits inside the task backdrop's stacking context, so it always layers
+   above the task it was opened from. */
+.plan-preview-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin: 8px 0;
+}
+.plan-viewer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  padding: clamp(0px, 3vw, 32px);
+  background: var(--backdrop);
+}
+.plan-viewer {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(1040px, 100%);
+  height: min(90vh, 1080px);
+  max-height: 100%;
+  overflow: hidden;
+  border-radius: 16px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+.plan-viewer:focus {
+  outline: none;
+}
+.plan-viewer-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--line);
+}
+.plan-viewer-header h2 {
+  margin: 0;
+  font-size: clamp(1.2rem, 2vw, 1.6rem);
+  overflow-wrap: anywhere;
+}
+.plan-viewer-close {
+  flex: none;
+  margin-left: auto;
+}
+.plan-viewer-body {
+  min-height: 0;
+  overflow: auto;
+  padding: 20px 28px;
+  line-height: 1.6;
+}
+.plan-viewer-body .plan-content {
+  max-width: 80ch;
+}
+.plan-viewer-footer {
+  display: grid;
+  gap: 6px;
+  padding: 10px 24px;
+  border-top: 1px solid var(--line);
+}
+.plan-viewer :focus-visible {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+@media (max-width: 760px) {
+  .plan-viewer-backdrop {
+    padding: 0;
+  }
+  .plan-viewer {
+    width: 100%;
+    height: 100%;
+    border-radius: 0;
+  }
+  .plan-viewer-header,
+  .plan-viewer-footer {
+    padding: 10px 16px;
+  }
+  .plan-viewer-body {
+    padding: 16px;
+  }
+}
+
+/* Recorded output reader: a tall, independently scrolling text area. */
+.session-history .recorded-output.session-history-text {
+  max-height: 60vh;
+  min-height: 12rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+.session-history-search {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 8px;
+  margin: 10px 0;
+}
+.session-history-search label {
+  display: grid;
+  flex: 1 1 16rem;
+  gap: 4px;
+  font-weight: 600;
+}
+.session-history-results ul {
+  max-height: 30vh;
+  overflow: auto;
+  margin: 6px 0;
+  padding-left: 1.2em;
+}
+.session-history-results code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.session-history-panes,
+.session-history-invocations {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.session-history-panes ul {
+  margin: 0;
+  padding-left: 1.2em;
+}
+
+/* Single agent run, selection, admissions and provider checks. */
+.single-agent-result,
+.single-agent-checks,
+.single-agent-decision,
+.admission-controls,
+.workflow-choice,
+.single-agent-selection,
+.workflow-default,
+.execution-configuration,
+.execution-check,
+.agent-profile-editor,
+.provider-selection,
+.provider-preview,
+.provider-batches,
+.provider-proofs {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.single-agent-selection,
+.workflow-default,
+.execution-configuration,
+.execution-check,
+.agent-profile-editor,
+.provider-selection {
+  margin: 10px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.single-agent-selection label,
+.execution-configuration > label,
+.execution-check label,
+.agent-profile-editor > label,
+.provider-row > label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  font-weight: 600;
+  font-size: .9rem;
+}
+.execution-configuration textarea,
+.agent-profile-editor textarea,
+.single-agent-decision textarea,
+.single-agent-run .inline-form textarea {
+  width: 100%;
+  min-height: 5rem;
+}
+.acceptance-evidence {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding-left: 1.2em;
+}
+.single-agent-checks code {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.provider-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr));
+  gap: 8px;
+  align-items: end;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.provider-row .model-selector {
+  grid-column: span 2;
+}
+.provider-installation,
+.provider-batch {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.provider-plan,
+.provider-batch ul,
+.provider-proofs ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 1.2em;
+}
+.provider-check,
+.provider-plan li,
+.provider-proofs li {
+  display: grid;
+  gap: 2px;
+}
+.provider-check.state-failed,
+.provider-check.state-delivery_unknown {
+  color: var(--danger-ink);
+}
+.attention-related ul {
+  margin: 4px 0 0;
+  padding-left: 1.2em;
+}
+
+/* Instruction-file comparison: removed and added lines stay distinguishable
+   without colour through their - and + prefixes. */
+.guidance-diff {
+  max-height: 50vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.guidance-diff .diff-removed {
+  color: var(--danger-ink);
+  background: var(--danger-bg);
+}
+.guidance-diff .diff-added {
+  color: var(--success-ink);
+  background: var(--success-bg);
+}
+.guidance-diff .diff-unchanged {
+  color: var(--muted);
+}

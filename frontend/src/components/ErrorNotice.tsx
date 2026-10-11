@@ -91,7 +91,7 @@ export function explainError(error: string): ErrorGuidance {
     return {
       summary: "New agent settings are waiting to take effect.",
       nextStep:
-        "They apply when the role's current session finishes. If Technical details asks for verification, verify the profile in the task's Agent settings.",
+        "They apply when the role's current session finishes. If Technical details asks for verification, verify the profile in the task's Roles tab.",
     };
   }
   if (/project folder is now at commit/.test(text)) {
@@ -260,7 +260,7 @@ export function explainError(error: string): ErrorGuidance {
       summary:
         "This agent profile still needs verification before it can be used.",
       nextStep:
-        "Open Project setup or the task's Agent settings. Run the offered runtime verification, then publish its proof after it passes and the session exits.",
+        "Open Project setup or the task's Roles tab. Run the offered runtime verification, then publish its proof after it passes and the session exits.",
     };
   }
   if (

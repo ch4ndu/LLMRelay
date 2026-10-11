@@ -15,12 +15,16 @@ import type {
   ObservedUsage,
   PermissionRequest,
   Project,
+  ProjectExecution,
   ProviderFailureHold,
   Session,
+  SingleAgentCheck,
+  SingleAgentRun,
   StateCursor,
   StateWaitResult,
   Task,
   TripSetupState,
+  TranscriptPage,
   TripSetupProfile,
   TripTaskVerification,
 } from "./types";
@@ -80,16 +84,25 @@ const { MarkdownContent, safeMarkdownUrl } = await import(
 );
 const { taskStatus } = await import("./components/TaskBoard");
 const { GuidanceRecovery } = await import("./components/GuidanceRecovery");
+const { ProviderSettings } = await import("./components/ProviderSettings");
 const { explainError } = await import("./components/ErrorNotice");
 const { AppErrorBoundary } = await import("./components/AppErrorBoundary");
 const nativeFetch = globalThis.fetch;
 const fixtureSource = Symbol("protocol fixture source");
 type FixtureFetch = typeof fetch & { [fixtureSource]?: typeof fetch };
+// The fixture service advertises every feature this dashboard can request,
+// so feature-gated operations reach the stubbed transport.
+const allFeatures = [
+  "http_operational_v1",
+  "history_view_v1",
+  "provider_validation_v1",
+  "multi_workflow_v1",
+];
 const protocolFixture = () => new Response(JSON.stringify({
   generation: 1,
   server_version: "fixture",
   instance_id: "test-instance",
-  supported_features: ["http_operational_v1"],
+  supported_features: allFeatures,
 }), { headers: { "content-type": "application/json" } });
 let protocolFixtureResponder = () => Promise.resolve(protocolFixture());
 const wrapFetch = (source: typeof fetch): FixtureFetch => {
@@ -944,7 +957,7 @@ Deno.test("M9 board and detail display exact scheduled draft provenance", () => 
     } };
   try {
     mount(<TaskBoard tasks={[scheduled]} projects={[initialized]} onOpen={noop} onEdit={noop} onChanged={noop} />);
-    check(document.body.textContent?.includes("Scheduled draft · Review revision 2"),
+    check(document.body.textContent?.includes("Scheduled TRIP draft · Review revision 2"),
       "board omitted the scheduled recipe revision");
     rerender(<TaskDetail task={scheduled} state={{ ...liveBase, tasks: [scheduled] }} onClose={noop} onChanged={noop} />);
     click("Activity");
@@ -2290,6 +2303,7 @@ Deno.test("Project add validates, guards repeats, and selects the created ID", a
 
 Deno.test("T15 role control and human review dispatch exact authority without fabricating state", async () => {
   const requests: Record<string, unknown>[] = [];
+  const historyPages: Record<string, TranscriptPage[]> = {};
   const currentPreparationKey = "current-complete-preparation-key";
   let failedRuntimeView = false;
   const codexCatalogRequests: Array<{
@@ -2402,6 +2416,22 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       }
       const request = JSON.parse(String(init?.body));
       requests.push(request);
+      if (request.kind === "history_page") {
+        const pages =
+          historyPages[`${request.session_id}/${request.transcript_epoch}`] ?? [];
+        const page = request.after_sequence === 0
+          ? pages[0]
+          : pages.find((_, index) =>
+            index > 0 && pages[index - 1].next_sequence === request.after_sequence
+          );
+        return new Response(JSON.stringify({
+          result: page ??
+            { frames: [], next_sequence: request.after_sequence, has_more: false },
+        }));
+      }
+      if (request.kind === "history_pane_views") {
+        return new Response(JSON.stringify({ result: [] }));
+      }
       if (request.kind === "cmux_discard_unknown") {
         const discardSession = String(request.session_id);
         cmuxDiscardResponses[discardSession] =
@@ -3652,7 +3682,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       />,
     );
     let historyText = "";
-    for (const tab of ["Overview", "Changes", "Checks", "Activity"]) {
+    for (const tab of ["Overview", "Changes", "Checks", "Roles", "Activity"]) {
       click(tab);
       historyText += document.body.textContent || "";
       for (
@@ -3753,6 +3783,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
           id: "restore-s-2",
           role: "implementer",
           status: "exited",
+          transcript_epoch: "recorded-epoch",
           exit_code: 1,
           exit_reason: `error: invalid model identifier gpt-missing ${
             "diagnostic context ".repeat(80)
@@ -3892,7 +3923,50 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       ...textEncoder.encode("double-escape-safe\n"),
     ]);
     let restoreViewCount = 0;
-    let restoreHistoricalViewCount = 0;
+    const recordedFrame = (
+      sequence: number,
+      encoding: "base64" | "utf8",
+      data: string,
+      gap = false,
+    ) => ({
+      epoch: "recorded-epoch",
+      sequence,
+      captured_at: `2026-01-01T00:00:${String(sequence).padStart(2, "0")}Z`,
+      encoding,
+      data,
+      gap,
+    });
+    // The stopped implementer's saved output, served by history_page in two
+    // pages; decoder state must carry across frames and the page boundary.
+    historyPages["restore-s-2/recorded-epoch"] = [{
+      frames: [
+        recordedFrame(1, "base64", "4oI="),
+        recordedFrame(2, "base64", "rBtb"),
+        recordedFrame(3, "base64", "MzFtcmVkG1swbQ=="),
+        recordedFrame(4, "base64", encodedBytes(longRawOsc)),
+        recordedFrame(5, "base64", encodedBytes(rawControlEnd)),
+        recordedFrame(6, "base64", encodedBytes(splitUtf8C1)),
+        recordedFrame(7, "utf8", "\u001b]0;SECRET-OSC"),
+        recordedFrame(
+          8,
+          "utf8",
+          "-CONT\u0007\u001bPSECRET-DCS\u0007SECRET-DCS-AFTER-BEL\u001b\\\u001b_SECRET-APC\u001b\\\u001b^SECRET-PM\u001b\\\u009dSECRET-C1-OSC\u009c\u0090SECRET-C1-DCS\u009c\u009fSECRET-C1-APC\u009csafe after controls",
+        ),
+        recordedFrame(9, "base64", encodedBytes(doubleEscapeStart)),
+      ],
+      next_sequence: 9,
+      has_more: true,
+    }, {
+      frames: [
+        recordedFrame(10, "base64", encodedBytes(doubleEscapeEnd)),
+        recordedFrame(11, "base64", encodedBytes(escapeIntermediatesStart)),
+        recordedFrame(12, "base64", encodedBytes(escapeIntermediatesEnd)),
+        recordedFrame(13, "utf8", "older output was retained only in part", true),
+        recordedFrame(14, "utf8", "final retained marker"),
+      ],
+      next_sequence: 14,
+      has_more: false,
+    }];
     let selectedRecoveryTask: Task | undefined;
     mount(
       <Workspace
@@ -3928,24 +4002,6 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
               surface: persistentSurface(),
             };
           }
-          if (sessionId === "restore-s-2") {
-            restoreHistoricalViewCount++;
-          }
-          if (sessionId === "restore-s-2" && restoreHistoricalViewCount === 2) {
-            return {
-              state: "unknown_live" as const,
-              message:
-                "exact attachment client is live while the surface identity remains unknown",
-              retry_available: false,
-              surface: persistentSurface(
-                "00000000-0000-0000-0000-000000000045",
-                {
-                  surface_state: "unknown" as const,
-                  attachment_state: "live" as const,
-                },
-              ),
-            };
-          }
           if (sessionId === "restore-s" && restoreViewCount >= 3) {
             return {
               state: "unknown" as const,
@@ -3960,117 +4016,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
               ),
             };
           }
-          return {
-            state: "recorded_output" as const,
-            message:
-              "exact retained history only; no provider resume was requested",
-            retry_available: false,
-            recorded_output: {
-              frames: [{
-                epoch: "recorded-epoch",
-                sequence: 1,
-                captured_at: "2026-01-01T00:00:00Z",
-                encoding: "base64" as const,
-                data: "4oI=",
-                gap: false,
-              }, {
-                epoch: "recorded-epoch",
-                sequence: 2,
-                captured_at: "2026-01-01T00:00:01Z",
-                encoding: "base64" as const,
-                data: "rBtb",
-                gap: false,
-              }, {
-                epoch: "recorded-epoch",
-                sequence: 3,
-                captured_at: "2026-01-01T00:00:02Z",
-                encoding: "base64" as const,
-                data: "MzFtcmVkG1swbQ==",
-                gap: false,
-              }, {
-                epoch: "recorded-epoch",
-                sequence: 4,
-                captured_at: "2026-01-01T00:00:03Z",
-                encoding: "base64" as const,
-                data: encodedBytes(longRawOsc),
-                gap: false,
-              }, {
-                epoch: "recorded-epoch",
-                sequence: 5,
-                captured_at: "2026-01-01T00:00:04Z",
-                encoding: "base64" as const,
-                data: encodedBytes(rawControlEnd),
-                gap: false,
-              }, {
-                epoch: "recorded-epoch",
-                sequence: 6,
-                captured_at: "2026-01-01T00:00:05Z",
-                encoding: "base64" as const,
-                data: encodedBytes(splitUtf8C1),
-                gap: false,
-              }, {
-                epoch: "recorded-epoch",
-                sequence: 7,
-                captured_at: "2026-01-01T00:00:06Z",
-                encoding: "utf8" as const,
-                data: "\u001b]0;SECRET-OSC",
-                gap: false,
-              }, {
-                epoch: "recorded-epoch",
-                sequence: 8,
-                captured_at: "2026-01-01T00:00:07Z",
-                encoding: "utf8" as const,
-                data:
-                  "-CONT\u0007\u001bPSECRET-DCS\u0007SECRET-DCS-AFTER-BEL\u001b\\\u001b_SECRET-APC\u001b\\\u001b^SECRET-PM\u001b\\\u009dSECRET-C1-OSC\u009c\u0090SECRET-C1-DCS\u009c\u009fSECRET-C1-APC\u009csafe after controls",
-                gap: false,
-              }, {
-                epoch: "recorded-epoch",
-                sequence: 9,
-                captured_at: "2026-01-01T00:00:08Z",
-                encoding: "base64" as const,
-                data: encodedBytes(doubleEscapeStart),
-                gap: false,
-              }, {
-                epoch: "recorded-epoch",
-                sequence: 10,
-                captured_at: "2026-01-01T00:00:09Z",
-                encoding: "base64" as const,
-                data: encodedBytes(doubleEscapeEnd),
-                gap: false,
-              }, {
-                epoch: "recorded-epoch",
-                sequence: 11,
-                captured_at: "2026-01-01T00:00:10Z",
-                encoding: "base64" as const,
-                data: encodedBytes(escapeIntermediatesStart),
-                gap: false,
-              }, {
-                epoch: "recorded-epoch",
-                sequence: 12,
-                captured_at: "2026-01-01T00:00:11Z",
-                encoding: "base64" as const,
-                data: encodedBytes(escapeIntermediatesEnd),
-                gap: false,
-              }, {
-                epoch: "recorded-epoch",
-                sequence: 13,
-                captured_at: "2026-01-01T00:00:12Z",
-                encoding: "utf8" as const,
-                data: "older output was retained only in part",
-                gap: true,
-              }, {
-                epoch: "replacement-epoch",
-                sequence: 1,
-                captured_at: "2026-01-01T00:00:13Z",
-                encoding: "utf8" as const,
-                data: "after exact epoch replacement",
-                gap: false,
-              }],
-              next_epoch: "replacement-epoch",
-              next_sequence: 1,
-              has_more: false,
-            },
-          };
+          throw new Error(`a stopped session opened a cmux view: ${sessionId}`);
         }}
         onSetCmuxKeyboardControl={async (sessionId, surface, action) => {
           directTakeControls.push({
@@ -4358,11 +4304,25 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         row.querySelector("strong")?.textContent?.startsWith("Implementer") &&
         row.textContent?.includes("Codex")
       );
-    const liveView = [
+    const recordedView = [
       ...(implementerSession?.querySelectorAll("button") || []),
     ]
       .find((button) => button.textContent?.includes("View recorded output"));
-    act(() => liveView!.click());
+    const sessionMutationsBeforeHistory = requests.filter((request) =>
+      !String(request.kind).startsWith("history_")
+    ).length;
+    act(() => recordedView!.click());
+    await settle();
+    const firstPage = requests.filter((request) => request.kind === "history_page");
+    if (
+      firstPage.length !== 1 || firstPage[0].session_id !== "restore-s-2" ||
+      firstPage[0].transcript_epoch !== "recorded-epoch" ||
+      firstPage[0].after_sequence !== 0 ||
+      !document.body.textContent?.includes("More saved output is available")
+    ) {
+      throw new Error("the stopped reader did not request its exact first page");
+    }
+    click("Load all remaining output");
     await settle();
     if (
       !document.body.textContent?.includes("€red") ||
@@ -4382,42 +4342,28 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       document.body.textContent?.includes("\u0085") ||
       document.body.textContent?.includes("SECRET-") ||
       !document.body.textContent.includes("recorded output gap") ||
-      !document.body.textContent.includes("recorded output changed")
+      !document.body.textContent.includes("final retained marker") ||
+      !document.body.textContent.includes("Showing all saved output. It ends at frame 14.")
     ) {
       throw new Error(
-        "historical recorded cmux output was not safely rendered",
+        "stopped recorded output did not reach its final retained frame safely",
       );
     }
-    const unknownLiveView = [
-      ...(implementerSession?.querySelectorAll("button") || []),
-    ].find((button) => button.textContent?.includes("View recorded output"));
-    act(() => unknownLiveView!.click());
-    await settle();
+    // Reading saved output is read-only: no cmux view, keyboard lease or
+    // other request is made for the stopped session.
     if (
-      !document.body.textContent?.includes(
-        "exact attachment client is live while the surface identity remains unknown",
-      ) ||
-      [...document.querySelectorAll("button")].some((button) =>
-        button.textContent?.includes("Discard unknown reservation")
-      ) ||
-      unknownLiveView?.hasAttribute("disabled") ||
+      taskOutputRequests.includes("restore-s-2") ||
+      requests.filter((request) =>
+          !String(request.kind).startsWith("history_")
+        ).length !== sessionMutationsBeforeHistory ||
       [...(implementerSession?.querySelectorAll("button") || [])]
         .some((button) => button.textContent?.includes("Take control"))
     ) {
-      throw new Error(
-        "an exited unknown presentation did not preserve recorded-only access",
-      );
+      throw new Error("reading stopped output opened a live route or sent a mutation");
     }
-    act(() => unknownLiveView!.click());
-    await settle();
-    if (
-      !document.body.textContent?.includes(
-        "exact retained history only; no provider resume was requested",
-      )
-    ) {
-      throw new Error(
-        "non-running unknown presentation did not return to recorded output",
-      );
+    click("Close recorded output");
+    if (document.querySelector(".session-history")) {
+      throw new Error("Close recorded output did not hide the reader");
     }
     const checkbox = document.querySelector<HTMLInputElement>(
       'input[type="checkbox"]',
@@ -6160,7 +6106,7 @@ Deno.test("M8A concurrent negotiation and incarnation reset fence descriptor cac
     check(descriptorCalls === 1 && businessCalls === 0, "concurrent operations did not share protocol discovery");
     resolveFirst!(new Response(JSON.stringify({
       generation: 1, server_version: "fixture", instance_id: incarnation,
-      supported_features: ["http_operational_v1"],
+      supported_features: allFeatures,
     })));
     await Promise.all([first, second]);
     check(businessCalls === 2, "negotiated operations did not dispatch once each");
@@ -6170,7 +6116,7 @@ Deno.test("M8A concurrent negotiation and incarnation reset fence descriptor cac
       descriptorCalls++;
       return Promise.resolve(new Response(JSON.stringify({
         generation: 1, server_version: "fixture", instance_id: incarnation,
-        supported_features: ["http_operational_v1"],
+        supported_features: allFeatures,
       })));
     };
     await command({ kind: "retry", operation_id: "m8a-third" });
@@ -6190,7 +6136,7 @@ Deno.test("M8A a newer observed incarnation fences unresolved descriptor discove
   let resolveOldDescriptor: ((response: Response) => void) | undefined;
   const descriptor = (instanceId: string) => new Response(JSON.stringify({
     generation: 1, server_version: "fixture", instance_id: instanceId,
-    supported_features: ["http_operational_v1"],
+    supported_features: allFeatures,
   }));
   globalThis.fetch = (async (input: string | URL | Request) => {
     if (String(input) === "/api/state") {
@@ -6254,7 +6200,7 @@ Deno.test("M8A an older state observation allows bounded replacement discovery",
     descriptorCalls++;
     return Promise.resolve(new Response(JSON.stringify({
       generation: 1, server_version: "fixture", instance_id: "m8a-replaced-b",
-      supported_features: ["http_operational_v1"],
+      supported_features: allFeatures,
     })));
   };
   try {
@@ -7645,6 +7591,23 @@ Deno.test("Task details open as a modal that closes by keyboard and returns focu
         document.activeElement === tab("Changes"),
       "arrow keys did not move between tabs",
     );
+    const press = (from: string, key: string) =>
+      act(() => {
+        tab(from).dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+      });
+    const selected = (name: string) =>
+      tab(name).getAttribute("aria-selected") === "true" &&
+      document.activeElement === tab(name) &&
+      document.querySelector('[role="tabpanel"]')?.getAttribute("aria-labelledby") ===
+        tab(name).id;
+    press("Changes", "End");
+    check(selected("Activity"), "End did not select and show the last tab");
+    press("Activity", "ArrowRight");
+    check(selected("Overview"), "ArrowRight did not wrap from the last tab to the first");
+    press("Overview", "ArrowLeft");
+    check(selected("Activity"), "ArrowLeft did not wrap from the first tab to the last");
+    press("Activity", "Home");
+    check(selected("Overview"), "Home did not select and show the first tab");
     click("Overview");
     const reply = document.querySelector<HTMLTextAreaElement>("textarea");
     check(!!reply, "a waiting task with a running manager offers no reply");
@@ -8101,7 +8064,11 @@ Deno.test("A generic wait never offers a reply; only the Answer question item do
 
 Deno.test("Board and header actions open every destination kind exactly, list every item, and refuse stale bindings", async () => {
   const priorEnvironment = { ...liveEnvironment };
-  globalThis.fetch = (async () => new Response("[]")) as typeof fetch;
+  const mutations: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method && init.method !== "GET") mutations.push(String(input));
+    return new Response("[]");
+  }) as typeof fetch;
   const settingsItem: AttentionItem = {
     ...railItem("task:AJ-1:decision", "blocked", "New agent settings need verifying", {
       kind: "role_settings",
@@ -8223,9 +8190,12 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
       check(focused() === item.marker, `${item.name}: focused ${focused()}`);
       if (item.name === "Open agent settings") {
         check(
-          !!document.activeElement?.closest("details[open]"),
-          "Agent settings did not open to the affected role",
+          document.querySelector('[role="dialog"] [role="tab"][aria-selected="true"]')
+            ?.textContent === "Roles" &&
+            !!document.activeElement?.closest('[role="tabpanel"]'),
+          "the role settings route did not open the Roles tab at the affected role",
         );
+        check(mutations.length === 0, "opening role settings sent a mutation");
       }
       if (item.dialog) {
         const header = document.querySelector(".task-dialog-next");
@@ -11254,11 +11224,18 @@ Deno.test("Project defaults recover empty draft roles without starting work and 
       requests.at(-1) === uncertain,
       "uncertain save automatically repeated",
     );
-    click("Refresh role settings");
+    click("Check whether it was saved");
     await settle();
     check(
       requests.at(-1) === uncertain,
       "checking the outcome repeated the mutation",
+    );
+    // The authoritative read still shows the draft at the sent version with
+    // none of the project choices, so the save is reported as not applied.
+    check(
+      document.body.textContent?.includes("were not applied") &&
+        !document.body.textContent.includes("outcome is unknown"),
+      "the outcome check did not use the state it read",
     );
     unmount();
     mount(card());
@@ -11304,6 +11281,7 @@ Deno.test("Stopped session recorded output survives historical cmux failures and
   const ended: Session = {
     ...managerSession,
     status: "exited",
+    transcript_epoch: "e",
     cmux_surface: surface,
     reported_in_latest_invocation: true,
   };
@@ -11357,6 +11335,14 @@ Deno.test("Stopped session recorded output survives historical cmux failures and
       !terminalGuidance(recorded).includes("could not show"),
       "recorded output was described as a failed terminal",
     );
+    const historyRequests: Record<string, unknown>[] = [];
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      historyRequests.push(body);
+      return new Response(JSON.stringify({
+        result: body.kind === "history_page" ? recorded.recorded_output : [],
+      }));
+    }) as typeof fetch;
     mount(<Card />);
     check(
       !document.body.textContent?.includes("View fresh view-only surface"),
@@ -11365,24 +11351,26 @@ Deno.test("Stopped session recorded output survives historical cmux failures and
     click("View recorded output");
     await settle();
     rerender(<Card />);
+    const pages = historyRequests.filter((body) => body.kind === "history_page");
     check(
-      viewed === 1 &&
-        document.querySelector(".recorded-output")?.textContent ===
+      viewed === 0 && pages.length === 1 && pages[0].transcript_epoch === "e" &&
+        document.querySelector(".session-history-text")?.textContent ===
           "Finished report body",
-      "refresh replaced recorded output or repeated its request",
+      "a stopped session's saved output used a live view or repeated its read",
     );
     check(
-      document.body.textContent?.includes("does not restart the agent") &&
+      document.body.textContent?.includes("never restarts the agent") &&
         !document.body.textContent.includes("the agent keeps working"),
-      "closed output implied a running agent",
+      "the recorded output reader implied a running agent",
     );
-    click("Close output");
+    click("Close recorded output");
     check(
-      !document.querySelector(".recorded-output"),
-      "Close output did not hide the transcript",
+      !document.querySelector(".session-history-text"),
+      "Close recorded output did not hide the transcript",
     );
   } finally {
     unmount();
+    globalThis.fetch = nativeFetch;
   }
 });
 
@@ -11706,5 +11694,1587 @@ Deno.test("Role readiness refreshes when runtime evidence changes without changi
       liveEnvironment.scheduler = priorEnvironment.scheduler;
       localStorage.clear();
     }
+  }
+});
+
+const findButton = (text: string) => {
+  const button = [...document.querySelectorAll<HTMLButtonElement>("button")]
+    .find((item) => item.textContent?.includes(text));
+  if (!button) throw new Error(`button not found: ${text}`);
+  return button;
+};
+const choiceFor = (text: string, within: ParentNode = document) => {
+  const input = [...within.querySelectorAll("label")]
+    .find((label) => label.textContent?.trim().startsWith(text))
+    ?.querySelector<HTMLInputElement>("input");
+  if (!input) throw new Error(`choice not found: ${text}`);
+  return input;
+};
+const workflowCommands = (bodies: Record<string, unknown>[]) =>
+  bodies.filter((body) => body.kind === "workflow")
+    .map((body) => body.command as Record<string, unknown>);
+const workflowResult = (body: Record<string, unknown>) =>
+  new Response(JSON.stringify({
+    result: {
+      operation_id: (body.command as Record<string, unknown>).operation_id,
+      entity_kind: "task",
+      entity_id: "fixture",
+      version: 8,
+      state: "applied",
+      detail: {},
+    },
+  }));
+const singleAgentExecution: ProjectExecution = {
+  project_id: "p1",
+  default_family: "single_agent",
+  default_version: 3,
+  configurations: [{
+    id: "cfg-1",
+    revision: 2,
+    content_hash: "config-hash",
+    configuration: {
+      guidance: [{ path: "AGENTS.md" }],
+      testing_coverage: "moderate",
+      documentation_policy: "Update the README when behavior changes.",
+    },
+    checks: [{
+      id: "check-1",
+      check_key: "unit",
+      original_text: "Unit tests pass",
+      command_kind: "exact_argv",
+      executable: "deno",
+      arguments: ["task", "test"],
+      cwd: ".",
+      timeout_seconds: 600,
+    }],
+    approved_at: "2026-10-01T00:00:00Z",
+  }],
+  profiles: [{
+    id: "profile-1",
+    display_name: "Writer",
+    version: 2,
+    current_revision: {
+      id: "prof-rev-1",
+      revision: 1,
+      provider: "codex",
+      model: "gpt-6.1-sol",
+      effort: "high",
+      instructions_hash: "instructions",
+      policy_id: "single-agent-writer",
+      policy_hash: "policy",
+      adapter_hash: "adapter",
+      authority: "workspace-write",
+      session_contract: "retained",
+      profile_hash: "profile",
+      created_at: "2026-10-01T00:00:00Z",
+    },
+  }],
+  admissions: [{
+    id: "adm-1",
+    profile_revision_id: "prof-rev-1",
+    execution_config_revision_id: "cfg-1",
+    state: "pending",
+    state_reason: "Waiting for native qualification.",
+    probe_task_id: null,
+    activated_at: null,
+    updated_at: "2026-10-02T00:00:00Z",
+    probe_available: false,
+    probe_unavailable_reason:
+      "The Codex Single agent writer mode has not been qualified for this version.",
+  }],
+};
+const singleAgentRun = (
+  overrides: Partial<SingleAgentRun> = {},
+): SingleAgentRun => ({
+  attempt_id: "sa-attempt",
+  definition_id: "single-agent-v1",
+  definition_state: "pinned",
+  profile_revision_id: "prof-rev-1",
+  execution_config_revision_id: "cfg-1",
+  parent_attempt_id: null,
+  probe_admission_id: null,
+  stage: "awaiting_human",
+  stage_reason: "Waiting for you to accept the result or request changes.",
+  selected_check_ids: [],
+  checks: [],
+  guidance_changes: [],
+  guidance_change_hash: null,
+  resume: null,
+  result: {
+    id: "result-1",
+    state: "submitted",
+    summary: "Implemented the change.",
+    acceptance_rows: [{
+      criterion: "works",
+      status: "met",
+      evidence: [{ kind: "source", detail: "src/lib.rs" }],
+    }],
+    snapshot_id: "snapshot-1",
+    candidate_hash: "candidate-1",
+    selected_check_revision: 1,
+    created_at: "2026-10-10T00:00:00Z",
+  },
+  available_actions: ["accept_result", "request_rework"],
+  integration_recorded: false,
+  ...overrides,
+});
+const singleAgentTask = (
+  run: SingleAgentRun,
+  overrides: Partial<Task> = {},
+): Task => ({
+  ...task,
+  id: "SA-1",
+  title: "Single agent work",
+  active_attempt: {
+    id: run.attempt_id,
+    phase: "awaiting_human",
+    status: "running",
+    base_revision: "abc",
+  },
+  workflow: {
+    family: "single_agent",
+    definition_id: "single-agent-v1",
+    execution_config_revision_id: "cfg-1",
+    profile_revision_id: "prof-rev-1",
+    check_ids: [],
+    selection_revision: 1,
+    admission_state: "admitted",
+    admission_reason: null,
+    run,
+  },
+  ...overrides,
+});
+
+Deno.test("Recorded output decoding matches the service's named literal vectors", async () => {
+  const { recordedOutputText } = await import("./cmuxRouting");
+  const bytes = (value: number[] | string) =>
+    encodedBytes(
+      typeof value === "string" ? new TextEncoder().encode(value) : new Uint8Array(value),
+    );
+  const frame = (epoch: string, sequence: number, value: number[] | string) => ({
+    epoch,
+    sequence,
+    captured_at: "2026-01-01T00:00:00Z",
+    encoding: "base64" as const,
+    data: bytes(value),
+    gap: false,
+  });
+  const gap = (epoch: string, sequence: number, data: string) => ({
+    epoch,
+    sequence,
+    captured_at: "2026-01-01T00:00:00Z",
+    encoding: "utf8" as const,
+    data,
+    gap: true,
+  });
+  // The same names, frames and expected text as transcript.rs's
+  // recorded_history_vectors, so both readers stay byte-for-byte equivalent.
+  const vectors = [
+    ["split_utf8", [frame("epoch-a", 1, [0xe2, 0x82]), frame("epoch-a", 2, [0xac, 0x21])], "€!"],
+    ["split_csi_osc", [
+      frame("epoch-a", 1, "red\x1b[3"),
+      frame("epoch-a", 2, "1mtext\x1b]0;tit"),
+      frame("epoch-a", 3, "le\x07done"),
+    ], "redtextdone"],
+    ["retention_gap", [
+      frame("epoch-a", 1, [0xe2, 0x82]),
+      gap("epoch-a", 2, "lost"),
+      frame("epoch-a", 3, "after"),
+    ], "�\n[recorded output gap at exact epoch epoch-a, frame 2]\nlostafter"],
+    ["epoch_boundary", [
+      frame("epoch-a", 1, "\x1b]0;unterminated"),
+      frame("epoch-b", 1, "next\r\n"),
+    ], "\n[recorded output changed at exact epoch epoch-b, frame 1]\nnext\n\n"],
+  ] as const;
+  for (const [name, frames, expected] of vectors) {
+    const text = recordedOutputText({
+      state: "recorded_output",
+      message: "",
+      retry_available: false,
+      recorded_output: { frames: [...frames], next_sequence: 0, has_more: false },
+    });
+    check(text === expected, `${name} decoded to ${JSON.stringify(text)}`);
+  }
+});
+
+Deno.test("Stopped output reaches its final retained page, searches the full saved copy, and keeps pane identities exact", async () => {
+  const { useSessionAccess } = await import("./components/SessionTree");
+  const bodies: Record<string, unknown>[] = [];
+  let viewed = 0;
+  const pageFrame = (epoch: string, sequence: number, data: string) => ({
+    epoch,
+    sequence,
+    captured_at: "2026-01-01T00:00:00Z",
+    encoding: "utf8" as const,
+    data,
+    gap: false,
+  });
+  const paneView = (id: string, operation: string, state: "unknown" | "opened") => ({
+    id,
+    operation_id: operation,
+    session_id: "hist-s",
+    transcript_epoch: "epoch-a",
+    role_generation_id: null,
+    high_water_sequence: 3,
+    export_hash: null,
+    service_boot_id: "boot",
+    workspace_id: null,
+    surface_id: null,
+    state,
+    failure_reason: null,
+    retry_allowed: false,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+  });
+  // The first page alone exceeds the old single 64 KiB view.
+  const longLine = `${"x".repeat(70_000)}\n`;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    bodies.push(body);
+    const result = body.kind === "history_page"
+      ? body.session_id === "hist-x"
+        ? { frames: [pageFrame("epoch-y", 1, "another invocation")], next_sequence: 1, has_more: false }
+        : body.after_sequence === 0
+        ? { frames: [pageFrame("epoch-a", 1, longLine)], next_sequence: 1, has_more: true }
+        : { frames: [pageFrame("epoch-a", 2, "final retained line\n")], next_sequence: 2, has_more: false }
+      : body.kind === "history_pane_views"
+      ? [paneView("view-unknown", "op-unknown", "unknown")]
+      : body.kind === "history_export_text"
+      ? {
+        session_id: "hist-s",
+        transcript_epoch: "epoch-a",
+        export_hash: "export",
+        high_water_sequence: 3,
+        retention: { first_retained_sequence: 1, high_water_sequence: 3, gap_count: 0, complete: true },
+        text: "alpha\nbeta needle\ngamma needle\n",
+      }
+      : body.kind === "history_pane_open"
+      ? { view: paneView("view-new", String(body.operation_id), "opened"), message: "History pane opened in cmux." }
+      : null;
+    return new Response(JSON.stringify({ result }));
+  }) as typeof fetch;
+  const stopped = (id: string, epoch: string): Session => ({
+    ...managerSession,
+    id,
+    role: "implementer",
+    status: "exited",
+    transcript_epoch: epoch,
+  });
+  function Card({ session }: { session: Session }) {
+    const access = useSessionAccess([session], {
+      onView: () => {
+        viewed++;
+        return Promise.resolve<CmuxViewOutcome>({
+          state: "failed",
+          message: "",
+          retry_available: false,
+        });
+      },
+      onSetKeyboardControl: () => {
+        throw new Error("stopped output requested keyboard control");
+      },
+      onDiscard: () => {
+        throw new Error("stopped output requested a terminal discard");
+      },
+      onChanged: noop,
+    });
+    return (
+      <SessionTree
+        sessions={[session]}
+        access={access}
+        setupProjectId={() => undefined}
+        onOpenSetup={noop}
+      />
+    );
+  }
+  try {
+    mount(<Card session={stopped("hist-s", "epoch-a")} />);
+    click("View recorded output");
+    await settle();
+    check(
+      document.body.textContent?.includes("More saved output is available"),
+      "the first page did not offer the remaining output",
+    );
+    click("Load more output");
+    await settle();
+    const shown = document.querySelector(".session-history-text")?.textContent ?? "";
+    const pages = bodies.filter((body) => body.kind === "history_page");
+    check(
+      shown.length > 70_000 && shown.endsWith("final retained line\n") &&
+        pages.length === 2 && pages[1].after_sequence === 1 &&
+        pages.every((page) => page.transcript_epoch === "epoch-a") &&
+        document.body.textContent?.includes("It ends at frame 2"),
+      "paging did not reach the final retained frame of the exact epoch",
+    );
+    const search = document.querySelector<HTMLFormElement>(".session-history-search")!;
+    field("Search all saved output", "needle");
+    act(() => {
+      search.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    await settle();
+    check(
+      document.body.textContent?.includes("2 matching lines for “needle” in the saved output through frame 3"),
+      "search did not cover the complete saved copy beyond the loaded pages",
+    );
+    check(
+      document.body.textContent?.includes("could not confirm whether an earlier history pane"),
+      "an unknown pane outcome was not shown",
+    );
+    click("Open another history pane");
+    await settle();
+    const open = bodies.find((body) => body.kind === "history_pane_open");
+    check(
+      open?.acknowledged_unknown_view_id === "view-unknown" &&
+        typeof open.operation_id === "string" && open.operation_id !== "op-unknown" &&
+        document.body.textContent?.includes("History pane opened in cmux."),
+      "a new pane did not acknowledge the exact unknown view with a new identity",
+    );
+    check(
+      viewed === 0 &&
+        !bodies.some((body) =>
+          ["cmux_view", "cmux_set_keyboard_control"].includes(String(body.kind))
+        ),
+      "reading saved output used a live view or keyboard control",
+    );
+
+    mount(<Card session={stopped("hist-x", "epoch-x")} />);
+    click("View recorded output");
+    await settle();
+    check(
+      document.body.textContent?.includes("different invocation than the one selected") &&
+        !document.querySelector(".session-history-text")?.textContent?.includes("another invocation"),
+      "a page from another invocation was shown under the selected one",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Roles holds agent settings, Activity keeps output, and the full plan window is topmost and read-only", async () => {
+  const sent: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method && init.method !== "GET") sent.push(String(input));
+    return new Response("[]");
+  }) as typeof fetch;
+  const plan = ["# Plan", ...Array.from({ length: 150 }, (_, index) => `- Step ${index + 1}`)]
+    .join("\n");
+  const planning: Task = {
+    ...task,
+    active_attempt: {
+      id: "a1",
+      phase: "awaiting_plan_approval",
+      status: "running",
+      base_revision: "abc",
+      plan_hash: "plan-1",
+      content_revision: "content-1",
+      plan,
+    },
+  };
+  let closed = 0;
+  const detail = (value: Task) => (
+    <TaskDetail
+      task={value}
+      state={{ ...liveBase, tasks: [value] }}
+      onClose={() => closed++}
+      onChanged={noop}
+    />
+  );
+  try {
+    mount(detail(planning));
+    click("Roles");
+    await settle();
+    check(
+      !!document.querySelector(".role-settings") &&
+        !!document.querySelector('[data-attention-target="role_settings:AJ-1:manager"]'),
+      "Roles did not show the agent settings",
+    );
+    click("Activity");
+    check(
+      !document.querySelector(".role-settings") &&
+        document.body.textContent?.includes("Reports") &&
+        document.body.textContent.includes("Task history"),
+      "Activity still held agent settings or lost its records",
+    );
+    click("Overview");
+    const opener = findButton("Open plan");
+    act(() => {
+      opener.focus();
+      opener.click();
+    });
+    const viewer = document.querySelector(".plan-viewer");
+    check(
+      viewer?.textContent?.includes("Step 150") &&
+        document.activeElement?.getAttribute("aria-label") === "Close plan" &&
+        document.querySelector(".task-dialog")?.hasAttribute("inert") &&
+        document.body.classList.contains("dialog-open"),
+      "Open plan did not show the complete plan as the focused top window",
+    );
+    act(() => {
+      document.activeElement!.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+      );
+    });
+    check(
+      !document.querySelector(".plan-viewer") && !!document.querySelector(".task-dialog") &&
+        closed === 0 && document.body.classList.contains("dialog-open") &&
+        document.activeElement === opener &&
+        !document.querySelector(".task-dialog")?.hasAttribute("inert"),
+      "Escape did not close only the plan window and return focus to Open plan",
+    );
+    act(() => {
+      opener.focus();
+      opener.click();
+    });
+    rerender(detail({
+      ...planning,
+      active_attempt: {
+        ...planning.active_attempt!,
+        plan_hash: "plan-2",
+        content_revision: "content-2",
+        plan: "# Revised plan\n- New step",
+      },
+    }));
+    check(
+      !document.querySelector(".plan-viewer")?.textContent?.includes("Step 150") &&
+        document.body.textContent?.includes("This plan changed after you opened it"),
+      "a changed plan kept showing the earlier text",
+    );
+    click("Show the current plan");
+    check(
+      document.querySelector(".plan-viewer")?.textContent?.includes("New step"),
+      "the current plan could not be reopened",
+    );
+    check(sent.length === 0, "reading the plan or switching tabs sent a request");
+    unmount();
+    check(!document.body.classList.contains("dialog-open"), "closing every dialog left the page locked");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("A Single agent run sends only the service's offered decisions with their exact bindings", async () => {
+  localStorage.clear();
+  const bodies: Record<string, unknown>[] = [];
+  let failNext = false;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    bodies.push(body);
+    if (failNext) {
+      failNext = false;
+      throw new TypeError("Connection lost");
+    }
+    return workflowResult(body);
+  }) as typeof fetch;
+  const commands = () => workflowCommands(bodies);
+  const selectedCheck: SingleAgentCheck = {
+    check_id: "check-1",
+    check_key: "unit",
+    original_text: "Unit tests pass",
+    command_kind: "exact_argv",
+    executable: "deno",
+    arguments: ["task", "test"],
+    shell_command: null,
+    cwd: ".",
+    exact_command_hash: "command-hash",
+    scope_hash: "scope-hash",
+    authorization: "missing",
+    latest_run_id: null,
+    latest_run_status: null,
+    latest_run_passed: null,
+  };
+  try {
+    mount(
+      <ReviewPanel
+        task={singleAgentTask(singleAgentRun({
+          stage: "awaiting_selected_checks",
+          stage_reason: "The selected checks must pass against the captured candidate.",
+          selected_check_ids: ["check-1"],
+          checks: [selectedCheck],
+          available_actions: ["authorize_check", "cancel"],
+        }))}
+        onChanged={noop}
+      />,
+    );
+    check(
+      !document.body.textContent?.includes("Accept result") &&
+        document.body.textContent?.includes("deno task test"),
+      "checks waiting showed Accept or hid the exact command",
+    );
+    click("Allow once");
+    await settle();
+    const authorize = commands().at(-1);
+    check(
+      authorize?.kind === "authorize_check" && authorize.check_id === "check-1" &&
+        authorize.exact_command_hash === "command-hash" &&
+        authorize.scope_hash === "scope-hash" && authorize.decision === "authorized" &&
+        authorize.lifetime === "once" && authorize.attempt_id === "sa-attempt",
+      "check authorization lost its exact binding",
+    );
+
+    const guided = singleAgentTask(singleAgentRun({
+      guidance_changes: [{
+        path: "README.md",
+        base_revision: "abc",
+        approved_sha256: "a".repeat(64),
+        candidate_sha256: "b".repeat(64),
+      }],
+      guidance_change_hash: "guidance-hash",
+    }));
+    mount(<ReviewPanel task={guided} onChanged={noop} />);
+    check(
+      findButton("Request changes").disabled &&
+        document.body.textContent?.includes("README.md") &&
+        document.body.textContent.includes("also accepts these changes"),
+      "rework was enabled without feedback or a guidance change was hidden",
+    );
+    failNext = true;
+    click("Accept result");
+    await settle();
+    const unknown = commands().at(-1);
+    check(
+      unknown?.kind === "accept_result" && unknown.result_binding_id === "result-1" &&
+        unknown.candidate_hash === "candidate-1" &&
+        unknown.guidance_change_hash === "guidance-hash" &&
+        unknown.expected_version === guided.version &&
+        document.body.textContent?.includes("may already have been applied"),
+      "acceptance lost its binding or hid the unknown outcome",
+    );
+    click("Accept result");
+    await settle();
+    check(
+      commands().length === 3 && commands()[2].operation_id === unknown?.operation_id,
+      "an identical retry after an unknown outcome changed its identity",
+    );
+
+    localStorage.clear();
+    mount(<ReviewPanel task={guided} onChanged={noop} />);
+    failNext = true;
+    click("Accept result");
+    await settle();
+    const before = commands().length;
+    const held = commands().at(-1);
+    rerender(<ReviewPanel task={{ ...guided, version: guided.version + 1 }} onChanged={noop} />);
+    click("Accept result");
+    await settle();
+    check(
+      commands().length === before &&
+        document.body.textContent?.includes("the page has changed since"),
+      "a changed request after an unknown outcome was sent silently",
+    );
+    click("Accept result");
+    await settle();
+    check(
+      commands().length === before + 1 &&
+        commands().at(-1)?.operation_id !== held?.operation_id &&
+        commands().at(-1)?.expected_version === guided.version + 1,
+      "the reviewed changed request was not sent as a new current request",
+    );
+
+    mount(<ReviewPanel task={singleAgentTask(singleAgentRun())} onChanged={noop} />);
+    field("Changes to request", "Handle empty input");
+    click("Request changes");
+    await settle();
+    const rework = commands().at(-1);
+    check(
+      rework?.kind === "request_rework" && rework.feedback === "Handle empty input" &&
+        rework.result_binding_id === "result-1" && rework.candidate_hash === "candidate-1",
+      "request changes lost its exact result binding",
+    );
+
+    mount(
+      <ReviewPanel
+        task={singleAgentTask(singleAgentRun({ available_actions: [] }))}
+        onChanged={noop}
+      />,
+    );
+    check(
+      ![...document.querySelectorAll("button")].some((button) =>
+        button.textContent === "Accept result" || button.textContent === "Request changes"
+      ) && document.body.textContent?.includes("does not offer Accept result"),
+      "a decision the service did not offer was shown",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Board and task detail show the same Single agent stage and reason", () => {
+  const working = singleAgentTask(singleAgentRun({
+    stage: "result_submitted_waiting_for_stop",
+    stage_reason: "The agent submitted its result; waiting for its processes to stop before capturing the worktree.",
+    result: null,
+    available_actions: [],
+  }));
+  try {
+    mount(<TaskBoard tasks={[working]} projects={[initialized]} onOpen={noop} onEdit={noop} onChanged={noop} />);
+    const boardBadge = document.querySelector(".task-card .status-badge")?.textContent;
+    mount(<TaskDetail task={working} state={{ ...liveBase, tasks: [working] }} onClose={noop} onChanged={noop} />);
+    check(
+      boardBadge === "Result submitted" &&
+        document.querySelector(".task-dialog-title-row .status-badge")?.textContent === boardBadge &&
+        document.getElementById("task-dialog-status")?.textContent ===
+          working.workflow?.run?.stage_reason &&
+        document.querySelector('.phase-progress [aria-current="step"]')?.textContent?.startsWith("Result"),
+      "board and detail disagreed on the Single agent stage",
+    );
+  } finally {
+    unmount();
+  }
+});
+
+Deno.test("New tasks follow the project default workflow, and draft choices bind their exact version", async () => {
+  localStorage.clear();
+  const bodies: Record<string, unknown>[] = [];
+  let saved = 0;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (!init?.body) return new Response("[]");
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    bodies.push(body);
+    return body.kind === "workflow"
+      ? workflowResult(body)
+      : new Response(JSON.stringify({ result: { entity_id: "AJ-9", version: 1 } }));
+  }) as typeof fetch;
+  try {
+    mount(
+      <TaskForm
+        projects={[initialized]}
+        selectedProjectId="p1"
+        onSaved={() => saved++}
+        onClose={noop}
+        workflowExecution={[singleAgentExecution]}
+      />,
+    );
+    check(
+      choiceFor("Single agent (one agent").checked &&
+        !document.body.textContent?.includes("Create Ready task"),
+      "the project default was not preselected or a Single agent Ready create was offered",
+    );
+    field("Title", "Write the guide");
+    change(findSelect("Agent profile"), "prof-rev-1");
+    act(() => choiceFor("Unit tests pass").click());
+    click("Save draft");
+    await settle();
+    const created = workflowCommands(bodies).at(-1);
+    check(
+      created?.kind === "create_task" && created.title === "Write the guide" &&
+        JSON.stringify(created.selection) === JSON.stringify({
+          family: "single_agent",
+          execution_config_revision_id: "cfg-1",
+          profile_revision_id: "prof-rev-1",
+          check_ids: ["check-1"],
+        }) && !("ready" in created) && saved === 1,
+      "the Single agent create did not bind its exact selection",
+    );
+
+    localStorage.clear();
+    mount(
+      <TaskForm
+        projects={[initialized]}
+        selectedProjectId="p1"
+        onSaved={noop}
+        onClose={noop}
+        workflowExecution={[{ ...singleAgentExecution, default_family: "trip" }]}
+      />,
+    );
+    check(
+      choiceFor("TRIP (manager").checked &&
+        document.body.textContent?.includes("Create Ready task") &&
+        document.body.textContent.includes("Role overrides"),
+      "a TRIP default lost the TRIP create path",
+    );
+
+    const ready: Task = { ...task, lifecycle: "ready", active_attempt: undefined };
+    mount(
+      <RoleSettings
+        task={ready}
+        project={initialized}
+        sessions={[]}
+        execution={singleAgentExecution}
+        tasks={[ready]}
+        onChanged={noop}
+      />,
+    );
+    await settle();
+    act(() => choiceFor("Single agent (one agent").click());
+    change(findSelect("Agent profile"), "prof-rev-1");
+    check(
+      document.body.textContent?.includes("moves this Ready task back to the drafts"),
+      "changing a Ready task's workflow did not warn about admission",
+    );
+    click("Save workflow choice");
+    await settle();
+    const selected = workflowCommands(bodies).at(-1);
+    check(
+      selected?.kind === "set_task_workflow" && selected.task_id === ready.id &&
+        selected.expected_version === ready.version &&
+        JSON.stringify(selected.selection) === JSON.stringify({
+          family: "single_agent",
+          execution_config_revision_id: "cfg-1",
+          profile_revision_id: "prof-rev-1",
+          check_ids: [],
+        }),
+      "the workflow choice lost its exact task version or selection",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Project Single agent settings show the service's probe blocker and send exact default and admission commands", async () => {
+  localStorage.clear();
+  const bodies: Record<string, unknown>[] = [];
+  let loseNextResponse = false;
+  let refuseNextRequest = false;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (!init?.body) return new Response("[]");
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    bodies.push(body);
+    if (loseNextResponse) {
+      loseNextResponse = false;
+      throw new TypeError("Connection lost");
+    }
+    if (refuseNextRequest) {
+      refuseNextRequest = false;
+      return new Response(
+        JSON.stringify({ error: "browser session required" }),
+        { status: 401 },
+      );
+    }
+    const command = body.command as Record<string, unknown> | undefined;
+    if (command?.kind === "save_agent_profile" && command.profile_id === null) {
+      return new Response(JSON.stringify({
+        result: {
+          operation_id: command.operation_id,
+          entity_kind: "agent_profile",
+          entity_id: "profile-new",
+          version: 1,
+          state: "created",
+          detail: {},
+        },
+      }));
+    }
+    return workflowResult(body);
+  }) as typeof fetch;
+  const settings = (execution: ProjectExecution, tasks: Task[] = []) => (
+    <ProjectSettings project={initialized} execution={execution} tasks={tasks} onChanged={noop} />
+  );
+  try {
+    mount(settings(singleAgentExecution));
+    check(
+      findButton("Probe this profile").disabled &&
+        document.body.textContent?.includes(
+          "A probe cannot start now: The Codex Single agent writer mode has not been qualified",
+        ) &&
+        !document.body.textContent.includes("Queue the probe run"),
+      "an unavailable probe was offered or its reason hidden",
+    );
+    act(() => choiceFor("TRIP", document.querySelector(".workflow-default")!).click());
+    click("Save default workflow");
+    await settle();
+    const defaulted = workflowCommands(bodies).at(-1);
+    check(
+      defaulted?.kind === "set_project_workflow_default" &&
+        defaulted.project_id === "p1" && defaulted.expected_version === 3 &&
+        defaulted.family === "trip" && workflowCommands(bodies).length === 1,
+      "the project default lost its version or a probe was sent",
+    );
+    const available = {
+      ...singleAgentExecution,
+      admissions: [{
+        ...singleAgentExecution.admissions[0],
+        probe_available: true,
+        probe_unavailable_reason: null,
+      }],
+    };
+    rerender(settings(available));
+    click("Probe this profile");
+    check(workflowCommands(bodies).length === 1, "probing started without confirmation");
+    click("Queue the probe run");
+    await settle();
+    const probe = workflowCommands(bodies).at(-1);
+    check(
+      probe?.kind === "probe_profile_admission" && probe.admission_id === "adm-1" &&
+        probe.project_id === "p1",
+      "the probe lost its exact admission",
+    );
+    check(
+      ![...document.querySelectorAll("button")].some((button) =>
+        button.textContent === "Activate admission"
+      ),
+      "activation was offered without recorded probe evidence",
+    );
+    const probeTask = singleAgentTask(
+      singleAgentRun({ stage: "probe_evidence_recorded", probe_admission_id: "adm-1", result: null, available_actions: [] }),
+      { id: "probe-task", lifecycle: "done" },
+    );
+    rerender(settings({
+      ...available,
+      admissions: [{ ...available.admissions[0], probe_task_id: "probe-task" }],
+    }, [probeTask]));
+    click("Activate admission");
+    await settle();
+    const activated = workflowCommands(bodies).at(-1);
+    check(
+      activated?.kind === "activate_profile_admission" && activated.admission_id === "adm-1",
+      "activation lost its exact admission",
+    );
+
+    // A new profile has no version fence, so a lost creation response must be
+    // settled by resending that exact request before anything else is created.
+    const editor = () => document.querySelector(".agent-profile-editor")!;
+    const editorField = (label: string) =>
+      [...editor().querySelectorAll("label")]
+        .find((item) => item.textContent?.startsWith(label))!
+        .querySelector<HTMLInputElement | HTMLTextAreaElement>("input, textarea")!;
+    const editorButton = (text: string) =>
+      [...editor().querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes(text))!;
+    const creations = () =>
+      workflowCommands(bodies).filter((command) =>
+        command.kind === "save_agent_profile" && command.profile_id === null
+      );
+    click("Add an agent profile");
+    change(editorField("Name"), "Reviewer");
+    change(editorField("Profile exact model"), "gpt-6.1-sol");
+    change(editorField("Instructions for the agent"), "Review carefully.");
+    loseNextResponse = true;
+    act(() => editorButton("Save profile").click());
+    await settle();
+    const original = creations().at(-1);
+    change(editorField("Profile exact model"), "gpt-6.2-sol");
+    act(() => editorButton("Save profile").click());
+    await settle();
+    check(
+      creations().length === 1 && editorButton("Save profile").disabled &&
+        editorField("Profile exact model").value === "gpt-6.2-sol" &&
+        editor().textContent?.includes("“Reviewer” (codex · gpt-6.1-sol · medium)"),
+      "an edited creation was sent while the earlier one was unresolved, or the edit was lost",
+    );
+    act(() => editorButton("Cancel").click());
+    click("Add an agent profile");
+    check(
+      editorField("Profile exact model").value === "gpt-6.1-sol" &&
+        editorButton("Save profile").disabled,
+      "reopening the editor lost the unresolved creation",
+    );
+    // An expired sign-in refuses the resend before the service looks the
+    // operation up, so the original creation stays unresolved.
+    const storedOriginal = localStorage.getItem("llmrelay.workflow.project.p1");
+    refuseNextRequest = true;
+    act(() => editorButton("Check the earlier profile creation").click());
+    await settle();
+    const refused = creations().at(-1);
+    check(
+      creations().length === 2 && refused?.operation_id === original?.operation_id &&
+        localStorage.getItem("llmrelay.workflow.project.p1") === storedOriginal &&
+        editorButton("Save profile").disabled &&
+        !!editorButton("Check the earlier profile creation") &&
+        document.body.textContent?.includes("browser session required"),
+      "a refused resend discarded the unresolved creation or allowed a new one",
+    );
+    act(() => editorButton("Check the earlier profile creation").click());
+    await settle();
+    const replay = creations().at(-1);
+    check(
+      creations().length === 3 && replay?.operation_id === original?.operation_id &&
+        JSON.stringify(replay) === JSON.stringify(original) &&
+        editor().querySelector("legend")?.textContent === "Edit the recovered profile",
+      "recovery did not resend the exact earlier creation",
+    );
+    change(editorField("Instructions for the agent"), "Review very carefully.");
+    act(() => editorButton("Save profile").click());
+    await settle();
+    const edit = workflowCommands(bodies).at(-1);
+    check(
+      creations().length === 3 && edit?.kind === "save_agent_profile" &&
+        edit.profile_id === "profile-new" && edit.expected_version === 1 &&
+        edit.operation_id !== original?.operation_id,
+      "the next save after recovery did not change the recovered profile",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Providers makes no request on open, starts only an authorized previewed plan, and keeps an unknown start's identity", async () => {
+  localStorage.clear();
+  const bodies: Record<string, unknown>[] = [];
+  let failStart = true;
+  let reconcileReply: (body: Record<string, unknown>) => unknown = () => null;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    bodies.push(body);
+    if (body.kind === "provider_validation_reconcile") {
+      return new Response(JSON.stringify({ result: reconcileReply(body) }));
+    }
+    if (body.kind === "provider_validation_preview") {
+      return new Response(JSON.stringify({
+        result: {
+          preview_hash: "preview-1",
+          installations: ["codex", "claude"].map((provider) => ({
+            provider,
+            ready: true,
+            executable_path: `/usr/local/bin/${provider}`,
+            executable_version: "1.0.0",
+            account_identity: provider === "codex" ? "account-1" : null,
+            authentication: "signed in",
+            model_calls_disabled_reason: null,
+            guidance: null,
+          })),
+          checks: [{
+            ordinal: 0, provider: "codex", model: "gpt-6.1-sol", effort: "high",
+            plan: "reuse_proof", reason: "A current confirmation exists.",
+            proof_observed_at: "2026-10-10T00:00:00Z", proof_expires_at: "2026-10-11T00:00:00Z",
+            model_listed: true,
+          }, {
+            ordinal: 1, provider: "claude", model: "claude-opus-5-5", effort: "medium",
+            plan: "model_call", reason: "No current confirmation.",
+            proof_observed_at: null, proof_expires_at: null, model_listed: null,
+          }],
+          model_calls_required: 1,
+        },
+      }));
+    }
+    if (body.kind === "provider_validation_start" && failStart) {
+      failStart = false;
+      throw new TypeError("Connection lost");
+    }
+    return new Response(JSON.stringify({
+      result: {
+        id: "batch-1",
+        operation_id: body.operation_id,
+        state: "finished",
+        model_calls_authorized: true,
+        max_model_calls: 1,
+        created_at: "2026-10-10T00:00:00Z",
+        updated_at: "2026-10-10T00:01:00Z",
+        finished_at: "2026-10-10T00:01:00Z",
+        checks: [{
+          id: "check-codex", ordinal: 0, provider: "codex", model: "gpt-6.1-sol",
+          effort: "high", state: "succeeded", reused_proof: true, reason: null,
+          proof_observed_at: "2026-10-10T00:00:00Z", proof_expires_at: "2026-10-11T00:00:00Z",
+          updated_at: "2026-10-10T00:01:00Z",
+        }, {
+          id: "check-claude", ordinal: 1, provider: "claude", model: "claude-opus-5-5",
+          effort: "medium", state: "failed", reused_proof: false,
+          reason: "The provider refused this model for the signed-in account.",
+          proof_observed_at: null, proof_expires_at: null, updated_at: "2026-10-10T00:01:00Z",
+        }],
+      },
+    }));
+  }) as typeof fetch;
+  const listedBatch = (day: number) => ({
+    id: `batch-listed-${day}`,
+    operation_id: `listed-${day}`,
+    state: "finished" as const,
+    model_calls_authorized: false,
+    max_model_calls: 0,
+    created_at: `2026-05-0${day}T00:00:00Z`,
+    updated_at: `2026-05-0${day}T00:00:00Z`,
+    finished_at: `2026-05-0${day}T00:00:00Z`,
+    checks: [],
+  });
+  const validation = {
+    // The five recent batches are all newer than the recovered request.
+    batches: [1, 2, 3, 4, 5].map(listedBatch),
+    proofs: [{
+      provider: "codex" as const,
+      model: "gpt-6.1-sol",
+      effort: "high",
+      executable_version: "1.0.0",
+      account_identity: "account-1",
+      observed_at: "2026-10-10T00:00:00Z",
+      expires_at: "2026-10-11T00:00:00Z",
+      expired: false,
+    }],
+  };
+  try {
+    mount(<ProviderSettings validation={validation} onChanged={noop} />);
+    check(bodies.length === 0, "opening Providers sent a request");
+    act(() => document.querySelectorAll<HTMLInputElement>(".provider-row input[type=checkbox]")[1].click());
+    field("Claude model to check", "claude-opus-5-5");
+    click("Preview checks");
+    await settle();
+    check(
+      bodies.length === 1 && bodies[0].kind === "provider_validation_preview" &&
+        JSON.stringify(bodies[0].selections) === JSON.stringify([
+          { provider: "codex", model: "gpt-6.1-sol", effort: "high" },
+          { provider: "claude", model: "claude-opus-5-5", effort: "medium" },
+        ]) &&
+        document.body.textContent?.includes("Account identity unavailable"),
+      "the preview lost the exact selection or hid unavailable account identity",
+    );
+    check(findButton("Start these checks").disabled, "model calls started without authorization");
+    act(() => choiceFor("Allow up to 1 new model call").click());
+    click("Start these checks");
+    await settle();
+    const first = bodies.at(-1);
+    check(
+      first?.kind === "provider_validation_start" && first.preview_hash === "preview-1" &&
+        first.authorize_model_calls === true && first.max_model_calls === 1 &&
+        localStorage.getItem("llmrelay.providers.start") !== null &&
+        !document.body.textContent?.includes("Forget"),
+      "an unknown start lost its persisted identity or offered to forget it",
+    );
+    const stored = localStorage.getItem("llmrelay.providers.start");
+    check(
+      !document.body.textContent?.includes("Check for the saved result") &&
+        !findButton("Check or close the earlier request").disabled,
+      "an unknown start offered only a refresh that cannot settle it",
+    );
+    // A reply for another request settles nothing.
+    reconcileReply = () => ({
+      outcome: "closed_without_start",
+      operation_id: "another-request",
+      closed_at: "2026-10-10T00:02:00Z",
+    });
+    click("Check or close the earlier request");
+    await settle();
+    const stale = bodies.at(-1);
+    check(
+      stale?.kind === "provider_validation_reconcile" &&
+        JSON.stringify({ ...stale, kind: "" }) === JSON.stringify({ ...first, kind: "" }) &&
+        localStorage.getItem("llmrelay.providers.start") === stored &&
+        choiceFor("Allow up to 1 new model call").checked &&
+        !findButton("Start these checks").disabled,
+      "reconciling changed the exact request, or another request's reply cleared it or its approval",
+    );
+    const startShown = () =>
+      [...document.querySelectorAll("button")].some((button) =>
+        button.textContent?.includes("Start these checks")
+      );
+    // The matching reply settles it, and its older batch stays shown.
+    reconcileReply = (body) => ({
+      outcome: "started",
+      batch: {
+        ...listedBatch(1),
+        id: "batch-recovered",
+        operation_id: body.operation_id,
+        created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+        finished_at: "2026-01-01T00:00:00Z",
+      },
+    });
+    click("Check or close the earlier request");
+    await settle();
+    check(
+      localStorage.getItem("llmrelay.providers.start") === null &&
+        document.querySelectorAll(".provider-batch").length === 6 &&
+        document.body.textContent?.includes("The earlier request had started"),
+      "a recovered request older than the recent checks was hidden, or its identity was kept",
+    );
+    // Settling leaves no preview or call approval to start from.
+    check(!startShown(), "a settled request left its preview available for a new start");
+
+    // A new start needs a new preview and approval, and gets a new identity;
+    // its identical replay never starts twice.
+    click("Preview checks");
+    await settle();
+    check(
+      findButton("Start these checks").disabled &&
+        !choiceFor("Allow up to 1 new model call").checked,
+      "the new preview reused the earlier call approval",
+    );
+    act(() => choiceFor("Allow up to 1 new model call").click());
+    failStart = true;
+    click("Start these checks");
+    await settle();
+    const second = bodies.at(-1);
+    check(
+      second?.kind === "provider_validation_start" &&
+        second.operation_id !== first?.operation_id &&
+        localStorage.getItem("llmrelay.providers.start") !== null,
+      "a new explicitly approved start reused the settled identity",
+    );
+    click("Send the identical request again");
+    await settle();
+    const replay = bodies.at(-1);
+    check(
+      replay?.operation_id === second?.operation_id &&
+        JSON.stringify({ ...replay, operation_id: "" }) === JSON.stringify({ ...second, operation_id: "" }) &&
+        localStorage.getItem("llmrelay.providers.start") === null,
+      "the replay changed the request or kept a settled identity",
+    );
+    check(
+      document.body.textContent?.includes("Reused a current confirmation") &&
+        document.body.textContent.includes("The provider refused this model for the signed-in account."),
+      "one provider's failure hid the other provider's result",
+    );
+
+    // A start that never arrived is closed without running anything.
+    click("Preview checks");
+    await settle();
+    act(() => choiceFor("Allow up to 1 new model call").click());
+    failStart = true;
+    click("Start these checks");
+    await settle();
+    const lost = bodies.at(-1);
+    const sentBeforeClosing = bodies.length;
+    reconcileReply = (body) => ({
+      outcome: "closed_without_start",
+      operation_id: body.operation_id,
+      closed_at: "2026-10-10T00:03:00Z",
+    });
+    click("Check or close the earlier request");
+    await settle();
+    check(
+      bodies.at(-1)?.operation_id === lost?.operation_id &&
+        localStorage.getItem("llmrelay.providers.start") === null &&
+        document.body.textContent?.includes("never started") &&
+        lost?.kind === "provider_validation_start" &&
+        !bodies.slice(sentBeforeClosing).some((body) =>
+          body.kind === "provider_validation_start"
+        ) && !startShown(),
+      "closing a request that never started kept it, started it, or left it startable",
+    );
+    click("Preview checks");
+    await settle();
+    check(
+      findButton("Start these checks").disabled &&
+        !choiceFor("Allow up to 1 new model call").checked,
+      "a closed request's call approval carried over to the new preview",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Retry stays off while an instruction file still differs, and the review path is offered", async () => {
+  globalThis.fetch = (async () => new Response("[]")) as typeof fetch;
+  const failed = (prerequisite: string | null) => ({
+    id: "r-fail",
+    attempt_id: "a1",
+    session_id: null,
+    state: "attention_required",
+    detail: {
+      kind: "coordinator_failure",
+      task_id: "AJ-1",
+      operation: "guidance_delivery",
+      causal_identity: {},
+      effect_certainty: "none",
+      cause: "guidance delivery failed",
+      failure_key: "key",
+    },
+    retry_blocked_by: [],
+    ...(prerequisite ? { retry_prerequisite: prerequisite } : {}),
+  });
+  const action = (prerequisite: string | null): ContinuationAction => ({
+    kind: "recover_failed_step",
+    enabled: true,
+    reason: "An automatic step failed.",
+    owner: "human",
+    operation: "resolve_recovery",
+    binding: {
+      task_id: "AJ-1",
+      attempt_id: "a1",
+      recovery_id: "r-fail",
+      retry_enabled: prerequisite === null,
+      retry_prerequisite: prerequisite,
+      retry_blocked_by: [],
+    },
+  });
+  const detail = (prerequisite: string | null) => (
+    <TaskDetail
+      task={task}
+      state={{
+        ...liveBase,
+        recovery: [failed(prerequisite)],
+        continuation_actions: [action(prerequisite)],
+      }}
+      onClose={noop}
+      onChanged={noop}
+    />
+  );
+  try {
+    mount(detail("README.md differs from its approved content"));
+    field("Recovery evidence", "README.md still has my edit");
+    check(
+      findButton("Retry failed step").disabled &&
+        document.body.textContent?.includes("its cause has not changed") &&
+        document.body.textContent.includes("Review changed instruction files"),
+      "an unchanged cause offered Retry or hid the review path",
+    );
+    mount(detail(null));
+    field("Recovery evidence", "README.md was restored");
+    check(!findButton("Retry failed step").disabled, "a settled cause kept Retry off");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Instruction-file review labels its comparison source and keeps the complete content", async () => {
+  const requests: Record<string, unknown>[] = [];
+  const pin = "a".repeat(64);
+  const current = "b".repeat(64);
+  let malformed = false;
+  const preview = () => ({
+    task_id: task.id,
+    attempt_id: "a1",
+    expected_version: task.version,
+    plan_hash: "approved-plan",
+    config_revision_id: "config",
+    policy_hash: "policy",
+    workspace: { path: "/tmp/llmrelay/worktrees/AJ-1", base_revision: "0123456789abcdef" },
+    files: [{
+      path: "README.md",
+      previous_sha256: pin,
+      sha256: current,
+      content: "# Title\nNew line\n",
+      baseline: { source: "pinned", revision: "0123456789abcdef", sha256: malformed ? "c".repeat(64) : pin, reason: null },
+      diff: [
+        { kind: "context", text: "# Title\n" },
+        { kind: "removed", text: "Old line\n" },
+        { kind: "added", text: "New line\n" },
+        { kind: "unchanged", lines: 4 },
+      ],
+    }, {
+      path: "docs/GUIDE.md",
+      previous_sha256: pin,
+      sha256: current,
+      content: "guide\n",
+      baseline: { source: "base_commit", revision: "0123456789abcdef", sha256: "d".repeat(64), reason: null },
+      diff: [{ kind: "added", text: "guide\n" }],
+    }, {
+      path: "AGENTS.md",
+      previous_sha256: pin,
+      sha256: current,
+      content: "the whole agents file\n",
+      baseline: {
+        source: "unavailable",
+        revision: "0123456789abcdef",
+        sha256: null,
+        reason: "The earlier version is larger than the preview limit.",
+      },
+      diff: null,
+    }],
+  });
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).endsWith("/guidance-reauthorization")) {
+      return new Response(JSON.stringify(preview()));
+    }
+    requests.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ result: { state: "guidance_reauthorized" } }));
+  }) as typeof fetch;
+  const section = (path: string) =>
+    [...document.querySelectorAll("details")].find((item) =>
+      item.querySelector("summary")?.textContent === `Changed file: ${path}`
+    );
+  try {
+    mount(<GuidanceRecovery task={task} onChanged={noop} />);
+    click("Review planned documentation update");
+    await settle();
+    const diff = section("README.md")?.querySelector(".guidance-diff")?.textContent ?? "";
+    check(
+      document.body.textContent?.includes("/tmp/llmrelay/worktrees/AJ-1") &&
+        section("README.md")?.textContent?.includes("compared with the approved copy") &&
+        diff.includes("- Old line") && diff.includes("+ New line") &&
+        diff.includes("… 4 unchanged lines …"),
+      "the pinned comparison or its workspace was not shown",
+    );
+    check(
+      section("docs/GUIDE.md")?.textContent?.includes("This is not the approved copy") &&
+        section("AGENTS.md")?.textContent?.includes("larger than the preview limit") &&
+        section("AGENTS.md")?.querySelector("pre")?.textContent === "the whole agents file\n",
+      "a base-commit or unavailable comparison was presented as the approved copy",
+    );
+    click("Approve planned documentation update");
+    await settle();
+    check(
+      requests.length === 1 &&
+        JSON.stringify(requests[0].files) === JSON.stringify(
+          ["README.md", "docs/GUIDE.md", "AGENTS.md"].map((path) => ({
+            path,
+            previous_sha256: pin,
+            sha256: current,
+          })),
+        ),
+      "approval sent comparison content as authority",
+    );
+    malformed = true;
+    mount(<GuidanceRecovery task={task} onChanged={noop} />);
+    click("Review planned documentation update");
+    await settle();
+    check(
+      !section("README.md") &&
+        ![...document.querySelectorAll("button")].some((button) =>
+          button.textContent === "Approve planned documentation update"
+        ),
+      "a pinned comparison whose hash is not the approved pin was accepted",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Verification and replacement wait until the role's generation has settled", async () => {
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    if (String(input).includes("/role-preparations")) {
+      return new Response(JSON.stringify([{
+        task_id: "AJ-1",
+        role: "implementer",
+        requested_revision: 1,
+        config: { provider: "codex", model: "gpt-5.6-sol", effort: "high" },
+        capability_key: "implementer-key",
+        status: "unverified",
+        reason: "verification required",
+        compatibility: {
+          status: "matched", observed_version: "codex-cli 0.155.1",
+          pack_id: "codex", pack_revision: "1", contract_id: "implementer",
+          contract_revision: "1", short_hash: "123456789abc",
+          predicate_id: "codex-exact", missing_evidence: [],
+          action: "requalify_exact_profile",
+          message: "Eligible for qualification.",
+        },
+      }]));
+    }
+    return new Response("{}");
+  }) as typeof fetch;
+  const config = { provider: "codex" as const, model: "gpt-5.6-sol", effort: "high" };
+  const configured: Task = {
+    ...task,
+    role_settings: [{
+      id: "impl-1",
+      role: "implementer",
+      revision: 1,
+      config,
+      effective_generation_id: "g-impl",
+    }, {
+      id: "manager-1",
+      role: "manager",
+      revision: 1,
+      config,
+      effective_generation_id: "g1",
+    }, {
+      id: "manager-2",
+      role: "manager",
+      revision: 2,
+      config: { ...config, model: "next" },
+    }],
+  };
+  const exited = (
+    id: string,
+    generation: string,
+    role: Session["role"],
+    fields: Partial<Session>,
+  ): Session => ({
+    ...managerSession,
+    id,
+    role,
+    role_generation_id: generation,
+    status: "exited",
+    process_group_quiescent: 1,
+    ...fields,
+  });
+  const roles = (session: Session) => (
+    <RoleSettings task={configured} project={initialized} sessions={[session]} onChanged={noop} />
+  );
+  try {
+    mount(roles(exited("s-impl", "g-impl", "implementer", {
+      generation_status: "stopping",
+      has_newer_generation: 0,
+    })));
+    await settle();
+    check(
+      findButton("Prepare verification").disabled &&
+        document.body.textContent?.includes("has not yet confirmed that it fully stopped"),
+      "verification was offered while the generation was still stopping",
+    );
+    rerender(roles(exited("s-impl", "g-impl", "implementer", {
+      generation_status: "exited",
+      has_newer_generation: 0,
+    })));
+    await settle();
+    check(!findButton("Prepare verification").disabled, "a settled generation kept verification off");
+    rerender(roles(exited("s-impl", "g-impl", "implementer", {})));
+    await settle();
+    check(
+      findButton("Prepare verification").disabled,
+      "an older snapshot without generation fields was treated as settled",
+    );
+    const controls = (session: Session) => (
+      <WorkflowControls task={configured} sessions={[session]} onChanged={noop} />
+    );
+    mount(controls(exited("s1", "g1", "manager", {
+      generation_status: "stopping",
+      has_newer_generation: 0,
+    })));
+    check(
+      document.body.textContent?.includes("The manager is still stopping") &&
+        !document.body.textContent.includes("Change manager at safe boundary"),
+      "a stopping manager could be replaced",
+    );
+    rerender(controls(exited("s1", "g1", "manager", {
+      generation_status: "exited",
+      has_newer_generation: false,
+    })));
+    check(
+      document.body.textContent?.includes("Change manager at safe boundary"),
+      "a stopped manager could not be replaced",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Attention groups one obligation's notices without merging items that have no target", () => {
+  const target: AttentionTarget = { kind: "task", project_id: "p1", task_id: "AJ-1", task_version: 7 };
+  const state: AppState = {
+    ...liveBase,
+    attention: [
+      { ...railItem("first", "decision", "Plan needs review", target), action: { kind: "open_task", label: "Open task" } },
+      { ...railItem("second", "decision", "Plan reviewer finished", target), action: { kind: "open_task", label: "Open task" } },
+      railItem("old-1", "recovery", "Earlier safety record", null),
+      railItem("old-2", "recovery", "Earlier safety record", null),
+    ],
+  };
+  try {
+    mount(<AttentionInbox state={state} onNavigate={() => undefined} onChanged={noop} />);
+    const related = document.querySelector(".attention-related");
+    check(
+      [...document.querySelectorAll("button")].filter((button) =>
+          button.textContent?.startsWith("Open task")
+        ).length === 1 &&
+        related?.textContent?.includes("1 more notice about the same step") &&
+        related.textContent.includes("Plan reviewer finished reason") &&
+        !!related.querySelector('[data-attention-id="second"]'),
+      "one obligation's notices were not grouped with their own reasons",
+    );
+    check(
+      [...document.querySelectorAll("button")].filter((button) =>
+        button.textContent?.startsWith("Refresh")
+      ).length === 2,
+      "items without a target were merged",
+    );
+  } finally {
+    unmount();
+  }
+});
+
+Deno.test("Stored draft deletions settle only from a complete snapshot, not the filtered board", async () => {
+  const priorEnvironment = { ...liveEnvironment };
+  const live = liveHarness();
+  liveEnvironment.transport = live.environment.transport;
+  liveEnvironment.scheduler = live.environment.scheduler;
+  globalThis.fetch = (async () => new Response("[]")) as typeof fetch;
+  const pending = (key: string) => [key, { body: "{}", id: `op-${key}` }];
+  localStorage.clear();
+  localStorage.setItem("agenticjira.page", "board");
+  localStorage.setItem("agenticjira.project", "p2");
+  localStorage.setItem(
+    "llmrelay.task.operations.AJ-del",
+    JSON.stringify([pending("delete_draft_task:AJ-del:4:"), pending("add_dependency:AJ-del:4:AJ-x")]),
+  );
+  localStorage.setItem(
+    "llmrelay.task.operations.AJ-kept",
+    JSON.stringify([pending("delete_draft_task:AJ-kept:3:")]),
+  );
+  localStorage.setItem(
+    "llmrelay.task.operations.AJ-moved",
+    JSON.stringify([pending("delete_draft_task:AJ-moved:2:")]),
+  );
+  // A restored database can show a lower version, which proves nothing.
+  localStorage.setItem(
+    "llmrelay.task.operations.AJ-restored",
+    JSON.stringify([pending("delete_draft_task:AJ-restored:4:")]),
+  );
+  // Unreadable versions are never settlement evidence, even for a missing task.
+  const malformed = [
+    pending("delete_draft_task:AJ-odd:abc:"),
+    pending("delete_draft_task:AJ-odd:-1:"),
+    pending("delete_draft_task:AJ-odd:2.5:"),
+  ];
+  localStorage.setItem("llmrelay.task.operations.AJ-odd", JSON.stringify(malformed));
+  const draft = (id: string, version: number): Task => ({
+    ...task,
+    id,
+    title: id,
+    lifecycle: "backlog",
+    active_attempt: undefined,
+    version,
+  });
+  try {
+    mount(<App />);
+    await settle();
+    check(
+      localStorage.getItem("llmrelay.task.operations.AJ-moved") !== null,
+      "stored deletions were swept before any snapshot arrived",
+    );
+    live.reads[0].resolve(snapshotAt("dq03", "1", {
+      projects: [initialized, secondProject],
+      tasks: [draft("AJ-kept", 3), draft("AJ-moved", 5), draft("AJ-restored", 3)],
+    }));
+    await settle();
+    check(
+      !document.querySelector(".task-card"),
+      "the board was not filtered to the other project",
+    );
+    const remaining = (taskId: string) =>
+      localStorage.getItem(`llmrelay.task.operations.${taskId}`);
+    check(
+      remaining("AJ-del") === JSON.stringify([pending("add_dependency:AJ-del:4:AJ-x")]) &&
+        remaining("AJ-kept") === JSON.stringify([pending("delete_draft_task:AJ-kept:3:")]) &&
+        remaining("AJ-moved") === null &&
+        remaining("AJ-restored") ===
+          JSON.stringify([pending("delete_draft_task:AJ-restored:4:")]) &&
+        remaining("AJ-odd") === JSON.stringify(malformed),
+      "draft deletions were not settled exactly by the complete snapshot",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Providers is reachable outside Projects and opening it sends nothing", async () => {
+  const priorEnvironment = { ...liveEnvironment };
+  const live = liveHarness();
+  liveEnvironment.transport = live.environment.transport;
+  liveEnvironment.scheduler = live.environment.scheduler;
+  const calls: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    calls.push(String(input));
+    return new Response("[]");
+  }) as typeof fetch;
+  localStorage.clear();
+  localStorage.setItem("agenticjira.page", "workspace");
+  try {
+    mount(<App />);
+    await settle();
+    live.reads[0].resolve(snapshotAt("providers", "1", {
+      provider_validation: { batches: [], proofs: [] },
+    }));
+    await settle();
+    const before = calls.length;
+    const reads = live.reads.length;
+    click("Providers");
+    await settle();
+    check(
+      document.querySelector("h1")?.textContent === "Providers" &&
+        !!document.querySelector(".provider-settings") &&
+        calls.length === before && live.reads.length === reads,
+      "opening Providers did not show it or sent a request",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    localStorage.clear();
   }
 });

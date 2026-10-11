@@ -4,7 +4,8 @@ use agenticjira::{
     control::{self, ControlRequest},
     domain::{
         AttentionActionKind, AttentionTarget, CapabilityStatus, HookEnvelope, HumanCommand,
-        LaunchConfig, Provider, RoleKind, RoleOverride, RoleResultReport, ValidationLaunchRequest,
+        LaunchConfig, Provider, RoleKind, RoleOverride, RoleResultReport, SessionOwner,
+        ValidationLaunchRequest,
     },
     operations::Application,
     providers::{self, PreparedLaunch},
@@ -693,7 +694,12 @@ async fn t10_pty_failure_cases(
         cleanup.sessions.push(session.clone());
         let identity = app
             .supervisor
-            .spawn(&session, &generation, &epoch, &launch)
+            .spawn(
+                &session,
+                &SessionOwner::RoleGeneration(generation.clone()),
+                &epoch,
+                &launch,
+            )
             .unwrap();
         store
             .update_session_running(&session, &epoch, &serde_json::to_string(&identity).unwrap())
@@ -1174,7 +1180,14 @@ async fn service_requested_stop_crosses_settling_deadline() {
         ],
         supervision_executable: std::path::PathBuf::from(env!("CARGO_BIN_EXE_agenticjira")),
     };
-    let identity = supervisor.spawn("s", "g", "epoch", &launch).unwrap();
+    let identity = supervisor
+        .spawn(
+            "s",
+            &SessionOwner::RoleGeneration("g".into()),
+            "epoch",
+            &launch,
+        )
+        .unwrap();
     store
         .update_session_running("s", "epoch", &serde_json::to_string(&identity).unwrap())
         .unwrap();
@@ -1389,7 +1402,14 @@ async fn service_requested_stop_allows_exact_descendant_to_settle() {
         ],
         supervision_executable: std::path::PathBuf::from(env!("CARGO_BIN_EXE_agenticjira")),
     };
-    let identity = supervisor.spawn("s", "g", "epoch", &launch).unwrap();
+    let identity = supervisor
+        .spawn(
+            "s",
+            &SessionOwner::RoleGeneration("g".into()),
+            "epoch",
+            &launch,
+        )
+        .unwrap();
     store
         .update_session_running("s", "epoch", &serde_json::to_string(&identity).unwrap())
         .unwrap();
@@ -1900,7 +1920,7 @@ async fn t10_role_auth_hook_and_human_boundary() {
         .supervisor
         .spawn(
             &session,
-            "0d9a4cfe-dc25-47ac-8229-ade497a2d321",
+            &SessionOwner::RoleGeneration("0d9a4cfe-dc25-47ac-8229-ade497a2d321".into()),
             "9c53a030-f42e-4b95-a2bc-e5b709d29b25",
             &child,
         )

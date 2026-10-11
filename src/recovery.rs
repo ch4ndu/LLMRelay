@@ -422,7 +422,10 @@ pub(crate) fn restart_session_facts(
          JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
          JOIN projects p ON p.id=t.project_id
          LEFT JOIN restart_candidates restart ON restart.session_id=s.id
-         WHERE (?1 IS NULL OR s.id=?1) ORDER BY s.created_at,s.id",
+         WHERE (?1 IS NULL OR s.id=?1)
+           -- A Single agent writer resumes only through its own shared rule.
+           AND rg.role!='single_agent'
+         ORDER BY s.created_at,s.id",
     )?;
     let rows = statement
         .query_map(params![session_id], |row| {
@@ -538,7 +541,13 @@ pub fn capture_desired_running_before_drain(store: &Store) -> Result<Vec<String>
         [],
     )?;
     let mut statement = transaction
-        .prepare("SELECT id FROM sessions WHERE status='running' ORDER BY created_at")?;
+        .prepare("SELECT id FROM sessions WHERE status='running' AND role_generation_id IS NOT NULL
+            AND (NOT EXISTS(SELECT 1 FROM execution_bindings eb WHERE eb.role_generation_id=sessions.role_generation_id)
+              -- A Single agent writer still working resumes after the restart;
+              -- one that already reported its result does not.
+              OR EXISTS(SELECT 1 FROM execution_bindings eb JOIN attempts a ON a.id=eb.attempt_id
+                WHERE eb.role_generation_id=sessions.role_generation_id AND a.phase='agent_execution'))
+            ORDER BY created_at")?;
     let ids = statement
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -854,7 +863,14 @@ pub fn reconcile_prior_boot(store: &Store) -> Result<Vec<serde_json::Value>> {
         transaction.commit()?;
         results.extend(uncertain);
     }
-    let mut statement=connection.prepare("SELECT id,process_identity_json,launch_state FROM sessions WHERE status IN ('launch_reserved','running')")?;
+    {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        results.extend(crate::store::reconcile_prior_boot_provider_checks_in(
+            &transaction,
+        )?);
+        transaction.commit()?;
+    }
+    let mut statement=connection.prepare("SELECT id,process_identity_json,launch_state FROM sessions WHERE status IN ('launch_reserved','running') AND role_generation_id IS NOT NULL")?;
     let sessions = statement
         .query_map([], |row| {
             Ok((

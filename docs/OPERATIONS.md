@@ -151,11 +151,22 @@ from the instruction content pinned for the attempt. Preserve the approved edit;
 restoring it solely to force progress can make the delivered candidate incomplete.
 
 In the task's **Overview**, choose **Review planned documentation update**.
-Read the displayed current content and compare it with the approved plan, then
-choose **Approve planned documentation update**. The preview is read-only;
-approval uses the exact displayed content hashes and task bindings. If the task
-or file changes after preview, approval is refused until you review a fresh
-preview. Other recovery holds must be resolved through their own actions.
+The preview names the task workspace it read and, for each changed file, shows
+what the change is compared with: the approved copy, or only the workspace's
+base-commit version when the approved copy could not be compared, or no
+comparison with the reason. The complete current content is always available.
+Compare it with the approved plan, then choose **Approve planned documentation
+update**. The preview is read-only; approval uses the exact displayed content
+hashes and task bindings, never the comparison. If the task, attempt or plan
+changes after preview, approval is refused until you review a fresh preview.
+LLMRelay never restores or discards the edit for you. Other recovery holds must
+be resolved through their own actions.
+
+When an automatic instruction delivery failed because such a file still differs
+from its approved content, **Retry failed step** stays unavailable: retrying
+would fail the same way. The recovery panel says so and offers this review
+path; Retry becomes available once the file is restored or the change is
+approved.
 
 The CLI route remains available. At a settled boundary, retrieve the current bindings with
 `llmrelay state --data-dir <INSTANCE> --task <TASK_ID>`, inspect the approved plan
@@ -529,8 +540,8 @@ reuse old qualification evidence to bypass these checks.
 ## Database restore points
 
 The database commands operate on the instance selected by `--data-dir` and never
-migrate it. Inspect, check and manual backup require current schema 38. Verify
-and restore accept schema 38 and the supported prior schemas 31–37, requiring the
+migrate it. Inspect, check and manual backup require current schema 39. Verify
+and restore accept schema 39 and the supported prior schemas 31–38, requiring the
 manifest version to match the actual SQLite version. Unknown versions are refused.
 
 Service start holds the exclusive instance lock, reconciles an interrupted
@@ -541,7 +552,7 @@ the default backup directory. It checks migration space again after publication.
 A failed preflight or backup prevents migration. Missing and already-current
 databases do not require this extra snapshot.
 
-Supported schemas 31–37 then upgrade to 38 through the existing migration
+Supported schemas 31–38 then upgrade to 39 through the existing migration
 transactions. Each failed migration rolls back its own transaction; earlier
 successful steps may remain committed. The failure identifies the verified
 restore point and offline recovery command. Startup never automatically restores
@@ -549,7 +560,10 @@ or retries it. Existing receipts retain their recorded values. Schema 32 records
 final-repair receipt provenance; 33 records native-resolution provenance; 34 adds
 the submitted guidance text and digest; 35 adds provider failure holds; 36 adds
 durable attention observations; 37 adds TRIP migration receipts; 38 adds
-Codex observed usage.
+Codex observed usage; 39 adds the Single agent workflow records, app-wide
+provider check records and read-only history pane records. Schema 39 rebuilds
+the sessions table so a session belongs to exactly one role generation or one
+provider check, keeping every existing session row and reference unchanged.
 
 ```sh
 llmrelay database --data-dir <ABSOLUTE_INSTANCE_PATH> inspect
@@ -654,7 +668,7 @@ permission rules and automatic resume authority are invalidated. The dashboard
 may be available for inspection and safe recovery, but execution remains fenced.
 Restoring an older snapshot first installs its original schema and commits this
 hold. A later service start makes a new verified snapshot and attempts the
-supported forward upgrade while retaining the hold. This build serves schema 38;
+supported forward upgrade while retaining the hold. This build serves schema 39;
 a persistent migration defect still requires a corrected build or operator
 repair. Restoring the data does not promise that a failing migration will succeed
 or launch a compatible older executable.

@@ -345,6 +345,16 @@ fn evaluate_ready_task(
         serde_json::json!({"task_id":task.task_id.clone()}),
         None,
     ));
+    if crate::workflow::task_family(connection, &task.task_id)?
+        == crate::domain::WorkflowFamily::SingleAgent
+    {
+        return evaluate_single_agent_ready_task(
+            connection,
+            runtime.is_some(),
+            task,
+            prerequisites,
+        );
+    }
     if let Err(error) = crate::trip::require_project_ready(connection, &task.project_id) {
         return Ok(blocked_scheduler_evaluation(
             &task,
@@ -613,6 +623,144 @@ fn evaluate_ready_task(
         task,
         mutation: SchedulerMutation::None,
         eligible: true,
+    })
+}
+
+/// Single agent admission: repository registration plus its own exact
+/// execution configuration and one activated writer admission. TRIP
+/// installation and six-role readiness do not apply.
+fn evaluate_single_agent_ready_task(
+    connection: &Connection,
+    runtime_available: bool,
+    task: ReadyTask,
+    mut prerequisites: Vec<DecisionPrerequisite>,
+) -> Result<SchedulerEvaluation> {
+    let inspect_project = || DecisionNextAction {
+        operation: "inspect_project".into(),
+        enabled: true,
+        owner: DecisionOwner::Human,
+        binding: DecisionActionBinding {
+            project_id: Some(task.project_id.clone()),
+            ..DecisionActionBinding::default()
+        },
+        accounting_note: None,
+    };
+    if let Some(problem) =
+        crate::workflow::single_agent_admission_problem(connection, &task.task_id)?
+    {
+        return Ok(blocked_scheduler_evaluation(
+            &task,
+            "scheduler.single_agent_admission_stale",
+            DecisionEvidenceState::Stale,
+            DecisionOwner::Human,
+            serde_json::json!({"task_id":task.task_id.clone()}),
+            Some(problem),
+            prerequisites,
+            SchedulerMutation::BacklogNeedsInput,
+            None,
+            Vec::new(),
+        ));
+    }
+    prerequisites.push(scheduler_prerequisite(
+        "scheduler.single_agent_admission_current",
+        DecisionEvidenceState::Satisfied,
+        DecisionOwner::Human,
+        serde_json::json!({"task_id":task.task_id.clone()}),
+        None,
+    ));
+    if let Err(error) = crate::recipes::require_binding_current(connection, &task.task_id) {
+        return Ok(blocked_scheduler_evaluation(
+            &task,
+            "scheduler.recipe_pin_stale",
+            DecisionEvidenceState::Stale,
+            DecisionOwner::Human,
+            serde_json::json!({"task_id":task.task_id.clone()}),
+            Some(error.to_string()),
+            prerequisites,
+            SchedulerMutation::NeedsInput,
+            Some(inspect_project()),
+            vec!["inspect_project".into()],
+        ));
+    }
+    // Guidance identity needs repository reads, which only the claiming
+    // service performs; projections report it as checked at admission.
+    if runtime_available {
+        if let Some(problem) =
+            crate::workflow::single_agent_guidance_problem(connection, &task.task_id)?
+        {
+            return Ok(blocked_scheduler_evaluation(
+                &task,
+                "scheduler.single_agent_guidance_stale",
+                DecisionEvidenceState::Stale,
+                DecisionOwner::Human,
+                serde_json::json!({"project_id":task.project_id.clone(),"base_revision":task.base_revision.clone()}),
+                Some(problem),
+                prerequisites,
+                SchedulerMutation::NeedsInput,
+                Some(inspect_project()),
+                vec!["inspect_project".into()],
+            ));
+        }
+    }
+    let provider: String = connection.query_row(
+        "SELECT r.provider FROM task_workflow_selections s JOIN agent_profile_revisions r ON r.id=s.profile_revision_id
+         WHERE s.task_id=?1",
+        params![task.task_id],
+        |row| row.get(0),
+    )?;
+    if !crate::store::session_capacity_available(connection, &provider, false, None, None)? {
+        return Ok(blocked_scheduler_evaluation(
+            &task,
+            "scheduler.global_capacity_full",
+            DecisionEvidenceState::Pending,
+            DecisionOwner::Service,
+            serde_json::json!({"provider":provider}),
+            Some("Waiting for agent capacity for this provider".into()),
+            prerequisites,
+            SchedulerMutation::QueuedCapacity,
+            None,
+            Vec::new(),
+        ));
+    }
+    prerequisites.push(scheduler_prerequisite(
+        "scheduler.single_agent_capacity_available",
+        DecisionEvidenceState::Satisfied,
+        DecisionOwner::Service,
+        serde_json::json!({"provider":provider}),
+        None,
+    ));
+    let eligible = runtime_available;
+    let (reason_code, disposition) = if eligible {
+        ("scheduler.ready_for_admission", DecisionDisposition::Ready)
+    } else {
+        ("scheduler.awaiting_admission", DecisionDisposition::Waiting)
+    };
+    Ok(SchedulerEvaluation {
+        decision: scheduler_decision(
+            &task,
+            reason_code,
+            disposition,
+            None,
+            prerequisites,
+            DecisionOwnership {
+                owner: DecisionOwner::Service,
+                state: "ready".into(),
+                binding: scheduler_binding(&task),
+            },
+            eligible.then(|| DecisionNextAction {
+                operation: "scheduler_claim".into(),
+                enabled: true,
+                owner: DecisionOwner::Service,
+                binding: scheduler_action_binding(&task),
+                accounting_note: Some(
+                    "Admission still rechecks every current predicate in its transaction.".into(),
+                ),
+            }),
+            DecisionControlPolicy::default(),
+        ),
+        task,
+        mutation: SchedulerMutation::None,
+        eligible,
     })
 }
 
@@ -925,34 +1073,37 @@ impl Scheduler {
         let scope_hash = crate::store::json_hash(
             &serde_json::json!({"title":scope.0,"description":scope.1,"acceptance_criteria":serde_json::from_str::<serde_json::Value>(&scope.2)?,"base_revision":base_revision}),
         )?;
-        let configurations = {
-            let mut statement=transaction.prepare("SELECT role,revision,config_json FROM role_settings r WHERE task_id=?1 AND revision=(SELECT MAX(revision) FROM role_settings WHERE task_id=r.task_id AND role=r.role) ORDER BY role")?;
-            let rows = statement
-                .query_map(params![task_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
-        };
-        let configuration_hash = crate::store::json_hash(&configurations)?;
-        let configuration_revision = configurations.iter().map(|item| item.1).max().unwrap_or(1);
-        transaction.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at,scope_hash,configuration_hash,workflow_version,workflow_hash,upstream_source_hash,overlay_hash,legacy_migration_required)
-            VALUES(?1,?2,?3,'planning',?4,?5,'workspace_reserved',?6,?6,?7,?8,?9,?10,?11,?12,0)", params![attempt_id,task_id,uuid::Uuid::new_v4().to_string(),base_revision,configuration_revision,now,scope_hash,configuration_hash,crate::workflow_resources::WORKFLOW_VERSION,crate::workflow_resources::workflow_hash(),crate::trip::source_hash(),crate::trip::overlay_hash()])?;
-        crate::trip::bind_attempt_profiles(
-            &transaction,
-            &task_id,
-            &attempt_id,
-            std::path::Path::new(&repository_path),
-            &task_runtime,
-            &now,
-        )?;
-        for (kind, allowance) in [("plan", 2), ("code", 2), ("final", 1)] {
-            transaction.execute("INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance) VALUES(?1,?2,?3,?4)",
-                params![uuid::Uuid::new_v4().to_string(),attempt_id,kind,allowance])?;
+        if crate::workflow::task_family(&transaction, &task_id)?
+            == crate::domain::WorkflowFamily::SingleAgent
+        {
+            let (selection_revision, configuration_hash): (i64, Option<String>) = transaction
+                .query_row(
+                    "SELECT s.selection_revision,c.content_hash FROM task_workflow_selections s
+                 LEFT JOIN execution_config_revisions c ON c.id=s.execution_config_revision_id
+                 WHERE s.task_id=?1",
+                    params![task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+            transaction.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at,scope_hash,configuration_hash,workflow_version,workflow_hash,legacy_migration_required)
+                VALUES(?1,?2,?3,'agent_execution',?4,?5,'workspace_reserved',?6,?6,?7,?8,?9,?10,0)", params![attempt_id,task_id,uuid::Uuid::new_v4().to_string(),base_revision,selection_revision,now,scope_hash,configuration_hash,crate::workflow_resources::SINGLE_AGENT_DEFINITION_ID,crate::workflow_resources::single_agent_definition_hash()])?;
+            crate::workflow::bind_single_agent_run(
+                &transaction,
+                &task_id,
+                &attempt_id,
+                &scope_hash,
+                &now,
+            )?;
+        } else {
+            self.bind_trip_attempt(
+                &transaction,
+                &task_runtime,
+                &task_id,
+                &attempt_id,
+                &repository_path,
+                &base_revision,
+                &scope_hash,
+                &now,
+            )?;
         }
         transaction.execute("INSERT INTO claims(id,task_id,attempt_id,repository_identity,state,created_at,updated_at) VALUES(?1,?2,?3,?4,'reserved',?5,?5)",
             params![claim_id,task_id,attempt_id,repository_identity,now])?;
@@ -979,6 +1130,52 @@ impl Scheduler {
             plan: self.create_workspace(plan)?,
             decision: None,
         })
+    }
+
+    /// The TRIP attempt record, its pinned role profiles and ordinary review
+    /// allowances, exactly as before Single agent existed.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_trip_attempt(
+        &self,
+        transaction: &Transaction<'_>,
+        task_runtime: &crate::trip::CapabilityRuntime,
+        task_id: &str,
+        attempt_id: &str,
+        repository_path: &str,
+        base_revision: &str,
+        scope_hash: &str,
+        now: &str,
+    ) -> Result<()> {
+        let configurations = {
+            let mut statement=transaction.prepare("SELECT role,revision,config_json FROM role_settings r WHERE task_id=?1 AND revision=(SELECT MAX(revision) FROM role_settings WHERE task_id=r.task_id AND role=r.role) ORDER BY role")?;
+            let rows = statement
+                .query_map(params![task_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let configuration_hash = crate::store::json_hash(&configurations)?;
+        let configuration_revision = configurations.iter().map(|item| item.1).max().unwrap_or(1);
+        transaction.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at,scope_hash,configuration_hash,workflow_version,workflow_hash,upstream_source_hash,overlay_hash,legacy_migration_required)
+            VALUES(?1,?2,?3,'planning',?4,?5,'workspace_reserved',?6,?6,?7,?8,?9,?10,?11,?12,0)", params![attempt_id,task_id,uuid::Uuid::new_v4().to_string(),base_revision,configuration_revision,now,scope_hash,configuration_hash,crate::workflow_resources::WORKFLOW_VERSION,crate::workflow_resources::workflow_hash(),crate::trip::source_hash(),crate::trip::overlay_hash()])?;
+        crate::trip::bind_attempt_profiles(
+            transaction,
+            task_id,
+            attempt_id,
+            std::path::Path::new(repository_path),
+            task_runtime,
+            now,
+        )?;
+        for (kind, allowance) in [("plan", 2), ("code", 2), ("final", 1)] {
+            transaction.execute("INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance) VALUES(?1,?2,?3,?4)",
+                params![uuid::Uuid::new_v4().to_string(),attempt_id,kind,allowance])?;
+        }
+        Ok(())
     }
 
     fn create_workspace(&self, mut plan: DispatchPlan) -> Result<Option<DispatchPlan>> {
@@ -1057,11 +1254,22 @@ impl Scheduler {
             )?;
             bail!("worktree creation outcome requires recovery: {error:#}")
         }
-        if let Err(error) = crate::trip::materialize_project_policy(
-            &self.store,
-            &plan.attempt_id,
-            &plan.workspace_path,
-        ) {
+        let trip_policy = {
+            let connection = self.store.lock()?;
+            crate::workflow::attempt_family(&connection, &plan.attempt_id)?
+                == crate::domain::WorkflowFamily::Trip
+        };
+        let materialized = if trip_policy {
+            crate::trip::materialize_project_policy(
+                &self.store,
+                &plan.attempt_id,
+                &plan.workspace_path,
+            )
+            .map(|_| ())
+        } else {
+            Ok(())
+        };
+        if let Err(error) = materialized {
             return self.fail_claim(
                 &plan,
                 &format!("TRIP policy materialization requires recovery: {error:#}"),
@@ -1084,7 +1292,9 @@ impl Scheduler {
             params![plan.workspace_id, plan.attempt_id],
             |row| row.get(0),
         )?;
-        crate::trip::validate_materialized_policy(&policy_json)?;
+        if trip_policy {
+            crate::trip::validate_materialized_policy(&policy_json)?;
+        }
         let workspace_changed = transaction.execute(
             "UPDATE workspaces SET state='ready',updated_at=?1 WHERE id=?2 AND attempt_id=?3 AND state='reserved'",
             params![now, plan.workspace_id, plan.attempt_id],

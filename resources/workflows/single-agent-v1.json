@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "family": "single_agent",
+  "id": "llmrelay-single-agent",
+  "version": "1",
+  "description": "One admitted workspace-writing agent completes the task, reports a structured result, any human-selected checks run against the frozen candidate, and a person accepts the result or requests changes.",
+  "evaluator": {
+    "id": "llmrelay-single-agent-evaluator",
+    "revision": 1
+  },
+  "steps": [
+    "agent_execution",
+    "structured_result",
+    "selected_checks",
+    "human_decision"
+  ],
+  "slots": [
+    {
+      "key": "single_agent",
+      "policy_mode": "single_agent_writer",
+      "authority": "workspace_write",
+      "session_contract": "retained",
+      "count": 1
+    }
+  ],
+  "result": {
+    "schema_revision": 1,
+    "completing_outcome": "result_ready",
+    "non_completing_outcomes": ["blocked", "needs_input"],
+    "evidence_kinds": ["source", "check", "manual", "not_run"]
+  },
+  "check_requirement": "selected",
+  "human_acceptance": "required",
+  "rework": {
+    "lineage": "linked_child",
+    "initial_conversation": "fresh",
+    "within_run": "retained",
+    "carry_plan_approval": false
+  }
+}

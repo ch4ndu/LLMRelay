@@ -28,8 +28,11 @@ enum Command {
     Status(InstanceArgs),
     Stop(StopArgs),
     Attach(AttachArgs),
+    History(HistoryArgs),
     Capability(CapabilityArgs),
     Apply(ApplyArgs),
+    /// Single agent setup, task selection and result decisions.
+    Workflow(WorkflowArgs),
     State(StateArgs),
     Scheduler(SchedulerArgs),
     Snapshot(SnapshotArgs),
@@ -133,6 +136,16 @@ struct AttachArgs {
     cmux_surface_route_id: Option<String>,
     #[arg(long, requires = "cmux_surface_route_id")]
     cmux_binding_revision: Option<i64>,
+}
+
+/// Shows the generated output export of one dashboard-created history pane in
+/// a read-only pager. It accepts a view ID only, never a file path.
+#[derive(Debug, Args)]
+struct HistoryArgs {
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    #[arg(long)]
+    view_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -282,6 +295,181 @@ struct ApplyArgs {
     data_dir: Option<PathBuf>,
     #[arg(long)]
     file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct WorkflowArgs {
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    /// Reuse an operation ID to retry safely; a new one is generated otherwise.
+    #[arg(long)]
+    operation_id: Option<String>,
+    #[command(subcommand)]
+    command: WorkflowCliCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkflowCliCommand {
+    /// Saves a reviewed execution configuration revision from a JSON file.
+    SaveConfiguration {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Creates or revises an agent profile from a JSON file.
+    SaveProfile {
+        #[arg(long)]
+        project: String,
+        #[arg(long, requires = "expected_version")]
+        profile: Option<String>,
+        #[arg(long)]
+        expected_version: Option<i64>,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    PrepareAdmission {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        profile_revision: String,
+        #[arg(long)]
+        configuration: String,
+    },
+    /// Queues the disposable probe run that proves a pending admission.
+    ProbeAdmission {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        admission: String,
+    },
+    ActivateAdmission {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        admission: String,
+    },
+    /// Continues a held writer's retained conversation exactly as the task shows it.
+    Resume {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        attempt: String,
+        #[arg(long)]
+        expected_version: i64,
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        transcript_epoch: String,
+        #[arg(long)]
+        message: Option<String>,
+    },
+    /// Sets the workflow new tasks in the project use; existing tasks keep theirs.
+    SetDefault {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        expected_version: i64,
+        #[arg(long)]
+        family: String,
+    },
+    /// Creates a draft with its workflow; without --family the project default applies.
+    CreateTask {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long = "criterion")]
+        criteria: Vec<String>,
+        #[arg(long, default_value_t = 0)]
+        priority: i64,
+        #[command(flatten)]
+        selection: WorkflowSelectionArgs,
+    },
+    SetTaskWorkflow {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        expected_version: i64,
+        #[command(flatten)]
+        selection: WorkflowSelectionArgs,
+    },
+    /// Authorizes or denies one selected check exactly as the task shows it.
+    AuthorizeCheck {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        attempt: String,
+        #[arg(long)]
+        check: String,
+        #[arg(long)]
+        command_hash: String,
+        #[arg(long)]
+        scope_hash: String,
+        #[arg(long)]
+        deny: bool,
+        #[arg(long, default_value = "once", value_parser = ["once", "run"])]
+        lifetime: String,
+    },
+    Accept {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        attempt: String,
+        #[arg(long)]
+        expected_version: i64,
+        #[arg(long)]
+        result: String,
+        #[arg(long)]
+        candidate: String,
+        /// Required when the result changes approved guidance files.
+        #[arg(long)]
+        guidance_change_hash: Option<String>,
+    },
+    RequestRework {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        attempt: String,
+        #[arg(long)]
+        expected_version: i64,
+        #[arg(long)]
+        result: String,
+        #[arg(long)]
+        candidate: String,
+        #[arg(long)]
+        feedback: String,
+    },
+}
+
+#[derive(Debug, Args)]
+struct WorkflowSelectionArgs {
+    #[arg(long)]
+    family: Option<String>,
+    #[arg(long, requires = "family")]
+    configuration: Option<String>,
+    #[arg(long, requires = "family")]
+    profile_revision: Option<String>,
+    #[arg(long = "check", requires = "family")]
+    checks: Vec<String>,
+}
+
+impl WorkflowSelectionArgs {
+    fn selection(self) -> Result<Option<crate::domain::TaskWorkflowSelectionInput>> {
+        let Some(family) = self.family else {
+            return Ok(None);
+        };
+        Ok(Some(crate::domain::TaskWorkflowSelectionInput {
+            family: family.parse().map_err(|error: String| anyhow!(error))?,
+            execution_config_revision_id: self.configuration,
+            profile_revision_id: self.profile_revision,
+            check_ids: self.checks,
+        }))
+    }
 }
 
 #[derive(Debug, Args)]
@@ -629,8 +817,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Command::Attach(args) => run_attach(args).await,
+        Command::History(args) => run_history(args).await,
         Command::Capability(args) => run_capability(args).await,
         Command::Apply(args) => run_apply(args).await,
+        Command::Workflow(args) => run_workflow(args).await,
         Command::State(args) => {
             let request = match args.task {
                 Some(task_id) => ControlRequest::TaskRecoveryBindings { task_id },
@@ -753,6 +943,93 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::InternalLaunch(args) => run_internal_launch(args),
         Command::UnixConnectProbe(args) => run_unix_connect_probe(args).await,
     }
+}
+
+async fn run_history(args: HistoryArgs) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    uuid::Uuid::parse_str(&args.view_id).context("--view-id must be a UUID")?;
+    let paths = InstancePaths::resolve(args.data_dir)?;
+    let response = control::request(
+        &paths.control_socket,
+        &ControlRequest::HistoryExport {
+            view_id: args.view_id,
+        },
+    )
+    .await?;
+    let (Some(path), Some(export_hash)) = (
+        response
+            .result
+            .get("path")
+            .and_then(serde_json::Value::as_str),
+        response
+            .result
+            .get("export_hash")
+            .and_then(serde_json::Value::as_str),
+    ) else {
+        bail!("the service did not return a complete history export binding")
+    };
+    let path = generated_history_export(&paths, std::path::Path::new(path))?;
+    let export = crate::transcript::open_bound_history_export(&path, export_hash)?;
+    let term = std::env::var("TERM").ok();
+    let error = history_pager_command(export, term.as_deref()).exec();
+    Err(error).with_context(|| {
+        format!(
+            "could not start the secure pager {}; read this output in the dashboard instead",
+            crate::cmux::HISTORY_PAGER
+        )
+    })
+}
+
+/// The service names the export, but the pager still opens only a regular
+/// file directly inside this instance's history export directory.
+fn generated_history_export(paths: &InstancePaths, path: &std::path::Path) -> Result<PathBuf> {
+    let directory = paths.artifacts.join("history-exports");
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("history export name is not valid UTF-8"))?;
+    let stem = name
+        .strip_suffix(".txt")
+        .ok_or_else(|| anyhow!("history export is not a generated text file"))?;
+    let generated_name = stem.len() == 73
+        && stem.as_bytes()[36] == b'-'
+        && uuid::Uuid::parse_str(&stem[..36]).is_ok()
+        && uuid::Uuid::parse_str(&stem[37..]).is_ok();
+    if path.parent() != Some(directory.as_path()) || !generated_name {
+        bail!("history export is outside this instance's generated history directory")
+    }
+    if !std::fs::symlink_metadata(path)
+        .with_context(|| format!("history export {} is unavailable", path.display()))?
+        .is_file()
+    {
+        bail!("history export is not a regular file")
+    }
+    Ok(path.to_path_buf())
+}
+
+/// Secure mode disables shell escapes, editing and log files; the cleared
+/// environment removes user pager, preprocessor and key-binding settings.
+/// Without -R, any control byte is shown inert instead of interpreted. The
+/// pager reads the already verified handle on stdin, never the pathname.
+fn history_pager_command(export: std::fs::File, term: Option<&str>) -> std::process::Command {
+    let term = term
+        .filter(|term| {
+            !term.is_empty()
+                && term.len() <= 64
+                && term.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')
+                })
+        })
+        .unwrap_or("dumb");
+    let mut command = std::process::Command::new(crate::cmux::HISTORY_PAGER);
+    command
+        .env_clear()
+        .env("TERM", term)
+        .env("LESSSECURE", "1")
+        .env("LESSHISTFILE", "-")
+        .env("LESSCHARSET", "utf-8")
+        .stdin(std::process::Stdio::from(export));
+    command
 }
 
 async fn run_unix_connect_probe(args: UnixConnectProbeArgs) -> Result<()> {
@@ -1581,6 +1858,183 @@ async fn run_apply(args: ApplyArgs) -> Result<()> {
     .await
 }
 
+fn read_json_file<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
+}
+
+async fn run_workflow(args: WorkflowArgs) -> Result<()> {
+    use crate::domain::{CheckAuthorizationDecision, CheckAuthorizationLifetime, WorkflowCommand};
+    let operation_id = args
+        .operation_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let command = match args.command {
+        WorkflowCliCommand::SaveConfiguration {
+            project,
+            expected_revision,
+            file,
+        } => WorkflowCommand::SaveExecutionConfiguration {
+            operation_id,
+            project_id: project,
+            expected_revision,
+            configuration: read_json_file(&file)?,
+        },
+        WorkflowCliCommand::SaveProfile {
+            project,
+            profile,
+            expected_version,
+            file,
+        } => WorkflowCommand::SaveAgentProfile {
+            operation_id,
+            project_id: project,
+            profile_id: profile,
+            expected_version,
+            profile: read_json_file(&file)?,
+        },
+        WorkflowCliCommand::PrepareAdmission {
+            project,
+            profile_revision,
+            configuration,
+        } => WorkflowCommand::PrepareProfileAdmission {
+            operation_id,
+            project_id: project,
+            profile_revision_id: profile_revision,
+            execution_config_revision_id: configuration,
+        },
+        WorkflowCliCommand::ProbeAdmission { project, admission } => {
+            WorkflowCommand::ProbeProfileAdmission {
+                operation_id,
+                project_id: project,
+                admission_id: admission,
+            }
+        }
+        WorkflowCliCommand::ActivateAdmission { project, admission } => {
+            WorkflowCommand::ActivateProfileAdmission {
+                operation_id,
+                project_id: project,
+                admission_id: admission,
+            }
+        }
+        WorkflowCliCommand::Resume {
+            task,
+            attempt,
+            expected_version,
+            session,
+            transcript_epoch,
+            message,
+        } => WorkflowCommand::ResumeRun {
+            operation_id,
+            task_id: task,
+            attempt_id: attempt,
+            expected_version,
+            session_id: session,
+            transcript_epoch,
+            message,
+        },
+        WorkflowCliCommand::SetDefault {
+            project,
+            expected_version,
+            family,
+        } => WorkflowCommand::SetProjectWorkflowDefault {
+            operation_id,
+            project_id: project,
+            expected_version,
+            family: family.parse().map_err(|error: String| anyhow!(error))?,
+        },
+        WorkflowCliCommand::CreateTask {
+            project,
+            title,
+            description,
+            criteria,
+            priority,
+            selection,
+        } => WorkflowCommand::CreateTask {
+            operation_id,
+            project_id: project,
+            title,
+            description,
+            acceptance_criteria: criteria,
+            priority,
+            selection: selection.selection()?,
+        },
+        WorkflowCliCommand::SetTaskWorkflow {
+            task,
+            expected_version,
+            selection,
+        } => WorkflowCommand::SetTaskWorkflow {
+            operation_id,
+            task_id: task,
+            expected_version,
+            selection: selection
+                .selection()?
+                .ok_or_else(|| anyhow!("--family is required"))?,
+        },
+        WorkflowCliCommand::AuthorizeCheck {
+            task,
+            attempt,
+            check,
+            command_hash,
+            scope_hash,
+            deny,
+            lifetime,
+        } => WorkflowCommand::AuthorizeCheck {
+            operation_id,
+            task_id: task,
+            attempt_id: attempt,
+            check_id: check,
+            exact_command_hash: command_hash,
+            scope_hash,
+            decision: if deny {
+                CheckAuthorizationDecision::Denied
+            } else {
+                CheckAuthorizationDecision::Authorized
+            },
+            lifetime: if lifetime == "run" {
+                CheckAuthorizationLifetime::Run
+            } else {
+                CheckAuthorizationLifetime::Once
+            },
+        },
+        WorkflowCliCommand::Accept {
+            task,
+            attempt,
+            expected_version,
+            result,
+            candidate,
+            guidance_change_hash,
+        } => WorkflowCommand::AcceptResult {
+            operation_id,
+            task_id: task,
+            attempt_id: attempt,
+            expected_version,
+            result_binding_id: result,
+            candidate_hash: candidate,
+            guidance_change_hash,
+        },
+        WorkflowCliCommand::RequestRework {
+            task,
+            attempt,
+            expected_version,
+            result,
+            candidate,
+            feedback,
+        } => WorkflowCommand::RequestRework {
+            operation_id,
+            task_id: task,
+            attempt_id: attempt,
+            expected_version,
+            result_binding_id: result,
+            candidate_hash: candidate,
+            feedback,
+        },
+    };
+    print_control(
+        &InstancePaths::resolve(args.data_dir)?,
+        ControlRequest::WorkflowCommand { command },
+    )
+    .await
+}
+
 async fn run_snapshot(args: SnapshotArgs) -> Result<()> {
     let request = match args.command {
         SnapshotCommand::Freeze { attempt, kind } => ControlRequest::SnapshotFreeze {
@@ -2032,6 +2486,87 @@ mod attach_input_tests {
             "/tmp/llmrelay-backups"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn history_pane_command_takes_a_view_id_and_pages_only_generated_exports_securely() {
+        let view = uuid::Uuid::new_v4().to_string();
+        let Command::History(args) =
+            Cli::try_parse_from(["llmrelay", "history", "--view-id", &view])
+                .unwrap()
+                .command
+        else {
+            panic!("history command was not parsed")
+        };
+        assert_eq!(args.view_id, view);
+        assert!(Cli::try_parse_from(["llmrelay", "history", "--path", "/etc/passwd"]).is_err());
+
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-history-cli-{}", uuid::Uuid::new_v4()));
+        let paths = crate::config::InstancePaths::resolve(Some(root.clone())).unwrap();
+        let directory = paths.artifacts.join("history-exports");
+        std::fs::create_dir_all(&directory).unwrap();
+        let name = format!("{}-{}.txt", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let export = directory.join(&name);
+        std::fs::write(&export, b"output\n").unwrap();
+        assert_eq!(
+            super::generated_history_export(&paths, &export).unwrap(),
+            export
+        );
+        let outside = root.join(&name);
+        std::fs::write(&outside, b"output\n").unwrap();
+        let linked = directory.join(format!(
+            "{}-{}.txt",
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4()
+        ));
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        for refused in [
+            outside.clone(),
+            directory.join("notes.txt"),
+            directory.join(format!("{name}.sh")),
+            directory.join("..").join(&name),
+            linked,
+        ] {
+            assert!(
+                super::generated_history_export(&paths, &refused).is_err(),
+                "{}",
+                refused.display()
+            );
+        }
+
+        let opened = || std::fs::File::open(&export).unwrap();
+        let command = super::history_pager_command(opened(), Some("xterm-256color"));
+        assert_eq!(command.get_program(), crate::cmux::HISTORY_PAGER);
+        assert_eq!(
+            command.get_args().count(),
+            0,
+            "the pager is never given a path it could reopen"
+        );
+        let mut environment = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_str().unwrap(),
+                    value.and_then(|value| value.to_str()),
+                )
+            })
+            .collect::<Vec<_>>();
+        environment.sort();
+        assert_eq!(
+            environment,
+            [
+                ("LESSCHARSET", Some("utf-8")),
+                ("LESSHISTFILE", Some("-")),
+                ("LESSSECURE", Some("1")),
+                ("TERM", Some("xterm-256color")),
+            ]
+        );
+        let hostile = super::history_pager_command(opened(), Some("xterm;sh -c id"));
+        assert!(hostile
+            .get_envs()
+            .any(|(key, value)| key == "TERM" && value == Some(std::ffi::OsStr::new("dumb"))));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

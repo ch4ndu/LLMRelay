@@ -35,6 +35,25 @@ pub fn prompt_hash(role: RoleKind) -> String {
     ))
 }
 
+/// The bundled Single agent definition. Its content hash is independent of
+/// the TRIP workflow identity above and never substitutes for it.
+pub const SINGLE_AGENT_DEFINITION: &str =
+    include_str!("../resources/workflows/single-agent-v1.json");
+pub const SINGLE_AGENT_PROMPT: &str = include_str!("../resources/prompts/single-agent.md");
+pub const SINGLE_AGENT_DEFINITION_ID: &str = "llmrelay-single-agent-v1";
+pub const SINGLE_AGENT_DEFINITION_VERSION: &str = "1";
+pub const SINGLE_AGENT_EVALUATOR_ID: &str = "llmrelay-single-agent-evaluator";
+pub const SINGLE_AGENT_EVALUATOR_REVISION: i64 = 1;
+pub const SINGLE_AGENT_RESULT_SCHEMA_REVISION: i64 = 1;
+
+pub fn single_agent_definition_hash() -> String {
+    hex::encode(Sha256::digest(SINGLE_AGENT_DEFINITION.as_bytes()))
+}
+
+pub fn single_agent_prompt_hash() -> String {
+    hex::encode(Sha256::digest(SINGLE_AGENT_PROMPT.as_bytes()))
+}
+
 pub fn render(role: RoleKind, context: &serde_json::Value) -> Result<String> {
     Ok(format!(
         "{}\n\n{}\n\nWorkflow version: {}\nWorkflow hash: {}\nUpstream source hash: {}\nOverlay hash: {}\nTask-scoped invocation context:\n{}",

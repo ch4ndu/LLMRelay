@@ -12,7 +12,10 @@ opens the exact place to act (for example **Review plan**, **Review request**,
 **Answer question**, **Open agent output** or **Resolve issue**). These entries
 are derived from service-owned state, not terminal output. An explanation shared
 by several entries is shown once while distinct permission requests and
-recovery records remain separate. Setup and instance restore holds remain
+recovery records remain separate. Entries that open the same exact place for
+the same action are shown as one item, with the others listed under it and
+their own reasons kept; entries without a current destination are never merged.
+Setup and instance restore holds remain
 visible alongside task work, including unresolved records of a replaced
 attempt. Automatic waits such as a full queue or a busy agent slot are shown on
 the task rather than here. Navigation does not approve or resume anything; use
@@ -66,6 +69,54 @@ The first turn of a retained setup discovery or profile probe completes at a str
 
 Ordinary reviewers receive evidence tied to their current review request: the frozen manifest, structured plan and approval receipts, lane yields, integration records, and applicable verification evidence. Missing or stale evidence remains explicitly unavailable. Reviewers inspect workspace content read-only against the manifest; a recorded hash alone is not proof of the file contents. Selected checks that await code approval remain pending. The standalone formatting restrictions for submitting a role report do not prohibit separately authorized ordinary review inspection, and do not expand setup or runtime-probe authority.
 
+## Single agent workflow
+
+Besides TRIP, LLMRelay bundles a **Single agent** workflow: one admitted agent
+profile writes the whole task in its own worktree, with no manager, Explorer,
+review rounds, plan approval or TRIP installation. Choose the workflow for a new
+task under **Workflow** in the New task form; the project's default for new
+tasks is preselected. A draft or Ready task that has never started can change
+its workflow on its **Roles** tab. Changing a Ready task's choice moves it back
+to the drafts, and **Make Ready** checks it again. Tasks with work already
+started keep their workflow; use a new task to switch. Existing tasks and
+tasks without a choice are TRIP. Recipes, schedules and review allowances
+remain TRIP concepts and never create Single agent tasks.
+
+A Single agent task names an execution configuration revision, one agent
+profile revision and, optionally, checks from that configuration. Project
+settings hold these under **Single agent profiles and configuration** (see
+[Project setup](PROJECT_SETUP.md#single-agent-setup)). A profile can be used
+only after its admission for the chosen configuration is activated.
+
+The run moves through **Agent work**, **Result** (the agent submitted a
+structured result and LLMRelay waits for its processes to stop before capturing
+the worktree), **Checks** (only when checks were selected) and **Your review**.
+The board, the task header and the run panel show the same stage and
+explanation from the service. Each selected check is required and runs only
+after you authorize its exact command with **Allow once**, **Allow for this
+run** or **Deny**; a failed check runs again only after a newer authorization.
+The result panel shows the agent's summary and per-criterion evidence, labelled
+as the agent's own report. **Accept result** completes the task only when the
+service offers it for that exact result and captured candidate; if the result
+changes approved instruction files, accepting also accepts those changes. An
+agent exit, its report text or passing checks never complete the task.
+Accepting does not merge anything: integration is recorded separately from a
+dependent task's **Changes** tab after you merge the changes yourself.
+
+**Request changes** needs your feedback and starts a linked new run with a fresh
+conversation; the earlier result stays recorded and check authorizations do
+not carry over. **Resume agent** continues the run's own retained conversation
+once, optionally with your message, only when the service offers it; Cancel
+stays in the task's Controls. Buttons appear only for decisions the service
+currently offers. If a decision's outcome is unknown, the panel says so; trying
+again unchanged reuses the same request, and a changed request after a refresh
+is sent only after you choose it again.
+
+The Single agent writer modes for Codex and Claude have not been qualified on
+real provider installations yet, so LLMRelay refuses their probe runs and shows
+the reason; no Single agent profile can be activated until that qualification
+exists.
+
 ## Stop or change the task manager
 
 Open the task's workflow controls to see its requested and effective manager
@@ -100,7 +151,7 @@ tasks remain read-only. Setup discovery has its own
 
 ## Dashboard workspace
 
-The Workspace page lists what is waiting for you, Active and Completed tasks, and service-owned sessions, and opens live output in cmux. A task's details open as a dialog, full screen on narrow windows, with **Overview** (summary, why it is waiting, the next decision and controls), **Changes**, **Checks** and **Activity** (agent output, reports and history). The dialog remembers its tab, and the page behind it keeps its section, filters and scroll position. In one service boot, each task owns one cmux workspace and each current role-session binding owns one active, mode-neutral surface in that workspace. **View output** creates or focuses the exact surface in view-only mode and never changes an existing input lease. **Take control** sends a revision-bound acquire to that same authenticated attachment connection so you can answer an agent prompt; **Release control** or **Ctrl-]** releases it and lets automation continue without stopping the agent. Closing the output view never stops work. There are no separate dashboard watch and control routes. Reopening a valid route focuses its existing cmux surface. An unknown result requires authenticated discard after any live child ends. A validated loss with a live attachment first waits for `Retire`, connection-secret/lease cleanup, and durable `ended` recording (or the positive expiry of the matching bounded lease); only a later explicit View can reserve a fresh view-only surface with retained output replayed. An ended or failed attachment leaves its old pane historical and the next View creates a fresh view-only surface in the same task workspace. Workspace, Project Setup, and runtime-admission cards derive their refreshed surface state from the durable projection, showing a control-revision gap as pending before historical actual state. Ended sessions expose bounded recorded output in the dashboard without launching an agent. No cmux action restarts a provider, resumes workflow work, or resumes a native conversation. Each application transcript is a bounded recent-output record: its steady file is capped at 10 MiB and is compacted to approximately 6 MiB before more output is appended. The atomic compaction can temporarily use one additional approximately 6 MiB file, bounding per-session application transcript storage at approximately 16 MiB during compaction and 10 MiB otherwise. Compaction retains complete recent frames and inserts an explicit gap; an evicted replay cursor receives a recoverable gap followed by the retained tail. This application scrollback is separate from provider-native CLI history, which remains the source for exact native conversation resumption.
+The Workspace page lists what is waiting for you, Active and Completed tasks, and service-owned sessions, and opens live output in cmux. A task's details open as a dialog, full screen on narrow windows, with **Overview** (summary, why it is waiting, the next decision and controls), **Changes**, **Checks**, **Roles** (the workflow choice, every agent setting and verification control, and implementation lanes) and **Activity** (agent output, reports and history). The dialog remembers its tab, and the page behind it keeps its section, filters and scroll position. In one service boot, each task owns one cmux workspace and each current role-session binding owns one active, mode-neutral surface in that workspace. **View output** creates or focuses the exact surface in view-only mode and never changes an existing input lease. **Take control** sends a revision-bound acquire to that same authenticated attachment connection so you can answer an agent prompt; **Release control** or **Ctrl-]** releases it and lets automation continue without stopping the agent. Closing the output view never stops work. There are no separate dashboard watch and control routes. Reopening a valid route focuses its existing cmux surface. An unknown result requires authenticated discard after any live child ends. A validated loss with a live attachment first waits for `Retire`, connection-secret/lease cleanup, and durable `ended` recording (or the positive expiry of the matching bounded lease); only a later explicit View can reserve a fresh view-only surface with retained output replayed. An ended or failed attachment leaves its old pane historical and the next View creates a fresh view-only surface in the same task workspace. Workspace, Project Setup, and runtime-admission cards derive their refreshed surface state from the durable projection, showing a control-revision gap as pending before historical actual state. **View recorded output** (or **Read recorded output** while a session runs) reads one exact invocation's saved output page by page in the browser, through its final retained frame; search, download and the complete saved copy always cover all output saved for that invocation. It can also open that saved output in a separate read-only cmux pane; if LLMRelay cannot confirm whether such a pane opened, it says so and opens another only when you choose to. Reading saved output never launches an agent, sends input or takes keyboard control, and works without cmux. No cmux action restarts a provider, resumes workflow work, or resumes a native conversation. Each application transcript is a bounded recent-output record: its steady file is capped at 10 MiB and is compacted to approximately 6 MiB before more output is appended. The atomic compaction can temporarily use one additional approximately 6 MiB file, bounding per-session application transcript storage at approximately 16 MiB during compaction and 10 MiB otherwise. Compaction retains complete recent frames and inserts an explicit gap; an evicted replay cursor receives a recoverable gap followed by the retained tail. This application scrollback is separate from provider-native CLI history, which remains the source for exact native conversation resumption.
 
 The existing attachment connection holds a short, renewed input lease for you only after its exact revision-bound acquire succeeds, and serializes bytes through the exact session and process generation. Another viewer or automatic guidance delivery cannot write through the same lease concurrently. A blocked acquire, ownership loss, or stale acknowledgement remains view-only and never silently reacquires or takes over control. Detach when finished answering a prompt so automatic guidance can proceed.
 
@@ -112,7 +163,11 @@ Projects can opt in to **Remind agents to submit reports** in project settings. 
 
 Each role generation has two reminder reservations for its entire lifetime, including resumed sessions. Reservations are durable and remain spent after cancellation or uncertain delivery; duplicate observations of the same accepted turn do not reserve again. Reminders use the existing guidance path and respect pauses, holds, permissions, input ownership and current report/turn identity before both paste and Enter. A definite refusal before writing cancels the reminder and restores only its unchanged idle reservation so later ordinary guidance can proceed. After a possible write, delivery remains uncertain and is never retried automatically. This feature neither fabricates native readiness nor makes failure recovery automatic.
 
-For a draft or Ready task that has never started, open **Agent settings → Use project defaults** to copy all six current project role choices into the task. This replaces task role choices and keeps prior setting revisions for history. It neither starts agents nor makes a draft Ready. A Ready task whose new choices lack current runtime authority returns to backlog. An uncertain save keeps its operation identity: choose **Refresh role settings**, inspect the requested settings, and retry explicitly only if needed.
+For a draft or Ready task that has never started, open **Roles → Use project defaults** to copy all six current project role choices into the task. This replaces task role choices and keeps prior setting revisions for history. It neither starts agents nor makes a draft Ready. A Ready task whose new choices lack current runtime authority returns to backlog. An uncertain save keeps its operation identity: choose **Check whether it was saved**, which reads the current state and reports whether the choices were saved or not applied; retry explicitly only if needed.
+
+Verification, checkpoint switches and manager changes for a role wait while its
+session has exited but LLMRelay has not yet confirmed that the role's whole
+generation stopped; the affected controls explain the wait.
 
 Use **Continue**, **Run next**, **Pause after this step**, **Pause now**, **Retry**, or **Cancel** from task details. These are versioned requests. A draining control remains visible until owned process state is reconciled. **Run next** arms one coordinator action and then pauses again.
 
@@ -196,9 +251,9 @@ If one workflow step fails on every try, Workspace shows **Automatic progress is
 
 Role settings retain requested revisions separately from the effective generation and running session. Codex Implementer shows its backend-owned current `Unverified` validation requirement on both the requested row and edit selection before a capability row exists; historical capability rows keep their recorded status. Each active-session record identifies its task, attempt, role, generation, configuration revision, and immutable launch settings. A task-specific profile requires explicit activation against the current reviewed project configuration and exact capability evidence. Missing replacement evidence leaves the current role active and exposes the runtime-check path. A provider/model switch also requires a complete checkpoint and typed handoff. Once replacement eligibility is established, LLMRelay revokes the old credential before interrupting the old process, verifies process-group quiescence, and only then makes the captured settings revision dispatchable. A later settings edit remains requested for a future invocation and does not alter the captured replacement.
 
-The Explorer and the reviewers never write, and each exploration or review starts a new session, so an activated settings change for one of them applies at the next session boundary without a switch. That boundary requires every earlier session of the role to have exited with a verified quiet process group, the task to be at that role's step, and nothing that could still use the old settings: no review of its kind in flight, and no pending switch, permission request, keyboard control, uncertain guidance, control, restart hold, recovery, capture, running check or other writer or reviewer. The service then rechecks the activation, settings revision, adapter, capability evidence and the ready workspace's reviewed policy files, updates the attempt's settings and workspace policy together, and records the change; the next review request and its launch are bound to the new settings revision. Until then the task shows that the new settings are waiting, and no review is launched with the replaced settings. If the new settings need their profile verified again, the task shows **Open agent settings**, which opens that role in the task's Agent settings. An earlier review that went to replaced settings stays spent and never counts as approval. An activation made for a different project configuration does not apply to an attempt, which keeps the configuration it was reviewed with.
+The Explorer and the reviewers never write, and each exploration or review starts a new session, so an activated settings change for one of them applies at the next session boundary without a switch. That boundary requires every earlier session of the role to have exited with a verified quiet process group, the task to be at that role's step, and nothing that could still use the old settings: no review of its kind in flight, and no pending switch, permission request, keyboard control, uncertain guidance, control, restart hold, recovery, capture, running check or other writer or reviewer. The service then rechecks the activation, settings revision, adapter, capability evidence and the ready workspace's reviewed policy files, updates the attempt's settings and workspace policy together, and records the change; the next review request and its launch are bound to the new settings revision. Until then the task shows that the new settings are waiting, and no review is launched with the replaced settings. If the new settings need their profile verified again, the task shows **Open agent settings**, which opens that role on the task's **Roles** tab without changing anything. An earlier review that went to replaced settings stays spent and never counts as approval. An activation made for a different project configuration does not apply to an attempt, which keeps the configuration it was reviewed with.
 
-The plan and final acceptance panels are human-only. Requesting rework records feedback in a new attempt lineage. Plan approval carries only when task scope and the complete role configuration are unchanged.
+The plan and final acceptance panels are human-only. **Open plan** beside the plan preview shows the complete plan in a larger read-only window above the task; Escape closes only that window. If the plan changes while it is open, the earlier text is withdrawn and **Show the current plan** reopens the new one. Reading never approves. Requesting rework records feedback in a new attempt lineage. Plan approval carries only when task scope and the complete role configuration are unchanged.
 
 A terminal review ends the attempt incomplete: an ordinary code or final `needs_rework`, or a closed final-repair recheck. Such an attempt can continue only through an explicit replan (see [Operations](OPERATIONS.md#replan-after-a-terminal-review)). The replan stages a new planning attempt whose workspace starts from the exact rejected candidate. That candidate is only the new attempt's source; it never becomes an accepted snapshot. The new attempt carries no plan, plan approval, checks, conformance or verdicts, and starts with fresh default review allowances. The old attempt's requests, results, allowances, recheck receipt and snapshots stay as recorded. Its workspace is created only after every role generation of the old attempt is terminal, every launched session has exited with proven process-group quiescence, and nothing else still owns it. An exited session does not release a role generation that is still stopping or held for recovery.
 
@@ -276,7 +331,8 @@ contract candidate alone is not a qualified role profile.
 
 ## Recipes and reusable project profiles
 
-Select a project, then open **Recipes**. Save a profile set containing the six role
+Recipes, profile sets and schedules are TRIP features; they create TRIP drafts
+only. Select a project, then open **Recipes**. Save a profile set containing the six role
 configurations, then a recipe with task content, acceptance criteria, priority, an
 exact profile revision and required checks. Saved configurations are not capability
 proofs; ordinary task-specific activation and Ready admission still apply. Templates

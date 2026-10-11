@@ -5,8 +5,82 @@ import {
   getGuidanceReauthorization,
   operationId,
 } from "../api";
-import type { GuidanceReauthorizationPreview, Task } from "../types";
+import type {
+  GuidanceDiffLine,
+  GuidancePreviewFile,
+  GuidanceReauthorizationPreview,
+  Task,
+} from "../types";
 import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
+
+const diffPrefix = { context: "  ", removed: "- ", added: "+ " } as const;
+
+function DiffLines({ lines }: { lines: GuidanceDiffLine[] }) {
+  return (
+    <pre className="guidance-diff">
+      {lines.map((line, index) =>
+        line.kind === "unchanged"
+          ? (
+            <span className="diff-unchanged" key={index}>
+              {`… ${line.lines} unchanged line${line.lines === 1 ? "" : "s"} …\n`}
+            </span>
+          )
+          : (
+            <span className={`diff-${line.kind}`} key={index}>
+              {diffPrefix[line.kind]}
+              {line.text}
+            </span>
+          )
+      )}
+    </pre>
+  );
+}
+
+// The comparison is labelled by its actual source: only `pinned` is the
+// approved copy; a base-commit comparison or none is never presented as one.
+function FileComparison({ file }: { file: GuidancePreviewFile }) {
+  const baseline = file.baseline;
+  const diff = baseline && baseline.source !== "unavailable" ? file.diff : null;
+  return (
+    <>
+      <p className="hint">
+        {!baseline
+          ? "This service offers no comparison for this file."
+          : baseline.source === "pinned"
+          ? "Changes compared with the approved copy:"
+          : baseline.source === "base_commit"
+          ? "Changes compared with the version in the workspace's base commit. This is not the approved copy, which could not be compared:"
+          : `No comparison is available${
+            baseline.reason ? `: ${baseline.reason}` : "."
+          }`}
+      </p>
+      {diff && <DiffLines lines={diff} />}
+      {diff
+        ? (
+          <details>
+            <summary>Complete new content</summary>
+            <pre>{file.content}</pre>
+          </details>
+        )
+        : (
+          <>
+            <p className="hint">The complete new content in the task's workspace:</p>
+            <pre>{file.content}</pre>
+          </>
+        )}
+      <TechnicalDetails>
+        {baseline && (
+          <p>
+            Compared with {baseline.source} at {baseline.revision}
+            {baseline.sha256 ? ` (${baseline.sha256})` : ""}
+          </p>
+        )}
+        <p>Approved content: {file.previous_sha256}</p>
+        <p>Content shown here: {file.sha256}</p>
+      </TechnicalDetails>
+    </>
+  );
+}
 
 export function GuidanceRecovery(
   { task, onChanged }: { task: Task; onChanged: () => void },
@@ -27,12 +101,17 @@ export function GuidanceRecovery(
       setBusy(false);
     }
   };
+  const attempt = task.active_attempt;
+  // A preview reviewed for another task version, attempt or plan is stale and
+  // can never approve the content now in the worktree.
+  const stale = !!preview && (
+    preview.expected_version !== task.version ||
+    preview.attempt_id !== attempt?.id ||
+    (attempt?.plan_hash !== undefined && preview.plan_hash !== attempt.plan_hash)
+  );
   const approve = async () => {
     if (
-      !preview || busy || uncertain ||
-      preview.expected_version !== task.version ||
-      preview.attempt_id !== task.active_attempt?.id ||
-      preview.files.length === 0
+      !preview || busy || uncertain || stale || preview.files.length === 0
     ) return;
     const request = {
       kind: "reauthorize_attempt_guidance",
@@ -79,9 +158,11 @@ export function GuidanceRecovery(
     <section className="panel recovery guidance-recovery">
       <h3>Review changed instruction files</h3>
       <p>
-        This task changed a file that also supplies agent instructions. Preserve
-        an approved documentation edit. Review its content below before
-        approving it for the remaining task steps.
+        This task changed a file that also supplies agent instructions. If the
+        approved plan includes this documentation edit, review its content
+        below and approve it for the remaining task steps. Otherwise restore
+        the file yourself. LLMRelay never restores or discards the edit for
+        you.
       </p>
       <button disabled={busy || uncertain} onClick={() => void load()}>
         Review planned documentation update
@@ -96,27 +177,31 @@ export function GuidanceRecovery(
         )
         : (
           <>
+            <p className="hint">
+              {preview.workspace
+                ? `Read from the task's workspace at ${preview.workspace.path}, based on commit ${
+                  preview.workspace.base_revision.slice(0, 12)
+                }.`
+                : "This service did not report which workspace these files were read from."}
+            </p>
             {preview.files.map((file) => (
               <details key={file.path} open>
-                <summary>{file.path}</summary>
-                <pre>{file.content}</pre>
-                <TechnicalDetails>
-                  <p>Previous content: {file.previous_sha256}</p>
-                  <p>Reviewed content: {file.sha256}</p>
-                </TechnicalDetails>
+                <summary>Changed file: {file.path}</summary>
+                <FileComparison file={file} />
               </details>
             ))}
             <p>
               This approves only the displayed documentation content.
               Independent review and every other hold still apply.
             </p>
-            {preview.expected_version !== task.version && (
-              <p>The task changed. Review a fresh preview before approving.</p>
+            {stale && (
+              <p>
+                The task changed since this preview. Choose Review planned
+                documentation update again before approving.
+              </p>
             )}
             <button
-              disabled={busy || uncertain ||
-                preview.expected_version !== task.version ||
-                preview.attempt_id !== task.active_attempt?.id}
+              disabled={busy || uncertain || stale}
               onClick={() => void approve()}
             >
               Approve planned documentation update

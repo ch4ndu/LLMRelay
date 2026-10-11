@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "provider": "codex",
+  "pack_id": "llmrelay-codex-policy-modes",
+  "pack_revision": "1",
+  "description": "Codex CLI 0.160.0 contracts for the Single agent writer and app-wide provider checks; separate from the six-role TRIP pack.",
+  "selectors": [
+    {
+      "predicate_id": "codex-cli-0.160.0",
+      "exact_version": "codex-cli 0.160.0",
+      "contracts": [
+        {
+          "mode": "provider_observation",
+          "contract_id": "codex-provider-observation",
+          "contract_revision": "codex-provider-observation-v1",
+          "authority": "none",
+          "session_contract": "fresh",
+          "launch_revision": "llmrelay-codex-observation-launch-v1",
+          "native_policy_revision": "codex-observation-empty-scope-v1",
+          "credential_revision": "llmrelay-no-role-credential-v1",
+          "evidence_revision": "llmrelay-provider-observation-v1",
+          "required_evidence": [
+            "empty_app_scope",
+            "exact_native_policy",
+            "local_credential",
+            "nonce_model_response"
+          ],
+          "qualification": {
+            "state": "unqualified",
+            "reason": "Model checks for this Codex version are not qualified yet. LLMRelay inspects the installation and sign-in locally, but sends no model request until a release includes reviewed native evidence for this exact check."
+          }
+        },
+        {
+          "mode": "single_agent_writer",
+          "contract_id": "codex-single-agent-writer",
+          "contract_revision": "codex-single-agent-writer-v1",
+          "authority": "workspace_write",
+          "session_contract": "retained",
+          "launch_revision": "llmrelay-codex-single-agent-launch-v1",
+          "native_policy_revision": "codex-single-agent-writer-v1",
+          "credential_revision": "llmrelay-single-agent-credential-v1",
+          "evidence_revision": "llmrelay-single-agent-proof-v1",
+          "required_evidence": [
+            "exact_native_policy",
+            "hook_trust",
+            "local_credential",
+            "single_agent_capability_proof"
+          ],
+          "qualification": {
+            "state": "unqualified",
+            "reason": "The Codex Single agent writer is not qualified yet. It cannot run until a release includes reviewed native evidence for this exact mode."
+          }
+        }
+      ]
+    }
+  ]
+}

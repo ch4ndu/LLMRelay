@@ -1,15 +1,22 @@
 import { ErrorNotice } from "./ErrorNotice";
 import { type FormEvent, useEffect, useRef, useState } from "react";
-import { ApiError, command, operationId } from "../api";
+import { ApiError, command, operationId, submitWorkflowCommand } from "../api";
 import { ModelSelector } from "./ModelSelector";
 import {
+  emptySingleAgentSelection,
+  type SingleAgentSelection,
+  SingleAgentSelectionFields,
+} from "./RoleSettings";
+import {
   type Project,
+  type ProjectExecution,
   type Provider,
   type Role,
   type RoleConfig,
   roleLabel,
   ROLES,
   type Task,
+  type WorkflowFamily,
 } from "../types";
 
 const efforts = ["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -39,6 +46,15 @@ type TaskCreateRequest = {
   priority: number;
   ready: boolean;
   role_overrides: Partial<Record<Role, RoleConfig>>;
+};
+type SingleAgentCreateRequest = {
+  kind: "create_task";
+  project_id: string;
+  title: string;
+  description: string;
+  acceptance_criteria: string[];
+  priority: number;
+  selection: { family: "single_agent" } & SingleAgentSelection;
 };
 
 const blank = (project = ""): TaskDraft => ({
@@ -75,12 +91,51 @@ const normalizeRole = (value: unknown): TaskRoleDraft | undefined => {
   };
 };
 
+const isStringList = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((item) => typeof item === "string");
+
+const pendingSingleAgentCreate = (
+  value: Record<string, unknown>,
+): SingleAgentCreateRequest | undefined => {
+  const selection = value.selection;
+  if (
+    value.kind !== "create_task" ||
+    Object.keys(value).sort().join() !==
+      "acceptance_criteria,description,kind,priority,project_id,selection,title" ||
+    typeof value.project_id !== "string" || typeof value.title !== "string" ||
+    typeof value.description !== "string" ||
+    !isStringList(value.acceptance_criteria) ||
+    typeof value.priority !== "number" || !Number.isFinite(value.priority) ||
+    !isRecord(selection) || selection.family !== "single_agent" ||
+    typeof selection.execution_config_revision_id !== "string" ||
+    typeof selection.profile_revision_id !== "string" ||
+    !isStringList(selection.check_ids)
+  ) return undefined;
+  return {
+    kind: "create_task",
+    project_id: value.project_id,
+    title: value.title,
+    description: value.description,
+    acceptance_criteria: value.acceptance_criteria,
+    priority: value.priority,
+    selection: {
+      family: "single_agent",
+      execution_config_revision_id: selection.execution_config_revision_id,
+      profile_revision_id: selection.profile_revision_id,
+      check_ids: selection.check_ids,
+    },
+  };
+};
+
 const pendingCreateRequest = (
   pending: PendingTaskOperation | undefined,
-): TaskCreateRequest | undefined => {
+): TaskCreateRequest | SingleAgentCreateRequest | undefined => {
   if (!pending) return undefined;
   try {
     const value: unknown = JSON.parse(pending.body);
+    if (isRecord(value) && "selection" in value) {
+      return pendingSingleAgentCreate(value);
+    }
     if (
       !isRecord(value) || value.kind !== "create_task" ||
       Object.keys(value).sort().join() !== [
@@ -155,6 +210,7 @@ export function TaskForm(
     onSaved,
     onClose,
     onOpenSetup = () => {},
+    workflowExecution,
   }: {
     projects: Project[];
     selectedProjectId?: string;
@@ -162,6 +218,11 @@ export function TaskForm(
     onSaved: () => void;
     onClose: () => void;
     onOpenSetup?: (projectId: string) => void;
+    /**
+     * Each project's Single agent setup and default workflow. Without it the
+     * form creates TRIP tasks only, as older services do.
+     */
+    workflowExecution?: ProjectExecution[];
   },
 ) {
   const key = editing
@@ -277,6 +338,26 @@ export function TaskForm(
     }));
   };
   const selectedProject = projects.find((item) => item.id === draft.project_id);
+  const execution = workflowExecution?.find((item) =>
+    item.project_id === draft.project_id
+  );
+  // Undefined follows the project's default; a choice is reset per project.
+  const [chosenFamily, setChosenFamily] = useState<
+    { project_id: string; family: WorkflowFamily } | undefined
+  >(undefined);
+  const family: WorkflowFamily = editing || !workflowExecution
+    ? "trip"
+    : chosenFamily?.project_id === draft.project_id
+    ? chosenFamily.family
+    : execution?.default_family ?? "trip";
+  const singleAgent = family === "single_agent";
+  const [singleAgentChoice, setSingleAgentChoice] = useState<
+    { project_id: string; selection: SingleAgentSelection } | undefined
+  >(undefined);
+  const singleAgentSelection =
+    singleAgentChoice?.project_id === draft.project_id
+      ? singleAgentChoice.selection
+      : emptySingleAgentSelection(execution);
   const inheritedRole = (role: Role): TaskRoleDraft | undefined => {
     const candidate = selectedProject?.settings["roles"];
     const roles = isRecord(candidate) ? candidate : {};
@@ -310,7 +391,7 @@ export function TaskForm(
   const projectIsAvailable = projects.some((item) =>
     item.id === draft.project_id
   );
-  const missingRole = !editing
+  const missingRole = !editing && !singleAgent
     ? ROLES.find((role) => {
       if (!draft.roleOverrides[role]) return false;
       const config = draft.roles[role];
@@ -318,7 +399,7 @@ export function TaskForm(
         !config.effort.trim();
     })
     : undefined;
-  const unactivatedOverride = !editing
+  const unactivatedOverride = !editing && !singleAgent
     ? ROLES.find((role) => {
       if (!draft.roleOverrides[role]) return false;
       const requested = draft.roles[role];
@@ -343,6 +424,13 @@ export function TaskForm(
         roleLabel(missingRole)
       }.`;
     }
+    if (
+      singleAgent &&
+      (!singleAgentSelection.execution_config_revision_id ||
+        !singleAgentSelection.profile_revision_id)
+    ) {
+      return "Choose an execution configuration and an agent profile for the Single agent.";
+    }
     return "";
   })();
   const readyReason = validationReason ||
@@ -361,9 +449,21 @@ export function TaskForm(
       } differs from the project default. Save this as a draft, validate its exact ordinary capability, and explicitly activate the task-only profile before making it Ready.`
       : "");
   const missingProject = draft.project_id && !projectIsAvailable;
+  const singleAgentCreate = (criteria: string[]): SingleAgentCreateRequest => ({
+    kind: "create_task",
+    project_id: draft.project_id,
+    title: draft.title,
+    description: draft.description,
+    acceptance_criteria: criteria,
+    priority: draft.priority,
+    selection: { family: "single_agent", ...singleAgentSelection },
+  });
 
-  const submit = async (ready: boolean) => {
+  const submit = async (requestedReady: boolean) => {
     if (saveGuard.current) return;
+    // The typed Single agent create always makes a draft; Make Ready then
+    // checks its admission.
+    const ready = requestedReady && !singleAgent;
     const reason = ready ? readyReason : validationReason;
     if (reason) {
       setError(reason);
@@ -406,16 +506,18 @@ export function TaskForm(
               : []
           ),
         );
-        const body = {
-          kind: "create_task",
-          project_id: draft.project_id,
-          title: draft.title,
-          description: draft.description,
-          acceptance_criteria: criteria,
-          priority: draft.priority,
-          ready,
-          role_overrides: roleOverrides,
-        };
+        const body: TaskCreateRequest | SingleAgentCreateRequest = singleAgent
+          ? singleAgentCreate(criteria)
+          : {
+            kind: "create_task",
+            project_id: draft.project_id,
+            title: draft.title,
+            description: draft.description,
+            acceptance_criteria: criteria,
+            priority: draft.priority,
+            ready,
+            role_overrides: roleOverrides,
+          };
         const serialized = JSON.stringify(body);
         if (unresolvedCreate && unresolvedCreate.body !== serialized) {
           setError(
@@ -432,7 +534,11 @@ export function TaskForm(
           `${key}.operation`,
           JSON.stringify(pendingOperation.current),
         );
-        await command({ ...body, operation_id: id });
+        if ("selection" in body) {
+          await submitWorkflowCommand({ ...body, operation_id: id });
+        } else {
+          await command({ ...body, operation_id: id });
+        }
       }
       pendingOperation.current = undefined;
       setUnresolvedCreate(undefined);
@@ -480,22 +586,32 @@ export function TaskForm(
           : []
       ),
     );
-    const currentRequest = {
-      kind: "create_task",
-      project_id: draft.project_id,
-      title: draft.title,
-      description: draft.description,
-      acceptance_criteria: draft.criteria.split("\n").map((value) =>
-        value.trim()
-      ).filter(Boolean),
-      priority: draft.priority,
-      ready: request.ready,
-      role_overrides: currentRoleOverrides,
-    };
+    const currentCriteria = draft.criteria.split("\n").map((value) =>
+      value.trim()
+    ).filter(Boolean);
+    const currentRequest = "selection" in request
+      ? singleAgentCreate(currentCriteria)
+      : {
+        kind: "create_task",
+        project_id: draft.project_id,
+        title: draft.title,
+        description: draft.description,
+        acceptance_criteria: currentCriteria,
+        priority: draft.priority,
+        ready: request.ready,
+        role_overrides: currentRoleOverrides,
+      };
     const preserveEditedDraft = JSON.stringify(currentRequest) !==
       unresolvedCreate.body;
     try {
-      await command({ ...request, operation_id: unresolvedCreate.id });
+      if ("selection" in request) {
+        await submitWorkflowCommand({
+          ...request,
+          operation_id: unresolvedCreate.id,
+        });
+      } else {
+        await command({ ...request, operation_id: unresolvedCreate.id });
+      }
       pendingOperation.current = undefined;
       setUnresolvedCreate(undefined);
       localStorage.removeItem(`${key}.operation`);
@@ -614,13 +730,56 @@ export function TaskForm(
             onChange={(event) => update("criteria", event.target.value)}
           />
         </label>
+        {!editing && workflowExecution && (
+          <fieldset className="workflow-choice" disabled={saving}>
+            <legend>Workflow</legend>
+            <div role="radiogroup" aria-label="Workflow">
+              {(["trip", "single_agent"] as const).map((option) => (
+                <label className="toggle" key={option}>
+                  <input
+                    type="radio"
+                    name="task-workflow"
+                    checked={family === option}
+                    onChange={() =>
+                      setChosenFamily({
+                        project_id: draft.project_id,
+                        family: option,
+                      })}
+                  />
+                  {option === "trip"
+                    ? "TRIP (manager and five delegated roles)"
+                    : "Single agent (one agent writes the whole task)"}
+                </label>
+              ))}
+            </div>
+            <small>
+              Project default:{" "}
+              {execution?.default_family === "single_agent"
+                ? "Single agent"
+                : "TRIP"}
+            </small>
+          </fieldset>
+        )}
         {editing
           ? (
             <p className="hint">
-              Change provider, model, or effort in Role settings. Saving this
-              form changes only the queued task fields above. The project stays
-              fixed for this versioned update.
+              Change the workflow, provider, model, or effort in the task's
+              Roles tab. Saving this form changes only the queued task fields
+              above. The project stays fixed for this versioned update.
+              {editing.workflow?.family === "single_agent" &&
+                editing.lifecycle === "ready" &&
+                " Saving changes to a Ready Single agent task moves it back to the drafts; choose Make Ready again afterwards."}
             </p>
+          )
+          : singleAgent
+          ? (
+            <SingleAgentSelectionFields
+              execution={execution}
+              value={singleAgentSelection}
+              onChange={(selection) =>
+                setSingleAgentChoice({ project_id: draft.project_id, selection })}
+              disabled={saving}
+            />
           )
           : (
             <details>
@@ -733,6 +892,9 @@ export function TaskForm(
         >
           {saving
             ? "Saving the task…"
+            : singleAgent
+            ? validationReason ||
+              "Single agent tasks are saved as drafts. Make one Ready from the task once its agent profile is admitted."
             : (editing ? validationReason : readyReason) || (editing
               ? "Save changes updates this queued task at its current version."
               : "Ready uses the activated project defaults or exact task-only profiles explicitly activated with current ordinary capability evidence.")}
@@ -744,14 +906,15 @@ export function TaskForm(
           {!editing && (
             <button
               type="button"
-              disabled={saving}
+              className={singleAgent ? "primary" : undefined}
+              disabled={saving || (singleAgent && !!validationReason)}
               aria-describedby="task-form-status"
               onClick={() => void submit(false)}
             >
               Save draft
             </button>
           )}
-          {!editing && selectedProject &&
+          {!editing && !singleAgent && selectedProject &&
             selectedProject.trip?.readiness !== "ready" && (
             <button
               type="button"
@@ -761,19 +924,21 @@ export function TaskForm(
               Open project setup
             </button>
           )}
-          <button
-            className="primary"
-            type="submit"
-            aria-describedby="task-form-status"
-            disabled={saving || !!(editing ? validationReason : readyReason)}
-            title={(editing ? validationReason : readyReason) || undefined}
-          >
-            {saving
-              ? "Saving…"
-              : editing
-              ? "Save changes"
-              : "Create Ready task"}
-          </button>
+          {(editing || !singleAgent) && (
+            <button
+              className="primary"
+              type="submit"
+              aria-describedby="task-form-status"
+              disabled={saving || !!(editing ? validationReason : readyReason)}
+              title={(editing ? validationReason : readyReason) || undefined}
+            >
+              {saving
+                ? "Saving…"
+                : editing
+                ? "Save changes"
+                : "Create Ready task"}
+            </button>
+          )}
         </footer>
       </form>
     </div>

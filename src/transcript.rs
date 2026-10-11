@@ -3,6 +3,7 @@ use crate::domain::{TranscriptFrame, TranscriptPage};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -248,11 +249,9 @@ fn scan_complete_frames(path: &Path) -> Result<(Vec<(TranscriptFrame, usize)>, V
     }
 }
 
-/// Returns a small printable tail suitable for an exited-session status row.
-/// The transcript remains the source of truth; this summary is intentionally
-/// bounded and strips terminal control sequences before persistence/display.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 enum PlainTextState {
+    #[default]
     Text,
     Escape,
     EscapeIntermediate,
@@ -263,33 +262,42 @@ enum PlainTextState {
     StringEscape,
 }
 
-struct BoundedPlainText {
+/// Incremental UTF-8 decoding and terminal-control stripping. It mirrors the
+/// dashboard's `PlainRecordedBytes`, so the status summary, the browser reader
+/// and the generated history export show the same text for the same bytes.
+#[derive(Default)]
+struct PlainTerminalText {
     state: PlainTextState,
     utf8_pending: Vec<u8>,
-    text: VecDeque<char>,
-    retained_chars: usize,
 }
 
-impl BoundedPlainText {
-    fn new(max_chars: usize) -> Self {
-        Self {
-            state: PlainTextState::Text,
-            utf8_pending: Vec::with_capacity(4),
-            text: VecDeque::new(),
-            retained_chars: max_chars
-                .max(1)
-                .saturating_mul(4)
-                .clamp(max_chars.max(1), 32 * 1024),
-        }
-    }
-
-    fn push_bytes(&mut self, bytes: &[u8]) {
+impl PlainTerminalText {
+    fn push_bytes(&mut self, bytes: &[u8], out: &mut impl FnMut(char)) {
         for byte in bytes {
-            self.push_byte(*byte);
+            self.push_byte(*byte, out);
         }
     }
 
-    fn push_byte(&mut self, byte: u8) {
+    fn push_text(&mut self, text: &str, out: &mut impl FnMut(char)) {
+        self.finish(out);
+        for character in text.chars() {
+            self.push_character(character, out);
+        }
+    }
+
+    fn finish(&mut self, out: &mut impl FnMut(char)) {
+        if !self.utf8_pending.is_empty() {
+            self.utf8_pending.clear();
+            self.push_character('\u{fffd}', out);
+        }
+    }
+
+    fn reset(&mut self) {
+        self.state = PlainTextState::Text;
+        self.utf8_pending.clear();
+    }
+
+    fn push_byte(&mut self, byte: u8, out: &mut impl FnMut(char)) {
         if !self.utf8_pending.is_empty() {
             if (0x80..=0xbf).contains(&byte) {
                 self.utf8_pending.push(byte);
@@ -303,32 +311,32 @@ impl BoundedPlainText {
                     match std::str::from_utf8(&pending) {
                         Ok(value) => {
                             for character in value.chars() {
-                                self.push_character(character);
+                                self.push_character(character, out);
                             }
                         }
-                        Err(_) => self.push_character('\u{fffd}'),
+                        Err(_) => self.push_character('\u{fffd}', out),
                     }
                 }
                 return;
             }
             self.utf8_pending.clear();
-            self.push_character('\u{fffd}');
-            self.push_byte(byte);
+            self.push_character('\u{fffd}', out);
+            self.push_byte(byte, out);
             return;
         }
 
         match byte {
             0x00..=0x7f | 0x80..=0x9f => {
                 if let Some(character) = char::from_u32(byte as u32) {
-                    self.push_character(character);
+                    self.push_character(character, out);
                 }
             }
             0xc2..=0xf4 => self.utf8_pending.push(byte),
-            _ => self.push_character('\u{fffd}'),
+            _ => self.push_character('\u{fffd}', out),
         }
     }
 
-    fn push_character(&mut self, character: char) {
+    fn push_character(&mut self, character: char, out: &mut impl FnMut(char)) {
         self.state = match self.state {
             PlainTextState::Escape => match character {
                 '\u{1b}' => PlainTextState::Escape,
@@ -376,36 +384,119 @@ impl BoundedPlainText {
                 '\u{9d}' => PlainTextState::Osc,
                 '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => PlainTextState::String,
                 '\r' => {
-                    self.retain('\n');
+                    out('\n');
                     PlainTextState::Text
                 }
                 '\n' | '\t' => {
-                    self.retain(character);
+                    out(character);
                     PlainTextState::Text
                 }
                 _ if !character.is_control() => {
-                    self.retain(character);
+                    out(character);
                     PlainTextState::Text
                 }
                 _ => PlainTextState::Text,
             },
         };
     }
+}
 
-    fn retain(&mut self, character: char) {
-        self.text.push_back(character);
-        while self.text.len() > self.retained_chars {
-            self.text.pop_front();
+/// Returns a small printable tail suitable for an exited-session status row.
+/// The transcript remains the source of truth; this summary is intentionally
+/// bounded and strips terminal control sequences before persistence/display.
+struct BoundedPlainText {
+    decoder: PlainTerminalText,
+    text: VecDeque<char>,
+    retained_chars: usize,
+}
+
+impl BoundedPlainText {
+    fn new(max_chars: usize) -> Self {
+        Self {
+            decoder: PlainTerminalText::default(),
+            text: VecDeque::new(),
+            retained_chars: max_chars
+                .max(1)
+                .saturating_mul(4)
+                .clamp(max_chars.max(1), 32 * 1024),
         }
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        let Self {
+            decoder,
+            text,
+            retained_chars,
+        } = self;
+        decoder.push_bytes(bytes, &mut |character| {
+            retain_tail(text, *retained_chars, character)
+        });
     }
 
     fn finish(mut self) -> String {
-        if !self.utf8_pending.is_empty() {
-            self.utf8_pending.clear();
-            self.push_character('\u{fffd}');
-        }
+        let Self {
+            decoder,
+            text,
+            retained_chars,
+        } = &mut self;
+        decoder.finish(&mut |character| retain_tail(text, *retained_chars, character));
         self.text.into_iter().collect()
     }
+}
+
+fn retain_tail(text: &mut VecDeque<char>, retained_chars: usize, character: char) {
+    text.push_back(character);
+    while text.len() > retained_chars {
+        text.pop_front();
+    }
+}
+
+fn recorded_boundary(frame: &TranscriptFrame, reason: &str) -> String {
+    format!(
+        "\n[recorded output {reason} at exact epoch {}, frame {}]\n",
+        frame.epoch, frame.sequence
+    )
+}
+
+/// The authoritative plain text of retained frames, frame for frame the same as
+/// the dashboard's `recordedOutputText`: decoder state carries across adjacent
+/// frames and resets only at an epoch change, a gap or an undecodable frame.
+pub(crate) fn recorded_history_text(frames: &[TranscriptFrame]) -> String {
+    let mut output = String::new();
+    let mut emit = |character: char| output.push(character);
+    let mut plain = PlainTerminalText::default();
+    let mut epoch: Option<&str> = None;
+    for frame in frames {
+        if epoch.is_some_and(|epoch| epoch != frame.epoch) {
+            plain.finish(&mut emit);
+            plain.reset();
+            recorded_boundary(frame, "changed")
+                .chars()
+                .for_each(&mut emit);
+        }
+        if frame.gap {
+            plain.finish(&mut emit);
+            plain.reset();
+            recorded_boundary(frame, "gap").chars().for_each(&mut emit);
+        }
+        epoch = Some(frame.epoch.as_str());
+        if frame.encoding != "base64" {
+            plain.push_text(&frame.data, &mut emit);
+            continue;
+        }
+        match base64::engine::general_purpose::STANDARD.decode(&frame.data) {
+            Ok(bytes) => plain.push_bytes(&bytes, &mut emit),
+            Err(_) => {
+                plain.finish(&mut emit);
+                plain.reset();
+                "[recorded output frame could not be decoded]\n"
+                    .chars()
+                    .for_each(&mut emit);
+            }
+        }
+    }
+    plain.finish(&mut emit);
+    output
 }
 
 pub fn recent_output_summary(
@@ -741,6 +832,295 @@ pub fn read_attachment_frames(
     })
 }
 
+pub const MAX_HISTORY_PAGE_BYTES: usize = 512 * 1024;
+const HISTORY_EXPORT_DIRECTORY: &str = "history-exports";
+const MAX_HISTORY_EXPORT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// One page of the complete retained selection of exactly one session epoch,
+/// resumed after the epoch frame `after_sequence`. Unlike the live attachment
+/// reader, an evicted cursor never jumps to the recent tail: the page reports
+/// the loss and continues from the earliest later frame still retained, so
+/// following `has_more` always reaches every retained frame.
+pub fn read_history_page(
+    root: &Path,
+    session_id: &str,
+    epoch: &str,
+    after_sequence: u64,
+    limit_bytes: usize,
+) -> Result<TranscriptPage> {
+    const MAX_PAGE_FRAMES: usize = 512;
+    let page_bytes = limit_bytes.clamp(1024, MAX_HISTORY_PAGE_BYTES);
+    let selection = retained_epoch_selection(root, session_id, epoch)?;
+    let is_epoch_frame = |frame: &TranscriptFrame| !frame.gap && frame.epoch == epoch;
+    let mut frames = Vec::new();
+    let start = if after_sequence == 0 {
+        if selection.is_empty() {
+            frames.push(history_gap(
+                epoch,
+                0,
+                "no output for this epoch is retained".to_owned(),
+            ));
+        }
+        0
+    } else if let Some(index) = selection
+        .iter()
+        .position(|(frame, _)| is_epoch_frame(frame) && frame.sequence == after_sequence)
+    {
+        index + 1
+    } else {
+        let resume = selection
+            .iter()
+            .position(|(frame, _)| is_epoch_frame(frame) && frame.sequence > after_sequence);
+        frames.push(history_gap(
+            epoch,
+            after_sequence,
+            match resume {
+                Some(index) => format!(
+                    "output after frame {after_sequence} before frame {} of this epoch was removed by the 10 MiB retention limit",
+                    selection[index].0.sequence
+                ),
+                None => format!(
+                    "output after frame {after_sequence} of this epoch was removed by the 10 MiB retention limit"
+                ),
+            },
+        ));
+        resume.unwrap_or(selection.len())
+    };
+    let mut bytes = 0;
+    let mut next_sequence = after_sequence;
+    let mut last_epoch_frame = None;
+    let mut has_more = false;
+    for (frame, frame_bytes) in selection.into_iter().skip(start) {
+        if is_epoch_frame(&frame) {
+            if last_epoch_frame.is_some()
+                && (bytes + frame_bytes > page_bytes || frames.len() >= MAX_PAGE_FRAMES)
+            {
+                has_more = true;
+                break;
+            }
+            next_sequence = frame.sequence;
+            last_epoch_frame = Some(frames.len());
+        }
+        bytes += frame_bytes;
+        frames.push(frame);
+    }
+    // Gaps after this page's last epoch frame follow the cursor it issues, so
+    // the next page delivers them exactly once.
+    if let (true, Some(last)) = (has_more, last_epoch_frame) {
+        frames.truncate(last + 1);
+    }
+    Ok(TranscriptPage {
+        frames,
+        next_epoch: Some(epoch.to_owned()),
+        next_sequence,
+        has_more,
+    })
+}
+
+fn history_gap(epoch: &str, sequence: u64, data: String) -> TranscriptFrame {
+    TranscriptFrame {
+        epoch: epoch.to_owned(),
+        sequence,
+        captured_at: Utc::now().to_rfc3339(),
+        encoding: "utf8".to_owned(),
+        data,
+        gap: true,
+    }
+}
+
+/// Every retained frame of one epoch from a single locked scan, with its
+/// encoded size: the epoch's frames and any later gap in file order, led by a
+/// gap when the epoch's first frames were evicted.
+fn retained_epoch_selection(
+    root: &Path,
+    session_id: &str,
+    epoch: &str,
+) -> Result<Vec<(TranscriptFrame, usize)>> {
+    uuid::Uuid::parse_str(epoch).context("history epoch must be a UUID")?;
+    let path = transcript_path(root, session_id)?;
+    let coordinator = session_coordinator(&path)?;
+    let stored = {
+        let mut coordination = coordinator
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transcript session lock poisoned"))?;
+        recover_incomplete_tail(&path, &mut coordination)?
+    };
+    let Some(start) = stored.iter().position(|(frame, _)| frame.epoch == epoch) else {
+        return Ok(Vec::new());
+    };
+    let mut selection = stored
+        .into_iter()
+        .skip(start)
+        .filter(|(frame, _)| frame.gap || frame.epoch == epoch)
+        .collect::<Vec<_>>();
+    let leading_gap = selection
+        .first()
+        .map(|(frame, _)| frame)
+        .filter(|frame| !frame.gap && frame.sequence > 1)
+        .map(|first| {
+            history_gap(
+                epoch,
+                first.sequence - 1,
+                format!(
+                    "output before frame {} of this epoch was removed by the 10 MiB retention limit",
+                    first.sequence
+                ),
+            )
+        });
+    if let Some(gap) = leading_gap {
+        selection.insert(0, (gap, 0));
+    }
+    Ok(selection)
+}
+
+#[derive(Clone, Debug)]
+pub struct HistoryExport {
+    pub path: PathBuf,
+    pub export_hash: String,
+    pub high_water_sequence: u64,
+    pub retention: serde_json::Value,
+    pub text: String,
+}
+
+/// Generates the one plain-text export for a session epoch from every retained
+/// frame. Identical content reuses the existing file; changed content replaces
+/// it by atomic rename, so a pager that already opened the prior file keeps its
+/// snapshot. The path is always generated here, never supplied by a caller.
+pub fn write_history_export(
+    transcripts: &Path,
+    artifacts: &Path,
+    session_id: &str,
+    epoch: &str,
+) -> Result<HistoryExport> {
+    let frames = retained_epoch_selection(transcripts, session_id, epoch)?
+        .into_iter()
+        .map(|(frame, _)| frame)
+        .collect::<Vec<_>>();
+    let retained = frames
+        .iter()
+        .filter(|frame| !frame.gap && frame.epoch == epoch)
+        .map(|frame| frame.sequence);
+    let first_retained = retained.clone().min();
+    let high_water_sequence = retained.max().unwrap_or(0);
+    let gap_count = frames.iter().filter(|frame| frame.gap).count();
+    let note = match (first_retained, gap_count) {
+        (None, _) => "No output for this epoch is retained.",
+        (Some(_), 0) => "All retained output for this epoch is included.",
+        (Some(_), _) => {
+            "Some output for this epoch was not retained; each gap is marked where it occurs."
+        }
+    };
+    let mut text = format!(
+        "LLMRelay recorded output (read-only)\nSession: {session_id}\nEpoch: {epoch}\nRetained through frame: {high_water_sequence}\n{note}\n\n"
+    );
+    text.push_str(&recorded_history_text(&frames));
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let export_hash = hex::encode(Sha256::digest(text.as_bytes()));
+    let directory = history_export_directory(artifacts)?;
+    let path = directory.join(format!("{session_id}-{epoch}.txt"));
+    let unchanged = fs::symlink_metadata(&path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .and_then(|_| fs::read(&path).ok())
+        .is_some_and(|existing| existing == text.as_bytes());
+    if !unchanged {
+        atomic_write(&path, text.as_bytes())?;
+    }
+    Ok(HistoryExport {
+        path,
+        export_hash,
+        high_water_sequence,
+        retention: serde_json::json!({
+            "first_retained_sequence": first_retained,
+            "high_water_sequence": high_water_sequence,
+            "gap_count": gap_count,
+            "complete": gap_count == 0 && first_retained.is_some_and(|sequence| sequence <= 1),
+        }),
+        text,
+    })
+}
+
+/// Resolves a generated export only when the file is still the exact bytes the
+/// service bound to a history view.
+pub fn validated_history_export(
+    artifacts: &Path,
+    session_id: &str,
+    epoch: &str,
+    expected_hash: &str,
+) -> Result<PathBuf> {
+    uuid::Uuid::parse_str(session_id).context("history session must be a UUID")?;
+    uuid::Uuid::parse_str(epoch).context("history epoch must be a UUID")?;
+    let path = history_export_directory(artifacts)?.join(format!("{session_id}-{epoch}.txt"));
+    open_bound_history_export(&path, expected_hash)?;
+    Ok(path)
+}
+
+/// Opens a generated export once, without following links, and checks the
+/// bytes read through that handle against the hash bound to the view. The file
+/// is returned rewound, so an atomic replacement of the path afterwards cannot
+/// change what this reader shows; a replacement before the open is refused.
+pub fn open_bound_history_export(path: &Path, expected_hash: &str) -> Result<File> {
+    use std::io::{Read, Seek};
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("history export {} is unavailable", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_HISTORY_EXPORT_BYTES {
+        bail!("history export is not a bounded generated regular file")
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_HISTORY_EXPORT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read history export {}", path.display()))?;
+    if bytes.len() as u64 > MAX_HISTORY_EXPORT_BYTES
+        || hex::encode(Sha256::digest(&bytes)) != expected_hash
+    {
+        bail!("history output changed after this pane was requested; choose Open history pane again from the dashboard")
+    }
+    file.rewind()?;
+    Ok(file)
+}
+
+/// Disposable exports are reclaimed at service start. A pager from an earlier
+/// boot keeps reading its open file; authoritative transcripts are untouched.
+pub fn reclaim_history_exports(artifacts: &Path) -> Result<usize> {
+    let directory = artifacts.join(HISTORY_EXPORT_DIRECTORY);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error).with_context(|| format!("read {}", directory.display())),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_file() || file_type.is_symlink() {
+            fs::remove_file(entry.path())
+                .with_context(|| format!("remove history export {}", entry.path().display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn history_export_directory(artifacts: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = artifacts.join(HISTORY_EXPORT_DIRECTORY);
+    fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
+    let metadata = fs::symlink_metadata(&directory)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("history export directory must be an owned directory, not a link")
+    }
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    Ok(directory)
+}
+
 pub fn initialize_gap_transcript(
     root: &Path,
     session_id: &str,
@@ -856,6 +1236,286 @@ mod summary_tests {
             .unwrap()
             .unwrap();
         assert!(bounded.chars().count() <= 32);
+        drop(sink);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn frame(epoch: &str, sequence: u64, bytes: &[u8]) -> TranscriptFrame {
+        TranscriptFrame {
+            epoch: epoch.to_owned(),
+            sequence,
+            captured_at: "2026-01-01T00:00:00Z".to_owned(),
+            encoding: "base64".to_owned(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            gap: false,
+        }
+    }
+
+    fn gap(epoch: &str, sequence: u64, text: &str) -> TranscriptFrame {
+        TranscriptFrame {
+            epoch: epoch.to_owned(),
+            sequence,
+            captured_at: "2026-01-01T00:00:00Z".to_owned(),
+            encoding: "utf8".to_owned(),
+            data: text.to_owned(),
+            gap: true,
+        }
+    }
+
+    /// Named literal vectors shared with the dashboard's `recordedOutputText`
+    /// tests; both readers must produce exactly this text for these frames.
+    fn recorded_history_vectors() -> Vec<(&'static str, Vec<TranscriptFrame>, &'static str)> {
+        vec![
+            (
+                "split_utf8",
+                vec![
+                    frame("epoch-a", 1, &[0xe2, 0x82]),
+                    frame("epoch-a", 2, &[0xac, b'!']),
+                ],
+                "\u{20ac}!",
+            ),
+            (
+                "split_csi_osc",
+                vec![
+                    frame("epoch-a", 1, b"red\x1b[3"),
+                    frame("epoch-a", 2, b"1mtext\x1b]0;tit"),
+                    frame("epoch-a", 3, b"le\x07done"),
+                ],
+                "redtextdone",
+            ),
+            (
+                "retention_gap",
+                vec![
+                    frame("epoch-a", 1, &[0xe2, 0x82]),
+                    gap("epoch-a", 2, "lost"),
+                    frame("epoch-a", 3, b"after"),
+                ],
+                "\u{fffd}\n[recorded output gap at exact epoch epoch-a, frame 2]\nlostafter",
+            ),
+            (
+                "epoch_boundary",
+                vec![
+                    frame("epoch-a", 1, b"\x1b]0;unterminated"),
+                    frame("epoch-b", 1, b"next\r\n"),
+                ],
+                "\n[recorded output changed at exact epoch epoch-b, frame 1]\nnext\n\n",
+            ),
+        ]
+    }
+
+    #[test]
+    fn recorded_history_text_matches_the_shared_literal_vectors() {
+        for (name, frames, expected) in recorded_history_vectors() {
+            assert_eq!(recorded_history_text(&frames), expected, "{name}");
+        }
+    }
+
+    fn history_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("agenticjira-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn history_pages_stay_on_one_epoch_and_reach_the_final_retained_frame() {
+        let root = history_root("history-pages");
+        let session = uuid::Uuid::new_v4().to_string();
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        let sink = TranscriptSink::create(&root, &session, &first).unwrap();
+        for index in 0..40 {
+            sink.append(format!("line {index:02} {}\n", "x".repeat(120)).as_bytes())
+                .unwrap();
+        }
+        sink.append(b"FINAL-MARKER\n").unwrap();
+        drop(sink);
+        let later = TranscriptSink::create(&root, &session, &second).unwrap();
+        later.append(b"other epoch\n").unwrap();
+        drop(later);
+
+        let mut after = 0;
+        let mut frames = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = read_history_page(&root, &session, &first, after, 1024).unwrap();
+            pages += 1;
+            frames.extend(page.frames);
+            if !page.has_more {
+                break;
+            }
+            assert!(page.next_sequence > after, "the cursor always advances");
+            after = page.next_sequence;
+        }
+        assert!(pages > 1, "a 1 KiB page cannot hold the whole epoch");
+        assert!(frames
+            .iter()
+            .all(|frame| frame.epoch == first && !frame.gap));
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.sequence)
+                .collect::<Vec<_>>(),
+            (1..=41).collect::<Vec<_>>()
+        );
+        let text = recorded_history_text(&frames);
+        assert!(text.ends_with("FINAL-MARKER\n"));
+        assert!(!text.contains("other epoch"));
+
+        // Retention later evicts the frame an issued cursor names, keeping
+        // more of the epoch than one page plus the later epoch.
+        let issued = read_history_page(&root, &session, &first, 0, 1024)
+            .unwrap()
+            .next_sequence;
+        assert!(issued < 20);
+        let path = root.join(format!("{session}.jsonl"));
+        let mut compacted =
+            encoded_frame(&gap("retention-fixture", 1, "older output was evicted")).unwrap();
+        for line in std::fs::read(&path)
+            .unwrap()
+            .split_inclusive(|byte| *byte == b'\n')
+        {
+            let stored: TranscriptFrame = serde_json::from_slice(line).unwrap();
+            if stored.epoch != first || stored.sequence >= 20 {
+                compacted.extend_from_slice(line);
+            }
+        }
+        std::fs::write(&path, compacted).unwrap();
+
+        let mut after = issued;
+        let mut resumed = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = read_history_page(&root, &session, &first, after, 1024).unwrap();
+            pages += 1;
+            resumed.extend(page.frames);
+            if !page.has_more {
+                break;
+            }
+            assert!(page.next_sequence > after, "the cursor always advances");
+            after = page.next_sequence;
+        }
+        assert!(pages > 1, "the retained remainder spans several pages");
+        assert!(resumed[0].gap);
+        assert!(resumed[0]
+            .data
+            .contains(&format!("after frame {issued} before frame 20")));
+        assert_eq!(resumed[1].sequence, 20);
+        assert!(recorded_history_text(&resumed[1..2]).contains("line 19"));
+        assert_eq!(resumed.iter().filter(|frame| frame.gap).count(), 1);
+        assert_eq!(
+            resumed
+                .iter()
+                .filter(|frame| !frame.gap)
+                .map(|frame| frame.sequence)
+                .collect::<Vec<_>>(),
+            (20..=41).collect::<Vec<_>>()
+        );
+        let text = recorded_history_text(&resumed);
+        assert!(text.ends_with("FINAL-MARKER\n"));
+        assert!(!text.contains("other epoch"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn history_of_an_epoch_with_evicted_frames_starts_with_an_explicit_gap() {
+        let root = history_root("history-gap");
+        let session = uuid::Uuid::new_v4().to_string();
+        let epoch = uuid::Uuid::new_v4().to_string();
+        let mut bytes = Vec::new();
+        for sequence in 5..=6 {
+            bytes.extend(encoded_frame(&frame(&epoch, sequence, b"kept\n")).unwrap());
+        }
+        std::fs::write(root.join(format!("{session}.jsonl")), bytes).unwrap();
+        let page = read_history_page(&root, &session, &epoch, 0, 4096).unwrap();
+        assert!(page.frames[0].gap);
+        assert_eq!(page.frames[0].epoch, epoch);
+        assert!(page.frames[0].data.contains("before frame 5"));
+        assert_eq!(page.frames.len(), 3);
+        let resumed = read_history_page(&root, &session, &epoch, 5, 4096).unwrap();
+        assert!(resumed.frames.iter().all(|frame| !frame.gap));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn history_export_is_generated_reused_and_refused_after_change() {
+        use std::os::unix::fs::MetadataExt;
+        let root = history_root("history-export");
+        let transcripts = root.join("transcripts");
+        let artifacts = root.join("artifacts");
+        let session = uuid::Uuid::new_v4().to_string();
+        let epoch = uuid::Uuid::new_v4().to_string();
+        let sink = TranscriptSink::create(&transcripts, &session, &epoch).unwrap();
+        sink.append(b"\x1b[32mgreen\x1b[0m line\r\nFINAL-MARKER\n")
+            .unwrap();
+
+        let export = write_history_export(&transcripts, &artifacts, &session, &epoch).unwrap();
+        assert_eq!(
+            export.path,
+            artifacts
+                .join("history-exports")
+                .join(format!("{session}-{epoch}.txt"))
+        );
+        let text = std::fs::read_to_string(&export.path).unwrap();
+        assert!(text.starts_with("LLMRelay recorded output (read-only)\n"));
+        assert!(text.contains(
+            "Retained through frame: 1\nAll retained output for this epoch is included."
+        ));
+        assert!(text.ends_with("green line\n\nFINAL-MARKER\n"));
+        assert!(!text.contains('\u{1b}'));
+        assert_eq!(export.high_water_sequence, 1);
+        assert_eq!(export.retention["complete"], true);
+        assert_eq!(
+            validated_history_export(&artifacts, &session, &epoch, &export.export_hash).unwrap(),
+            export.path
+        );
+
+        let inode = std::fs::metadata(&export.path).unwrap().ino();
+        let again = write_history_export(&transcripts, &artifacts, &session, &epoch).unwrap();
+        assert_eq!(again.export_hash, export.export_hash);
+        assert_eq!(std::fs::metadata(&export.path).unwrap().ino(), inode);
+
+        let mut pager_input = open_bound_history_export(&export.path, &export.export_hash).unwrap();
+        sink.append(b"later output\n").unwrap();
+        let changed = write_history_export(&transcripts, &artifacts, &session, &epoch).unwrap();
+        assert_ne!(changed.export_hash, export.export_hash);
+        assert_eq!(changed.high_water_sequence, 2);
+        assert_eq!(pager_input.metadata().unwrap().ino(), inode);
+        let mut shown = String::new();
+        std::io::Read::read_to_string(&mut pager_input, &mut shown).unwrap();
+        assert_eq!(
+            shown, text,
+            "the verified handle keeps the bound snapshot from its first byte after replacement"
+        );
+        for stale in [
+            open_bound_history_export(&export.path, &export.export_hash)
+                .map(|_| ())
+                .unwrap_err(),
+            validated_history_export(&artifacts, &session, &epoch, &export.export_hash)
+                .map(|_| ())
+                .unwrap_err(),
+        ] {
+            assert!(
+                stale
+                    .to_string()
+                    .contains("changed after this pane was requested"),
+                "{stale:#}"
+            );
+        }
+
+        // The link target holds exactly the bound bytes, so only refusing to
+        // follow the link can reject it.
+        let elsewhere = root.join("elsewhere.txt");
+        std::fs::write(&elsewhere, changed.text.as_bytes()).unwrap();
+        std::fs::remove_file(&changed.path).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &changed.path).unwrap();
+        assert!(open_bound_history_export(&changed.path, &changed.export_hash).is_err());
+        assert!(
+            validated_history_export(&artifacts, &session, &epoch, &changed.export_hash).is_err()
+        );
+        assert_eq!(reclaim_history_exports(&artifacts).unwrap(), 1);
+        assert!(std::fs::symlink_metadata(&changed.path).is_err());
+        assert!(transcripts.join(format!("{session}.jsonl")).exists());
         drop(sink);
         let _ = std::fs::remove_dir_all(root);
     }

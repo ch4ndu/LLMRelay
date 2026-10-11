@@ -1,9 +1,10 @@
 use crate::domain::{
     AttachmentBinding, CmuxAttachmentMode, CmuxAttachmentRoute, CmuxKeyboardControlAction,
     CmuxKeyboardControlOutcome, CmuxSessionSurface, CmuxTaskWorkspace, CmuxViewOutcome,
-    TranscriptFrame, TranscriptPage,
+    HistoryPaneOutcome, HistoryPaneView, HistoryPaneViewState, TranscriptFrame, TranscriptPage,
 };
 use crate::operations::Application;
+use crate::store::{HistoryPaneFinish, HistoryPaneReservation};
 use crate::transcript;
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
@@ -1559,6 +1560,286 @@ fn persistent_attachment_command(
         .join(" "))
 }
 
+/// The only pager a history pane runs. It is started in secure mode with a
+/// cleared environment by `llmrelay history`, never through a user pager.
+pub(crate) const HISTORY_PAGER: &str = "/usr/bin/less";
+
+pub(crate) fn history_pager_available() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(HISTORY_PAGER)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+/// Opens a plain read-only cmux pane showing a generated export of one exact
+/// session epoch. The pane never attaches to the provider, takes keyboard
+/// control or resumes anything; the browser reader stays available whatever
+/// happens here. An uncertain create is recorded and never repeated.
+pub(crate) fn open_history_pane(
+    app: &Application,
+    service_boot_id: &str,
+    request: &crate::store::HistoryPaneRequest<'_>,
+) -> Result<HistoryPaneOutcome> {
+    if app.service_boot_id() != service_boot_id {
+        return Err(anyhow!(
+            "history pane service boot is not the current authenticated service"
+        ));
+    }
+    let view = match app
+        .store
+        .reserve_history_pane_view(request, service_boot_id)?
+    {
+        HistoryPaneReservation::Replayed(view) => return Ok(history_pane_outcome(view)),
+        HistoryPaneReservation::Reserved(view) => view,
+    };
+    let (view, command, cwd) = match prepare_history_pane(app, &view, request) {
+        Ok(prepared) => prepared,
+        Err(NotDelivered {
+            reason,
+            retry_allowed,
+        }) => {
+            let failed = app
+                .store
+                .finish_history_pane_view(
+                    &view.id,
+                    HistoryPaneFinish::FailedBeforeDelivery {
+                        reason: &reason,
+                        retry_allowed,
+                    },
+                )
+                .with_context(|| {
+                    format!(
+                        "No cmux pane was created ({reason}), but that outcome could not be recorded, so history pane request {} still shows as opening",
+                        view.id
+                    )
+                })?;
+            return Ok(history_pane_outcome(failed));
+        }
+    };
+    let create = cmux_rpc(
+        app,
+        "surface.create",
+        json!({
+            "type": "terminal",
+            "cwd": cwd,
+            "title": format!("LLMRelay history {}", short_id(request.session_id)),
+            "initial_command": command,
+            "focus": true,
+        }),
+    );
+    let recorded = match create.and_then(|value| extract_surface_ids(&value)) {
+        Ok((workspace_id, surface_id)) => app.store.finish_history_pane_view(
+            &view.id,
+            HistoryPaneFinish::Opened {
+                workspace_id: &workspace_id,
+                surface_id: &surface_id,
+            },
+        ),
+        Err(error @ (CmuxCommandError::Unavailable(_) | CmuxCommandError::AccessDenied(_))) => {
+            app.store.finish_history_pane_view(
+                &view.id,
+                HistoryPaneFinish::FailedBeforeDelivery {
+                    reason: &bounded_detail(&error.message()),
+                    retry_allowed: true,
+                },
+            )
+        }
+        Err(error) => app.store.finish_history_pane_view(
+            &view.id,
+            HistoryPaneFinish::Unknown {
+                reason: &format!(
+                    "LLMRelay could not confirm whether cmux opened the history pane: {}. Check cmux before opening another history pane.",
+                    bounded_detail(&error.message())
+                ),
+            },
+        ),
+    };
+    let view = recorded.with_context(|| {
+        format!(
+            "The cmux create request for history pane {} was sent, but its outcome could not be recorded. Check cmux before opening another history pane.",
+            view.id
+        )
+    })?;
+    cmux_diagnostic(
+        app,
+        if view.state == HistoryPaneViewState::Opened {
+            "info"
+        } else {
+            "warn"
+        },
+        "cmux.history_pane",
+        view.state.as_str(),
+        Some(request.operation_id),
+        json!({"session_id": request.session_id, "history_view_id": view.id}),
+    );
+    Ok(history_pane_outcome(view))
+}
+
+struct NotDelivered {
+    reason: String,
+    retry_allowed: bool,
+}
+
+impl NotDelivered {
+    fn new(reason: impl Into<String>, retry_allowed: bool) -> Self {
+        Self {
+            reason: reason.into(),
+            retry_allowed,
+        }
+    }
+}
+
+/// Everything before `surface.create` is proven not to have reached cmux, so
+/// any failure here settles the reservation as failed instead of leaving it
+/// shown as opening. Only a later create can have an unknown outcome.
+fn prepare_history_pane(
+    app: &Application,
+    view: &HistoryPaneView,
+    request: &crate::store::HistoryPaneRequest<'_>,
+) -> std::result::Result<(HistoryPaneView, String, String), NotDelivered> {
+    let detail = |error: anyhow::Error| bounded_detail(&format!("{error:#}"));
+    let export = transcript::write_history_export(
+        &app.paths.transcripts,
+        &app.paths.artifacts,
+        request.session_id,
+        request.transcript_epoch,
+    )
+    .map_err(|error| {
+        NotDelivered::new(
+            format!("The history file could not be prepared: {}", detail(error)),
+            true,
+        )
+    })?;
+    let view = app
+        .store
+        .bind_history_view_export(&view.id, &export.export_hash, export.high_water_sequence)
+        .map_err(|error| {
+            NotDelivered::new(
+                format!(
+                    "The history file could not be bound to this pane: {}",
+                    detail(error)
+                ),
+                true,
+            )
+        })?;
+    if !history_pager_available() {
+        return Err(NotDelivered::new(
+            format!("The secure pager {HISTORY_PAGER} is unavailable, so no cmux pane was created. Read the output in the dashboard instead."),
+            false,
+        ));
+    }
+    if !app.automatic_cmux_routing_permitted() {
+        return Err(NotDelivered::new(
+            "A cmux pane can be created only when LLMRelay was started from a cmux terminal. No pane was created; read the output in the dashboard instead.",
+            false,
+        ));
+    }
+    let command = history_command(app, &view.id).map_err(|error| {
+        NotDelivered::new(
+            format!(
+                "The history pane command could not be prepared: {}",
+                detail(error)
+            ),
+            false,
+        )
+    })?;
+    let cwd = app.paths.root.to_str().map(str::to_owned).ok_or_else(|| {
+        NotDelivered::new(
+            "The LLMRelay data directory is not valid UTF-8, so no cmux pane was created. Read the output in the dashboard instead.",
+            false,
+        )
+    })?;
+    Ok((view, command, cwd))
+}
+
+/// Resolves the generated export bound to a history view of this service
+/// start. A pane asking for it is itself evidence the create reached cmux, so
+/// an unknown view still resolves; a failed or closed one never does.
+pub(crate) fn history_export_for_view(app: &Application, view_id: &str) -> Result<Value> {
+    let view = app.store.history_pane_view(view_id)?;
+    if view.service_boot_id != app.service_boot_id() {
+        return Err(anyhow!(
+            "This history pane belongs to an earlier LLMRelay start. Open the history pane again from the dashboard."
+        ));
+    }
+    if !matches!(
+        view.state,
+        HistoryPaneViewState::Reserved
+            | HistoryPaneViewState::Opened
+            | HistoryPaneViewState::Unknown
+    ) {
+        return Err(anyhow!(
+            "This history pane is no longer current. Open the history pane again from the dashboard."
+        ));
+    }
+    let export_hash = view
+        .export_hash
+        .as_deref()
+        .ok_or_else(|| anyhow!("This history pane has no prepared output yet."))?;
+    let path = transcript::validated_history_export(
+        &app.paths.artifacts,
+        &view.session_id,
+        &view.transcript_epoch,
+        export_hash,
+    )?;
+    Ok(json!({
+        "path": path,
+        "export_hash": export_hash,
+        "session_id": view.session_id,
+        "transcript_epoch": view.transcript_epoch,
+        "high_water_sequence": view.high_water_sequence,
+    }))
+}
+
+fn history_pane_outcome(view: HistoryPaneView) -> HistoryPaneOutcome {
+    let message = match view.state {
+        HistoryPaneViewState::Reserved => {
+            "The history pane is still opening. Refresh to see its result before opening another."
+        }
+        HistoryPaneViewState::Opened => {
+            "Opened a read-only history pane in cmux. It shows saved output only and cannot send input to the agent."
+        }
+        HistoryPaneViewState::Unknown => {
+            "LLMRelay could not confirm whether the history pane opened. Check cmux before opening another history pane; the output is still readable here."
+        }
+        HistoryPaneViewState::Failed if view.retry_allowed => {
+            "The history pane was not created. You can try again, or read the output here."
+        }
+        HistoryPaneViewState::Failed => {
+            "The history pane is unavailable right now. Read the output here instead."
+        }
+        HistoryPaneViewState::Closed => "This history pane is closed.",
+    };
+    HistoryPaneOutcome {
+        message: message.to_owned(),
+        view,
+    }
+}
+
+fn history_command(app: &Application, view_id: &str) -> Result<String> {
+    uuid::Uuid::parse_str(view_id).context("history view must be a UUID")?;
+    let executable = app
+        .executable_path()
+        .to_str()
+        .ok_or_else(|| anyhow!("LLMRelay executable path is not valid UTF-8"))?;
+    let data_dir = app
+        .paths
+        .root
+        .to_str()
+        .ok_or_else(|| anyhow!("LLMRelay data directory is not valid UTF-8"))?;
+    Ok([
+        executable,
+        "history",
+        "--data-dir",
+        data_dir,
+        "--view-id",
+        view_id,
+    ]
+    .iter()
+    .map(|value| shell_quote(value))
+    .collect::<Vec<_>>()
+    .join(" "))
+}
+
 const REQUIRED_PERSISTENT_CMUX_METHODS: &[&str] = &[
     "workspace.create",
     "workspace.close",
@@ -2434,6 +2715,197 @@ mod g14_tests {
         assert_eq!(test_cmux_rpc_result_count(), 1);
         clear_test_cmux_rpc_results();
         drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn history_pane_preparation_failure_settles_retryable_without_a_cmux_create() {
+        let (root, mut app) = cmux_test_application();
+        app.set_automatic_cmux_routing_for_tests(true).unwrap();
+        let binding = seed_attachment(&app, "history-preparation");
+        let sink = crate::transcript::TranscriptSink::create(
+            &app.paths.transcripts,
+            &binding.session_id,
+            &binding.transcript_epoch,
+        )
+        .unwrap();
+        sink.append(b"saved history output\n").unwrap();
+        let boot = app.service_boot_id().to_owned();
+        let open = |operation_id: &str| {
+            open_history_pane(
+                &app,
+                &boot,
+                &crate::store::HistoryPaneRequest {
+                    operation_id,
+                    session_id: &binding.session_id,
+                    transcript_epoch: &binding.transcript_epoch,
+                    acknowledged_unknown_view_id: None,
+                },
+            )
+        };
+        let blocker = app.paths.artifacts.join("history-exports");
+        std::fs::write(&blocker, b"not the export directory").unwrap();
+        clear_test_cmux_rpc_results();
+        // Any create attempt would consume this result.
+        push_test_cmux_rpc_result(Ok(json!({"unexpected": "surface.create"})));
+
+        let failed = open(&uuid::Uuid::new_v4().to_string()).unwrap();
+        assert_eq!(failed.view.state, HistoryPaneViewState::Failed);
+        assert!(failed.view.retry_allowed);
+        assert!(failed
+            .view
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("could not be prepared"));
+        assert_eq!(test_cmux_rpc_result_count(), 1);
+        assert_eq!(
+            app.store.history_pane_view(&failed.view.id).unwrap().state,
+            HistoryPaneViewState::Failed
+        );
+
+        std::fs::remove_file(&blocker).unwrap();
+        clear_test_cmux_rpc_results();
+        push_test_cmux_rpc_result(Ok(json!({
+            "workspace_id": uuid::Uuid::new_v4().to_string(),
+            "surface_id": uuid::Uuid::new_v4().to_string(),
+        })));
+        let retried = open(&uuid::Uuid::new_v4().to_string()).unwrap();
+        assert_eq!(
+            retried.view.state,
+            if history_pager_available() {
+                HistoryPaneViewState::Opened
+            } else {
+                HistoryPaneViewState::Failed
+            },
+            "a settled failure never leaves a request still opening"
+        );
+        clear_test_cmux_rpc_results();
+        drop(sink);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn history_pane_reserves_first_replays_exactly_and_needs_a_deliberate_new_request() {
+        let (root, mut app) = cmux_test_application();
+        app.set_automatic_cmux_routing_for_tests(true).unwrap();
+        let binding = seed_attachment(&app, "history-pane");
+        let sink = crate::transcript::TranscriptSink::create(
+            &app.paths.transcripts,
+            &binding.session_id,
+            &binding.transcript_epoch,
+        )
+        .unwrap();
+        sink.append(b"saved history output\n").unwrap();
+        let boot = app.service_boot_id().to_owned();
+        let open = |app: &Application, operation_id: &str, acknowledged: Option<&str>| {
+            open_history_pane(
+                app,
+                &boot,
+                &crate::store::HistoryPaneRequest {
+                    operation_id,
+                    session_id: &binding.session_id,
+                    transcript_epoch: &binding.transcript_epoch,
+                    acknowledged_unknown_view_id: acknowledged,
+                },
+            )
+        };
+        let first_operation = uuid::Uuid::new_v4().to_string();
+        clear_test_cmux_rpc_results();
+        if !history_pager_available() {
+            let outcome = open(&app, &first_operation, None).unwrap();
+            assert_eq!(outcome.view.state, HistoryPaneViewState::Failed);
+            assert!(!outcome.view.retry_allowed);
+            assert_eq!(test_cmux_rpc_result_count(), 0);
+            drop(sink);
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        push_test_cmux_rpc_hook(|method, params| {
+            assert_eq!(method, "surface.create");
+            let command = params["initial_command"].as_str().unwrap();
+            assert!(command.contains(" history ") && command.contains(" --view-id "));
+            assert!(!command.contains(" attach "));
+            push_test_cmux_rpc_result(Err(CmuxCommandError::TimedOut));
+        });
+        let unknown = open(&app, &first_operation, None).unwrap();
+        assert_eq!(unknown.view.state, HistoryPaneViewState::Unknown);
+        assert!(unknown
+            .message
+            .contains("Check cmux before opening another history pane"));
+        let export_hash = unknown.view.export_hash.clone().unwrap();
+        let exported = crate::transcript::validated_history_export(
+            &app.paths.artifacts,
+            &binding.session_id,
+            &binding.transcript_epoch,
+            &export_hash,
+        )
+        .unwrap();
+        assert!(std::fs::read_to_string(exported)
+            .unwrap()
+            .contains("saved history output"));
+
+        // A replay must not reach cmux; the sentinel would be consumed if it did.
+        push_test_cmux_rpc_result(Ok(json!({"unexpected": "second create"})));
+        let replay = open(&app, &first_operation, None).unwrap();
+        assert_eq!(replay.view.id, unknown.view.id);
+        assert_eq!(replay.view.state, HistoryPaneViewState::Unknown);
+        assert_eq!(test_cmux_rpc_result_count(), 1);
+
+        let undeliberate = open(&app, &uuid::Uuid::new_v4().to_string(), None).unwrap_err();
+        assert!(
+            undeliberate
+                .to_string()
+                .contains("Check cmux before opening another history pane"),
+            "{undeliberate:#}"
+        );
+        assert_eq!(test_cmux_rpc_result_count(), 1);
+        clear_test_cmux_rpc_results();
+
+        let workspace_id = uuid::Uuid::new_v4().to_string();
+        let surface_id = uuid::Uuid::new_v4().to_string();
+        push_test_cmux_rpc_result(Ok(
+            json!({"workspace_id": workspace_id, "surface_id": surface_id}),
+        ));
+        let second_operation = uuid::Uuid::new_v4().to_string();
+        let opened = open(&app, &second_operation, Some(&unknown.view.id)).unwrap();
+        assert_eq!(opened.view.state, HistoryPaneViewState::Opened);
+        assert_eq!(opened.view.surface_id.as_deref(), Some(surface_id.as_str()));
+        assert_ne!(opened.view.id, unknown.view.id);
+        assert_eq!(
+            app.store.history_pane_view(&unknown.view.id).unwrap().state,
+            HistoryPaneViewState::Unknown,
+            "the earlier uncertain record is preserved"
+        );
+        assert!(open(&app, &second_operation, None)
+            .unwrap_err()
+            .to_string()
+            .contains("operation ID was already used with different input"));
+        assert_eq!(
+            history_export_for_view(&app, &opened.view.id).unwrap()["path"],
+            json!(app.paths.artifacts.join("history-exports").join(format!(
+                "{}-{}.txt",
+                binding.session_id, binding.transcript_epoch
+            )))
+        );
+        let leases: i64 = app
+            .store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM input_leases)+(SELECT COUNT(*) FROM cmux_session_surfaces)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            leases, 0,
+            "a history pane never takes input or a live route"
+        );
+        clear_test_cmux_rpc_results();
+        drop(sink);
+        drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,6 +1,7 @@
 use crate::domain::{
     AttachmentBinding, CapabilityProofInput, CmuxAttachmentControlDisposition, CmuxAttachmentMode,
-    HumanCommand, PeerProcessIdentity, RoleKind, ValidationLaunchRequest,
+    HumanCommand, PeerProcessIdentity, ProviderValidationPreviewRequest,
+    ProviderValidationStartRequest, RoleKind, ValidationLaunchRequest, WorkflowCommand,
     WorkflowValidationRequest,
 };
 use crate::operations::Application;
@@ -219,6 +220,29 @@ pub enum ControlRequest {
         expected_project_version: i64,
         source: std::path::PathBuf,
         expected_source_hash: String,
+    },
+    /// Used only by `llmrelay history`: resolves a current history view to
+    /// its generated export. It never attaches, resumes or acquires input.
+    HistoryExport {
+        view_id: String,
+    },
+    ProviderValidationPreview {
+        request: ProviderValidationPreviewRequest,
+    },
+    ProviderValidationStart {
+        request: ProviderValidationStartRequest,
+    },
+    ProviderValidationReconcile {
+        request: ProviderValidationStartRequest,
+    },
+    ProviderValidationInspect {
+        batch_id: String,
+    },
+    ProviderValidationCancel {
+        batch_id: String,
+    },
+    WorkflowCommand {
+        command: WorkflowCommand,
     },
 }
 
@@ -1648,6 +1672,27 @@ fn dispatch(
             &source,
             &expected_source_hash,
         )?),
+        ControlRequest::HistoryExport { view_id } => {
+            ControlResponse::success(crate::cmux::history_export_for_view(app, &view_id)?)
+        }
+        ControlRequest::ProviderValidationPreview { request } => {
+            ControlResponse::success(app.preview_provider_validation(&request)?)
+        }
+        ControlRequest::ProviderValidationStart { request } => {
+            ControlResponse::success(app.start_provider_validation(&request)?)
+        }
+        ControlRequest::ProviderValidationReconcile { request } => {
+            ControlResponse::success(app.reconcile_provider_validation_start(&request)?)
+        }
+        ControlRequest::ProviderValidationInspect { batch_id } => {
+            ControlResponse::success(app.inspect_provider_validation(&batch_id)?)
+        }
+        ControlRequest::ProviderValidationCancel { batch_id } => {
+            ControlResponse::success(app.cancel_provider_validation(&batch_id)?)
+        }
+        ControlRequest::WorkflowCommand { command } => {
+            ControlResponse::success(app.execute_workflow_command(&command)?)
+        }
     }
 }
 
@@ -1695,7 +1740,14 @@ fn blocking_control_request(request: &ControlRequest) -> bool {
         | ControlRequest::Diagnostics { .. }
         | ControlRequest::CheckRun { .. }
         | ControlRequest::LegacyPreview { .. }
-        | ControlRequest::LegacyImport { .. } => true,
+        | ControlRequest::LegacyImport { .. }
+        | ControlRequest::HistoryExport { .. }
+        | ControlRequest::ProviderValidationPreview { .. }
+        | ControlRequest::ProviderValidationStart { .. }
+        | ControlRequest::ProviderValidationReconcile { .. }
+        | ControlRequest::ProviderValidationInspect { .. }
+        | ControlRequest::ProviderValidationCancel { .. }
+        | ControlRequest::WorkflowCommand { .. } => true,
     }
 }
 

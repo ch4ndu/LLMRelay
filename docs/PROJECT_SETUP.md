@@ -93,6 +93,35 @@ An activated setup keeps showing its recorded results. When a selected profile's
 
 During supported Implementer sessions, the Workspace **Approvals** list handles native action requests the CLI actually emits with **Approve once**, **Always approve matching actions**, and **Deny**. Codex honors approvals already granted through its native policy, so a natively allowed or sandbox-allowed action may run without a new inbox item. LLMRelay does not enumerate, create, edit, or revoke native Codex approvals; dashboard **Revoke** affects only LLMRelay-owned reusable rules. Workflow approvals, review-budget changes, role switching, and final acceptance remain separate decisions you make in the dashboard. Trusting a folder does not grant those actions to an agent.
 
+## Single agent setup
+
+A project does not need a TRIP installation to run [Single agent](WORKFLOWS.md#single-agent-workflow)
+tasks. In **Projects**, each project offers **Default workflow for new tasks**
+(TRIP or Single agent). Saving it affects only tasks created later; existing
+tasks, recipes and schedules keep their workflow. Projects without a saved
+choice default to TRIP.
+
+Under **Single agent profiles and configuration**:
+
+- **Execution configuration** lists guidance files, testing coverage, a
+  documentation policy and optional checks. Guidance files are read from the
+  project's registered commit when you save; uncommitted edits are not
+  included. Each save creates a new immutable revision.
+- **Agent profiles** name a provider, exact model, effort and instructions.
+  Saved instructions are not shown again; changing the provider, model, effort
+  or instructions creates a new revision that needs its own admission, while a
+  rename does not.
+- **Prepare admission** records exactly which profile revision would be admitted
+  with the newest configuration; it starts nothing. **Probe this profile…**
+  queues one disposable probe task that makes a paid model call, after a second
+  confirmation. It is offered only when LLMRelay reports that a probe can start;
+  otherwise the service's reason is shown. **Activate admission** appears only
+  after that probe recorded its evidence.
+
+The Single agent writer modes have not been qualified for any installed Codex or
+Claude version yet, so probes are currently refused with that reason and no
+Single agent profile can be activated on a real installation.
+
 
 
 ## Existing workflow files
