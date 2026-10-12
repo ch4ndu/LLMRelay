@@ -2,7 +2,7 @@
   "schema": 1,
   "provider": "claude",
   "pack_id": "llmrelay-claude-policy-modes",
-  "pack_revision": "1",
+  "pack_revision": "2",
   "description": "Claude Code 2.1.289 contracts for the Single agent writer and app-wide provider checks; separate from the six-role TRIP pack.",
   "selectors": [
     {
@@ -33,11 +33,11 @@
         {
           "mode": "single_agent_writer",
           "contract_id": "claude-single-agent-writer",
-          "contract_revision": "claude-single-agent-writer-v1",
+          "contract_revision": "claude-single-agent-writer-v2",
           "authority": "workspace_write",
           "session_contract": "retained",
-          "launch_revision": "llmrelay-claude-single-agent-launch-v1",
-          "native_policy_revision": "claude-single-agent-writer-v1",
+          "launch_revision": "llmrelay-claude-single-agent-launch-v2",
+          "native_policy_revision": "claude-single-agent-writer-v2",
           "credential_revision": "llmrelay-single-agent-credential-v1",
           "evidence_revision": "llmrelay-single-agent-proof-v1",
           "required_evidence": [

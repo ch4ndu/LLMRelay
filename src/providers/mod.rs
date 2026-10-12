@@ -1,5 +1,7 @@
 pub mod claude;
 pub mod codex;
+#[cfg(test)]
+mod native_qualification;
 
 use crate::config::{atomic_write, InstancePaths};
 use crate::domain::{
@@ -628,6 +630,8 @@ pub struct SingleAgentLaunchRequest<'a> {
     pub model: &'a str,
     pub effort: &'a str,
     pub cwd: &'a Path,
+    pub read_denials: &'a [PathBuf],
+    pub service_root: &'a Path,
     pub prompt: &'a str,
     pub role_socket: &'a Path,
     pub token: &'a str,
@@ -637,6 +641,79 @@ pub struct SingleAgentLaunchRequest<'a> {
     pub assets: &'a HookAssets,
     pub executable_path: &'a Path,
     pub bundles: &'a crate::provider_compatibility::BundleSet,
+}
+
+struct SingleAgentReadScope {
+    worktree: PathBuf,
+    denied_roots: Vec<PathBuf>,
+    executable_read: Option<PathBuf>,
+}
+
+fn single_agent_read_scope(request: &SingleAgentLaunchRequest<'_>) -> Result<SingleAgentReadScope> {
+    if request.read_denials.len() != 2
+        || !request.cwd.is_absolute()
+        || !request.service_root.is_absolute()
+    {
+        bail!("Single agent read scope needs the registered repository, Git common directory and service root")
+    }
+    let worktree = request.cwd.canonicalize()?;
+    let service_root = request.service_root.canonicalize()?;
+    let worktrees = service_root.join("artifacts/worktrees");
+    if worktrees.canonicalize()? != worktrees
+        || worktree.parent() != Some(worktrees.as_path())
+        || !worktree.is_dir()
+    {
+        bail!("Single agent worktree must be the current direct child of the service's artifacts/worktrees")
+    }
+    let mut denied_roots = std::collections::BTreeSet::new();
+    for root in request.read_denials {
+        if !root.is_absolute() || !root.is_dir() {
+            bail!("Single agent repository read denial must name an existing absolute directory")
+        }
+        let root = root.canonicalize()?;
+        if worktree.starts_with(&root) {
+            bail!("Single agent worktree overlaps a denied repository or Git common directory")
+        }
+        denied_roots.insert(root);
+    }
+    if denied_roots.len() != 2 {
+        bail!("Single agent read scope requires distinct repository and Git common directory roots")
+    }
+    denied_roots.insert(service_root);
+    let socket_directory = request
+        .role_socket
+        .parent()
+        .context("Single agent role socket directory")?
+        .canonicalize()?;
+    if denied_roots
+        .iter()
+        .any(|root| socket_directory.starts_with(root))
+    {
+        bail!("Single agent role socket must remain outside the denied roots")
+    }
+    let executable = request.executable_path.canonicalize()?;
+    if executable.as_path() != request.executable_path {
+        bail!("Single agent role executable must use its canonical file path")
+    }
+    let executable_read = if denied_roots.iter().any(|root| executable.starts_with(root)) {
+        if executable.starts_with(&worktree) {
+            bail!("Single agent executable must be outside its writable worktree")
+        }
+        let metadata = executable.metadata()?;
+        if !metadata.is_file() || metadata.mode() & 0o222 != 0 || metadata.mode() & 0o111 == 0 {
+            bail!(
+                "Single agent executable inside a denied root must be an immutable executable file"
+            )
+        }
+        Some(executable)
+    } else {
+        None
+    };
+    Ok(SingleAgentReadScope {
+        worktree,
+        denied_roots: denied_roots.into_iter().collect(),
+        executable_read,
+    })
 }
 
 /// A provider's part of a Single agent launch, before the policy binding.
@@ -712,6 +789,16 @@ pub fn prepare_single_agent_launch(
     if let Some(reason) = binding.native_calls_disabled_reason() {
         bail!("{reason}")
     }
+    assemble_single_agent_launch(request, native, &binding)
+}
+
+/// Production launches must pass the qualification check in
+/// `prepare_single_agent_launch` before reaching this shared assembly.
+fn assemble_single_agent_launch(
+    request: &SingleAgentLaunchRequest<'_>,
+    native: SingleAgentNative,
+    binding: &crate::provider_compatibility::PolicyBinding,
+) -> Result<SingleAgentLaunch> {
     let identity = SingleAgentNativeIdentity {
         provider: request.provider,
         executable: executable_fingerprint(&native.executable)?,
@@ -1246,7 +1333,12 @@ mod tests {
     fn local_inspection_is_bounded_in_time_and_output() {
         let generous = std::time::Duration::from_secs(5);
         let (status, output) = bounded_inspection(
-            Command::new("/bin/sh").args(["-c", "echo 'codex-cli 0.160.0'"]),
+            Command::new("/bin/sh").args([
+                "-c",
+                "printf '%s\\n' \"$1\"",
+                "fixture",
+                codex::EXACT_CODEX_VERSION,
+            ]),
             "fixture version",
             generous,
         )
@@ -1254,7 +1346,7 @@ mod tests {
         assert!(status.success());
         assert_eq!(
             String::from_utf8(output).unwrap().trim(),
-            "codex-cli 0.160.0"
+            codex::EXACT_CODEX_VERSION
         );
 
         let pid_file =

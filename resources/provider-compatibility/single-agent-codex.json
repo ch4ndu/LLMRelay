@@ -2,21 +2,21 @@
   "schema": 1,
   "provider": "codex",
   "pack_id": "llmrelay-codex-policy-modes",
-  "pack_revision": "1",
-  "description": "Codex CLI 0.160.0 contracts for the Single agent writer and app-wide provider checks; separate from the six-role TRIP pack.",
+  "pack_revision": "3",
+  "description": "Codex CLI 0.162.1 contracts for the Single agent writer and app-wide provider checks; separate from the six-role TRIP pack.",
   "selectors": [
     {
-      "predicate_id": "codex-cli-0.160.0",
-      "exact_version": "codex-cli 0.160.0",
+      "predicate_id": "codex-cli-0.162.1",
+      "exact_version": "codex-cli 0.162.1",
       "contracts": [
         {
           "mode": "provider_observation",
           "contract_id": "codex-provider-observation",
-          "contract_revision": "codex-provider-observation-v1",
+          "contract_revision": "codex-provider-observation-v2",
           "authority": "none",
           "session_contract": "fresh",
-          "launch_revision": "llmrelay-codex-observation-launch-v1",
-          "native_policy_revision": "codex-observation-empty-scope-v1",
+          "launch_revision": "llmrelay-codex-observation-launch-v2",
+          "native_policy_revision": "codex-observation-empty-scope-v2",
           "credential_revision": "llmrelay-no-role-credential-v1",
           "evidence_revision": "llmrelay-provider-observation-v1",
           "required_evidence": [
@@ -33,11 +33,11 @@
         {
           "mode": "single_agent_writer",
           "contract_id": "codex-single-agent-writer",
-          "contract_revision": "codex-single-agent-writer-v1",
+          "contract_revision": "codex-single-agent-writer-v3",
           "authority": "workspace_write",
           "session_contract": "retained",
-          "launch_revision": "llmrelay-codex-single-agent-launch-v1",
-          "native_policy_revision": "codex-single-agent-writer-v1",
+          "launch_revision": "llmrelay-codex-single-agent-launch-v3",
+          "native_policy_revision": "codex-single-agent-writer-v3",
           "credential_revision": "llmrelay-single-agent-credential-v1",
           "evidence_revision": "llmrelay-single-agent-proof-v1",
           "required_evidence": [

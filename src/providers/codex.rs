@@ -13,22 +13,23 @@ use std::path::{Path, PathBuf};
 
 pub const IMPLEMENTER_NATIVE_POLICY_STATUS: &str = "unknown_unattested";
 pub const IMPLEMENTER_NATIVE_POLICY_REASON: &str = "Codex Implementer requires exact current native validation, including a delivered PermissionRequest decision; native approvals may be reused without an inbox request and app revocation affects only app-owned rules";
-pub const DENIED_READ_FLOOR_VERSION: &str = "codex-denied-read-floor-v2";
+pub const DENIED_READ_FLOOR_VERSION: &str = "codex-denied-read-floor-v3";
 pub const DENIED_READ_FLOOR_PROFILE: &str = "agenticjira_role";
-pub const LEGACY_DENIED_READ_FLOOR_GAP: &str = "historical Codex configuration predates the canonical control-socket denied-read and restricted-proxy floor; fresh native validation is required";
-pub const MCP_COVERAGE_REVISION: &str = "codex-local-mcp-coverage-v1-0.160.0";
+pub const LEGACY_DENIED_READ_FLOOR_GAP: &str = "historical Codex configuration does not match the current canonical control-socket denied-read and restricted-proxy contract; fresh exact-version native validation is required";
+pub const MCP_COVERAGE_REVISION: &str = "codex-local-mcp-coverage-v1-0.162.1";
 pub const MCP_COVERAGE_CLASS: &str = "personal_ineligible_observed_prelaunch";
-pub const APPROVAL_OWNERSHIP_REVISION: &str = "codex-native-approval-ownership-v1";
-pub const LEGACY_MCP_COVERAGE_GAP: &str = "historical Codex configuration predates exact local MCP-source coverage; fresh native validation is required";
-pub const LEGACY_APPROVAL_OWNERSHIP_GAP: &str = "historical Codex Implementer configuration predates native approval ownership; fresh native validation is required";
-pub const EXACT_CODEX_VERSION: &str = "codex-cli 0.160.0";
-pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-codex-launch-v2";
-pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-codex-resume-v2";
+pub const APPROVAL_OWNERSHIP_REVISION: &str = "codex-native-approval-ownership-v2";
+pub const LEGACY_MCP_COVERAGE_GAP: &str = "historical Codex configuration does not match the current exact local MCP-source coverage contract; fresh exact-version native validation is required";
+pub const LEGACY_APPROVAL_OWNERSHIP_GAP: &str = "historical Codex Implementer configuration does not match the current native approval ownership contract; fresh exact-version native validation is required";
+pub const EXACT_CODEX_VERSION: &str = "codex-cli 0.162.1";
+pub(crate) const SOURCE_VERSION: &str = "0.162.1";
+pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-codex-launch-v3";
+pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-codex-resume-v3";
 pub const CREDENTIAL_CONTRACT_REVISION: &str = "llmrelay-local-credential-v1";
-pub const OBSERVATION_LAUNCH_REVISION: &str = "llmrelay-codex-observation-launch-v1";
-pub const OBSERVATION_POLICY_REVISION: &str = "codex-observation-empty-scope-v1";
-pub const SINGLE_AGENT_LAUNCH_REVISION: &str = "llmrelay-codex-single-agent-launch-v1";
-pub const SINGLE_AGENT_POLICY_REVISION: &str = "codex-single-agent-writer-v1";
+pub const OBSERVATION_LAUNCH_REVISION: &str = "llmrelay-codex-observation-launch-v2";
+pub const OBSERVATION_POLICY_REVISION: &str = "codex-observation-empty-scope-v2";
+pub const SINGLE_AGENT_LAUNCH_REVISION: &str = "llmrelay-codex-single-agent-launch-v3";
+pub const SINGLE_AGENT_POLICY_REVISION: &str = "codex-single-agent-writer-v3";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_AUTH_BYTES: u64 = 256 * 1024;
 const ACCESS_TOKEN_MARGIN_SECONDS: i64 = 15 * 60;
@@ -139,8 +140,12 @@ pub(crate) fn prepare_with_bundles(
     } else {
         ":read-only"
     };
-    let role_profile =
-        permission_profile(permission_base, &canonical_control_socket, read_denials)?;
+    let role_profile = permission_profile(
+        permission_base,
+        &canonical_control_socket,
+        read_denials,
+        None,
+    )?;
     let network_proxy = network_proxy(&canonical_role_socket)?;
     let approval = if role == RoleKind::Implementer {
         "on-request"
@@ -373,6 +378,7 @@ fn native_arguments(spec: &NativeArguments<'_>) -> Result<Vec<String>> {
 pub(crate) fn single_agent_native(
     request: &super::SingleAgentLaunchRequest<'_>,
 ) -> Result<super::SingleAgentNative> {
+    let scope = super::single_agent_read_scope(request)?;
     let synthetic = request.bundles.is_synthetic();
     let (executable, version) = if synthetic {
         (
@@ -403,23 +409,33 @@ pub(crate) fn single_agent_native(
     let (canonical_role_socket, canonical_control_socket) =
         canonical_socket_endpoints(request.role_socket)?;
     let arguments = native_arguments(&NativeArguments {
-        cwd: request.cwd,
+        cwd: &scope.worktree,
         model: request.model,
         effort: request.effort,
         approval: "on-request",
-        permission_profile: permission_profile(":workspace", &canonical_control_socket, &[])?,
+        permission_profile: permission_profile(
+            ":workspace",
+            &canonical_control_socket,
+            &scope.denied_roots,
+            Some(&scope),
+        )?,
         network_proxy: network_proxy(&canonical_role_socket)?,
         hook_command: &shell_quote(&request.assets.runner.to_string_lossy()),
         writer: true,
         disabled_mcp_servers: &disabled_mcp_servers,
         native_session_id: request.native_session_id,
     })?;
+    let mut denied_paths = BTreeSet::from([canonical_control_socket.clone()]);
+    denied_paths.extend(scope.denied_roots.iter().cloned());
     let security_policy = serde_json::json!({
         "permission_profile": {
             "name": DENIED_READ_FLOOR_PROFILE,
             "extends": ":workspace",
-            "filesystem": {"deny": [&canonical_control_socket], "temporary_directories": "read-only"},
+            "filesystem": {"deny": denied_paths, "write": ["<worktree>"],
+                "read": &scope.executable_read, "temporary_directories": "read-only"},
         },
+        "executable_read_exception": scope.executable_read.as_deref()
+            .map(super::executable_fingerprint).transpose()?,
         "network_proxy": {"unix_sockets": [{"path": &canonical_role_socket, "access": "allow"}], "domains": {}},
         "approval": "on-request",
         "approval_reviewer": "user",
@@ -553,7 +569,7 @@ pub fn require_denied_read_floor(identity: &CapabilityIdentity) -> Result<()> {
             .pointer("/features/request_permissions_tool")
             .and_then(serde_json::Value::as_bool)
             == Some(false);
-    let profile = permission_profile(expected_base, &control_socket, &denied_paths)?;
+    let profile = permission_profile(expected_base, &control_socket, &denied_paths, None)?;
     let proxy = network_proxy(&role_socket)?;
     let argv_matches = identity.effective_argv.first().map(String::as_str)
         == Some("--strict-config")
@@ -798,6 +814,7 @@ fn permission_profile(
     base: &str,
     control_socket: &Path,
     read_denials: &[PathBuf],
+    single_agent_scope: Option<&super::SingleAgentReadScope>,
 ) -> Result<String> {
     let mut denied = BTreeSet::from([control_socket.to_path_buf()]);
     denied.extend(read_denials.iter().cloned());
@@ -813,6 +830,18 @@ fn permission_profile(
         .join(",");
     if base == ":workspace" {
         filesystem.push_str(",\":tmpdir\"=\"read\",\":slash_tmp\"=\"read\"");
+    }
+    if let Some(scope) = single_agent_scope {
+        filesystem.push_str(&format!(
+            ",{}=\"write\"",
+            toml_string(&scope.worktree.to_string_lossy())?
+        ));
+        if let Some(executable) = &scope.executable_read {
+            filesystem.push_str(&format!(
+                ",{}=\"read\"",
+                toml_string(&executable.to_string_lossy())?
+            ));
+        }
     }
     Ok(format!(
         "permissions.{DENIED_READ_FLOOR_PROFILE}={{extends={},filesystem={{{filesystem}}},network={{enabled=true}}}}",
@@ -962,11 +991,11 @@ pub fn inspect_observation_account(
     })
 }
 
-/// Candidate arguments for the provider-observation contract: one non-interactive
-/// turn in the empty scope with a read-only sandbox, no shell or exec tool,
-/// approvals, hooks, configured MCP servers or excluded features, and no role
-/// environment. Whether the pinned build then exposes no tool at all is
-/// unproven until native qualification.
+/// Candidate arguments for the provider-observation contract: one ephemeral
+/// turn ignoring user configuration and rules in the empty read-only scope,
+/// no shell or exec tool, approvals, hooks, configured MCP servers or excluded
+/// features, and no role environment. Whether the pinned build then exposes no
+/// tool at all is unproven until native qualification.
 pub(crate) fn observation_arguments(
     model: &str,
     effort: &str,
@@ -976,6 +1005,10 @@ pub(crate) fn observation_arguments(
     let compatibility = inspect_native_compatibility(scope, EXACT_CODEX_VERSION)?;
     let mut arguments = vec![
         "exec".to_owned(),
+        "--strict-config".to_owned(),
+        "--ephemeral".to_owned(),
+        "--ignore-user-config".to_owned(),
+        "--ignore-rules".to_owned(),
         "--skip-git-repo-check".to_owned(),
         "--cd".to_owned(),
         scope.to_string_lossy().into_owned(),
@@ -1149,7 +1182,7 @@ pub(crate) fn read_capacity_history(
     if meta.get("type")?.as_str()? != "session_meta"
         || payload.get("id")?.as_str()? != native_id
         || payload.get("session_id")?.as_str()? != native_id
-        || payload.get("cli_version")?.as_str()? != "0.160.0"
+        || payload.get("cli_version")?.as_str()? != SOURCE_VERSION
         || payload.get("source")?.as_str()? != "cli"
         || payload.get("originator")?.as_str()? != "codex-tui"
         || payload.get("thread_source")?.as_str()? != "user"
@@ -1223,7 +1256,7 @@ fn capacity_turn_complete(tail: &[u8], turn_id: &str) -> Option<()> {
     completed.then_some(())
 }
 
-pub(crate) const USAGE_CONTRACT_REVISION: &str = "codex-0.160.0-response-usage-v1";
+pub(crate) const USAGE_CONTRACT_REVISION: &str = "codex-0.162.1-response-usage-v1";
 
 pub(crate) fn valid_usage_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
@@ -1283,7 +1316,7 @@ pub(crate) fn read_usage_history(
     if meta.get("type")?.as_str()? != "session_meta"
         || payload.get("id")?.as_str()? != native_id
         || payload.get("session_id")?.as_str()? != native_id
-        || payload.get("cli_version")?.as_str()? != "0.160.0"
+        || payload.get("cli_version")?.as_str()? != SOURCE_VERSION
         || payload.get("source")?.as_str()? != "cli"
         || payload.get("originator")?.as_str()? != "codex-tui"
         || payload.get("thread_source")?.as_str()? != "user"
@@ -1389,7 +1422,7 @@ mod executor_environment_tests {
         let path = root.join("sessions/day/rollout.jsonl");
         let records = vec![
             serde_json::json!({"type":"session_meta","payload":{"id":CAPACITY_NATIVE,
-                "session_id":CAPACITY_NATIVE,"cwd":root,"cli_version":"0.160.0",
+                "session_id":CAPACITY_NATIVE,"cwd":root,"cli_version":SOURCE_VERSION,
                 "source":"cli","originator":"codex-tui","thread_source":"user","history_mode":"paginated"}}),
             serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":CAPACITY_TURN}}),
             serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":CAPACITY_TURN,
@@ -1506,7 +1539,11 @@ mod executor_environment_tests {
             )
         };
         for (index, pointer, value) in [
+            (0, "/payload/cli_version", serde_json::json!("0.160.0")),
             (0, "/payload/cli_version", serde_json::json!("0.161.0")),
+            (0, "/payload/cli_version", serde_json::json!("unknown")),
+            (0, "/payload/source", serde_json::json!("exec")),
+            (0, "/payload/originator", serde_json::json!("codex_exec")),
             (0, "/payload/id", serde_json::json!("other-native-session")),
             (0, "/payload/cwd", serde_json::json!(root.join("sessions"))),
             (
@@ -1603,6 +1640,9 @@ mod executor_environment_tests {
             ),
             (0, "/payload/cwd", serde_json::json!(root.join("sessions"))),
             (0, "/payload/cli_version", serde_json::json!("0.159.2")),
+            (0, "/payload/cli_version", serde_json::json!("0.160.0")),
+            (0, "/payload/cli_version", serde_json::json!("unknown")),
+            (0, "/payload/source", serde_json::json!("exec")),
             (0, "/payload/source", serde_json::json!("subagent")),
             (0, "/payload/originator", serde_json::json!("other")),
             (0, "/payload/thread_source", serde_json::json!("subagent")),

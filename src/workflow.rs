@@ -6022,7 +6022,11 @@ fn observed_usage(
                     row.get::<_, String>(9)?.as_str()
                 ),
                 ("0.157.1", "codex-0.157.1-response-usage-v1")
-                    | ("0.160.0", crate::providers::codex::USAGE_CONTRACT_REVISION)
+                    | ("0.160.0", "codex-0.160.0-response-usage-v1")
+                    | (
+                        crate::providers::codex::SOURCE_VERSION,
+                        crate::providers::codex::USAGE_CONTRACT_REVISION
+                    )
             )
         {
             usage.status = ObservedUsageStatus::Invalid;

@@ -11874,6 +11874,7 @@ pub struct SingleAgentLaunchContext {
     pub task_id: String,
     pub attempt_id: String,
     pub workspace: std::path::PathBuf,
+    pub read_denials: Vec<std::path::PathBuf>,
     pub provider: Provider,
     pub model: String,
     pub effort: String,
@@ -12542,15 +12543,17 @@ impl Store {
             }
         };
         let (task_id, workspace, provider, model, effort, instructions, profile_revision_id, admission_id,
-             capability_key, policy_hash, selection_revision, (adapter_hash, profile_hash, prepared_scope_hash)): (
+             capability_key, policy_hash, selection_revision, (adapter_hash, profile_hash, prepared_scope_hash),
+             repository_path, repository_identity): (
             String, String, String, String, String, String, String, String, Option<String>, String, i64,
-            (String, String, String),
+            (String, String, String), String, String,
         ) = connection.query_row(
             "SELECT a.task_id,w.path,r.provider,r.model,r.effort,r.instructions_text,rp.profile_revision_id,
                     rp.admission_id,pa.capability_key,rp.policy_hash,
                     COALESCE((SELECT selection_revision FROM task_workflow_selections WHERE task_id=a.task_id),1),
-                    r.adapter_hash,rp.profile_hash,pa.prepared_scope_hash
+                    r.adapter_hash,rp.profile_hash,pa.prepared_scope_hash,p.repository_path,p.repository_identity
              FROM attempts a JOIN workspaces w ON w.attempt_id=a.id AND w.state='ready'
+             JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
              JOIN workflow_run_profiles rp ON rp.attempt_id=a.id AND rp.slot_key='single_agent'
              JOIN agent_profile_revisions r ON r.id=rp.profile_revision_id AND r.policy_hash=rp.policy_hash
              JOIN profile_admissions pa ON pa.id=rp.admission_id
@@ -12559,7 +12562,7 @@ impl Store {
             |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?,
                     row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?,
-                    (row.get(11)?, row.get(12)?, row.get(13)?)))
+                    (row.get(11)?, row.get(12)?, row.get(13)?), row.get(14)?, row.get(15)?))
             },
         )?;
         let provider: Provider = provider.parse().map_err(|error: String| anyhow!(error))?;
@@ -12579,10 +12582,21 @@ impl Store {
         )? {
             return Err(RoleLaunchCapacityError.into());
         }
+        drop(connection);
+        let repository = crate::workspace::inspect(Path::new(&repository_path))?;
+        let workspace = std::path::PathBuf::from(workspace).canonicalize()?;
+        let worktree = crate::workspace::inspect(&workspace)?;
+        if repository.identity != repository_identity
+            || worktree.identity != repository.identity
+            || worktree.root != workspace
+        {
+            bail!("Single agent repository or worktree identity changed before preparation")
+        }
         Ok(SingleAgentLaunchContext {
             task_id,
             attempt_id: attempt_id.to_owned(),
-            workspace: workspace.into(),
+            workspace,
+            read_denials: vec![repository.root, repository.common_directory],
             provider,
             model,
             effort,
@@ -14117,7 +14131,7 @@ fn codex_history_candidate(
          JOIN projects p ON p.id=t.project_id CROSS JOIN accepted CROSS JOIN frontier
          WHERE s.id=?1 AND s.provider='codex' AND rg.provider='codex'
            AND s.status='running' AND rg.status='running' AND s.exit_json IS NULL
-           AND s.executable_version='codex-cli 0.160.0' AND s.process_identity_json IS NOT NULL
+           AND s.executable_version=?4 AND s.process_identity_json IS NOT NULL
            AND {OBSERVED_CURRENT_ATTEMPT_SQL} AND {OBSERVED_EFFECTIVE_GENERATION_SQL}
            AND json_type(accepted.payload_json,'$.session_id')='text'
            AND json_extract(accepted.payload_json,'$.session_id')=s.native_session_id
@@ -14135,7 +14149,7 @@ fn codex_history_candidate(
                    OR (h.hook_rowid>frontier.hook_rowid AND h.event_name IN
                        ('PreToolUse','PostToolUse','PermissionRequest','SubagentStart','SubagentStop')))))",
             crate::workflow::CURRENT_TURN_HOOKS_SQL),
-        params![session_id, frontier, observe_usage],
+        params![session_id, frontier, observe_usage, crate::providers::codex::EXACT_CODEX_VERSION],
         |row| {
             Ok((
                 CodexCapacityCandidate {
@@ -14455,14 +14469,15 @@ impl Store {
                     AND transcript_epoch=?8 AND invocation_start=?9 AND accepted_hook_event_id=?10
                     AND input_tokens=?11 AND cached_input_tokens=?12 AND cache_write_input_tokens IS ?13
                     AND output_tokens=?14 AND reasoning_output_tokens=?15 AND total_tokens=?16
-                    AND source_version='0.160.0' AND contract_revision=?17
+                    AND source_version=?17 AND contract_revision=?18
                  FROM codex_usage_observations WHERE provider='codex' AND native_thread_id=?1
                     AND native_turn_id=?2 AND response_id=?3",
                 params![binding.native_session_id, binding.turn_id, response.response_id, candidate.task_id,
                     binding.attempt_id, binding.role_generation_id, binding.session_id, binding.transcript_epoch,
                     binding.invocation_start, binding.accepted_hook_id, counters.input_tokens, counters.cached_input_tokens,
                     counters.cache_write_input_tokens, counters.output_tokens, counters.reasoning_output_tokens,
-                    counters.total_tokens, crate::providers::codex::USAGE_CONTRACT_REVISION], |row| row.get(0)
+                    counters.total_tokens, crate::providers::codex::SOURCE_VERSION,
+                    crate::providers::codex::USAGE_CONTRACT_REVISION], |row| row.get(0)
             ).optional()?;
             match existing {
                 Some(true) => {}
@@ -14484,12 +14499,13 @@ impl Store {
                             accepted_hook_event_id,input_tokens,cached_input_tokens,cache_write_input_tokens,
                             output_tokens,reasoning_output_tokens,total_tokens,source_version,contract_revision,
                             source_identity_json,received_at)
-                         VALUES('codex',?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'0.160.0',?17,?18,?19)",
+                         VALUES('codex',?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
                         params![binding.native_session_id, binding.turn_id, response.response_id, candidate.task_id,
                             binding.attempt_id, binding.role_generation_id, binding.session_id, binding.transcript_epoch,
                             binding.invocation_start, binding.accepted_hook_id, counters.input_tokens, counters.cached_input_tokens,
                             counters.cache_write_input_tokens, counters.output_tokens, counters.reasoning_output_tokens,
-                            counters.total_tokens, crate::providers::codex::USAGE_CONTRACT_REVISION, source, now])?;
+                            counters.total_tokens, crate::providers::codex::SOURCE_VERSION,
+                            crate::providers::codex::USAGE_CONTRACT_REVISION, source, now])?;
                 }
             }
         }
@@ -21457,7 +21473,7 @@ mod attention_observation_tests {
             std::fs::create_dir_all(session.root.join("sessions/day")).unwrap();
             let records = [
                 serde_json::json!({"type":"session_meta","payload":{"id":CAPACITY_NATIVE,"session_id":CAPACITY_NATIVE,
-                    "cwd":session.root,"cli_version":"0.160.0","source":"cli","originator":"codex-tui","thread_source":"user"}}),
+                    "cwd":session.root,"cli_version":"0.162.1","source":"cli","originator":"codex-tui","thread_source":"user"}}),
                 serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":CAPACITY_TURN}}),
                 serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":CAPACITY_TURN,
                     "error":{"codex_error_info":"server_overloaded","message":"private provider text"}}}),
@@ -21545,7 +21561,7 @@ mod attention_observation_tests {
         fn write_usage(&self, turn: &str, responses: &[serde_json::Value]) {
             let mut records = vec![
                 serde_json::json!({"type":"session_meta","payload":{"id":CAPACITY_NATIVE,"session_id":CAPACITY_NATIVE,
-                    "cwd":self.root,"cli_version":"0.160.0","source":"cli","originator":"codex-tui","thread_source":"user"}}),
+                    "cwd":self.root,"cli_version":"0.162.1","source":"cli","originator":"codex-tui","thread_source":"user"}}),
                 serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":turn}}),
             ];
             records.extend(responses.iter().cloned().map(|mut record| {
@@ -22372,6 +22388,11 @@ mod attention_observation_tests {
         session.record_usage(&observations[0]).unwrap();
         assert_eq!(session.business_rows(), before);
         assert_eq!(session.revision(), revision + 3);
+        assert_eq!(
+            session.scalar::<i64>("SELECT COUNT(*) FROM codex_usage_observations
+                WHERE source_version='0.162.1' AND contract_revision='codex-0.162.1-response-usage-v1'"),
+            3
+        );
         let state = crate::workflow::state(&session.store).unwrap();
         let task = state.tasks[0].observed_usage.as_ref().unwrap();
         assert_eq!(task.status, ObservedUsageStatus::Observed);
@@ -22724,7 +22745,42 @@ mod attention_observation_tests {
                 .status,
             ObservedUsageStatus::Invalid
         );
-        session.execute("UPDATE codex_usage_observations SET contract_revision='codex-0.157.1-response-usage-v1' WHERE response_id='one'");
+        session.execute(
+            "UPDATE codex_usage_observations SET source_version='0.160.0' WHERE response_id='one'",
+        );
+        let historical = crate::workflow::state(&session.store).unwrap().tasks[0]
+            .observed_usage
+            .clone()
+            .unwrap();
+        assert_eq!(historical.status, ObservedUsageStatus::Observed);
+        assert_eq!(historical.counters.unwrap().total_tokens, 30);
+        session
+            .store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE codex_usage_observations SET contract_revision=?1 WHERE response_id='one'",
+                params![crate::providers::codex::USAGE_CONTRACT_REVISION],
+            )
+            .unwrap();
+        assert_eq!(
+            crate::workflow::state(&session.store).unwrap().tasks[0]
+                .observed_usage
+                .as_ref()
+                .unwrap()
+                .status,
+            ObservedUsageStatus::Invalid
+        );
+        session.execute("UPDATE codex_usage_observations SET source_version='0.162.1',contract_revision='codex-0.160.0-response-usage-v1' WHERE response_id='one'");
+        assert_eq!(
+            crate::workflow::state(&session.store).unwrap().tasks[0]
+                .observed_usage
+                .as_ref()
+                .unwrap()
+                .status,
+            ObservedUsageStatus::Invalid
+        );
+        session.execute("UPDATE codex_usage_observations SET source_version='0.157.1',contract_revision='codex-0.157.1-response-usage-v1' WHERE response_id='one'");
         let revision = session.revision();
         session.store.lock().unwrap().execute("UPDATE codex_usage_observations SET input_tokens=?1,total_tokens=?1 WHERE response_id='two'",
             params![crate::domain::MAX_OBSERVED_TOKENS]).unwrap();
@@ -22936,6 +22992,8 @@ mod attention_observation_tests {
     fn codex_capacity_selection_requires_admitted_explicit_current_turn() {
         for mutation in [
             "UPDATE sessions SET executable_version='codex-cli 0.159.2'",
+            "UPDATE sessions SET executable_version='codex-cli 0.160.0'",
+            "UPDATE sessions SET executable_version='unknown'",
             "UPDATE sessions SET launch_config_json=json_set(launch_config_json,'$.compatibility.synthetic_origin',json('true'))",
             "UPDATE sessions SET launch_config_json=json_remove(launch_config_json,'$.compatibility')",
             "UPDATE sessions SET launch_config_json=json_set(launch_config_json,'$.compatibility.effective_hash','wrong')",

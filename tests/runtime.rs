@@ -1355,7 +1355,7 @@ async fn service_requested_stop_allows_exact_descendant_to_settle() {
          INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
            VALUES('g','a','manager','codex',1,1,'launch_reserved','authority','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
          INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
-           VALUES('s','g','codex','launch_reserved','{}','fixture','epoch','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+           VALUES('s','g','codex','launch_reserved','{}','fixture','00000000-0000-4000-8000-000000000003','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
          INSERT INTO claims(id,task_id,attempt_id,repository_identity,state,created_at,updated_at)
            VALUES('claim','t','a','settling-identity','running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
     ).unwrap();
@@ -1406,12 +1406,16 @@ async fn service_requested_stop_allows_exact_descendant_to_settle() {
         .spawn(
             "s",
             &SessionOwner::RoleGeneration("g".into()),
-            "epoch",
+            "00000000-0000-4000-8000-000000000003",
             &launch,
         )
         .unwrap();
     store
-        .update_session_running("s", "epoch", &serde_json::to_string(&identity).unwrap())
+        .update_session_running(
+            "s",
+            "00000000-0000-4000-8000-000000000003",
+            &serde_json::to_string(&identity).unwrap(),
+        )
         .unwrap();
     for _ in 0..200 {
         if root.join("ready").exists() && supervisor.process_group_members("s").unwrap().len() > 2 {
@@ -1452,13 +1456,28 @@ async fn service_requested_stop_allows_exact_descendant_to_settle() {
     std::fs::write(root.join("release"), b"release").unwrap();
     for _ in 0..200 {
         supervisor.reconcile().unwrap();
-        if store.session_json("s").unwrap()["status"] == "exited" {
+        let session = store.session_json("s").unwrap();
+        if session["status"] == "exited" && session["capture_state"] == "complete" {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     let exited = store.session_json("s").unwrap();
     assert_eq!(exited["status"], "exited");
+    assert_eq!(exited["capture_state"], "complete");
+    let output = agenticjira::transcript::read_history_page(
+        &paths.transcripts,
+        "s",
+        "00000000-0000-4000-8000-000000000003",
+        0,
+        64 * 1024,
+    )
+    .unwrap();
+    assert!(output.frames.iter().any(|frame| {
+        frame.epoch == "00000000-0000-4000-8000-000000000003"
+            && !frame.gap
+            && frame.encoding == "base64"
+    }));
     assert_eq!(exited["exit"]["process_group_quiescent"], true);
     assert_eq!(
         database

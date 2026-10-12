@@ -11,6 +11,7 @@ use chrono::{Duration, Utc};
 use portable_pty::{native_pty_system, MasterPty, PtySize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt;
 use std::process::Command;
 use std::sync::{Arc, Mutex, RwLock};
@@ -121,6 +122,114 @@ struct SessionHandle {
     codex_helper_image: Option<Mutex<Option<ExecutableFingerprint>>>,
     codex_helper_identity: Mutex<Option<NativeHelperIdentity>>,
     _master: Mutex<Box<dyn MasterPty + Send>>,
+}
+
+struct StartupCapture {
+    reader: Option<std::fs::File>,
+    transcript: TranscriptSink,
+    store: Store,
+    session_id: String,
+    transcript_epoch: String,
+    failed: bool,
+}
+
+impl StartupCapture {
+    fn new(
+        master: &dyn MasterPty,
+        transcript: TranscriptSink,
+        store: Store,
+        session_id: &str,
+        transcript_epoch: &str,
+    ) -> Result<Self> {
+        let fd = master
+            .as_raw_fd()
+            .context("PTY has no readable descriptor")?;
+        // Own the descriptor even if failure cleanup drops the session master.
+        let reader = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+        Ok(Self {
+            reader: Some(std::fs::File::from(reader)),
+            transcript,
+            store,
+            session_id: session_id.to_owned(),
+            transcript_epoch: transcript_epoch.to_owned(),
+            failed: false,
+        })
+    }
+
+    fn record_failure(&mut self, reason: &str) {
+        if self.failed {
+            return;
+        }
+        self.failed = true;
+        if let Err(error) =
+            self.store
+                .record_capture_failure(&self.session_id, &self.transcript_epoch, reason)
+        {
+            tracing::error!(session_id = %self.session_id, error = %error, "startup capture failure persistence failed");
+        }
+    }
+
+    fn drain_available(&mut self) {
+        let mut buffer = [0_u8; 16 * 1024];
+        // Never wait for a still-live, unaccepted process to finish its output.
+        for _ in 0..64 {
+            let Some(reader) = self.reader.as_mut() else {
+                return;
+            };
+            let mut readiness = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut readiness, 1, 0) };
+            if ready == 0 {
+                return;
+            }
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                self.record_failure(&format!("startup PTY poll failure: {error}"));
+                return;
+            }
+            match reader.read(&mut buffer) {
+                Ok(0) => return,
+                // portable-pty also treats a closed Unix slave's EIO as EOF.
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    self.record_failure(&format!("startup PTY read failure: {error}"));
+                    return;
+                }
+                Ok(count) if !self.failed => match self.transcript.append(&buffer[..count]) {
+                    Ok(Some(frame)) => {
+                        if let Err(error) = self.store.set_transcript_sequence(
+                            &self.session_id,
+                            &self.transcript_epoch,
+                            frame.sequence,
+                        ) {
+                            tracing::warn!(session_id = %self.session_id, error = %error, "startup transcript cursor persistence failed");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.record_failure(&format!("startup transcript sink failure: {error:#}"));
+                    }
+                },
+                Ok(_) => {}
+            }
+        }
+    }
+}
+
+impl Drop for StartupCapture {
+    fn drop(&mut self) {
+        if self.reader.is_some() {
+            self.drain_available();
+            self.record_failure("PTY capture stopped before verified reader ownership");
+        }
+    }
 }
 
 fn setup_stop_timeout_receipt_matches_handle(
@@ -488,12 +597,21 @@ impl Supervisor {
         let spawn_baseline = self
             .process_inventory()
             .map_err(SpawnFailure::inventory_unavailable)?;
+        let mut startup_capture = StartupCapture::new(
+            pair.master.as_ref(),
+            transcript.clone(),
+            self.store.clone(),
+            session_id,
+            transcript_epoch,
+        )
+        .map_err(SpawnFailure::proven)?;
         let mut child = pair
             .slave
             .spawn_command(launch.command(&anchor_path))
             .with_context(|| format!("launch {} in PTY", launch.executable.display()))
             .map_err(SpawnFailure::proven)?;
         drop(pair.slave);
+        startup_capture.drain_available();
         let child_pid = child.process_id();
         let wrapper_group = child_pid
             .map(|pid| unsafe { libc::getpgid(pid as libc::pid_t) })
@@ -546,6 +664,7 @@ impl Supervisor {
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let (leader_anchor, provider_anchor) = loop {
+            startup_capture.drain_available();
             match std::fs::read(&anchor_path) {
                 Ok(bytes) => {
                     match serde_json::from_slice::<LaunchHandshake>(&bytes) {
@@ -755,7 +874,17 @@ impl Supervisor {
             native_start_marker: native_start_marker.clone(),
             observed_started_at: Utc::now().to_rfc3339(),
         };
-        let process_json = serde_json::to_string(&process).map_err(SpawnFailure::proven)?;
+        let process_json = match serde_json::to_string(&process) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.classify_spawn_failure(
+                    child.as_mut(),
+                    Some(leader_pid),
+                    Some(process_group_id),
+                    error,
+                ));
+            }
+        };
         // cmux may expose Codex through a script shim.  By this point the
         // handshake has bound the final provider PID, so use its OS-backed
         // executable path as the fallback source for the exact helper image.
@@ -838,6 +967,7 @@ impl Supervisor {
         let tracked_epoch = transcript_epoch.to_owned();
         let tracked_process = process_json.clone();
         let transcript_root = self.transcripts_root.clone();
+        startup_capture.drain_available();
         if let Err(error) = std::thread::Builder::new().name(format!("pty-{session_id}")).spawn(move || {
             let mut buffer = vec![0_u8; 16 * 1024];
             let mut sink_failed = false;
@@ -923,6 +1053,8 @@ impl Supervisor {
                 ],
             });
         }
+        // The accepted reader is now the sole consumer of this PTY stream.
+        drop(startup_capture.reader.take());
         Ok(process)
     }
 
@@ -3065,22 +3197,7 @@ mod tests {
             std::env::temp_dir().join(format!("llmrelay-owner-spawn-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let store = Store::open(&root.join("state.sqlite3")).unwrap();
-        store
-            .lock()
-            .unwrap()
-            .execute_batch(
-                "INSERT INTO provider_validation_batches(id,operation_id,request_hash,preview_hash,selection_json,
-                   max_fresh_calls,native_calls_authorized,state,created_at,updated_at)
-                   VALUES('b','op','h','p','[]',1,1,'running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
-                 INSERT INTO provider_validation_invocations(id,batch_id,ordinal,provider,model,effort,evidence_key,
-                   state,created_at,updated_at)
-                   VALUES('shared-id','b',0,'codex','model','low','key','reserved','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
-                 INSERT INTO sessions(id,role_generation_id,provider_validation_invocation_id,provider,status,
-                   launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
-                   VALUES('s',NULL,'shared-id','codex','launch_reserved','{}','fixture','epoch',
-                   '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
-            )
-            .unwrap();
+        reserve_fixture_provider_check(&store);
         let transcripts = root.join("transcripts");
         let supervisor = Supervisor::new(store.clone(), transcripts.clone());
         for wrong in [
@@ -3111,6 +3228,177 @@ mod tests {
         assert_eq!(launch_state, "reserved", "no spawn intent was recorded");
         assert!(!transcripts.exists());
         assert!(supervisor.handles().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn reserve_fixture_provider_check(store: &Store) {
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO provider_validation_batches(id,operation_id,request_hash,preview_hash,selection_json,
+                   max_fresh_calls,native_calls_authorized,state,created_at,updated_at)
+                   VALUES('b','op','h','p','[]',1,1,'running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO provider_validation_invocations(id,batch_id,ordinal,provider,model,effort,evidence_key,
+                   state,created_at,updated_at)
+                   VALUES('shared-id','b',0,'codex','model','low','key','reserved','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO sessions(id,role_generation_id,provider_validation_invocation_id,provider,status,
+                   launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+                   VALUES('s',NULL,'shared-id','codex','launch_reserved','{}','fixture','epoch',
+                   '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn fast_startup_exit_retains_output_without_accepting_or_replaying_launch() {
+        use base64::Engine;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-startup-capture-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&root.join("state.sqlite3")).unwrap();
+        reserve_fixture_provider_check(&store);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET transcript_epoch=?1 WHERE id='s'",
+                ["00000000-0000-4000-8000-000000000001"],
+            )
+            .unwrap();
+        let transcripts = root.join("transcripts");
+        let prior =
+            TranscriptSink::create(&transcripts, "s", "00000000-0000-4000-8000-000000000002")
+                .unwrap();
+        prior.append(b"retained prior epoch\n").unwrap();
+        drop(prior);
+        let child = root.join("startup-child");
+        std::fs::write(
+            &child,
+            r"#!/bin/sh
+printf 'LOCAL_STARTUP_STDOUT\n'
+printf 'LOCAL_STARTUP_ERROR\n' >&2
+printf 'started\n' >> start-count
+exit 23
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let supervisor = Supervisor::new(store.clone(), transcripts.clone());
+        let mut launch = fixture_launch(&root);
+        launch.supervision_executable = child;
+        let failure = supervisor
+            .spawn(
+                "s",
+                &SessionOwner::ProviderValidationInvocation("shared-id".into()),
+                "00000000-0000-4000-8000-000000000001",
+                &launch,
+            )
+            .unwrap_err();
+        let SpawnFailure::DeliveryUnknown {
+            root_pid,
+            process_group_id,
+            ..
+        } = &failure
+        else {
+            panic!("startup bytes cannot prove nondelivery: {failure}");
+        };
+        let inventory = process_inventory().unwrap();
+        assert!(inventory.iter().all(|process| {
+            Some(process.pid) != *root_pid && Some(process.pgid) != *process_group_id
+        }));
+        let page = transcript::read_history_page(
+            &transcripts,
+            "s",
+            "00000000-0000-4000-8000-000000000001",
+            0,
+            64 * 1024,
+        )
+        .unwrap();
+        assert!(page.frames.iter().all(|frame| {
+            frame.epoch == "00000000-0000-4000-8000-000000000001"
+                && !frame.gap
+                && frame.encoding == "base64"
+        }));
+        let output = page
+            .frames
+            .iter()
+            .flat_map(|frame| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(&frame.data)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("LOCAL_STARTUP_STDOUT"), "{output}");
+        assert!(output.contains("LOCAL_STARTUP_ERROR"), "{output}");
+        assert!(!output.contains("retained prior epoch"));
+        let prior = transcript::read_history_page(
+            &transcripts,
+            "s",
+            "00000000-0000-4000-8000-000000000002",
+            0,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(prior.frames.len(), 1);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&prior.frames[0].data)
+                .unwrap(),
+            b"retained prior epoch\n"
+        );
+        store
+            .mark_session_delivery_ambiguous("s", failure.reason())
+            .unwrap();
+        supervisor.reconcile().unwrap();
+        let state: (String, String, String, bool, bool, String, i64) = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT s.status,s.launch_state,s.capture_state,s.process_identity_json IS NULL,
+                        s.exit_json IS NULL,i.state,(SELECT COUNT(*) FROM provider_validation_invocations)
+                 FROM sessions s JOIN provider_validation_invocations i
+                   ON i.id=s.provider_validation_invocation_id WHERE s.id='s'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                "recovery_required".into(),
+                "delivery_unknown".into(),
+                "failed".into(),
+                true,
+                true,
+                "delivery_unknown".into(),
+                1,
+            )
+        );
+        assert!(!store
+            .mark_capture_complete("s", "00000000-0000-4000-8000-000000000001", "{}", None)
+            .unwrap());
+        assert!(supervisor.handles().unwrap().is_empty());
+        assert!(store
+            .mark_session_spawning("s", "00000000-0000-4000-8000-000000000001", "boot")
+            .is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("start-count")).unwrap(),
+            "started\n"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

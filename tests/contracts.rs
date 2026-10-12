@@ -20209,10 +20209,14 @@ fn capability_identity_orders_overlapping_denials_and_preserves_probe_commands()
 #[test]
 fn capability_keys_keep_external_socket_identity_without_probe_policy() {
     let binding = agenticjira::provider_compatibility::BundleSet::embedded()
-        .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
+        .resolve(
+            Provider::Codex,
+            providers::codex::EXACT_CODEX_VERSION,
+            RoleKind::Manager,
+        )
         .unwrap();
     let mut first = launch(RoleKind::Manager, "fixture", "/fixture/c".into());
-    first.executable_version = "codex-cli 0.160.0".into();
+    first.executable_version = providers::codex::EXACT_CODEX_VERSION.into();
     first.compatibility = Some(binding);
     first.argv = vec![
         "--cd".into(),
@@ -20248,9 +20252,13 @@ fn m7_embedded_provider_selectors_are_exact_and_require_role_qualification() {
     use agenticjira::provider_compatibility::{AuthorityBinding, BundleSet, CompatibilityError};
     let bundles = BundleSet::embedded();
     let matched = bundles
-        .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
+        .resolve(
+            Provider::Codex,
+            providers::codex::EXACT_CODEX_VERSION,
+            RoleKind::Manager,
+        )
         .unwrap();
-    assert_eq!(matched.predicate_id, "codex-cli-0.160.0");
+    assert_eq!(matched.predicate_id, "codex-cli-0.162.1");
     assert!(!matched.effective_hash.is_empty());
     assert_ne!(matched.effective_hash, matched.bundle_hash);
     let authority = serde_json::to_value(AuthorityBinding::from(&matched)).unwrap();
@@ -20260,7 +20268,12 @@ fn m7_embedded_provider_selectors_are_exact_and_require_role_qualification() {
         bundles.resolve(Provider::Codex, "codex-cli 0.155.2", RoleKind::Manager),
         Err(CompatibilityError::Unsupported { .. })
     ));
-    for version in ["codex-cli 0.157.1", "codex-cli 0.161.0"] {
+    for version in [
+        "codex-cli 0.157.1",
+        "codex-cli 0.160.0",
+        "codex-cli 0.161.0",
+        "unknown",
+    ] {
         assert!(matches!(
             bundles.resolve(Provider::Codex, version, RoleKind::Manager),
             Err(CompatibilityError::Unsupported { .. })
@@ -20288,7 +20301,7 @@ fn m7_embedded_provider_selectors_are_exact_and_require_role_qualification() {
             .iter()
             .any(|item| item == "role_capability_proof"));
         bundles
-            .resolve(Provider::Codex, "codex-cli 0.160.0", role)
+            .resolve(Provider::Codex, providers::codex::EXACT_CODEX_VERSION, role)
             .unwrap();
         for version in [
             "2.1.283 (Claude Code)",
@@ -20309,25 +20322,37 @@ fn m7_embedded_provider_selectors_are_exact_and_require_role_qualification() {
     changed["description"] = "Different display text".into();
     changed["pack_revision"] = "2".into();
     let reworded = BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes)
-        .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
+        .resolve(
+            Provider::Codex,
+            providers::codex::EXACT_CODEX_VERSION,
+            RoleKind::Manager,
+        )
         .unwrap();
     assert_eq!(matched.effective_hash, reworded.effective_hash);
     assert_ne!(matched.bundle_hash, reworded.bundle_hash);
     changed["selectors"][0]["contracts"][3]["contract_revision"] = "codex-implementer-v2".into();
     let unrelated = BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes)
-        .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
+        .resolve(
+            Provider::Codex,
+            providers::codex::EXACT_CODEX_VERSION,
+            RoleKind::Manager,
+        )
         .unwrap();
     assert_eq!(matched.effective_hash, unrelated.effective_hash);
     changed["selectors"][0]["contracts"][0]["contract_revision"] = "codex-manager-v2".into();
     let affected = BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes)
-        .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
+        .resolve(
+            Provider::Codex,
+            providers::codex::EXACT_CODEX_VERSION,
+            RoleKind::Manager,
+        )
         .unwrap();
     assert_ne!(matched.effective_hash, affected.effective_hash);
     changed["unexpected"] = true.into();
     assert!(matches!(
         BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes).resolve(
             Provider::Codex,
-            "codex-cli 0.160.0",
+            providers::codex::EXACT_CODEX_VERSION,
             RoleKind::Manager
         ),
         Err(CompatibilityError::InvalidManifest { .. })
@@ -20336,7 +20361,11 @@ fn m7_embedded_provider_selectors_are_exact_and_require_role_qualification() {
     let duplicate = changed["selectors"][0].clone();
     changed["selectors"].as_array_mut().unwrap().push(duplicate);
     let overlap = BundleSet::synthetic_for_tests(&changed.to_string(), claude_bytes)
-        .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
+        .resolve(
+            Provider::Codex,
+            providers::codex::EXACT_CODEX_VERSION,
+            RoleKind::Manager,
+        )
         .unwrap_err();
     assert!(matches!(
         overlap,
@@ -20428,10 +20457,14 @@ fn m7_persisted_production_equivalent_synthetic_proof_cannot_authorize_normal_re
         .unwrap()
         .with_synthetic_compatibility_for_tests(codex, claude);
     let mut synthetic_launch = launch(RoleKind::Manager, "fixture", root.clone());
-    synthetic_launch.executable_version = "codex-cli 0.160.0".into();
+    synthetic_launch.executable_version = providers::codex::EXACT_CODEX_VERSION.into();
     synthetic_launch.compatibility = Some(
         BundleSet::synthetic_for_tests(codex, claude)
-            .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
+            .resolve(
+                Provider::Codex,
+                providers::codex::EXACT_CODEX_VERSION,
+                RoleKind::Manager,
+            )
             .unwrap(),
     );
     let synthetic_key = providers::capability_key(&synthetic_launch).unwrap();
@@ -20461,15 +20494,19 @@ fn m7_persisted_production_equivalent_synthetic_proof_cannot_authorize_normal_re
     let proof = serde_json::json!({"compatibility":synthetic_identity.compatibility});
     Connection::open(&database).unwrap().execute(
         "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,hook_hash,proof_json)
-         VALUES('synthetic-proof','codex','codex-cli 0.160.0','manager','interactive_pty',?1,'supported','fixture','[]','2026-09-23T00:00:00Z','fixture',?2)",
-        params![synthetic_key, proof.to_string()],
+         VALUES('synthetic-proof','codex',?3,'manager','interactive_pty',?1,'supported','fixture','[]','2026-09-23T00:00:00Z','fixture',?2)",
+        params![synthetic_key, proof.to_string(), providers::codex::EXACT_CODEX_VERSION],
     ).unwrap();
     drop(synthetic);
     let reopened = Store::open(&database).unwrap();
     let mut production_launch = synthetic_launch.clone();
     production_launch.compatibility = Some(
         BundleSet::embedded()
-            .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
+            .resolve(
+                Provider::Codex,
+                providers::codex::EXACT_CODEX_VERSION,
+                RoleKind::Manager,
+            )
             .unwrap(),
     );
     let production_key = providers::capability_key(&production_launch).unwrap();
@@ -20747,10 +20784,14 @@ fn m7_retained_launch_and_resume_share_exact_bound_identity() {
         .join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&root).unwrap();
     let binding = agenticjira::provider_compatibility::BundleSet::embedded()
-        .resolve(Provider::Codex, "codex-cli 0.160.0", RoleKind::Manager)
+        .resolve(
+            Provider::Codex,
+            providers::codex::EXACT_CODEX_VERSION,
+            RoleKind::Manager,
+        )
         .unwrap();
     let mut fresh = launch(RoleKind::Manager, "fixture", root);
-    fresh.executable_version = "codex-cli 0.160.0".into();
+    fresh.executable_version = providers::codex::EXACT_CODEX_VERSION.into();
     fresh.compatibility = Some(binding);
     fresh.argv = vec!["prompt".into()];
     let mut resumed = fresh.clone();
@@ -33986,6 +34027,10 @@ fn provider_check_candidate_arguments_request_no_tools_and_no_customization() {
 
     let codex = launch(Provider::Codex, providers::codex::EXACT_CODEX_VERSION);
     for expected in [
+        &["exec", "--strict-config"][..],
+        &["--ephemeral"],
+        &["--ignore-user-config"],
+        &["--ignore-rules"],
         &["--disable", "shell_tool"][..],
         &["--disable", "unified_exec"],
         &["--sandbox", "read-only"],
@@ -34226,7 +34271,8 @@ fn running_single_agent(
     fixture: &Fixture,
     task_id: &str,
 ) -> (agenticjira::store::SingleAgentLaunchContext, PathBuf) {
-    let artifacts = fixture.root.join("artifacts");
+    let paths = instance_paths(fixture);
+    let artifacts = paths.artifacts.clone();
     let plan = scheduler(fixture, artifacts.clone())
         .claim_next()
         .unwrap()
@@ -34237,15 +34283,17 @@ fn running_single_agent(
         .single_agent_launch_context(&plan.attempt_id)
         .unwrap();
     let hooks = test_hooks(fixture);
-    let executable = std::env::current_exe().unwrap();
+    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
     let bundles = single_agent_bundles();
     let launch = providers::prepare_single_agent_launch(&providers::SingleAgentLaunchRequest {
         provider: context.provider,
         model: &context.model,
         effort: &context.effort,
         cwd: &context.workspace,
+        read_denials: &context.read_denials,
+        service_root: &paths.root,
         prompt: "fixture",
-        role_socket: &fixture.root.join("role.sock"),
+        role_socket: &paths.role_socket,
         token: &context.token,
         role_generation_id: &context.role_generation_id,
         session_id: &context.session_id,
@@ -34375,8 +34423,7 @@ fn single_agent_session_start(
 }
 
 fn single_agent_application(fixture: &Fixture) -> Application {
-    let mut paths = instance_paths(fixture);
-    paths.role_socket = fixture.root.join("role.sock");
+    let paths = instance_paths(fixture);
     Application::new_with_synthetic_compatibility_for_tests(
         paths,
         fixture.store.clone(),
@@ -34607,16 +34654,7 @@ fn single_agent_runs_without_trip_and_completes_only_on_exact_acceptance() {
         .unwrap_err()
         .to_string()
         .contains("writer is active"));
-    std::fs::write(
-        fixture
-            .root
-            .join("artifacts")
-            .join("worktrees")
-            .join(&context.attempt_id)
-            .join("fixture.txt"),
-        "DONE\n",
-    )
-    .unwrap();
+    std::fs::write(context.workspace.join("fixture.txt"), "DONE\n").unwrap();
     exit_single_agent(&fixture, &context);
     let captured = reviews
         .freeze_single_agent_result(&context.attempt_id)
@@ -35238,6 +35276,13 @@ fn single_agent_writer_resumes_only_its_exact_retained_conversation() {
     let (task_id, version) = single_agent_task(&fixture, &setup);
     make_ready(&fixture, &task_id, version).unwrap();
     let (context, _) = running_single_agent(&fixture, &task_id);
+    assert_eq!(
+        context.read_denials,
+        vec![
+            repository.canonicalize().unwrap(),
+            repository.join(".git").canonicalize().unwrap()
+        ]
+    );
     let native = single_agent_session_start(&fixture, &context);
     let app = single_agent_application(&fixture);
 
@@ -35385,15 +35430,17 @@ fn single_agent_writer_resumes_only_its_exact_retained_conversation() {
         ..context.clone()
     };
     let hooks = test_hooks(&fixture);
-    let executable = std::env::current_exe().unwrap();
+    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
     let bundles = single_agent_bundles();
-    let launch = providers::prepare_single_agent_launch(&providers::SingleAgentLaunchRequest {
+    let mut request = providers::SingleAgentLaunchRequest {
         provider: next.provider,
         model: &next.model,
         effort: &next.effort,
         cwd: &next.workspace,
+        read_denials: &next.read_denials,
+        service_root: &app.paths.root,
         prompt: "fixture",
-        role_socket: &fixture.root.join("role.sock"),
+        role_socket: &app.paths.role_socket,
         token: &next.token,
         role_generation_id: &next.role_generation_id,
         session_id: &next.session_id,
@@ -35401,8 +35448,156 @@ fn single_agent_writer_resumes_only_its_exact_retained_conversation() {
         assets: &hooks,
         executable_path: &executable,
         bundles: &bundles,
-    })
+    };
+    let launch = providers::prepare_single_agent_launch(&request).unwrap();
+    let later_worktree = app.paths.artifacts.join("worktrees/later-run");
+    std::fs::create_dir(&later_worktree).unwrap();
+    let other_repository = fixture.repository("other-single-agent-repository");
+    let other_roots = [
+        other_repository.canonicalize().unwrap(),
+        other_repository.join(".git").canonicalize().unwrap(),
+    ];
+    let control_socket = app
+        .paths
+        .socket_dir
+        .canonicalize()
+        .unwrap()
+        .join("control.sock");
+    for provider in [Provider::Codex, Provider::Claude] {
+        request.provider = provider;
+        let resumed = providers::prepare_single_agent_launch(&request).unwrap();
+        request.native_session_id = None;
+        let fresh = providers::prepare_single_agent_launch(&request).unwrap();
+        let identity = serde_json::to_value(&fresh.identity).unwrap();
+        assert_eq!(identity, serde_json::to_value(&resumed.identity).unwrap());
+        match provider {
+            Provider::Codex => {
+                let profile: toml::Value = fresh
+                    .arguments
+                    .iter()
+                    .find(|argument| argument.starts_with("permissions.agenticjira_role="))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let filesystem = &profile["permissions"]["agenticjira_role"]["filesystem"];
+                for root in next
+                    .read_denials
+                    .iter()
+                    .chain([&app.paths.root, &control_socket])
+                {
+                    assert_eq!(filesystem[root.to_str().unwrap()].as_str(), Some("deny"));
+                }
+                assert_eq!(
+                    filesystem[next.workspace.to_str().unwrap()].as_str(),
+                    Some("write")
+                );
+                assert_eq!(filesystem[":tmpdir"].as_str(), Some("read"));
+                assert!(filesystem
+                    .get(app.paths.artifacts.join("worktrees").to_str().unwrap())
+                    .is_none());
+                assert!(next.capability_key_for(&fresh.identity).is_ok());
+            }
+            Provider::Claude => {
+                let settings: serde_json::Value = serde_json::from_str(
+                    &fresh
+                        .arguments
+                        .windows(2)
+                        .find(|pair| pair[0] == "--settings")
+                        .unwrap()[1],
+                )
+                .unwrap();
+                let denied = settings["sandbox"]["filesystem"]["denyRead"]
+                    .as_array()
+                    .unwrap();
+                for root in next.read_denials.iter().chain([&app.paths.root]) {
+                    assert!(denied.contains(&serde_json::json!(root)));
+                }
+                assert_eq!(
+                    settings["sandbox"]["filesystem"]["allowRead"],
+                    serde_json::json!([next.workspace])
+                );
+                assert_eq!(
+                    settings["permissions"]["blockReadsOutsideWorkingDirectories"],
+                    true
+                );
+                assert_eq!(
+                    settings["permissions"]["additionalDirectories"],
+                    serde_json::json!([])
+                );
+                assert_eq!(settings["permissions"]["defaultMode"], "default");
+                assert_eq!(settings["sandbox"]["allowUnsandboxedCommands"], false);
+            }
+        }
+        request.cwd = &later_worktree;
+        let later = providers::prepare_single_agent_launch(&request).unwrap();
+        assert_eq!(
+            identity,
+            serde_json::to_value(&later.identity).unwrap(),
+            "{provider} proof must survive a new run worktree"
+        );
+        request.cwd = &next.workspace;
+        request.read_denials = &other_roots;
+        let changed = providers::prepare_single_agent_launch(&request).unwrap();
+        assert_ne!(
+            identity,
+            serde_json::to_value(&changed.identity).unwrap(),
+            "{provider} repository scope is authority"
+        );
+        if provider == Provider::Codex {
+            assert!(next.capability_key_for(&changed.identity).is_err());
+        }
+        request.read_denials = &next.read_denials;
+        request.native_session_id = Some(native.as_str());
+    }
+    request.read_denials = &[];
+    let missing_roots = providers::prepare_single_agent_launch(&request)
+        .err()
+        .unwrap();
+    assert!(
+        missing_roots.to_string().contains("read scope"),
+        "{missing_roots:#}"
+    );
+    request.read_denials = &next.read_denials;
+    request.cwd = &app.paths.artifacts;
+    let invalid_scope = providers::prepare_single_agent_launch(&request)
+        .err()
+        .unwrap();
+    assert!(
+        invalid_scope.to_string().contains("current direct child"),
+        "{invalid_scope:#}"
+    );
+    request.cwd = &next.workspace;
+    let exact_executable = app.paths.root.join("read-exception-executable");
+    std::fs::write(&exact_executable, b"fixture executable").unwrap();
+    std::fs::set_permissions(&exact_executable, std::fs::Permissions::from_mode(0o555)).unwrap();
+    request.executable_path = &exact_executable;
+    let exempted = providers::prepare_single_agent_launch(&request).unwrap();
+    let settings: serde_json::Value = serde_json::from_str(
+        &exempted
+            .arguments
+            .windows(2)
+            .find(|pair| pair[0] == "--settings")
+            .unwrap()[1],
+    )
     .unwrap();
+    assert_eq!(
+        settings["sandbox"]["filesystem"]["allowRead"],
+        serde_json::json!([next.workspace, exact_executable])
+    );
+    assert_eq!(
+        settings["permissions"]["additionalDirectories"],
+        serde_json::json!([])
+    );
+    std::fs::set_permissions(&exact_executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mutable_executable = providers::prepare_single_agent_launch(&request)
+        .err()
+        .unwrap();
+    assert!(
+        mutable_executable
+            .to_string()
+            .contains("immutable executable file"),
+        "{mutable_executable:#}"
+    );
     let untouched = || -> String {
         fixture.scalar(&format!(
             "SELECT s.status||':'||s.transcript_epoch||':'||s.resume_count||':'||t.version||':'||a.status||':'||
@@ -37350,7 +37545,7 @@ args = ["--unicode"]
             old_rejection["observed_identity"],
             serde_json::json!({
                 "provider":"codex",
-                "executable_version":"codex-cli 0.160.0",
+                "executable_version":providers::codex::EXACT_CODEX_VERSION,
                 "role":"implementer",
                 "model":"gpt-5.6-sol",
                 "effort":"high",
@@ -38789,7 +38984,7 @@ args = ["--unicode"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|gap| { gap.as_str() == Some(providers::codex::LEGACY_DENIED_READ_FLOOR_GAP) }));
+        .any(|gap| { gap.as_str() == Some("historical Codex configuration predates the canonical control-socket denied-read and restricted-proxy floor; fresh native validation is required") }));
     let legacy_claude = migrated_connection
         .query_row(
             "SELECT status,evidence_reference,gaps_json,checked_at,proof_json FROM capabilities

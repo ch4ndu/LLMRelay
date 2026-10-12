@@ -9,7 +9,7 @@ const CODEX_POLICY_BYTES: &str =
     include_str!("../resources/provider-compatibility/single-agent-codex.json");
 const CLAUDE_POLICY_BYTES: &str =
     include_str!("../resources/provider-compatibility/single-agent-claude.json");
-pub const CODEX_EXACT_VERSION: &str = "codex-cli 0.160.0";
+pub const CODEX_EXACT_VERSION: &str = crate::providers::codex::EXACT_CODEX_VERSION;
 const REQUIRED_EVIDENCE: [&str; 4] = [
     "exact_native_policy",
     "hook_trust",
@@ -338,7 +338,7 @@ impl ExecutionPolicy {
         Self {
             schema: 1,
             policy_id: format!("llmrelay-{provider}-single-agent-writer"),
-            revision: 1,
+            revision: 2,
             provider,
             mode: PolicyMode::SingleAgentWriter,
             authority,
@@ -984,7 +984,12 @@ mod tests {
     #[test]
     fn strict_manifest_and_unknown_version_fail_closed() {
         let embedded = BundleSet::embedded();
-        for version in ["codex-cli 0.155.1", "codex-cli 0.157.2"] {
+        for version in [
+            "codex-cli 0.155.1",
+            "codex-cli 0.157.2",
+            "codex-cli 0.160.0",
+            "unknown",
+        ] {
             let error = embedded
                 .resolve(Provider::Codex, version, RoleKind::Manager)
                 .unwrap_err();
@@ -1219,14 +1224,12 @@ mod tests {
                 "{case}"
             );
         }
-        assert!(matches!(
-            embedded.resolve_policy(
-                Provider::Codex,
-                "codex-cli 0.161.0",
-                PolicyMode::ProviderObservation
-            ),
-            Err(CompatibilityError::Unsupported { .. })
-        ));
+        for version in ["codex-cli 0.160.0", "codex-cli 0.161.0", "unknown"] {
+            assert!(matches!(
+                embedded.resolve_policy(Provider::Codex, version, PolicyMode::ProviderObservation),
+                Err(CompatibilityError::Unsupported { .. })
+            ));
+        }
     }
 
     #[test]

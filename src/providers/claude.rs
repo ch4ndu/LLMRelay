@@ -10,8 +10,8 @@ pub const CREDENTIAL_CONTRACT_REVISION: &str = "llmrelay-local-credential-v1";
 pub const EXACT_CLAUDE_VERSION: &str = "2.1.289 (Claude Code)";
 pub const OBSERVATION_LAUNCH_REVISION: &str = "llmrelay-claude-observation-launch-v1";
 pub const OBSERVATION_POLICY_REVISION: &str = "claude-observation-no-tools-v1";
-pub const SINGLE_AGENT_LAUNCH_REVISION: &str = "llmrelay-claude-single-agent-launch-v1";
-pub const SINGLE_AGENT_POLICY_REVISION: &str = "claude-single-agent-writer-v1";
+pub const SINGLE_AGENT_LAUNCH_REVISION: &str = "llmrelay-claude-single-agent-launch-v2";
+pub const SINGLE_AGENT_POLICY_REVISION: &str = "claude-single-agent-writer-v2";
 
 /// Claude Code exposes no reviewed account-identity source for this version,
 /// so the identity is reported unavailable rather than inferred from the
@@ -219,6 +219,7 @@ pub(crate) fn prepare_with_bundles(
         &canonical_role_socket,
         effective_read_denials,
         write_denials,
+        None,
     )?;
     let relative = cwd.strip_prefix("/").unwrap_or(cwd);
     let mut allowed = vec![
@@ -399,6 +400,7 @@ pub(crate) fn single_agent_native(
     request: &super::SingleAgentLaunchRequest<'_>,
 ) -> Result<super::SingleAgentNative> {
     use sha2::Digest;
+    let scope = super::single_agent_read_scope(request)?;
     let (executable, version) = if request.bundles.is_synthetic() {
         (
             request.executable_path.to_path_buf(),
@@ -411,14 +413,15 @@ pub(crate) fn single_agent_native(
     let settings_argument = native_sandbox_settings_argument(
         &request.assets.claude_implementer_settings,
         &canonical_role_socket,
-        &[],
+        &scope.denied_roots,
         None,
+        Some(&scope),
     )?;
     let channel = request.executable_path.display();
-    let relative = request
-        .cwd
+    let relative = scope
+        .worktree
         .strip_prefix("/")
-        .unwrap_or(request.cwd)
+        .unwrap_or(&scope.worktree)
         .display();
     let tools = "Read,Grep,Glob,Edit,Write,Bash";
     let denied = "NotebookEdit,WebFetch,WebSearch,Task,Agent";
@@ -488,6 +491,12 @@ pub(crate) fn single_agent_native(
         .iter()
         .map(|rule| rule.replace(&worktree, "<worktree>"))
         .collect::<Vec<_>>();
+    // Only the per-run worktree grant varies; denied roots remain scope-bound.
+    let mut settings_identity: serde_json::Value = serde_json::from_str(&settings_argument)?;
+    *settings_identity
+        .pointer_mut("/sandbox/filesystem/allowRead/0")
+        .context("Claude Single agent settings lack the current worktree read grant")? =
+        serde_json::json!("<worktree>");
     let security_policy = serde_json::json!({
         "restricted": true,
         "permission_mode": "default",
@@ -497,11 +506,17 @@ pub(crate) fn single_agent_native(
         "denied": denied,
         "mcp": "strict_empty",
         "native_sandbox": {
-            "policy_revision": NATIVE_SANDBOX_POLICY_REVISION,
+            "policy_revision": SINGLE_AGENT_POLICY_REVISION,
             "fail_if_unavailable": true,
             "allow_unsandboxed_commands": false,
             "network_allow_unix_sockets": [&canonical_role_socket],
+            "filesystem_deny_read": &scope.denied_roots,
+            "filesystem_allow_read": &settings_identity["sandbox"]["filesystem"]["allowRead"],
+            "executable_read_exception": scope.executable_read.as_deref()
+                .map(super::executable_fingerprint).transpose()?,
         },
+        "block_reads_outside_working_directories": true,
+        "additional_directories": [],
         "hooks": "native_explicit_trust",
     });
     Ok(super::SingleAgentNative {
@@ -512,8 +527,8 @@ pub(crate) fn single_agent_native(
         role_socket: canonical_role_socket,
         account_identity: inspect_observation_account().account_identity,
         config_identity: serde_json::json!({
-            "revision": NATIVE_SANDBOX_POLICY_REVISION,
-            "settings_sha256": hex::encode(sha2::Sha256::digest(settings_argument.as_bytes())),
+            "revision": SINGLE_AGENT_POLICY_REVISION,
+            "settings_sha256": hex::encode(sha2::Sha256::digest(serde_json::to_vec(&settings_identity)?)),
         }),
         security_policy,
         hook_revision: format!(
@@ -528,6 +543,7 @@ fn native_sandbox_settings_argument(
     role_socket: &Path,
     read_denials: &[PathBuf],
     write_denials: Option<&[PathBuf]>,
+    single_agent_scope: Option<&super::SingleAgentReadScope>,
 ) -> Result<String> {
     let bytes = std::fs::read(settings)
         .with_context(|| format!("read Claude settings {}", settings.display()))?;
@@ -595,6 +611,21 @@ fn native_sandbox_settings_argument(
                 denied_writes.push(path);
             }
         }
+    }
+    if let Some(scope) = single_agent_scope {
+        let mut allowed_reads = vec![scope.worktree.clone()];
+        allowed_reads.extend(scope.executable_read.iter().cloned());
+        filesystem.insert("allowRead".to_owned(), serde_json::json!(allowed_reads));
+        let permissions = root
+            .entry("permissions")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .context("Claude permissions must be an object")?;
+        permissions.insert(
+            "blockReadsOutsideWorkingDirectories".to_owned(),
+            serde_json::json!(true),
+        );
+        permissions.insert("additionalDirectories".to_owned(), serde_json::json!([]));
     }
     serde_json::to_string(&value).context("serialize native-sandboxed Claude settings")
 }

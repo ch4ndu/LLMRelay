@@ -5766,12 +5766,15 @@ impl Application {
                 prompt
             }
         };
+        let executable = self.executable.canonicalize()?;
         let mut prepared =
             providers::prepare_single_agent_launch(&providers::SingleAgentLaunchRequest {
                 provider: context.provider,
                 model: &context.model,
                 effort: &context.effort,
                 cwd: &context.workspace,
+                read_denials: &context.read_denials,
+                service_root: &self.paths.root,
                 prompt: &prompt,
                 role_socket: &self.paths.role_socket,
                 token: &context.token,
@@ -5782,7 +5785,7 @@ impl Application {
                     .as_ref()
                     .map(|target| target.native_session_id.as_str()),
                 assets: &self.hooks,
-                executable_path: &self.executable,
+                executable_path: &executable,
                 bundles: &self.store.compatibility_bundles,
             })?;
         prepared.record["prompt_hash"] = serde_json::json!(json_hash(&prompt)?);
@@ -5854,6 +5857,19 @@ impl Application {
 
 const PROVIDER_CHECK_PREFIX: &str = "LLMRELAY-CHECK-";
 const MAX_PROVIDER_CHECK_PAGES: usize = 32;
+
+/// A fresh provider-check prompt and the exact answer it asks for. Only the
+/// model can turn the lowercase nonce in the prompt into the uppercase
+/// answer, so an echoed prompt never counts as a reply.
+pub(crate) fn provider_check_challenge() -> (String, String) {
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let answer = format!("{PROVIDER_CHECK_PREFIX}{nonce}").to_ascii_uppercase();
+    let prompt = format!(
+        "This is an LLMRelay connectivity check. Do not use any tools. Reply with exactly one line: the text {} written entirely in uppercase letters.",
+        answer.to_ascii_lowercase()
+    );
+    (prompt, answer)
+}
 
 fn provider_name(provider: crate::domain::Provider) -> &'static str {
     match provider {
@@ -6082,14 +6098,7 @@ impl Application {
                 }
             }
         }
-        // Only the model can turn the lowercase nonce in the prompt into the
-        // uppercase answer, so an echoed prompt never counts as a reply.
-        let nonce = uuid::Uuid::new_v4().simple().to_string();
-        let answer = format!("{PROVIDER_CHECK_PREFIX}{nonce}").to_ascii_uppercase();
-        let prompt = format!(
-            "This is an LLMRelay connectivity check. Do not use any tools. Reply with exactly one line: the text {} written entirely in uppercase letters.",
-            answer.to_ascii_lowercase()
-        );
+        let (prompt, answer) = provider_check_challenge();
         let launch = match providers::prepare_observation_launch(
             installation,
             policy.clone(),
