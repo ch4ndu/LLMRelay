@@ -44694,6 +44694,198 @@ fn h3h15_projection_merges_exact_old_sessions_and_folds_only_matching_sources() 
 }
 
 #[test]
+fn startup_reserved_resume_restoration_rolls_back_and_retries_exact_prior_epoch() {
+    let fixture = Fixture::new("startup-prior-epoch-restoration");
+    let repository_path = fixture.repository("repo");
+    let repository = workspace::inspect(&repository_path).unwrap();
+    let executable = fixture.root.join("provider-bin");
+    std::fs::copy("/usr/bin/true", &executable).unwrap();
+    let request = ValidationLaunchRequest {
+        operation_id: "resume-launch".into(),
+        cell: "L01".into(),
+        provider: Provider::Codex,
+        role: RoleKind::PlanReviewer,
+        project_path: repository_path.clone(),
+        model: "gpt-5.6-sol".into(),
+        effort: "high".into(),
+        prompt: "retain the stopped conversation".into(),
+    };
+    let mut configuration = providers::prepare_role_launch(
+        request.provider,
+        request.role,
+        &request.model,
+        &request.effort,
+        &repository_path,
+        &request.prompt,
+        &fixture.root.join("role.sock"),
+        "initial-token",
+        "resume-generation",
+        "resume-session",
+        None,
+        &test_hooks(&fixture),
+        &std::env::current_exe().unwrap(),
+    )
+    .unwrap()
+    .config;
+    configuration.executable = executable;
+    fixture
+        .store
+        .reserve_validation(
+            &request,
+            &agenticjira::store::json_hash(&request).unwrap(),
+            "resume-project",
+            &repository.root.to_string_lossy(),
+            &repository.identity,
+            &repository.head,
+            "resume-task",
+            "resume-attempt",
+            "resume-context",
+            "resume-config",
+            "resume-generation",
+            "initial-credential",
+            &auth::hash_secret("initial-token"),
+            "resume-session",
+            "stopped-epoch",
+            &configuration,
+        )
+        .unwrap();
+    let prior_exit = r#"{"code":0,"process_group_quiescent":true,"reason":"stopped conversation"}"#;
+    let prior_anchor = serde_json::json!({
+        "pid":2_000_000_000_u32,"process_group_id":2_000_000_000,
+        "native_start_marker":"stopped-start","boot_identity":"stopped-boot",
+    })
+    .to_string();
+    let prior_process = serde_json::json!({
+        "pid":2_000_000_000_u32,"process_group_id":2_000_000_000,
+        "native_start_marker":"stopped-start","observed_started_at":"2026-01-01T00:00:00Z",
+    })
+    .to_string();
+    fixture.execute(
+        "UPDATE sessions SET status='exited',launch_state='finished',native_session_id='stopped-native',
+           exit_json=?1,launch_boot_identity='stopped-boot',recovery_anchor_json=?2,
+           recovery_root_pid=2000000000,recovery_process_group_id=2000000000,
+           process_identity_json=?3,desired_running=0 WHERE id='resume-session'",
+        params![prior_exit, prior_anchor, prior_process],
+    );
+    fixture.execute(
+        "UPDATE role_generations SET status='exited' WHERE id='resume-generation'",
+        [],
+    );
+    let restored_fields = "SELECT json_array(exit_json,transcript_epoch,launch_boot_identity,
+           recovery_anchor_json,recovery_root_pid,recovery_process_group_id)
+         FROM sessions WHERE id='resume-session'";
+    let stopped_fields = fixture.scalar::<String>(restored_fields);
+    fixture
+        .store
+        .reserve_session_resume(
+            "resume-session",
+            "reserved-epoch",
+            &configuration,
+            "resume-token",
+        )
+        .unwrap();
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM restart_candidates", 0);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM resume_invocations", 1);
+    let target_state = "SELECT json_object(
+           'session_status',s.status,'launch_state',s.launch_state,'launch_error',s.launch_error,
+           'exit',s.exit_json,'epoch',s.transcript_epoch,'boot',s.launch_boot_identity,
+           'anchor',s.recovery_anchor_json,'root',s.recovery_root_pid,'group',s.recovery_process_group_id,
+           'readiness',s.readiness_state,'session_updated_at',s.updated_at,
+           'generation_status',g.status,'generation_updated_at',g.updated_at,
+           'resume_state',r.state,'resume_error',r.error,'resume_updated_at',r.updated_at,
+           'revision',(SELECT revision FROM state_revision))
+         FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+         JOIN resume_invocations r ON r.session_id=s.id AND r.transcript_epoch='reserved-epoch'
+         WHERE s.id='resume-session'";
+    let bindings = "SELECT json_object(
+           'session',json_array(s.role_generation_id,s.provider,s.native_session_id,s.native_identity_source,
+             s.process_identity_json,s.resume_count,s.launch_config_json,s.executable_version,
+             s.capability_key,s.capability_identity_json,s.desired_running),
+           'generation',json_array(g.attempt_id,g.role,g.provider,g.generation,g.config_revision,g.authority_generation),
+           'resume',json_array(r.id,r.session_id,r.resume_ordinal,r.transcript_epoch,r.launch_config_json,
+             r.capability_key,r.capability_identity_json,r.process_identity_json,r.prior_exit_json,
+             r.prior_transcript_epoch,r.prior_launch_boot_identity,r.prior_recovery_anchor_json,
+             r.prior_recovery_root_pid,r.prior_recovery_process_group_id,r.hook_event_boundary_rowid,r.created_at),
+           'history',(SELECT json_group_array(json_array(id,revision,config_json,created_at))
+             FROM config_revisions WHERE attempt_id=g.attempt_id),
+           'credentials',(SELECT json_group_array(json_array(id,token_hash,permissions_json,revoked_at,created_at))
+             FROM (SELECT id,token_hash,permissions_json,revoked_at,created_at
+               FROM role_credentials WHERE role_generation_id=g.id ORDER BY id)))
+         FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+         JOIN resume_invocations r ON r.session_id=s.id AND r.transcript_epoch='reserved-epoch'
+         WHERE s.id='resume-session'";
+    let before = fixture.scalar::<String>(target_state);
+    let bindings_before = fixture.scalar::<String>(bindings);
+    let reserved: serde_json::Value = serde_json::from_str(&before).unwrap();
+    assert_eq!(reserved["session_status"], "launch_reserved");
+    assert_eq!(reserved["generation_status"], "launch_reserved");
+    assert_eq!(reserved["resume_state"], "reserved");
+    fixture.execute_batch(
+        "CREATE TRIGGER fail_prior_epoch_restoration BEFORE UPDATE OF status ON role_generations
+         WHEN NEW.id='resume-generation' AND NEW.status='exited'
+         BEGIN SELECT RAISE(ABORT,'injected prior epoch restoration failure'); END;",
+    );
+
+    let error = recovery::reconcile_prior_boot(&fixture.store).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("injected prior epoch restoration failure"),
+        "{error:#}"
+    );
+    assert_eq!(
+        fixture.scalar::<String>(target_state),
+        before,
+        "failed prior-epoch restoration must roll back every target mutation"
+    );
+    assert_eq!(fixture.scalar::<String>(bindings), bindings_before);
+
+    fixture.execute_batch("DROP TRIGGER fail_prior_epoch_restoration;");
+    let results = recovery::reconcile_prior_boot(&fixture.store).unwrap();
+    assert_eq!(
+        results,
+        vec![serde_json::json!({
+            "session_id":"resume-session","attempt_id":"resume-attempt",
+            "state":"resume_proven_nondelivery","replacement_allowed":false,"exact_retry_allowed":true,
+        })]
+    );
+    let restored_state = fixture.scalar::<String>(target_state);
+    let state: serde_json::Value = serde_json::from_str(&restored_state).unwrap();
+    assert_eq!(state["session_status"], "exited");
+    assert_eq!(state["generation_status"], "exited");
+    assert_eq!(state["launch_state"], "finished");
+    assert_eq!(
+        state["launch_error"],
+        "resume proven not delivered before service restart"
+    );
+    assert_eq!(state["resume_state"], "proven_nondelivery");
+    assert_eq!(
+        state["resume_error"],
+        "service restarted before native resume spawn began"
+    );
+    assert_eq!(state["readiness"], reserved["readiness"]);
+    assert_eq!(fixture.scalar::<String>(restored_fields), stopped_fields);
+    assert_eq!(fixture.scalar::<String>(bindings), bindings_before);
+    fixture.assert_scalar::<i64>(
+        "SELECT resume_count FROM sessions WHERE id='resume-session'",
+        1,
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM resume_invocations", 1);
+    let uncertain = "SELECT (SELECT COUNT(*) FROM recovery_records)
+           + (SELECT COUNT(*) FROM sessions WHERE launch_state='delivery_unknown')
+           + (SELECT COUNT(*) FROM resume_invocations WHERE state='delivery_unknown')";
+    fixture.assert_scalar::<i64>(uncertain, 0);
+
+    assert!(recovery::reconcile_prior_boot(&fixture.store)
+        .unwrap()
+        .is_empty());
+    assert_eq!(fixture.scalar::<String>(target_state), restored_state);
+    assert_eq!(fixture.scalar::<String>(restored_fields), stopped_fields);
+    assert_eq!(fixture.scalar::<String>(bindings), bindings_before);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM resume_invocations", 1);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM restart_candidates", 0);
+    fixture.assert_scalar::<i64>(uncertain, 0);
+}
+
+#[test]
 fn startup_never_spawned_session_settlement_rolls_back_and_retries_once() {
     let fixture = Fixture::new("startup-never-spawned-settlement");
     seed_attempt(&fixture, "implementation");

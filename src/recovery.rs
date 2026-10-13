@@ -909,17 +909,20 @@ pub fn reconcile_prior_boot(store: &Store) -> Result<Vec<serde_json::Value>> {
                 prior_group,
             )) = resume
             {
-                connection.execute(
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute(
                     "UPDATE resume_invocations SET state='proven_nondelivery',error='service restarted before native resume spawn began',updated_at=?1
                      WHERE session_id=?2 AND transcript_epoch=(SELECT transcript_epoch FROM sessions WHERE id=?2) AND state='reserved'",
                     params![now,id],
                 )?;
-                connection.execute(
+                transaction.execute(
                     "UPDATE sessions SET status='exited',launch_state='finished',launch_error='resume proven not delivered before service restart',exit_json=?1,
                        transcript_epoch=?2,launch_boot_identity=?3,recovery_anchor_json=?4,recovery_root_pid=?5,recovery_process_group_id=?6,updated_at=?7 WHERE id=?8",
                     params![prior_exit,prior_epoch,prior_boot,prior_anchor,prior_root,prior_group,now,id],
                 )?;
-                connection.execute("UPDATE role_generations SET status='exited',updated_at=?1 WHERE id=(SELECT role_generation_id FROM sessions WHERE id=?2)",params![now,id])?;
+                transaction.execute("UPDATE role_generations SET status='exited',updated_at=?1 WHERE id=(SELECT role_generation_id FROM sessions WHERE id=?2)",params![now,id])?;
+                transaction.commit()?;
                 results.push(serde_json::json!({"session_id":id,"attempt_id":attempt,"state":"resume_proven_nondelivery","replacement_allowed":false,"exact_retry_allowed":true}));
                 continue;
             }
