@@ -924,32 +924,35 @@ pub fn reconcile_prior_boot(store: &Store) -> Result<Vec<serde_json::Value>> {
                 continue;
             }
             if identity.is_none() {
-                connection.execute(
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute(
                 "UPDATE sessions SET status='launch_failed',launch_state='failed',
                         launch_error='service restarted before native spawn began',
                         exit_json=?1,readiness_state='unknown',updated_at=?2 WHERE id=?3",
                 params![serde_json::json!({"delivery":"proven_nondelivery","reason":"launch reservation never entered spawning state"}).to_string(),now,id],
             )?;
-                connection.execute(
+                transaction.execute(
                     "UPDATE role_generations SET status='launch_failed',updated_at=?1
                  WHERE id=(SELECT role_generation_id FROM sessions WHERE id=?2)",
                     params![now, id],
                 )?;
-                connection.execute(
+                transaction.execute(
                     "UPDATE role_credentials SET revoked_at=COALESCE(revoked_at,?1)
                  WHERE role_generation_id=(SELECT role_generation_id FROM sessions WHERE id=?2)",
                     params![now, id],
                 )?;
-                connection.execute(
+                transaction.execute(
                 "UPDATE resume_invocations SET state='proven_nondelivery',error='service restarted before native spawn began',updated_at=?1
                  WHERE session_id=?2 AND transcript_epoch=(SELECT transcript_epoch FROM sessions WHERE id=?2) AND state='reserved'",
                 params![now, id],
             )?;
-                connection.execute(
+                transaction.execute(
                 "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
                  VALUES(?1,?2,'service','session.launch.proven_nondelivery','session',?3,?4,?5)",
                 params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),id,serde_json::json!({"attempt_id":attempt,"launch_state":"reserved","replacement_allowed":true}).to_string(),now],
             )?;
+                transaction.commit()?;
                 results.push(serde_json::json!({"session_id":id,"attempt_id":attempt,"state":"proven_nondelivery","replacement_allowed":true}));
                 continue;
             }

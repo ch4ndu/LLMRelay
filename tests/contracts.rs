@@ -44694,6 +44694,149 @@ fn h3h15_projection_merges_exact_old_sessions_and_folds_only_matching_sources() 
 }
 
 #[test]
+fn startup_never_spawned_session_settlement_rolls_back_and_retries_once() {
+    let fixture = Fixture::new("startup-never-spawned-settlement");
+    seed_attempt(&fixture, "implementation");
+    seed_session(
+        &fixture,
+        "a",
+        "implementer",
+        "reserved-generation",
+        "reserved-session",
+        "launch_reserved",
+    );
+    fixture.execute_batch(
+        "UPDATE role_generations SET status='launch_reserved' WHERE id='reserved-generation';
+         UPDATE sessions SET launch_state='reserved',process_identity_json=NULL,
+           transcript_epoch='reserved-epoch',resume_count=1,capability_key='reserved-key',
+           capability_identity_json='{}' WHERE id='reserved-session';
+         INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,
+           prior_transcript_epoch,launch_config_json,capability_key,capability_identity_json,
+           state,created_at,updated_at)
+         VALUES('reserved-invocation','reserved-session',1,'reserved-epoch',NULL,'{}',
+           'reserved-key','{}','reserved','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+         INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at)
+         VALUES('reserved-credential','reserved-generation','reserved-token-hash','[]',
+           '2026-01-01T00:00:00Z');",
+    );
+    let target_state = "SELECT json_object(
+           'session_status',s.status,'launch_state',s.launch_state,'launch_error',s.launch_error,
+           'exit',json(s.exit_json),'readiness',s.readiness_state,'session_updated_at',s.updated_at,
+           'generation_status',g.status,'generation_updated_at',g.updated_at,
+           'credential_revoked_at',c.revoked_at,'resume_state',r.state,'resume_error',r.error,
+           'resume_updated_at',r.updated_at,'attempt',json_array(a.status,a.updated_at),
+           'task',json_array(t.attention,t.version,t.updated_at),
+           'revision',(SELECT revision FROM state_revision))
+         FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+         JOIN resume_invocations r ON r.session_id=s.id AND r.transcript_epoch=s.transcript_epoch
+         JOIN role_credentials c ON c.role_generation_id=g.id
+         JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id
+         WHERE s.id='reserved-session' AND r.id='reserved-invocation' AND c.id='reserved-credential'";
+    let bindings = "SELECT json_object(
+           'session',json_array(s.role_generation_id,s.provider,s.native_session_id,s.native_identity_source,
+             s.transcript_epoch,s.resume_count,s.process_identity_json,s.launch_config_json,
+             s.capability_key,s.capability_identity_json,s.launch_boot_identity,s.recovery_anchor_json,
+             s.recovery_root_pid,s.recovery_process_group_id,s.desired_running),
+           'generation',json_array(g.attempt_id,g.role,g.provider,g.generation,g.config_revision,g.authority_generation),
+           'resume',json_array(r.session_id,r.resume_ordinal,r.transcript_epoch,r.prior_transcript_epoch,
+             r.process_identity_json,r.launch_config_json,r.capability_key,r.capability_identity_json,
+             r.prior_exit_json,r.prior_launch_boot_identity,r.prior_recovery_anchor_json,
+             r.prior_recovery_root_pid,r.prior_recovery_process_group_id),
+           'credential',json_array(c.role_generation_id,c.token_hash,c.permissions_json,c.created_at))
+         FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+         JOIN resume_invocations r ON r.session_id=s.id JOIN role_credentials c ON c.role_generation_id=g.id
+         WHERE s.id='reserved-session' AND r.id='reserved-invocation' AND c.id='reserved-credential'";
+    let before = fixture.scalar::<String>(target_state);
+    let bindings_before = fixture.scalar::<String>(bindings);
+    fixture.execute_batch(
+        "CREATE TRIGGER fail_nondelivery_settlement BEFORE UPDATE OF status ON role_generations
+         WHEN NEW.id='reserved-generation' AND NEW.status='launch_failed'
+         BEGIN SELECT RAISE(ABORT,'injected nondelivery settlement failure'); END;",
+    );
+
+    let error = recovery::reconcile_prior_boot(&fixture.store).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("injected nondelivery settlement failure"),
+        "{error:#}"
+    );
+    assert_eq!(
+        fixture.scalar::<String>(target_state),
+        before,
+        "failed never-spawned settlement must roll back every target mutation"
+    );
+    assert_eq!(fixture.scalar::<String>(bindings), bindings_before);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events", 0);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+
+    fixture.execute_batch("DROP TRIGGER fail_nondelivery_settlement;");
+    let results = recovery::reconcile_prior_boot(&fixture.store).unwrap();
+    assert_eq!(
+        results,
+        vec![serde_json::json!({
+            "session_id":"reserved-session","attempt_id":"a",
+            "state":"proven_nondelivery","replacement_allowed":true,
+        })]
+    );
+    let settled_state = fixture.scalar::<String>(target_state);
+    let state: serde_json::Value = serde_json::from_str(&settled_state).unwrap();
+    assert_eq!(state["session_status"], "launch_failed");
+    assert_eq!(state["launch_state"], "failed");
+    assert_eq!(
+        state["launch_error"],
+        "service restarted before native spawn began"
+    );
+    assert_eq!(state["readiness"], "unknown");
+    assert_eq!(
+        state["exit"],
+        serde_json::json!({
+            "delivery":"proven_nondelivery","reason":"launch reservation never entered spawning state",
+        })
+    );
+    assert_eq!(state["generation_status"], "launch_failed");
+    assert_eq!(state["credential_revoked_at"], state["session_updated_at"]);
+    assert_eq!(state["resume_state"], "proven_nondelivery");
+    assert_eq!(
+        state["resume_error"],
+        "service restarted before native spawn began"
+    );
+    let original: serde_json::Value = serde_json::from_str(&before).unwrap();
+    assert_eq!(state["attempt"], original["attempt"]);
+    assert_eq!(state["task"], original["task"]);
+    assert_eq!(fixture.scalar::<String>(bindings), bindings_before);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events", 1);
+    let audit_state = "SELECT json_object('id',id,'operation_id',operation_id,'actor_kind',actor_kind,
+           'event_code',event_code,'entity_kind',entity_kind,'entity_id',entity_id,
+           'detail',json(detail_json),'created_at',created_at)
+         FROM audit_events WHERE event_code='session.launch.proven_nondelivery' AND entity_id='reserved-session'";
+    let settled_audit = fixture.scalar::<String>(audit_state);
+    let audit: serde_json::Value = serde_json::from_str(&settled_audit).unwrap();
+    assert_eq!(audit["actor_kind"], "service");
+    assert_eq!(audit["event_code"], "session.launch.proven_nondelivery");
+    assert_eq!(audit["entity_kind"], "session");
+    assert_eq!(audit["entity_id"], "reserved-session");
+    assert_eq!(
+        audit["detail"],
+        serde_json::json!({
+            "attempt_id":"a","launch_state":"reserved","replacement_allowed":true,
+        })
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+    let uncertain = "SELECT (SELECT COUNT(*) FROM sessions WHERE launch_state='delivery_unknown')
+           + (SELECT COUNT(*) FROM resume_invocations WHERE state='delivery_unknown')";
+    fixture.assert_scalar::<i64>(uncertain, 0);
+
+    assert!(recovery::reconcile_prior_boot(&fixture.store)
+        .unwrap()
+        .is_empty());
+    assert_eq!(fixture.scalar::<String>(target_state), settled_state);
+    assert_eq!(fixture.scalar::<String>(bindings), bindings_before);
+    assert_eq!(fixture.scalar::<String>(audit_state), settled_audit);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events", 1);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+    fixture.assert_scalar::<i64>(uncertain, 0);
+}
+
+#[test]
 fn startup_session_recovery_publication_rolls_back_and_retries_exactly_once() {
     let fixture = Fixture::new("startup-session-recovery-publication");
     seed_attempt(&fixture, "implementation");
