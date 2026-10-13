@@ -197,7 +197,7 @@ inspect recorded sessions before stopping work. Preview runs only when requested
 It does not drain, signal, reconcile, reserve a launch, or change saved state.
 It distinguishes resumable, fresh-only, blocked, uncertain, awaiting-approval and
 completed work. Running-session eligibility is conditional on verified quiescence;
-a preview never authorizes a resume. The CLI control channel retains its 1 MiB
+a preview never authorizes a resume. The CLI control channel has a 16 MiB
 response limit and returns an explicit error when a complete preview exceeds it.
 It does not silently truncate the result.
 
@@ -209,7 +209,8 @@ It excludes other tasks, transcripts, provider launch configuration and report
 history. The read uses one database snapshot and is limited to 100 open recoveries
 and 256 KiB; exceeding either limit fails explicitly. Reading these bindings
 does not approve a recovery or change any workflow state. The unscoped `state`
-command still returns the full workspace projection and retains its 1 MiB limit.
+command still returns the full workspace projection and has a 16 MiB response
+limit. Control requests remain limited to 1 MiB.
 
 One distinct selected session uses the direct resume path. **Resume eligible**
 and selections with two or more distinct sessions create a durable batch of at
@@ -228,6 +229,11 @@ allowance; failed or uncertain deliveries are not automatically retried. Counter
 and consumed batch membership survive restart.
 
 ### Exact recovery records
+
+On startup, each ordinary session or check recovery transition and its recovery
+record commit together. If saving that record fails, the related status changes
+roll back so a later startup can retry reconciliation. This does not establish
+that the interrupted process has stopped or authorize another launch.
 
 Recovery commands carry the displayed `recovery_id` with the current task,
 attempt, optional session and task version. Refresh after a stale-record refusal.

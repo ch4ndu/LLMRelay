@@ -44694,6 +44694,274 @@ fn h3h15_projection_merges_exact_old_sessions_and_folds_only_matching_sources() 
 }
 
 #[test]
+fn startup_session_recovery_publication_rolls_back_and_retries_exactly_once() {
+    let fixture = Fixture::new("startup-session-recovery-publication");
+    seed_attempt(&fixture, "implementation");
+    seed_session(
+        &fixture,
+        "a",
+        "implementer",
+        "startup-generation",
+        "startup-session",
+        "running",
+    );
+    let process_identity = serde_json::json!({
+        "pid":2_000_000_000_u32,
+        "process_group_id":2_000_000_000,
+        "native_start_marker":"prior-session-start",
+        "observed_started_at":"2026-01-01T00:00:00Z",
+    })
+    .to_string();
+    let anchor = serde_json::json!({
+        "pid":2_000_000_000_u32,
+        "process_group_id":2_000_000_000,
+        "native_start_marker":"prior-session-start",
+        "boot_identity":"prior-session-boot",
+    })
+    .to_string();
+    fixture.execute(
+        "UPDATE sessions SET launch_state='started',readiness_state='idle_candidate',
+           native_session_id='startup-native',native_identity_source='provider',
+           native_identity_verified_at='2026-01-01T00:00:00Z',transcript_epoch='startup-epoch',
+           resume_count=1,process_identity_json=?1,recovery_anchor_json=?2,
+           recovery_root_pid=2000000000,recovery_process_group_id=2000000000,
+           launch_boot_identity='prior-session-boot',capability_key='startup-key',
+           capability_identity_json='{}' WHERE id='startup-session'",
+        params![process_identity, anchor],
+    );
+    fixture.execute(
+        "INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,
+           launch_config_json,capability_key,capability_identity_json,state,process_identity_json,
+           created_at,updated_at)
+         VALUES('startup-resume','startup-session',1,'startup-epoch','{}','startup-key','{}',
+           'running',?1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![process_identity],
+    );
+    fixture.execute(
+        "INSERT INTO claims(id,task_id,attempt_id,repository_identity,state,process_identity_json,
+           created_at,updated_at)
+         VALUES('startup-claim','t','a','/tmp/identity','running',?1,
+           '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![process_identity],
+    );
+    let target_state = "SELECT json_object(
+           'session_status',s.status,'launch_state',s.launch_state,'readiness',s.readiness_state,
+           'session_updated_at',s.updated_at,'resume_state',r.state,'resume_error',r.error,
+           'resume_updated_at',r.updated_at,'attempt_status',a.status,'attempt_updated_at',a.updated_at,
+           'task_attention',t.attention,'task_version',t.version,'task_updated_at',t.updated_at,
+           'claim_state',c.state,'claim_updated_at',c.updated_at,
+           'generation_status',g.status,'generation_updated_at',g.updated_at,
+           'revision',(SELECT revision FROM state_revision))
+         FROM sessions s JOIN resume_invocations r ON r.session_id=s.id AND r.transcript_epoch=s.transcript_epoch
+         JOIN role_generations g ON g.id=s.role_generation_id JOIN attempts a ON a.id=g.attempt_id
+         JOIN tasks t ON t.id=a.task_id JOIN claims c ON c.attempt_id=a.id
+         WHERE s.id='startup-session' AND r.id='startup-resume' AND c.id='startup-claim'";
+    let identity_state = "SELECT json_object(
+           'session',json_array(s.role_generation_id,s.provider,s.native_session_id,s.native_identity_source,
+             s.native_identity_verified_at,s.transcript_epoch,s.resume_count,s.process_identity_json,
+             s.launch_boot_identity,s.recovery_anchor_json,s.recovery_root_pid,s.recovery_process_group_id,
+             s.capability_key,s.capability_identity_json,s.launch_config_json,s.exit_json,s.launch_error,
+             s.desired_running),
+           'resume',json_array(r.session_id,r.resume_ordinal,r.transcript_epoch,r.process_identity_json,
+             r.capability_key,r.capability_identity_json,r.launch_config_json),
+           'claim',json_array(c.task_id,c.attempt_id,c.repository_identity,c.process_identity_json))
+         FROM sessions s JOIN resume_invocations r ON r.session_id=s.id
+         JOIN claims c ON c.attempt_id=(SELECT attempt_id FROM role_generations WHERE id=s.role_generation_id)
+         WHERE s.id='startup-session' AND r.id='startup-resume' AND c.id='startup-claim'";
+    let before = fixture.scalar::<String>(target_state);
+    let identity_before = fixture.scalar::<String>(identity_state);
+    fixture.execute_batch(
+        "CREATE TRIGGER fail_session_recovery_publication BEFORE INSERT ON recovery_records
+         WHEN NEW.session_id='startup-session' AND NEW.attempt_id='a'
+         BEGIN SELECT RAISE(ABORT,'injected session recovery publication failure'); END;",
+    );
+
+    let error = recovery::reconcile_prior_boot(&fixture.store).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("injected session recovery publication failure"),
+        "{error:#}"
+    );
+    assert_eq!(
+        fixture.scalar::<String>(target_state),
+        before,
+        "failed session recovery publication must roll back every target mutation"
+    );
+    assert_eq!(fixture.scalar::<String>(identity_state), identity_before);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+
+    fixture.execute_batch("DROP TRIGGER fail_session_recovery_publication;");
+    let results = recovery::reconcile_prior_boot(&fixture.store).unwrap();
+    assert_eq!(
+        results,
+        vec![serde_json::json!({
+            "session_id":"startup-session","attempt_id":"a",
+            "state":"root_absent_descendants_unknown","replacement_allowed":false,
+        })]
+    );
+    let published_state = fixture.scalar::<String>(target_state);
+    let state: serde_json::Value = serde_json::from_str(&published_state).unwrap();
+    assert_eq!(state["session_status"], "recovery_required");
+    assert_eq!(state["launch_state"], "started");
+    assert_eq!(state["readiness"], "unknown");
+    assert_eq!(state["resume_state"], "delivery_unknown");
+    assert_eq!(
+        state["resume_error"],
+        "service restarted before process ownership was reconciled"
+    );
+    assert_eq!(state["attempt_status"], "needs_recovery");
+    assert_eq!(state["task_attention"], "needs_recovery");
+    assert_eq!(state["claim_state"], "unknown");
+    assert_eq!(state["generation_status"], "running");
+    assert_eq!(fixture.scalar::<String>(identity_state), identity_before);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 1);
+    let record_state = "SELECT json_object('id',id,'session_id',session_id,'attempt_id',attempt_id,
+           'state',state,'process_identity_json',process_identity_json,'detail',json(detail_json),
+           'created_at',created_at,'updated_at',updated_at,'resolved_at',resolved_at)
+         FROM recovery_records WHERE session_id='startup-session' AND attempt_id='a'";
+    let published_record = fixture.scalar::<String>(record_state);
+    let record: serde_json::Value = serde_json::from_str(&published_record).unwrap();
+    assert_eq!(record["session_id"], "startup-session");
+    assert_eq!(record["attempt_id"], "a");
+    assert_eq!(record["state"], "attention_required");
+    assert_eq!(record["process_identity_json"], process_identity);
+    assert_eq!(record["resolved_at"], serde_json::Value::Null);
+    assert_eq!(
+        record["detail"],
+        serde_json::json!({
+            "observation":"root_absent_descendants_unknown","launch_state":"started",
+            "replacement_allowed":false,"descendant_state":"unknown_until_explicit_reconciliation",
+        })
+    );
+
+    assert!(recovery::reconcile_prior_boot(&fixture.store)
+        .unwrap()
+        .is_empty());
+    assert_eq!(fixture.scalar::<String>(target_state), published_state);
+    assert_eq!(fixture.scalar::<String>(identity_state), identity_before);
+    assert_eq!(fixture.scalar::<String>(record_state), published_record);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 1);
+}
+
+#[test]
+fn startup_check_recovery_publication_rolls_back_and_retries_exactly_once() {
+    let fixture = Fixture::new("startup-check-recovery-publication");
+    seed_attempt(&fixture, "checks");
+    let anchor = serde_json::json!({
+        "pid":2_000_000_000_u32,
+        "process_group_id":2_000_000_000,
+        "native_start_marker":"prior-check-start",
+        "boot_identity":"prior-check-boot",
+    })
+    .to_string();
+    fixture.execute(
+        "INSERT INTO check_runs(id,attempt_id,candidate_hash,executable,arguments_json,cwd,status,
+           launch_state,evidence_json,created_at,recovery_root_pid,recovery_process_group_id,
+           recovery_anchor_json,launch_boot_identity)
+         VALUES('startup-check','a','startup-candidate','/usr/bin/true','[]','/tmp','running',
+           'started','{\"prior_evidence\":true}','2026-01-01T00:00:00Z',2000000000,2000000000,
+           ?1,'prior-check-boot')",
+        params![anchor],
+    );
+    fixture.execute_batch(
+        r#"INSERT INTO check_processes(check_id,pid,native_start_marker,process_group_id,parent_pid,last_seen_at)
+         VALUES('startup-check',2000000000,'prior-check-start',2000000000,1,'2026-01-01T00:00:00Z');
+         INSERT INTO claims(id,task_id,attempt_id,repository_identity,state,process_identity_json,
+           created_at,updated_at)
+         VALUES('startup-claim','t','a','/tmp/identity','running',
+           '{"pid":2000000000,"process_group_id":2000000000,
+             "native_start_marker":"prior-check-start","observed_started_at":"2026-01-01T00:00:00Z"}',
+           '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');"#,
+    );
+    let target_state = "SELECT json_object(
+           'check_status',cr.status,'launch_state',cr.launch_state,'evidence',cr.evidence_json,
+           'launch_error',cr.launch_error,'exit_code',cr.exit_code,'finished_at',cr.finished_at,
+           'attempt_status',a.status,'attempt_updated_at',a.updated_at,
+           'task_attention',t.attention,'task_version',t.version,'task_updated_at',t.updated_at,
+           'claim_state',c.state,'claim_updated_at',c.updated_at,
+           'revision',(SELECT revision FROM state_revision))
+         FROM check_runs cr JOIN attempts a ON a.id=cr.attempt_id JOIN tasks t ON t.id=a.task_id
+         JOIN claims c ON c.attempt_id=a.id WHERE cr.id='startup-check' AND c.id='startup-claim'";
+    let identity_state = "SELECT json_object(
+           'check',json_array(cr.attempt_id,cr.candidate_hash,cr.executable,cr.arguments_json,cr.cwd,
+             cr.launch_boot_identity,cr.recovery_anchor_json,cr.recovery_root_pid,cr.recovery_process_group_id),
+           'processes',(SELECT json_group_array(json_array(pid,native_start_marker,process_group_id,
+             parent_pid,last_seen_at)) FROM check_processes WHERE check_id=cr.id),
+           'claim',json_array(c.task_id,c.attempt_id,c.repository_identity,c.process_identity_json))
+         FROM check_runs cr JOIN claims c ON c.attempt_id=cr.attempt_id
+         WHERE cr.id='startup-check' AND c.id='startup-claim'";
+    let before = fixture.scalar::<String>(target_state);
+    let identity_before = fixture.scalar::<String>(identity_state);
+    fixture.execute_batch(
+        "CREATE TRIGGER fail_check_recovery_publication BEFORE INSERT ON recovery_records
+         WHEN NEW.session_id IS NULL AND NEW.attempt_id='a'
+           AND json_extract(NEW.detail_json,'$.check_id')='startup-check'
+         BEGIN SELECT RAISE(ABORT,'injected check recovery publication failure'); END;",
+    );
+
+    let error = recovery::reconcile_prior_boot(&fixture.store).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("injected check recovery publication failure"),
+        "{error:#}"
+    );
+    assert_eq!(
+        fixture.scalar::<String>(target_state),
+        before,
+        "failed check recovery publication must roll back every target mutation"
+    );
+    assert_eq!(fixture.scalar::<String>(identity_state), identity_before);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
+
+    fixture.execute_batch("DROP TRIGGER fail_check_recovery_publication;");
+    let results = recovery::reconcile_prior_boot(&fixture.store).unwrap();
+    assert_eq!(
+        results,
+        vec![serde_json::json!({
+            "check_id":"startup-check","attempt_id":"a","state":"recovery_required",
+            "live_pids":[],"replacement_allowed":false,
+        })]
+    );
+    let published_state = fixture.scalar::<String>(target_state);
+    let state: serde_json::Value = serde_json::from_str(&published_state).unwrap();
+    assert_eq!(state["check_status"], "recovery_required");
+    assert_eq!(state["launch_state"], "started");
+    assert_eq!(state["attempt_status"], "needs_recovery");
+    assert_eq!(state["task_attention"], "needs_recovery");
+    assert_eq!(state["claim_state"], "unknown");
+    assert_eq!(fixture.scalar::<String>(identity_state), identity_before);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 1);
+    let record_state = "SELECT json_object('id',id,'session_id',session_id,'attempt_id',attempt_id,
+           'state',state,'process_identity_json',process_identity_json,'detail',json(detail_json),
+           'created_at',created_at,'updated_at',updated_at,'resolved_at',resolved_at)
+         FROM recovery_records WHERE attempt_id='a' AND json_extract(detail_json,'$.check_id')='startup-check'";
+    let published_record = fixture.scalar::<String>(record_state);
+    let record: serde_json::Value = serde_json::from_str(&published_record).unwrap();
+    assert_eq!(record["session_id"], serde_json::Value::Null);
+    assert_eq!(record["attempt_id"], "a");
+    assert_eq!(record["state"], "attention_required");
+    assert_eq!(record["process_identity_json"], serde_json::Value::Null);
+    assert_eq!(record["resolved_at"], serde_json::Value::Null);
+    assert_eq!(
+        record["detail"],
+        serde_json::json!({
+            "check_id":"startup-check","observation":"recorded_processes_absent",
+            "live_pids":[],"replacement_allowed":false,
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(state["evidence"].as_str().unwrap()).unwrap(),
+        record["detail"]
+    );
+
+    assert!(recovery::reconcile_prior_boot(&fixture.store)
+        .unwrap()
+        .is_empty());
+    assert_eq!(fixture.scalar::<String>(target_state), published_state);
+    assert_eq!(fixture.scalar::<String>(identity_state), identity_before);
+    assert_eq!(fixture.scalar::<String>(record_state), published_record);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 1);
+}
+
+#[test]
 fn restart_makes_in_flight_guidance_uncertain_and_keeps_the_rest() {
     let fixture = Fixture::new("restart-guidance");
     seed_attempt(&fixture, "planning");

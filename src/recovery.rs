@@ -962,23 +962,25 @@ pub fn reconcile_prior_boot(store: &Store) -> Result<Vec<serde_json::Value>> {
             None => "identity_missing",
         };
         let now = Utc::now().to_rfc3339();
-        let attempt:String=connection.query_row("SELECT attempt_id FROM role_generations WHERE id=(SELECT role_generation_id FROM sessions WHERE id=?1)",params![id],|row|row.get(0))?;
-        connection.execute("UPDATE sessions SET status='recovery_required',launch_state=CASE WHEN launch_state='reserved' THEN 'delivery_unknown' ELSE launch_state END,readiness_state='unknown',updated_at=?1 WHERE id=?2",params![now,id])?;
-        connection.execute(
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt:String=transaction.query_row("SELECT attempt_id FROM role_generations WHERE id=(SELECT role_generation_id FROM sessions WHERE id=?1)",params![id],|row|row.get(0))?;
+        transaction.execute("UPDATE sessions SET status='recovery_required',launch_state=CASE WHEN launch_state='reserved' THEN 'delivery_unknown' ELSE launch_state END,readiness_state='unknown',updated_at=?1 WHERE id=?2",params![now,id])?;
+        transaction.execute(
             "UPDATE resume_invocations SET state='delivery_unknown',error='service restarted before process ownership was reconciled',updated_at=?1
              WHERE session_id=?2 AND transcript_epoch=(SELECT transcript_epoch FROM sessions WHERE id=?2) AND state IN ('reserved','spawning','running')",
             params![now, id],
         )?;
-        connection.execute(
+        transaction.execute(
             "UPDATE attempts SET status='needs_recovery',updated_at=?1 WHERE id=?2",
             params![now, attempt],
         )?;
-        connection.execute("UPDATE tasks SET attention='needs_recovery',updated_at=?1 WHERE id=(SELECT task_id FROM attempts WHERE id=?2)",params![now,attempt])?;
-        connection.execute(
+        transaction.execute("UPDATE tasks SET attention='needs_recovery',updated_at=?1 WHERE id=(SELECT task_id FROM attempts WHERE id=?2)",params![now,attempt])?;
+        transaction.execute(
             "UPDATE claims SET state='unknown',updated_at=?1 WHERE attempt_id=?2",
             params![now, attempt],
         )?;
-        connection.execute("INSERT INTO recovery_records(id,session_id,attempt_id,state,process_identity_json,detail_json,created_at,updated_at) SELECT ?1,?2,?3,'attention_required',?4,?5,?6,?6 WHERE NOT EXISTS(SELECT 1 FROM recovery_records WHERE session_id=?2 AND attempt_id=?3 AND state='attention_required' AND json_extract(detail_json,'$.kind') IS NULL AND json_extract(detail_json,'$.launch_state') IS NOT NULL AND json_extract(detail_json,'$.observation') IS NOT NULL AND json_extract(detail_json,'$.replacement_allowed')=0 AND json_extract(detail_json,'$.descendant_state')='unknown_until_explicit_reconciliation')",params![uuid::Uuid::new_v4().to_string(),id,attempt,identity,serde_json::json!({"observation":state,"launch_state":launch_state,"replacement_allowed":false,"descendant_state":"unknown_until_explicit_reconciliation"}).to_string(),now])?;
+        transaction.execute("INSERT INTO recovery_records(id,session_id,attempt_id,state,process_identity_json,detail_json,created_at,updated_at) SELECT ?1,?2,?3,'attention_required',?4,?5,?6,?6 WHERE NOT EXISTS(SELECT 1 FROM recovery_records WHERE session_id=?2 AND attempt_id=?3 AND state='attention_required' AND json_extract(detail_json,'$.kind') IS NULL AND json_extract(detail_json,'$.launch_state') IS NOT NULL AND json_extract(detail_json,'$.observation') IS NOT NULL AND json_extract(detail_json,'$.replacement_allowed')=0 AND json_extract(detail_json,'$.descendant_state')='unknown_until_explicit_reconciliation')",params![uuid::Uuid::new_v4().to_string(),id,attempt,identity,serde_json::json!({"observation":state,"launch_state":launch_state,"replacement_allowed":false,"descendant_state":"unknown_until_explicit_reconciliation"}).to_string(),now])?;
+        transaction.commit()?;
         results.push(serde_json::json!({"session_id":id,"attempt_id":attempt,"state":state,"replacement_allowed":false}));
     }
     let interrupted_admissions = {
@@ -1267,20 +1269,22 @@ pub fn reconcile_prior_boot(store: &Store) -> Result<Vec<serde_json::Value>> {
             "live_pids":live,
             "replacement_allowed":false
         });
-        connection.execute(
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             "UPDATE check_runs SET status='recovery_required',launch_state=CASE WHEN launch_state='reserved' THEN 'delivery_unknown' ELSE launch_state END,evidence_json=?1 WHERE id=?2 AND status IN ('launch_reserved','running')",
             params![detail.to_string(), check_id],
         )?;
-        connection.execute(
+        transaction.execute(
             "UPDATE attempts SET status='needs_recovery',updated_at=?1 WHERE id=?2",
             params![now, attempt],
         )?;
-        connection.execute("UPDATE tasks SET attention='needs_recovery',updated_at=?1 WHERE id=(SELECT task_id FROM attempts WHERE id=?2)",params![now,attempt])?;
-        connection.execute(
+        transaction.execute("UPDATE tasks SET attention='needs_recovery',updated_at=?1 WHERE id=(SELECT task_id FROM attempts WHERE id=?2)",params![now,attempt])?;
+        transaction.execute(
             "UPDATE claims SET state='unknown',updated_at=?1 WHERE attempt_id=?2",
             params![now, attempt],
         )?;
-        connection.execute("INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at) VALUES(?1,NULL,?2,'attention_required',?3,?4,?4)",params![uuid::Uuid::new_v4().to_string(),attempt,detail.to_string(),now])?;
+        transaction.execute("INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at) VALUES(?1,NULL,?2,'attention_required',?3,?4,?4)",params![uuid::Uuid::new_v4().to_string(),attempt,detail.to_string(),now])?;
+        transaction.commit()?;
         results.push(serde_json::json!({"check_id":check_id,"attempt_id":attempt,"state":"recovery_required","live_pids":live,"replacement_allowed":false}));
     }
     let freezes = {
