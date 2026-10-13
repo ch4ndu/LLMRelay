@@ -47,8 +47,8 @@
             "single_agent_capability_proof"
           ],
           "qualification": {
-            "state": "unqualified",
-            "reason": "The Claude Single agent writer is not qualified yet. It cannot run until a release includes reviewed native evidence for this exact mode."
+            "state": "qualified",
+            "evidence_reference": "docs/provider-qualification-20261011.md#claude-single-agent-writer"
           }
         }
       ]

@@ -47,16 +47,23 @@ const compatibilityActions: Record<CompatibilityExplanation["action"], string> =
 
 export function CompatibilityDetails({
   compatibility,
+  verification,
 }: {
   compatibility?: CompatibilityExplanation | null;
+  verification?: "current_profile" | "saved_record";
 }) {
   if (!compatibility) return null;
   const candidate = compatibility.status === "matched";
+  const verified = candidate && verification !== undefined;
   return (
     <div className="compatibility-details">
       <p>
-        <strong>{candidate ? "Agent version recognized" : "Agent verification needs attention"}</strong>
-        {" · "}{compatibility.status === "unknown_version"
+        <strong>{verified ? "Agent verification passed" : candidate ? "Agent version recognized" : "Agent verification needs attention"}</strong>
+        {" · "}{verified
+          ? verification === "current_profile"
+            ? "These exact agent settings passed verification."
+            : "This saved record passed verification. Current task settings are checked separately."
+          : compatibility.status === "unknown_version"
           ? `This agent version (${compatibility.observed_version || "unknown"}) is not supported by this LLMRelay release.`
           : compatibility.status === "contract_changed"
           ? "The agent connection settings have changed since the last verification."
@@ -70,7 +77,7 @@ export function CompatibilityDetails({
           ? "Version recognition alone does not mean this profile is ready to run. Check its verification status."
           : "LLMRelay's agent support information could not be validated."}
       </p>
-      <p className="hint">Next step: {compatibilityActions[compatibility.action]}</p>
+      {!verified && <p className="hint">Next step: {compatibilityActions[compatibility.action]}</p>}
       <details>
         <summary>Technical details</summary>
         <p>{compatibility.message}</p>
@@ -620,6 +627,7 @@ export function RoleSettings(
   const [config, setConfig] = useState<RoleConfig>();
   const [error, setError] = useState("");
   const [cmuxSocketPath, setCmuxSocketPath] = useState("");
+  const cmuxSocketInstruction = "Enter the live cmux socket path before preparing Claude verification.";
   const operationStorageKey = `llmrelay.role.operations.${task.id}`;
   const browserOperationIdentities = useRef(
     new Map<string, { body: string; id: string }>(
@@ -964,6 +972,10 @@ export function RoleSettings(
       item.task_id === task.id && item.role === role &&
       item.requested_revision === revision
     );
+    if (preparation?.config.provider === "claude" && !cmuxSocketPath.trim()) {
+      setError(cmuxSocketInstruction);
+      return;
+    }
     const projectScoped = preparation?.task_profile_source ===
       "project_default";
     try {
@@ -1395,7 +1407,10 @@ export function RoleSettings(
                   <TechnicalDetails>{productionRestriction.reason}</TechnicalDetails>
                 </div>
               )}
-              <CompatibilityDetails compatibility={compatibility} />
+              <CompatibilityDetails
+                compatibility={compatibility}
+                verification={currentProof ? "current_profile" : undefined}
+              />
               {requested && preparation?.task_profile_source && (
                 <small>
                   Settings from{" "}
@@ -1594,7 +1609,9 @@ export function RoleSettings(
           );
         })}
       </div>
-      {error && <ErrorNotice error={error} />}
+      {error && (error === cmuxSocketInstruction
+        ? <p className="error" role="alert">{error}</p>
+        : <ErrorNotice error={error} />)}
       <p className="hint">
         A change to a running role stays requested until the role reaches a
         safe checkpoint. Resume continues the same agent conversation with the

@@ -17718,7 +17718,7 @@ pub(crate) fn eligible_manager_service_stop(
                     WHERE started.session_id=stopped_turn.session_id
                       AND started.event_name='PreToolUse'
                       AND started.rowid BETWEEN stopped_turn.submit_rowid AND stopped_turn.stop_rowid)
-                 > (SELECT COUNT(*) FROM hook_events finished
+                 <> (SELECT COUNT(*) FROM hook_events finished
                     WHERE finished.session_id=stopped_turn.session_id
                       AND finished.event_name IN ('PostToolUse','PostToolUseFailure')
                       AND finished.rowid BETWEEN stopped_turn.submit_rowid AND stopped_turn.stop_rowid)

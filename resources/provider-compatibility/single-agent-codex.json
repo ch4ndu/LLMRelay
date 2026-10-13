@@ -2,7 +2,7 @@
   "schema": 1,
   "provider": "codex",
   "pack_id": "llmrelay-codex-policy-modes",
-  "pack_revision": "3",
+  "pack_revision": "4",
   "description": "Codex CLI 0.162.1 contracts for the Single agent writer and app-wide provider checks; separate from the six-role TRIP pack.",
   "selectors": [
     {
@@ -12,11 +12,11 @@
         {
           "mode": "provider_observation",
           "contract_id": "codex-provider-observation",
-          "contract_revision": "codex-provider-observation-v2",
+          "contract_revision": "codex-provider-observation-v3",
           "authority": "none",
           "session_contract": "fresh",
-          "launch_revision": "llmrelay-codex-observation-launch-v2",
-          "native_policy_revision": "codex-observation-empty-scope-v2",
+          "launch_revision": "llmrelay-codex-observation-launch-v3",
+          "native_policy_revision": "codex-observation-empty-scope-v3",
           "credential_revision": "llmrelay-no-role-credential-v1",
           "evidence_revision": "llmrelay-provider-observation-v1",
           "required_evidence": [
@@ -47,8 +47,8 @@
             "single_agent_capability_proof"
           ],
           "qualification": {
-            "state": "unqualified",
-            "reason": "The Codex Single agent writer is not qualified yet. It cannot run until a release includes reviewed native evidence for this exact mode."
+            "state": "qualified",
+            "evidence_reference": "docs/provider-qualification-20261011.md#codex-single-agent-writer"
           }
         }
       ]

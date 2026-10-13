@@ -1115,17 +1115,22 @@ mod tests {
     }
 
     #[test]
-    fn policy_modes_resolve_apart_from_trip_packs_and_start_unqualified() {
+    fn policy_modes_resolve_apart_from_trip_packs_and_qualify_only_writers() {
         let embedded = BundleSet::embedded();
         let trip = embedded
             .resolve(Provider::Codex, CODEX_EXACT_VERSION, RoleKind::Implementer)
             .unwrap();
         assert_eq!(trip.bundle_hash, digest(CODEX_BYTES.as_bytes()));
-        for (provider, version) in [
-            (Provider::Codex, CODEX_EXACT_VERSION),
+        for (provider, version, writer_evidence_reference) in [
+            (
+                Provider::Codex,
+                CODEX_EXACT_VERSION,
+                "docs/provider-qualification-20261011.md#codex-single-agent-writer",
+            ),
             (
                 Provider::Claude,
                 crate::providers::claude::EXACT_CLAUDE_VERSION,
+                "docs/provider-qualification-20261011.md#claude-single-agent-writer",
             ),
         ] {
             for mode in [
@@ -1134,12 +1139,22 @@ mod tests {
             ] {
                 let binding = embedded.resolve_policy(provider, version, mode).unwrap();
                 assert!(!binding.synthetic_origin);
-                assert!(
-                    binding
-                        .native_calls_disabled_reason()
-                        .is_some_and(|reason| reason.contains("not qualified")),
-                    "{provider} {mode:?}"
-                );
+                if mode == PolicyMode::SingleAgentWriter {
+                    assert!(binding.native_calls_disabled_reason().is_none());
+                    assert_eq!(
+                        binding.qualification,
+                        PolicyQualification::Qualified {
+                            evidence_reference: writer_evidence_reference.into(),
+                        }
+                    );
+                } else {
+                    assert!(
+                        binding
+                            .native_calls_disabled_reason()
+                            .is_some_and(|reason| reason.contains("not qualified")),
+                        "{provider} {mode:?}"
+                    );
+                }
             }
         }
         let observation = embedded

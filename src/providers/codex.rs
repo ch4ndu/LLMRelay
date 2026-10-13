@@ -26,8 +26,8 @@ pub(crate) const SOURCE_VERSION: &str = "0.162.1";
 pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-codex-launch-v3";
 pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-codex-resume-v3";
 pub const CREDENTIAL_CONTRACT_REVISION: &str = "llmrelay-local-credential-v1";
-pub const OBSERVATION_LAUNCH_REVISION: &str = "llmrelay-codex-observation-launch-v2";
-pub const OBSERVATION_POLICY_REVISION: &str = "codex-observation-empty-scope-v2";
+pub const OBSERVATION_LAUNCH_REVISION: &str = "llmrelay-codex-observation-launch-v3";
+pub const OBSERVATION_POLICY_REVISION: &str = "codex-observation-empty-scope-v3";
 pub const SINGLE_AGENT_LAUNCH_REVISION: &str = "llmrelay-codex-single-agent-launch-v3";
 pub const SINGLE_AGENT_POLICY_REVISION: &str = "codex-single-agent-writer-v3";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
@@ -59,15 +59,29 @@ const DISABLED_FEATURES: &[&str] = &[
     "use_xaa",
 ];
 
-/// Built-in tools the pinned version enables by default. A read-only sandbox
-/// still lets them read files, so the observation contract turns them off.
-const OBSERVATION_DISABLED_TOOLS: &[&str] = &["shell_tool", "unified_exec"];
+/// A read-only sandbox permits file reads. Observation separately requests
+/// these tool features off; native exclusion still needs qualification.
+const OBSERVATION_DISABLED_TOOLS: &[&str] = &[
+    "shell_tool",
+    "unified_exec",
+    "view_image",
+    "sleep_tool",
+    "tool_suggest",
+    "goals",
+    "workspace_dependencies",
+];
 
 #[derive(Debug)]
 struct NativeCompatibility {
     disabled_mcp_servers: BTreeSet<String>,
     identity: serde_json::Value,
     account: CodexAccount,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum NativeUserConfig {
+    Load,
+    Ignore,
 }
 
 /// Only these validated fields leave the bounded auth parser; token and JWT
@@ -131,7 +145,7 @@ pub(crate) fn prepare_with_bundles(
 ) -> Result<PreparedLaunch> {
     let (executable, version) = super::executable_and_version(Provider::Codex)?;
     let contract_binding = bundles.resolve(Provider::Codex, &version, role)?;
-    let compatibility = inspect_native_compatibility(cwd, &version)?;
+    let compatibility = inspect_native_compatibility(cwd, &version, NativeUserConfig::Load)?;
     let hook_command = shell_quote(&assets.runner.to_string_lossy());
     let (canonical_role_socket, canonical_control_socket) =
         canonical_socket_endpoints(role_socket)?;
@@ -396,7 +410,8 @@ pub(crate) fn single_agent_native(
             None,
         )
     } else {
-        let compatibility = inspect_native_compatibility(request.cwd, &version)?;
+        let compatibility =
+            inspect_native_compatibility(request.cwd, &version, NativeUserConfig::Load)?;
         (
             compatibility.disabled_mcp_servers,
             compatibility.identity,
@@ -781,7 +796,8 @@ pub fn require_current_native_policy(identity: &CapabilityIdentity, cwd: &Path) 
         return Ok(());
     }
     require_native_policy_identity(identity)?;
-    let current = inspect_native_compatibility(cwd, &identity.executable_version)?;
+    let current =
+        inspect_native_compatibility(cwd, &identity.executable_version, NativeUserConfig::Load)?;
     if identity.security_policy.get("local_mcp_coverage") != Some(&current.identity) {
         bail!("current Codex local configuration no longer matches the validated MCP and personal-account compatibility policy")
     }
@@ -880,7 +896,11 @@ fn config_key_count(arguments: &[String], expected_key: &str) -> usize {
         .count()
 }
 
-fn inspect_native_compatibility(cwd: &Path, version: &str) -> Result<NativeCompatibility> {
+fn inspect_native_compatibility(
+    cwd: &Path,
+    version: &str,
+    user_config: NativeUserConfig,
+) -> Result<NativeCompatibility> {
     if version != EXACT_CODEX_VERSION {
         bail!("Codex local compatibility requires exact {EXACT_CODEX_VERSION}")
     }
@@ -922,13 +942,26 @@ fn inspect_native_compatibility(cwd: &Path, version: &str) -> Result<NativeCompa
     }
 
     let mut unconditional = BTreeSet::new();
-    for (path, label) in [
-        (PathBuf::from("/etc/codex/config.toml"), "system"),
-        (codex_home.join("config.toml"), "user"),
+    let mut ignored_user_config = None;
+    for (path, label, loaded) in [
+        (PathBuf::from("/etc/codex/config.toml"), "system", true),
+        (
+            codex_home.join("config.toml"),
+            "user",
+            user_config == NativeUserConfig::Load,
+        ),
     ] {
         if let Some(value) = parse_config(&path, label)? {
             validate_local_config(&value, label)?;
-            unconditional.extend(mcp_names(&value, label)?);
+            let names = mcp_names(&value, label)?;
+            if loaded {
+                unconditional.extend(names);
+            } else {
+                ignored_user_config = Some(
+                    path.canonicalize()
+                        .context("resolve Codex user configuration")?,
+                );
+            }
         }
     }
     let canonical_cwd = cwd
@@ -938,13 +971,33 @@ fn inspect_native_compatibility(cwd: &Path, version: &str) -> Result<NativeCompa
     ancestors.reverse();
     for ancestor in ancestors {
         let path = ancestor.join(".codex").join("config.toml");
+        if let Some(ignored) = &ignored_user_config {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_CONFIG_BYTES => {
+                    if path
+                        .canonicalize()
+                        .context("resolve Codex project ancestor configuration")?
+                        == *ignored
+                    {
+                        continue;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => bail!("Codex project ancestor source is unreadable"),
+            }
+        }
         let Some(value) = parse_config(&path, "project ancestor")? else {
             continue;
         };
         validate_local_config(&value, "project ancestor")?;
         let names = mcp_names(&value, "project ancestor")?;
         if names.iter().any(|name| !unconditional.contains(name)) {
-            bail!("Codex project-layer MCP configuration introduces a conditional server name; v1 supports only names already present in unconditional system/user layers")
+            let layers = match user_config {
+                NativeUserConfig::Load => "system/user layers",
+                NativeUserConfig::Ignore => "system layer; user configuration is ignored",
+            };
+            bail!("Codex project-layer MCP configuration introduces a conditional server name; v1 supports only names already present in unconditional {layers}")
         }
     }
     let account = classify_file_auth(&codex_home.join("auth.json"))?;
@@ -953,7 +1006,10 @@ fn inspect_native_compatibility(cwd: &Path, version: &str) -> Result<NativeCompa
         "class": MCP_COVERAGE_CLASS,
         "codex_version": EXACT_CODEX_VERSION,
         "system_config": "enumerated_if_present",
-        "user_config": "enumerated_if_present",
+        "user_config": match user_config {
+            NativeUserConfig::Load => "enumerated_if_present",
+            NativeUserConfig::Ignore => "validated_if_present_ignored_by_native_cli",
+        },
         "ancestor_configs": "no_additional_mcp_names",
         "managed_sources": "absent",
         "profile_selector": "absent",
@@ -980,7 +1036,7 @@ pub fn inspect_observation_account(
     scope: &Path,
     version: &str,
 ) -> Result<super::ProviderAccountObservation> {
-    let compatibility = inspect_native_compatibility(scope, version)?;
+    let compatibility = inspect_native_compatibility(scope, version, NativeUserConfig::Ignore)?;
     Ok(super::ProviderAccountObservation {
         account_identity: compatibility
             .account
@@ -1002,7 +1058,8 @@ pub(crate) fn observation_arguments(
     scope: &Path,
     prompt: &str,
 ) -> Result<Vec<String>> {
-    let compatibility = inspect_native_compatibility(scope, EXACT_CODEX_VERSION)?;
+    let compatibility =
+        inspect_native_compatibility(scope, EXACT_CODEX_VERSION, NativeUserConfig::Ignore)?;
     let mut arguments = vec![
         "exec".to_owned(),
         "--strict-config".to_owned(),
@@ -1028,6 +1085,12 @@ pub(crate) fn observation_arguments(
         "features.multi_agent=false".to_owned(),
         "--config".to_owned(),
         "features.multi_agent_v2=false".to_owned(),
+        "--config".to_owned(),
+        "web_search=\"disabled\"".to_owned(),
+        "--config".to_owned(),
+        "project_doc_max_bytes=0".to_owned(),
+        "--config".to_owned(),
+        "features.skip_host_skill_discovery=true".to_owned(),
     ];
     for feature in DISABLED_FEATURES.iter().chain(OBSERVATION_DISABLED_TOOLS) {
         arguments.extend(["--disable".to_owned(), (*feature).to_owned()]);

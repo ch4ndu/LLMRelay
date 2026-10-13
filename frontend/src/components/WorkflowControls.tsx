@@ -98,7 +98,9 @@ export function useWorkflowCommands(
     () => new Set(),
   );
   const inFlight = useRef(false);
-  const update = (change: (identities: Map<string, StoredIdentity>) => void) => {
+  const update = (
+    change: (identities: Map<string, StoredIdentity>) => void,
+  ) => {
     const identities = readIdentities(storageKey);
     change(identities);
     localStorage.setItem(storageKey, JSON.stringify([...identities]));
@@ -188,10 +190,14 @@ export function UncertainRequestNotice(
  */
 export function generationSettled(session: Session | undefined): boolean {
   // An older snapshot without these fields is never treated as settled.
-  if (!session?.generation_status || session.has_newer_generation === undefined) {
+  if (
+    !session?.generation_status || session.has_newer_generation === undefined
+  ) {
     return false;
   }
-  if (session.has_newer_generation === true || session.has_newer_generation === 1) {
+  if (
+    session.has_newer_generation === true || session.has_newer_generation === 1
+  ) {
     return false;
   }
   const quiescent = session.process_group_quiescent === true ||
@@ -300,10 +306,12 @@ export function WorkflowControls(
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [routeNotice, setRouteNotice] = useState("");
-  const setupProblem = projectSetupProblem(
-    project,
-    decision?.primary_blocker?.code,
-  );
+  const setupProblem = isSingleAgentTask(task)
+    ? undefined
+    : projectSetupProblem(
+      project,
+      decision?.primary_blocker?.code,
+    );
   const operationStorageKey = `llmrelay.workflow.operations.${task.id}`;
   const commandIdentities = useRef(
     new Map<string, { body: string; id: string }>(
@@ -430,6 +438,10 @@ export function WorkflowControls(
     value.old_generation_id === effectiveManager?.effective_generation_id
   );
   const singleAgent = isSingleAgentTask(task);
+  const failedProbe = !!task.workflow?.run?.probe_admission_id &&
+    task.workflow?.run?.stage_reason.startsWith(
+        "The probe did not prove the profile:",
+      ) === true;
   const pendingManagerChange = !!requestedManager && !!effectiveManager &&
     requestedManager.revision !== effectiveManager.revision;
   // The service also accepts a stopping manager whose earlier switch needs
@@ -504,7 +516,9 @@ export function WorkflowControls(
   };
   const actionRole = (action: ContinuationAction) => {
     const role = actionValue(action, "role") ||
-      sessions.find((session) => session.id === actionValue(action, "session_id"))
+      sessions.find((session) =>
+        session.id === actionValue(action, "session_id")
+      )
         ?.role;
     return role ? roleLabel(role as Session["role"]) : undefined;
   };
@@ -526,9 +540,12 @@ export function WorkflowControls(
           <button
             disabled={!action.enabled || !attemptId ||
               (reviewKind !== "plan" && reviewKind !== "code") || !!busy}
-            onClick={() => void send("extend_review_budget", {
-              attempt_id: attemptId, review_kind: reviewKind, additional: 1,
-            })}
+            onClick={() =>
+              void send("extend_review_budget", {
+                attempt_id: attemptId,
+                review_kind: reviewKind,
+                additional: 1,
+              })}
           >
             Allow one more {reviewKind} review
           </button>
@@ -686,7 +703,9 @@ export function WorkflowControls(
               !onOpenRecoveryRecord}
             onClick={() => {
               if (attemptId && recoveryId && onOpenRecoveryRecord) {
-                setRouteNotice(onOpenRecoveryRecord(attemptId, recoveryId) ?? "");
+                setRouteNotice(
+                  onOpenRecoveryRecord(attemptId, recoveryId) ?? "",
+                );
               }
             }}
           >
@@ -709,14 +728,16 @@ export function WorkflowControls(
       </header>
       {task.lifecycle === "ready" && (
         <p className="hint">
-          Prepare task creates its workspace and pauses before starting an agent.
-          Then choose Continue to start this task. Other queued tasks stay paused
-          if project pickup is paused.
+          Prepare task creates its workspace and pauses before starting an
+          agent. Then choose Continue to start this task. Other queued tasks
+          stay paused if project pickup is paused.
         </p>
       )}
       {decision && decision.primary_blocker?.message && (
         <p className="hint decision-summary">
-          {setupProblem || decision.primary_blocker.message}{" "}
+          {failedProbe
+            ? "This profile probe did not establish admission evidence. Review the recovery steps in its run panel, then choose Cancel to keep its history."
+            : setupProblem || decision.primary_blocker.message}{" "}
           <span className="owner">
             Waiting on: {ownerLabel(decision.primary_blocker.owner)}.
           </span>
@@ -726,11 +747,11 @@ export function WorkflowControls(
         <TechnicalDetails>
           <p>
             {decision.reason_code} · {decision.disposition} · owner{" "}
-            {decision.ownership.owner} ·{" "}
-            {decision.next_action
+            {decision.ownership.owner} · {decision.next_action
               ? `next ${decision.next_action.operation}`
               : "no current action"}
           </p>
+          {failedProbe && <p>{decision.primary_blocker?.message}</p>}
           {setupProblem && (
             <p>
               {decision.primary_blocker?.message} · project readiness{" "}
@@ -841,8 +862,8 @@ export function WorkflowControls(
           </small>
           <TechnicalDetails>
             <p>
-              requested revision {requestedManager?.revision ?? "none"} ·
-              effective revision {effectiveManager?.revision ?? "none"}
+              requested revision {requestedManager?.revision ?? "none"}{" "}
+              · effective revision {effectiveManager?.revision ?? "none"}
               {managerSession ? ` · session ${managerSession.status}` : ""}
             </p>
           </TechnicalDetails>
@@ -894,36 +915,38 @@ export function WorkflowControls(
               </button>
             )}
             {managerControlsAllowed && managerChangeCanStart &&
-              pendingManagerChange && requestedManager && !managerReplaceable && (
-              <small className="hint">
-                The manager is still stopping. Changing it becomes available
-                once LLMRelay confirms the current manager has fully stopped.
-              </small>
-            )}
+              pendingManagerChange && requestedManager && !managerReplaceable &&
+              (
+                <small className="hint">
+                  The manager is still stopping. Changing it becomes available
+                  once LLMRelay confirms the current manager has fully stopped.
+                </small>
+              )}
             {managerControlsAllowed && managerChangeCanStart &&
-              pendingManagerChange && requestedManager && managerReplaceable && (
-              <>
-                <button
-                  disabled={!!busy}
-                  onClick={() =>
-                    control("change_manager_safe_boundary", {
-                      settings_revision: requestedManager.revision,
-                    })}
-                >
-                  Change manager at safe boundary
-                </button>
-                <button
-                  className="danger"
-                  disabled={!!busy}
-                  onClick={() =>
-                    control("change_manager_interrupt", {
-                      settings_revision: requestedManager.revision,
-                    })}
-                >
-                  Interrupt and change manager
-                </button>
-              </>
-            )}
+              pendingManagerChange && requestedManager && managerReplaceable &&
+              (
+                <>
+                  <button
+                    disabled={!!busy}
+                    onClick={() =>
+                      control("change_manager_safe_boundary", {
+                        settings_revision: requestedManager.revision,
+                      })}
+                  >
+                    Change manager at safe boundary
+                  </button>
+                  <button
+                    className="danger"
+                    disabled={!!busy}
+                    onClick={() =>
+                      control("change_manager_interrupt", {
+                        settings_revision: requestedManager.revision,
+                      })}
+                  >
+                    Interrupt and change manager
+                  </button>
+                </>
+              )}
           </div>
         </div>
       )}
@@ -945,7 +968,10 @@ export function WorkflowControls(
             >
               <div className="continuation-copy">
                 <strong>
-                  {actionTitles[action.kind] || "Next step"}
+                  {action.kind === "exact_resume" &&
+                      action.operation === "runtime_probe_resume"
+                    ? "Verification is ready to finish"
+                    : actionTitles[action.kind] || "Next step"}
                   {actionRole(action) ? ` · ${actionRole(action)}` : ""}
                 </strong>
                 <span>{action.reason}</span>

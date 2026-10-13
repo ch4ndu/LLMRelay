@@ -23,8 +23,8 @@ import {
   type CurrentInputSource,
   type CurrentInputUnavailableReason,
   type PermissionRequest,
-  roleLabel,
   type Role,
+  roleLabel,
   type Task,
   type TaskAction,
   type TaskContent,
@@ -49,7 +49,11 @@ import { ServiceCheckPermissionActions } from "./ApprovalInbox";
 import { MarkdownContent } from "./MarkdownContent";
 import { type AttemptTarget, guidanceState } from "./AttentionInbox";
 import { ActivityTimeline } from "./ActivityTimeline";
-import { ObservedUsageDetails, SessionTree, useSessionAccess } from "./SessionTree";
+import {
+  ObservedUsageDetails,
+  SessionTree,
+  useSessionAccess,
+} from "./SessionTree";
 import { StatusBadge, taskStatus, taskSteps } from "./TaskBoard";
 
 export type TaskTab = "overview" | "changes" | "checks" | "roles" | "activity";
@@ -117,7 +121,9 @@ function useDialogFocus(
     if (event.key !== "Tab" || !dialog.current) return;
     const focusable = [
       ...dialog.current.querySelectorAll<HTMLElement>(focusableSelector),
-    ].filter((element) => element.getClientRects().length > 0 || element === document.activeElement);
+    ].filter((element) =>
+      element.getClientRects().length > 0 || element === document.activeElement
+    );
     if (!focusable.length) return;
     const first = focusable[0];
     const last = focusable[focusable.length - 1];
@@ -141,7 +147,9 @@ function useTaskContent(task: Task, enabled: boolean) {
   const attemptId = task.active_attempt?.id;
   // Absent from older services, which then bind content by attempt alone.
   const revision = task.active_attempt?.content_revision ?? "";
-  const current = (value?: { attempt_id: string | null; content_revision: string }) =>
+  const current = (
+    value?: { attempt_id: string | null; content_revision: string },
+  ) =>
     !!value && value.attempt_id === attemptId &&
     (!revision || value.content_revision === revision);
   const [content, setContent] = useState<TaskContent>();
@@ -420,8 +428,9 @@ function CurrentInputReport(
       </article>
       <TechnicalDetails>
         <p>
-          Report {source.report.id} · generation {source.role_generation_id} ·
-          attempt {source.attempt_id}
+          Report {source.report.id} · generation {source.role_generation_id}
+          {" "}
+          · attempt {source.attempt_id}
         </p>
       </TechnicalDetails>
     </>
@@ -527,28 +536,28 @@ function PlanViewer(
                 {view.decision && !decisionEnded
                   ? (
                     <>
-                      <p><strong>Opened for:</strong> {view.decision.title}</p>
+                      <p>
+                        <strong>Opened for:</strong> {view.decision.title}
+                      </p>
                       <p className="hint">
-                        This is the complete plan that decision applies to.
-                        Your decision covers the whole plan.
+                        This is the complete plan that decision applies to. Your
+                        decision covers the whole plan.
                       </p>
                     </>
                   )
                   : decisionEnded
                   ? (
                     <p className="warning" role="status">
-                      The decision you opened this plan for is no longer
-                      waiting for you, so it is shown only as the task's
-                      current plan. Check Your decision for what the task
-                      needs now.
+                      The decision you opened this plan for is no longer waiting
+                      for you, so it is shown only as the task's current plan.
+                      Check Your decision for what the task needs now.
                     </p>
                   )
                   : (
                     <p className="hint">
                       This is the task's current plan, shown as context. It is
-                      not linked to any particular report or question; only
-                      an agent's own words say which plan or part of it they
-                      mean.
+                      not linked to any particular report or question; only an
+                      agent's own words say which plan or part of it they mean.
                     </p>
                   )}
                 <MarkdownContent className="plan-content" text={view.text} />
@@ -616,7 +625,9 @@ function ProgressFacts({ progress }: { progress: TaskProgress }) {
           <>
             <dt>Waiting since</dt>
             <dd>
-              <time dateTime={progress.waiting_since}>{when(progress.waiting_since)}</time>
+              <time dateTime={progress.waiting_since}>
+                {when(progress.waiting_since)}
+              </time>
             </dd>
           </>
         )}
@@ -735,7 +746,10 @@ export function TaskDetail(
     const requested = attempt?.id === planRequest.attempt_id &&
       attempt.phase === planRequest.phase &&
       (attempt.plan_hash ?? null) === planRequest.plan_hash;
-    const decision = currentPlanDecision(task, state.continuation_actions || []);
+    const decision = currentPlanDecision(
+      task,
+      state.continuation_actions || [],
+    );
     const view = requested
       ? currentPlanView(
         task,
@@ -806,6 +820,8 @@ export function TaskDetail(
     ),
   );
   const attempt = task.active_attempt;
+  const singleAgent = isSingleAgentTask(task);
+  const singleAgentRun = singleAgent ? task.workflow?.run ?? null : null;
   const project = state.projects.find((item) => item.id === task.project_id);
   const terminal = task.archived ||
     task.lifecycle === "done" || task.lifecycle === "cancelled";
@@ -830,14 +846,20 @@ export function TaskDetail(
     session.status === "running"
   );
   const status = taskStatus(task, { project, sessions: state.active_sessions });
+  const failedProbe = !!task.workflow?.run?.probe_admission_id &&
+    task.workflow?.run?.stage_reason.startsWith(
+        "The probe did not prove the profile:",
+      ) === true;
   // The reply form exists only for the host's Answer question item, and it
   // writes only to that item's exact session; a generic wait never opens it.
-  const question = terminal ? undefined : state.attention.find((item) =>
-    item.action?.kind === "answer_question" &&
-    item.target?.kind === "session" &&
-    item.target.task_id === task.id &&
-    item.target.attempt_id === attempt?.id
-  );
+  const question = terminal
+    ? undefined
+    : state.attention.find((item) =>
+      item.action?.kind === "answer_question" &&
+      item.target?.kind === "session" &&
+      item.target.task_id === task.id &&
+      item.target.attempt_id === attempt?.id
+    );
   const questionTarget = question?.target?.kind === "session"
     ? question.target
     : undefined;
@@ -848,11 +870,19 @@ export function TaskDetail(
       session.status === "running"
     );
   const waitingForInput = !terminal && task.attention === "needs_input";
-  const needsAnswer = !!question || waitingForInput;
-  const { content, error: contentError, reload: reloadContent } = useTaskContent(
-    task,
-    tab === "activity" || needsAnswer,
-  );
+  const resultDecision = !!singleAgentRun?.result?.candidate_hash &&
+    (singleAgentRun.stage === "awaiting_selected_checks" ||
+      singleAgentRun.stage === "awaiting_human" ||
+      singleAgentRun.available_actions.some((action) =>
+        ["authorize_check", "accept_result", "request_rework"].includes(action)
+      ));
+  const needsAnswer = !failedProbe &&
+    (!!question || (waitingForInput && !resultDecision));
+  const { content, error: contentError, reload: reloadContent } =
+    useTaskContent(
+      task,
+      tab === "activity" || needsAnswer,
+    );
   const currentInput = content?.current_input;
   const askedBy = currentInput?.state === "available"
     ? inputAuthor(currentInput)
@@ -865,8 +895,11 @@ export function TaskDetail(
       : body.kind === "archive"
       ? `archive:${task.id}:${task.version}`
       : [
-        "delete_draft_task", "add_dependency", "remove_dependency", "record_integration",
-      ].includes(String(body.kind))
+          "delete_draft_task",
+          "add_dependency",
+          "remove_dependency",
+          "record_integration",
+        ].includes(String(body.kind))
       ? `${String(body.kind)}:${task.id}:${task.version}:${
         String(body.depends_on_task_id || "")
       }`
@@ -948,6 +981,14 @@ export function TaskDetail(
   const selectedChecks = (state.trip_task_verification || []).filter((value) =>
     value.attempt_id === attempt?.id
   );
+  const checkApprovalPending = !singleAgent &&
+    selectedChecks.some((selection) =>
+      selection.authorization.action_state === "actionable" &&
+      !selection.authorization.authorized
+    );
+  const showInputReport = needsAnswer &&
+    (!checkApprovalPending || !!question ||
+      currentInput?.state === "available");
   const historicalSuites = state.check_suites.filter((value) =>
     value.project_id === task.project_id
   );
@@ -968,23 +1009,66 @@ export function TaskDetail(
   const waitingReason = waitingBlocker?.message;
   const retryOffered = !!workflowDecision?.control_policy.allowed_controls
     .includes("retry");
-  const singleAgent = isSingleAgentTask(task);
-  const singleAgentRun = singleAgent ? task.workflow?.run ?? null : null;
   const resumeOffered = !!singleAgentRun?.resume &&
     singleAgentRun.available_actions.includes("resume_run");
+  const selectedCheckCount = singleAgentRun?.selected_check_ids.length ??
+    task.workflow?.check_ids.length ?? 0;
+  let singleAgentVerification: string;
+  if (!singleAgentRun) {
+    const selection = task.lifecycle === "ready" ? "queued task" : "draft";
+    singleAgentVerification = selectedCheckCount
+      ? `${selectedCheckCount} ${
+        selectedCheckCount === 1 ? "check is" : "checks are"
+      } selected for this ${selection}. Not run yet; no run has started.`
+      : `No checks are selected for this ${selection}. No run has started.`;
+  } else if (!selectedCheckCount) {
+    singleAgentVerification = terminal
+      ? "No checks were selected for this run."
+      : "No checks are selected for this run. Your review of the result is the only verification.";
+  } else {
+    const passed = singleAgentRun.checks.filter((check) =>
+      check.latest_run_passed === true
+    ).length;
+    const recorded = singleAgentRun.checks.filter((check) =>
+      check.latest_run_passed !== null
+    ).length;
+    singleAgentVerification =
+      `${passed} of ${selectedCheckCount} selected checks passed on the captured result.`;
+    if (terminal) {
+      if (recorded < selectedCheckCount) {
+        singleAgentVerification +=
+          " Some recorded check outcomes are unavailable.";
+      }
+      singleAgentVerification += task.lifecycle === "cancelled"
+        ? " This run was cancelled; no further checks will run."
+        : singleAgentRun.result?.state === "accepted"
+        ? " This result was accepted."
+        : task.archived
+        ? " This task is archived."
+        : " This run is complete.";
+    } else {
+      singleAgentVerification +=
+        " Every selected check must pass before you can accept it.";
+    }
+  }
   // A failed step with a retry prerequisite is the service's own finding that
   // an instruction file still differs, so its review path is offered too.
   const guidanceConflict = !singleAgent && (
     task.progress?.reason_code === "workflow.attempt_readiness_stale" ||
-    state.recovery.some((record) => record.attempt_id === attempt?.id &&
+    state.recovery.some((record) =>
+      record.attempt_id === attempt?.id &&
       record.state === "attention_required" && (
         typeof record.retry_prerequisite === "string" ||
         (typeof record.detail === "object" && record.detail !== null &&
           "cause" in record.detail && typeof record.detail.cause === "string" &&
-          record.detail.cause.includes("worktree policy file changed after verified materialization:"))
-      )));
+          record.detail.cause.includes(
+            "worktree policy file changed after verified materialization:",
+          ))
+      )
+    )
+  );
   // Follows whichever explanation the panel would otherwise show.
-  const setupProblem = !terminal
+  const setupProblem = !terminal && !singleAgent
     ? projectSetupProblem(
       project,
       task.progress ? task.progress.reason_code : waitingBlocker?.code,
@@ -1000,7 +1084,9 @@ export function TaskDetail(
   const transitionProposals = state.controls.filter((value) =>
     value.attempt_id === attempt?.id && value.kind === "transition_proposal"
   );
-  const managerGeneration = task.role_settings.filter((value) => value.role === "manager")
+  const managerGeneration = task.role_settings.filter((value) =>
+    value.role === "manager"
+  )
     .sort((left, right) => right.revision - left.revision)
     .find((value) => value.effective_generation_id)?.effective_generation_id;
   const proposals = transitionProposals.filter((value) =>
@@ -1012,12 +1098,15 @@ export function TaskDetail(
     (value.payload.plan_hash ?? null) === (attempt?.plan_hash ?? null) &&
     (value.payload.candidate_hash ?? null) === (attempt?.candidate_hash ?? null)
   );
-  const historicalProposals = transitionProposals.filter((value) => !proposals.includes(value));
-  const passedChecks = selectedChecks.filter((selection) =>
-    selection.latest_run?.freshness_state === "current" &&
-    selection.latest_run.status === "finished" &&
-    selection.latest_run.exit_code === 0
-  ).length;
+  const historicalProposals = transitionProposals.filter((value) =>
+    !proposals.includes(value)
+  );
+  const passedChecks =
+    selectedChecks.filter((selection) =>
+      selection.latest_run?.freshness_state === "current" &&
+      selection.latest_run.status === "finished" &&
+      selection.latest_run.exit_code === 0
+    ).length;
   const guidance = state.guidance.filter((item) =>
     item.attempt_id === attempt?.id
   );
@@ -1049,7 +1138,12 @@ export function TaskDetail(
           <h3 id="task-summary-title">Summary</h3>
           <ObservedUsageDetails usage={task.observed_usage} label="Task" />
           {task.description.trim()
-            ? <MarkdownContent className="task-description" text={task.description} />
+            ? (
+              <MarkdownContent
+                className="task-description"
+                text={task.description}
+              />
+            )
             : <p className="empty">No description.</p>}
           {task.acceptance_criteria.length > 0 && (
             <>
@@ -1092,15 +1186,21 @@ export function TaskDetail(
       </div>
       <div className="task-overview-side">
         {(task.progress || waitingReason) && (
-          <section className="panel next-step" aria-labelledby="task-waiting-title">
+          <section
+            className="panel next-step"
+            aria-labelledby="task-waiting-title"
+          >
             <h3 id="task-waiting-title">Why it is waiting</h3>
             {/* A Single agent stage reason is already the header's status. */}
-            {!(singleAgent &&
-              (task.progress?.waiting_reason || waitingReason) === status.detail) && (
-              <p>
-                {setupProblem || task.progress?.waiting_reason || waitingReason}
-              </p>
-            )}
+            {!failedProbe && !(singleAgent &&
+              (task.progress?.waiting_reason || waitingReason) ===
+                status.detail) &&
+              (
+                <p>
+                  {setupProblem || task.progress?.waiting_reason ||
+                    waitingReason}
+                </p>
+              )}
             {setupProblem && (
               <>
                 <button
@@ -1111,8 +1211,9 @@ export function TaskDetail(
                 </button>
                 <TechnicalDetails>
                   <p>
-                    {task.progress?.waiting_reason || waitingReason} · project
-                    readiness {project?.trip?.readiness ?? "not reported"}
+                    {task.progress?.waiting_reason || waitingReason}{" "}
+                    · project readiness{" "}
+                    {project?.trip?.readiness ?? "not reported"}
                   </p>
                 </TechnicalDetails>
               </>
@@ -1120,7 +1221,7 @@ export function TaskDetail(
             {task.progress && <ProgressFacts progress={task.progress} />}
           </section>
         )}
-        {needsAnswer && (
+        {showInputReport && (
           <section
             className="panel next-step"
             aria-labelledby="task-question-title"
@@ -1191,8 +1292,8 @@ export function TaskDetail(
               ? (
                 <p className="hint">
                   The manager that receives replies is no longer running, so a
-                  reply cannot be sent now. Refresh to see the current state,
-                  or use an available action in Controls below once you have
+                  reply cannot be sent now. Refresh to see the current state, or
+                  use an available action in Controls below once you have
                   resolved what was asked.
                 </p>
               )
@@ -1208,9 +1309,9 @@ export function TaskDetail(
               )
               : (
                 <p className="hint">
-                  This wait is not a question the manager can take a reply
-                  to. Resolve what is described above, then use an available
-                  action in Controls below.
+                  This wait is not a question the manager can take a reply to.
+                  Resolve what is described above, then use an available action
+                  in Controls below.
                 </p>
               )}
             {guidance.length > 0 && (
@@ -1273,19 +1374,19 @@ export function TaskDetail(
           onChanged={onChanged}
         />
         {guidanceConflict &&
-          <GuidanceRecovery key={attempt?.id} task={task} onChanged={onChanged} />}
+          (
+            <GuidanceRecovery
+              key={attempt?.id}
+              task={task}
+              onChanged={onChanged}
+            />
+          )}
         {singleAgent
           ? (
             <section className="panel verification-summary">
               <h3>Verification</h3>
               <p>
-                {!singleAgentRun || !singleAgentRun.selected_check_ids.length
-                  ? "No checks are selected for this run. Your review of the result is the only verification."
-                  : `${
-                    singleAgentRun.checks.filter((check) =>
-                      check.latest_run_passed === true
-                    ).length
-                  } of ${singleAgentRun.selected_check_ids.length} selected checks passed on the captured result. Every selected check must pass before you can accept it.`}
+                {singleAgentVerification}
               </p>
             </section>
           )
@@ -1299,7 +1400,10 @@ export function TaskDetail(
                   ? "No verification checks are selected yet."
                   : "Checks are selected when the plan is written."}
               </p>
-              <button className="link-button" onClick={() => chooseTab("checks")}>
+              <button
+                className="link-button"
+                onClick={() => chooseTab("checks")}
+              >
                 Open Checks
               </button>
             </section>
@@ -1336,7 +1440,8 @@ export function TaskDetail(
                       aria-label={`Integration ref for ${String(item.task_id)}`}
                       value={integrationRef}
                       disabled={queueBusy}
-                      onChange={(event) => setIntegrationRef(event.target.value)}
+                      onChange={(event) =>
+                        setIntegrationRef(event.target.value)}
                       placeholder="Exact integrated git ref"
                     />
                   </label>
@@ -1358,13 +1463,16 @@ export function TaskDetail(
               {dependenciesEditable && (
                 <button
                   disabled={queueBusy}
-                  aria-label={`Remove dependency on ${other?.title || String(item.task_id)}`}
-                  onClick={() => queueMutation({
-                    kind: "remove_dependency",
-                    task_id: task.id,
-                    depends_on_task_id: item.task_id,
-                    expected_version: task.version,
-                  })}
+                  aria-label={`Remove dependency on ${
+                    other?.title || String(item.task_id)
+                  }`}
+                  onClick={() =>
+                    queueMutation({
+                      kind: "remove_dependency",
+                      task_id: task.id,
+                      depends_on_task_id: item.task_id,
+                      expected_version: task.version,
+                    })}
                 >
                   Remove dependency
                 </button>
@@ -1393,7 +1501,8 @@ export function TaskDetail(
               >
                 <option value="">Choose a task in this project</option>
                 {state.tasks.filter((value) =>
-                  value.id !== task.id && value.project_id === task.project_id &&
+                  value.id !== task.id &&
+                  value.project_id === task.project_id &&
                   !value.archived && value.lifecycle !== "cancelled" &&
                   !task.dependencies.some((item) => item.task_id === value.id)
                 ).map((value) => (
@@ -1429,263 +1538,271 @@ export function TaskDetail(
       </div>
     )
     : (
-    <div className="task-tab-stack">
-      <section className="panel">
-        <h3>Verification checks</h3>
-        <p className="hint">
-          The manager selects which of the project's checks apply. Each check
-          runs only after you approve it, and only on the exact result it was
-          approved for.
-        </p>
-        {selectedChecks.map((selection) => {
-          const check = tripChecks.find((item) =>
-            item.id === selection.check_id
-          );
-          const authorized = selection.authorization.authorized;
-          const actionable =
-            selection.authorization.action_state !== "inactive";
-          const run = selection.latest_run;
-          const runLabel = !run
-            ? "Not run yet"
-            : run.freshness_state !== "current"
-            ? "Result is out of date"
-            : run.status === "finished"
-            ? run.exit_code === 0 ? "Passed" : "Failed"
-            : run.status.replaceAll("_", " ");
-          return (
-            <div
-              className="verification-row"
-              key={`${selection.check_id}:${selection.selected_revision}`}
-            >
-              <div>
-                <strong>{check?.original_text || check?.check_key || "Selected check"}</strong>
-                <small>
-                  {check?.category === "focused"
-                    ? "Focused check"
-                    : check?.category === "broad"
-                    ? "Full check"
-                    : check?.category || "Check"}
-                  {selection.required ? " · required" : ""}
-                </small>
-              </div>
-              <span
-                className={`badge ${
-                  runLabel === "Passed"
-                    ? "supported"
-                    : runLabel === "Failed"
-                    ? "danger"
-                    : "waiting"
-                }`}
+      <div className="task-tab-stack">
+        <section className="panel">
+          <h3>Verification checks</h3>
+          <p className="hint">
+            The manager selects which of the project's checks apply. Each check
+            runs only after you approve it, and only on the exact result it was
+            approved for.
+          </p>
+          {selectedChecks.map((selection) => {
+            const check = tripChecks.find((item) =>
+              item.id === selection.check_id
+            );
+            const authorized = selection.authorization.authorized;
+            const actionable =
+              selection.authorization.action_state !== "inactive";
+            const run = selection.latest_run;
+            const runLabel = !run
+              ? "Not run yet"
+              : run.freshness_state !== "current"
+              ? "Result is out of date"
+              : run.status === "finished"
+              ? run.exit_code === 0 ? "Passed" : "Failed"
+              : run.status.replaceAll("_", " ");
+            return (
+              <div
+                className="verification-row"
+                key={`${selection.check_id}:${selection.selected_revision}`}
               >
-                {runLabel}
-              </span>
-              <TechnicalDetails>
-                <p>
-                  {check?.check_key} · selection revision{" "}
-                  {selection.selected_revision} · relevant inputs{" "}
-                  {check?.relevant_inputs.join(", ") || "none declared"} ·
-                  coverage {run?.acceptance_coverage.length || 0}/
-                  {check?.acceptance_rows.length || 0} acceptance rows
-                  {run ? ` · ${run.status} · ${run.freshness_state}` : ""}
-                </p>
-                {run && Boolean(run.evidence) && (
-                  <pre>{JSON.stringify(run.evidence, null, 2)}</pre>
-                )}
-              </TechnicalDetails>
-              {!terminal && (
-                <>
-                  <ServiceCheckPermissionActions
-                    selection={selection}
-                    onDecision={(decision, lifetime) =>
-                      apply({
-                        kind: "trip",
-                        action: "authorize_check",
-                        attempt_id: selection.attempt_id,
-                        check_id: selection.check_id,
-                        selected_revision: selection.selected_revision,
-                        exact_command_hash: selection.exact_command_hash,
-                        scope_hash: selection.scope_hash,
-                        decision,
-                        lifetime,
-                      })}
-                    onRevoke={(rule_id, expected_revision) =>
-                      apply({
-                        kind: "trip",
-                        action: "revoke_check_permission_rule",
-                        rule_id,
-                        expected_revision,
-                      })}
-                  />
-                  <div className="button-row">
-                    <button
-                      disabled={!attempt ||
-                        selection.attempt_id !== attempt.id ||
-                        !authorized || !actionable}
-                      onClick={() => {
-                        const body = {
-                          kind: "check_run",
-                          attempt_id: attempt?.id,
+                <div>
+                  <strong>
+                    {check?.original_text || check?.check_key ||
+                      "Selected check"}
+                  </strong>
+                  <small>
+                    {check?.category === "focused"
+                      ? "Focused check"
+                      : check?.category === "broad"
+                      ? "Full check"
+                      : check?.category || "Check"}
+                    {selection.required ? " · required" : ""}
+                  </small>
+                </div>
+                <span
+                  className={`badge ${
+                    runLabel === "Passed"
+                      ? "supported"
+                      : runLabel === "Failed"
+                      ? "danger"
+                      : "waiting"
+                  }`}
+                >
+                  {runLabel}
+                </span>
+                <TechnicalDetails>
+                  <p>
+                    {check?.check_key} · selection revision{" "}
+                    {selection.selected_revision} · relevant inputs{" "}
+                    {check?.relevant_inputs.join(", ") || "none declared"}{" "}
+                    · coverage {run?.acceptance_coverage.length || 0}/
+                    {check?.acceptance_rows.length || 0} acceptance rows
+                    {run ? ` · ${run.status} · ${run.freshness_state}` : ""}
+                  </p>
+                  {run && Boolean(run.evidence) && (
+                    <pre>{JSON.stringify(run.evidence, null, 2)}</pre>
+                  )}
+                </TechnicalDetails>
+                {!terminal && (
+                  <>
+                    <ServiceCheckPermissionActions
+                      selection={selection}
+                      onDecision={(decision, lifetime) =>
+                        apply({
+                          kind: "trip",
+                          action: "authorize_check",
+                          attempt_id: selection.attempt_id,
                           check_id: selection.check_id,
-                        };
-                        const key =
-                          `check_run:${body.attempt_id}:${body.check_id}`;
-                        const stable = reuseOperationIdentity(
-                          commandIdentities.current.get(key),
-                          body,
-                        );
-                        const { id, request } = stable;
-                        commandIdentities.current.set(key, {
-                          body: JSON.stringify(request),
-                          id,
-                        });
-                        localStorage.setItem(
-                          operationStorageKey,
-                          JSON.stringify([...commandIdentities.current]),
-                        );
-                        void operation(
-                          { ...request, operation_id: id } as never,
-                        ).then(() => {
-                          commandIdentities.current.delete(key);
+                          selected_revision: selection.selected_revision,
+                          exact_command_hash: selection.exact_command_hash,
+                          scope_hash: selection.scope_hash,
+                          decision,
+                          lifetime,
+                        })}
+                      onRevoke={(rule_id, expected_revision) =>
+                        apply({
+                          kind: "trip",
+                          action: "revoke_check_permission_rule",
+                          rule_id,
+                          expected_revision,
+                        })}
+                    />
+                    <div className="button-row">
+                      <button
+                        disabled={!attempt ||
+                          selection.attempt_id !== attempt.id ||
+                          !authorized || !actionable}
+                        onClick={() => {
+                          const body = {
+                            kind: "check_run",
+                            attempt_id: attempt?.id,
+                            check_id: selection.check_id,
+                          };
+                          const key =
+                            `check_run:${body.attempt_id}:${body.check_id}`;
+                          const stable = reuseOperationIdentity(
+                            commandIdentities.current.get(key),
+                            body,
+                          );
+                          const { id, request } = stable;
+                          commandIdentities.current.set(key, {
+                            body: JSON.stringify(request),
+                            id,
+                          });
                           localStorage.setItem(
                             operationStorageKey,
                             JSON.stringify([...commandIdentities.current]),
                           );
-                          onChanged();
-                        }).catch((cause) => {
-                          if (
-                            !(cause instanceof ApiError && cause.ambiguous)
-                          ) {
+                          void operation(
+                            { ...request, operation_id: id } as never,
+                          ).then(() => {
                             commandIdentities.current.delete(key);
                             localStorage.setItem(
                               operationStorageKey,
                               JSON.stringify([...commandIdentities.current]),
                             );
-                          }
-                          setError(
-                            cause instanceof ApiError && cause.ambiguous
-                              ? `${cause.message} Refresh and reconcile before retrying.`
-                              : cause instanceof Error
-                              ? cause.message
-                              : String(cause),
-                          );
-                          onChanged();
-                        });
-                      }}
-                    >
-                      {selection.authorization.action_state ===
-                          "current_receipt"
-                        ? "Run the approved check again"
-                        : "Run the approved check"}
-                    </button>
-                  </div>
-                </>
-              )}
-            </div>
-          );
-        })}
-        {!selectedChecks.length && (
-          <p className="empty">
-            No verification checks are selected. The task cannot be verified
-            as complete until the checks that apply have passed.
-          </p>
+                            onChanged();
+                          }).catch((cause) => {
+                            if (
+                              !(cause instanceof ApiError && cause.ambiguous)
+                            ) {
+                              commandIdentities.current.delete(key);
+                              localStorage.setItem(
+                                operationStorageKey,
+                                JSON.stringify([...commandIdentities.current]),
+                              );
+                            }
+                            setError(
+                              cause instanceof ApiError && cause.ambiguous
+                                ? `${cause.message} Refresh and reconcile before retrying.`
+                                : cause instanceof Error
+                                ? cause.message
+                                : String(cause),
+                            );
+                            onChanged();
+                          });
+                        }}
+                      >
+                        {selection.authorization.action_state ===
+                            "current_receipt"
+                          ? "Run the approved check again"
+                          : "Run the approved check"}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })}
+          {!selectedChecks.length && (
+            <p className="empty">
+              No verification checks are selected. The task cannot be verified
+              as complete until the checks that apply have passed.
+            </p>
+          )}
+        </section>
+        {checks.length > 0 && (
+          <section className="panel">
+            <h3>Check runs</h3>
+            {checks.map((check) => (
+              <article className="review-row" key={String(check.id)}>
+                <strong>
+                  {tripChecks.find((item) =>
+                    item.id === check.check_id
+                  )
+                    ?.original_text ||
+                    String(check.suite_name || check.executable)}
+                </strong>
+                <span>
+                  {check.status === "finished"
+                    ? check.exit_code === 0
+                      ? "Passed"
+                      : `Failed (exit ${String(check.exit_code)})`
+                    : String(check.status).replaceAll("_", " ")}
+                </span>
+                {Boolean(check.evidence) && (
+                  <TechnicalDetails>
+                    <pre>{JSON.stringify(check.evidence, null, 2)}</pre>
+                  </TechnicalDetails>
+                )}
+              </article>
+            ))}
+          </section>
         )}
-      </section>
-      {checks.length > 0 && (
+        {historicalSuites.length > 0 && (
+          <details className="panel">
+            <summary>Older check results</summary>
+            {historicalSuites.map((suite) => {
+              const runs = checks.filter((check) =>
+                check.suite_name === suite.name || check.suite_id === suite.id
+              );
+              return (
+                <article className="review-row" key={String(suite.id)}>
+                  <strong>{String(suite.name)}</strong>
+                  {runs.length
+                    ? runs.map((run) => (
+                      <div key={String(run.id)}>
+                        <span>{String(run.status)}</span>
+                        {Boolean(run.evidence) && (
+                          <pre>{JSON.stringify(run.evidence, null, 2)}</pre>
+                        )}
+                      </div>
+                    ))
+                    : <span>No recorded result</span>}
+                </article>
+              );
+            })}
+          </details>
+        )}
         <section className="panel">
-          <h3>Check runs</h3>
-          {checks.map((check) => (
-            <article className="review-row" key={String(check.id)}>
+          <h3>TRIP reviews</h3>
+          {task.review_budgets.filter((budget) =>
+            budget.attempt_id === attempt?.id
+          ).map((budget) => (
+            <article className="review-row" key={budget.id}>
               <strong>
-                {tripChecks.find((item) => item.id === check.check_id)
-                  ?.original_text || String(check.suite_name || check.executable)}
+                {budget.kind === "plan"
+                  ? "Plan reviews"
+                  : budget.kind === "code"
+                  ? "Code reviews"
+                  : "Final verifications"}
               </strong>
               <span>
-                {check.status === "finished"
-                  ? check.exit_code === 0 ? "Passed" : `Failed (exit ${String(check.exit_code)})`
-                  : String(check.status).replaceAll("_", " ")}
+                {budget.spent} used · {budget.remaining} left
               </span>
-              {Boolean(check.evidence) && (
-                <TechnicalDetails>
-                  <pre>{JSON.stringify(check.evidence, null, 2)}</pre>
-                </TechnicalDetails>
+              {!terminal && budget.remaining === 0 && (
+                <small className="hint">
+                  No reviews of this kind are left. The dashboard cannot add
+                  more.
+                </small>
               )}
             </article>
           ))}
+          {task.reviews.map((review) => (
+            <article className="review-row" key={review.id}>
+              <strong>
+                {review.kind === "plan"
+                  ? "Plan review"
+                  : review.kind === "code"
+                  ? "Code review"
+                  : "Final verification"}
+              </strong>
+              <span>
+                {review.verdict
+                  ? outcomeLabel(review.verdict)
+                  : review.delivery_state === "delivered"
+                  ? "In progress"
+                  : review.delivery_state.replaceAll("_", " ")}
+              </span>
+              {review.feedback && <MarkdownContent text={review.feedback} />}
+            </article>
+          ))}
+          {!task.reviews.length && (
+            <p className="empty">No reviews have been requested yet.</p>
+          )}
         </section>
-      )}
-      {historicalSuites.length > 0 && (
-        <details className="panel">
-          <summary>Older check results</summary>
-          {historicalSuites.map((suite) => {
-            const runs = checks.filter((check) =>
-              check.suite_name === suite.name || check.suite_id === suite.id
-            );
-            return (
-              <article className="review-row" key={String(suite.id)}>
-                <strong>{String(suite.name)}</strong>
-                {runs.length
-                  ? runs.map((run) => (
-                    <div key={String(run.id)}>
-                      <span>{String(run.status)}</span>
-                      {Boolean(run.evidence) && (
-                        <pre>{JSON.stringify(run.evidence, null, 2)}</pre>
-                      )}
-                    </div>
-                  ))
-                  : <span>No recorded result</span>}
-              </article>
-            );
-          })}
-        </details>
-      )}
-      <section className="panel">
-        <h3>TRIP reviews</h3>
-        {task.review_budgets.filter((budget) =>
-          budget.attempt_id === attempt?.id
-        ).map((budget) => (
-          <article className="review-row" key={budget.id}>
-            <strong>
-              {budget.kind === "plan"
-                ? "Plan reviews"
-                : budget.kind === "code"
-                ? "Code reviews"
-                : "Final verifications"}
-            </strong>
-            <span>
-              {budget.spent} used · {budget.remaining} left
-            </span>
-            {!terminal && budget.remaining === 0 && (
-              <small className="hint">
-                No reviews of this kind are left. The dashboard cannot add
-                more.
-              </small>
-            )}
-          </article>
-        ))}
-        {task.reviews.map((review) => (
-          <article className="review-row" key={review.id}>
-            <strong>
-              {review.kind === "plan"
-                ? "Plan review"
-                : review.kind === "code"
-                ? "Code review"
-                : "Final verification"}
-            </strong>
-            <span>
-              {review.verdict
-                ? outcomeLabel(review.verdict)
-                : review.delivery_state === "delivered"
-                ? "In progress"
-                : review.delivery_state.replaceAll("_", " ")}
-            </span>
-            {review.feedback && <MarkdownContent text={review.feedback} />}
-          </article>
-        ))}
-        {!task.reviews.length && (
-          <p className="empty">No reviews have been requested yet.</p>
-        )}
-      </section>
-    </div>
+      </div>
     );
 
   const activity = (
@@ -1705,7 +1822,11 @@ export function TaskDetail(
       </section>
       <section className="panel">
         <h3>Reports</h3>
-        <ReportList content={content} error={contentError} started={!!attempt} />
+        <ReportList
+          content={content}
+          error={contentError}
+          started={!!attempt}
+        />
       </section>
       {historicalProposals.length > 0 && (
         <details className="panel">
@@ -1713,7 +1834,10 @@ export function TaskDetail(
           <p>These proposals no longer apply to the current task state.</p>
           {historicalProposals.map((proposal) => (
             <article className="review-row" key={proposal.id}>
-              <strong>{String(proposal.payload.source_phase)} → {String(proposal.payload.phase)}</strong>
+              <strong>
+                {String(proposal.payload.source_phase)} →{" "}
+                {String(proposal.payload.phase)}
+              </strong>
               <TechnicalDetails>
                 <pre>{JSON.stringify(proposal.payload, null, 2)}</pre>
               </TechnicalDetails>
@@ -1746,14 +1870,15 @@ export function TaskDetail(
             </p>
           )}
           <p className="hint">
-            If the recipe's settings are out of date, save a current profile
-            set and recipe, archive this draft, then create a fresh draft.
-            Restore keeps the original settings.
+            If the recipe's settings are out of date, save a current profile set
+            and recipe, archive this draft, then create a fresh draft. Restore
+            keeps the original settings.
           </p>
           <TechnicalDetails>
             <p>
               Exact recipe revision {task.recipe_provenance.recipe_revision_id}
-              {" "}· profile revision {task.recipe_provenance.profile_revision_id}
+              {" "}
+              · profile revision {task.recipe_provenance.profile_revision_id}
               {task.recipe_provenance.schedule_id
                 ? ` · schedule ${task.recipe_provenance.schedule_id} at ${task.recipe_provenance.scheduled_for_utc}`
                 : ""}
@@ -1815,7 +1940,9 @@ export function TaskDetail(
         lanes={tripLanes}
         productionRestrictions={state.production_role_restrictions}
         capabilities={state.capabilities}
-        runtimeAdmissions={(state.trip_setups || []).filter((setup) => setup.project_id === task.project_id)
+        runtimeAdmissions={(state.trip_setups || []).filter((setup) =>
+          setup.project_id === task.project_id
+        )
           .flatMap((setup) => setup.runtime_admissions)}
         actions={continuationActions}
         execution={state.workflow_execution?.find((item) =>
@@ -1825,65 +1952,65 @@ export function TaskDetail(
         onChanged={onChanged}
       />
       {!singleAgent && (
-      <details className="panel">
-        <summary>Explorer and implementation lanes</summary>
-        {tripExplorer.filter((item) => item.attempt_id === attempt?.id).map((
-          decision,
-        ) => (
-          <article className="review-row" key={decision.id}>
-            <strong>
-              Explorer ·{" "}
-              {decision.stage === "planning"
-                ? "planning"
-                : decision.stage === "rescue"
-                ? "extra call"
-                : "final check"}
-            </strong>
-            <span>
-              {decision.activated
-                ? decision.outcome ? "Findings recorded" : "Findings pending"
-                : "Not used"}
-            </span>
-            <small>
-              Explorer findings inform the manager; they never approve a plan,
-              change, review or result.
-            </small>
-            <TechnicalDetails>
-              <pre>
+        <details className="panel">
+          <summary>Explorer and implementation lanes</summary>
+          {tripExplorer.filter((item) => item.attempt_id === attempt?.id).map((
+            decision,
+          ) => (
+            <article className="review-row" key={decision.id}>
+              <strong>
+                Explorer · {decision.stage === "planning"
+                  ? "planning"
+                  : decision.stage === "rescue"
+                  ? "extra call"
+                  : "final check"}
+              </strong>
+              <span>
+                {decision.activated
+                  ? decision.outcome ? "Findings recorded" : "Findings pending"
+                  : "Not used"}
+              </span>
+              <small>
+                Explorer findings inform the manager; they never approve a plan,
+                change, review or result.
+              </small>
+              <TechnicalDetails>
+                <pre>
                 {JSON.stringify(
                   { trigger: decision.trigger, limits: decision.limits, census: decision.census },
                   null,
                   2,
                 )}
-              </pre>
-            </TechnicalDetails>
-          </article>
-        ))}
-        {tripLanes.filter((item) => item.attempt_id === attempt?.id).map((
-          lane,
-        ) => (
-          <article className="review-row" key={lane.id}>
-            <strong>Lane {lane.lane_key} · {lane.state}</strong>
-            <span>Owns {lane.owned_paths.join(", ")}</span>
-            <TechnicalDetails>
-              <p>
-                Shared: {lane.shared_paths.join(", ") || "none"} · protected:
-                {" "}
-                {lane.protected_paths.join(", ") || "none"} · dependencies:{" "}
-                {lane.dependencies.join(", ") || "none"} · effective generation
-                {" "}
-                {lane.effective_generation_id || "pending"}
-              </p>
-            </TechnicalDetails>
-          </article>
-        ))}
-        {!tripLanes.some((item) => item.attempt_id === attempt?.id) && (
-          <p className="hint">
-            The implementer works in a single lane unless the plan splits the
-            work.
-          </p>
-        )}
-      </details>
+                </pre>
+              </TechnicalDetails>
+            </article>
+          ))}
+          {tripLanes.filter((item) => item.attempt_id === attempt?.id).map((
+            lane,
+          ) => (
+            <article className="review-row" key={lane.id}>
+              <strong>Lane {lane.lane_key} · {lane.state}</strong>
+              <span>Owns {lane.owned_paths.join(", ")}</span>
+              <TechnicalDetails>
+                <p>
+                  Shared: {lane.shared_paths.join(", ") || "none"} · protected:
+                  {" "}
+                  {lane.protected_paths.join(", ") || "none"} · dependencies:
+                  {" "}
+                  {lane.dependencies.join(", ") || "none"}{" "}
+                  · effective generation{" "}
+                  {lane.effective_generation_id || "pending"}
+                </p>
+              </TechnicalDetails>
+            </article>
+          ))}
+          {!tripLanes.some((item) => item.attempt_id === attempt?.id) && (
+            <p className="hint">
+              The implementer works in a single lane unless the plan splits the
+              work.
+            </p>
+          )}
+        </details>
       )}
     </div>
   );
@@ -1916,10 +2043,16 @@ export function TaskDetail(
           </div>
           <div className="task-dialog-title-row">
             <h2 id="task-dialog-title">{task.title}</h2>
-            <StatusBadge status={status} />
+            <StatusBadge
+              status={failedProbe
+                ? { ...status, label: "Profile probe failed" }
+                : status}
+            />
           </div>
           <p className="task-dialog-status" id="task-dialog-status">
-            {status.detail}
+            {failedProbe
+              ? "This probe did not establish the evidence needed to admit the profile. Review the recovery steps in the Single agent run panel."
+              : status.detail}
           </p>
           {nextAction && onTaskAction && (
             <div className="task-dialog-next">
@@ -1948,7 +2081,9 @@ export function TaskDetail(
                             onClick={() => onTaskAction(nextAction, itemId)}
                           >
                             {item.action?.label || "Open"}
-                            <span className="visually-hidden">: {item.title}</span>
+                            <span className="visually-hidden">
+                              : {item.title}
+                            </span>
                           </button>
                         </li>
                       );
@@ -1969,7 +2104,8 @@ export function TaskDetail(
               </span>
               <button
                 className="task-permission-action"
-                onClick={() => onOpenPermission(headerPermission)}
+                onClick={() =>
+                  onOpenPermission(headerPermission)}
               >
                 Review approval request
               </button>
@@ -2007,27 +2143,32 @@ export function TaskDetail(
           {tab === "activity" && activity}
           {queueBusy && (
             <p role="status">
-              Updating this task. <button onClick={onChanged}>Refresh task</button>
+              Updating this task.{" "}
+              <button onClick={onChanged}>Refresh task</button>
             </p>
           )}
           {deleteVersion === task.version && task.draft_deletion?.allowed && (
             <section className="panel" aria-label="Confirm draft deletion">
               <h3>Delete “{task.title}”?</h3>
               <p>
-                This permanently removes the unused draft and its settings.
-                It cannot be restored.
+                This permanently removes the unused draft and its settings. It
+                cannot be restored.
               </p>
-              <button disabled={queueBusy} onClick={() => setDeleteVersion(null)}>
+              <button
+                disabled={queueBusy}
+                onClick={() => setDeleteVersion(null)}
+              >
                 Keep draft
               </button>
               <button
                 className="danger"
                 disabled={queueBusy}
-                onClick={() => queueMutation({
-                  kind: "delete_draft_task",
-                  task_id: task.id,
-                  expected_version: task.version,
-                })}
+                onClick={() =>
+                  queueMutation({
+                    kind: "delete_draft_task",
+                    task_id: task.id,
+                    expected_version: task.version,
+                  })}
               >
                 Confirm delete draft
               </button>
@@ -2044,7 +2185,9 @@ export function TaskDetail(
                 <dt>State</dt>
                 <dd>
                   {task.lifecycle} · attention {task.attention}
-                  {attempt ? ` · phase ${attempt.phase} · ${attempt.status}` : ""}
+                  {attempt
+                    ? ` · phase ${attempt.phase} · ${attempt.status}`
+                    : ""}
                 </dd>
               </div>
               {attempt && (
@@ -2090,17 +2233,22 @@ export function TaskDetail(
               <button
                 className="danger"
                 disabled={queueBusy || !task.draft_deletion.allowed}
-                aria-describedby={task.draft_deletion.reason ? "draft-delete-reason" : undefined}
+                aria-describedby={task.draft_deletion.reason
+                  ? "draft-delete-reason"
+                  : undefined}
                 onClick={() => setDeleteVersion(task.version)}
               >
                 Delete draft
               </button>
               {task.draft_deletion.reason && (
-                <p id="draft-delete-reason" className="hint">{task.draft_deletion.reason}</p>
+                <p id="draft-delete-reason" className="hint">
+                  {task.draft_deletion.reason}
+                </p>
               )}
               {dependentTasks.length > 0 && (
                 <p className="hint">
-                  Used by: {dependentTasks.map((other) => other.title).join(", ")}
+                  Used by:{" "}
+                  {dependentTasks.map((other) => other.title).join(", ")}
                 </p>
               )}
             </div>

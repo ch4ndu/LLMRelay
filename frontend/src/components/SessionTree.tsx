@@ -1663,7 +1663,8 @@ export function SessionTree(
                   onReleased={access.refresh}
                 />
               ))}
-              {running && session.native_prompt && (
+              {running && session.native_prompt &&
+                (!awaitingApproval || session.native_prompt.kind !== "permission_prompt") && (
                 <NativePromptNotice prompt={session.native_prompt} onChanged={access.refresh} />
               )}
               {waitingForStartup && (

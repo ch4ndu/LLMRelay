@@ -131,6 +131,9 @@ struct StartupCapture {
     session_id: String,
     transcript_epoch: String,
     failed: bool,
+    launch_anchor: std::path::PathBuf,
+    leader: Option<ProcessGenerationAnchor>,
+    provider: Option<ProcessGenerationAnchor>,
 }
 
 impl StartupCapture {
@@ -140,6 +143,7 @@ impl StartupCapture {
         store: Store,
         session_id: &str,
         transcript_epoch: &str,
+        launch_anchor: &std::path::Path,
     ) -> Result<Self> {
         let fd = master
             .as_raw_fd()
@@ -153,7 +157,60 @@ impl StartupCapture {
             session_id: session_id.to_owned(),
             transcript_epoch: transcript_epoch.to_owned(),
             failed: false,
+            launch_anchor: launch_anchor.to_path_buf(),
+            leader: None,
+            provider: None,
         })
+    }
+
+    fn exit_diagnostic(&self) -> Option<String> {
+        let bytes = std::fs::read(&self.launch_anchor).ok()?;
+        let LaunchHandshake::ProviderExited {
+            leader,
+            provider,
+            exit_code,
+            signal,
+        } = serde_json::from_slice(&bytes).ok()?
+        else {
+            return None;
+        };
+        let valid_status = match (exit_code, signal) {
+            (Some(code), None) => (0..=255).contains(&code),
+            (None, Some(signal)) => (1..=127).contains(&signal),
+            _ => false,
+        };
+        if self.leader.as_ref() != Some(&leader)
+            || self
+                .provider
+                .as_ref()
+                .is_some_and(|expected| expected != &provider)
+            || provider.pid <= 1
+            || provider.pid == leader.pid
+            || provider.process_group_id != leader.process_group_id
+            || provider.boot_identity != leader.boot_identity
+            || provider.native_start_marker.is_empty()
+            || !valid_status
+        {
+            return None;
+        }
+        Some(format!(
+            "wrapper observed provider exit: code={exit_code:?}, signal={signal:?}"
+        ))
+    }
+
+    fn drain_until_wrapper_exit(
+        &mut self,
+        child: &mut dyn portable_pty::Child,
+        deadline: std::time::Instant,
+    ) {
+        // Reaping can precede the wrapper's wait receipt; retain the startup deadline.
+        while std::time::Instant::now() < deadline {
+            self.drain_available();
+            if !matches!(child.try_wait(), Ok(None)) {
+                break;
+            }
+            std::thread::yield_now();
+        }
     }
 
     fn record_failure(&mut self, reason: &str) {
@@ -603,6 +660,7 @@ impl Supervisor {
             self.store.clone(),
             session_id,
             transcript_epoch,
+            &anchor_path,
         )
         .map_err(SpawnFailure::proven)?;
         let mut child = pair
@@ -610,7 +668,7 @@ impl Supervisor {
             .spawn_command(launch.command(&anchor_path))
             .with_context(|| format!("launch {} in PTY", launch.executable.display()))
             .map_err(SpawnFailure::proven)?;
-        drop(pair.slave);
+        // Retain the service's slave until final capture, even if the wrapper exits.
         startup_capture.drain_available();
         let child_pid = child.process_id();
         let wrapper_group = child_pid
@@ -619,6 +677,7 @@ impl Supervisor {
         if let Some(wrapper_pid) = child_pid {
             let Some(wrapper_group) = wrapper_group else {
                 return Err(self.classify_spawn_failure(
+                    &mut startup_capture,
                     child.as_mut(),
                     child_pid,
                     None,
@@ -627,6 +686,7 @@ impl Supervisor {
             };
             if wrapper_group == unsafe { libc::getpgrp() } {
                 return Err(self.classify_spawn_failure(
+                    &mut startup_capture,
                     child.as_mut(),
                     child_pid,
                     None,
@@ -637,6 +697,7 @@ impl Supervisor {
                 Ok(start) => start,
                 Err(error) => {
                     return Err(self.classify_spawn_failure(
+                        &mut startup_capture,
                         child.as_mut(),
                         child_pid,
                         Some(wrapper_group),
@@ -650,11 +711,13 @@ impl Supervisor {
                 native_start_marker: wrapper_start,
                 boot_identity: boot_identity.clone(),
             };
+            startup_capture.leader = Some(wrapper_anchor.clone());
             if let Err(error) =
                 self.store
                     .record_session_anchor(session_id, transcript_epoch, &wrapper_anchor)
             {
                 return Err(self.classify_spawn_failure(
+                    &mut startup_capture,
                     child.as_mut(),
                     child_pid,
                     Some(wrapper_group),
@@ -663,19 +726,34 @@ impl Supervisor {
             }
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let (leader_anchor, provider_anchor) = loop {
-            startup_capture.drain_available();
-            match std::fs::read(&anchor_path) {
-                Ok(bytes) => {
-                    match serde_json::from_slice::<LaunchHandshake>(&bytes) {
+        let (leader_anchor, provider_anchor) =
+            loop {
+                startup_capture.drain_available();
+                match std::fs::read(&anchor_path) {
+                    Ok(bytes) => match serde_json::from_slice::<LaunchHandshake>(&bytes) {
                         Ok(LaunchHandshake::ProviderSpawned { leader, provider })
                             if leader.boot_identity == boot_identity
                                 && provider.boot_identity == boot_identity =>
                         {
                             break (leader, provider)
                         }
+                        Ok(LaunchHandshake::ProviderExited { .. }) => {
+                            let reason = if startup_capture.exit_diagnostic().is_some() {
+                                "provider exited before startup identity verification"
+                            } else {
+                                "launch wrapper exit receipt does not match the current generation"
+                            };
+                            return Err(self.classify_spawn_failure(
+                                &mut startup_capture,
+                                child.as_mut(),
+                                child_pid,
+                                wrapper_group,
+                                reason,
+                            ));
+                        }
                         Ok(LaunchHandshake::PreProviderSpawnFailed { reason }) => {
                             return Err(self.classify_acknowledged_nondelivery(
+                                &mut startup_capture,
                                 child.as_mut(),
                                 child_pid,
                                 wrapper_group,
@@ -683,6 +761,7 @@ impl Supervisor {
                             ));
                         }
                         Ok(_) => return Err(self.classify_spawn_failure(
+                            &mut startup_capture,
                             child.as_mut(),
                             child_pid,
                             wrapper_group,
@@ -693,81 +772,93 @@ impl Supervisor {
                         }
                         Err(error) => {
                             return Err(self.classify_spawn_failure(
+                                &mut startup_capture,
                                 child.as_mut(),
                                 child_pid,
                                 wrapper_group,
                                 format!("launch wrapper anchor is malformed: {error}"),
                             ))
                         }
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(self.classify_spawn_failure(
+                            &mut startup_capture,
+                            child.as_mut(),
+                            child_pid,
+                            wrapper_group,
+                            format!("read launch wrapper anchor: {error}"),
+                        ))
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(self.classify_spawn_failure(
-                        child.as_mut(),
-                        child_pid,
-                        wrapper_group,
-                        format!("read launch wrapper anchor: {error}"),
-                    ))
-                }
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let reason = format!(
-                        "launch wrapper exited before provider spawn handshake: {status:?}"
-                    );
-                    if let Ok(bytes) = std::fs::read(&anchor_path) {
-                        if let Ok(LaunchHandshake::PreProviderSpawnFailed { reason }) =
-                            serde_json::from_slice::<LaunchHandshake>(&bytes)
-                        {
-                            return Err(self.classify_acknowledged_nondelivery(
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let reason = format!(
+                            "launch wrapper exited before provider spawn handshake: {status:?}"
+                        );
+                        if let Ok(bytes) = std::fs::read(&anchor_path) {
+                            if let Ok(LaunchHandshake::PreProviderSpawnFailed { reason }) =
+                                serde_json::from_slice::<LaunchHandshake>(&bytes)
+                            {
+                                return Err(self.classify_acknowledged_nondelivery(
+                                    &mut startup_capture,
+                                    child.as_mut(),
+                                    child_pid,
+                                    wrapper_group,
+                                    reason,
+                                ));
+                            }
+                        }
+                        return Err(if child_pid.is_some() {
+                            self.classify_spawn_failure(
+                                &mut startup_capture,
                                 child.as_mut(),
                                 child_pid,
                                 wrapper_group,
                                 reason,
-                            ));
-                        }
+                            )
+                        } else {
+                            self.classify_pidless_spawn_failure(
+                                &mut startup_capture,
+                                child.as_mut(),
+                                &spawn_baseline,
+                                reason,
+                            )
+                        });
                     }
-                    return Err(if child_pid.is_some() {
-                        self.classify_spawn_failure(
+                    Ok(None) => {}
+                    Err(error) => {
+                        return Err(self.classify_spawn_failure(
+                            &mut startup_capture,
                             child.as_mut(),
                             child_pid,
                             wrapper_group,
-                            reason,
-                        )
-                    } else {
-                        self.classify_pidless_spawn_failure(child.as_mut(), &spawn_baseline, reason)
-                    });
+                            format!("inspect launch wrapper before provider exec: {error}"),
+                        ))
+                    }
                 }
-                Ok(None) => {}
-                Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    if child_pid.is_none() {
+                        return Err(self.classify_pidless_spawn_failure(
+                            &mut startup_capture,
+                            child.as_mut(),
+                            &spawn_baseline,
+                            "launch wrapper exposed neither its durable anchor nor a portable PID",
+                        ));
+                    }
                     return Err(self.classify_spawn_failure(
+                        &mut startup_capture,
                         child.as_mut(),
                         child_pid,
                         wrapper_group,
-                        format!("inspect launch wrapper before provider exec: {error}"),
-                    ))
-                }
-            }
-            if std::time::Instant::now() >= deadline {
-                if child_pid.is_none() {
-                    return Err(self.classify_pidless_spawn_failure(
-                        child.as_mut(),
-                        &spawn_baseline,
-                        "launch wrapper exposed neither its durable anchor nor a portable PID",
+                        "launch wrapper did not publish its durable anchor before timeout",
                     ));
                 }
-                return Err(self.classify_spawn_failure(
-                    child.as_mut(),
-                    child_pid,
-                    wrapper_group,
-                    "launch wrapper did not publish its durable anchor before timeout",
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
         let leader_pid = leader_anchor.pid;
         let pid = provider_anchor.pid;
+        startup_capture.provider = Some(provider_anchor.clone());
         if leader_anchor.process_group_id <= 0
             || leader_anchor.process_group_id == unsafe { libc::getpgrp() }
             || leader_anchor.pid as i32 != leader_anchor.process_group_id
@@ -775,6 +866,7 @@ impl Supervisor {
             || child_pid.is_some_and(|wrapper| wrapper != leader_anchor.pid)
         {
             return Err(self.classify_spawn_failure(
+                &mut startup_capture,
                 child.as_mut(),
                 Some(leader_pid),
                 Some(leader_anchor.process_group_id),
@@ -783,14 +875,22 @@ impl Supervisor {
         }
         let process_group_id = unsafe { libc::getpgid(pid as libc::pid_t) };
         if process_group_id <= 0 || process_group_id != provider_anchor.process_group_id {
+            if process_group_id <= 0 {
+                startup_capture.drain_until_wrapper_exit(child.as_mut(), deadline);
+            }
             return Err(self.classify_spawn_failure(
+                &mut startup_capture,
                 child.as_mut(),
                 Some(leader_pid),
                 Some(leader_anchor.process_group_id),
-                format!(
-                    "provider child {pid} no longer matches anchored process group {}",
-                    provider_anchor.process_group_id
-                ),
+                if process_group_id <= 0 {
+                    format!("provider child {pid} is absent from the anchored process group")
+                } else {
+                    format!(
+                        "provider child {pid} has process group {process_group_id}, expected {}",
+                        provider_anchor.process_group_id
+                    )
+                },
             ));
         }
         if let Err(error) =
@@ -798,6 +898,7 @@ impl Supervisor {
                 .record_session_anchor(session_id, transcript_epoch, &leader_anchor)
         {
             return Err(self.classify_spawn_failure(
+                &mut startup_capture,
                 child.as_mut(),
                 Some(leader_pid),
                 Some(process_group_id),
@@ -808,6 +909,7 @@ impl Supervisor {
             Ok(inventory) => inventory,
             Err(error) => {
                 return Err(self.classify_spawn_failure(
+                    &mut startup_capture,
                     child.as_mut(),
                     Some(leader_pid),
                     Some(process_group_id),
@@ -820,20 +922,28 @@ impl Supervisor {
             .find(|process| process.pid == pid)
             .map(|process| process.ppid);
         if provider_parent != Some(leader_anchor.pid) {
+            let reason = match provider_parent {
+                None => {
+                    startup_capture.drain_until_wrapper_exit(child.as_mut(), deadline);
+                    format!("provider child {pid} is absent from the startup process inventory")
+                }
+                Some(parent) => format!(
+                    "provider child {pid} has parent {parent}, expected launch wrapper {leader_pid}"
+                ),
+            };
             return Err(self.classify_spawn_failure(
+                &mut startup_capture,
                 child.as_mut(),
                 Some(leader_pid),
                 Some(process_group_id),
-                format!(
-                    "provider child {pid} is not rooted at launch wrapper {:?}",
-                    leader_anchor.pid
-                ),
+                reason,
             ));
         }
         let leader_start = match native_start_marker(leader_anchor.pid) {
             Ok(marker) => marker,
             Err(error) => {
                 return Err(self.classify_spawn_failure(
+                    &mut startup_capture,
                     child.as_mut(),
                     Some(leader_pid),
                     Some(process_group_id),
@@ -843,6 +953,7 @@ impl Supervisor {
         };
         if !same_process_start(&leader_start, &leader_anchor.native_start_marker) {
             return Err(self.classify_spawn_failure(
+                &mut startup_capture,
                 child.as_mut(),
                 Some(leader_pid),
                 Some(process_group_id),
@@ -852,7 +963,11 @@ impl Supervisor {
         let native_start_marker = match native_start_marker(pid) {
             Ok(marker) => marker,
             Err(error) => {
+                if unsafe { libc::getpgid(pid as libc::pid_t) } <= 0 {
+                    startup_capture.drain_until_wrapper_exit(child.as_mut(), deadline);
+                }
                 return Err(self.classify_spawn_failure(
+                    &mut startup_capture,
                     child.as_mut(),
                     Some(leader_pid),
                     Some(process_group_id),
@@ -862,6 +977,7 @@ impl Supervisor {
         };
         if !same_process_start(&native_start_marker, &provider_anchor.native_start_marker) {
             return Err(self.classify_spawn_failure(
+                &mut startup_capture,
                 child.as_mut(),
                 Some(leader_pid),
                 Some(process_group_id),
@@ -878,6 +994,7 @@ impl Supervisor {
             Ok(value) => value,
             Err(error) => {
                 return Err(self.classify_spawn_failure(
+                    &mut startup_capture,
                     child.as_mut(),
                     Some(leader_pid),
                     Some(process_group_id),
@@ -900,13 +1017,13 @@ impl Supervisor {
             leader_anchor.pid,
         ) {
             return Err(self.classify_spawn_failure(
+                &mut startup_capture,
                 child.as_mut(),
                 Some(leader_pid),
                 Some(process_group_id),
                 error.context("persist provider process identity"),
             ));
         }
-        let _ = std::fs::remove_file(&anchor_path);
         let mut known_members = HashMap::new();
         known_members.insert(leader_pid, leader_anchor.native_start_marker.clone());
         known_members.insert(pid, native_start_marker);
@@ -952,6 +1069,7 @@ impl Supervisor {
                     },
                     |mut child| {
                         self.classify_spawn_failure(
+                            &mut startup_capture,
                             &mut **child,
                             Some(leader_pid),
                             Some(process_group_id),
@@ -1027,6 +1145,7 @@ impl Supervisor {
             }
             if let Ok(mut child) = handle.child.lock() {
                 return Err(self.classify_spawn_failure(
+                    &mut startup_capture,
                     &mut **child,
                     Some(leader_pid),
                     Some(process_group_id),
@@ -1055,18 +1174,26 @@ impl Supervisor {
         }
         // The accepted reader is now the sole consumer of this PTY stream.
         drop(startup_capture.reader.take());
+        let _ = std::fs::remove_file(&anchor_path);
         Ok(process)
     }
 
     fn classify_spawn_failure(
         &self,
+        capture: &mut StartupCapture,
         child: &mut dyn portable_pty::Child,
         root_pid: Option<u32>,
         process_group_id: Option<i32>,
         error: impl std::fmt::Display,
     ) -> SpawnFailure {
-        let reason = error.to_string();
+        capture.drain_available();
+        let diagnostic = capture.exit_diagnostic();
+        let mut reason = error.to_string();
         let owned_process_state = self.cleanup_owned_processes(child, root_pid, process_group_id);
+        capture.drain_available();
+        if let Some(diagnostic) = diagnostic.or_else(|| capture.exit_diagnostic()) {
+            reason.push_str(&format!("; {diagnostic}"));
+        }
         let (root_pid, process_group_id, members) = owned_process_state.evidence();
         SpawnFailure::DeliveryUnknown {
             reason,
@@ -1146,12 +1273,14 @@ impl Supervisor {
 
     fn classify_acknowledged_nondelivery(
         &self,
+        capture: &mut StartupCapture,
         child: &mut dyn portable_pty::Child,
         root_pid: Option<u32>,
         process_group_id: Option<i32>,
         reason: impl std::fmt::Display,
     ) -> SpawnFailure {
         let reason = reason.to_string();
+        capture.drain_available();
         let owned_process_state = self.cleanup_owned_processes(child, root_pid, process_group_id);
         SpawnFailure::ProvenNondelivery {
             reason,
@@ -1162,11 +1291,13 @@ impl Supervisor {
 
     fn classify_pidless_spawn_failure(
         &self,
+        capture: &mut StartupCapture,
         child: &mut dyn portable_pty::Child,
         baseline: &[ProcessInfo],
         error: impl std::fmt::Display,
     ) -> SpawnFailure {
         let reason = error.to_string();
+        capture.drain_available();
         let mut observed = match process_inventory() {
             Ok(inventory) => newly_spawned_service_descendants(baseline, &inventory),
             Err(_) => Vec::new(),

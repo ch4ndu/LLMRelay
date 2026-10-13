@@ -122,9 +122,13 @@ Under **Single agent profiles and configuration**:
   otherwise the service's reason is shown. **Activate admission** appears only
   after that probe recorded its evidence.
 
-The Single agent writer modes have not been qualified for any installed Codex or
-Claude version yet, so probes are currently refused with that reason and no
-Single agent profile can be activated on a real installation.
+The Single agent writer contracts are qualified for Codex CLI 0.162.1 and
+Claude Code 2.1.289. The native qualification records describe the tested
+[Codex profile](provider-qualification-20261011.md#codex-single-agent-writer)
+and [Claude profile](provider-qualification-20261011.md#claude-single-agent-writer)
+and their evidence limits. Qualification allows the app to attempt a profile's
+admission probe; it does not activate a profile or replace its current capability
+proof.
 
 
 

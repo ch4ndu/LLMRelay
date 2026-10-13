@@ -122,7 +122,10 @@ export function DiagnosticsPanel(
               {providerName(item.provider)} · {roleLabel(item.role)} ·{" "}
               {verificationLabel(item.status)}
             </strong>
-            <CompatibilityDetails compatibility={item.compatibility} />
+            <CompatibilityDetails
+              compatibility={item.compatibility}
+              verification={item.status === "supported" ? "saved_record" : undefined}
+            />
           </div>
         ))}
         {setups.filter((setup, index) => setup.state !== "superseded" &&

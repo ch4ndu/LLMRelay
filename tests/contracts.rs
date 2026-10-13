@@ -2627,18 +2627,125 @@ fn start_synthetic_runtime_probe(
 }
 
 #[test]
-fn runtime_capacity_rejection_preserves_unspent_authorization() {
-    let (fixture, paths, _, admission) = authorized_runtime_fixture("runtime-capacity-retry");
-    let (manager, ..) =
-        start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Manager, false);
-    let (verifier, ..) =
-        start_synthetic_runtime_probe(&fixture, &admission, RoleKind::FinalReviewer, false);
+fn runtime_first_dispatch_rejects_changed_hook_identity_before_launch() {
+    let (fixture, mut paths, _, admission) =
+        authorized_runtime_fixture("runtime-prelaunch-hook-drift");
+    paths.role_socket = fixture.root.join("role.sock");
+    let frozen_hooks = test_hooks(&fixture);
     let application = Application::new(
         paths,
         fixture.store.clone(),
         PathBuf::from("/usr/bin/false"),
     )
     .unwrap();
+    assert_ne!(
+        application.hooks.codex_revision_hash,
+        frozen_hooks.codex_revision_hash
+    );
+    let inventory = || {
+        fixture
+            .connection()
+            .query_row(
+                "SELECT p.session_id,permit.state,a.fresh_call_count,
+                        (SELECT COUNT(*) FROM role_generations),
+                        (SELECT COUNT(*) FROM sessions),
+                        (SELECT COUNT(*) FROM launch_permits),
+                        (SELECT COUNT(*) FROM permission_requests),
+                        (SELECT COUNT(*) FROM resume_invocations)
+                 FROM trip_runtime_probes p
+                 JOIN trip_runtime_admissions a ON a.id=p.admission_id
+                 JOIN trip_setup_permits permit
+                   ON permit.attempt_id=p.attempt_id AND permit.role=p.role
+                 WHERE p.admission_id=?1 AND p.role='explorer'",
+                params![admission],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let before = inventory();
+    assert_eq!(before.0, None);
+    assert_eq!(before.1, "issued");
+    let error = application
+        .dispatch_runtime_probe("reject-first-hook-drift", &admission, RoleKind::Explorer)
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("no longer matches the current app or agent settings"));
+    assert!(error.to_string().contains("Prepare a new verification"));
+    let detail = format!("{error:#}");
+    assert!(
+        detail.contains("runtime admission scope is stale"),
+        "{detail}"
+    );
+    assert_eq!(
+        inventory(),
+        before,
+        "stale first launch spent provider authority"
+    );
+    let rejected: (String, String) = fixture
+        .connection()
+        .query_row(
+            "SELECT state,failure_reason FROM trip_runtime_probes
+             WHERE admission_id=?1 AND role='explorer'",
+            params![admission],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(rejected, ("failed".into(), detail));
+}
+
+#[test]
+fn runtime_capacity_rejection_preserves_unspent_authorization() {
+    let (fixture, paths, project, occupied_admission) =
+        authorized_runtime_fixture("runtime-capacity-retry");
+    let (manager, ..) =
+        start_synthetic_runtime_probe(&fixture, &occupied_admission, RoleKind::Manager, false);
+    let (verifier, ..) = start_synthetic_runtime_probe(
+        &fixture,
+        &occupied_admission,
+        RoleKind::FinalReviewer,
+        false,
+    );
+    let application = Application::new(
+        paths,
+        fixture.store.clone(),
+        PathBuf::from("/usr/bin/false"),
+    )
+    .unwrap();
+    let prepared = application
+        .execute_human_command(&HumanCommand::Trip {
+            operation_id: "prepare-capacity-dispatch".into(),
+            action: TripHumanAction::PrepareRuntimeAdmission {
+                project_id: project,
+                task_id: None,
+                role: Some(RoleKind::Explorer),
+                settings_revision: None,
+                cmux_socket_path: None,
+                expected_version: 2,
+            },
+        })
+        .unwrap();
+    application
+        .execute_human_command(&HumanCommand::Trip {
+            operation_id: "authorize-capacity-dispatch".into(),
+            action: TripHumanAction::AuthorizeRuntimeAdmission {
+                admission_id: prepared.entity_id.clone(),
+                scope_hash: prepared.detail["scope_hash"].as_str().unwrap().to_owned(),
+            },
+        })
+        .unwrap();
+    let admission = prepared.entity_id;
     let snapshot = || {
         fixture
             .connection()
@@ -5014,6 +5121,10 @@ fn m5_scheduler_explanations_preserve_precedence_and_do_not_duplicate_authority(
         params![child, parent],
     );
     let filtered_state = workflow::state(&filtered.store).unwrap();
+    assert!(!filtered_state
+        .attention
+        .iter()
+        .any(|item| { item.id == format!("task:{paused_task}:decision") }));
     assert!(filtered_state
         .decisions
         .iter()
@@ -5903,6 +6014,27 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
         .entity_id;
         let (discovery, discovery_prompt) =
             start_synthetic_setup_resume(&resume_fixture, &setup, RoleKind::Manager);
+        let state = workflow::state(&resume_fixture.store).unwrap();
+        let projected_setup = state
+            .trip_setups
+            .iter()
+            .find(|value| value["setup_operation_id"] == setup)
+            .unwrap();
+        for actions in [
+            serde_json::to_value(&state.continuation_actions).unwrap(),
+            projected_setup["continuation_actions"].clone(),
+        ] {
+            assert!(
+                !actions.as_array().unwrap().iter().any(|action| {
+                    action["binding"]["session_id"] == discovery.session_id
+                        && matches!(
+                            action["operation"].as_str(),
+                            Some("authorization_required" | "role_resume")
+                        )
+                }),
+                "setup discovery must use its permit controls: {actions}"
+            );
+        }
         resume_fixture.assert_scalar::<i64>(
             "SELECT COUNT(*) FROM capabilities WHERE status='supported'",
             0,
@@ -6388,6 +6520,27 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
         .unwrap();
         let (retained_review, _) =
             start_synthetic_setup_resume(&resume_fixture, &setup, RoleKind::PlanReviewer);
+        let state = workflow::state(&resume_fixture.store).unwrap();
+        let projected_setup = state
+            .trip_setups
+            .iter()
+            .find(|value| value["setup_operation_id"] == setup)
+            .unwrap();
+        for actions in [
+            serde_json::to_value(&state.continuation_actions).unwrap(),
+            projected_setup["continuation_actions"].clone(),
+        ] {
+            assert!(
+                !actions.as_array().unwrap().iter().any(|action| {
+                    action["binding"]["session_id"] == retained_review.session_id
+                        && matches!(
+                            action["operation"].as_str(),
+                            Some("authorization_required" | "role_resume")
+                        )
+                }),
+                "setup profile probes must use their permit controls: {actions}"
+            );
+        }
         let (fresh_final, _) =
             start_synthetic_setup_resume(&resume_fixture, &setup, RoleKind::FinalReviewer);
         let (consumed, _) =
@@ -6783,6 +6936,27 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
     .unwrap();
     assert_eq!(activated.state, "activated");
     assert_eq!(activated.detail["recovered"], true);
+    let setup_state = workflow::state(&fixture.store).unwrap();
+    let projected_setup = setup_state
+        .trip_setups
+        .iter()
+        .find(|value| value["setup_operation_id"] == setup)
+        .unwrap();
+    for selection in projected_setup["selected_profiles"].as_array().unwrap() {
+        let receipt = projected_setup["probe_receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|receipt| {
+                receipt["role"] == selection["role"]
+                    && receipt["profile_hash"] == selection["profile_hash"]
+                    && receipt["result"] == "success"
+                    && receipt["adapter_hash"].as_str().is_some()
+            })
+            .unwrap();
+        assert!(selection["current_adapter_hash"].as_str().is_some());
+        assert_eq!(selection["current_adapter_hash"], receipt["adapter_hash"]);
+    }
     let validation = std::process::Command::new("python3")
         .arg("-B")
         .arg(repository.join(".agents/trip-explorer/bin/validate_installed.py"))
@@ -7546,20 +7720,42 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
             "UPDATE trip_setup_operations SET validation_task_id=?1 WHERE id=?2",
             params![dispatch_validation_task, dispatch_setup],
         );
-        let dispatch_admission = prepare_runtime_admission(
-            &dispatch_fixture,
+        let dispatch_executable = PathBuf::from("/usr/bin/false");
+        let dispatch_runtime = agenticjira::trip::CapabilityRuntime::from_store(
+            &dispatch_fixture.store,
+            providers::install_hook_assets(&dispatch_paths, &dispatch_executable).unwrap(),
+            dispatch_paths.role_socket.clone(),
+            dispatch_executable,
+        );
+        let dispatch_admission = agenticjira::trip::execute_human_with_runtime(
+            &dispatch_fixture.store,
             &dispatch_paths,
+            &dispatch_runtime,
             "prepare-runtime-sibling-dispatch",
-            &dispatch_project,
-            None,
-            2,
-        );
-        authorize_runtime_admission(
-            &dispatch_fixture,
+            &TripHumanAction::PrepareRuntimeAdmission {
+                project_id: dispatch_project.clone(),
+                task_id: None,
+                role: None,
+                settings_revision: None,
+                cmux_socket_path: None,
+                expected_version: 2,
+            },
+        )
+        .unwrap();
+        agenticjira::trip::execute_human_with_runtime(
+            &dispatch_fixture.store,
             &dispatch_paths,
+            &dispatch_runtime,
             "authorize-runtime-sibling-dispatch",
-            &dispatch_admission,
-        );
+            &TripHumanAction::AuthorizeRuntimeAdmission {
+                admission_id: dispatch_admission.entity_id.clone(),
+                scope_hash: dispatch_admission.detail["scope_hash"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            },
+        )
+        .unwrap();
         let dispatch_admission_id = dispatch_admission.entity_id;
         let (failed_explorer, _, failed_nonce, failed_control, _) = start_synthetic_runtime_probe(
             &dispatch_fixture,
@@ -9913,8 +10109,9 @@ fn trip_runtime_native_hook_commands_bind_report_acceptance_and_preserve_sibling
 
 #[test]
 fn trip_runtime_terminal_exit_allows_one_recall_then_fails_resumed_and_final() {
-    let (fixture, _paths, _project, admission) =
+    let (fixture, paths, project, admission) =
         authorized_runtime_fixture("trip-runtime-terminal-exit");
+    fixture.execute("DELETE FROM capabilities", []);
     let (sibling, _, _, _, _) =
         start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Manager, false);
     let sibling_before = runtime_probe_snapshot(&fixture, &admission, RoleKind::Manager);
@@ -9941,6 +10138,131 @@ fn trip_runtime_terminal_exit_allows_one_recall_then_fails_resumed_and_final() {
         &retained.session_id,
     )
     .is_ok());
+
+    let (implementer, _, _, _, _) =
+        start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Implementer, false);
+    let (write_epoch, write_process) = runtime_session_identity(&fixture, &implementer.session_id);
+    assert!(fixture
+        .store
+        .update_session_exit(
+            &implementer.session_id,
+            &write_epoch,
+            &write_process,
+            r#"{"code":0,"process_group_quiescent":true,"synthetic_fixture":true}"#,
+        )
+        .unwrap());
+    let first_state = workflow::state(&fixture.store).unwrap();
+    let selected_project = first_state
+        .projects
+        .iter()
+        .find(|entry| entry.id == project)
+        .unwrap();
+    for (session_id, title) in [
+        (
+            &retained.session_id,
+            "Explorer verification is ready to finish",
+        ),
+        (
+            &implementer.session_id,
+            "Implementer verification is ready to finish",
+        ),
+    ] {
+        let session = first_state
+            .active_sessions
+            .iter()
+            .find(|session| session["id"] == *session_id)
+            .unwrap();
+        assert_eq!(session["capability_current"], false);
+        let actions = first_state
+            .continuation_actions
+            .iter()
+            .filter(|action| action.binding["session_id"] == *session_id)
+            .collect::<Vec<_>>();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(actions[0].enabled);
+        assert_eq!(actions[0].operation, "runtime_probe_resume");
+        assert_eq!(actions[0].binding["runtime_admission_id"], admission);
+        assert_eq!(
+            actions[0].binding["role_generation_id"],
+            session["role_generation_id"]
+        );
+        assert_eq!(
+            actions[0].binding["transcript_epoch"],
+            session["transcript_epoch"]
+        );
+        assert!(actions[0]
+            .reason
+            .contains("first verification phase finished"));
+        let attention = first_state
+            .attention
+            .iter()
+            .find(|item| item.id == format!("continuation:runtime_probe_resume:{session_id}"))
+            .unwrap();
+        assert_eq!(attention.title, title);
+        assert_eq!(attention.category, AttentionCategory::Decision);
+        assert_eq!(attention.action.kind, AttentionActionKind::OpenProjectSetup);
+        assert_eq!(
+            attention.target,
+            Some(AttentionTarget::ProjectSetup {
+                project_id: project.clone(),
+                setup_operation_id: Some(
+                    selected_project.trip["setup_operation_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                ),
+            })
+        );
+    }
+    let mut changed_settings = selected_project.settings.clone();
+    changed_settings["roles"]["explorer"]["model"] =
+        serde_json::json!(format!("{}-changed", retained.config.model));
+    let probe_before = runtime_probe_snapshot(&fixture, &admission, RoleKind::Explorer);
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::UpdateProjectSettings {
+            operation_id: "change-selected-runtime-model".into(),
+            project_id: project.clone(),
+            expected_version: selected_project.version,
+            settings: changed_settings,
+        },
+    )
+    .unwrap();
+    let changed_state = workflow::state(&fixture.store).unwrap();
+    assert!(
+        !changed_state
+            .continuation_actions
+            .iter()
+            .any(
+                |action| action.binding["session_id"] == implementer.session_id
+                    && action.enabled
+                    && action.operation == "runtime_probe_resume"
+            ),
+        "changing a selected profile invalidates the shared admission for sibling roles too"
+    );
+    assert!(!changed_state
+        .continuation_actions
+        .iter()
+        .any(|action| action.binding["session_id"] == retained.session_id
+            && action.enabled
+            && action.operation == "runtime_probe_resume"));
+    assert!(changed_state
+        .continuation_actions
+        .iter()
+        .any(|action| action.binding["session_id"] == retained.session_id
+            && !action.enabled
+            && action.operation == "authorization_required"
+            && action
+                .reason
+                .contains("selected agent settings or project configuration no longer match")));
+    assert_eq!(
+        runtime_probe_snapshot(&fixture, &admission, RoleKind::Explorer),
+        probe_before,
+    );
+    fixture.assert_scalar::<String>(
+        &format!("SELECT state FROM trip_runtime_admissions WHERE id='{admission}'"),
+        "running".into(),
+    );
 
     let resumed_epoch = "synthetic-retained-resume-epoch";
     let resumed_process = r#"{"pid":4242,"synthetic":"retained-resume"}"#;
@@ -10003,6 +10325,18 @@ fn trip_runtime_terminal_exit_allows_one_recall_then_fails_resumed_and_final() {
         runtime_probe_snapshot(&fixture, &admission, RoleKind::Manager),
         sibling_before
     );
+    assert!(!workflow::state(&fixture.store)
+        .unwrap()
+        .continuation_actions
+        .iter()
+        .any(
+            |action| (action.binding["session_id"] == retained.session_id
+                || action.binding["session_id"] == final_probe.session_id)
+                && matches!(
+                    action.operation.as_str(),
+                    "role_resume" | "runtime_probe_resume" | "authorization_required"
+                )
+        ));
     fixture.assert_scalar::<i64>(
         &format!(
             "SELECT COUNT(*) FROM role_results WHERE session_id IN ('{}','{}','{}')",
@@ -10011,6 +10345,37 @@ fn trip_runtime_terminal_exit_allows_one_recall_then_fails_resumed_and_final() {
         0,
     );
     assert_eq!(fixture.store.reconcile_exited_runtime_probes().unwrap(), 0);
+    let replacement = execute_trip(
+        &fixture,
+        &paths,
+        "prepare-newer-write-verification",
+        &TripHumanAction::PrepareRuntimeAdmission {
+            project_id: project,
+            task_id: None,
+            role: Some(RoleKind::Implementer),
+            settings_revision: None,
+            cmux_socket_path: None,
+            expected_version: 3,
+        },
+    )
+    .unwrap();
+    authorize_runtime_admission(
+        &fixture,
+        &paths,
+        "authorize-newer-write-verification",
+        &replacement,
+    );
+    assert!(!workflow::state(&fixture.store)
+        .unwrap()
+        .continuation_actions
+        .iter()
+        .any(
+            |action| action.binding["session_id"] == implementer.session_id
+                && matches!(
+                    action.operation.as_str(),
+                    "role_resume" | "runtime_probe_resume" | "authorization_required"
+                )
+        ));
 }
 
 #[test]
@@ -10429,6 +10794,31 @@ fn runtime_completed_reports_close_retained_and_fresh_sessions_without_publishin
         assert_eq!(snapshot.0, recorded_state);
         assert_eq!(snapshot.3, "exited");
         assert_eq!(snapshot.4, i64::from(retained));
+        let state = workflow::state(&fixture.store).unwrap();
+        assert!(!state
+            .continuation_actions
+            .iter()
+            .any(|action| action.binding["session_id"] == context.session_id
+                && matches!(
+                    action.operation.as_str(),
+                    "role_resume" | "runtime_probe_resume" | "authorization_required"
+                )));
+        assert!(state
+            .trip_setups
+            .iter()
+            .any(
+                |setup| setup["runtime_admissions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["id"] == admission
+                        && entry["probes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|probe| probe["session_id"] == context.session_id
+                                && probe["state"] == recorded_state))
+            ));
         fixture.assert_scalar::<i64>(
             "SELECT COUNT(*) FROM trip_runtime_probes WHERE published_at IS NOT NULL",
             0,
@@ -10596,7 +10986,8 @@ fn runtime_rejected_reports_close_once_without_acceptance_or_retry() {
 
 #[test]
 fn runtime_provider_model_context_exposes_only_bound_native_observations() {
-    let (fixture, _, _, admission) = authorized_runtime_fixture("runtime-provider-model-context");
+    let (fixture, _, _, admission) =
+        authorized_claude_explorer_runtime_fixture("runtime-provider-model-context");
     let (launch, _, _, _, initial) =
         start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Explorer, false);
     let context = fixture.store.role_context(&launch.token).unwrap();
@@ -10619,17 +11010,20 @@ fn runtime_provider_model_context_exposes_only_bound_native_observations() {
         serde_json::Value::Null,
         serde_json::json!({"model":"wrong-type"}),
         serde_json::json!(""),
-        serde_json::json!("different-model"),
+        serde_json::json!("unsafe model"),
+        serde_json::json!("x".repeat(257)),
     ] {
         set_model(unavailable);
         assert!(read()["provider_model_observation"].is_null());
     }
-    set_model(serde_json::json!(launch.config.model));
+    let provider_model = "claude-fable-5-1";
+    assert_ne!(launch.config.model, provider_model);
+    set_model(serde_json::json!(provider_model));
     let observed = read()["provider_model_observation"].clone();
-    assert_eq!(observed["model"], launch.config.model);
+    assert_eq!(observed["model"], provider_model);
     assert_eq!(
         observed["model_evidence"],
-        format!("provider_session_start:{}", launch.config.model)
+        format!("provider_session_start:{provider_model}")
     );
     assert_eq!(observed["source_trust"], "untrusted_provider_payload");
     assert_eq!(observed["backend_identity_attested"], false);
@@ -10661,13 +11055,30 @@ fn runtime_provider_model_context_exposes_only_bound_native_observations() {
 
 #[test]
 fn runtime_provider_model_report_checks_the_original_invocation_without_reopening_context() {
-    for matches in [false, true] {
-        let (fixture, paths, _, admission) =
-            authorized_runtime_fixture("runtime-provider-model-report");
+    let provider_model = "claude-fable-5-1";
+    for (reported_model, profile_drift) in [
+        (None, false),
+        (Some("another-model"), false),
+        (Some(provider_model), false),
+        (Some(provider_model), true),
+    ] {
+        let (fixture, paths, project, admission) =
+            authorized_claude_explorer_runtime_fixture("runtime-provider-model-report");
         let (launch, _, nonce, control, _) =
             start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Explorer, true);
         let context = fixture.store.role_context(&launch.token).unwrap();
-        fixture.execute("UPDATE hook_events SET payload_json=json_set(payload_json,'$.model',?1) WHERE session_id=?2 AND event_name='SessionStart'",params![launch.config.model,launch.session_id]);
+        let requested_model = launch.config.model.clone();
+        let frozen_before: (String, String) = fixture.connection().query_row(
+            "SELECT json_extract(s.launch_config_json,'$.model'),json_extract(p.profile_json,'$.model')
+             FROM sessions s JOIN trip_runtime_probes p ON p.session_id=s.id WHERE s.id=?1",
+            params![launch.session_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(frozen_before.0, requested_model);
+        assert_ne!(requested_model, provider_model);
+        fixture.execute("UPDATE hook_events SET payload_json=json_set(payload_json,'$.model',?1) WHERE session_id=?2 AND event_name='SessionStart'",params![provider_model,launch.session_id]);
+        fixture.execute("INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,payload_json,peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+            SELECT 'later-model-start',session_id,role_generation_id,provider,event_name,native_session_id,json_set(payload_json,'$.model','another-model'),peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at
+            FROM hook_events WHERE session_id=?1 AND event_name='SessionStart' ORDER BY rowid LIMIT 1",params![launch.session_id]);
         assert!(
             agenticjira::trip::setup_context(&fixture.connection(), &context)
                 .unwrap_err()
@@ -10683,15 +11094,9 @@ fn runtime_provider_model_report_checks_the_original_invocation_without_reopenin
             &control,
             "runtime-provider-model-report",
         );
-        report.metadata["validation_observation"]["model_evidence"] = format!(
-            "provider_session_start:{}",
-            if matches {
-                launch.config.model.as_str()
-            } else {
-                "another-model"
-            }
-        )
-        .into();
+        let reported_model = reported_model.unwrap_or(&requested_model);
+        report.metadata["validation_observation"]["model_evidence"] =
+            format!("provider_session_start:{reported_model}").into();
         insert_synthetic_runtime_report_hook(
             &fixture,
             &launch,
@@ -10699,14 +11104,18 @@ fn runtime_provider_model_report_checks_the_original_invocation_without_reopenin
             "model-observation",
         );
         let result = fixture.store.save_role_result(&context, &report);
-        if matches {
+        if reported_model == provider_model {
             result.unwrap();
             assert_eq!(
                 runtime_probe_snapshot(&fixture, &admission, RoleKind::Explorer).0,
                 "evidence_recorded"
             );
             fixture.finish_role(&launch);
-            execute_trip(
+            if profile_drift {
+                fixture.execute("UPDATE projects SET settings_json=json_set(settings_json,'$.roles.explorer.model',?1) WHERE id=?2",
+                    params![format!("{requested_model}-changed"), project]);
+            }
+            let publication = execute_trip(
                 &fixture,
                 &paths,
                 "publish-observed-model",
@@ -10714,12 +11123,27 @@ fn runtime_provider_model_report_checks_the_original_invocation_without_reopenin
                     admission_id: admission.clone(),
                     role: RoleKind::Explorer,
                 },
-            )
-            .unwrap();
-            assert_eq!(
-                runtime_probe_snapshot(&fixture, &admission, RoleKind::Explorer).0,
-                "published"
             );
+            if profile_drift {
+                assert!(publication
+                    .unwrap_err()
+                    .to_string()
+                    .contains("runtime admission scope is stale"));
+                assert_eq!(
+                    runtime_probe_snapshot(&fixture, &admission, RoleKind::Explorer).0,
+                    "stale"
+                );
+                fixture.assert_scalar::<i64>(
+                    "SELECT COUNT(*) FROM trip_runtime_probes WHERE published_at IS NOT NULL",
+                    0,
+                );
+            } else {
+                publication.unwrap();
+                assert_eq!(
+                    runtime_probe_snapshot(&fixture, &admission, RoleKind::Explorer).0,
+                    "published"
+                );
+            }
         } else {
             assert!(result
                 .unwrap_err()
@@ -10731,6 +11155,12 @@ fn runtime_provider_model_report_checks_the_original_invocation_without_reopenin
                 "failed"
             );
         }
+        let frozen: (String, String) = fixture.connection().query_row(
+            "SELECT json_extract(s.launch_config_json,'$.model'),json_extract(p.profile_json,'$.model')
+             FROM sessions s JOIN trip_runtime_probes p ON p.session_id=s.id WHERE s.id=?1",
+            params![launch.session_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(frozen, frozen_before);
     }
 }
 
@@ -10904,6 +11334,27 @@ fn trip_runtime_terminal_exit_preserves_accepted_report_states() {
     .unwrap();
     let published_before = runtime_probe_snapshot(&fixture, &admission, RoleKind::FinalReviewer);
     assert_eq!(published_before.0, "published");
+
+    record_synthetic_runtime_pass(&fixture, &admission, RoleKind::Manager);
+    execute_trip(
+        &fixture,
+        &paths,
+        "publish-reported-retained-runtime",
+        &TripHumanAction::PublishRuntimeProof {
+            admission_id: admission.clone(),
+            role: RoleKind::Manager,
+        },
+    )
+    .unwrap();
+    let state = workflow::state(&fixture.store).unwrap();
+    assert!(!state.continuation_actions.iter().any(|action| matches!(
+        action.operation.as_str(),
+        "role_resume" | "runtime_probe_resume" | "authorization_required"
+    ) && state
+        .active_sessions
+        .iter()
+        .any(|session| session["id"] == action.binding["session_id"]
+            && session["validation_cell"] == "trip_runtime_probe")));
 
     assert_eq!(fixture.store.reconcile_exited_runtime_probes().unwrap(), 0);
     assert_eq!(
@@ -16388,11 +16839,48 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
         completed_handoff_version,
     );
-    record_unbalanced_manager_stop(&handoff, &handoff_ready_manager, handoff_native);
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+    ] {
+        record_manager_hook(&handoff, &handoff_ready_manager, handoff_native, event);
+    }
+    for tool_use_id in ["unmatched-terminal-one", "unmatched-terminal-two"] {
+        handoff.store.save_hook_event(
+            &handoff_ready_manager,
+            &HookEnvelope {
+                provider: Provider::Codex,
+                payload: serde_json::json!({"hook_event_name":"PostToolUse", "session_id":handoff_native,
+                    "cwd":handoff_plan.workspace_path, "tool_use_id":tool_use_id}),
+            },
+            &RolePeerProvenance {
+                peer_pid: 42, peer_process_group_id: 42,
+                peer_start_marker: "manager-handoff-peer".into(), managed_root_pid: 42,
+                managed_root_start_marker: "manager-handoff-root".into(),
+                state: "managed_process_group_untrusted_payload".into(),
+            },
+        ).unwrap();
+    }
+    record_manager_hook(&handoff, &handoff_ready_manager, handoff_native, "Stop");
+    handoff.assert_scalar::<String>(
+        &format!("SELECT readiness_state FROM sessions WHERE id='{handoff_session}'"),
+        "busy_unresolved_hook_work".into(),
+    );
+    handoff.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM hook_events WHERE event_name='PreToolUse'
+           AND json_extract(payload_json,'$.tool_use_id') IN ('unmatched-terminal-one','unmatched-terminal-two')",
+        0,
+    );
+    let excess_terminal_stop = handoff_app.coordinator_tick().unwrap();
     assert_eq!(
-        handoff_app.coordinator_tick().unwrap()["action"],
+        excess_terminal_stop["action"],
         "manager_service_stop_requested"
     );
+    assert_eq!(excess_terminal_stop["state"], "interrupt_requested");
+    assert_eq!(excess_terminal_stop["completion_inferred"], false);
+    assert_eq!(excess_terminal_stop["automatic_escalation"], false);
     handoff.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM audit_events WHERE event_code='manager.service_stop.claimed'",
         3,
@@ -16404,6 +16892,24 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
     handoff.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM audit_events WHERE event_code='manager.service_stop.claimed'",
         3,
+    );
+    finish_synthetic_role(&handoff, &handoff_ready_manager);
+    handoff.execute(
+        "UPDATE sessions SET exit_json='{\"process_group_quiescent\":false,\"synthetic_fixture\":true}' WHERE id=?1",
+        params![handoff_session],
+    );
+    let unverified_exit = handoff_app.coordinator_tick().unwrap();
+    assert_eq!(unverified_exit["action"], "waiting");
+    assert_eq!(unverified_exit["for"], "manager_quiescence_or_recovery");
+    assert_eq!(unverified_exit["process_group_quiescent"], false);
+    handoff.assert_scalar::<String>(
+        "SELECT phase FROM attempts LIMIT 1",
+        "manager_handoff".into(),
+    );
+    handoff.assert_scalar::<i64>("SELECT COUNT(*) FROM snapshots WHERE kind='accepted'", 0);
+    handoff.assert_scalar::<i64>(
+        "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        completed_handoff_version,
     );
     finish_synthetic_role(&handoff, &handoff_ready_manager);
     let human_ready = handoff_app.coordinator_tick().unwrap();
@@ -33934,7 +34440,7 @@ fn t18_permission_rules_match_only_current_verified_scope_and_reservation() {
 #[test]
 fn codex_provider_check_account_is_allowlisted_and_never_carries_credentials() {
     install_synthetic_codex_home();
-    let scope = std::env::temp_dir().join(format!(
+    let scope = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
         "agenticjira-provider-check-scope-{}",
         uuid::Uuid::new_v4()
     ));
@@ -33949,6 +34455,16 @@ fn codex_provider_check_account_is_allowlisted_and_never_carries_credentials() {
         Some("chatgpt:synthetic-account")
     );
     assert_eq!(account.authentication, "chatgpt_pro");
+    assert_eq!(
+        account.config_identity["user_config"],
+        "validated_if_present_ignored_by_native_cli"
+    );
+    let disabled_names = account.config_identity["disabled_names"]
+        .as_array()
+        .unwrap();
+    for name in ["plain", "quoted.dot", "rocket🚀"] {
+        assert!(!disabled_names.iter().any(|disabled| disabled == name));
+    }
     let serialized = serde_json::to_string(&account).unwrap();
     for secret in [
         "synthetic-refresh-token",
@@ -33975,11 +34491,17 @@ fn codex_provider_check_account_is_allowlisted_and_never_carries_credentials() {
 #[test]
 fn provider_check_candidate_arguments_request_no_tools_and_no_customization() {
     install_synthetic_codex_home();
-    let scope = std::env::temp_dir().join(format!(
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let root = home.join(format!(
         "agenticjira-provider-check-argv-{}",
         uuid::Uuid::new_v4()
     ));
-    std::fs::create_dir_all(&scope).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    let home_alias = root.join("home-alias");
+    std::os::unix::fs::symlink(&home, &home_alias).unwrap();
+    let scope = home_alias.join(root.file_name().unwrap());
+    providers::codex::inspect_observation_account(&scope, providers::codex::EXACT_CODEX_VERSION)
+        .unwrap();
     let bundles = agenticjira::provider_compatibility::BundleSet::embedded();
     let launch = |provider: Provider, version: &str| {
         let installation = providers::ProviderInstallation {
@@ -34014,7 +34536,6 @@ fn provider_check_candidate_arguments_request_no_tools_and_no_customization() {
             "check prompt",
             std::path::Path::new("/synthetic/llmrelay"),
         )
-        .unwrap()
     };
     let has = |arguments: &[String], expected: &[&str]| {
         arguments.windows(expected.len()).any(|window| {
@@ -34025,7 +34546,7 @@ fn provider_check_candidate_arguments_request_no_tools_and_no_customization() {
         })
     };
 
-    let codex = launch(Provider::Codex, providers::codex::EXACT_CODEX_VERSION);
+    let codex = launch(Provider::Codex, providers::codex::EXACT_CODEX_VERSION).unwrap();
     for expected in [
         &["exec", "--strict-config"][..],
         &["--ephemeral"],
@@ -34033,8 +34554,18 @@ fn provider_check_candidate_arguments_request_no_tools_and_no_customization() {
         &["--ignore-rules"],
         &["--disable", "shell_tool"][..],
         &["--disable", "unified_exec"],
+        &["--disable", "view_image"],
+        &["--disable", "sleep_tool"],
+        &["--disable", "tool_suggest"],
+        &["--disable", "goals"],
+        &["--disable", "workspace_dependencies"],
         &["--sandbox", "read-only"],
+        &["--config", "approval_policy=\"never\""],
+        &["--config", "cli_auth_credentials_store=\"file\""],
         &["--config", "features.hooks=false"],
+        &["--config", "web_search=\"disabled\""],
+        &["--config", "project_doc_max_bytes=0"],
+        &["--config", "features.skip_host_skill_discovery=true"],
     ] {
         assert!(
             has(&codex.arguments, expected),
@@ -34043,8 +34574,29 @@ fn provider_check_candidate_arguments_request_no_tools_and_no_customization() {
         );
     }
     assert!(codex.environment.is_empty());
+    assert!(!codex
+        .arguments
+        .iter()
+        .any(|argument| argument.starts_with("tools.view_image=")));
+    let mcp_overrides = codex
+        .arguments
+        .windows(2)
+        .filter(|pair| pair[0] == "--config" && pair[1].starts_with("mcp_servers="))
+        .collect::<Vec<_>>();
+    assert_eq!(mcp_overrides.len(), 1);
+    let override_config = mcp_overrides[0][1].parse::<toml::Value>().unwrap();
+    let servers = override_config["mcp_servers"].as_table().unwrap();
+    for name in ["plain", "quoted.dot", "rocket🚀"] {
+        assert!(
+            !servers.contains_key(name),
+            "ignored user server {name} was recreated"
+        );
+    }
+    assert!(servers
+        .values()
+        .all(|server| server.get("enabled").and_then(toml::Value::as_bool) == Some(false)));
 
-    let claude = launch(Provider::Claude, providers::claude::EXACT_CLAUDE_VERSION);
+    let claude = launch(Provider::Claude, providers::claude::EXACT_CLAUDE_VERSION).unwrap();
     for expected in [
         &["--safe-mode"][..],
         &["--no-session-persistence"],
@@ -34069,7 +34621,27 @@ fn provider_check_candidate_arguments_request_no_tools_and_no_customization() {
             .all(|(key, _)| !key.starts_with("AGENTICJIRA_")));
         assert_eq!(launch.process().cwd, scope.as_path());
     }
-    std::fs::remove_dir_all(scope).unwrap();
+    std::fs::create_dir(scope.join(".codex")).unwrap();
+    std::fs::write(
+        scope.join(".codex/config.toml"),
+        "[mcp_servers.\"quoted.dot\"]\nenabled = true\n",
+    )
+    .unwrap();
+    let account_error = providers::codex::inspect_observation_account(
+        &scope,
+        providers::codex::EXACT_CODEX_VERSION,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(account_error.contains("conditional server name"));
+    assert!(account_error.contains("user configuration is ignored"));
+    assert_eq!(
+        launch(Provider::Codex, providers::codex::EXACT_CODEX_VERSION)
+            .unwrap_err()
+            .to_string(),
+        account_error
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// A synthetic store whose Single agent writer contracts are qualified. It
@@ -34861,10 +35433,74 @@ fn single_agent_selection_admission_and_profiles_are_exact() {
             "profile_revision_id":new_revision,"check_ids":[]}
     }))
     .unwrap();
+    let readiness = workflow::state(&fixture.store)
+        .unwrap()
+        .decisions
+        .into_iter()
+        .find(|decision| decision.subject.task_id.as_deref() == Some(task_id.as_str()))
+        .unwrap();
+    assert_eq!(
+        readiness.primary_blocker.as_ref().unwrap().code,
+        "task.single_agent_admission"
+    );
+    assert!(!readiness
+        .control_policy
+        .allowed_controls
+        .contains(&"make_ready".into()));
     let error = make_ready(&fixture, &task_id, reselected.version.unwrap())
         .unwrap_err()
         .to_string();
     assert!(error.contains("not admitted"), "{error}");
+    let pending = workflow_command(&fixture, serde_json::json!({
+        "kind":"prepare_profile_admission","operation_id":"revised-admission","project_id":setup.project_id,
+        "profile_revision_id":new_revision,"execution_config_revision_id":setup.config_id
+    })).unwrap();
+    let queued = workflow_command(&fixture, serde_json::json!({
+        "kind":"probe_profile_admission","operation_id":"revised-probe","project_id":setup.project_id,
+        "admission_id":pending.entity_id
+    })).unwrap();
+    let probe_task = queued.detail["probe_task_id"].as_str().unwrap();
+    let before = workflow::state(&fixture.store)
+        .unwrap()
+        .workflow_execution
+        .into_iter()
+        .flat_map(|project| project.admissions)
+        .find(|admission| admission.id == pending.entity_id)
+        .unwrap();
+    assert!(!before.probe_available);
+    assert!(before.state_reason.unwrap().contains("queued"));
+    let (context, _) = running_single_agent(&fixture, probe_task);
+    let app = single_agent_application(&fixture);
+    exit_single_agent(&fixture, &context);
+    tick_until(&fixture, &app, "held");
+    let probe_version: i64 = fixture.scalar(&format!(
+        "SELECT version FROM tasks WHERE id='{probe_task}'"
+    ));
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: "cancel-revised-probe".into(),
+            task_id: probe_task.into(),
+            expected_version: probe_version,
+            action: "cancel".into(),
+            payload: serde_json::Value::Null,
+        },
+    )
+    .unwrap();
+    tick_until(&fixture, &app, "cancel");
+    let after = workflow::state(&fixture.store)
+        .unwrap()
+        .workflow_execution
+        .into_iter()
+        .flat_map(|project| project.admissions)
+        .find(|admission| admission.id == pending.entity_id)
+        .unwrap();
+    assert!(after.probe_available);
+    assert!(after.state_reason.unwrap().contains("cancelled"));
+    fixture.assert_scalar(
+        &format!("SELECT COUNT(*) FROM tasks WHERE id='{probe_task}' AND lifecycle='cancelled'"),
+        1_i64,
+    );
     let unknown_check = workflow_command(
         &fixture,
         serde_json::json!({
@@ -35008,6 +35644,13 @@ fn single_agent_selected_checks_run_only_under_exact_human_authorization() {
     assert!(run_state
         .available_actions
         .contains(&"authorize_check".to_owned()));
+    let state = workflow::state(&fixture.store).unwrap();
+    let check_notice = state
+        .attention
+        .iter()
+        .find(|item| item.id == format!("attempt:{}:awaiting_checks", context.attempt_id))
+        .expect("check authorization opens the captured result's decisions");
+    assert_eq!(check_notice.action.kind, AttentionActionKind::ReviewResult);
     assert!(!run_state
         .available_actions
         .contains(&"accept_result".to_owned()));
@@ -35091,6 +35734,73 @@ fn single_agent_selected_checks_run_only_under_exact_human_authorization() {
     )
     .unwrap();
     assert_eq!(accepted.state, "accepted");
+    let reloaded = workflow::state(&Store::open(&fixture.database).unwrap()).unwrap();
+    let accepted_run = reloaded
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .and_then(|task| task.workflow.as_ref())
+        .and_then(|workflow| workflow.run.as_ref())
+        .unwrap();
+    assert!(accepted_run.available_actions.is_empty());
+    assert_eq!(accepted_run.checks.len(), 1);
+    assert_eq!(accepted_run.checks[0].latest_run_passed, Some(true));
+    assert_eq!(
+        accepted_run.checks[0].latest_run_id.as_deref(),
+        Some(finished["result"]["check_id"].as_str().unwrap())
+    );
+    assert!(app
+        .checks
+        .run_single_agent_check(&context.attempt_id, &check_id)
+        .unwrap_err()
+        .to_string()
+        .contains("not current"));
+    assert!(authorize(
+        "authorize-after-acceptance",
+        &check.exact_command_hash,
+        "authorized",
+        "once"
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("no longer waiting"));
+    let terminal_version: i64 =
+        fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task_id}'"));
+    assert!(app.execute_workflow_command(&serde_json::from_value(serde_json::json!({
+        "kind":"resume_run","operation_id":"resume-accepted","task_id":task_id,
+        "attempt_id":context.attempt_id,"expected_version":terminal_version,
+        "session_id":context.session_id,"transcript_epoch":context.transcript_epoch,"message":null
+    })).unwrap()).is_err());
+    fixture.assert_scalar("SELECT COUNT(*) FROM check_runs", 1_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM workflow_check_authorizations", 2_i64);
+    fixture.assert_scalar(
+        &format!(
+            "SELECT COUNT(*) FROM resume_invocations WHERE session_id='{}'",
+            context.session_id
+        ),
+        0_i64,
+    );
+    fixture.execute(
+        "UPDATE check_runs SET candidate_hash='foreign-candidate' WHERE attempt_id=?1",
+        params![context.attempt_id],
+    );
+    assert_eq!(
+        single_agent_run(&fixture, &task_id).checks[0].latest_run_passed,
+        None
+    );
+    fixture.execute(
+        "UPDATE check_runs SET candidate_hash=?1 WHERE attempt_id=?2",
+        params![candidate, context.attempt_id],
+    );
+    let receipts: String =
+        fixture.scalar("SELECT check_receipts_json FROM workflow_result_acceptances");
+    fixture.execute("UPDATE workflow_result_acceptances SET check_receipts_json=json_set(check_receipts_json,'$.check_runs','unavailable')",
+        []);
+    assert!(single_agent_run(&fixture, &task_id).checks.is_empty());
+    fixture.execute(
+        "UPDATE workflow_result_acceptances SET check_receipts_json=?1",
+        params![receipts],
+    );
     fixture.assert_scalar(
         "SELECT json_array_length(check_receipts_json,'$.check_runs') FROM workflow_result_acceptances",
         1_i64,
@@ -35770,8 +36480,41 @@ fn single_agent_project_is_not_asked_to_install_trip_it_does_not_run() {
     assert!(!setup_notice());
     // Single agent work keeps it that way; the notice never needs dismissing.
     let (task_id, version) = single_agent_task(&fixture, &setup);
+    let decision = workflow::state(&fixture.store)
+        .unwrap()
+        .decisions
+        .into_iter()
+        .find(|decision| decision.subject.task_id.as_deref() == Some(task_id.as_str()))
+        .unwrap();
+    assert!(decision.primary_blocker.is_none(), "{decision:?}");
+    assert_eq!(decision.control_policy.allowed_controls, ["make_ready"]);
+    assert!(decision.prerequisites.iter().all(|item| {
+        !matches!(
+            item.code.as_str(),
+            "task.project_ready" | "task.six_role_settings"
+        )
+    }));
     make_ready(&fixture, &task_id, version).unwrap();
     assert!(!setup_notice());
+    let (draft, draft_version) = single_agent_task(&fixture, &setup);
+    fixture.execute(
+        "UPDATE projects SET base_revision='stale-starting-commit' WHERE id=?1",
+        params![setup.project_id],
+    );
+    let held = workflow::state(&fixture.store)
+        .unwrap()
+        .decisions
+        .into_iter()
+        .find(|decision| decision.subject.task_id.as_deref() == Some(draft.as_str()))
+        .unwrap();
+    assert!(!held
+        .control_policy
+        .allowed_controls
+        .contains(&"make_ready".into()));
+    assert!(make_ready(&fixture, &draft, draft_version)
+        .unwrap_err()
+        .to_string()
+        .contains("registered starting commit"));
 }
 
 #[test]
@@ -36053,7 +36796,24 @@ fn single_agent_new_task_resolves_the_default_only_at_creation() {
 
 #[test]
 fn single_agent_probe_is_refused_while_the_writer_contract_is_unqualified() {
-    let fixture = Fixture::new("single-agent-unqualified-probe");
+    let mut fixture = Fixture::new("single-agent-unqualified-probe");
+    let mut claude_policy: serde_json::Value = serde_json::from_str(include_str!(
+        "../resources/provider-compatibility/single-agent-claude.json"
+    ))
+    .unwrap();
+    claude_policy["selectors"][0]["contracts"][1]["qualification"] = serde_json::json!({
+        "state":"unqualified","reason":"The synthetic Claude writer is not qualified."
+    });
+    let bundles = agenticjira::provider_compatibility::BundleSet::embedded()
+        .with_policy_packs_for_tests(
+            include_str!("../resources/provider-compatibility/single-agent-codex.json"),
+            &claude_policy.to_string(),
+        );
+    fixture.store = fixture
+        .store
+        .clone()
+        .with_synthetic_bundles_for_tests(bundles)
+        .unwrap();
     let repository = fixture.repository("single-agent-repo");
     let project_id = workflow::execute(
         &fixture.store,
@@ -36089,8 +36849,7 @@ fn single_agent_probe_is_refused_while_the_writer_contract_is_unqualified() {
         }),
     )
     .unwrap();
-    // The embedded release's own policy keeps the probe unavailable, and the
-    // dashboard shows exactly the refusal the command gives.
+    // The synthetic unqualified policy's refusal must match the dashboard's reason.
     let admission = workflow::state(&fixture.store)
         .unwrap()
         .workflow_execution

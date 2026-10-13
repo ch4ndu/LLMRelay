@@ -1402,6 +1402,312 @@ async fn service_requested_stop_allows_exact_descendant_to_settle() {
         ],
         supervision_executable: std::path::PathBuf::from(env!("CARGO_BIN_EXE_agenticjira")),
     };
+    use std::io::{Read, Write};
+    use std::os::unix::process::CommandExt;
+
+    struct StartupWrapper(std::process::Child);
+    impl Drop for StartupWrapper {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let leader = self.0.id() as libc::pid_t;
+                // The unreaped child still owns this isolated group during assertion unwinding.
+                if unsafe { libc::getpgid(leader) } == leader {
+                    unsafe { libc::killpg(leader, libc::SIGKILL) };
+                }
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    let project = &launch.config.cwd;
+    let receipt_path = project.join("startup-wrapper-receipt.json");
+    let mut wrapper = StartupWrapper(
+        std::process::Command::new(&launch.supervision_executable)
+            .arg("internal-launch")
+            .arg("--anchor")
+            .arg(&receipt_path)
+            .args(["--executable", "/bin/sh", "--", "-c"])
+            .arg(
+                r"printf 'REAL_WRAPPER_STARTUP_STDOUT\n'
+printf 'REAL_WRAPPER_STARTUP_ERROR\n' >&2
+printf 'started\n' >> wrapper-startup-count
+IFS= read -r release || exit 24
+exit 23
+",
+            )
+            .current_dir(project)
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    // Hold the child alive until the real wrapper has published its generation anchors.
+    let mut spawned = None;
+    for _ in 0..200 {
+        if let Ok(bytes) = std::fs::read(&receipt_path) {
+            let receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(receipt["state"], "provider_spawned", "{receipt}");
+            spawned = Some(receipt);
+            break;
+        }
+        assert!(wrapper.0.try_wait().unwrap().is_none());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let spawned = spawned.expect("the held child must have a real wrapper receipt");
+    assert_eq!(spawned["leader"]["pid"], wrapper.0.id());
+    assert_eq!(spawned["leader"]["process_group_id"], wrapper.0.id());
+    assert_eq!(
+        spawned["provider"]["process_group_id"],
+        spawned["leader"]["process_group_id"]
+    );
+    assert_eq!(
+        spawned["provider"]["boot_identity"],
+        spawned["leader"]["boot_identity"]
+    );
+    for anchor in ["leader", "provider"] {
+        assert!(!spawned[anchor]["native_start_marker"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+        assert!(!spawned[anchor]["boot_identity"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+    }
+    wrapper
+        .0
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"release\n")
+        .unwrap();
+    let mut wrapper_exit = None;
+    for _ in 0..200 {
+        if let Some(status) = wrapper.0.try_wait().unwrap() {
+            wrapper_exit = Some(status);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        wrapper_exit.expect("released wrapper must exit").code(),
+        Some(23)
+    );
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    wrapper
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    wrapper
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(stdout.contains("REAL_WRAPPER_STARTUP_STDOUT"), "{stdout}");
+    assert!(stderr.contains("REAL_WRAPPER_STARTUP_ERROR"), "{stderr}");
+    let exited: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(exited["state"], "provider_exited", "{exited}");
+    assert_eq!(exited["exit_code"], 23);
+    assert!(exited["signal"].is_null());
+    assert_eq!(exited["leader"], spawned["leader"]);
+    assert_eq!(exited["provider"], spawned["provider"]);
+    assert_eq!(
+        std::fs::read_to_string(project.join("wrapper-startup-count")).unwrap(),
+        "started\n"
+    );
+    assert_eq!(unsafe { libc::killpg(wrapper.0.id() as i32, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+
+    database.execute_batch(
+        "INSERT INTO provider_validation_batches(id,operation_id,request_hash,preview_hash,selection_json,
+           max_fresh_calls,native_calls_authorized,state,created_at,updated_at)
+           VALUES('startup-batch','startup-op','h','p','[]',1,1,'running','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+         INSERT INTO provider_validation_invocations(id,batch_id,ordinal,provider,model,effort,evidence_key,
+           state,created_at,updated_at)
+           VALUES('startup-invocation','startup-batch',0,'codex','inert-local','none','startup-key',
+             'reserved','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+         INSERT INTO sessions(id,role_generation_id,provider_validation_invocation_id,provider,status,
+           launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+           VALUES('startup-session',NULL,'startup-invocation','codex','launch_reserved','{}','fixture',
+             '00000000-0000-4000-8000-000000000004','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+    ).unwrap();
+    let mut short_launch = launch.clone();
+    short_launch.executable = "/bin/sh".into();
+    short_launch.config.executable = short_launch.executable.clone();
+    short_launch.environment.clear();
+    short_launch.arguments = vec![
+        "-c".into(),
+        r"printf 'REAL_WRAPPER_STARTUP_STDOUT\n'
+printf 'REAL_WRAPPER_STARTUP_ERROR\n' >&2
+printf 'started\n' >> startup-count
+exit 23
+"
+        .into(),
+    ];
+    // This child may exit either before or after the supervisor verifies its live identity.
+    let group = match supervisor.spawn(
+        "startup-session",
+        &SessionOwner::ProviderValidationInvocation("startup-invocation".into()),
+        "00000000-0000-4000-8000-000000000004",
+        &short_launch,
+    ) {
+        Err(failure) => {
+            assert!(matches!(
+                failure,
+                agenticjira::supervisor::SpawnFailure::DeliveryUnknown { .. }
+            ));
+            assert!(!failure.reason().contains("not rooted"), "{failure}");
+            store
+                .mark_session_delivery_ambiguous("startup-session", failure.reason())
+                .unwrap();
+            let failed: (String, String, bool) = database
+                .query_row(
+                    "SELECT status,capture_state,exit_json IS NULL FROM sessions WHERE id='startup-session'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(failed, ("recovery_required".into(), "failed".into(), true));
+            let held: (String, bool, i64) = database
+                .query_row(
+                    "SELECT i.state,s.process_identity_json IS NULL,
+                        (SELECT COUNT(*) FROM provider_validation_invocations)
+                     FROM provider_validation_invocations i JOIN sessions s
+                       ON s.provider_validation_invocation_id=i.id WHERE s.id='startup-session'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(held, ("delivery_unknown".into(), true, 1));
+            match failure {
+                agenticjira::supervisor::SpawnFailure::DeliveryUnknown {
+                    process_group_id, ..
+                } => process_group_id.expect("the local PTY wrapper must expose its process group"),
+                _ => unreachable!(),
+            }
+        }
+        Ok(process) => {
+            let process_json = serde_json::to_string(&process).unwrap();
+            store
+                .update_session_running(
+                    "startup-session",
+                    "00000000-0000-4000-8000-000000000004",
+                    &process_json,
+                )
+                .unwrap();
+            for _ in 0..200 {
+                supervisor.reconcile().unwrap();
+                let complete: bool = database
+                    .query_row(
+                        "SELECT status='exited' AND capture_state='complete'
+                         FROM sessions WHERE id='startup-session'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                if complete {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let settled: (String, String, String, String, String) = database
+                .query_row(
+                    "SELECT status,capture_state,process_identity_json,transcript_epoch,exit_json
+                     FROM sessions WHERE id='startup-session'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(settled.0, "exited");
+            assert_eq!(settled.1, "complete");
+            assert_eq!(settled.2, process_json);
+            assert_eq!(settled.3, "00000000-0000-4000-8000-000000000004");
+            let exit: serde_json::Value = serde_json::from_str(&settled.4).unwrap();
+            assert_eq!(exit["code"], 23);
+            assert_eq!(exit["success"], false);
+            assert_eq!(exit["app_stop_requested"], false);
+            assert_eq!(exit["process_group_quiescent"], true);
+            let invocation: (String, i64) = database
+                .query_row(
+                    "SELECT state,(SELECT COUNT(*) FROM provider_validation_invocations)
+                     FROM provider_validation_invocations WHERE id='startup-invocation'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(invocation, ("running".into(), 1));
+            process.process_group_id
+        }
+    };
+    let page = agenticjira::transcript::read_history_page(
+        &paths.transcripts,
+        "startup-session",
+        "00000000-0000-4000-8000-000000000004",
+        0,
+        64 * 1024,
+    )
+    .unwrap();
+    assert!(page.frames.iter().all(|frame| {
+        frame.epoch == "00000000-0000-4000-8000-000000000004"
+            && !frame.gap
+            && frame.encoding == "base64"
+    }));
+    let output = page
+        .frames
+        .iter()
+        .flat_map(|frame| {
+            base64::engine::general_purpose::STANDARD
+                .decode(&frame.data)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("REAL_WRAPPER_STARTUP_STDOUT"), "{output}");
+    assert!(output.contains("REAL_WRAPPER_STARTUP_ERROR"), "{output}");
+    assert!(store
+        .mark_session_spawning(
+            "startup-session",
+            "00000000-0000-4000-8000-000000000004",
+            "boot"
+        )
+        .is_err());
+    let mut absent = false;
+    for _ in 0..200 {
+        if unsafe { libc::killpg(group, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            absent = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(absent, "startup process group {group} remains observable");
+    assert_eq!(
+        std::fs::read_to_string(short_launch.config.cwd.join("startup-count")).unwrap(),
+        "started\n"
+    );
     let identity = supervisor
         .spawn(
             "s",

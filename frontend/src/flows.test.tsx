@@ -9,8 +9,8 @@ import type {
   AttentionItem,
   AttentionTarget,
   CmuxSessionSurface,
-  ContinuationAction,
   CmuxViewOutcome,
+  ContinuationAction,
   DecisionExplanation,
   ObservedUsage,
   PermissionRequest,
@@ -23,9 +23,9 @@ import type {
   StateCursor,
   StateWaitResult,
   Task,
-  TripSetupState,
   TranscriptPage,
   TripSetupProfile,
+  TripSetupState,
   TripTaskVerification,
 } from "./types";
 import type { LiveEnvironment, LiveStatus } from "./liveState";
@@ -73,7 +73,15 @@ const { WorkflowControls } = await import("./components/WorkflowControls");
 const { ModelSelector } = await import("./components/ModelSelector");
 const { Workspace } = await import("./components/Workspace");
 const { SessionTree } = await import("./components/SessionTree");
-const { ApiError, ProtocolError, command, getState, getTaskContent, waitForState, transportTimeouts } = await import("./api");
+const {
+  ApiError,
+  ProtocolError,
+  command,
+  getState,
+  getTaskContent,
+  waitForState,
+  transportTimeouts,
+} = await import("./api");
 const { liveEnvironment, liveTiming, startLiveState } = await import(
   "./liveState"
 );
@@ -98,18 +106,23 @@ const allFeatures = [
   "provider_validation_v1",
   "multi_workflow_v1",
 ];
-const protocolFixture = () => new Response(JSON.stringify({
-  generation: 1,
-  server_version: "fixture",
-  instance_id: "test-instance",
-  supported_features: allFeatures,
-}), { headers: { "content-type": "application/json" } });
+const protocolFixture = () =>
+  new Response(
+    JSON.stringify({
+      generation: 1,
+      server_version: "fixture",
+      instance_id: "test-instance",
+      supported_features: allFeatures,
+    }),
+    { headers: { "content-type": "application/json" } },
+  );
 let protocolFixtureResponder = () => Promise.resolve(protocolFixture());
 const wrapFetch = (source: typeof fetch): FixtureFetch => {
-  const wrapped = ((input: string | URL | Request, init?: RequestInit) =>
-    String(input) === "/api/protocol"
-      ? protocolFixtureResponder()
-      : source(input, init)) as FixtureFetch;
+  const wrapped =
+    ((input: string | URL | Request, init?: RequestInit) =>
+      String(input) === "/api/protocol"
+        ? protocolFixtureResponder()
+        : source(input, init)) as FixtureFetch;
   wrapped[fixtureSource] = source;
   return wrapped;
 };
@@ -305,7 +318,9 @@ Deno.test("M9 Recipes creates an exact draft and explicitly arms a paused schedu
   const requests: Record<string, unknown>[] = [];
   const opened: string[] = [];
   let refreshes = 0;
-  const refreshed = () => { refreshes += 1; };
+  const refreshed = () => {
+    refreshes += 1;
+  };
   let failNextSave = false;
   let failNextConflict = false;
   const currentProject: Project = {
@@ -315,180 +330,423 @@ Deno.test("M9 Recipes creates an exact draft and explicitly arms a paused schedu
   const state: AppState = {
     ...liveBase,
     projects: [currentProject],
-    profile_sets: [{ id: "profile-1", project_id: "p1", name: "Saved roles", version: 1,
-      archived: false, revision: 1, revision_id: "profile-rev-1",
-      roles: inheritedRoles as Record<(typeof ROLES)[number], { provider: "codex"; model: string; effort: string }>,
-      config_revision_id: "config-1", configuration_hash: "hash-1" }],
-    task_recipes: [{ id: "recipe-1", project_id: "p1", name: "Review", version: 2,
-      archived: false, revision: 2, revision_id: "recipe-rev-2", title: "Review change",
-      description: "", acceptance_criteria: ["Evidence"], priority: 0,
-      profile_revision_id: "profile-rev-1", required_check_ids: ["old-check"],
-      config_revision_id: "config-1", configuration_hash: "hash-1",
-      workflow_version: "workflow-1", workflow_hash: "workflow-hash" }],
-    recipe_schedules: [{ id: "schedule-1", project_id: "p1", name: "Morning", version: 1,
-      archived: false, paused: true, recipe_revision_id: "recipe-rev-2", recipe_name: "Review",
+    profile_sets: [{
+      id: "profile-1",
+      project_id: "p1",
+      name: "Saved roles",
+      version: 1,
+      archived: false,
+      revision: 1,
+      revision_id: "profile-rev-1",
+      roles: inheritedRoles as Record<
+        (typeof ROLES)[number],
+        { provider: "codex"; model: string; effort: string }
+      >,
+      config_revision_id: "config-1",
+      configuration_hash: "hash-1",
+    }],
+    task_recipes: [{
+      id: "recipe-1",
+      project_id: "p1",
+      name: "Review",
+      version: 2,
+      archived: false,
+      revision: 2,
+      revision_id: "recipe-rev-2",
+      title: "Review change",
+      description: "",
+      acceptance_criteria: ["Evidence"],
+      priority: 0,
+      profile_revision_id: "profile-rev-1",
+      required_check_ids: ["old-check"],
+      config_revision_id: "config-1",
+      configuration_hash: "hash-1",
+      workflow_version: "workflow-1",
+      workflow_hash: "workflow-hash",
+    }],
+    recipe_schedules: [{
+      id: "schedule-1",
+      project_id: "p1",
+      name: "Morning",
+      version: 1,
+      archived: false,
+      paused: true,
+      recipe_revision_id: "recipe-rev-2",
+      recipe_name: "Review",
       recipe_config_revision_id: "config-1",
-      recipe_archived: false, cadence: "daily", anchor_utc: "2026-10-01T09:00:00Z",
-      next_fire_utc: null, last_fire: null }],
+      recipe_archived: false,
+      cadence: "daily",
+      anchor_utc: "2026-10-01T09:00:00Z",
+      next_fire_utc: null,
+      last_fire: null,
+    }],
   };
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    requests.push(body);
-    if (failNextSave) {
-      failNextSave = false;
-      throw new ApiError("unknown save outcome", 0, String(body.operation_id), true);
-    }
-    if (failNextConflict) {
-      failNextConflict = false;
-      throw new ApiError("version conflict", 409);
-    }
-    return new Response(JSON.stringify({ result: { entity_id: "AJ-created", version: 1 } }));
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      if (failNextSave) {
+        failNextSave = false;
+        throw new ApiError(
+          "unknown save outcome",
+          0,
+          String(body.operation_id),
+          true,
+        );
+      }
+      if (failNextConflict) {
+        failNextConflict = false;
+        throw new ApiError("version conflict", 409);
+      }
+      return new Response(
+        JSON.stringify({ result: { entity_id: "AJ-created", version: 1 } }),
+      );
+    }) as typeof fetch;
   try {
-    mount(<Recipes state={state} project={currentProject} onChanged={refreshed} onOpenTask={(id) => opened.push(id)} />);
+    mount(
+      <Recipes
+        state={state}
+        project={currentProject}
+        onChanged={refreshed}
+        onOpenTask={(id) => opened.push(id)}
+      />,
+    );
     field("Name", "Unsaved profile edits");
-    rerender(<Recipes state={{ ...state, revision: "2" }} project={currentProject} onChanged={noop} onOpenTask={(id) => opened.push(id)} />);
-    check(findField("Name").value === "Unsaved profile edits", "polling reset the dirty profile form");
+    rerender(
+      <Recipes
+        state={{ ...state, revision: "2" }}
+        project={currentProject}
+        onChanged={noop}
+        onOpenTask={(id) => opened.push(id)}
+      />,
+    );
+    check(
+      findField("Name").value === "Unsaved profile edits",
+      "polling reset the dirty profile form",
+    );
     click("Save profile set");
     await settle();
-    const profileSave = requests.find((body) => body.kind === "upsert_profile_set");
-    check(profileSave?.name === "Unsaved profile edits" && profileSave.profile_set_id === null &&
-      profileSave.expected_version === null && Object.keys(profileSave.roles as object).length === 6,
-      "profile save did not submit the six-role configuration");
+    const profileSave = requests.find((body) =>
+      body.kind === "upsert_profile_set"
+    );
+    check(
+      profileSave?.name === "Unsaved profile edits" &&
+        profileSave.profile_set_id === null &&
+        profileSave.expected_version === null &&
+        Object.keys(profileSave.roles as object).length === 6,
+      "profile save did not submit the six-role configuration",
+    );
     const sections = [...document.querySelectorAll("section.panel")];
-    const profilePanel = sections.find((element) => element.querySelector("h2")?.textContent === "Profile sets")!;
-    act(() => profilePanel.querySelector<HTMLButtonElement>("article button")!.click());
+    const profilePanel = sections.find((element) =>
+      element.querySelector("h2")?.textContent === "Profile sets"
+    )!;
+    act(() =>
+      profilePanel.querySelector<HTMLButtonElement>("article button")!.click()
+    );
     field("Name", "Edited saved roles");
     click("Save profile set");
     await settle();
-    check(requests.some((body) => body.kind === "upsert_profile_set" && body.profile_set_id === "profile-1" &&
-      body.expected_version === 1 && body.name === "Edited saved roles"),
-      "profile edit lost its identity or version");
-    act(() => profilePanel.querySelectorAll<HTMLButtonElement>("article button")[1].click());
+    check(
+      requests.some((body) =>
+        body.kind === "upsert_profile_set" &&
+        body.profile_set_id === "profile-1" &&
+        body.expected_version === 1 && body.name === "Edited saved roles"
+      ),
+      "profile edit lost its identity or version",
+    );
+    act(() =>
+      profilePanel.querySelectorAll<HTMLButtonElement>("article button")[1]
+        .click()
+    );
     await settle();
-    check(requests.some((body) => body.kind === "archive_profile_set" &&
-      body.profile_set_id === "profile-1" && body.expected_version === 1),
-      "profile Archive lost its identity or version");
-    const recipePanel = sections.find((element) => element.querySelector("h2")?.textContent === "Task recipes")!;
-    const recipeFields = recipePanel.querySelectorAll<HTMLInputElement>("input");
+    check(
+      requests.some((body) =>
+        body.kind === "archive_profile_set" &&
+        body.profile_set_id === "profile-1" && body.expected_version === 1
+      ),
+      "profile Archive lost its identity or version",
+    );
+    const recipePanel = sections.find((element) =>
+      element.querySelector("h2")?.textContent === "Task recipes"
+    )!;
+    const recipeFields = recipePanel.querySelectorAll<HTMLInputElement>(
+      "input",
+    );
     change(recipeFields[0], "New review");
     change(recipeFields[1], "Review exact revision");
-    change(recipePanel.querySelector<HTMLSelectElement>("select")!, "profile-rev-1");
+    change(
+      recipePanel.querySelector<HTMLSelectElement>("select")!,
+      "profile-rev-1",
+    );
     click("Save recipe");
     await settle();
-    const recipeSave = requests.find((body) => body.kind === "upsert_task_recipe");
-    check(recipeSave?.title === "Review exact revision" && recipeSave.profile_revision_id === "profile-rev-1" &&
-      recipeSave.recipe_id === null && recipeSave.expected_version === null,
-      "recipe save did not submit the selected profile revision");
-    act(() => recipePanel.querySelector<HTMLButtonElement>("article button")!.click());
+    const recipeSave = requests.find((body) =>
+      body.kind === "upsert_task_recipe"
+    );
+    check(
+      recipeSave?.title === "Review exact revision" &&
+        recipeSave.profile_revision_id === "profile-rev-1" &&
+        recipeSave.recipe_id === null && recipeSave.expected_version === null,
+      "recipe save did not submit the selected profile revision",
+    );
+    act(() =>
+      recipePanel.querySelector<HTMLButtonElement>("article button")!.click()
+    );
     click("Save recipe");
     await settle();
-    check(requests.some((body) => body.kind === "upsert_task_recipe" &&
-      body.recipe_id === "recipe-1" && body.expected_version === 2 &&
-      Array.isArray(body.required_check_ids) && body.required_check_ids.length === 0),
-      "recipe edit reused a historical check instead of requiring reselection");
-    const schedulePanel = sections.find((element) => element.querySelector("h2")?.textContent === "Foreground schedules")!;
-    const scheduleInputs = schedulePanel.querySelectorAll<HTMLInputElement>("input");
+    check(
+      requests.some((body) =>
+        body.kind === "upsert_task_recipe" &&
+        body.recipe_id === "recipe-1" && body.expected_version === 2 &&
+        Array.isArray(body.required_check_ids) &&
+        body.required_check_ids.length === 0
+      ),
+      "recipe edit reused a historical check instead of requiring reselection",
+    );
+    const schedulePanel = sections.find((element) =>
+      element.querySelector("h2")?.textContent === "Foreground schedules"
+    )!;
+    const scheduleInputs = schedulePanel.querySelectorAll<HTMLInputElement>(
+      "input",
+    );
     change(scheduleInputs[0], "Weekly review");
-    change(schedulePanel.querySelector<HTMLSelectElement>("select")!, "recipe-rev-2");
-    change(schedulePanel.querySelectorAll<HTMLSelectElement>("select")[1], "weekly");
+    change(
+      schedulePanel.querySelector<HTMLSelectElement>("select")!,
+      "recipe-rev-2",
+    );
+    change(
+      schedulePanel.querySelectorAll<HTMLSelectElement>("select")[1],
+      "weekly",
+    );
     change(scheduleInputs[1], "2026-10-01T09:00:00Z");
     click("Save schedule");
     await settle();
-    const scheduleSave = requests.find((body) => body.kind === "upsert_recipe_schedule");
-    check(scheduleSave?.cadence === "weekly" && scheduleSave.recipe_revision_id === "recipe-rev-2" &&
-      scheduleSave.schedule_id === null && scheduleSave.expected_version === null,
-      "schedule create did not submit the selected revision and cadence");
+    const scheduleSave = requests.find((body) =>
+      body.kind === "upsert_recipe_schedule"
+    );
+    check(
+      scheduleSave?.cadence === "weekly" &&
+        scheduleSave.recipe_revision_id === "recipe-rev-2" &&
+        scheduleSave.schedule_id === null &&
+        scheduleSave.expected_version === null,
+      "schedule create did not submit the selected revision and cadence",
+    );
     click("Create draft");
     await settle();
-    const draft = requests.find((body) => body.kind === "create_draft_from_recipe");
-    check(draft?.recipe_id === "recipe-1" && draft.recipe_revision_id === "recipe-rev-2" &&
-      draft.expected_recipe_version === 2 && opened[0] === "AJ-created",
-      "manual draft did not use exact recipe identity or navigate to the task");
-    act(() => recipePanel.querySelectorAll<HTMLButtonElement>("article button")[2].click());
+    const draft = requests.find((body) =>
+      body.kind === "create_draft_from_recipe"
+    );
+    check(
+      draft?.recipe_id === "recipe-1" &&
+        draft.recipe_revision_id === "recipe-rev-2" &&
+        draft.expected_recipe_version === 2 && opened[0] === "AJ-created",
+      "manual draft did not use exact recipe identity or navigate to the task",
+    );
+    act(() =>
+      recipePanel.querySelectorAll<HTMLButtonElement>("article button")[2]
+        .click()
+    );
     await settle();
-    check(requests.some((body) => body.kind === "archive_task_recipe" &&
-      body.recipe_id === "recipe-1" && body.expected_version === 2),
-      "recipe Archive lost its identity or version");
+    check(
+      requests.some((body) =>
+        body.kind === "archive_task_recipe" &&
+        body.recipe_id === "recipe-1" && body.expected_version === 2
+      ),
+      "recipe Archive lost its identity or version",
+    );
     click("Enable");
     await settle();
-    const enable = requests.find((body) => body.kind === "resume_recipe_schedule");
-    check(enable?.schedule_id === "schedule-1" && enable.expected_version === 1,
-      "Enable did not submit the sole arming command");
-    act(() => schedulePanel.querySelector<HTMLButtonElement>("article button")!.click());
-    change(schedulePanel.querySelectorAll<HTMLSelectElement>("select")[1], "weekly");
+    const enable = requests.find((body) =>
+      body.kind === "resume_recipe_schedule"
+    );
+    check(
+      enable?.schedule_id === "schedule-1" && enable.expected_version === 1,
+      "Enable did not submit the sole arming command",
+    );
+    act(() =>
+      schedulePanel.querySelector<HTMLButtonElement>("article button")!.click()
+    );
+    change(
+      schedulePanel.querySelectorAll<HTMLSelectElement>("select")[1],
+      "weekly",
+    );
     click("Save schedule");
     await settle();
-    check(requests.some((body) => body.kind === "upsert_recipe_schedule" &&
-      body.schedule_id === "schedule-1" && body.expected_version === 1 && body.cadence === "weekly"),
-      "schedule edit lost its identity or expected version");
-    rerender(<Recipes state={{ ...state, recipe_schedules: [{ ...state.recipe_schedules[0], paused: false, version: 2 }] }}
-      project={currentProject} onChanged={noop} onOpenTask={noop} />);
+    check(
+      requests.some((body) =>
+        body.kind === "upsert_recipe_schedule" &&
+        body.schedule_id === "schedule-1" && body.expected_version === 1 &&
+        body.cadence === "weekly"
+      ),
+      "schedule edit lost its identity or expected version",
+    );
+    rerender(
+      <Recipes
+        state={{
+          ...state,
+          recipe_schedules: [{
+            ...state.recipe_schedules[0],
+            paused: false,
+            version: 2,
+          }],
+        }}
+        project={currentProject}
+        onChanged={noop}
+        onOpenTask={noop}
+      />,
+    );
     click("Pause");
     await settle();
-    check(requests.some((body) => body.kind === "pause_recipe_schedule" &&
-      body.schedule_id === "schedule-1" && body.expected_version === 2),
-      "Pause did not submit the schedule version");
-    rerender(<Recipes state={{ ...state, recipe_schedules: [{ ...state.recipe_schedules[0], paused: true,
-      version: 3, last_fire: { outcome: "missed", scheduled_for_utc: "2026-10-01T09:00:00Z",
-        task_id: null, reason: null, missed_count: 1, missed_first_utc: "2026-10-01T09:00:00Z",
-        missed_last_utc: "2026-10-01T09:00:00Z" } }] }}
-      project={currentProject} onChanged={refreshed} onOpenTask={noop} />);
+    check(
+      requests.some((body) =>
+        body.kind === "pause_recipe_schedule" &&
+        body.schedule_id === "schedule-1" && body.expected_version === 2
+      ),
+      "Pause did not submit the schedule version",
+    );
+    rerender(
+      <Recipes
+        state={{
+          ...state,
+          recipe_schedules: [{
+            ...state.recipe_schedules[0],
+            paused: true,
+            version: 3,
+            last_fire: {
+              outcome: "missed",
+              scheduled_for_utc: "2026-10-01T09:00:00Z",
+              task_id: null,
+              reason: null,
+              missed_count: 1,
+              missed_first_utc: "2026-10-01T09:00:00Z",
+              missed_last_utc: "2026-10-01T09:00:00Z",
+            },
+          }],
+        }}
+        project={currentProject}
+        onChanged={refreshed}
+        onOpenTask={noop}
+      />,
+    );
     click("Resume");
     await settle();
-    check(requests.some((body) => body.kind === "resume_recipe_schedule" &&
-      body.schedule_id === "schedule-1" && body.expected_version === 3),
-      "Resume did not submit the paused schedule version");
-    const activeSchedule = [...document.querySelectorAll("section.panel")].find((element) =>
-      element.querySelector("h2")?.textContent === "Foreground schedules")!;
-    act(() => activeSchedule.querySelectorAll<HTMLButtonElement>("article button")[2].click());
+    check(
+      requests.some((body) =>
+        body.kind === "resume_recipe_schedule" &&
+        body.schedule_id === "schedule-1" && body.expected_version === 3
+      ),
+      "Resume did not submit the paused schedule version",
+    );
+    const activeSchedule = [...document.querySelectorAll("section.panel")].find(
+      (element) =>
+        element.querySelector("h2")?.textContent === "Foreground schedules",
+    )!;
+    act(() =>
+      activeSchedule.querySelectorAll<HTMLButtonElement>("article button")[2]
+        .click()
+    );
     await settle();
-    check(requests.some((body) => body.kind === "archive_recipe_schedule" &&
-      body.schedule_id === "schedule-1" && body.expected_version === 3),
-      "schedule Archive did not submit the exact version");
-    act(() => profilePanel.querySelector<HTMLButtonElement>("article button")!.click());
+    check(
+      requests.some((body) =>
+        body.kind === "archive_recipe_schedule" &&
+        body.schedule_id === "schedule-1" && body.expected_version === 3
+      ),
+      "schedule Archive did not submit the exact version",
+    );
+    act(() =>
+      profilePanel.querySelector<HTMLButtonElement>("article button")!.click()
+    );
     field("Name", "Unknown profile result");
     failNextSave = true;
     const refreshBefore = refreshes;
     click("Save profile set");
     await settle();
     const ambiguousSave = requests.at(-1)!;
-    check(refreshes > refreshBefore, "unknown result did not refresh current state");
+    check(
+      refreshes > refreshBefore,
+      "unknown result did not refresh current state",
+    );
     field("Name", "Changed after unknown result");
     const beforeBlocked = requests.length;
     click("Save profile set");
     await settle();
-    check(requests.length === beforeBlocked && document.body.textContent?.includes("unknown result"),
-      "editing an ambiguous save dispatched a second operation");
-    act(() => profilePanel.querySelectorAll<HTMLButtonElement>("article button")[1].click());
+    check(
+      requests.length === beforeBlocked &&
+        document.body.textContent?.includes("unknown result"),
+      "editing an ambiguous save dispatched a second operation",
+    );
+    act(() =>
+      profilePanel.querySelectorAll<HTMLButtonElement>("article button")[1]
+        .click()
+    );
     await settle();
-    check(requests.length === beforeBlocked, "cross-action Archive bypassed the pending profile edit");
-    const refreshedState = { ...state, profile_sets: [{ ...state.profile_sets[0], version: 2,
-      name: "Unknown profile result" }] };
-    rerender(<Recipes state={refreshedState} project={currentProject} onChanged={refreshed} onOpenTask={noop} />);
-    act(() => profilePanel.querySelector<HTMLButtonElement>("article button")!.click());
-    check(findField("Name").value === "Unknown profile result", "refreshed profile was not selectable");
+    check(
+      requests.length === beforeBlocked,
+      "cross-action Archive bypassed the pending profile edit",
+    );
+    const refreshedState = {
+      ...state,
+      profile_sets: [{
+        ...state.profile_sets[0],
+        version: 2,
+        name: "Unknown profile result",
+      }],
+    };
+    rerender(
+      <Recipes
+        state={refreshedState}
+        project={currentProject}
+        onChanged={refreshed}
+        onOpenTask={noop}
+      />,
+    );
+    act(() =>
+      profilePanel.querySelector<HTMLButtonElement>("article button")!.click()
+    );
+    check(
+      findField("Name").value === "Unknown profile result",
+      "refreshed profile was not selectable",
+    );
     unmount();
-    mount(<Recipes state={refreshedState} project={currentProject} onChanged={refreshed} onOpenTask={noop} />);
-    const remountedProfile = [...document.querySelectorAll("section.panel")].find((element) =>
-      element.querySelector("h2")?.textContent === "Profile sets")!;
-    act(() => remountedProfile.querySelector<HTMLButtonElement>("article button")!.click());
+    mount(
+      <Recipes
+        state={refreshedState}
+        project={currentProject}
+        onChanged={refreshed}
+        onOpenTask={noop}
+      />,
+    );
+    const remountedProfile = [...document.querySelectorAll("section.panel")]
+      .find((element) =>
+        element.querySelector("h2")?.textContent === "Profile sets"
+      )!;
+    act(() =>
+      remountedProfile.querySelector<HTMLButtonElement>("article button")!
+        .click()
+    );
     field("Name", "Modified after remount");
     click("Save profile set");
     await settle();
-    check(requests.length === beforeBlocked && document.body.textContent?.includes("Retry exact pending request"),
-      "remount lost the pending guard");
+    check(
+      requests.length === beforeBlocked &&
+        document.body.textContent?.includes("Retry exact pending request"),
+      "remount lost the pending guard",
+    );
     click("Retry exact pending request");
     await settle();
-    check(requests.at(-1)?.operation_id === ambiguousSave.operation_id &&
-      JSON.stringify(requests.at(-1)) === JSON.stringify(ambiguousSave),
-      "explicit retry changed the pending body or operation identity");
+    check(
+      requests.at(-1)?.operation_id === ambiguousSave.operation_id &&
+        JSON.stringify(requests.at(-1)) === JSON.stringify(ambiguousSave),
+      "explicit retry changed the pending body or operation identity",
+    );
     click("Save profile set");
     await settle();
-    check(requests.at(-1)?.name === "Modified after remount" &&
-      requests.at(-1)?.profile_set_id === "profile-1" &&
-      requests.at(-1)?.operation_id !== ambiguousSave.operation_id,
-      "existing-ID edit did not remain bound after exact retry receipt");
+    check(
+      requests.at(-1)?.name === "Modified after remount" &&
+        requests.at(-1)?.profile_set_id === "profile-1" &&
+        requests.at(-1)?.operation_id !== ambiguousSave.operation_id,
+      "existing-ID edit did not remain bound after exact retry receipt",
+    );
     field("Name", "Conflict profile result");
     failNextConflict = true;
     click("Save profile set");
@@ -497,9 +755,11 @@ Deno.test("M9 Recipes creates an exact draft and explicitly arms a paused schedu
     field("Name", "Edited after conflict");
     click("Save profile set");
     await settle();
-    check(requests.at(-1)?.operation_id !== conflictId &&
-      requests.at(-1)?.name === "Edited after conflict",
-      "conflict retry failed to submit the edited intent with a fresh identity");
+    check(
+      requests.at(-1)?.operation_id !== conflictId &&
+        requests.at(-1)?.name === "Edited after conflict",
+      "conflict retry failed to submit the edited intent with a fresh identity",
+    );
     click("New");
     field("Name", "Creation with lost response");
     failNextSave = true;
@@ -507,32 +767,80 @@ Deno.test("M9 Recipes creates an exact draft and explicitly arms a paused schedu
     await settle();
     const unknownCreate = requests.at(-1)!;
     const beforeCreateRetry = requests.length;
-    check(unknownCreate.profile_set_id === null &&
-      sessionStorage.getItem("llmrelay.m9.pending-commands.v1")?.includes(String(unknownCreate.operation_id)),
-      "unknown create was not retained before navigation");
-    const otherProject = { ...currentProject, id: "p2", display_name: "Other project" };
-    rerender(<Recipes state={{ ...state, projects: [currentProject, otherProject] }}
-      project={otherProject} onChanged={refreshed} onOpenTask={noop} />);
-    rerender(<Recipes state={state} project={currentProject} onChanged={refreshed} onOpenTask={noop} />);
+    check(
+      unknownCreate.profile_set_id === null &&
+        sessionStorage.getItem("llmrelay.m9.pending-commands.v1")?.includes(
+          String(unknownCreate.operation_id),
+        ),
+      "unknown create was not retained before navigation",
+    );
+    const otherProject = {
+      ...currentProject,
+      id: "p2",
+      display_name: "Other project",
+    };
+    rerender(
+      <Recipes
+        state={{ ...state, projects: [currentProject, otherProject] }}
+        project={otherProject}
+        onChanged={refreshed}
+        onOpenTask={noop}
+      />,
+    );
+    rerender(
+      <Recipes
+        state={state}
+        project={currentProject}
+        onChanged={refreshed}
+        onOpenTask={noop}
+      />,
+    );
     unmount();
-    mount(<Recipes state={state} project={currentProject} onChanged={refreshed} onOpenTask={noop} />);
+    mount(
+      <Recipes
+        state={state}
+        project={currentProject}
+        onChanged={refreshed}
+        onOpenTask={noop}
+      />,
+    );
     field("Name", "Another creation after reload");
     click("Save profile set");
     await settle();
-    check(requests.length === beforeCreateRetry, "unknown create became a fresh create after remount");
+    check(
+      requests.length === beforeCreateRetry,
+      "unknown create became a fresh create after remount",
+    );
     click("Retry exact pending request");
     await settle();
-    check(requests.length === beforeCreateRetry + 1 &&
-      JSON.stringify(requests.at(-1)) === JSON.stringify(unknownCreate) &&
-      document.body.textContent?.includes("New profile set") &&
-      findField("Name").value === "Another creation after reload",
-      "unknown create retry changed the request or rebound an unrelated New profile");
+    check(
+      requests.length === beforeCreateRetry + 1 &&
+        JSON.stringify(requests.at(-1)) === JSON.stringify(unknownCreate) &&
+        document.body.textContent?.includes("New profile set") &&
+        findField("Name").value === "Another creation after reload",
+      "unknown create retry changed the request or rebound an unrelated New profile",
+    );
     field("Name", "Project one draft");
-    rerender(<Recipes state={{ ...state, projects: [currentProject, otherProject] }}
-      project={otherProject} onChanged={noop} onOpenTask={noop} />);
-    check(findField("Name").value === "", "project change retained another project's dirty form");
-    check(requests.every((body) => !["make_ready", "scheduler_run_once", "approve_plan"].includes(String(body.kind))),
-      "recipe controls submitted execution or approval authority");
+    rerender(
+      <Recipes
+        state={{ ...state, projects: [currentProject, otherProject] }}
+        project={otherProject}
+        onChanged={noop}
+        onOpenTask={noop}
+      />,
+    );
+    check(
+      findField("Name").value === "",
+      "project change retained another project's dirty form",
+    );
+    check(
+      requests.every((body) =>
+        !["make_ready", "scheduler_run_once", "approve_plan"].includes(
+          String(body.kind),
+        )
+      ),
+      "recipe controls submitted execution or approval authority",
+    );
   } finally {
     unmount();
     sessionStorage.clear();
@@ -628,9 +936,11 @@ Deno.test("A05 recipe New controls preserve each form identity during deferred s
       "profile New changed identity while its save was pending",
     );
     field("Name", "Profile edit made while saving");
-    deferred[0].resolve(new Response(JSON.stringify({
-      result: { entity_id: "profile-created", version: 1 },
-    })));
+    deferred[0].resolve(
+      new Response(JSON.stringify({
+        result: { entity_id: "profile-created", version: 1 },
+      })),
+    );
     await settle();
     check(
       profilePanel.querySelector("h3")?.textContent === "Edit profile set" &&
@@ -639,7 +949,9 @@ Deno.test("A05 recipe New controls preserve each form identity during deferred s
     );
 
     const recipePanel = panel("Task recipes");
-    const recipeInputs = recipePanel.querySelectorAll<HTMLInputElement>("input");
+    const recipeInputs = recipePanel.querySelectorAll<HTMLInputElement>(
+      "input",
+    );
     change(recipeInputs[0], "Recipe being saved");
     change(recipeInputs[1], "Original recipe task");
     change(
@@ -656,9 +968,11 @@ Deno.test("A05 recipe New controls preserve each form identity during deferred s
       "recipe New changed identity while its save was pending",
     );
     change(recipeInputs[0], "Recipe edit made while saving");
-    deferred[1].resolve(new Response(JSON.stringify({
-      result: { entity_id: "recipe-created", version: 1 },
-    })));
+    deferred[1].resolve(
+      new Response(JSON.stringify({
+        result: { entity_id: "recipe-created", version: 1 },
+      })),
+    );
     await settle();
     check(
       recipePanel.querySelector("h3")?.textContent === "Edit recipe" &&
@@ -678,16 +992,21 @@ Deno.test("A05 recipe New controls preserve each form identity during deferred s
     click("Save schedule");
     await settle();
     const scheduleNew = newButton(schedulePanel);
-    check(scheduleNew.disabled, "schedule New remained enabled during its save");
+    check(
+      scheduleNew.disabled,
+      "schedule New remained enabled during its save",
+    );
     act(() => scheduleNew.click());
     check(
       scheduleInputs[0].value === "Schedule being saved",
       "schedule New changed identity while its save was pending",
     );
     change(scheduleInputs[0], "Schedule edit made while saving");
-    deferred[2].resolve(new Response(JSON.stringify({
-      result: { entity_id: "schedule-created", version: 1 },
-    })));
+    deferred[2].resolve(
+      new Response(JSON.stringify({
+        result: { entity_id: "schedule-created", version: 1 },
+      })),
+    );
     await settle();
     check(
       schedulePanel.querySelector("h3")?.textContent === "Edit schedule" &&
@@ -715,26 +1034,51 @@ Deno.test("M9 App opens created and recovered recipe drafts after authoritative 
     ...liveBase,
     projects: [projectWithRecipe],
     tasks: [],
-    task_recipes: [{ id: "recipe-1", project_id: "p1", name: "Review", version: 2,
-      archived: false, revision: 2, revision_id: "recipe-rev-2", title: "Review change",
-      description: "", acceptance_criteria: [], priority: 0,
-      profile_revision_id: "profile-rev-1", required_check_ids: [],
-      config_revision_id: "config-1", configuration_hash: "hash-1",
-      workflow_version: "workflow-1", workflow_hash: "workflow-hash" }],
+    task_recipes: [{
+      id: "recipe-1",
+      project_id: "p1",
+      name: "Review",
+      version: 2,
+      archived: false,
+      revision: 2,
+      revision_id: "recipe-rev-2",
+      title: "Review change",
+      description: "",
+      acceptance_criteria: [],
+      priority: 0,
+      profile_revision_id: "profile-rev-1",
+      required_check_ids: [],
+      config_revision_id: "config-1",
+      configuration_hash: "hash-1",
+      workflow_version: "workflow-1",
+      workflow_hash: "workflow-hash",
+    }],
   };
-  const created: AppState = { ...initial, revision: "2", tasks: [{
-    ...task, id: "AJ-created", title: "Review change", lifecycle: "backlog",
-    active_attempt: undefined,
-  }] };
+  const created: AppState = {
+    ...initial,
+    revision: "2",
+    tasks: [{
+      ...task,
+      id: "AJ-created",
+      title: "Review change",
+      lifecycle: "backlog",
+      active_attempt: undefined,
+    }],
+  };
   const priorEnvironment = { ...liveEnvironment };
   const requests: Record<string, unknown>[] = [];
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    requests.push(body);
-    return new Response(JSON.stringify({ result: { entity_id: "AJ-created", version: 1 } }));
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      return new Response(
+        JSON.stringify({ result: { entity_id: "AJ-created", version: 1 } }),
+      );
+    }) as typeof fetch;
   try {
-    for (const outcome of ["created", "recovered", "missing", "left"] as const) {
+    for (
+      const outcome of ["created", "recovered", "missing", "left"] as const
+    ) {
       const recovered = outcome === "recovered";
       const live = liveHarness();
       liveEnvironment.transport = live.environment.transport;
@@ -744,12 +1088,22 @@ Deno.test("M9 App opens created and recovered recipe drafts after authoritative 
       localStorage.setItem("agenticjira.project", "p1");
       sessionStorage.clear();
       if (recovered) {
-        const body = { kind: "create_draft_from_recipe", project_id: "p1",
-          operation_id: "pending-create", recipe_id: "recipe-1",
-          recipe_revision_id: "recipe-rev-2", expected_recipe_version: 2 };
-        sessionStorage.setItem("llmrelay.m9.pending-commands.v1", JSON.stringify([{
-          version: 1, resource: "p1:recipe:recipe-1", body,
-        }]));
+        const body = {
+          kind: "create_draft_from_recipe",
+          project_id: "p1",
+          operation_id: "pending-create",
+          recipe_id: "recipe-1",
+          recipe_revision_id: "recipe-rev-2",
+          expected_recipe_version: 2,
+        };
+        sessionStorage.setItem(
+          "llmrelay.m9.pending-commands.v1",
+          JSON.stringify([{
+            version: 1,
+            resource: "p1:recipe:recipe-1",
+            body,
+          }]),
+        );
       }
       mount(<App />);
       await settle();
@@ -757,8 +1111,10 @@ Deno.test("M9 App opens created and recovered recipe drafts after authoritative 
       await settle();
       click(recovered ? "Retry exact pending request" : "Create draft");
       await settle();
-      check(!document.querySelector('[role="dialog"]') && live.reads.length >= 2,
-        "task detail opened before the authoritative read");
+      check(
+        !document.querySelector('[role="dialog"]') && live.reads.length >= 2,
+        "task detail opened before the authoritative read",
+      );
       if (outcome === "left") click("Board");
       const next = outcome === "missing" ? initial : created;
       live.reads[1].resolve(next);
@@ -767,16 +1123,25 @@ Deno.test("M9 App opens created and recovered recipe drafts after authoritative 
         live.reads[index].resolve(next);
         await settle();
       }
-      check(requests.at(-1)?.kind === "create_draft_from_recipe" &&
-        (!recovered || requests.at(-1)?.operation_id === "pending-create"),
-        `${outcome} draft did not submit the exact command`);
+      check(
+        requests.at(-1)?.kind === "create_draft_from_recipe" &&
+          (!recovered || requests.at(-1)?.operation_id === "pending-create"),
+        `${outcome} draft did not submit the exact command`,
+      );
       if (outcome === "created" || outcome === "recovered") {
-        check(document.querySelector('[role="dialog"]')?.getAttribute("data-attention-target") === "task:AJ-created",
-          `${outcome} draft did not open its task detail`);
+        check(
+          document.querySelector('[role="dialog"]')?.getAttribute(
+            "data-attention-target",
+          ) === "task:AJ-created",
+          `${outcome} draft did not open its task detail`,
+        );
       } else {
-        check(!document.querySelector('[role="dialog"]') &&
-          (outcome === "left" || document.body.textContent?.includes("not in the latest state")),
-          `${outcome} draft crossed navigation or selected a task missing from the refresh`);
+        check(
+          !document.querySelector('[role="dialog"]') &&
+            (outcome === "left" ||
+              document.body.textContent?.includes("not in the latest state")),
+          `${outcome} draft crossed navigation or selected a task missing from the refresh`,
+        );
       }
       unmount();
     }
@@ -792,40 +1157,86 @@ Deno.test("M9 App opens created and recovered recipe drafts after authoritative 
 
 Deno.test("M9 exact create retry leaves unrelated recipe and schedule New forms unbound", async () => {
   const requests: Record<string, unknown>[] = [];
-  const currentProject = { ...initialized,
-    trip: { ...initialized.trip!, active_config_revision_id: "config-1" } };
-  const state: AppState = { ...liveBase, projects: [currentProject], tasks: [] };
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    requests.push(JSON.parse(String(init?.body)));
-    return new Response(JSON.stringify({ result: { entity_id: "recovered", version: 1 } }));
-  }) as typeof fetch;
+  const currentProject = {
+    ...initialized,
+    trip: { ...initialized.trip!, active_config_revision_id: "config-1" },
+  };
+  const state: AppState = {
+    ...liveBase,
+    projects: [currentProject],
+    tasks: [],
+  };
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(
+        JSON.stringify({ result: { entity_id: "recovered", version: 1 } }),
+      );
+    }) as typeof fetch;
   try {
-    for (const kind of ["upsert_task_recipe", "upsert_recipe_schedule"] as const) {
+    for (
+      const kind of ["upsert_task_recipe", "upsert_recipe_schedule"] as const
+    ) {
       sessionStorage.clear();
       const recipe = kind === "upsert_task_recipe";
       const body = recipe
-        ? { kind, project_id: "p1", operation_id: "pending-recipe", recipe_id: null,
-          expected_version: null, name: "Original", title: "Original task",
-          description: "", acceptance_criteria: [], priority: 0,
-          profile_revision_id: "profile-rev-1", required_check_ids: [] }
-        : { kind, project_id: "p1", operation_id: "pending-schedule", schedule_id: null,
-          expected_version: null, name: "Original", recipe_revision_id: "recipe-rev-2",
-          cadence: "daily", anchor_utc: "2026-10-01T09:00:00Z" };
-      sessionStorage.setItem("llmrelay.m9.pending-commands.v1", JSON.stringify([{
-        version: 1, resource: recipe ? "p1:recipe:new" : "p1:schedule:new", body,
-      }]));
-      mount(<Recipes state={state} project={currentProject} onChanged={noop} onOpenTask={noop} />);
+        ? {
+          kind,
+          project_id: "p1",
+          operation_id: "pending-recipe",
+          recipe_id: null,
+          expected_version: null,
+          name: "Original",
+          title: "Original task",
+          description: "",
+          acceptance_criteria: [],
+          priority: 0,
+          profile_revision_id: "profile-rev-1",
+          required_check_ids: [],
+        }
+        : {
+          kind,
+          project_id: "p1",
+          operation_id: "pending-schedule",
+          schedule_id: null,
+          expected_version: null,
+          name: "Original",
+          recipe_revision_id: "recipe-rev-2",
+          cadence: "daily",
+          anchor_utc: "2026-10-01T09:00:00Z",
+        };
+      sessionStorage.setItem(
+        "llmrelay.m9.pending-commands.v1",
+        JSON.stringify([{
+          version: 1,
+          resource: recipe ? "p1:recipe:new" : "p1:schedule:new",
+          body,
+        }]),
+      );
+      mount(
+        <Recipes
+          state={state}
+          project={currentProject}
+          onChanged={noop}
+          onOpenTask={noop}
+        />,
+      );
       const heading = recipe ? "Task recipes" : "Foreground schedules";
-      const panel = [...document.querySelectorAll("section.panel")].find((element) =>
-        element.querySelector("h2")?.textContent === heading)!;
+      const panel = [...document.querySelectorAll("section.panel")].find((
+        element,
+      ) => element.querySelector("h2")?.textContent === heading)!;
       change(panel.querySelector<HTMLInputElement>("input")!, "Unrelated");
       click("Retry exact pending request");
       await settle();
-      check(panel.querySelector("h3")?.textContent === (recipe ? "New recipe" : "New schedule") &&
-        panel.querySelector<HTMLInputElement>("input")?.value === "Unrelated" &&
-        requests.at(-1)?.operation_id === body.operation_id &&
-        document.body.textContent?.includes("Pending request recovered"),
-        `${heading} exact retry rebound or erased an unrelated New form`);
+      check(
+        panel.querySelector("h3")?.textContent ===
+            (recipe ? "New recipe" : "New schedule") &&
+          panel.querySelector<HTMLInputElement>("input")?.value ===
+            "Unrelated" &&
+          requests.at(-1)?.operation_id === body.operation_id &&
+          document.body.textContent?.includes("Pending request recovered"),
+        `${heading} exact retry rebound or erased an unrelated New form`,
+      );
       unmount();
     }
   } finally {
@@ -837,19 +1248,43 @@ Deno.test("M9 exact create retry leaves unrelated recipe and schedule New forms 
 
 Deno.test("M9 archived backlog drafts stay visible in History for Restore", async () => {
   const requests: Record<string, unknown>[] = [];
-  const archivedDraft: Task = { ...task, id: "AJ-archived", lifecycle: "backlog",
-    archived: true, active_attempt: undefined, version: 3, can_archive: false };
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    if (init?.body) requests.push(JSON.parse(String(init.body)));
-    return new Response(JSON.stringify({ result: { entity_id: archivedDraft.id, version: 4 } }));
-  }) as typeof fetch;
+  const archivedDraft: Task = {
+    ...task,
+    id: "AJ-archived",
+    lifecycle: "backlog",
+    archived: true,
+    active_attempt: undefined,
+    version: 3,
+    can_archive: false,
+  };
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.body) requests.push(JSON.parse(String(init.body)));
+      return new Response(
+        JSON.stringify({ result: { entity_id: archivedDraft.id, version: 4 } }),
+      );
+    }) as typeof fetch;
   try {
-    mount(<History tasks={[archivedDraft]} projects={[initialized]} onOpen={noop} onChanged={noop} />);
-    check(document.body.textContent?.includes("AJ-archived"), "archived draft is missing from History");
+    mount(
+      <History
+        tasks={[archivedDraft]}
+        projects={[initialized]}
+        onOpen={noop}
+        onChanged={noop}
+      />,
+    );
+    check(
+      document.body.textContent?.includes("AJ-archived"),
+      "archived draft is missing from History",
+    );
     click("Restore");
     await settle();
-    check(requests[0]?.kind === "restore" && requests[0]?.task_id === archivedDraft.id &&
-      requests[0]?.expected_version === 3, "History did not submit the ordinary Restore command");
+    check(
+      requests[0]?.kind === "restore" &&
+        requests[0]?.task_id === archivedDraft.id &&
+        requests[0]?.expected_version === 3,
+      "History did not submit the ordinary Restore command",
+    );
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -858,19 +1293,41 @@ Deno.test("M9 archived backlog drafts stay visible in History for Restore", asyn
 
 Deno.test("M9 task detail Archive submits the never-attempted draft version", async () => {
   const requests: Record<string, unknown>[] = [];
-  const draft: Task = { ...task, id: "AJ-draft", lifecycle: "backlog", archived: false,
-    active_attempt: undefined, version: 4, can_archive: true };
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    if (init?.body) requests.push(JSON.parse(String(init.body)));
-    return new Response(JSON.stringify({ result: { entity_id: draft.id, version: 5 } }));
-  }) as typeof fetch;
+  const draft: Task = {
+    ...task,
+    id: "AJ-draft",
+    lifecycle: "backlog",
+    archived: false,
+    active_attempt: undefined,
+    version: 4,
+    can_archive: true,
+  };
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.body) requests.push(JSON.parse(String(init.body)));
+      return new Response(
+        JSON.stringify({ result: { entity_id: draft.id, version: 5 } }),
+      );
+    }) as typeof fetch;
   try {
-    mount(<TaskDetail task={draft} state={{ ...liveBase, tasks: [draft] }} onClose={noop} onChanged={noop} />);
+    mount(
+      <TaskDetail
+        task={draft}
+        state={{ ...liveBase, tasks: [draft] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
     click("Activity");
     click("Archive");
     await settle();
-    check(requests.some((body) => body.kind === "archive" && body.task_id === draft.id &&
-      body.expected_version === 4), "Task detail did not archive the exact draft version");
+    check(
+      requests.some((body) =>
+        body.kind === "archive" && body.task_id === draft.id &&
+        body.expected_version === 4
+      ),
+      "Task detail did not archive the exact draft version",
+    );
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -878,68 +1335,132 @@ Deno.test("M9 task detail Archive submits the never-attempted draft version", as
 });
 
 Deno.test("task detail explains an unset-up project plainly and routes to project setup", () => {
-  const draft: Task = { ...task, id: "AJ-unset", lifecycle: "backlog",
-    active_attempt: undefined, can_archive: true };
-  const unset: Project = { ...initialized, trip: { readiness: "not_initialized",
-    reason: "Project setup has not been inspected", detected_installation: "unknown" } };
-  const raw = "project TRIP readiness is not_initialized; execution requires ready";
+  const draft: Task = {
+    ...task,
+    id: "AJ-unset",
+    lifecycle: "backlog",
+    active_attempt: undefined,
+    can_archive: true,
+  };
+  const unset: Project = {
+    ...initialized,
+    trip: {
+      readiness: "not_initialized",
+      reason: "Project setup has not been inspected",
+      detected_installation: "unknown",
+    },
+  };
+  const raw =
+    "project TRIP readiness is not_initialized; execution requires ready";
   const decision: DecisionExplanation = {
-    decision_schema: 1, reason_code: "task.backlog_readiness", disposition: "waiting",
+    decision_schema: 1,
+    reason_code: "task.backlog_readiness",
+    disposition: "waiting",
     subject: { project_id: unset.id, task_id: draft.id },
     observed_revision: { task_version: draft.version },
-    primary_blocker: { code: "task.project_ready", state: "missing", owner: "human",
-      evidence: null, message: raw },
+    primary_blocker: {
+      code: "task.project_ready",
+      state: "missing",
+      owner: "human",
+      evidence: null,
+      message: raw,
+    },
     prerequisites: [],
     ownership: { owner: "human", state: "recorded_task_status", binding: {} },
-    next_action: { operation: "inspect_project", enabled: true, owner: "human",
-      binding: { project_id: unset.id } },
-    control_policy: { allowed_controls: ["inspect_project"],
-      disabled_reason_code: "task.project_ready" },
+    next_action: {
+      operation: "inspect_project",
+      enabled: true,
+      owner: "human",
+      binding: { project_id: unset.id },
+    },
+    control_policy: {
+      allowed_controls: ["inspect_project"],
+      disabled_reason_code: "task.project_ready",
+    },
   };
   const opened: string[] = [];
   try {
-    mount(<TaskDetail task={draft} state={{ ...liveBase, projects: [unset], tasks: [draft],
-      decisions: [decision] }} onClose={noop} onChanged={noop}
-      onOpenSetup={(projectId) => opened.push(projectId)} />);
-    const waiting = document.querySelector('[aria-labelledby="task-waiting-title"]');
+    mount(
+      <TaskDetail
+        task={draft}
+        state={{
+          ...liveBase,
+          projects: [unset],
+          tasks: [draft],
+          decisions: [decision],
+        }}
+        onClose={noop}
+        onChanged={noop}
+        onOpenSetup={(projectId) => opened.push(projectId)}
+      />,
+    );
+    const waiting = document.querySelector(
+      '[aria-labelledby="task-waiting-title"]',
+    );
     const primary = waiting?.querySelector("p")?.textContent || "";
-    const summary = document.querySelector(".decision-summary")?.textContent || "";
-    check(primary.includes("has not been set up yet") && summary.includes("has not been set up yet"),
-      `unset-up project was not explained plainly: ${primary} | ${summary}`);
-    check(![primary, summary].some((text) => text.includes("not_initialized")),
-      "raw readiness enum was the primary explanation");
-    check(waiting?.querySelector(".technical-details")?.textContent?.includes(raw),
-      "raw readiness diagnostic was not kept under Technical details");
-    const makeReady = [...document.querySelectorAll<HTMLButtonElement>("button")]
+    const summary = document.querySelector(".decision-summary")?.textContent ||
+      "";
+    check(
+      primary.includes("has not been set up yet") &&
+        summary.includes("has not been set up yet"),
+      `unset-up project was not explained plainly: ${primary} | ${summary}`,
+    );
+    check(
+      ![primary, summary].some((text) => text.includes("not_initialized")),
+      "raw readiness enum was the primary explanation",
+    );
+    check(
+      waiting?.querySelector(".technical-details")?.textContent?.includes(raw),
+      "raw readiness diagnostic was not kept under Technical details",
+    );
+    const makeReady = [
+      ...document.querySelectorAll<HTMLButtonElement>("button"),
+    ]
       .find((button) => button.textContent?.trim() === "Make Ready");
-    check(makeReady?.disabled && !makeReady.title.includes("not_initialized"),
-      "Make Ready was enabled or explained with the raw enum");
+    check(
+      makeReady?.disabled && !makeReady.title.includes("not_initialized"),
+      "Make Ready was enabled or explained with the raw enum",
+    );
     click("Open project setup");
-    check(opened.length === 1 && opened[0] === unset.id,
-      "Open project setup did not route to the task's project");
+    check(
+      opened.length === 1 && opened[0] === unset.id,
+      "Open project setup did not route to the task's project",
+    );
   } finally {
     unmount();
   }
 });
 
 Deno.test("M9 malformed can_archive state is rejected before controls render", async () => {
-  globalThis.fetch = (async () => new Response(JSON.stringify({
-    ...liveBase,
-    tasks: [{ ...task, can_archive: "false" }],
-  }))) as typeof fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({
+      ...liveBase,
+      tasks: [{ ...task, can_archive: "false" }],
+    }))) as typeof fetch;
   try {
     let refused = false;
     try {
       await getState();
     } catch (error) {
-      refused = error instanceof Error && error.message.includes("unsupported recipe state");
+      refused = error instanceof Error &&
+        error.message.includes("unsupported recipe state");
     }
     check(refused, "non-boolean can_archive crossed the snapshot boundary");
-    mount(<TaskDetail task={task} state={liveBase} onClose={noop} onChanged={noop} />);
+    mount(
+      <TaskDetail
+        task={task}
+        state={liveBase}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
     click("Activity");
-    const archive = [...document.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
-      button.textContent === "Archive");
-    check(archive?.disabled, "last known good state unexpectedly enabled Archive");
+    const archive = [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent === "Archive");
+    check(
+      archive?.disabled,
+      "last known good state unexpectedly enabled Archive",
+    );
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -947,23 +1468,58 @@ Deno.test("M9 malformed can_archive state is rejected before controls render", a
 });
 
 Deno.test("M9 board and detail display exact scheduled draft provenance", () => {
-  const scheduled: Task = { ...task, id: "AJ-scheduled", lifecycle: "backlog", can_archive: true,
+  const scheduled: Task = {
+    ...task,
+    id: "AJ-scheduled",
+    lifecycle: "backlog",
+    can_archive: true,
     recipe_provenance: {
-      recipe_id: "recipe-1", recipe_name: "Review", recipe_revision_id: "revision-2",
-      recipe_revision: 2, profile_revision_id: "profile-revision-3", required_check_ids: [],
-      config_revision_id: "config-1", configuration_hash: "hash-1",
-      workflow_version: "workflow-1", workflow_hash: "workflow-hash",
-      schedule_id: "schedule-1", scheduled_for_utc: "2026-09-25T09:00:00Z",
-    } };
+      recipe_id: "recipe-1",
+      recipe_name: "Review",
+      recipe_revision_id: "revision-2",
+      recipe_revision: 2,
+      profile_revision_id: "profile-revision-3",
+      required_check_ids: [],
+      config_revision_id: "config-1",
+      configuration_hash: "hash-1",
+      workflow_version: "workflow-1",
+      workflow_hash: "workflow-hash",
+      schedule_id: "schedule-1",
+      scheduled_for_utc: "2026-09-25T09:00:00Z",
+    },
+  };
   try {
-    mount(<TaskBoard tasks={[scheduled]} projects={[initialized]} onOpen={noop} onEdit={noop} onChanged={noop} />);
-    check(document.body.textContent?.includes("Scheduled TRIP draft · Review revision 2"),
-      "board omitted the scheduled recipe revision");
-    rerender(<TaskDetail task={scheduled} state={{ ...liveBase, tasks: [scheduled] }} onClose={noop} onChanged={noop} />);
+    mount(
+      <TaskBoard
+        tasks={[scheduled]}
+        projects={[initialized]}
+        onOpen={noop}
+        onEdit={noop}
+        onChanged={noop}
+      />,
+    );
+    check(
+      document.body.textContent?.includes(
+        "Scheduled TRIP draft · Review revision 2",
+      ),
+      "board omitted the scheduled recipe revision",
+    );
+    rerender(
+      <TaskDetail
+        task={scheduled}
+        state={{ ...liveBase, tasks: [scheduled] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
     click("Activity");
-    check(document.body.textContent?.includes("Exact recipe revision revision-2") &&
-      document.body.textContent?.includes("schedule schedule-1 at 2026-09-25T09:00:00Z"),
-      "detail omitted exact scheduled provenance");
+    check(
+      document.body.textContent?.includes("Exact recipe revision revision-2") &&
+        document.body.textContent?.includes(
+          "schedule schedule-1 at 2026-09-25T09:00:00Z",
+        ),
+      "detail omitted exact scheduled provenance",
+    );
   } finally {
     unmount();
   }
@@ -984,65 +1540,164 @@ Deno.test("M7 unknown Claude contract explains the release route and blocks setu
     message: "This provider version has no reviewed contract in this release.",
   };
   try {
-    mount(<ProjectSetup
-      project={initialized}
-      setup={{
-        setup_operation_id: "claude-unknown", project_id: initialized.id,
-        state: "activated", target_inventory: {}, final_files: [],
-        installation_source_binding_complete: true,
-        installation_source_binding_reason: "activated",
-        selected_profiles: [{
-          role: "explorer", selection_state: "selected",
-          profile: { provider: "claude", model: "advisory-model", effort: "high" },
-          compatibility,
-        }],
-        probe_receipts: [], sessions: [], runtime_admissions: [],
-        agents_file: {}, created_at: "2026-01-01T00:00:00Z",
-        updated_at: "2026-01-01T00:00:00Z",
-      }}
-      onChanged={noop}
-      onViewSession={async () => ({ state: "failed", message: "unavailable", retry_available: false })}
-    />);
-    if (!document.body.textContent?.includes("Update LLMRelay to a release that supports this agent version") ||
-      !document.body.textContent?.includes("reviewed_exact_version_predicate") ||
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={{
+          setup_operation_id: "claude-unknown",
+          project_id: initialized.id,
+          state: "activated",
+          target_inventory: {},
+          final_files: [],
+          installation_source_binding_complete: true,
+          installation_source_binding_reason: "activated",
+          selected_profiles: [{
+            role: "explorer",
+            selection_state: "selected",
+            profile: {
+              provider: "claude",
+              model: "advisory-model",
+              effort: "high",
+            },
+            compatibility,
+          }],
+          probe_receipts: [],
+          sessions: [],
+          runtime_admissions: [],
+          agents_file: {},
+          created_at: "2026-01-01T00:00:00Z",
+          updated_at: "2026-01-01T00:00:00Z",
+        }}
+        onChanged={noop}
+        onViewSession={async () => ({
+          state: "failed",
+          message: "unavailable",
+          retry_available: false,
+        })}
+      />,
+    );
+    if (
+      !document.body.textContent?.includes(
+        "Update LLMRelay to a release that supports this agent version",
+      ) ||
+      !document.body.textContent?.includes(
+        "reviewed_exact_version_predicate",
+      ) ||
       ![...document.querySelectorAll("button")].some((button) =>
-        button.textContent?.includes("Prepare exact runtime verification") && button.disabled)) {
-      throw new Error("unknown Claude contract was presented as qualification eligible");
+        button.textContent?.includes("Prepare exact runtime verification") &&
+        button.disabled
+      )
+    ) {
+      throw new Error(
+        "unknown Claude contract was presented as qualification eligible",
+      );
     }
     unmount();
-    mount(<ProjectSetup
-      project={initialized}
-      setup={{
-        setup_operation_id: "claude-discovery", project_id: initialized.id,
-        state: "discovery", discovery_attempt_id: "claude-attempt",
-        target_inventory: {}, final_files: [],
-        installation_source_binding_complete: false,
-        installation_source_binding_reason: "discovery",
-        selected_profiles: [{
-          role: "manager", selection_state: "selected",
-          profile: { provider: "claude", model: "advisory-model", effort: "high" },
-          compatibility,
-        }],
-        probe_receipts: [], sessions: [], runtime_admissions: [],
-        agents_file: {}, created_at: "2026-01-01T00:00:00Z",
-        updated_at: "2026-01-01T00:00:00Z",
-      }}
-      onChanged={noop}
-      onViewSession={async () => ({ state: "failed", message: "unavailable", retry_available: false })}
-    />);
-    if ([...document.querySelectorAll("button")].some((button) =>
-      button.textContent?.includes("Launch manager discovery"))) {
-      throw new Error("unknown Claude contract exposed a failing discovery launch");
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={{
+          setup_operation_id: "claude-discovery",
+          project_id: initialized.id,
+          state: "discovery",
+          discovery_attempt_id: "claude-attempt",
+          target_inventory: {},
+          final_files: [],
+          installation_source_binding_complete: false,
+          installation_source_binding_reason: "discovery",
+          selected_profiles: [{
+            role: "manager",
+            selection_state: "selected",
+            profile: {
+              provider: "claude",
+              model: "advisory-model",
+              effort: "high",
+            },
+            compatibility,
+          }],
+          probe_receipts: [],
+          sessions: [],
+          runtime_admissions: [],
+          agents_file: {},
+          created_at: "2026-01-01T00:00:00Z",
+          updated_at: "2026-01-01T00:00:00Z",
+        }}
+        onChanged={noop}
+        onViewSession={async () => ({
+          state: "failed",
+          message: "unavailable",
+          retry_available: false,
+        })}
+      />,
+    );
+    if (
+      [...document.querySelectorAll("button")].some((button) =>
+        button.textContent?.includes("Launch manager discovery")
+      )
+    ) {
+      throw new Error(
+        "unknown Claude contract exposed a failing discovery launch",
+      );
     }
     unmount();
-    mount(<DiagnosticsPanel capabilities={[{
-      provider: "claude", role: "explorer", mode: "interactive_pty",
-      status: "unverified", gaps: [], compatibility,
-    }]} />);
-    if (!document.body.textContent?.includes("Agent verification needs attention") ||
-      !document.body.textContent?.includes("Update LLMRelay to a release that supports this agent version")) {
-      throw new Error("diagnostics omitted the structured compatibility action");
+    const savedEvidence = {
+      provider: "claude" as const,
+      role: "explorer" as const,
+      mode: "interactive_pty",
+      status: "supported" as const,
+      gaps: [],
+      compatibility,
+    };
+    mount(<DiagnosticsPanel capabilities={[savedEvidence]} />);
+    if (
+      !document.body.textContent?.includes(
+        "Agent verification needs attention",
+      ) ||
+      !document.body.textContent?.includes(
+        "Update LLMRelay to a release that supports this agent version",
+      )
+    ) {
+      throw new Error(
+        "diagnostics omitted the structured compatibility action",
+      );
     }
+    check(
+      !document.body.textContent?.includes("Agent verification passed"),
+      "unsupported compatibility became successful proof",
+    );
+    const matchedEvidence = {
+      ...savedEvidence,
+      compatibility: {
+        ...compatibility,
+        status: "matched" as const,
+        observed_version: "claude 2.1.289",
+        contract_id: "claude-explorer",
+        contract_revision: "1",
+        missing_evidence: [],
+        action: "requalify_exact_profile" as const,
+      },
+    };
+    rerender(<DiagnosticsPanel capabilities={[matchedEvidence]} />);
+    check(
+      document.querySelector(".compatibility-details")?.textContent?.includes(
+        "This saved record passed verification.",
+      ) &&
+        !document.querySelector(".compatibility-details")?.textContent
+          ?.includes("Next step:"),
+      "successful saved evidence still advised requalification or claimed current task readiness",
+    );
+    rerender(
+      <DiagnosticsPanel
+        capabilities={[{ ...matchedEvidence, status: "unverified" }]}
+      />,
+    );
+    check(
+      document.querySelector(".compatibility-details")?.textContent?.includes(
+        "Next step:",
+      ) &&
+        !document.body.textContent?.includes("Agent verification passed"),
+      "missing proof lost its verification action",
+    );
   } finally {
     unmount();
   }
@@ -1051,11 +1706,34 @@ Deno.test("M7 fresh qualification stays reachable while stale exact resume is he
   localStorage.clear();
   const priorFetch = globalThis.fetch;
   const requests: Record<string, unknown>[] = [];
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    requests.push(JSON.parse(String(init?.body)));
-    return new Response(JSON.stringify({ result: { state: "ready" } }));
-  }) as typeof fetch;
-  const compatibility = (status: "matched" | "evidence_stale" | "contract_changed" | "unknown_version" | "ambiguous_manifest" | "manifest_invalid") => ({
+  let prepareFailure: "refused" | "ambiguous" | null = null;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body));
+      requests.push(request);
+      if (request.action === "prepare_runtime_admission" && prepareFailure) {
+        if (prepareFailure === "ambiguous") {
+          throw new Error("Preparation response lost");
+        }
+        return new Response(JSON.stringify({ error: "Preparation refused" }), {
+          status: 409,
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          result: { state: "ready", entity_id: "created-group" },
+        }),
+      );
+    }) as typeof fetch;
+  const compatibility = (
+    status:
+      | "matched"
+      | "evidence_stale"
+      | "contract_changed"
+      | "unknown_version"
+      | "ambiguous_manifest"
+      | "manifest_invalid",
+  ) => ({
     status,
     observed_version: status === "evidence_stale" ? null : "codex-cli 0.155.1",
     pack_id: status === "evidence_stale" ? null : "codex",
@@ -1064,9 +1742,13 @@ Deno.test("M7 fresh qualification stays reachable while stale exact resume is he
     contract_revision: status === "evidence_stale" ? null : "1",
     short_hash: status === "evidence_stale" ? null : "123456789abc",
     predicate_id: status === "evidence_stale" ? null : "codex-cli-0.155.1",
-    missing_evidence: status === "matched" ? [] : ["exact_selected_profile_observation"],
+    missing_evidence: status === "matched"
+      ? []
+      : ["exact_selected_profile_observation"],
     action: "requalify_exact_profile" as const,
-    message: status === "matched" ? "Candidate is reviewed." : "Exact observation is missing.",
+    message: status === "matched"
+      ? "Candidate is reviewed."
+      : "Exact observation is missing.",
   });
   const probe = (role: "explorer" | "plan_reviewer") => ({
     role,
@@ -1082,142 +1764,597 @@ Deno.test("M7 fresh qualification stays reachable while stale exact resume is he
     has_native_session: false,
   });
   const setup: TripSetupState = {
-    setup_operation_id: "m7-role-scope", project_id: initialized.id,
-    state: "activated", target_inventory: {}, final_files: [],
+    setup_operation_id: "m7-role-scope",
+    project_id: initialized.id,
+    state: "activated",
+    target_inventory: {},
+    final_files: [],
     installation_source_binding_complete: true,
     installation_source_binding_reason: "activated",
     selected_profiles: [
-      { role: "explorer", selection_state: "selected", profile: probe("explorer").profile, compatibility: compatibility("evidence_stale") },
-      { role: "plan_reviewer", selection_state: "selected", profile: probe("plan_reviewer").profile, compatibility: compatibility("matched") },
+      {
+        role: "explorer",
+        selection_state: "selected",
+        profile: probe("explorer").profile,
+        compatibility: compatibility("evidence_stale"),
+      },
+      {
+        role: "plan_reviewer",
+        selection_state: "selected",
+        profile: probe("plan_reviewer").profile,
+        compatibility: compatibility("matched"),
+      },
     ],
-    probe_receipts: [], sessions: [],
-    runtime_admissions: [{ id: "m7-admission", scope_hash: "m7-scope", state: "running", fresh_call_count: 2, probes: [probe("explorer"), probe("plan_reviewer")] }],
-    agents_file: {}, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+    probe_receipts: [],
+    sessions: [],
+    runtime_admissions: [{
+      id: "m7-admission",
+      scope_hash: "m7-scope",
+      state: "running",
+      fresh_call_count: 2,
+      probes: [probe("explorer"), probe("plan_reviewer")],
+    }],
+    agents_file: {},
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+  };
+  const correctionAction: ContinuationAction = {
+    kind: "prepare_corrected_runtime",
+    enabled: true,
+    owner: "human",
+    reason: "The Explorer verification failed.",
+    operation: "prepare_runtime_admission",
+    binding: {
+      project_id: initialized.id,
+      task_id: null,
+      admission_id: "m7-admission",
+      role: "explorer",
+    },
+  };
+  const actionableSetup: TripSetupState = {
+    ...setup,
+    continuation_actions: [correctionAction],
+    runtime_admissions: [
+      {
+        ...setup.runtime_admissions[0],
+        id: "newer-correction",
+        project_id: initialized.id,
+        task_id: null,
+        state: "ready",
+        probes: [],
+      },
+      {
+        ...setup.runtime_admissions[0],
+        project_id: initialized.id,
+        task_id: null,
+        state: "failed",
+        probes: [{ ...probe("explorer"), state: "failed" }],
+      },
+    ],
   };
   try {
-    mount(<ProjectSetup project={initialized} setup={setup} onChanged={noop} onViewSession={cmuxFixture} />);
-    check(document.body.textContent?.includes("These are installation records") &&
-      !document.body.textContent.includes("verification again before tasks can use"),
-      "historical setup evidence was presented as current runtime authority");
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={setup}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    check(
+      document.body.textContent?.includes("These are installation records") &&
+        !document.body.textContent.includes(
+          "verification again before tasks can use",
+        ),
+      "historical setup evidence was presented as current runtime authority",
+    );
     const probeRows = [...document.querySelectorAll(".profile-list > div")];
-    const explorerRow = probeRows.find((row) => row.querySelector("strong")?.textContent === "Explorer");
-    const reviewerRow = probeRows.find((row) => row.querySelector("strong")?.textContent === "Plan Reviewer");
-    if (!explorerRow?.textContent?.includes("Launch bounded probe") ||
-      !reviewerRow?.textContent?.includes("Launch bounded probe")) {
-      throw new Error(`fresh stale and unaffected roles did not retain bounded launches: ${document.body.textContent?.slice(-1800)}`);
+    const explorerRow = probeRows.find((row) =>
+      row.querySelector("strong")?.textContent === "Explorer"
+    );
+    const reviewerRow = probeRows.find((row) =>
+      row.querySelector("strong")?.textContent === "Plan Reviewer"
+    );
+    if (
+      !explorerRow?.textContent?.includes("Launch bounded probe") ||
+      !reviewerRow?.textContent?.includes("Launch bounded probe")
+    ) {
+      throw new Error(
+        `fresh stale and unaffected roles did not retain bounded launches: ${
+          document.body.textContent?.slice(-1800)
+        }`,
+      );
     }
-    const staleLaunch = [...explorerRow.querySelectorAll("button")].find((button) => button.textContent?.includes("Launch bounded probe"))!;
+    const staleLaunch = [...explorerRow.querySelectorAll("button")].find((
+      button,
+    ) => button.textContent?.includes("Launch bounded probe"))!;
     act(() => staleLaunch.click());
     await settle();
-    if (requests.at(-1)?.kind !== "runtime_probe_launch" || requests.at(-1)?.role !== "explorer") {
-      throw new Error("fresh stale role launch was not routed to backend admission");
+    if (
+      requests.at(-1)?.kind !== "runtime_probe_launch" ||
+      requests.at(-1)?.role !== "explorer"
+    ) {
+      throw new Error(
+        "fresh stale role launch was not routed to backend admission",
+      );
     }
     unmount();
 
-    mount(<ProjectSetup project={initialized} setup={{ ...setup, runtime_admissions: [
-      { ...setup.runtime_admissions[0], id: "newer-correction", state: "ready", probes: [] },
-      setup.runtime_admissions[0],
-    ] }} onChanged={noop} onViewSession={cmuxFixture} />);
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={actionableSetup}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    check(
+      findSelect("Runtime verification group").value === "m7-admission",
+      "initial setup view hid the actionable failure behind a ready sibling",
+    );
+    act(() => {
+      const group = findSelect("Runtime verification group");
+      group.value = "newer-correction";
+      group.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    rerender(
+      <ProjectSetup
+        project={initialized}
+        setup={actionableSetup}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    check(
+      findSelect("Runtime verification group").value === "newer-correction",
+      "actionable failure replaced an explicit group selection on refresh",
+    );
+    rerender(
+      <ProjectSetup
+        project={initialized}
+        setup={{
+          ...setup,
+          runtime_admissions: [
+            actionableSetup.runtime_admissions[0],
+            setup.runtime_admissions[0],
+          ],
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
     const verificationGroup = [...document.querySelectorAll("label")]
-      .find((label) => label.textContent?.includes("Runtime verification group"))
+      .find((label) =>
+        label.textContent?.includes("Runtime verification group")
+      )
       ?.querySelector("select");
-    if (!verificationGroup) throw new Error("earlier runtime verification group became unreachable");
+    if (!verificationGroup) {
+      throw new Error("earlier runtime verification group became unreachable");
+    }
     act(() => {
       verificationGroup.value = "m7-admission";
       verificationGroup.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    const earlierExplorer = [...document.querySelectorAll(".runtime-admission .profile-list > div")]
+    const earlierExplorer = [
+      ...document.querySelectorAll(".runtime-admission .profile-list > div"),
+    ]
       .find((row) => row.querySelector("strong")?.textContent === "Explorer");
     const earlierLaunch = earlierExplorer?.querySelector("button");
-    if (!earlierLaunch) throw new Error("earlier authorized probe was not restored");
+    if (!earlierLaunch) {
+      throw new Error("earlier authorized probe was not restored");
+    }
     act(() => earlierLaunch.click());
     await settle();
-    if (requests.at(-1)?.admission_id !== "m7-admission" || requests.at(-1)?.role !== "explorer") {
+    if (
+      requests.at(-1)?.admission_id !== "m7-admission" ||
+      requests.at(-1)?.role !== "explorer"
+    ) {
       throw new Error("earlier probe launch lost its exact admission binding");
     }
+    const pendingClaudeExplorer = {
+      ...setup.selected_profiles[0],
+      profile: {
+        ...probe("explorer").profile,
+        provider: "claude" as const,
+      },
+    };
+    const claudeManagerProject: Project = {
+      ...initialized,
+      settings: {
+        ...initialized.settings,
+        roles: {
+          ...inheritedRoles,
+          manager: {
+            provider: "claude",
+            model: "current-claude-model",
+            effort: "high",
+          },
+        },
+      },
+    };
+    const claudeExplorerProject: Project = {
+      ...initialized,
+      settings: {
+        ...initialized.settings,
+        roles: { ...inheritedRoles, explorer: pendingClaudeExplorer.profile },
+      },
+    };
+    const correctionSetup: TripSetupState = {
+      ...setup,
+      continuation_actions: [correctionAction],
+      selected_profiles: [pendingClaudeExplorer, setup.selected_profiles[1]],
+      runtime_admissions: [
+        {
+          ...setup.runtime_admissions[0],
+          id: "newer-correction",
+          state: "ready",
+          probes: [],
+        },
+        {
+          ...setup.runtime_admissions[0],
+          project_id: initialized.id,
+          task_id: null,
+          probes: [{ ...probe("explorer"), state: "failed" }],
+        },
+      ],
+    };
+    rerender(
+      <ProjectSetup
+        project={claudeManagerProject}
+        setup={correctionSetup}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    for (const failure of ["refused", "ambiguous"] as const) {
+      prepareFailure = failure;
+      click("Prepare a new verification");
+      await settle();
+      check(
+        findSelect("Runtime verification group").value === "m7-admission",
+        "failed preparation replaced the selected verification group",
+      );
+      check(
+        document.body.textContent?.includes(
+          failure === "refused"
+            ? "Preparation refused"
+            : "Refresh and reconcile",
+        ),
+        "preparation failure did not retain its actionable error",
+      );
+    }
+    const ambiguousOperation = requests.at(-1)?.operation_id;
+    prepareFailure = null;
+    click("Prepare a new verification");
+    await settle();
+    check(
+      typeof ambiguousOperation === "string" &&
+        requests.at(-1)?.operation_id === ambiguousOperation &&
+        requests.at(-1)?.role === "explorer" &&
+        !("cmux_socket_path" in (requests.at(-1) || {})),
+      "Codex correction changed uncertain identity or required a sibling's cmux path",
+    );
+    rerender(
+      <ProjectSetup
+        project={claudeManagerProject}
+        setup={{
+          ...correctionSetup,
+          runtime_admissions: [correctionSetup.runtime_admissions[0], {
+            ...setup.runtime_admissions[0],
+            id: "created-group",
+          }, correctionSetup.runtime_admissions[1]],
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    check(
+      findSelect("Runtime verification group").value === "created-group",
+      "successful preparation did not select its returned entity after refreshed props",
+    );
+    rerender(
+      <ProjectSetup
+        project={claudeExplorerProject}
+        setup={{
+          ...setup,
+          runtime_admissions: [{
+            ...setup.runtime_admissions[0],
+            id: "created-group",
+            probes: [{ ...probe("explorer"), state: "failed" }],
+          }],
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    const beforeClaudeCorrection = requests.length;
+    click("Prepare a new verification");
+    await settle();
+    check(
+      requests.length === beforeClaudeCorrection &&
+        document.querySelector(".error[role=alert]:not(.error-notice)")
+          ?.textContent?.includes("Enter the live cmux socket path"),
+      "current Claude correction used old Codex setup history and sent a blank socket",
+    );
     unmount();
 
-    for (const status of ["unknown_version", "ambiguous_manifest", "manifest_invalid"] as const) {
-      mount(<ProjectSetup project={initialized} setup={{ ...setup, runtime_admissions: [], selected_profiles: [
-        ...setup.selected_profiles,
-        { role: "manager", selection_state: "selected", profile: probe("explorer").profile, compatibility: compatibility(status) },
-      ] }} onChanged={noop} onViewSession={cmuxFixture} />);
-      const prepare = [...document.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Prepare exact runtime verification"));
-      if (!prepare?.disabled) throw new Error(`${status} enabled runtime preparation`);
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={{
+          ...actionableSetup,
+          continuation_actions: [
+            {
+              ...correctionAction,
+              binding: { ...correctionAction.binding, task_id: "task" },
+            },
+            {
+              ...correctionAction,
+              binding: {
+                ...correctionAction.binding,
+                project_id: "other-project",
+              },
+            },
+            { ...correctionAction, kind: "wait_for_service" },
+            { ...correctionAction, enabled: false },
+            {
+              ...correctionAction,
+              binding: { ...correctionAction.binding, admission_id: "missing" },
+            },
+          ],
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    check(
+      findSelect("Runtime verification group").value === "newer-correction",
+      "inapplicable correction actions overrode the first project verification group",
+    );
+    unmount();
+
+    for (
+      const status of [
+        "unknown_version",
+        "ambiguous_manifest",
+        "manifest_invalid",
+      ] as const
+    ) {
+      mount(
+        <ProjectSetup
+          project={initialized}
+          setup={{
+            ...setup,
+            runtime_admissions: [],
+            selected_profiles: [
+              ...setup.selected_profiles,
+              {
+                role: "manager",
+                selection_state: "selected",
+                profile: probe("explorer").profile,
+                compatibility: compatibility(status),
+              },
+            ],
+          }}
+          onChanged={noop}
+          onViewSession={cmuxFixture}
+        />,
+      );
+      const prepare = [
+        ...document.querySelectorAll<HTMLButtonElement>("button"),
+      ].find((button) =>
+        button.textContent?.includes("Prepare exact runtime verification")
+      );
+      if (!prepare?.disabled) {
+        throw new Error(`${status} enabled runtime preparation`);
+      }
       unmount();
     }
 
-    mount(<ProjectSetup project={initialized} setup={{ ...setup, runtime_admissions: [] }} onChanged={noop} onViewSession={cmuxFixture} />);
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={{
+          ...setup,
+          runtime_admissions: [],
+          selected_profiles: [
+            pendingClaudeExplorer,
+            setup.selected_profiles[1],
+          ],
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    const beforeCodexGroup = requests.length;
     click("Prepare exact runtime verification");
     await settle();
-    if (requests.at(-1)?.action !== "prepare_runtime_admission") {
-      throw new Error("stale observation blocked fresh runtime preparation");
+    if (
+      requests.length !== beforeCodexGroup + 1 ||
+      requests.at(-1)?.action !== "prepare_runtime_admission" ||
+      "role" in (requests.at(-1) || {})
+    ) {
+      throw new Error(
+        "pending Claude setup selection blocked the current Codex group",
+      );
     }
+    check(
+      !("cmux_socket_path" in (requests.at(-1) || {})),
+      "Codex-only preparation required cmux",
+    );
+    rerender(
+      <ProjectSetup
+        project={claudeManagerProject}
+        setup={{ ...setup, runtime_admissions: [] }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    const beforeSocket = requests.length;
+    click("Prepare exact runtime verification");
+    await settle();
+    check(
+      requests.length === beforeSocket &&
+        document.querySelector(".error[role=alert]:not(.error-notice)")
+          ?.textContent?.includes("Enter the live cmux socket path"),
+      "current Claude manager with old Codex setup history sent a preparation or hid the inline instruction",
+    );
+    field(
+      "Live cmux Unix socket for Claude requalification",
+      "/tmp/live-cmux.sock",
+    );
+    click("Prepare exact runtime verification");
+    await settle();
+    check(
+      requests.at(-1)?.cmux_socket_path === "/tmp/live-cmux.sock",
+      "current Claude group did not send the entered socket",
+    );
     unmount();
 
     const retainedProbe = {
-      ...probe("explorer"), state: "running" as const,
-      session_id: "retained-explorer", session_status: "exited",
+      ...probe("explorer"),
+      state: "running" as const,
+      session_id: "retained-explorer",
+      session_status: "exited",
       has_native_session: true,
     };
     const retainedSetup = {
-      ...setup, runtime_admissions: [{
-        ...setup.runtime_admissions[0], probes: [retainedProbe, probe("plan_reviewer")],
+      ...setup,
+      runtime_admissions: [{
+        ...setup.runtime_admissions[0],
+        probes: [retainedProbe, probe("plan_reviewer")],
       }],
     };
-    mount(<ProjectSetup project={initialized} setup={retainedSetup} onChanged={noop} onViewSession={cmuxFixture} />);
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={retainedSetup}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
     click("Resume same native session");
     await settle();
-    if (requests.at(-1)?.kind !== "runtime_probe_resume" || requests.at(-1)?.role !== "explorer") {
-      throw new Error("first runtime qualification could not resume to produce its missing proof");
+    if (
+      requests.at(-1)?.kind !== "runtime_probe_resume" ||
+      requests.at(-1)?.role !== "explorer"
+    ) {
+      throw new Error(
+        "first runtime qualification could not resume to produce its missing proof",
+      );
     }
     unmount();
 
-    mount(<ProjectSetup project={initialized} setup={{ ...retainedSetup, selected_profiles: [
-      { ...setup.selected_profiles[0], compatibility: {
-        ...compatibility("evidence_stale"), observed_version: "codex-cli 0.155.1",
-        missing_evidence: ["executable_identity_changed"],
-      } },
-      setup.selected_profiles[1],
-    ] }} onChanged={noop} onViewSession={cmuxFixture} />);
-    const staleRow = [...document.querySelectorAll(".profile-list > div")].find((row) => row.querySelector("strong")?.textContent === "Explorer");
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={{
+          ...retainedSetup,
+          selected_profiles: [
+            {
+              ...setup.selected_profiles[0],
+              compatibility: {
+                ...compatibility("evidence_stale"),
+                observed_version: "codex-cli 0.155.1",
+                missing_evidence: ["executable_identity_changed"],
+              },
+            },
+            setup.selected_profiles[1],
+          ],
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    const staleRow = [...document.querySelectorAll(".profile-list > div")].find(
+      (row) => row.querySelector("strong")?.textContent === "Explorer",
+    );
     if (staleRow?.textContent?.includes("Resume same native session")) {
       throw new Error("stale runtime binding exposed exact native resume");
     }
     unmount();
 
-    mount(<ProjectSetup project={initialized} setup={{ ...retainedSetup, selected_profiles: [
-      { ...setup.selected_profiles[0], compatibility: compatibility("matched") },
-      setup.selected_profiles[1],
-    ] }} onChanged={noop} onViewSession={cmuxFixture} />);
-    const matchedRow = [...document.querySelectorAll(".profile-list > div")].find((row) => row.querySelector("strong")?.textContent === "Explorer");
-    const resume = [...matchedRow?.querySelectorAll("button") || []].find((button) => button.textContent?.includes("Resume same native session"));
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={{
+          ...retainedSetup,
+          selected_profiles: [
+            {
+              ...setup.selected_profiles[0],
+              compatibility: compatibility("matched"),
+            },
+            setup.selected_profiles[1],
+          ],
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    const matchedRow = [...document.querySelectorAll(".profile-list > div")]
+      .find((row) => row.querySelector("strong")?.textContent === "Explorer");
+    const resume = [...matchedRow?.querySelectorAll("button") || []].find((
+      button,
+    ) => button.textContent?.includes("Resume same native session"));
     if (!resume) throw new Error("matched role lost exact runtime resume");
     act(() => resume.click());
     await settle();
-    if (requests.at(-1)?.kind !== "runtime_probe_resume" || requests.at(-1)?.role !== "explorer") {
+    if (
+      requests.at(-1)?.kind !== "runtime_probe_resume" ||
+      requests.at(-1)?.role !== "explorer"
+    ) {
       throw new Error("matched exact resume did not retain its role binding");
     }
     unmount();
 
-    mount(<ProjectSetup project={initialized} setup={{ ...retainedSetup, selected_profiles: [
-      { ...setup.selected_profiles[0], compatibility: compatibility("contract_changed") },
-      setup.selected_profiles[1],
-    ] }} onChanged={noop} onViewSession={cmuxFixture} />);
-    const changedRow = [...document.querySelectorAll(".profile-list > div")].find((row) => row.querySelector("strong")?.textContent === "Explorer");
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={{
+          ...retainedSetup,
+          selected_profiles: [
+            {
+              ...setup.selected_profiles[0],
+              compatibility: compatibility("contract_changed"),
+            },
+            setup.selected_profiles[1],
+          ],
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    const changedRow = [...document.querySelectorAll(".profile-list > div")]
+      .find((row) => row.querySelector("strong")?.textContent === "Explorer");
     if (changedRow?.textContent?.includes("Resume same native session")) {
       throw new Error("changed contract exposed exact native resume");
     }
     unmount();
 
-    mount(<ProjectSetup project={initialized} setup={{ ...retainedSetup, runtime_admissions: [], selected_profiles: [
-      { ...setup.selected_profiles[0], compatibility: compatibility("contract_changed") },
-      setup.selected_profiles[1],
-    ] }} onChanged={noop} onViewSession={cmuxFixture} />);
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={{
+          ...retainedSetup,
+          runtime_admissions: [],
+          selected_profiles: [
+            {
+              ...setup.selected_profiles[0],
+              compatibility: compatibility("contract_changed"),
+            },
+            setup.selected_profiles[1],
+          ],
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
     click("Prepare exact runtime verification");
     await settle();
     if (requests.at(-1)?.action !== "prepare_runtime_admission") {
-      throw new Error("changed contract could not request fresh backend admission");
+      throw new Error(
+        "changed contract could not request fresh backend admission",
+      );
     }
   } finally {
     unmount();
@@ -1228,100 +2365,229 @@ Deno.test("M7 fresh Codex discovery and stale probe retry preserve exact resume 
   localStorage.clear();
   const priorFetch = globalThis.fetch;
   const requests: Record<string, unknown>[] = [];
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    requests.push(JSON.parse(String(init?.body)));
-    return new Response(JSON.stringify({ result: {} }));
-  }) as typeof fetch;
-  const profile = { provider: "codex" as const, model: "gpt-6-sol", effort: "medium" };
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ result: {} }));
+    }) as typeof fetch;
+  const profile = {
+    provider: "codex" as const,
+    model: "gpt-6-sol",
+    effort: "medium",
+  };
   const compatibility = {
-    status: "evidence_stale" as const, observed_version: null,
-    pack_id: null, pack_revision: null, contract_id: null,
-    contract_revision: null, short_hash: null, predicate_id: null,
+    status: "evidence_stale" as const,
+    observed_version: null,
+    pack_id: null,
+    pack_revision: null,
+    contract_id: null,
+    contract_revision: null,
+    short_hash: null,
+    predicate_id: null,
     missing_evidence: ["exact_selected_profile_observation"],
     action: "requalify_exact_profile" as const,
-    message: "No exact compatibility observation is recorded for this selected profile.",
+    message:
+      "No exact compatibility observation is recorded for this selected profile.",
   };
   const setup: TripSetupState = {
-    setup_operation_id: "fresh-codex", project_id: initialized.id,
-    state: "discovery", discovery_attempt_id: "discovery-attempt",
-    target_inventory: {}, final_files: [],
+    setup_operation_id: "fresh-codex",
+    project_id: initialized.id,
+    state: "discovery",
+    discovery_attempt_id: "discovery-attempt",
+    target_inventory: {},
+    final_files: [],
     installation_source_binding_complete: false,
     installation_source_binding_reason: "discovery",
-    selected_profiles: [{ role: "manager", selection_state: "selected", profile, compatibility }],
-    probe_receipts: [], sessions: [], runtime_admissions: [], agents_file: {},
-    created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+    selected_profiles: [{
+      role: "manager",
+      selection_state: "selected",
+      profile,
+      compatibility,
+    }],
+    probe_receipts: [],
+    sessions: [],
+    runtime_admissions: [],
+    agents_file: {},
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
   };
   const session: TripSetupState["sessions"][number] = {
-    id: "stale-probe-session", attempt_id: "probe-attempt", role: "explorer",
-    provider: "codex", generation: 1, lane_id: "probe-lane",
-    status: "exited", launch_state: "started", readiness: "idle_candidate",
-    capture_state: "complete", has_native_session: true, resume_count: 0,
+    id: "stale-probe-session",
+    attempt_id: "probe-attempt",
+    role: "explorer",
+    provider: "codex",
+    generation: 1,
+    lane_id: "probe-lane",
+    status: "exited",
+    launch_state: "started",
+    readiness: "idle_candidate",
+    capture_state: "complete",
+    has_native_session: true,
+    resume_count: 0,
     updated_at: "2026-01-01T00:00:00Z",
   };
   try {
-    mount(<ProjectSetup project={initialized} setup={setup} onChanged={noop} onViewSession={cmuxFixture} />);
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={setup}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
     click("Launch manager discovery");
     await settle();
-    if (requests.at(-1)?.kind !== "trip_setup_dispatch" ||
-      requests.at(-1)?.attempt_id !== "discovery-attempt" || requests.at(-1)?.role !== "manager") {
-      throw new Error("fresh Codex manager discovery did not reach its exact backend route");
+    if (
+      requests.at(-1)?.kind !== "trip_setup_dispatch" ||
+      requests.at(-1)?.attempt_id !== "discovery-attempt" ||
+      requests.at(-1)?.role !== "manager"
+    ) {
+      throw new Error(
+        "fresh Codex manager discovery did not reach its exact backend route",
+      );
     }
     unmount();
 
     const probing: TripSetupState = {
-      ...setup, state: "probing", probe_attempt_id: "probe-attempt",
-      selected_profiles: [{ role: "explorer", selection_state: "selected", profile, compatibility }],
+      ...setup,
+      state: "probing",
+      probe_attempt_id: "probe-attempt",
+      selected_profiles: [{
+        role: "explorer",
+        selection_state: "selected",
+        profile,
+        compatibility,
+      }],
     };
-    mount(<ProjectSetup project={initialized} setup={probing} onChanged={noop} onViewSession={cmuxFixture} />);
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={probing}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
     click("Agents");
-    const explorer = [...document.querySelectorAll(".setup-invocation")].find((row) => row.querySelector("strong")?.textContent === "Explorer");
-    const firstProbe = [...explorer?.querySelectorAll("button") || []].find((button) => button.textContent?.includes("Launch bounded probe"));
-    if (!firstProbe) throw new Error(`fresh delegated Codex probe was hidden without a receipt: ${document.body.textContent?.slice(-1800)}`);
+    const explorer = [...document.querySelectorAll(".setup-invocation")].find((
+      row,
+    ) => row.querySelector("strong")?.textContent === "Explorer");
+    const firstProbe = [...explorer?.querySelectorAll("button") || []].find((
+      button,
+    ) => button.textContent?.includes("Launch bounded probe"));
+    if (!firstProbe) {
+      throw new Error(
+        `fresh delegated Codex probe was hidden without a receipt: ${
+          document.body.textContent?.slice(-1800)
+        }`,
+      );
+    }
     act(() => firstProbe.click());
     await settle();
-    if (requests.at(-1)?.kind !== "trip_setup_dispatch" ||
-      requests.at(-1)?.attempt_id !== "probe-attempt" || requests.at(-1)?.role !== "explorer") {
-      throw new Error("first delegated probe did not retain exact role routing");
+    if (
+      requests.at(-1)?.kind !== "trip_setup_dispatch" ||
+      requests.at(-1)?.attempt_id !== "probe-attempt" ||
+      requests.at(-1)?.role !== "explorer"
+    ) {
+      throw new Error(
+        "first delegated probe did not retain exact role routing",
+      );
     }
     unmount();
 
-    mount(<ProjectSetup project={initialized} setup={{ ...probing, sessions: [session] }} onChanged={noop} onViewSession={cmuxFixture} />);
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={{ ...probing, sessions: [session] }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
     click("Agents");
     click("Resume the stopped session");
     await settle();
-    if (requests.at(-1)?.kind !== "role_resume" || requests.at(-1)?.session_id !== session.id) {
-      throw new Error("first setup probe could not resume to produce its missing qualification receipt");
+    if (
+      requests.at(-1)?.kind !== "role_resume" ||
+      requests.at(-1)?.session_id !== session.id
+    ) {
+      throw new Error(
+        "first setup probe could not resume to produce its missing qualification receipt",
+      );
     }
     unmount();
 
-    mount(<ProjectSetup project={initialized} setup={{ ...setup, sessions: [{
-      ...session, id: "discovery-session", attempt_id: "discovery-attempt", role: "manager",
-    }] }} onChanged={noop} onViewSession={cmuxFixture} />);
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={{
+          ...setup,
+          sessions: [{
+            ...session,
+            id: "discovery-session",
+            attempt_id: "discovery-attempt",
+            role: "manager",
+          }],
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
     click("Discover");
     click("Resume the stopped session");
     await settle();
-    if (requests.at(-1)?.kind !== "role_resume" || requests.at(-1)?.session_id !== "discovery-session") {
-      throw new Error("first discovery turn could not resume before its qualification receipt exists");
+    if (
+      requests.at(-1)?.kind !== "role_resume" ||
+      requests.at(-1)?.session_id !== "discovery-session"
+    ) {
+      throw new Error(
+        "first discovery turn could not resume before its qualification receipt exists",
+      );
     }
     unmount();
 
-    mount(<ProjectSetup project={initialized} setup={{ ...probing, sessions: [session],
-      selected_profiles: [{ ...probing.selected_profiles[0], compatibility: {
-        ...compatibility, observed_version: "codex-cli 0.155.1", missing_evidence: ["current_executable"],
-      } }],
-    }} onChanged={noop} onViewSession={cmuxFixture} />);
+    mount(
+      <ProjectSetup
+        project={initialized}
+        setup={{
+          ...probing,
+          sessions: [session],
+          selected_profiles: [{
+            ...probing.selected_profiles[0],
+            compatibility: {
+              ...compatibility,
+              observed_version: "codex-cli 0.155.1",
+              missing_evidence: ["current_executable"],
+            },
+          }],
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
     click("Agents");
-    const staleRow = [...document.querySelectorAll(".setup-invocation")].find((row) => row.querySelector("strong")?.textContent === "Explorer");
-    if (!staleRow?.textContent?.includes("Launch exact-profile retry") ||
-      staleRow.textContent.includes("Resume the stopped session")) {
-      throw new Error("stale probe did not offer fresh retry while holding exact resume");
+    const staleRow = [...document.querySelectorAll(".setup-invocation")].find((
+      row,
+    ) => row.querySelector("strong")?.textContent === "Explorer");
+    if (
+      !staleRow?.textContent?.includes("Launch exact-profile retry") ||
+      staleRow.textContent.includes("Resume the stopped session")
+    ) {
+      throw new Error(
+        "stale probe did not offer fresh retry while holding exact resume",
+      );
     }
-    const retry = [...staleRow.querySelectorAll("button")].find((button) => button.textContent?.includes("Launch exact-profile retry"))!;
+    const retry = [...staleRow.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Launch exact-profile retry")
+    )!;
     act(() => retry.click());
     await settle();
-    if (requests.at(-1)?.kind !== "trip_setup_dispatch" ||
-      requests.at(-1)?.attempt_id !== "probe-attempt" || requests.at(-1)?.role !== "explorer") {
-      throw new Error("stale retry did not route the selected profile to backend validation");
+    if (
+      requests.at(-1)?.kind !== "trip_setup_dispatch" ||
+      requests.at(-1)?.attempt_id !== "probe-attempt" ||
+      requests.at(-1)?.role !== "explorer"
+    ) {
+      throw new Error(
+        "stale retry did not route the selected profile to backend validation",
+      );
     }
   } finally {
     unmount();
@@ -1382,50 +2648,109 @@ Deno.test("report reminders settings preserve all keys and refresh after save", 
   };
   let stale = false;
   let refreshes = 0;
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    requests.push(body);
-    if (stale) {
-      return new Response(JSON.stringify({ error: "project version is stale" }), { status: 409 });
-    }
-    return new Response(JSON.stringify({ result: { state: "settings_updated" } }), { status: 200 });
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      if (stale) {
+        return new Response(
+          JSON.stringify({ error: "project version is stale" }),
+          { status: 409 },
+        );
+      }
+      return new Response(
+        JSON.stringify({ result: { state: "settings_updated" } }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
   const refreshed = () => {
     refreshes += 1;
-    current = { ...current, version: current.version + 1, settings: requests.at(-1)!.settings as Record<string, unknown> };
+    current = {
+      ...current,
+      version: current.version + 1,
+      settings: requests.at(-1)!.settings as Record<string, unknown>,
+    };
     rerender(<ProjectSettings project={current} onChanged={refreshed} />);
   };
   try {
     mount(<ProjectSettings project={current} onChanged={refreshed} />);
-    const checkbox = () => [...document.querySelectorAll<HTMLLabelElement>("label")]
-      .find((label) => label.textContent?.includes("Remind agents to submit reports"))!
-      .querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+    const checkbox = () =>
+      [...document.querySelectorAll<HTMLLabelElement>("label")]
+        .find((label) =>
+          label.textContent?.includes("Remind agents to submit reports")
+        )!
+        .querySelector<HTMLInputElement>('input[type="checkbox"]')!;
     check(!checkbox().checked, "reminders did not default off");
-    check(document.body.textContent?.includes("provider quota"), "quota cost missing");
-    check(document.body.textContent?.includes("two reminder reservations"), "lifetime cap missing");
-    check(document.body.textContent?.includes("already written cannot be retracted"), "disable boundary missing");
+    check(
+      document.body.textContent?.includes("provider quota"),
+      "quota cost missing",
+    );
+    check(
+      document.body.textContent?.includes("two reminder reservations"),
+      "lifetime cap missing",
+    );
+    check(
+      document.body.textContent?.includes(
+        "already written cannot be retracted",
+      ),
+      "disable boundary missing",
+    );
     await act(async () => checkbox().click());
     await click("Save report reminders");
     await settle();
-    check(requests.length === 1 && requests[0].kind === "update_project_settings", "wrong save route");
-    check(requests[0].expected_version === 1 && requests[0].project_id === "p1", "save lost project version");
+    check(
+      requests.length === 1 && requests[0].kind === "update_project_settings",
+      "wrong save route",
+    );
+    check(
+      requests[0].expected_version === 1 && requests[0].project_id === "p1",
+      "save lost project version",
+    );
     const settings = requests[0].settings as Record<string, unknown>;
     check(settings.role_report_reminders === true, "enabled value missing");
-    check(JSON.stringify(settings.roles) === JSON.stringify(originalSettings.roles), "role settings lost");
-    check(settings.trip_config_revision_id === "config-1" && JSON.stringify(settings.custom) === '{"keep":true}', "unrelated keys lost");
-    check(refreshes === 1 && checkbox().checked, "saved settings did not refresh");
+    check(
+      JSON.stringify(settings.roles) === JSON.stringify(originalSettings.roles),
+      "role settings lost",
+    );
+    check(
+      settings.trip_config_revision_id === "config-1" &&
+        JSON.stringify(settings.custom) === '{"keep":true}',
+      "unrelated keys lost",
+    );
+    check(
+      refreshes === 1 && checkbox().checked,
+      "saved settings did not refresh",
+    );
     stale = true;
     await act(async () => checkbox().click());
     await click("Save report reminders");
     await settle();
-    check(requests.length === 2 && requests[1].expected_version === 2, "refreshed version not used");
-    check(refreshes === 1 && current.settings.role_report_reminders === true, "stale save changed current settings");
-    check(document.body.textContent?.includes("Refresh"), "stale failure has no recovery step");
-    const details = [...document.querySelectorAll("details")].find((item) => item.textContent?.includes("project version is stale"));
+    check(
+      requests.length === 2 && requests[1].expected_version === 2,
+      "refreshed version not used",
+    );
+    check(
+      refreshes === 1 && current.settings.role_report_reminders === true,
+      "stale save changed current settings",
+    );
+    check(
+      document.body.textContent?.includes("Refresh"),
+      "stale failure has no recovery step",
+    );
+    const details = [...document.querySelectorAll("details")].find((item) =>
+      item.textContent?.includes("project version is stale")
+    );
     check(details && !details.open, "diagnostics were not collapsed");
-    current = { ...current, version: 3, settings: { ...current.settings, role_report_reminders: false } };
+    current = {
+      ...current,
+      version: 3,
+      settings: { ...current.settings, role_report_reminders: false },
+    };
     rerender(<ProjectSettings project={current} onChanged={refreshed} />);
-    check(!checkbox().checked, "new project snapshot did not refresh the toggle");
+    check(
+      !checkbox().checked,
+      "new project snapshot did not refresh the toggle",
+    );
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -1606,19 +2931,42 @@ Deno.test("setup migration review follows installation kind rather than path inv
       unmount();
     }
     localStorage.clear();
-    mount(<ProjectSetup project={observed("compatible")} setup={setup} onChanged={noop} onViewSession={cmuxFixture} />);
+    mount(
+      <ProjectSetup
+        project={observed("compatible")}
+        setup={setup}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
     field("Project name", "Preserved edited name");
     const review = [...document.querySelectorAll<HTMLButtonElement>("button")]
       .find((button) => button.textContent?.includes("Review changes"));
     act(() => review!.click());
-    rerender(<ProjectSetup project={observed("partial")} setup={setup} onChanged={noop} onViewSession={cmuxFixture} />);
+    rerender(
+      <ProjectSetup
+        project={observed("partial")}
+        setup={setup}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
     const save = [...document.querySelectorAll<HTMLButtonElement>("button")]
       .find((button) => button.textContent === "Save setup proposal");
-    check(save?.disabled, "changed observation retained compatible-installation save authority");
+    check(
+      save?.disabled,
+      "changed observation retained compatible-installation save authority",
+    );
     const settings = [...document.querySelectorAll<HTMLButtonElement>("button")]
-      .find((button) => button.textContent?.includes("2") && button.textContent.includes("Project settings"));
+      .find((button) =>
+        button.textContent?.includes("2") &&
+        button.textContent.includes("Project settings")
+      );
     act(() => settings!.click());
-    check(findField("Project name").value === "Preserved edited name", "observation refresh discarded edited settings");
+    check(
+      findField("Project name").value === "Preserved edited name",
+      "observation refresh discarded edited settings",
+    );
   } finally {
     unmount();
     localStorage.clear();
@@ -1856,7 +3204,7 @@ Deno.test("T14 New task inherits roles, submits explicit overrides, and retains 
       JSON.stringify(requests.at(-1)?.acceptance_criteria) !==
         JSON.stringify(["first", "second"]) ||
       JSON.stringify(requests.at(-1)?.role_overrides) !==
-      JSON.stringify({ implementer: roleOverride })
+        JSON.stringify({ implementer: roleOverride })
     ) throw new Error("repaired draft command did not preserve exact fields");
     const rejectedCreateOperation = requests.at(-1)?.operation_id;
     fail = false;
@@ -2306,6 +3654,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
   const historyPages: Record<string, TranscriptPage[]> = {};
   const currentPreparationKey = "current-complete-preparation-key";
   let failedRuntimeView = false;
+  let runtimeProvider: "codex" | "claude" = "codex";
   const codexCatalogRequests: Array<{
     resolve: (slug: string) => void;
     reject: (error: Error) => void;
@@ -2354,7 +3703,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
             role: "implementer",
             requested_revision: 1,
             config: {
-              provider: "codex",
+              provider: runtimeProvider,
               model: "gpt-5.6-sol",
               effort: "high",
             },
@@ -2366,12 +3715,18 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
             status: "unverified",
             reason: "fresh corrected verification required",
             compatibility: {
-              status: "matched", observed_version: "codex-cli 0.155.1",
-              pack_id: "codex", pack_revision: "1", contract_id: "manager",
-              contract_revision: "1", short_hash: "123456789abc",
-              predicate_id: "codex-exact", missing_evidence: ["native_proof"],
+              status: "matched",
+              observed_version: "codex-cli 0.155.1",
+              pack_id: "codex",
+              pack_revision: "1",
+              contract_id: "manager",
+              contract_revision: "1",
+              short_hash: "123456789abc",
+              predicate_id: "codex-exact",
+              missing_evidence: ["native_proof"],
               action: "requalify_exact_profile",
-              message: "The exact contract is eligible for capability qualification; proof is pending.",
+              message:
+                "The exact contract is eligible for capability qualification; proof is pending.",
             },
             runtime_admission: {
               id: "failed-task-runtime",
@@ -2391,7 +3746,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
           role: "implementer",
           requested_revision: 1,
           config: {
-            provider: "codex",
+            provider: runtimeProvider,
             model: "gpt-5.6-sol",
             effort: "high",
           },
@@ -2402,12 +3757,18 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
           adapter: "codex",
           status: proofReady ? "supported" : "unverified",
           compatibility: {
-            status: "matched", observed_version: "codex-cli 0.155.1",
-            pack_id: "codex", pack_revision: "1", contract_id: "manager",
-            contract_revision: "1", short_hash: "123456789abc",
-            predicate_id: "codex-exact", missing_evidence: ["native_proof"],
+            status: "matched",
+            observed_version: "codex-cli 0.155.1",
+            pack_id: "codex",
+            pack_revision: "1",
+            contract_id: "manager",
+            contract_revision: "1",
+            short_hash: "123456789abc",
+            predicate_id: "codex-exact",
+            missing_evidence: ["native_proof"],
             action: "requalify_exact_profile",
-            message: "The exact contract is eligible for capability qualification; proof is pending.",
+            message:
+              "The exact contract is eligible for capability qualification; proof is pending.",
           },
           reason: proofReady
             ? "Exact current runtime-scoped authority is supported"
@@ -2418,15 +3779,21 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       requests.push(request);
       if (request.kind === "history_page") {
         const pages =
-          historyPages[`${request.session_id}/${request.transcript_epoch}`] ?? [];
+          historyPages[`${request.session_id}/${request.transcript_epoch}`] ??
+            [];
         const page = request.after_sequence === 0
           ? pages[0]
           : pages.find((_, index) =>
-            index > 0 && pages[index - 1].next_sequence === request.after_sequence
+            index > 0 &&
+            pages[index - 1].next_sequence === request.after_sequence
           );
         return new Response(JSON.stringify({
           result: page ??
-            { frames: [], next_sequence: request.after_sequence, has_more: false },
+            {
+              frames: [],
+              next_sequence: request.after_sequence,
+              has_more: false,
+            },
         }));
       }
       if (request.kind === "history_pane_views") {
@@ -2482,6 +3849,76 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       requests.at(-1)?.expected_version !== 7 ||
       requests.at(-1)?.action !== "pause_after_role"
     ) throw new Error("control target or version drifted");
+    unmount();
+
+    const reportingNote =
+      "One retained reporting turn; the probes are not repeated.";
+    const reportingAction: ContinuationAction = {
+      kind: "exact_resume",
+      enabled: true,
+      reason:
+        "The first verification phase finished. Resume the same native session to submit its remembered result.",
+      owner: "human",
+      operation: "runtime_probe_resume",
+      binding: {
+        task_id: task.id,
+        session_id: "runtime-report-session",
+        runtime_admission_id: "runtime-report-admission",
+        role: "plan_reviewer",
+      },
+      accounting_note: reportingNote,
+    };
+    mount(
+      <WorkflowControls
+        task={task}
+        actions={[reportingAction]}
+        onChanged={noop}
+      />,
+    );
+    check(
+      document.querySelector(".continuation-copy strong")?.textContent ===
+          "Verification is ready to finish · Plan Reviewer" &&
+        !document.body.textContent?.includes(
+          "Session stopped before finishing",
+        ) &&
+        document.body.textContent?.includes(reportingAction.reason) &&
+        document.body.textContent?.includes(reportingNote),
+      "the expected reporting phase was presented as a stopped session or lost its call accounting",
+    );
+    click("Resume the verification");
+    await settle();
+    check(
+      requests.at(-1)?.kind === "runtime_probe_resume" &&
+        requests.at(-1)?.admission_id === "runtime-report-admission" &&
+        requests.at(-1)?.role === "plan_reviewer",
+      "reporting did not preserve the dedicated admission and role binding",
+    );
+    rerender(
+      <WorkflowControls
+        task={task}
+        actions={[{
+          ...reportingAction,
+          operation: "role_resume",
+          reason: "The stopped session can continue its unfinished work.",
+          accounting_note: undefined,
+          binding: { task_id: task.id, session_id: "ordinary-resume-session" },
+        }]}
+        onChanged={noop}
+      />,
+    );
+    check(
+      document.querySelector(".continuation-copy strong")?.textContent ===
+          "Session stopped before finishing" &&
+        !document.body.textContent?.includes("Verification is ready to finish"),
+      "ordinary exact resume lost its recovery wording",
+    );
+    click("Resume the stopped session");
+    await settle();
+    check(
+      requests.at(-1)?.kind === "role_resume" &&
+        requests.at(-1)?.session_id === "ordinary-resume-session",
+      "ordinary resume was routed as verification",
+    );
     unmount();
 
     const freshDispatchTask: Task = {
@@ -2658,7 +4095,9 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     if (
       !document.body.textContent?.includes("requested revision 2") ||
       !document.body.textContent?.includes("effective revision 1") ||
-      !document.body.textContent?.includes("requested change, not active yet") ||
+      !document.body.textContent?.includes(
+        "requested change, not active yet",
+      ) ||
       !document.body.textContent?.includes("Running now") ||
       !document.body.textContent?.includes("Needs verification") ||
       !document.body.textContent?.includes("not a usable replacement") ||
@@ -2712,9 +4151,21 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     unmount();
     preparationSource = "task_override";
     failedRuntimeView = true;
+    runtimeProvider = "claude";
+    const claudeConfigured: Task = {
+      ...configured,
+      role_settings: configured.role_settings.map((setting) =>
+        setting.role === "implementer"
+          ? {
+            ...setting,
+            config: { ...setting.config, provider: "claude" as const },
+          }
+          : setting
+      ),
+    };
     mount(
       <RoleSettings
-        task={configured}
+        task={claudeConfigured}
         project={initialized}
         sessions={[]}
         productionRestrictions={[]}
@@ -2722,12 +4173,26 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       />,
     );
     await settle();
+    const beforeClaude = requests.length;
+    click("Prepare a new verification");
+    await settle();
+    check(
+      requests.length === beforeClaude &&
+        document.querySelector(".error[role=alert]:not(.error-notice)")
+          ?.textContent?.includes("Enter the live cmux socket path"),
+      "task Claude preparation sent an empty socket instead of an inline instruction",
+    );
+    field(
+      "Live cmux Unix socket for Claude requalification",
+      "/tmp/task-cmux.sock",
+    );
     click("Prepare a new verification");
     await settle();
     if (
       requests.at(-1)?.action !== "prepare_runtime_admission" ||
       requests.at(-1)?.task_id !== "AJ-1" ||
       requests.at(-1)?.role !== "implementer" ||
+      requests.at(-1)?.cmux_socket_path !== "/tmp/task-cmux.sock" ||
       requests.some((request) => request.kind === "runtime_probe_launch")
     ) {
       throw new Error(
@@ -2735,6 +4200,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       );
     }
     unmount();
+    runtimeProvider = "codex";
     mount(
       <ProjectSetup
         project={initialized}
@@ -2767,7 +4233,8 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
               nonce: "not-rendered",
               state: "failed",
               failure_category: "observation_unavailable",
-              failure_reason: "ordinary runtime probe reported an observed failure",
+              failure_reason:
+                "ordinary runtime probe reported an observed failure",
               has_native_session: true,
             }, {
               role: "manager",
@@ -2791,11 +4258,19 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         onViewSession={cmuxFixture}
       />,
     );
-    check(document.body.textContent?.includes("did not identify which required observation was missing"),
-      "the historical runtime failure hid its missing-observation diagnostic");
-    check([...document.querySelectorAll("details pre")].some((node) =>
-      node.textContent === "ordinary runtime probe reported an observed failure\nFailure category: observation_unavailable"),
-      "the historical backend reason and category were not retained in Technical details");
+    check(
+      document.body.textContent?.includes(
+        "did not identify which required observation was missing",
+      ),
+      "the historical runtime failure hid its missing-observation diagnostic",
+    );
+    check(
+      [...document.querySelectorAll("details pre")].some((node) =>
+        node.textContent ===
+          "ordinary runtime probe reported an observed failure\nFailure category: observation_unavailable"
+      ),
+      "the historical backend reason and category were not retained in Technical details",
+    );
     click("Prepare a new verification");
     await settle();
     if (
@@ -2886,7 +4361,13 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
           state: "discovery",
           discovery_attempt_id: "setup-unchanged-manager-attempt",
           manager_control: {
-            hold: { id: "stopped-manager", state: "held", requested_operation_id: "stop-manager", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
+            hold: {
+              id: "stopped-manager",
+              state: "held",
+              requested_operation_id: "stop-manager",
+              created_at: "2026-01-01T00:00:00Z",
+              updated_at: "2026-01-01T00:00:00Z",
+            },
             current: { ...config, model: "previous-discovery-model" },
             requested: config,
             effective: config,
@@ -2921,13 +4402,20 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       (button) => button.textContent === "Restart discovery manager",
     ) as HTMLButtonElement | undefined;
     if (!restart || restart.disabled) {
-      throw new Error("quiescent held manager cannot restart with the same profile");
+      throw new Error(
+        "quiescent held manager cannot restart with the same profile",
+      );
     }
     act(() => restart.click());
     await settle();
-    if (requests.at(-1)?.action !== "change_setup_manager" ||
-      (requests.at(-1)?.host_manager as Record<string, unknown>)?.model !== config.model) {
-      throw new Error("restart did not preserve the exact selected manager profile");
+    if (
+      requests.at(-1)?.action !== "change_setup_manager" ||
+      (requests.at(-1)?.host_manager as Record<string, unknown>)?.model !==
+        config.model
+    ) {
+      throw new Error(
+        "restart did not preserve the exact selected manager profile",
+      );
     }
     field("Exact replacement model", "gpt-5.6-terra");
     const changedManager = [...document.querySelectorAll("button")].find((
@@ -3289,8 +4777,14 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         onViewSession={cmuxFixture}
       />,
     );
-    if (!document.querySelector('textarea[aria-label="Recovery evidence for manager"]')) {
-      throw new Error("activated setup hid unresolved recovery from an earlier invocation");
+    if (
+      !document.querySelector(
+        'textarea[aria-label="Recovery evidence for manager"]',
+      )
+    ) {
+      throw new Error(
+        "activated setup hid unresolved recovery from an earlier invocation",
+      );
     }
     unmount();
     const refreshesBeforeRuntime = recoveryRefreshCount();
@@ -3446,6 +4940,13 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         "stale Supported evidence with identical labels hid the exact current preparation gate",
       );
     }
+    check(
+      !document.body.textContent?.includes(
+        "These exact agent settings passed verification.",
+      ) &&
+        document.body.textContent?.includes("Next step:"),
+      "stale proof hid the current verification action",
+    );
     unmount();
     mount(
       <RoleSettings
@@ -3483,6 +4984,14 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         "exact current Supported preparation remained validation-required",
       );
     }
+    const proofCopy = [...document.querySelectorAll(".role-settings article")]
+      .find((row) => row.querySelector("strong")?.textContent === "Implementer")
+      ?.querySelector(".compatibility-details")?.textContent;
+    check(
+      proofCopy?.includes("These exact agent settings passed verification.") &&
+        !proofCopy.includes("Next step:"),
+      "exact current proof still advised requalification",
+    );
     click("Activate task profile");
     await settle();
     if (
@@ -3961,7 +5470,12 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
         recordedFrame(10, "base64", encodedBytes(doubleEscapeEnd)),
         recordedFrame(11, "base64", encodedBytes(escapeIntermediatesStart)),
         recordedFrame(12, "base64", encodedBytes(escapeIntermediatesEnd)),
-        recordedFrame(13, "utf8", "older output was retained only in part", true),
+        recordedFrame(
+          13,
+          "utf8",
+          "older output was retained only in part",
+          true,
+        ),
         recordedFrame(14, "utf8", "final retained marker"),
       ],
       next_sequence: 14,
@@ -4307,20 +5821,26 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     const recordedView = [
       ...(implementerSession?.querySelectorAll("button") || []),
     ]
-      .find((button) => button.textContent?.includes("View recorded output"));
+      .find((button) =>
+        button.textContent?.includes("View recorded output")
+      );
     const sessionMutationsBeforeHistory = requests.filter((request) =>
       !String(request.kind).startsWith("history_")
     ).length;
     act(() => recordedView!.click());
     await settle();
-    const firstPage = requests.filter((request) => request.kind === "history_page");
+    const firstPage = requests.filter((request) =>
+      request.kind === "history_page"
+    );
     if (
       firstPage.length !== 1 || firstPage[0].session_id !== "restore-s-2" ||
       firstPage[0].transcript_epoch !== "recorded-epoch" ||
       firstPage[0].after_sequence !== 0 ||
       !document.body.textContent?.includes("More saved output is available")
     ) {
-      throw new Error("the stopped reader did not request its exact first page");
+      throw new Error(
+        "the stopped reader did not request its exact first page",
+      );
     }
     click("Load all remaining output");
     await settle();
@@ -4343,7 +5863,9 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       document.body.textContent?.includes("SECRET-") ||
       !document.body.textContent.includes("recorded output gap") ||
       !document.body.textContent.includes("final retained marker") ||
-      !document.body.textContent.includes("Showing all saved output. It ends at frame 14.")
+      !document.body.textContent.includes(
+        "Showing all saved output. It ends at frame 14.",
+      )
     ) {
       throw new Error(
         "stopped recorded output did not reach its final retained frame safely",
@@ -4353,13 +5875,14 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     // other request is made for the stopped session.
     if (
       taskOutputRequests.includes("restore-s-2") ||
-      requests.filter((request) =>
-          !String(request.kind).startsWith("history_")
-        ).length !== sessionMutationsBeforeHistory ||
+      requests.filter((request) => !String(request.kind).startsWith("history_"))
+          .length !== sessionMutationsBeforeHistory ||
       [...(implementerSession?.querySelectorAll("button") || [])]
         .some((button) => button.textContent?.includes("Take control"))
     ) {
-      throw new Error("reading stopped output opened a live route or sent a mutation");
+      throw new Error(
+        "reading stopped output opened a live route or sent a mutation",
+      );
     }
     click("Close recorded output");
     if (document.querySelector(".session-history")) {
@@ -4565,7 +6088,8 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
           guidance: [{
             id: "worker-reminder",
             role_generation_id: "implementer-generation",
-            body: "Report reminder 1 of 2. 1 of 2 reservations spent for this agent generation.",
+            body:
+              "Report reminder 1 of 2. 1 of 2 reservations spent for this agent generation.",
             state: "written_awaiting_submit",
           }],
         }}
@@ -4586,7 +6110,8 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
           guidance: [{
             id: "worker-reminder",
             role_generation_id: "implementer-generation",
-            body: "Report reminder 1 of 2. 1 of 2 reservations spent for this agent generation.",
+            body:
+              "Report reminder 1 of 2. 1 of 2 reservations spent for this agent generation.",
             state: "submitted",
           }],
         }}
@@ -4616,15 +6141,18 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
     (async (_input: string | URL | Request, init?: RequestInit) => {
       requests.push(JSON.parse(String(init?.body)));
       return protocolConflict
-        ? new Response(JSON.stringify({
-          error: "protocol mismatch",
-          protocol_error: {
-            reason: "incompatible_generation",
-            observed_generation: 1,
-            expected_generation: 2,
-            guidance: "Reload the dashboard for the matching protocol.",
-          },
-        }), { status: 409 })
+        ? new Response(
+          JSON.stringify({
+            error: "protocol mismatch",
+            protocol_error: {
+              reason: "incompatible_generation",
+              observed_generation: 1,
+              expected_generation: 2,
+              guidance: "Reload the dashboard for the matching protocol.",
+            },
+          }),
+          { status: 409 },
+        )
         : conflict
         ? new Response(JSON.stringify({ error: "stale request" }), {
           status: 409,
@@ -4708,9 +6236,9 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
     switches: [],
     recovery: [],
     history: [],
-      profile_sets: [],
-      task_recipes: [],
-      recipe_schedules: [],
+    profile_sets: [],
+    task_recipes: [],
+    recipe_schedules: [],
     continuation_actions: [],
     decisions: [],
     instance_settings: {
@@ -4811,7 +6339,8 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
         onChanged={() => changed++}
       />,
     );
-    document.querySelector<HTMLButtonElement>(".approval-request .link-button")!.click();
+    document.querySelector<HTMLButtonElement>(".approval-request .link-button")!
+      .click();
     if (
       JSON.stringify(selections) !== JSON.stringify([["AJ-1", "session-1"]])
     ) throw new Error("permission request selected the wrong task or session");
@@ -4919,11 +6448,17 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
     const requestsBeforeProtocol = requests.length;
     click("Approve once");
     await settle();
-    if (changed !== changesBeforeProtocol ||
+    if (
+      changed !== changesBeforeProtocol ||
       requests.length !== requestsBeforeProtocol + 1 ||
-      !document.body.textContent?.includes("Reload the dashboard for the matching protocol.") ||
-      document.body.textContent?.includes("The request changed in another view")) {
-      throw new Error("protocol refusal entered the ordinary 409 revision branch");
+      !document.body.textContent?.includes(
+        "Reload the dashboard for the matching protocol.",
+      ) ||
+      document.body.textContent?.includes("The request changed in another view")
+    ) {
+      throw new Error(
+        "protocol refusal entered the ordinary 409 revision branch",
+      );
     }
     unmount();
     protocolConflict = false;
@@ -5040,15 +6575,37 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
       ...serviceState,
       trip_task_verification: [{
         ...serviceCheck,
-        authorization: { ...serviceCheck.authorization, authorized: true, once_available: true, state: "approved_once" },
+        authorization: {
+          ...serviceCheck.authorization,
+          authorized: true,
+          once_available: true,
+          state: "approved_once",
+        },
       }],
     } as AppState;
-    mount(<TaskDetail task={task} state={approvedState} onClose={() => {}} onChanged={() => changed++} />);
+    mount(
+      <TaskDetail
+        task={task}
+        state={approvedState}
+        onClose={() => {}}
+        onChanged={() => changed++}
+      />,
+    );
     click("Checks");
-    const approvedButton = [...document.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Approved for this candidate");
-    if (!approvedButton?.disabled) throw new Error("recorded check approval was not visible or offered duplicate approval");
-    const approvedRun = [...document.querySelectorAll<HTMLButtonElement>(".verification-row > .button-row button")][0];
-    if (approvedRun.disabled) throw new Error("approved current check did not enable Run");
+    const approvedButton = [
+      ...document.querySelectorAll<HTMLButtonElement>("button"),
+    ].find((button) => button.textContent === "Approved for this candidate");
+    if (!approvedButton?.disabled) {
+      throw new Error(
+        "recorded check approval was not visible or offered duplicate approval",
+      );
+    }
+    const approvedRun = [...document.querySelectorAll<HTMLButtonElement>(
+      ".verification-row > .button-row button",
+    )][0];
+    if (approvedRun.disabled) {
+      throw new Error("approved current check did not enable Run");
+    }
     unmount();
 
     const inactiveState = {
@@ -5395,7 +6952,9 @@ Deno.test("T20 durable cmux projections fence stale View results and local contr
       !document.body.textContent?.includes(
         "fixture validated cmux loss observation",
       ) ||
-      !document.body.textContent?.includes("previous terminal connection to close")
+      !document.body.textContent?.includes(
+        "previous terminal connection to close",
+      )
     ) {
       throw new Error(
         "live loss retirement exposed replacement or hid its causal evidence",
@@ -5471,42 +7030,98 @@ Deno.test("T20 durable cmux projections fence stale View results and local contr
     for (const card of [setupCard, runtimeCard]) {
       unmount();
       const opening = durableSurface("opening-route", "2026-09-20T00:00:11Z", {
-        surface_state: "opening", attachment_state: "pending",
-        desired_input_state: "view_only", actual_input_state: "view_only",
-        control_revision: 0, applied_revision: 0,
+        surface_state: "opening",
+        attachment_state: "pending",
+        desired_input_state: "view_only",
+        actual_input_state: "view_only",
+        control_revision: 0,
+        applied_revision: 0,
       });
       const view = async (): Promise<CmuxViewOutcome> => ({
-        state: "pending", message: "Opening", retry_available: false, surface: opening,
+        state: "pending",
+        message: "Opening",
+        retry_available: false,
+        surface: opening,
       });
-      mount(card({ ...opening, id: "prior-route", surface_state: "retired", attachment_state: "ended",
-        updated_at: "2026-09-20T00:00:10Z" }, view));
+      mount(
+        card({
+          ...opening,
+          id: "prior-route",
+          surface_state: "retired",
+          attachment_state: "ended",
+          updated_at: "2026-09-20T00:00:10Z",
+        }, view),
+      );
       click("View fresh view-only surface");
       await settle();
-      rerender(card({ ...opening, surface_state: "open", attachment_state: "live",
-        updated_at: "2026-09-20T00:00:12Z" }, view));
+      rerender(
+        card({
+          ...opening,
+          surface_state: "open",
+          attachment_state: "live",
+          updated_at: "2026-09-20T00:00:12Z",
+        }, view),
+      );
       await settle();
       assertCardState("view only");
       const take = [...document.querySelectorAll<HTMLButtonElement>("button")]
         .find((button) => button.textContent === "Take control");
-      if (!take || take.disabled) throw new Error("completed opening response kept the live route pending");
+      if (!take || take.disabled) {
+        throw new Error(
+          "completed opening response kept the live route pending",
+        );
+      }
     }
     unmount();
-    const priorSurface = durableSurface("prior-session-route", "2026-09-20T00:00:13Z", {
-      desired_input_state: "view_only", actual_input_state: "view_only", applied_revision: 4,
-    });
+    const priorSurface = durableSurface(
+      "prior-session-route",
+      "2026-09-20T00:00:13Z",
+      {
+        desired_input_state: "view_only",
+        actual_input_state: "view_only",
+        applied_revision: 4,
+      },
+    );
     let finishPriorView: ((outcome: CmuxViewOutcome) => void) | undefined;
-    const delayedView = () => new Promise<CmuxViewOutcome>((resolve) => { finishPriorView = resolve; });
+    const delayedView = () =>
+      new Promise<CmuxViewOutcome>((resolve) => {
+        finishPriorView = resolve;
+      });
     mount(setupCard(priorSurface, delayedView));
     click("View output");
     await settle();
     const replacement = setupState(priorSurface);
-    replacement.sessions = [{ ...replacement.sessions[0], id: "replacement-session", cmux_surface: undefined }];
-    rerender(<ProjectSetup project={initialized} setup={replacement} onChanged={noop} onViewSession={delayedView} />);
+    replacement.sessions = [{
+      ...replacement.sessions[0],
+      id: "replacement-session",
+      cmux_surface: undefined,
+    }];
+    rerender(
+      <ProjectSetup
+        project={initialized}
+        setup={replacement}
+        onChanged={noop}
+        onViewSession={delayedView}
+      />,
+    );
     await settle();
-    if (document.querySelector(".cmux-route")) throw new Error("replacement session inherited the previous session's pending presentation");
-    finishPriorView?.({ state: "view_only", message: "Prior session", retry_available: false, surface: priorSurface });
+    if (document.querySelector(".cmux-route")) {
+      throw new Error(
+        "replacement session inherited the previous session's pending presentation",
+      );
+    }
+    finishPriorView?.({
+      state: "view_only",
+      message: "Prior session",
+      retry_available: false,
+      surface: priorSurface,
+    });
     await settle();
-    if (document.querySelector(".cmux-route")) throw new Error("late View response attached a prior session's surface to its replacement");
+    if (document.querySelector(".cmux-route")) {
+      throw new Error(
+        "late View response attached a prior session's surface to its replacement",
+      );
+    }
   } finally {
     unmount();
   }
@@ -5714,23 +7329,31 @@ Deno.test("M8A protocol refusal is definitive before mutation reconciliation", a
   let businessCalls = 0;
   let expectedGeneration = 2;
   let observedGeneration: number | null = 1;
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    businessCalls++;
-    const declaration = JSON.parse(String(new Headers(init?.headers).get("x-llmrelay-protocol")));
-    if (declaration.generation !== 1 || declaration.client_kind !== "browser" ||
-      declaration.required_features[0] !== "http_operational_v1") {
-      throw new Error("business request omitted the protocol declaration");
-    }
-    return new Response(JSON.stringify({
-      error: "protocol mismatch",
-      protocol_error: {
-        reason: "incompatible_generation",
-        observed_generation: observedGeneration,
-        expected_generation: expectedGeneration,
-        guidance: "Reload the dashboard for the matching protocol.",
-      },
-    }), { status: 409 });
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      businessCalls++;
+      const declaration = JSON.parse(
+        String(new Headers(init?.headers).get("x-llmrelay-protocol")),
+      );
+      if (
+        declaration.generation !== 1 || declaration.client_kind !== "browser" ||
+        declaration.required_features[0] !== "http_operational_v1"
+      ) {
+        throw new Error("business request omitted the protocol declaration");
+      }
+      return new Response(
+        JSON.stringify({
+          error: "protocol mismatch",
+          protocol_error: {
+            reason: "incompatible_generation",
+            observed_generation: observedGeneration,
+            expected_generation: expectedGeneration,
+            guidance: "Reload the dashboard for the matching protocol.",
+          },
+        }),
+        { status: 409 },
+      );
+    }) as typeof fetch;
   try {
     let failure: unknown;
     try {
@@ -5738,12 +7361,21 @@ Deno.test("M8A protocol refusal is definitive before mutation reconciliation", a
     } catch (error) {
       failure = error;
     }
-    if (!(failure instanceof ProtocolError) || failure instanceof ApiError ||
+    if (
+      !(failure instanceof ProtocolError) || failure instanceof ApiError ||
       failure.message !== "Reload the dashboard for the matching protocol." ||
-      businessCalls !== 1) {
-      throw new Error("protocol refusal became an ambiguous or replayed mutation");
+      businessCalls !== 1
+    ) {
+      throw new Error(
+        "protocol refusal became an ambiguous or replayed mutation",
+      );
     }
-    for (const [expected, observed] of [[-1, 1], [0x1_0000_0000, 1], [2, -1], [2, 0x1_0000_0000]]) {
+    for (
+      const [expected, observed] of [[-1, 1], [0x1_0000_0000, 1], [2, -1], [
+        2,
+        0x1_0000_0000,
+      ]]
+    ) {
       expectedGeneration = expected;
       observedGeneration = observed;
       let invalidFailure: unknown;
@@ -5752,8 +7384,12 @@ Deno.test("M8A protocol refusal is definitive before mutation reconciliation", a
       } catch (error) {
         invalidFailure = error;
       }
-      if (!(invalidFailure instanceof ApiError) || invalidFailure.status !== 409) {
-        throw new Error("out-of-range protocol generation was accepted as a structured refusal");
+      if (
+        !(invalidFailure instanceof ApiError) || invalidFailure.status !== 409
+      ) {
+        throw new Error(
+          "out-of-range protocol generation was accepted as a structured refusal",
+        );
       }
     }
     const requestCount = () => businessCalls;
@@ -5857,6 +7493,77 @@ Deno.test("M5 decision policy keeps the permitted control and explains the block
     ) {
       throw new Error("Backlog action did not send exact task and version");
     }
+    const single = singleAgentTask(singleAgentRun());
+    const singleDraft: Task = {
+      ...single,
+      lifecycle: "backlog",
+      active_attempt: undefined,
+      workflow: { ...single.workflow!, admission_state: "draft", run: null },
+    };
+    mount(
+      <WorkflowControls
+        task={singleDraft}
+        project={{ ...initialized, trip: undefined }}
+        decision={{
+          ...readiness,
+          subject: { task_id: singleDraft.id },
+          observed_revision: { task_version: singleDraft.version },
+          ownership: {
+            ...readiness.ownership,
+            binding: {
+              task_id: singleDraft.id,
+              expected_task_version: singleDraft.version,
+            },
+          },
+          next_action: {
+            operation: "make_ready",
+            enabled: true,
+            owner: "human",
+            binding: {
+              task_id: singleDraft.id,
+              expected_task_version: singleDraft.version,
+            },
+          },
+        }}
+        onChanged={noop}
+      />,
+    );
+    check(
+      !findButton("Make Ready").disabled,
+      "Single agent readiness was replaced by TRIP setup gating",
+    );
+    click("Make Ready");
+    await settle();
+    check(
+      requests.at(-1)?.kind === "make_ready" &&
+        requests.at(-1)?.task_id === singleDraft.id &&
+        requests.at(-1)?.expected_version === singleDraft.version,
+      "Single agent Make Ready lost its service-authoritative binding",
+    );
+    rerender(
+      <WorkflowControls
+        task={singleDraft}
+        decision={{
+          ...readiness,
+          primary_blocker: {
+            code: "task.single_agent_admission",
+            state: "missing",
+            owner: "human",
+            evidence: null,
+            message: "The selected profile is not admitted",
+          },
+          control_policy: {
+            allowed_controls: [],
+            disabled_reason_code: "task.single_agent_admission",
+          },
+        }}
+        onChanged={noop}
+      />,
+    );
+    check(
+      findButton("Make Ready").disabled,
+      "a missing Single agent admission was bypassed in the UI",
+    );
     unmount();
     mount(
       <WorkflowControls
@@ -5906,7 +7613,10 @@ Deno.test("M5 decision policy keeps the permitted control and explains the block
     if (!runNext || runNext.disabled) {
       throw new Error("Ready Run next policy was disabled");
     }
-    check(document.body.textContent?.includes("pauses before starting an agent"), "Prepare task implies immediate agent startup");
+    check(
+      document.body.textContent?.includes("pauses before starting an agent"),
+      "Prepare task implies immediate agent startup",
+    );
     click("Prepare task");
     await settle();
     if (
@@ -6046,9 +7756,9 @@ const liveBase: AppState = {
   switches: [],
   recovery: [],
   history: [],
-      profile_sets: [],
-      task_recipes: [],
-      recipe_schedules: [],
+  profile_sets: [],
+  task_recipes: [],
+  recipe_schedules: [],
   instance_settings: {
     version: 1,
     auto_resume_eligible: false,
@@ -6098,30 +7808,48 @@ Deno.test("M8A concurrent negotiation and incarnation reset fence descriptor cac
     let descriptorCalls = 0;
     protocolFixtureResponder = () => {
       descriptorCalls++;
-      return new Promise<Response>((resolve) => { resolveFirst = resolve; });
+      return new Promise<Response>((resolve) => {
+        resolveFirst = resolve;
+      });
     };
     const first = command({ kind: "retry", operation_id: "m8a-first" });
     const second = command({ kind: "retry", operation_id: "m8a-second" });
     await Promise.resolve();
-    check(descriptorCalls === 1 && businessCalls === 0, "concurrent operations did not share protocol discovery");
-    resolveFirst!(new Response(JSON.stringify({
-      generation: 1, server_version: "fixture", instance_id: incarnation,
-      supported_features: allFeatures,
-    })));
+    check(
+      descriptorCalls === 1 && businessCalls === 0,
+      "concurrent operations did not share protocol discovery",
+    );
+    resolveFirst!(
+      new Response(JSON.stringify({
+        generation: 1,
+        server_version: "fixture",
+        instance_id: incarnation,
+        supported_features: allFeatures,
+      })),
+    );
     await Promise.all([first, second]);
-    check(businessCalls === 2, "negotiated operations did not dispatch once each");
+    check(
+      businessCalls === 2,
+      "negotiated operations did not dispatch once each",
+    );
     incarnation = "m8a-reset-b";
     await getState();
     protocolFixtureResponder = () => {
       descriptorCalls++;
-      return Promise.resolve(new Response(JSON.stringify({
-        generation: 1, server_version: "fixture", instance_id: incarnation,
-        supported_features: allFeatures,
-      })));
+      return Promise.resolve(
+        new Response(JSON.stringify({
+          generation: 1,
+          server_version: "fixture",
+          instance_id: incarnation,
+          supported_features: allFeatures,
+        })),
+      );
     };
     await command({ kind: "retry", operation_id: "m8a-third" });
-    check(descriptorCalls === 2 && businessCalls === 3,
-      "incarnation reset kept a stale descriptor or replayed a mutation");
+    check(
+      descriptorCalls === 2 && businessCalls === 3,
+      "incarnation reset kept a stale descriptor or replayed a mutation",
+    );
   } finally {
     protocolFixtureResponder = () => Promise.resolve(protocolFixture());
     globalThis.fetch = priorFetch;
@@ -6134,18 +7862,24 @@ Deno.test("M8A a newer observed incarnation fences unresolved descriptor discove
   let businessCalls = 0;
   let resolveNewState: ((response: Response) => void) | undefined;
   let resolveOldDescriptor: ((response: Response) => void) | undefined;
-  const descriptor = (instanceId: string) => new Response(JSON.stringify({
-    generation: 1, server_version: "fixture", instance_id: instanceId,
-    supported_features: allFeatures,
-  }));
+  const descriptor = (instanceId: string) =>
+    new Response(JSON.stringify({
+      generation: 1,
+      server_version: "fixture",
+      instance_id: instanceId,
+      supported_features: allFeatures,
+    }));
   globalThis.fetch = (async (input: string | URL | Request) => {
     if (String(input) === "/api/state") {
       stateCalls++;
       if (stateCalls === 2) {
-        return new Promise<Response>((resolve) => { resolveNewState = resolve; });
+        return new Promise<Response>((resolve) => {
+          resolveNewState = resolve;
+        });
       }
       return new Response(JSON.stringify(snapshotAt(
-        stateCalls === 1 ? "m8a-order-a" : "m8a-order-b", String(stateCalls),
+        stateCalls === 1 ? "m8a-order-a" : "m8a-order-b",
+        String(stateCalls),
       )));
     }
     businessCalls++;
@@ -6157,28 +7891,44 @@ Deno.test("M8A a newer observed incarnation fences unresolved descriptor discove
     await command({ kind: "retry", operation_id: "m8a-order-seed" });
     const newState = getState();
     await Promise.resolve();
-    check(!!resolveNewState, "newer state read was not dispatched before renegotiation");
+    check(
+      !!resolveNewState,
+      "newer state read was not dispatched before renegotiation",
+    );
     await getState();
     let descriptorCalls = 0;
     protocolFixtureResponder = () => {
       descriptorCalls++;
       return descriptorCalls === 1
-        ? new Promise<Response>((resolve) => { resolveOldDescriptor = resolve; })
+        ? new Promise<Response>((resolve) => {
+          resolveOldDescriptor = resolve;
+        })
         : Promise.resolve(descriptor("m8a-order-c"));
     };
-    const mutation = command({ kind: "retry", operation_id: "m8a-order-mutation" });
+    const mutation = command({
+      kind: "retry",
+      operation_id: "m8a-order-mutation",
+    });
     await Promise.resolve();
-    check(descriptorCalls === 1 && !!resolveOldDescriptor && businessCalls === 1,
-      "older descriptor discovery did not remain pending before newer state");
-    resolveNewState!(new Response(JSON.stringify(snapshotAt("m8a-order-c", "4"))));
+    check(
+      descriptorCalls === 1 && !!resolveOldDescriptor && businessCalls === 1,
+      "older descriptor discovery did not remain pending before newer state",
+    );
+    resolveNewState!(
+      new Response(JSON.stringify(snapshotAt("m8a-order-c", "4"))),
+    );
     await newState;
     resolveOldDescriptor!(descriptor("m8a-order-b"));
     await mutation;
-    check(descriptorCalls === 2 && businessCalls === 2,
-      "late older descriptor was cached or mutation replayed");
+    check(
+      descriptorCalls === 2 && businessCalls === 2,
+      "late older descriptor was cached or mutation replayed",
+    );
     await command({ kind: "retry", operation_id: "m8a-order-next" });
-    check(descriptorCalls === 2 && businessCalls === 3,
-      "current descriptor was not cached after fenced discovery");
+    check(
+      descriptorCalls === 2 && businessCalls === 3,
+      "current descriptor was not cached after fenced discovery",
+    );
   } finally {
     protocolFixtureResponder = () => Promise.resolve(protocolFixture());
     globalThis.fetch = priorFetch;
@@ -6198,17 +7948,23 @@ Deno.test("M8A an older state observation allows bounded replacement discovery",
   }) as typeof fetch;
   protocolFixtureResponder = () => {
     descriptorCalls++;
-    return Promise.resolve(new Response(JSON.stringify({
-      generation: 1, server_version: "fixture", instance_id: "m8a-replaced-b",
-      supported_features: allFeatures,
-    })));
+    return Promise.resolve(
+      new Response(JSON.stringify({
+        generation: 1,
+        server_version: "fixture",
+        instance_id: "m8a-replaced-b",
+        supported_features: allFeatures,
+      })),
+    );
   };
   try {
     await getState();
     descriptorCalls = 0;
     await command({ kind: "retry", operation_id: "m8a-replaced" });
-    check(descriptorCalls === 2 && businessCalls === 1,
-      "service replacement retried without a bound or dispatched a duplicate mutation");
+    check(
+      descriptorCalls === 2 && businessCalls === 1,
+      "service replacement retried without a bound or dispatched a duplicate mutation",
+    );
   } finally {
     protocolFixtureResponder = () => Promise.resolve(protocolFixture());
     globalThis.fetch = priorFetch;
@@ -7330,47 +9086,152 @@ Deno.test("M6 direct task opens drop a stale attention selection and route notic
 Deno.test("User errors explain recovery while retaining collapsed diagnostics", async () => {
   const { ErrorNotice } = await import("./components/ErrorNotice");
   const cases = [
-    ["setup discovery manager must exit before profile probes are frozen", "agent session has not closed yet", "saved setup information does not need correcting"],
-    ["role capacity is full", "agent slots are busy", "Wait for an active session"],
-    ["attempt is not dispatchable", "earlier agent session has stopped", "Check recovery and continue"],
-    ["ordinary runtime probe terminal reporting invocation exited quiescently without an accepted role report; prepare corrected runtime verification for a fresh scope", "verification finished without an accepted report", "Prepare a new verification"],
-    ["ordinary runtime evidence does not match the exact authenticated native hook commands and count; prepare corrected runtime verification for a fresh scope", "verification did not match the required check", "inspect the rejected report"],
-    ["ordinary runtime probe reported observation_unavailable: model_evidence", "could not observe which model was running", "before spending another call"],
-    ["ordinary runtime probe reported observation_unavailable: authentication_observed", "could not confirm its authenticated session", "cannot publish proof"],
-    ["ordinary runtime probe reported observation_unavailable: missing observation not identified", "did not identify which required observation was missing", "cause is understood"],
-    ["ordinary runtime probe reported an observed failure", "recorded a failed verification", "affected role's explanation"],
-    ["runtime model evidence does not match the bound first-invocation provider SessionStart observation; prepare corrected runtime verification for a fresh scope", "reported model could not be matched", "Prepare a new verification"],
-    ["browser session required", "sign-in has expired", "fresh dashboard sign-in link"],
-    ["role manager lacks exact current runtime authority: exact current runtime-scoped ordinary production capability proof is missing or stale; complete runtime verification for this project, setup, fixture, configuration, adapter, profile, and prepared identity", "profile still needs verification", "runtime verification"],
-    ["authentication credentials missing", "agent's current sign-in", "Complete sign-in there"],
-    ["Provider version codex-cli 9.9 has no reviewed contract", "agent version has not been verified", "Update LLMRelay"],
-    ["request deadline exceeded; mutation may have been dispatched", "could not confirm", "do not start a second copy"],
-    ["the failed step may have started an agent action, so it cannot be retried until these have a known outcome: guidance delivery to s-1 (response timeout)", "outcome of its agent action is known", "Check the task's Activity tab, then refresh the dashboard"],
-    ["unexpected SQLite fixture failure <script>alert(1)</script>", "could not complete", "Diagnostics"],
+    [
+      "setup discovery manager must exit before profile probes are frozen",
+      "agent session has not closed yet",
+      "saved setup information does not need correcting",
+    ],
+    [
+      "role capacity is full",
+      "agent slots are busy",
+      "Wait for an active session",
+    ],
+    [
+      "attempt is not dispatchable",
+      "earlier agent session has stopped",
+      "Check recovery and continue",
+    ],
+    [
+      "ordinary runtime probe terminal reporting invocation exited quiescently without an accepted role report; prepare corrected runtime verification for a fresh scope",
+      "verification finished without an accepted report",
+      "Prepare a new verification",
+    ],
+    [
+      "ordinary runtime evidence does not match the exact authenticated native hook commands and count; prepare corrected runtime verification for a fresh scope",
+      "verification did not match the required check",
+      "inspect the rejected report",
+    ],
+    [
+      "ordinary runtime probe reported observation_unavailable: model_evidence",
+      "could not observe which model was running",
+      "before spending another call",
+    ],
+    [
+      "ordinary runtime probe reported observation_unavailable: authentication_observed",
+      "could not confirm its authenticated session",
+      "cannot publish proof",
+    ],
+    [
+      "ordinary runtime probe reported observation_unavailable: missing observation not identified",
+      "did not identify which required observation was missing",
+      "cause is understood",
+    ],
+    [
+      "ordinary runtime probe reported an observed failure",
+      "recorded a failed verification",
+      "affected role's explanation",
+    ],
+    [
+      "runtime model evidence does not match the bound first-invocation provider SessionStart observation; prepare corrected runtime verification for a fresh scope",
+      "reported model could not be matched",
+      "Prepare a new verification",
+    ],
+    [
+      "browser session required",
+      "sign-in has expired",
+      "fresh dashboard sign-in link",
+    ],
+    [
+      "role manager lacks exact current runtime authority: exact current runtime-scoped ordinary production capability proof is missing or stale; complete runtime verification for this project, setup, fixture, configuration, adapter, profile, and prepared identity",
+      "profile still needs verification",
+      "runtime verification",
+    ],
+    [
+      "authentication credentials missing",
+      "agent's current sign-in",
+      "Complete sign-in there",
+    ],
+    [
+      "Provider version codex-cli 9.9 has no reviewed contract",
+      "agent version has not been verified",
+      "Update LLMRelay",
+    ],
+    [
+      "request deadline exceeded; mutation may have been dispatched",
+      "could not confirm",
+      "do not start a second copy",
+    ],
+    [
+      "the failed step may have started an agent action, so it cannot be retried until these have a known outcome: guidance delivery to s-1 (response timeout)",
+      "outcome of its agent action is known",
+      "Check the task's Activity tab, then refresh the dashboard",
+    ],
+    [
+      "unexpected SQLite fixture failure <script>alert(1)</script>",
+      "could not complete",
+      "Diagnostics",
+    ],
   ];
   try {
     for (const [raw, summary, action] of cases) {
       mount(<ErrorNotice error={raw} />);
       const alert = document.querySelector('[role="alert"]');
       const details = alert?.querySelector("details");
-      check(alert?.querySelector("strong")?.textContent?.includes(summary), `missing plain explanation for ${raw}`);
-      check(alert?.querySelector("p")?.textContent?.includes(action), `missing next step for ${raw}`);
-      check(details && !details.open && details.querySelector("pre")?.textContent === raw, "diagnostic missing or expanded by default");
+      check(
+        alert?.querySelector("strong")?.textContent?.includes(summary),
+        `missing plain explanation for ${raw}`,
+      );
+      check(
+        alert?.querySelector("p")?.textContent?.includes(action),
+        `missing next step for ${raw}`,
+      );
+      check(
+        details && !details.open &&
+          details.querySelector("pre")?.textContent === raw,
+        "diagnostic missing or expanded by default",
+      );
       check(!document.querySelector("script"), "diagnostic rendered as HTML");
       unmount();
     }
     const requests: Record<string, unknown>[] = [];
     globalThis.fetch = async (_input, init) => {
       requests.push(JSON.parse(String(init?.body)));
-      return new Response(JSON.stringify({ error: "attempt is not dispatchable" }), { status: 409 });
+      return new Response(
+        JSON.stringify({ error: "attempt is not dispatchable" }),
+        { status: 409 },
+      );
     };
-    mount(<RecoveryPanel task={task} records={[{ id: "plain-error-recovery", session_id: "session", attempt_id: "a1", state: "attention_required", detail: {} }]} onChanged={noop} />);
+    mount(
+      <RecoveryPanel
+        task={task}
+        records={[{
+          id: "plain-error-recovery",
+          session_id: "session",
+          attempt_id: "a1",
+          state: "attention_required",
+          detail: {},
+        }]}
+        onChanged={noop}
+      />,
+    );
     field("Recovery evidence", "Review the earlier session");
     click("Check recovery and continue");
     await settle();
-    check(document.querySelector('.recovery .error strong')?.textContent?.includes("earlier agent session"), "real request failure bypassed the plain error presentation");
-    check(requests.length === 1, "displaying guidance retried the action automatically");
-    check(document.querySelector<HTMLTextAreaElement>('textarea')?.value === "Review the earlier session", "error display discarded the user's text");
+    check(
+      document.querySelector(".recovery .error strong")?.textContent?.includes(
+        "earlier agent session",
+      ),
+      "real request failure bypassed the plain error presentation",
+    );
+    check(
+      requests.length === 1,
+      "displaying guidance retried the action automatically",
+    );
+    check(
+      document.querySelector<HTMLTextAreaElement>("textarea")?.value ===
+        "Review the earlier session",
+      "error display discarded the user's text",
+    );
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -7380,26 +9241,73 @@ Deno.test("User errors explain recovery while retaining collapsed diagnostics", 
 Deno.test("observed usage shows partial provenance, zero and unavailable without sending actions", () => {
   const actions: string[] = [];
   const zero: ObservedUsage = {
-    status: "observed", partial: true,
-    counters: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: null,
-      output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 0 },
-    observed_responses: 1, source: "Codex 0.157.1 response records",
-    last_observed_at: "2026-10-05T21:00:00Z", reason: null,
+    status: "observed",
+    partial: true,
+    counters: {
+      input_tokens: 0,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: null,
+      output_tokens: 0,
+      reasoning_output_tokens: 0,
+      total_tokens: 0,
+    },
+    observed_responses: 1,
+    source: "Codex 0.157.1 response records",
+    last_observed_at: "2026-10-05T21:00:00Z",
+    reason: null,
   };
-  const unavailable: ObservedUsage = { ...zero, status: "unavailable", counters: null,
-    observed_responses: 0, last_observed_at: null, source: "Claude usage unavailable",
-    reason: "Observed usage is not supported for Claude yet." };
+  const unavailable: ObservedUsage = {
+    ...zero,
+    status: "unavailable",
+    counters: null,
+    observed_responses: 0,
+    last_observed_at: null,
+    source: "Claude usage unavailable",
+    reason: "Observed usage is not supported for Claude yet.",
+  };
   const access = {
-    routes: {}, discarding: {}, routeFor: () => undefined,
-    view: (id: string) => { actions.push(`view:${id}`); return Promise.resolve({ state: "pending" as const, message: "fixture", retry_available: false }); },
-    take: (id: string) => { actions.push(`take:${id}`); return Promise.resolve(); },
-    release: (id: string) => { actions.push(`release:${id}`); return Promise.resolve(); },
-    discard: () => Promise.resolve(), close: noop, refresh: noop,
+    routes: {},
+    discarding: {},
+    routeFor: () => undefined,
+    view: (id: string) => {
+      actions.push(`view:${id}`);
+      return Promise.resolve({
+        state: "pending" as const,
+        message: "fixture",
+        retry_available: false,
+      });
+    },
+    take: (id: string) => {
+      actions.push(`take:${id}`);
+      return Promise.resolve();
+    },
+    release: (id: string) => {
+      actions.push(`release:${id}`);
+      return Promise.resolve();
+    },
+    discard: () => Promise.resolve(),
+    close: noop,
+    refresh: noop,
   };
-  const render = (usage: ObservedUsage) => <SessionTree sessions={[
-    { ...managerSession, observed_usage: { current_turn: usage, session: usage } },
-    { ...managerSession, id: "claude-session", provider: "claude", observed_usage: { current_turn: unavailable, session: unavailable } },
-  ]} access={access} setupProjectId={() => undefined} onOpenSetup={noop} />;
+  const render = (usage: ObservedUsage) => (
+    <SessionTree
+      sessions={[
+        {
+          ...managerSession,
+          observed_usage: { current_turn: usage, session: usage },
+        },
+        {
+          ...managerSession,
+          id: "claude-session",
+          provider: "claude",
+          observed_usage: { current_turn: unavailable, session: unavailable },
+        },
+      ]}
+      access={access}
+      setupProjectId={() => undefined}
+      onOpenSetup={noop}
+    />
+  );
   const nativeFetch = globalThis.fetch;
   const requests: string[] = [];
   globalThis.fetch = async (input) => {
@@ -7408,29 +9316,100 @@ Deno.test("observed usage shows partial provenance, zero and unavailable without
   };
   try {
     mount(render(zero));
-    check(document.querySelector(".session-metadata")?.textContent?.includes("Observed usage (partial): 0 tokens"), "observed zero became unavailable");
-    const details = document.querySelector<HTMLDetailsElement>(".session-metadata .technical-details");
-    check(!!details && !details.open, "session counters should start collapsed");
+    check(
+      document.querySelector(".session-metadata")?.textContent?.includes(
+        "Observed usage (partial): 0 tokens",
+      ),
+      "observed zero became unavailable",
+    );
+    const details = document.querySelector<HTMLDetailsElement>(
+      ".session-metadata .technical-details",
+    );
+    check(
+      !!details && !details.open,
+      "session counters should start collapsed",
+    );
     act(() => details?.querySelector("summary")?.click());
     check(details?.open === true, "session details did not expand");
-    check(details?.textContent?.includes("Current accepted turn — observed usage (partial)"), "current-turn usage is missing");
-    check(details?.textContent?.includes("Session — observed usage (partial)"), "session usage is missing");
-    check(details?.textContent?.includes("Cache write: Unavailable"), "missing cache writes were displayed as measured zero");
-    check(details?.textContent?.includes("included in input") && details?.textContent?.includes("included in output"), "subset categories lost their inclusion labels");
-    check(details?.textContent?.includes("1 observed responses") && details?.textContent?.includes("Last observation:"), "response count or observation time is missing");
-    check(document.body.textContent?.includes("not supported for Claude yet"), "Claude usage is presented as available");
-    rerender(render({ ...zero, status: "invalid", reason: "Conflicting response observations." }));
-    check(!document.querySelector(".session-metadata")?.textContent?.includes("0 tokens") &&
-      document.querySelector(".session-metadata")?.textContent?.includes("Usage unavailable"), "invalid counters remained in the compact total");
-    check(document.body.textContent?.includes("Conflicting response observations."), "invalid provenance is not explained");
-    const observedTask: Task = { ...task, active_attempt: undefined, observed_usage: {
-      ...zero, counters: { ...zero.counters!, input_tokens: 1234, total_tokens: 1234 }, observed_responses: 4,
-    } };
-    mount(<TaskDetail task={observedTask} state={{ ...liveBase, tasks: [observedTask], active_sessions: [] }} onClose={noop} onChanged={noop} />);
+    check(
+      details?.textContent?.includes(
+        "Current accepted turn — observed usage (partial)",
+      ),
+      "current-turn usage is missing",
+    );
+    check(
+      details?.textContent?.includes("Session — observed usage (partial)"),
+      "session usage is missing",
+    );
+    check(
+      details?.textContent?.includes("Cache write: Unavailable"),
+      "missing cache writes were displayed as measured zero",
+    );
+    check(
+      details?.textContent?.includes("included in input") &&
+        details?.textContent?.includes("included in output"),
+      "subset categories lost their inclusion labels",
+    );
+    check(
+      details?.textContent?.includes("1 observed responses") &&
+        details?.textContent?.includes("Last observation:"),
+      "response count or observation time is missing",
+    );
+    check(
+      document.body.textContent?.includes("not supported for Claude yet"),
+      "Claude usage is presented as available",
+    );
+    rerender(
+      render({
+        ...zero,
+        status: "invalid",
+        reason: "Conflicting response observations.",
+      }),
+    );
+    check(
+      !document.querySelector(".session-metadata")?.textContent?.includes(
+        "0 tokens",
+      ) &&
+        document.querySelector(".session-metadata")?.textContent?.includes(
+          "Usage unavailable",
+        ),
+      "invalid counters remained in the compact total",
+    );
+    check(
+      document.body.textContent?.includes("Conflicting response observations."),
+      "invalid provenance is not explained",
+    );
+    const observedTask: Task = {
+      ...task,
+      active_attempt: undefined,
+      observed_usage: {
+        ...zero,
+        counters: { ...zero.counters!, input_tokens: 1234, total_tokens: 1234 },
+        observed_responses: 4,
+      },
+    };
+    mount(
+      <TaskDetail
+        task={observedTask}
+        state={{ ...liveBase, tasks: [observedTask], active_sessions: [] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
     const taskUsage = document.querySelector('[aria-label="Task"]');
-    check(taskUsage?.textContent?.includes((1234).toLocaleString()), "task total depended on displayed historical session rows");
-    check(taskUsage?.textContent?.includes("4 observed responses") && taskUsage?.textContent?.includes("Codex 0.157.1"), "task provenance is missing");
-    check(actions.length === 0 && requests.length === 0, "usage display emitted an agent action or request");
+    check(
+      taskUsage?.textContent?.includes((1234).toLocaleString()),
+      "task total depended on displayed historical session rows",
+    );
+    check(
+      taskUsage?.textContent?.includes("4 observed responses") &&
+        taskUsage?.textContent?.includes("Codex 0.157.1"),
+      "task provenance is missing",
+    );
+    check(
+      actions.length === 0 && requests.length === 0,
+      "usage display emitted an agent action or request",
+    );
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -7475,30 +9454,74 @@ Deno.test("session startup notice follows current readiness and preserves explic
   try {
     mount(renderSession());
     const notice = () => document.querySelector(".session-startup-notice");
-    check(notice()?.getAttribute("role") === "status", "startup wait is not announced");
-    check(document.querySelector(".session-metadata .session-state")?.textContent?.includes("Waiting for startup"), "primary status still implies active work");
-    check(!document.querySelector(".session-metadata .technical-details")?.hasAttribute("open"), "process diagnostics are not collapsed");
-    check(notice()?.textContent?.includes("has not confirmed"), "process start was treated as readiness");
-    check(notice()?.textContent?.includes("If Codex shows"), "hook trust was asserted without evidence");
-    check(notice()?.textContent?.includes("Release control"), "recovery omits releasing input");
-    check(document.body.textContent?.includes("Closing the output does not stop the agent"), "output help omits that closing does not stop work");
+    check(
+      notice()?.getAttribute("role") === "status",
+      "startup wait is not announced",
+    );
+    check(
+      document.querySelector(".session-metadata .session-state")?.textContent
+        ?.includes("Waiting for startup"),
+      "primary status still implies active work",
+    );
+    check(
+      !document.querySelector(".session-metadata .technical-details")
+        ?.hasAttribute("open"),
+      "process diagnostics are not collapsed",
+    );
+    check(
+      notice()?.textContent?.includes("has not confirmed"),
+      "process start was treated as readiness",
+    );
+    check(
+      notice()?.textContent?.includes("If Codex shows"),
+      "hook trust was asserted without evidence",
+    );
+    check(
+      notice()?.textContent?.includes("Release control"),
+      "recovery omits releasing input",
+    );
+    check(
+      document.body.textContent?.includes(
+        "Closing the output does not stop the agent",
+      ),
+      "output help omits that closing does not stop work",
+    );
     check(actions.length === 0, "startup notice automatically took control");
     click("View output");
     click("Take control");
-    check(actions.join(",") === "view:s1,take:s1", "startup actions targeted the wrong session");
+    check(
+      actions.join(",") === "view:s1,take:s1",
+      "startup actions targeted the wrong session",
+    );
     rerender(renderSession({ readiness: "busy" }));
     check(!notice(), "startup notice remained after native work began");
     rerender(renderSession({ readiness: "idle_candidate" }));
     check(!notice(), "ready idle session is presented as startup blocked");
     rerender(renderSession({ transcript_epoch: "resumed-invocation" }));
-    check(!!notice(), "same-session resume retained previous readiness presentation");
-    rerender(renderSession({ id: "replacement", generation: 2, provider: "claude" }));
-    check(!!notice() && !notice()?.textContent?.includes("Codex"), "replacement inherited provider-specific advice");
+    check(
+      !!notice(),
+      "same-session resume retained previous readiness presentation",
+    );
+    rerender(
+      renderSession({ id: "replacement", generation: 2, provider: "claude" }),
+    );
+    check(
+      !!notice() && !notice()?.textContent?.includes("Codex"),
+      "replacement inherited provider-specific advice",
+    );
     click("View output");
-    check(actions.at(-1) === "view:replacement", "replacement opened the previous session");
+    check(
+      actions.at(-1) === "view:replacement",
+      "replacement opened the previous session",
+    );
     rerender(renderSession({ status: "exited" }));
     check(!notice(), "exited session still asks for startup input");
-    check(![...document.querySelectorAll("button")].some((button) => button.textContent === "Take control"), "exited session offers keyboard input");
+    check(
+      ![...document.querySelectorAll("button")].some((button) =>
+        button.textContent === "Take control"
+      ),
+      "exited session offers keyboard input",
+    );
   } finally {
     unmount();
   }
@@ -7553,7 +9576,8 @@ Deno.test("Task details open as a modal that closes by keyboard and returns focu
       </>
     );
   };
-  globalThis.fetch = (async () => new Response("{}", { status: 404 })) as typeof fetch;
+  globalThis.fetch =
+    (async () => new Response("{}", { status: 404 })) as typeof fetch;
   try {
     mount(<Harness />);
     change(document.getElementById("filter") as HTMLInputElement, "migration");
@@ -7564,22 +9588,41 @@ Deno.test("Task details open as a modal that closes by keyboard and returns focu
     click("Open details");
     await settle();
     const dialog = document.querySelector('[role="dialog"]');
-    check(dialog?.getAttribute("aria-modal") === "true", "details are not a modal dialog");
-    const title = document.getElementById(dialog?.getAttribute("aria-labelledby") || "");
-    check(title?.textContent === "Existing", "dialog is not named by the task title");
-    const close = document.querySelector<HTMLButtonElement>('[aria-label="Close task details"]');
-    check(close?.textContent?.trim() === "×", "close is not icon-only");
-    check(document.activeElement === close, "focus did not move into the dialog");
     check(
-      dialog!.querySelectorAll('[aria-label="Close task details"]').length === 1 &&
-        ![...dialog!.querySelectorAll("button")].some((button) => /back/i.test(button.textContent || "")),
+      dialog?.getAttribute("aria-modal") === "true",
+      "details are not a modal dialog",
+    );
+    const title = document.getElementById(
+      dialog?.getAttribute("aria-labelledby") || "",
+    );
+    check(
+      title?.textContent === "Existing",
+      "dialog is not named by the task title",
+    );
+    const close = document.querySelector<HTMLButtonElement>(
+      '[aria-label="Close task details"]',
+    );
+    check(close?.textContent?.trim() === "×", "close is not icon-only");
+    check(
+      document.activeElement === close,
+      "focus did not move into the dialog",
+    );
+    check(
+      dialog!.querySelectorAll('[aria-label="Close task details"]').length ===
+          1 &&
+        ![...dialog!.querySelectorAll("button")].some((button) =>
+          /back/i.test(button.textContent || "")
+        ),
       "narrow view replaces the icon-only close with another control",
     );
     const tab = (name: string) =>
-      [...document.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find((item) =>
-        item.textContent === name
-      )!;
-    check(tab("Overview").getAttribute("aria-selected") === "true", "Overview is not the first tab");
+      [...document.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find((
+        item,
+      ) => item.textContent === name)!;
+    check(
+      tab("Overview").getAttribute("aria-selected") === "true",
+      "Overview is not the first tab",
+    );
     act(() => {
       tab("Overview").focus();
       tab("Overview").dispatchEvent(
@@ -7593,19 +9636,29 @@ Deno.test("Task details open as a modal that closes by keyboard and returns focu
     );
     const press = (from: string, key: string) =>
       act(() => {
-        tab(from).dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+        tab(from).dispatchEvent(
+          new KeyboardEvent("keydown", { key, bubbles: true }),
+        );
       });
     const selected = (name: string) =>
       tab(name).getAttribute("aria-selected") === "true" &&
       document.activeElement === tab(name) &&
-      document.querySelector('[role="tabpanel"]')?.getAttribute("aria-labelledby") ===
+      document.querySelector('[role="tabpanel"]')?.getAttribute(
+          "aria-labelledby",
+        ) ===
         tab(name).id;
     press("Changes", "End");
     check(selected("Activity"), "End did not select and show the last tab");
     press("Activity", "ArrowRight");
-    check(selected("Overview"), "ArrowRight did not wrap from the last tab to the first");
+    check(
+      selected("Overview"),
+      "ArrowRight did not wrap from the last tab to the first",
+    );
     press("Overview", "ArrowLeft");
-    check(selected("Activity"), "ArrowLeft did not wrap from the first tab to the last");
+    check(
+      selected("Activity"),
+      "ArrowLeft did not wrap from the first tab to the last",
+    );
     press("Activity", "Home");
     check(selected("Overview"), "Home did not select and show the first tab");
     click("Overview");
@@ -7614,24 +9667,42 @@ Deno.test("Task details open as a modal that closes by keyboard and returns focu
     change(reply!, "Use the smaller migration");
     act(() => {
       reply!.focus();
-      reply!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      reply!.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+      );
     });
     await settle();
-    check(!document.querySelector('[role="dialog"]'), "one Escape in a text field did not close the dialog");
-    check(document.activeElement === opener, "focus did not return to what opened the dialog");
     check(
-      (document.getElementById("filter") as HTMLInputElement).value === "migration" &&
+      !document.querySelector('[role="dialog"]'),
+      "one Escape in a text field did not close the dialog",
+    );
+    check(
+      document.activeElement === opener,
+      "focus did not return to what opened the dialog",
+    );
+    check(
+      (document.getElementById("filter") as HTMLInputElement).value ===
+          "migration" &&
         board.scrollTop === 120,
       "closing the dialog lost the page filter or scroll position",
     );
     click("Open details");
     await settle();
     act(() => {
-      const handled = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+      const handled = new KeyboardEvent("keydown", {
+        key: "Escape",
+        bubbles: true,
+        cancelable: true,
+      });
       handled.preventDefault();
-      document.querySelector<HTMLTextAreaElement>("textarea")!.dispatchEvent(handled);
+      document.querySelector<HTMLTextAreaElement>("textarea")!.dispatchEvent(
+        handled,
+      );
     });
-    check(!!document.querySelector('[role="dialog"]'), "an Escape already handled inside the dialog closed it");
+    check(
+      !!document.querySelector('[role="dialog"]'),
+      "an Escape already handled inside the dialog closed it",
+    );
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -7662,12 +9733,17 @@ Deno.test("Markdown renders readable structure and never executes or links unsaf
   try {
     mount(<MarkdownContent text={text} />);
     const root = document.querySelector(".markdown-content")!;
-    check(root.querySelector("h1")?.textContent === "Plan heading", "heading was not rendered");
+    check(
+      root.querySelector("h1")?.textContent === "Plan heading",
+      "heading was not rendered",
+    );
     const links = [...root.querySelectorAll<HTMLAnchorElement>("a")];
     check(
       links.map((link) => link.getAttribute("href")).join("|") ===
         "https://example.com/docs|docs/WORKFLOWS.md",
-      `unsafe links stayed clickable: ${links.map((link) => link.getAttribute("href"))}`,
+      `unsafe links stayed clickable: ${
+        links.map((link) => link.getAttribute("href"))
+      }`,
     );
     check(
       links[0].getAttribute("rel")?.includes("noopener") &&
@@ -7675,7 +9751,9 @@ Deno.test("Markdown renders readable structure and never executes or links unsaf
       "external links do not isolate the dashboard",
     );
     check(
-      [...root.querySelectorAll(".markdown-inert-link")].map((item) => item.textContent)
+      [...root.querySelectorAll(".markdown-inert-link")].map((item) =>
+        item.textContent
+      )
         .join("|") === "bad|data|other host",
       "unsafe links lost their visible text",
     );
@@ -7684,7 +9762,10 @@ Deno.test("Markdown renders readable structure and never executes or links unsaf
         !("pwned" in globalThis),
       "raw HTML was rendered",
     );
-    check(!!root.querySelector(".markdown-table table td"), "GFM table was not rendered");
+    check(
+      !!root.querySelector(".markdown-table table td"),
+      "GFM table was not rendered",
+    );
     check(
       root.querySelectorAll('input[type="checkbox"]').length === 2,
       "task list items were not rendered",
@@ -7694,7 +9775,8 @@ Deno.test("Markdown renders readable structure and never executes or links unsaf
       "fenced code was not rendered",
     );
     check(
-      safeMarkdownUrl("mailto:team@example.com") === "mailto:team@example.com" &&
+      safeMarkdownUrl("mailto:team@example.com") ===
+          "mailto:team@example.com" &&
         safeMarkdownUrl(" JavaScript:alert(1)") === "" &&
         safeMarkdownUrl("vbscript:x") === "",
       "URL policy drifted",
@@ -7705,9 +9787,26 @@ Deno.test("Markdown renders readable structure and never executes or links unsaf
 });
 
 Deno.test("Active and Completed work stay separate and Ready means queued", () => {
-  const done: Task = { ...task, id: "AJ-done", title: "Shipped", lifecycle: "done", active_attempt: undefined };
-  const ready: Task = { ...task, id: "AJ-ready", title: "Queued work", lifecycle: "ready", active_attempt: undefined };
-  const recovering: Task = { ...task, id: "AJ-rec", title: "Recovering", attention: "needs_recovery" };
+  const done: Task = {
+    ...task,
+    id: "AJ-done",
+    title: "Shipped",
+    lifecycle: "done",
+    active_attempt: undefined,
+  };
+  const ready: Task = {
+    ...task,
+    id: "AJ-ready",
+    title: "Queued work",
+    lifecycle: "ready",
+    active_attempt: undefined,
+  };
+  const recovering: Task = {
+    ...task,
+    id: "AJ-rec",
+    title: "Recovering",
+    attention: "needs_recovery",
+  };
   try {
     mount(
       <TaskBoard
@@ -7725,7 +9824,10 @@ Deno.test("Active and Completed work stay separate and Ready means queued", () =
       "completed work crowded the active board or counts drifted",
     );
     click("Completed");
-    check(text().includes("Shipped") && !text().includes("Queued work"), "Completed did not show finished work");
+    check(
+      text().includes("Shipped") && !text().includes("Queued work"),
+      "Completed did not show finished work",
+    );
     click("Active");
     const readyStatus = taskStatus(ready, { project: initialized });
     check(
@@ -7735,12 +9837,19 @@ Deno.test("Active and Completed work stay separate and Ready means queued", () =
       "Ready was described as ready for review",
     );
     check(
-      taskStatus(ready, { project: { ...initialized, queue_paused: true } }).detail
+      taskStatus(ready, { project: { ...initialized, queue_paused: true } })
+        .detail
         .includes("pickup is paused"),
       "a paused queue was not explained",
     );
-    check(taskStatus(recovering).label === "Manual action needed", "recovery was not named plainly");
-    check(taskStatus(done).label === "Completed" && taskStatus(done).completed, "done work was not completed");
+    check(
+      taskStatus(recovering).label === "Manual action needed",
+      "recovery was not named plainly",
+    );
+    check(
+      taskStatus(done).label === "Completed" && taskStatus(done).completed,
+      "done work was not completed",
+    );
     check(
       taskStatus({ ...task, attention: "resume_failed" }).label ===
         "Resume needs recovery",
@@ -7772,13 +9881,21 @@ Deno.test("Active and Completed work stay separate and Ready means queued", () =
     );
     check(
       taskStatus(task, {
-        sessions: [{ ...managerSession, attempt_id: "a1", readiness: "unknown" }],
+        sessions: [{
+          ...managerSession,
+          attempt_id: "a1",
+          readiness: "unknown",
+        }],
       }).label === "Waiting for startup",
       "a starting agent was shown as working",
     );
     unmount();
     mount(
-      <Workspace state={{ ...liveBase, tasks: [] }} onSelect={noop} onChanged={noop} />,
+      <Workspace
+        state={{ ...liveBase, tasks: [] }}
+        onSelect={noop}
+        onChanged={noop}
+      />,
     );
     check(
       text().includes("Nothing is waiting for you.") &&
@@ -7792,20 +9909,39 @@ Deno.test("Active and Completed work stay separate and Ready means queued", () =
 });
 
 Deno.test("Recovery names the affected role and errors explain the setup baseline", () => {
-  const implementer: Session = { ...managerSession, id: "s-impl", role: "implementer" };
+  const implementer: Session = {
+    ...managerSession,
+    id: "s-impl",
+    role: "implementer",
+  };
   try {
     mount(
       <RecoveryPanel
         task={task}
         sessions={[implementer]}
-        records={[{ id: "r1", session_id: "s-impl", attempt_id: "a1", state: "attention_required", detail: {} }]}
+        records={[{
+          id: "r1",
+          session_id: "s-impl",
+          attempt_id: "a1",
+          state: "attention_required",
+          detail: {},
+        }]}
         onChanged={noop}
       />,
     );
     const text = document.body.textContent || "";
-    check(text.includes("Manual action needed: Implementer"), "recovery did not name the role");
-    check(text.includes("the implementer has fully stopped"), "recovery reason is not plain");
-    check(!/human/i.test(text.replace(/Technical details[\s\S]*/, "")), "primary recovery copy mentions a human");
+    check(
+      text.includes("Manual action needed: Implementer"),
+      "recovery did not name the role",
+    );
+    check(
+      text.includes("the implementer has fully stopped"),
+      "recovery reason is not plain",
+    );
+    check(
+      !/human/i.test(text.replace(/Technical details[\s\S]*/, "")),
+      "primary recovery copy mentions a human",
+    );
     const baseline = explainError(
       "Files that new tasks need were changed after commit abc123 and are not committed: AGENTS.md.",
     );
@@ -7814,8 +9950,13 @@ Deno.test("Recovery names the affected role and errors explain the setup baselin
         baseline.nextStep.includes("Validate and relink"),
       "baseline error guidance drifted",
     );
-    const moved = explainError("The project folder is now at commit abc, but LLMRelay starts new tasks from commit def.");
-    check(moved.nextStep.includes("Validate and relink"), "moved commit guidance drifted");
+    const moved = explainError(
+      "The project folder is now at commit abc, but LLMRelay starts new tasks from commit def.",
+    );
+    check(
+      moved.nextStep.includes("Validate and relink"),
+      "moved commit guidance drifted",
+    );
   } finally {
     unmount();
   }
@@ -7833,14 +9974,30 @@ Deno.test("Role settings edit fields keep visible labels", async () => {
   };
   globalThis.fetch = (async () => new Response("[]")) as typeof fetch;
   try {
-    mount(<RoleSettings task={configured} project={initialized} sessions={[]} onChanged={noop} />);
+    mount(
+      <RoleSettings
+        task={configured}
+        project={initialized}
+        sessions={[]}
+        onChanged={noop}
+      />,
+    );
     await settle();
     click("Edit");
-    check(findSelect("Provider").value === "codex", "provider has no visible label");
+    check(
+      findSelect("Provider").value === "codex",
+      "provider has no visible label",
+    );
     check(findSelect("Effort").value === "high", "effort has no visible label");
-    check(!!document.querySelector(".role-edit-fields .model-selector"), "model field is not in the labelled grid");
+    check(
+      !!document.querySelector(".role-edit-fields .model-selector"),
+      "model field is not in the labelled grid",
+    );
     click("Cancel");
-    check(!document.querySelector(".role-edit-fields"), "Cancel did not leave editing");
+    check(
+      !document.querySelector(".role-edit-fields"),
+      "Cancel did not leave editing",
+    );
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -7882,18 +10039,28 @@ Deno.test("Open agent output routes to the task's Activity tab and its exact ses
     await settle();
     live.reads[0].resolve(state);
     await settle();
-    const item = document.querySelector('[data-attention-id="continuation:wait_for_service:s1"]');
+    const item = document.querySelector(
+      '[data-attention-id="continuation:wait_for_service:s1"]',
+    );
     check(
       item?.textContent?.includes("Starting task") &&
-        item.querySelector("button")?.textContent?.startsWith("Open agent output"),
+        item.querySelector("button")?.textContent?.startsWith(
+          "Open agent output",
+        ),
       "attention item lacks its task title or action label",
     );
     act(() => item!.querySelector("button")!.click());
     await settle();
-    const selected = document.querySelector('[role="tab"][aria-selected="true"]');
-    check(selected?.textContent === "Activity", `output route opened ${selected?.textContent}`);
+    const selected = document.querySelector(
+      '[role="tab"][aria-selected="true"]',
+    );
     check(
-      document.activeElement?.getAttribute("data-attention-target") === "session:s1" &&
+      selected?.textContent === "Activity",
+      `output route opened ${selected?.textContent}`,
+    );
+    check(
+      document.activeElement?.getAttribute("data-attention-target") ===
+          "session:s1" &&
         !!document.activeElement?.closest('[role="dialog"]'),
       "the exact session inside the dialog was not focused",
     );
@@ -7953,7 +10120,9 @@ Deno.test("Board cards and the task header offer the host's next step and open i
     await settle();
     live.reads[0].resolve(state);
     await settle();
-    const next = document.querySelector<HTMLButtonElement>(".task-card .task-next-action");
+    const next = document.querySelector<HTMLButtonElement>(
+      ".task-card .task-next-action",
+    );
     check(
       next?.textContent === "Open agent output: Starting task +1 more",
       `card action reads ${next?.textContent}`,
@@ -7968,10 +10137,16 @@ Deno.test("Board cards and the task header offer the host's next step and open i
     await settle();
     const dialog = document.querySelector('[role="dialog"]');
     check(!!dialog, "the card action did not open the task");
-    const selected = dialog!.querySelector('[role="tab"][aria-selected="true"]');
-    check(selected?.textContent === "Activity", `card action opened ${selected?.textContent}`);
+    const selected = dialog!.querySelector(
+      '[role="tab"][aria-selected="true"]',
+    );
     check(
-      document.activeElement?.getAttribute("data-attention-target") === "session:s1",
+      selected?.textContent === "Activity",
+      `card action opened ${selected?.textContent}`,
+    );
+    check(
+      document.activeElement?.getAttribute("data-attention-target") ===
+        "session:s1",
       "the card action did not focus the exact session",
     );
     const header = dialog!.querySelector(".task-dialog-next");
@@ -7981,14 +10156,18 @@ Deno.test("Board cards and the task header offer the host's next step and open i
       `header action reads ${header?.textContent}`,
     );
     // The header repeats the route after the user moves elsewhere.
-    const overview = [...dialog!.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
+    const overview = [
+      ...dialog!.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
+    ]
       .find((tab) => tab.textContent === "Overview");
     act(() => overview!.click());
     await settle();
     act(() => header!.querySelector("button")!.click());
     await settle();
     check(
-      document.querySelector('[role="dialog"] [role="tab"][aria-selected="true"]')?.textContent === "Activity",
+      document.querySelector(
+        '[role="dialog"] [role="tab"][aria-selected="true"]',
+      )?.textContent === "Activity",
       "the header action did not return to the exact target",
     );
   } finally {
@@ -8002,20 +10181,31 @@ Deno.test("Board cards and the task header offer the host's next step and open i
 
 Deno.test("A generic wait never offers a reply; only the Answer question item does", async () => {
   const waiting: Task = { ...task, attention: "needs_input" };
-  globalThis.fetch = (async () => new Response("{}", { status: 404 })) as typeof fetch;
+  globalThis.fetch =
+    (async () => new Response("{}", { status: 404 })) as typeof fetch;
   try {
     mount(
       <TaskDetail
         task={waiting}
-        state={{ ...liveBase, tasks: [waiting], active_sessions: [managerSession], attention: [] }}
+        state={{
+          ...liveBase,
+          tasks: [waiting],
+          active_sessions: [managerSession],
+          attention: [],
+        }}
         onClose={noop}
         onChanged={noop}
       />,
     );
     await settle();
-    check(!document.querySelector(".next-step textarea"), "a generic wait offered a reply");
     check(
-      document.body.textContent?.includes("not a question the manager can take a reply"),
+      !document.querySelector(".next-step textarea"),
+      "a generic wait offered a reply",
+    );
+    check(
+      document.body.textContent?.includes(
+        "not a question the manager can take a reply",
+      ),
       "the generic wait does not explain why there is no reply",
     );
     unmount();
@@ -8026,7 +10216,11 @@ Deno.test("A generic wait never offers a reply; only the Answer question item do
         state={{
           ...liveBase,
           tasks: [waiting],
-          active_sessions: [{ ...managerSession, id: "s2", role_generation_id: "g2" }],
+          active_sessions: [{
+            ...managerSession,
+            id: "s2",
+            role_generation_id: "g2",
+          }],
           attention: [{
             id: "task:AJ-1:needs_input",
             category: "decision",
@@ -8051,7 +10245,10 @@ Deno.test("A generic wait never offers a reply; only the Answer question item do
       />,
     );
     await settle();
-    check(!document.querySelector(".next-step textarea"), "a reply was offered to a replaced manager");
+    check(
+      !document.querySelector(".next-step textarea"),
+      "a reply was offered to a replaced manager",
+    );
     check(
       document.body.textContent?.includes("no longer running"),
       "the replaced manager is not explained",
@@ -8065,18 +10262,24 @@ Deno.test("A generic wait never offers a reply; only the Answer question item do
 Deno.test("Board and header actions open every destination kind exactly, list every item, and refuse stale bindings", async () => {
   const priorEnvironment = { ...liveEnvironment };
   const mutations: string[] = [];
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    if (init?.method && init.method !== "GET") mutations.push(String(input));
-    return new Response("[]");
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method && init.method !== "GET") mutations.push(String(input));
+      return new Response("[]");
+    }) as typeof fetch;
   const settingsItem: AttentionItem = {
-    ...railItem("task:AJ-1:decision", "blocked", "New agent settings need verifying", {
-      kind: "role_settings",
-      project_id: "p1",
-      task_id: "AJ-1",
-      role: "plan_reviewer",
-      settings_revision: 2,
-    }),
+    ...railItem(
+      "task:AJ-1:decision",
+      "blocked",
+      "New agent settings need verifying",
+      {
+        kind: "role_settings",
+        project_id: "p1",
+        task_id: "AJ-1",
+        role: "plan_reviewer",
+        settings_revision: 2,
+      },
+    ),
     action: { kind: "open_agent_settings", label: "Open agent settings" },
   };
   const questionItem: AttentionItem = {
@@ -8102,7 +10305,11 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
     }),
     action: { kind: "review_plan", label: "Review plan" },
   };
-  const labelled = (item: AttentionItem, kind: AttentionActionKind, label: string) => ({
+  const labelled = (
+    item: AttentionItem,
+    kind: AttentionActionKind,
+    label: string,
+  ) => ({
     ...item,
     action: { kind, label },
   });
@@ -8116,7 +10323,11 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
             id: "rs-2",
             role: "plan_reviewer" as const,
             revision: 2,
-            config: { provider: "claude" as const, model: "fable", effort: "high" },
+            config: {
+              provider: "claude" as const,
+              model: "fable",
+              effort: "high",
+            },
           }],
         }
         : item
@@ -8144,16 +10355,50 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
     marker: string;
     dialog: boolean;
   }> = [
-    { name: "Review plan", task: "AJ-1", primary: "attempt:a1:awaiting_plan_approval", rest: ["task:AJ-1:decision"], marker: "attempt:a1", dialog: true },
-    { name: "Review request", task: "AJ-1", primary: "permission_request:pr1", marker: "permission_request:pr1", dialog: false },
-    { name: "Answer question", task: "AJ-1", primary: "task:AJ-1:needs_input", marker: "session:s1", dialog: true },
-    { name: "Resolve issue", task: "AJ-2", primary: "recovery_record:r-target", marker: "recovery_record:r-target", dialog: true },
-    { name: "Open agent settings", task: "AJ-1", primary: "task:AJ-1:decision", marker: "role_settings:AJ-1:plan_reviewer", dialog: true },
+    {
+      name: "Review plan",
+      task: "AJ-1",
+      primary: "attempt:a1:awaiting_plan_approval",
+      rest: ["task:AJ-1:decision"],
+      marker: "attempt:a1",
+      dialog: true,
+    },
+    {
+      name: "Review request",
+      task: "AJ-1",
+      primary: "permission_request:pr1",
+      marker: "permission_request:pr1",
+      dialog: false,
+    },
+    {
+      name: "Answer question",
+      task: "AJ-1",
+      primary: "task:AJ-1:needs_input",
+      marker: "session:s1",
+      dialog: true,
+    },
+    {
+      name: "Resolve issue",
+      task: "AJ-2",
+      primary: "recovery_record:r-target",
+      marker: "recovery_record:r-target",
+      dialog: true,
+    },
+    {
+      name: "Open agent settings",
+      task: "AJ-1",
+      primary: "task:AJ-1:decision",
+      marker: "role_settings:AJ-1:plan_reviewer",
+      dialog: true,
+    },
   ];
   const cardAction = (title: string) =>
-    [...document.querySelectorAll<HTMLButtonElement>(".task-card .task-next-action")]
+    [...document.querySelectorAll<HTMLButtonElement>(
+      ".task-card .task-next-action",
+    )]
       .find((button) => button.textContent?.includes(title));
-  const focused = () => document.activeElement?.getAttribute("data-attention-target");
+  const focused = () =>
+    document.activeElement?.getAttribute("data-attention-target");
   try {
     for (const item of cases) {
       const live = liveHarness();
@@ -8167,7 +10412,8 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
         task_actions: [{
           task_id: item.task,
           item_id: item.primary,
-          action: base.attention.find((entry) => entry.id === item.primary)!.action!,
+          action: base.attention.find((entry) => entry.id === item.primary)!
+            .action!,
           item_ids: ids,
         }],
       });
@@ -8177,9 +10423,15 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
       await settle();
       const title = state.tasks.find((entry) => entry.id === item.task)!.title;
       const button = cardAction(title);
-      check(button?.textContent?.startsWith(item.name), `${item.name}: card reads ${button?.textContent}`);
+      check(
+        button?.textContent?.startsWith(item.name),
+        `${item.name}: card reads ${button?.textContent}`,
+      );
       if (ids.length > 1) {
-        check(button!.textContent!.includes(`+${ids.length - 1} more`), `${item.name}: count missing`);
+        check(
+          button!.textContent!.includes(`+${ids.length - 1} more`),
+          `${item.name}: count missing`,
+        );
       }
       act(() => button!.click());
       await settle();
@@ -8190,8 +10442,10 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
       check(focused() === item.marker, `${item.name}: focused ${focused()}`);
       if (item.name === "Open agent settings") {
         check(
-          document.querySelector('[role="dialog"] [role="tab"][aria-selected="true"]')
-            ?.textContent === "Roles" &&
+          document.querySelector(
+                '[role="dialog"] [role="tab"][aria-selected="true"]',
+              )
+                ?.textContent === "Roles" &&
             !!document.activeElement?.closest('[role="tabpanel"]'),
           "the role settings route did not open the Roles tab at the affected role",
         );
@@ -8205,8 +10459,14 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
         );
         // Every other item for the task is listed and opens its own target.
         for (const rest of item.rest ?? []) {
-          const entry = base.attention.find((candidate) => candidate.id === rest)!;
-          const other = [...header!.querySelectorAll<HTMLButtonElement>(".task-dialog-more button")]
+          const entry = base.attention.find((candidate) =>
+            candidate.id === rest
+          )!;
+          const other = [
+            ...header!.querySelectorAll<HTMLButtonElement>(
+              ".task-dialog-more button",
+            ),
+          ]
             .find((candidate) => candidate.textContent?.includes(entry.title));
           check(!!other, `${item.name}: ${entry.title} is not listed`);
           act(() => other!.click());
@@ -8241,12 +10501,18 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
     const reads = live.reads.length;
     act(() => cardAction("Existing")!.click());
     await settle();
-    check(!document.querySelector('[role="dialog"]'), "a stale binding opened the task");
+    check(
+      !document.querySelector('[role="dialog"]'),
+      "a stale binding opened the task",
+    );
     check(
       document.body.textContent?.includes("changed before it could open"),
       "the stale binding was not explained",
     );
-    check(live.reads.length > reads, "the stale binding did not request the latest state");
+    check(
+      live.reads.length > reads,
+      "the stale binding did not request the latest state",
+    );
     unmount();
 
     // Open plan opens the decision's exact plan over its panel, decides
@@ -8258,10 +10524,15 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
     localStorage.setItem("agenticjira.page", "workspace");
     mount(<App />);
     await settle();
-    planLive.reads[0].resolve(snapshotAt("service-a", "63", { ...base, task_actions: [] }));
+    planLive.reads[0].resolve(
+      snapshotAt("service-a", "63", { ...base, task_actions: [] }),
+    );
     await settle();
     const openPlanFor = (itemId: string) =>
-      [...(document.querySelector(`[data-attention-id="${itemId}"]`)?.querySelectorAll("button") ?? [])]
+      [
+        ...(document.querySelector(`[data-attention-id="${itemId}"]`)
+          ?.querySelectorAll("button") ?? []),
+      ]
         .find((candidate) => candidate.textContent?.startsWith("Open plan"));
     const viewer = () => document.querySelector(".plan-viewer");
     const mutationsBefore = mutations.length;
@@ -8271,16 +10542,25 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
       await settle();
       check(
         viewer()?.textContent?.includes("Reviewed plan text") &&
-          viewer()!.textContent!.includes("Opened for: Review the plan for “Existing”") &&
+          viewer()!.textContent!.includes(
+            "Opened for: Review the plan for “Existing”",
+          ) &&
           document.activeElement?.getAttribute("aria-label") === "Close plan",
         `${round} Open plan did not open the exact plan as the focused window`,
       );
-      act(() => document.querySelector<HTMLButtonElement>('[aria-label="Close plan"]')!.click());
+      act(() =>
+        document.querySelector<HTMLButtonElement>('[aria-label="Close plan"]')!
+          .click()
+      );
       check(
         !viewer() && focused() === "attempt:a1",
         `${round} closing the plan did not return to its decision; focused ${focused()}`,
       );
-      act(() => document.querySelector<HTMLButtonElement>('[aria-label="Close task details"]')!.click());
+      act(() =>
+        document.querySelector<HTMLButtonElement>(
+          '[aria-label="Close task details"]',
+        )!.click()
+      );
       await settle();
     }
     const planReads = planLive.reads.length;
@@ -8292,7 +10572,10 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
         planLive.reads.length > planReads,
       "a request for a replaced plan opened a plan or was not refused",
     );
-    check(mutations.length === mutationsBefore, "opening a plan sent a mutation");
+    check(
+      mutations.length === mutationsBefore,
+      "opening a plan sent a mutation",
+    );
     unmount();
 
     // An item with no current destination offers Refresh, never a false route.
@@ -8310,14 +10593,20 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
     }));
     await settle();
     const unbound = document.querySelector('[data-attention-id="unbound"]');
-    check(!unbound?.textContent?.includes("earlier attempt"), "a targetless item claimed to be historical");
+    check(
+      !unbound?.textContent?.includes("earlier attempt"),
+      "a targetless item claimed to be historical",
+    );
     const refresh = [...(unbound?.querySelectorAll("button") ?? [])]
       .find((candidate) => candidate.textContent?.startsWith("Refresh"));
     check(!!refresh, "a targetless item offers no refresh");
     const before = refreshLive.reads.length;
     act(() => refresh!.click());
     await settle();
-    check(refreshLive.reads.length > before, "Refresh did not request the latest state");
+    check(
+      refreshLive.reads.length > before,
+      "Refresh did not request the latest state",
+    );
   } finally {
     unmount();
     liveEnvironment.transport = priorEnvironment.transport;
@@ -8367,7 +10656,10 @@ Deno.test("Progress facts and paused-service notices keep raw causes in technica
     );
     await settle();
     const facts = document.querySelector(".progress-facts")?.textContent ?? "";
-    check(facts.includes("Waiting on") && facts.includes("Manager"), `facts read ${facts}`);
+    check(
+      facts.includes("Waiting on") && facts.includes("Manager"),
+      `facts read ${facts}`,
+    );
     check(
       document.body.textContent?.includes(
         "An agent is running and producing activity; no newer workflow step is recorded.",
@@ -8397,17 +10689,21 @@ Deno.test("Progress facts and paused-service notices keep raw causes in technica
         id: "coordinator_deferred",
         category: "blocked",
         title: "Automatic progress is paused",
-        reason: "A service step failed on every try, so waiting work is not advancing.",
+        reason:
+          "A service step failed on every try, so waiting work is not advancing.",
         task_title: null,
         role: null,
         action: { kind: "open_diagnostics", label: "Open diagnostics" },
         target: { kind: "diagnostics" },
         held_tasks: [],
-        details: "Failing since 2026-01-01T00:00:00Z: sqlite busy at 0xdeadbeef",
+        details:
+          "Failing since 2026-01-01T00:00:00Z: sqlite busy at 0xdeadbeef",
       }],
     }));
     await settle();
-    const item = document.querySelector('[data-attention-id="coordinator_deferred"]');
+    const item = document.querySelector(
+      '[data-attention-id="coordinator_deferred"]',
+    );
     const copy = item?.querySelector(".attention-copy > p")?.textContent ?? "";
     check(!copy.includes("0xdeadbeef"), "the raw cause is primary copy");
     check(
@@ -8419,14 +10715,18 @@ Deno.test("Progress facts and paused-service notices keep raw causes in technica
     act(() => open!.click());
     await settle();
     check(
-      document.activeElement?.getAttribute("data-attention-target") === "diagnostics",
+      document.activeElement?.getAttribute("data-attention-target") ===
+        "diagnostics",
       "Open diagnostics did not open the Diagnostics page",
     );
     await settle();
     // The durable paused step is shown from the service state, plainly.
-    const current = document.querySelector('[data-diagnostic-id="coordinator_deferred"]');
+    const current = document.querySelector(
+      '[data-diagnostic-id="coordinator_deferred"]',
+    );
     check(
-      current?.querySelector("strong")?.textContent === "Automatic progress is paused",
+      current?.querySelector("strong")?.textContent ===
+        "Automatic progress is paused",
       "Diagnostics does not show the recorded paused step",
     );
     check(
@@ -8445,7 +10745,9 @@ Deno.test("Progress facts and paused-service notices keep raw causes in technica
     check(
       ![...logged!.querySelectorAll(":scope > strong, :scope > p")]
         .some((node) => node.textContent?.includes("coordinator.tick")) &&
-        logged!.querySelector("details")?.textContent?.includes("coordinator.tick"),
+        logged!.querySelector("details")?.textContent?.includes(
+          "coordinator.tick",
+        ),
       "the event code is primary copy",
     );
   } finally {
@@ -8458,10 +10760,18 @@ Deno.test("Progress facts and paused-service notices keep raw causes in technica
 });
 
 Deno.test("Activity reports show a truthful empty state before any attempt and keep real loading afterwards", async () => {
-  const draft: Task = { ...task, lifecycle: "backlog", active_attempt: undefined };
+  const draft: Task = {
+    ...task,
+    lifecycle: "backlog",
+    active_attempt: undefined,
+  };
   let requests = 0;
   globalThis.fetch = (async (input: string | URL | Request) => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const url = typeof input === "string"
+      ? input
+      : input instanceof URL
+      ? input.href
+      : input.url;
     if (url.includes("/content")) requests += 1;
     return await new Promise<Response>(() => {});
   }) as typeof fetch;
@@ -8477,7 +10787,10 @@ Deno.test("Activity reports show a truthful empty state before any attempt and k
     );
     await settle();
     const text = document.querySelector("[role=dialog]")?.textContent ?? "";
-    check(!text.includes("Loading reports"), "a draft shows a report load that never happens");
+    check(
+      !text.includes("Loading reports"),
+      "a draft shows a report load that never happens",
+    );
     check(
       text.includes("No agent has worked on this task yet"),
       "a draft does not explain why there are no reports",
@@ -8496,7 +10809,9 @@ Deno.test("Activity reports show a truthful empty state before any attempt and k
     );
     await settle();
     check(
-      document.querySelector("[role=dialog]")?.textContent?.includes("Loading reports"),
+      document.querySelector("[role=dialog]")?.textContent?.includes(
+        "Loading reports",
+      ),
       "an attempted task lost its loading state",
     );
     check(requests > 0, "an attempted task did not request its content");
@@ -8512,9 +10827,15 @@ Deno.test("Task content shows only the current revision when responses arrive ou
     reject: (cause: unknown) => void;
   }> = [];
   globalThis.fetch = (async (input: string | URL | Request) => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const url = typeof input === "string"
+      ? input
+      : input instanceof URL
+      ? input.href
+      : input.url;
     if (!url.includes("/content")) return new Response("[]");
-    return await new Promise<Response>((resolve, reject) => pending.push({ resolve, reject }));
+    return await new Promise<Response>((resolve, reject) =>
+      pending.push({ resolve, reject })
+    );
   }) as typeof fetch;
   const content = (revision: string, summary: string) =>
     new Response(JSON.stringify({
@@ -8544,28 +10865,47 @@ Deno.test("Task content shows only the current revision when responses arrive ou
       onChanged={noop}
     />
   );
-  const shown = () => document.querySelector("[role=dialog]")?.textContent ?? "";
+  const shown = () =>
+    document.querySelector("[role=dialog]")?.textContent ?? "";
   try {
     mount(view("r1"));
     await settle();
     rerender(view("r2"));
     await settle();
-    check(pending.length === 2, `expected two content requests, saw ${pending.length}`);
+    check(
+      pending.length === 2,
+      `expected two content requests, saw ${pending.length}`,
+    );
     // The newer request answers first; the older one arrives afterwards.
     pending[1].resolve(content("r2", "Newer report"));
     await settle();
     pending[0].resolve(content("r1", "Older report"));
     await settle();
-    check(shown().includes("Newer report"), "the current revision is not shown");
-    check(!shown().includes("Older report"), "an older revision replaced the current one");
+    check(
+      shown().includes("Newer report"),
+      "the current revision is not shown",
+    );
+    check(
+      !shown().includes("Older report"),
+      "an older revision replaced the current one",
+    );
     // A response for another revision of the same attempt is never shown.
     rerender(view("r3"));
     await settle();
-    check(!shown().includes("Newer report"), "content of a replaced revision stayed visible");
+    check(
+      !shown().includes("Newer report"),
+      "content of a replaced revision stayed visible",
+    );
     pending[2].resolve(content("r2", "Mismatched report"));
     await settle();
-    check(!shown().includes("Mismatched report"), "a response for another revision was shown");
-    check(shown().includes("Loading reports"), "the current revision is not being loaded");
+    check(
+      !shown().includes("Mismatched report"),
+      "a response for another revision was shown",
+    );
+    check(
+      shown().includes("Loading reports"),
+      "the current revision is not being loaded",
+    );
     // A superseded request that fails does not show an error for current content.
     rerender(view("r4"));
     await settle();
@@ -8574,8 +10914,14 @@ Deno.test("Task content shows only the current revision when responses arrive ou
     pending[3].reject(new Error("Stale failure from an older request"));
     pending[4].resolve(content("r5", "Current report"));
     await settle();
-    check(!shown().includes("Stale failure"), "an error from an older request was shown");
-    check(shown().includes("Current report"), "the current report was not shown");
+    check(
+      !shown().includes("Stale failure"),
+      "an error from an older request was shown",
+    );
+    check(
+      shown().includes("Current report"),
+      "the current report was not shown",
+    );
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -8605,7 +10951,8 @@ const heldSource = {
 
 Deno.test("Task content accepts only a current-input source bound to its exact report and attempt", async () => {
   let body: unknown;
-  globalThis.fetch = (async () => new Response(JSON.stringify(body))) as typeof fetch;
+  globalThis.fetch =
+    (async () => new Response(JSON.stringify(body))) as typeof fetch;
   const content = (currentInput?: unknown) => ({
     task_id: "AJ-1",
     attempt_id: "a1",
@@ -8626,27 +10973,44 @@ Deno.test("Task content accepts only a current-input source bound to its exact r
       "an exact source was refused",
     );
     body = content({
-      attempt_id: "a1", kind: "question", role: null, result_id: null,
-      role_generation_id: null, state: "unavailable", unavailable_reason: "not_recorded",
+      attempt_id: "a1",
+      kind: "question",
+      role: null,
+      result_id: null,
+      role_generation_id: null,
+      state: "unavailable",
+      unavailable_reason: "not_recorded",
     });
     check(
       (await getTaskContent("AJ-1")).current_input?.state === "unavailable",
       "an unavailable source was refused",
     );
     const malformed: Array<[string, unknown]> = [
-      ["another report", { ...heldSource, report: { ...heldQuestion, id: "r-later" } }],
+      ["another report", {
+        ...heldSource,
+        report: { ...heldQuestion, id: "r-later" },
+      }],
       ["another attempt", { ...heldSource, attempt_id: "a0" }],
       ["another outcome", { ...heldSource, kind: "blocked" }],
-      ["another author", { ...heldSource, report: { ...heldQuestion, role: "manager" } }],
+      ["another author", {
+        ...heldSource,
+        report: { ...heldQuestion, role: "manager" },
+      }],
       ["a report retired by a later turn", {
         ...heldSource,
         report: {
           ...heldQuestion,
-          superseded_by_native_turn: { hook_event_id: "h1", superseded_at: "2026-10-11T00:01:00Z" },
+          superseded_by_native_turn: {
+            hook_event_id: "h1",
+            superseded_at: "2026-10-11T00:01:00Z",
+          },
         },
       }],
       ["an unknown reason", {
-        ...heldSource, state: "unavailable", report: undefined, unavailable_reason: "expired",
+        ...heldSource,
+        state: "unavailable",
+        report: undefined,
+        unavailable_reason: "expired",
       }],
       ["an unknown state", { ...heldSource, state: "pending" }],
     ];
@@ -8656,7 +11020,8 @@ Deno.test("Task content accepts only a current-input source bound to its exact r
       try {
         await getTaskContent("AJ-1");
       } catch (cause) {
-        refused = cause instanceof Error && cause.message.includes("unsupported task content");
+        refused = cause instanceof Error &&
+          cause.message.includes("unsupported task content");
       }
       check(refused, `a source naming ${name} was accepted`);
     }
@@ -8679,21 +11044,24 @@ Deno.test("A waiting task shows only the exact report behind its hold and keeps 
     outcome: "blocked",
     summary: "Unrelated later blocker",
   };
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    if (String(input).includes("/content")) {
-      contentRequests += 1;
-      return new Response(JSON.stringify({
-        task_id: "AJ-1",
-        attempt_id: "a1",
-        content_revision: revision,
-        truncated: false,
-        records: [heldQuestion, later],
-        ...(currentInput === undefined ? {} : { current_input: currentInput }),
-      }));
-    }
-    if (init?.method === "POST") sent.push(JSON.parse(String(init.body)));
-    return new Response(JSON.stringify({ result: {} }));
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).includes("/content")) {
+        contentRequests += 1;
+        return new Response(JSON.stringify({
+          task_id: "AJ-1",
+          attempt_id: "a1",
+          content_revision: revision,
+          truncated: false,
+          records: [heldQuestion, later],
+          ...(currentInput === undefined
+            ? {}
+            : { current_input: currentInput }),
+        }));
+      }
+      if (init?.method === "POST") sent.push(JSON.parse(String(init.body)));
+      return new Response(JSON.stringify({ result: {} }));
+    }) as typeof fetch;
   const waitingAt = (contentRevision: string, attemptId = "a1"): Task => ({
     ...task,
     attention: "needs_input",
@@ -8714,7 +11082,8 @@ Deno.test("A waiting task shows only the exact report behind its hold and keeps 
       id: "task:AJ-1:needs_input",
       category: "decision",
       title: "Needs your input",
-      reason: "The implementer asked a question and is waiting for your answer.",
+      reason:
+        "The implementer asked a question and is waiting for your answer.",
       task_title: "Existing",
       role: null,
       action: { kind: "answer_question", label: "Answer question" },
@@ -8729,48 +11098,71 @@ Deno.test("A waiting task shows only the exact report behind its hold and keeps 
       held_tasks: [],
     }],
   };
-  const detail = (value: Task) => (
-    <TaskDetail task={value} state={{ ...state, tasks: [value] }} onClose={noop} onChanged={noop} />
+  const detail = (value: Task, projection: AppState = state) => (
+    <TaskDetail
+      task={value}
+      state={{ ...projection, tasks: [value] }}
+      onClose={noop}
+      onChanged={noop}
+    />
   );
-  const title = () => document.getElementById("task-question-title")?.textContent;
+  const title = () =>
+    document.getElementById("task-question-title")?.textContent;
   const panel = () =>
-    document.querySelector('[aria-labelledby="task-question-title"]')?.textContent ?? "";
+    document.querySelector('[aria-labelledby="task-question-title"]')
+      ?.textContent ?? "";
   try {
     mount(detail(waiting));
     await settle();
     await settle();
-    check(title() === "The implementer needs a decision", `question heading reads ${title()}`);
     check(
-      panel().includes("old column") && !panel().includes("Unrelated later blocker"),
+      title() === "The implementer needs a decision",
+      `question heading reads ${title()}`,
+    );
+    check(
+      panel().includes("old column") &&
+        !panel().includes("Unrelated later blocker"),
       "the question area did not show exactly the report behind the hold",
     );
     check(
-      panel().includes("Replies go to the manager, not directly to the implementer") &&
+      panel().includes(
+        "Replies go to the manager, not directly to the implementer",
+      ) &&
         panel().includes("Retry is not available right now"),
       "the reply does not say who receives it or what still continues the work",
     );
 
-    change(document.querySelector<HTMLTextAreaElement>(".next-step textarea")!, "Keep it for one release");
+    change(
+      document.querySelector<HTMLTextAreaElement>(".next-step textarea")!,
+      "Keep it for one release",
+    );
     click("Send reply");
     await settle();
     check(
       sent.length === 1 && sent[0].kind === "guidance" &&
-        sent[0].role_generation_id === "g1" && sent[0].body === "Keep it for one release",
-      `the reply sent ${JSON.stringify(sent)} instead of only guidance to the manager`,
+        sent[0].role_generation_id === "g1" &&
+        sent[0].body === "Keep it for one release",
+      `the reply sent ${
+        JSON.stringify(sent)
+      } instead of only guidance to the manager`,
     );
 
     click("Activity");
     await settle();
     const reports = document.querySelector(".report-list")?.textContent ?? "";
     check(
-      reports.includes("old column") && reports.includes("Unrelated later blocker"),
+      reports.includes("old column") &&
+        reports.includes("Unrelated later blocker"),
       "report history lost a record",
     );
     click("Overview");
 
     // A later native turn retires the report; the service's content revision moves.
     currentInput = {
-      ...heldSource, state: "unavailable", report: undefined, unavailable_reason: "superseded",
+      ...heldSource,
+      state: "unavailable",
+      report: undefined,
+      unavailable_reason: "superseded",
     };
     revision = "c2";
     const superseded = waitingAt("c2");
@@ -8779,8 +11171,10 @@ Deno.test("A waiting task shows only the exact report behind its hold and keeps 
     await settle();
     check(
       title() === "The agent's question is not available" &&
-        panel().includes("continued working") && panel().includes("No other report is shown") &&
-        !panel().includes("old column") && !panel().includes("Unrelated later blocker"),
+        panel().includes("continued working") &&
+        panel().includes("No other report is shown") &&
+        !panel().includes("old column") &&
+        !panel().includes("Unrelated later blocker"),
       "an unavailable source was replaced by another report",
     );
 
@@ -8789,14 +11183,20 @@ Deno.test("A waiting task shows only the exact report behind its hold and keeps 
     click("Refresh");
     await settle();
     await settle();
-    check(contentRequests > before, "Refresh did not reload the task's reports");
     check(
-      panel().includes("does not identify which report") && !panel().includes("Unrelated later blocker"),
+      contentRequests > before,
+      "Refresh did not reload the task's reports",
+    );
+    check(
+      panel().includes("does not identify which report") &&
+        !panel().includes("Unrelated later blocker"),
       "an older service's content was presented as a known question",
     );
     click("Open Activity");
     check(
-      document.getElementById("task-tab-activity")?.getAttribute("aria-selected") === "true",
+      document.getElementById("task-tab-activity")?.getAttribute(
+        "aria-selected",
+      ) === "true",
       "Open Activity did not open the report history",
     );
     click("Overview");
@@ -8810,16 +11210,136 @@ Deno.test("A waiting task shows only the exact report behind its hold and keeps 
       "the question area implied it knows which plan the report means",
     );
     click("Open the task's current plan");
-    const viewer = () => document.querySelector(".plan-viewer")?.textContent ?? "";
+    const viewer = () =>
+      document.querySelector(".plan-viewer")?.textContent ?? "";
     check(
-      viewer().includes("Keep existing data") && viewer().includes("shown as context") &&
+      viewer().includes("Keep existing data") &&
+        viewer().includes("shown as context") &&
         !viewer().includes("Opened for"),
       "the current plan was presented as the plan the question refers to",
     );
     rerender(detail(waitingAt("c2", "a2")));
     check(
-      !viewer().includes("Keep existing data") && viewer().includes("This plan changed after you opened it"),
+      !viewer().includes("Keep existing data") &&
+        viewer().includes("This plan changed after you opened it"),
       "a plan opened for one attempt stayed visible under another",
+    );
+    const pendingCheck: TripTaskVerification = {
+      attempt_id: "a1",
+      selected_revision: 1,
+      check_id: "focused-check",
+      required: true,
+      candidate_hash: "candidate",
+      exact_command_hash: "command",
+      scope_hash: "scope",
+      command: {
+        kind: "structured_argv",
+        executable: "./check",
+        arguments: [],
+        cwd: ".",
+      },
+      authorization: {
+        once_available: false,
+        reusable: false,
+        family: false,
+        authorized: false,
+        action_state: "actionable",
+        state: "pending",
+        source: "service_check",
+      },
+    };
+    const checksTask: Task = {
+      ...waiting,
+      active_attempt: {
+        ...waiting.active_attempt!,
+        phase: "checks",
+        candidate_hash: "candidate",
+        content_revision: "c3",
+      },
+    };
+    const checkState: AppState = {
+      ...state,
+      attention: [],
+      trip_task_verification: [pendingCheck],
+    };
+    currentInput = null;
+    revision = "c3";
+    mount(detail(checksTask, checkState));
+    await settle();
+    await settle();
+    check(
+      !document.getElementById("task-question-title") &&
+        !document.body.textContent?.includes(
+          "cannot tell which plan this report refers to",
+        ),
+      "a known check approval was presented as a missing question or uncertain plan",
+    );
+    click("Open Checks");
+    const approval = [
+      ...document.querySelectorAll<HTMLButtonElement>(
+        ".verification-row button",
+      ),
+    ]
+      .find((button) => button.textContent === "Approve once");
+    check(
+      document.getElementById("task-tab-checks")?.getAttribute(
+            "aria-selected",
+          ) === "true" &&
+        approval && !approval.disabled,
+      "the known approval wait did not retain its actionable Checks route",
+    );
+    click("Overview");
+    currentInput = heldSource;
+    revision = "c4";
+    const withReport: Task = {
+      ...checksTask,
+      active_attempt: {
+        ...checksTask.active_attempt!,
+        content_revision: revision,
+      },
+    };
+    rerender(detail(withReport, checkState));
+    await settle();
+    await settle();
+    check(
+      panel().includes("old column") &&
+        !document.querySelector(".next-step textarea"),
+      "a pending check hid a linked report or created a reply without an Answer question item",
+    );
+    currentInput = null;
+    revision = "c5";
+    const missingReport: Task = {
+      ...checksTask,
+      active_attempt: {
+        ...checksTask.active_attempt!,
+        content_revision: revision,
+      },
+    };
+    rerender(
+      detail(missingReport, { ...checkState, attention: state.attention }),
+    );
+    await settle();
+    await settle();
+    check(
+      title() === "No question is linked to this wait" &&
+        document.querySelector(".next-step textarea"),
+      "an actionable check hid the current Answer question item when its report was missing",
+    );
+    rerender(
+      detail(missingReport, {
+        ...checkState,
+        trip_task_verification: [{
+          ...pendingCheck,
+          attempt_id: "other-attempt",
+        }],
+      }),
+    );
+    await settle();
+    await settle();
+    check(
+      title() === "No question is linked to this wait" &&
+        panel().includes("cannot tell which plan this report refers to"),
+      "another attempt's pending check suppressed an unknown input wait",
     );
     check(sent.length === 1, "reading the question or plan sent a request");
   } finally {
@@ -8832,10 +11352,11 @@ Deno.test("A waiting task shows only the exact report behind its hold and keeps 
 Deno.test("Allow implementation is offered only for the plan shown and opens that approved plan", async () => {
   localStorage.clear();
   const sent: Record<string, unknown>[] = [];
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    if (init?.method === "POST") sent.push(JSON.parse(String(init.body)));
-    return new Response(JSON.stringify({ result: {} }));
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST") sent.push(JSON.parse(String(init.body)));
+      return new Response(JSON.stringify({ result: {} }));
+    }) as typeof fetch;
   const ready: Task = {
     ...task,
     active_attempt: {
@@ -8860,17 +11381,26 @@ Deno.test("Allow implementation is offered only for the plan shown and opens tha
           reason: "The approved plan is waiting for your permission.",
           owner: "human",
           operation: "authorize_implementation",
-          binding: { task_id: "AJ-1", attempt_id: attemptId, plan_hash: planHash },
+          binding: {
+            task_id: "AJ-1",
+            attempt_id: attemptId,
+            plan_hash: planHash,
+          },
         }],
       }}
       onClose={noop}
       onChanged={noop}
     />
   );
-  const decision = () => document.querySelector(".review-panel")?.textContent ?? "";
-  const viewer = () => document.querySelector(".plan-viewer")?.textContent ?? "";
+  const decision = () =>
+    document.querySelector(".review-panel")?.textContent ?? "";
+  const viewer = () =>
+    document.querySelector(".plan-viewer")?.textContent ?? "";
   const closePlan = () =>
-    act(() => document.querySelector<HTMLButtonElement>('[aria-label="Close plan"]')!.click());
+    act(() =>
+      document.querySelector<HTMLButtonElement>('[aria-label="Close plan"]')!
+        .click()
+    );
   try {
     // Another plan, or the same plan hash for another attempt: the shown plan
     // is offered only as context, never as the plan this request authorizes.
@@ -8885,7 +11415,8 @@ Deno.test("Allow implementation is offered only for the plan shown and opens tha
       );
       click("Open the task's current plan");
       check(
-        viewer().includes("Add the index") && viewer().includes("shown as context") &&
+        viewer().includes("Add the index") &&
+          viewer().includes("shown as context") &&
           !viewer().includes("Opened for"),
         `a request for ${attemptId}/${planHash} labelled the shown plan as its own`,
       );
@@ -8897,12 +11428,14 @@ Deno.test("Allow implementation is offered only for the plan shown and opens tha
     await settle();
     click("Open approved plan");
     check(
-      viewer().includes("Opened for: Ready to start work on “Existing”") && viewer().includes("Add the index"),
+      viewer().includes("Opened for: Ready to start work on “Existing”") &&
+        viewer().includes("Add the index"),
       "Open approved plan did not show the exact plan with its decision",
     );
     closePlan();
     check(
-      !findButton("Allow implementation").disabled && !decision().includes("not for the task"),
+      !findButton("Allow implementation").disabled &&
+        !decision().includes("not for the task"),
       "Allow implementation stayed refused for the plan shown",
     );
     click("Allow implementation");
@@ -8922,7 +11455,7 @@ Deno.test("Allow implementation is offered only for the plan shown and opens tha
 Deno.test("A held Single agent run shows its own report and answers only through Resume agent", async () => {
   localStorage.clear();
   const bodies: Record<string, unknown>[] = [];
-  const held = singleAgentTask(singleAgentRun({
+  const heldRun = singleAgentRun({
     stage: "needs_action",
     stage_reason: "The agent is waiting for you.",
     result: null,
@@ -8934,7 +11467,8 @@ Deno.test("A held Single agent run shows its own report and answers only through
       available: true,
       reason: null,
     },
-  }), { attention: "needs_input" });
+  });
+  const held = singleAgentTask(heldRun, { attention: "needs_input" });
   const report = {
     ...heldQuestion,
     id: "r-blocked",
@@ -8943,33 +11477,47 @@ Deno.test("A held Single agent run shows its own report and answers only through
     summary: "The fixture database is missing.",
   };
   let currentInput: unknown = {
-    attempt_id: "sa-attempt", kind: "blocked", role: "single_agent",
-    result_id: "r-blocked", role_generation_id: "g-sa", state: "available", report,
+    attempt_id: "sa-attempt",
+    kind: "blocked",
+    role: "single_agent",
+    result_id: "r-blocked",
+    role_generation_id: "g-sa",
+    state: "available",
+    report,
   };
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    if (String(input).includes("/content")) {
-      return new Response(JSON.stringify({
-        task_id: "SA-1",
-        attempt_id: "sa-attempt",
-        content_revision: "c1",
-        truncated: false,
-        records: [report],
-        current_input: currentInput,
-      }));
-    }
-    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    bodies.push(body);
-    return workflowResult(body);
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).includes("/content")) {
+        return new Response(JSON.stringify({
+          task_id: "SA-1",
+          attempt_id: "sa-attempt",
+          content_revision: "c1",
+          truncated: false,
+          records: [report],
+          current_input: currentInput,
+        }));
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      return workflowResult(body);
+    }) as typeof fetch;
   try {
     mount(
-      <TaskDetail task={held} state={{ ...liveBase, tasks: [held] }} onClose={noop} onChanged={noop} />,
+      <TaskDetail
+        task={held}
+        state={{ ...liveBase, tasks: [held] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
     );
     await settle();
     await settle();
-    const panel = document.querySelector('[aria-labelledby="task-question-title"]');
+    const panel = document.querySelector(
+      '[aria-labelledby="task-question-title"]',
+    );
     check(
-      document.getElementById("task-question-title")?.textContent === "The agent is blocked" &&
+      document.getElementById("task-question-title")?.textContent ===
+          "The agent is blocked" &&
         panel?.textContent?.includes("fixture database is missing") &&
         panel.textContent.includes("Resume agent is available now") &&
         !panel.querySelector("textarea"),
@@ -8987,19 +11535,30 @@ Deno.test("A held Single agent run shows its own report and answers only through
 
     const shown = async () => {
       mount(
-        <TaskDetail task={held} state={{ ...liveBase, tasks: [held] }} onClose={noop} onChanged={noop} />,
+        <TaskDetail
+          task={held}
+          state={{ ...liveBase, tasks: [held] }}
+          onClose={noop}
+          onChanged={noop}
+        />,
       );
       await settle();
       await settle();
       return {
         title: document.getElementById("task-question-title")?.textContent,
-        text: document.querySelector('[aria-labelledby="task-question-title"]')?.textContent ?? "",
+        text: document.querySelector('[aria-labelledby="task-question-title"]')
+          ?.textContent ?? "",
       };
     };
     // A legacy hold recorded before holds named their report.
     currentInput = {
-      attempt_id: "sa-attempt", kind: "question", role: null, result_id: null,
-      role_generation_id: null, state: "unavailable", unavailable_reason: "not_recorded",
+      attempt_id: "sa-attempt",
+      kind: "question",
+      role: null,
+      result_id: null,
+      role_generation_id: null,
+      state: "unavailable",
+      unavailable_reason: "not_recorded",
     };
     const legacy = await shown();
     check(
@@ -9018,6 +11577,86 @@ Deno.test("A held Single agent run shows its own report and answers only through
         !unlinked.text.includes("fixture database is missing"),
       `an unlinked wait read ${unlinked.title}`,
     );
+    const unavailable = singleAgentTask(
+      singleAgentRun({
+        ...heldRun,
+        available_actions: ["cancel"],
+        resume: {
+          session_id: "sa-session",
+          transcript_epoch: "epoch-1",
+          resume_count: 0,
+          available: false,
+          reason: "Native identity is missing",
+        },
+      }),
+      { attention: "needs_input" },
+    );
+    mount(
+      <TaskDetail
+        task={unavailable}
+        state={{ ...liveBase, tasks: [unavailable] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    await settle();
+    check(
+      document.getElementById("task-question-title") &&
+        document.querySelector(".single-agent-run")?.textContent?.includes(
+          "Resume agent is not available",
+        ) &&
+        ![...document.querySelectorAll("button")].some((button) =>
+          button.textContent?.trim() === "Resume agent"
+        ),
+      "an unknown input wait hid its unavailable resume recovery or offered an unsafe resume",
+    );
+    const failedProbe = singleAgentTask(
+      singleAgentRun({
+        stage: "blocked",
+        stage_reason:
+          "The probe did not prove the profile: the probe's hooks never named its native conversation",
+        probe_admission_id: "adm-1",
+        available_actions: ["cancel"],
+        resume: {
+          session_id: "sa-session",
+          transcript_epoch: "epoch-1",
+          resume_count: 0,
+          available: false,
+          reason: "The task is not in progress",
+        },
+      }),
+      { attention: "needs_input", lifecycle: "awaiting_review" },
+    );
+    mount(
+      <TaskDetail
+        task={failedProbe}
+        state={{ ...liveBase, tasks: [failedProbe] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    await settle();
+    check(
+      !document.getElementById("task-question-title") &&
+        ![...document.querySelectorAll("button")].some((button) =>
+          button.textContent?.trim() === "Resume agent"
+        ) &&
+        !document.body.textContent?.includes("Resume agent is not available") &&
+        document.querySelector(".single-agent-run")?.textContent?.includes(
+          "Review and trust",
+        ) &&
+        document.querySelector(".single-agent-run details")?.textContent
+          ?.includes("hooks never named"),
+      "a failed admission probe was routed as a question or hid its recorded reason",
+    );
+    click("Cancel");
+    await settle();
+    check(
+      bodies.at(-1)?.kind === "control" && bodies.at(-1)?.action === "cancel" &&
+        bodies.at(-1)?.task_id === failedProbe.id &&
+        bodies.at(-1)?.expected_version === failedProbe.version,
+      "probe recovery did not send the supported Cancel with its current task binding",
+    );
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -9028,14 +11667,29 @@ Deno.test("A held Single agent run shows its own report and answers only through
 Deno.test("Setup installation review explains the files and steps plainly and keeps exact bindings", async () => {
   localStorage.clear();
   const requests: Record<string, unknown>[] = [];
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    requests.push(JSON.parse(String(init?.body)));
-    return new Response(JSON.stringify({ result: {} }));
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ result: {} }));
+    }) as typeof fetch;
   const fresh: Project = {
     ...initialized,
-    trip: { ...initialized.trip!, readiness: "setup_in_progress", detected_installation: "absent" },
+    trip: {
+      ...initialized.trip!,
+      readiness: "setup_in_progress",
+      detected_installation: "absent",
+    },
   };
+  const profiles: Record<string, TripSetupProfile> = Object.fromEntries(
+    ROLES.filter((role) => role !== "manager").map((role) => [role, {
+      adapter: "llmrelay_codex",
+      provider: "codex",
+      model: "model",
+      effort: "high",
+      authority: role === "implementer" ? "workspace-write" : "read-only",
+      session: role === "final_verifier" ? "fresh" : "retained",
+    }]),
+  );
   const finalized: TripSetupState = {
     setup_operation_id: "install-review",
     project_id: fresh.id,
@@ -9045,7 +11699,9 @@ Deno.test("Setup installation review explains the files and steps plainly and ke
     final_source_set_hash: "source-set-hash-1",
     target_inventory: {},
     destination_preview: [{
-      relative_path: "AGENTS.md", source_sha256: "source-sha", preimage_sha256: "preimage-sha",
+      relative_path: "AGENTS.md",
+      source_sha256: "source-sha",
+      preimage_sha256: "preimage-sha",
     }],
     final_files: [{
       relative_path: "AGENTS.md",
@@ -9055,14 +11711,52 @@ Deno.test("Setup installation review explains the files and steps plainly and ke
       preimage_content: "# Old guidance",
     }],
     installation_source_binding_complete: true,
-    installation_source_binding_reason: "Exact post-preflight bytes and destination preimages are frozen",
-    selected_profiles: [],
+    installation_source_binding_reason:
+      "Exact post-preflight bytes and destination preimages are frozen",
+    selected_profiles: ROLES.map((role) => ({
+      role,
+      selection_state: "selected",
+      profile_hash: role,
+      current_adapter_hash: "adapter",
+      profile: role === "manager"
+        ? { provider: "codex", model: "model", effort: "high" }
+        : profiles[role],
+      compatibility: {
+        status: "evidence_stale",
+        observed_version: null,
+        pack_id: null,
+        pack_revision: null,
+        contract_id: null,
+        contract_revision: null,
+        short_hash: null,
+        predicate_id: null,
+        missing_evidence: ["exact_selected_profile_observation"],
+        action: "requalify_exact_profile",
+        message:
+          "Newer agent evidence replaced the verification recorded for this profile, so it must be verified again before starting work.",
+      },
+    })),
     probe_receipts: ROLES.map((role) => ({
-      id: `receipt-${role}`, profile_id: role, profile_hash: role, provider: "codex" as const, role,
-      authority: role === "implementer" ? "workspace-write" as const : "read-only" as const,
-      session_mode: role === "final_verifier" ? "fresh" as const : "retained" as const,
-      generation_id: `generation-${role}`, result: "success", model_evidence: "fixture",
-      evidence: {}, created_at: "", capability_key: `capability-${role}`, adapter_hash: "adapter",
+      id: `receipt-${role}`,
+      profile_id: role === "manager" ? "host_manager" : role,
+      profile_hash: role,
+      provider: "codex" as const,
+      role,
+      authority: role === "implementer"
+        ? "workspace-write" as const
+        : "read-only" as const,
+      session_mode: role === "final_verifier"
+        ? "fresh" as const
+        : "retained" as const,
+      generation_id: `generation-${role}`,
+      result: "success",
+      model_evidence: "fixture",
+      evidence: {
+        session_mode_observed: role === "final_verifier" ? "fresh" : "retained",
+      },
+      created_at: "2026-01-01T00:00:00Z",
+      capability_key: `capability-${role}`,
+      adapter_hash: "adapter",
     })),
     sessions: [],
     runtime_admissions: [],
@@ -9072,23 +11766,50 @@ Deno.test("Setup installation review explains the files and steps plainly and ke
   };
   const step = () =>
     [...document.querySelectorAll("fieldset.setup-step")].find((fieldset) =>
-      fieldset.querySelector("legend")?.textContent === "Review the files setup will write"
+      fieldset.querySelector("legend")?.textContent ===
+        "Review the files setup will write"
     );
   try {
-    mount(<ProjectSetup project={fresh} setup={finalized} onChanged={noop} onViewSession={cmuxFixture} />);
+    mount(
+      <ProjectSetup
+        project={fresh}
+        setup={finalized}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    const verification = document.querySelector(
+      '[aria-label="Agent verification"]',
+    );
+    const primaryVerification = [...verification!.querySelectorAll("p")]
+      .filter((node) => !node.closest("details"))
+      .map((node) => node.textContent).join(" ");
+    check(
+      verification?.querySelectorAll("p.success").length === 6 &&
+        primaryVerification.includes("6/6") &&
+        primaryVerification.includes("runtime verification is separate") &&
+        !primaryVerification.includes("Newer agent evidence replaced") &&
+        !document.querySelector(".trip-setup > p.warning"),
+      "exact setup receipts without runtime capability rows were presented as failed setup verification",
+    );
     check(!!step(), "the installation review is not shown");
-    const primary = [...step()!.querySelectorAll("legend, p, small, summary, button")]
+    const primary = [
+      ...step()!.querySelectorAll("legend, p, small, summary, button"),
+    ]
       .filter((node) => !node.closest(".technical-details"))
       .map((node) => node.textContent).join(" ");
     check(
-      primary.includes(fresh.repository_path) && primary.includes("Apply staged authorized installation") &&
+      primary.includes(fresh.repository_path) &&
+        primary.includes("Apply staged authorized installation") &&
         !/hash-1|preimage-sha|source-sha/.test(primary),
       `the review's primary copy is not plain: ${primary}`,
     );
     check(
       step()!.textContent?.includes("# Old guidance") &&
         step()!.textContent?.includes("# New workflow guidance") &&
-        step()!.querySelector(".technical-details")?.textContent?.includes("preimages-hash-1"),
+        step()!.querySelector(".technical-details")?.textContent?.includes(
+          "preimages-hash-1",
+        ),
       "the review lost the exact before/after content or its diagnostics",
     );
     click("Approve installation");
@@ -9105,6 +11826,154 @@ Deno.test("Setup installation review explains the files and steps plainly and ke
     localStorage.clear();
     mount(
       <ProjectSetup
+        project={initialized}
+        setup={{ ...finalized, state: "activated" }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    check(
+      document.querySelector('[aria-label="Agent verification"]')
+            ?.querySelectorAll("p.success").length === 6 &&
+        !document.querySelector('.trip-setup > p[role="status"]') &&
+        document.body.textContent?.includes(
+          "Setup receipts are never promoted into this authority",
+        ),
+      "activation turned successful installation records into a review warning or runtime permission",
+    );
+    check(
+      !findButton("Prepare exact runtime verification").disabled,
+      "successful setup records blocked separate runtime preparation",
+    );
+    rerender(
+      <ProjectSetup
+        project={initialized}
+        setup={{
+          ...finalized,
+          state: "activated",
+          selected_profiles: finalized.selected_profiles.map((selection) =>
+            selection.role === "implementer"
+              ? {
+                ...selection,
+                compatibility: {
+                  ...selection.compatibility!,
+                  status: "unknown_version",
+                  observed_version: "unsupported-cli",
+                  missing_evidence: ["reviewed_exact_version_predicate"],
+                  action: "update_llmrelay_release",
+                },
+              }
+              : selection
+          ),
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    check(
+      document.querySelector('[aria-label="Agent verification"]')
+            ?.querySelectorAll("p.success").length === 6 &&
+        findButton("Prepare exact runtime verification").disabled &&
+        [...document.querySelectorAll("fieldset.setup-step")].some((fieldset) =>
+          fieldset.textContent?.includes("Runtime capability readiness") &&
+          fieldset.textContent.includes(
+            "Update LLMRelay to a release that supports this agent version",
+          )
+        ),
+      "successful setup receipts hid an unsupported executable or granted runtime preparation",
+    );
+    unmount();
+
+    mount(
+      <ProjectSetup
+        project={fresh}
+        setup={{
+          ...finalized,
+          selected_profiles: finalized.selected_profiles.map((selection) =>
+            selection.role === "manager"
+              ? { ...selection, profile_hash: "changed-manager" }
+              : selection
+          ),
+          probe_receipts: [
+            {
+              ...finalized.probe_receipts.find((receipt) =>
+                receipt.role === "plan_reviewer"
+              )!,
+              id: "failed-reviewer",
+              result: "failure",
+              created_at: "2026-01-02T00:00:00Z",
+            },
+            ...finalized.probe_receipts.filter((receipt) =>
+              receipt.role !== "explorer"
+            ).map((receipt) =>
+              receipt.role === "implementer"
+                ? { ...receipt, adapter_hash: "prior-adapter" }
+                : receipt.role === "code_reviewer"
+                ? { ...receipt, provider: "claude" as const }
+                : receipt.role === "final_verifier"
+                ? { ...receipt, session_mode: "retained" as const }
+                : receipt
+            ),
+          ],
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    const unverified = document.querySelector(
+      '[aria-label="Agent verification"]',
+    );
+    check(
+      unverified?.querySelectorAll("p.success").length === 0 &&
+        unverified.textContent?.includes("0/6") &&
+        unverified.textContent.includes("not been checked for setup yet") &&
+        unverified.textContent.includes(
+          "latest setup check for this profile did not succeed",
+        ) &&
+        unverified.textContent.includes(
+          "does not match the selected profile",
+        ) &&
+        unverified.textContent.includes(
+          "current profile and adapter bindings are unverified",
+        ),
+      "missing, changed, failed, or incorrectly bound setup records were presented as successful",
+    );
+    unmount();
+
+    mount(
+      <ProjectSetup
+        project={fresh}
+        setup={{
+          ...finalized,
+          selected_profiles: finalized.selected_profiles.map((selection) =>
+            selection.role === "code_reviewer"
+              ? { ...selection, current_adapter_hash: null }
+              : selection
+          ),
+          probe_receipts: finalized.probe_receipts.map((receipt) =>
+            receipt.role === "plan_reviewer"
+              ? { ...receipt, capability_key: null }
+              : receipt
+          ),
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
+    );
+    check(
+      document.querySelector('[aria-label="Agent verification"]')
+            ?.querySelectorAll("p.success").length === 4 &&
+        document.querySelector('.trip-setup > p[role="status"]')?.textContent
+          ?.includes("Code Reviewer") &&
+        document.querySelector('.trip-setup > p[role="status"]')?.textContent
+          ?.includes("Plan Reviewer"),
+      "an unavailable adapter binding or historical unbound receipt was treated as verified",
+    );
+    unmount();
+
+    localStorage.clear();
+    mount(
+      <ProjectSetup
         project={fresh}
         setup={{
           ...finalized,
@@ -9113,7 +11982,8 @@ Deno.test("Setup installation review explains the files and steps plainly and ke
           final_source_set_hash: null,
           final_files: [],
           installation_source_binding_complete: false,
-          installation_source_binding_reason: "Finalize the post-preflight installation bytes before human approval",
+          installation_source_binding_reason:
+            "Finalize the post-preflight installation bytes before human approval",
         }}
         onChanged={noop}
         onViewSession={cmuxFixture}
@@ -9121,14 +11991,17 @@ Deno.test("Setup installation review explains the files and steps plainly and ke
     );
     check(
       findButton("Approve installation").disabled &&
-        step()?.textContent?.includes("becomes available after the final preview is prepared"),
+        step()?.textContent?.includes(
+          "becomes available after the final preview is prepared",
+        ),
       "approval was offered, or left unexplained, before the preview exists",
     );
     const sent = requests.length;
     click("Prepare final file preview");
     await settle();
     check(
-      requests.length === sent + 1 && requests.at(-1)?.action === "finalize_installation" &&
+      requests.length === sent + 1 &&
+        requests.at(-1)?.action === "finalize_installation" &&
         requests.at(-1)?.proposal_hash === "proposal-hash-1",
       "preparing the preview did not request only the exact finalization",
     );
@@ -9176,7 +12049,10 @@ Deno.test("Waiting after restart lists only current sessions with an enabled ste
     operation,
     binding: { session_id: session, attempt_id: attempt, task_id: taskId },
   });
-  const restartState = (rows: ReturnType<typeof row>[], actions: ContinuationAction[]): AppState => ({
+  const restartState = (
+    rows: ReturnType<typeof row>[],
+    actions: ContinuationAction[],
+  ): AppState => ({
     ...liveBase,
     tasks,
     attention: [],
@@ -9198,19 +12074,41 @@ Deno.test("Waiting after restart lists only current sessions with an enabled ste
     action("s-completed", "a3", "AJ-3", "exact_resume", "restart_resume"),
     action("s-stale", "a-old", "AJ-1", "exact_resume", "restart_resume"),
     action("s-missing-task", "a9", "AJ-404", "exact_resume", "restart_resume"),
-    action("s-waiting", "a1", "AJ-1", "wait_for_capacity", "wait_for_capacity", false),
+    action(
+      "s-waiting",
+      "a1",
+      "AJ-1",
+      "wait_for_capacity",
+      "wait_for_capacity",
+      false,
+    ),
   ];
   const bulk = () =>
     [...document.querySelectorAll<HTMLButtonElement>(".restart-tools button")]
-      .find((button) => button.textContent?.startsWith("Resume eligible sessions"));
+      .find((button) =>
+        button.textContent?.startsWith("Resume eligible sessions")
+      );
   try {
-    mount(<Workspace state={restartState(allRows, allActions)} onSelect={noop} onChanged={noop} />);
+    mount(
+      <Workspace
+        state={restartState(allRows, allActions)}
+        onSelect={noop}
+        onChanged={noop}
+      />,
+    );
     const urgent = document.querySelector(".restart-candidates");
-    const urgentRows = [...(urgent?.querySelectorAll(".restart-candidate") ?? [])];
-    check(urgentRows.length === 2, `expected two current restart rows, saw ${urgentRows.length}`);
+    const urgentRows = [
+      ...(urgent?.querySelectorAll(".restart-candidate") ?? []),
+    ];
+    check(
+      urgentRows.length === 2,
+      `expected two current restart rows, saw ${urgentRows.length}`,
+    );
     check(
       urgentRows[0].textContent?.includes("Resumable task") &&
-        urgentRows[0].textContent.includes("Can resume the same conversation") &&
+        urgentRows[0].textContent.includes(
+          "Can resume the same conversation",
+        ) &&
         urgentRows[1].textContent?.includes("Fresh continuation task") &&
         urgentRows[1].textContent.includes("Can continue with a new session"),
       "current rows do not name their projected step",
@@ -9221,30 +12119,44 @@ Deno.test("Waiting after restart lists only current sessions with an enabled ste
     );
     const history = document.querySelector(".restart-history");
     check(
-      history?.querySelector("summary")?.textContent === "Earlier restart sessions (5)",
+      history?.querySelector("summary")?.textContent ===
+        "Earlier restart sessions (5)",
       `history reads ${history?.querySelector("summary")?.textContent}`,
     );
     check(
       !history?.textContent?.includes("Can resume the same conversation"),
       "a non-current row offered resume",
     );
-    check(!!bulk() && !bulk()!.disabled, "bulk resume is not offered for an exact resume");
+    check(
+      !!bulk() && !bulk()!.disabled,
+      "bulk resume is not offered for an exact resume",
+    );
     unmount();
     // Fresh continuation alone never enables bulk resume.
     mount(
       <Workspace
         state={restartState([row("s-fresh", "a2", "AJ-2")], [
-          action("s-fresh", "a2", "AJ-2", "continue_fresh_dispatch", "continue"),
+          action(
+            "s-fresh",
+            "a2",
+            "AJ-2",
+            "continue_fresh_dispatch",
+            "continue",
+          ),
         ])}
         onSelect={noop}
         onChanged={noop}
       />,
     );
     check(
-      document.querySelectorAll(".restart-candidates .restart-candidate").length === 1,
+      document.querySelectorAll(".restart-candidates .restart-candidate")
+        .length === 1,
       "the fresh continuation row is not current",
     );
-    check(!!bulk() && bulk()!.disabled, "bulk resume was enabled for a fresh continuation");
+    check(
+      !!bulk() && bulk()!.disabled,
+      "bulk resume was enabled for a fresh continuation",
+    );
     unmount();
     // Only historical rows: no urgent section at all.
     mount(
@@ -9256,8 +12168,14 @@ Deno.test("Waiting after restart lists only current sessions with an enabled ste
         onChanged={noop}
       />,
     );
-    check(!document.querySelector(".restart-candidates"), "a completed task was shown as urgent recovery");
-    check(!!bulk() && bulk()!.disabled, "bulk resume was enabled for a completed task");
+    check(
+      !document.querySelector(".restart-candidates"),
+      "a completed task was shown as urgent recovery",
+    );
+    check(
+      !!bulk() && bulk()!.disabled,
+      "bulk resume was enabled for a completed task",
+    );
   } finally {
     unmount();
   }
@@ -9280,31 +12198,55 @@ const answeredNatively: PermissionRequest["native_resolution"] = {
   tool_use_id: "tool-1",
   observed_at: "2026-09-23T00:01:00Z",
 };
-const permissionItem = railItem("permission_request:pr1", "permission", "Manager · shell", {
-  kind: "permission_request",
-  project_id: "p1",
-  task_id: "AJ-1",
-  attempt_id: "a1",
-  session_id: "s1",
-  request_id: "pr1",
-  request_revision: 3,
-});
+const permissionItem = railItem(
+  "permission_request:pr1",
+  "permission",
+  "Manager · shell",
+  {
+    kind: "permission_request",
+    project_id: "p1",
+    task_id: "AJ-1",
+    attempt_id: "a1",
+    session_id: "s1",
+    request_id: "pr1",
+    request_revision: 3,
+  },
+);
 
 Deno.test("A permission wait stays visible beside an independent hold and opens its exact request", async () => {
   const priorEnvironment = { ...liveEnvironment };
   const methods: string[] = [];
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    methods.push(init?.method ?? "GET");
-    return new Response("[]");
-  }) as typeof fetch;
-  const recoveryItem = railItem("recovery_record:r1", "recovery", "Recovery needed", {
-    kind: "recovery_record",
-    project_id: "p1",
-    task_id: "AJ-1",
-    attempt_id: "a1",
-    recovery_id: "r1",
-  });
-  const held: Task = { ...task, attention: "needs_recovery", permission_waiting: true };
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      methods.push(init?.method ?? "GET");
+      return new Response("[]");
+    }) as typeof fetch;
+  const recoveryItem = railItem(
+    "recovery_record:r1",
+    "recovery",
+    "Recovery needed",
+    {
+      kind: "recovery_record",
+      project_id: "p1",
+      task_id: "AJ-1",
+      attempt_id: "a1",
+      recovery_id: "r1",
+    },
+  );
+  const held: Task = {
+    ...task,
+    attention: "needs_recovery",
+    permission_waiting: true,
+  };
+  const permissionSession: Session = {
+    ...managerSession,
+    native_prompt: {
+      hook_event_id: "hook-permission",
+      kind: "permission_prompt",
+      observed_at: "2026-09-23T00:00:00Z",
+      dismissed: false,
+    },
+  };
   const answered: PermissionRequest = {
     ...pendingPermission,
     id: "pr-native",
@@ -9312,13 +12254,28 @@ Deno.test("A permission wait stays visible beside an independent hold and opens 
     actionable: false,
     native_resolution: answeredNatively,
   };
-  const heldState = (revision: string, requests: PermissionRequest[]) =>
+  const heldState = (
+    revision: string,
+    requests: PermissionRequest[],
+    sessions = [permissionSession],
+  ) =>
     snapshotAt("service-a", revision, {
       tasks: [held],
-      active_sessions: [managerSession],
-      recovery: [{ id: "r1", session_id: "s1", attempt_id: "a1", state: "attention_required", detail: {} }],
+      active_sessions: sessions,
+      recovery: [{
+        id: "r1",
+        session_id: "s1",
+        attempt_id: "a1",
+        state: "attention_required",
+        detail: {},
+      }],
       permission_requests: requests,
-      attention: [recoveryItem, ...(requests.some((request) => request.actionable) ? [permissionItem] : [])],
+      attention: [
+        recoveryItem,
+        ...(requests.some((request) => request.actionable)
+          ? [permissionItem]
+          : []),
+      ],
       task_actions: [{
         task_id: "AJ-1",
         item_id: recoveryItem.id,
@@ -9326,15 +12283,24 @@ Deno.test("A permission wait stays visible beside an independent hold and opens 
         item_ids: [recoveryItem.id, permissionItem.id],
       }],
     });
-  const focused = () => document.activeElement?.getAttribute("data-attention-target");
+  const focused = () =>
+    document.activeElement?.getAttribute("data-attention-target");
   localStorage.clear();
   try {
-    const live = await mountLiveApp("board", heldState("70", [pendingPermission, answered]));
+    const live = await mountLiveApp(
+      "board",
+      heldState("70", [pendingPermission, answered]),
+    );
     const card = document.querySelector(".task-card");
-    const permission = card?.querySelector<HTMLButtonElement>(".task-permission-action");
+    const permission = card?.querySelector<HTMLButtonElement>(
+      ".task-permission-action",
+    );
     check(
-      card?.querySelector(".status-badge")?.textContent === "Manual action needed" &&
-        card.querySelector(".task-next-action")?.textContent?.startsWith("Resolve issue") &&
+      card?.querySelector(".status-badge")?.textContent ===
+          "Manual action needed" &&
+        card.querySelector(".task-next-action")?.textContent?.startsWith(
+          "Resolve issue",
+        ) &&
         permission?.textContent?.includes("Manager wants to use shell"),
       `the card hid the permission wait or the independent hold: ${card?.textContent}`,
     );
@@ -9342,13 +12308,20 @@ Deno.test("A permission wait stays visible beside an independent hold and opens 
       .find((link) => link.textContent?.startsWith("Approvals"));
     check(
       approvals?.querySelector(".count")?.textContent === "1" &&
-        document.querySelectorAll(".wait-notices li").length === 1,
-      "a natively answered request was still counted or announced as waiting",
+        document.querySelectorAll(".wait-notices li").length === 1 &&
+        document.querySelector(".wait-notices button")?.textContent?.startsWith(
+          "Review approval request:",
+        ) &&
+        !document.querySelector(".wait-notices")?.textContent?.includes(
+          "LLMRelay cannot answer it",
+        ),
+      "an answered request or duplicate terminal-only permission notice was announced as waiting",
     );
     act(() => permission!.click());
     await settle();
     check(
-      focused() === "permission_request:pr1" && !document.querySelector('[role="dialog"]'),
+      focused() === "permission_request:pr1" &&
+        !document.querySelector('[role="dialog"]'),
       `the card did not open its exact request: ${focused()}`,
     );
     const inbox = document.querySelector("#workspace-approvals")!;
@@ -9358,33 +12331,98 @@ Deno.test("A permission wait stays visible beside an independent hold and opens 
         inbox.textContent.includes("the agent reported the tool finished"),
       "native resolution was not kept as separate, non-actionable history",
     );
+    const sessionArticle = () =>
+      document.querySelector('[data-attention-target="session:s1"]');
+    check(
+      sessionArticle()?.textContent?.includes("Open Approvals") &&
+        !sessionArticle()?.querySelector(".session-native-prompt"),
+      "SessionTree contradicted the actionable app approval with a terminal-only permission notice",
+    );
     act(() => document.querySelector<HTMLButtonElement>(".task-row")!.click());
     await settle();
-    const header = document.querySelector('[role="dialog"] .task-dialog-permission');
+    const header = document.querySelector(
+      '[role="dialog"] .task-dialog-permission',
+    );
     check(
       header?.textContent?.includes("Manager wants to use shell") &&
-        document.querySelector('[role="dialog"] .task-dialog-next button')?.textContent === "Resolve issue",
+        document.querySelector('[role="dialog"] .task-dialog-next button')
+            ?.textContent === "Resolve issue",
       `the header dropped the permission wait or the hold: ${header?.textContent}`,
     );
     act(() => header!.querySelector("button")!.click());
     await settle();
     check(
-      !document.querySelector('[role="dialog"]') && focused() === "permission_request:pr1",
+      !document.querySelector('[role="dialog"]') &&
+        focused() === "permission_request:pr1",
       `the header did not open its exact request: ${focused()}`,
     );
-    live.waits.at(-1)!.resolve(changedTo(heldState("71", [
-      { ...pendingPermission, actionable: false, native_resolution: answeredNatively },
+    const independent: Session = {
+      ...permissionSession,
+      id: "s-other",
+      role_generation_id: "g-other",
+      role: "implementer",
+    };
+    const failed: Session = {
+      ...permissionSession,
+      native_turn: {
+        accepted_hook_event_id: "hook-accept",
+        accepted_at: "2026-09-23T00:00:00Z",
+        failure: {
+          hook_event_id: "hook-failure",
+          kind: "overloaded",
+          provider_error: "Selected model is at capacity.",
+          details: null,
+          observed_at: "2026-09-23T00:01:00Z",
+        },
+      },
+    };
+    live.waits.at(-1)!.resolve(
+      changedTo(
+        heldState("71", [pendingPermission, answered], [failed, independent]),
+      ),
+    );
+    await settle();
+    check(
+      document.querySelectorAll(".wait-notices li").length === 3 &&
+        document.querySelector(".wait-notices")?.textContent?.includes(
+          "latest turn stopped",
+        ) &&
+        document.querySelector(".wait-notices")?.textContent?.includes(
+          "LLMRelay cannot answer it",
+        ) &&
+        sessionArticle()?.querySelector(".session-turn-failure") &&
+        !sessionArticle()?.querySelector(".session-native-prompt") &&
+        document.querySelector(
+          '[data-attention-target="session:s-other"] .session-native-prompt',
+        ),
+      "approval priority hid an independent failure or another session's native permission prompt",
+    );
+    live.waits.at(-1)!.resolve(changedTo(heldState("72", [
+      {
+        ...pendingPermission,
+        actionable: false,
+        native_resolution: answeredNatively,
+      },
       answered,
     ])));
     await settle();
     check(
-      !document.querySelector(".wait-notices") &&
+      document.querySelectorAll(".wait-notices li").length === 1 &&
+        document.querySelector(".wait-notices")?.textContent?.includes(
+          "LLMRelay cannot answer it",
+        ) &&
+        sessionArticle()?.querySelector(".session-native-prompt") &&
         !document.querySelector(".task-permission-action") &&
         !document.querySelector("#workspace-approvals .approval-actions") &&
-        document.querySelector("#workspace-approvals")?.textContent?.includes("Answered in the agent (2)"),
-      "a request answered in the agent stayed actionable",
+        document.querySelector("#workspace-approvals")?.textContent?.includes(
+          "Answered in the agent (2)",
+        ),
+      "an answered request stayed actionable or its tool outcome incorrectly retired the standing native prompt",
     );
-    check(methods.every((method) => method === "GET"), `navigation dispatched a mutation: ${methods}`);
+    check(
+      methods.every((method) => method === "GET"),
+      `navigation dispatched a mutation: ${methods}`,
+    );
   } finally {
     unmount();
     liveEnvironment.transport = priorEnvironment.transport;
@@ -9396,10 +12434,11 @@ Deno.test("A permission wait stays visible beside an independent hold and opens 
 
 Deno.test("An uncertain approval refreshes and is never resent automatically", async () => {
   const bodies: Array<Record<string, unknown>> = [];
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    bodies.push(JSON.parse(String(init?.body)));
-    throw new TypeError("Load failed");
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      throw new TypeError("Load failed");
+    }) as typeof fetch;
   let refreshed = 0;
   localStorage.clear();
   try {
@@ -9433,10 +12472,11 @@ Deno.test("Browser notifications need this page's opt-in, announce each new wait
   const priorEnvironment = { ...liveEnvironment };
   const priorHasFocus = document.hasFocus;
   const methods: string[] = [];
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    methods.push(init?.method ?? "GET");
-    return new Response("[]");
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      methods.push(init?.method ?? "GET");
+      return new Response("[]");
+    }) as typeof fetch;
   class FakeNotification {
     static permission: NotificationPermission = "default";
     static answer: NotificationPermission = "granted";
@@ -9445,7 +12485,10 @@ Deno.test("Browser notifications need this page's opt-in, announce each new wait
       return Promise.resolve(FakeNotification.answer);
     }
     onclick: (() => void) | null = null;
-    constructor(readonly title: string, readonly options?: NotificationOptions) {
+    constructor(
+      readonly title: string,
+      readonly options?: NotificationOptions,
+    ) {
       shown.push(this);
     }
     close() {}
@@ -9479,20 +12522,30 @@ Deno.test("Browser notifications need this page's opt-in, announce each new wait
     revision: string,
     requests: PermissionRequest[],
     sessions: Session[] = [managerSession],
-  ) => snapshotAt(incarnation, revision, { permission_requests: requests, active_sessions: sessions });
-  const listed = () => document.querySelector(".wait-notices")?.textContent ?? "";
-  const focused = () => document.activeElement?.getAttribute("data-attention-target");
-  const advance = (live: ReturnType<typeof liveHarness>) => (state: AppState) => {
-    live.waits.at(-1)!.resolve(changedTo(state));
-    return settle();
-  };
+  ) =>
+    snapshotAt(incarnation, revision, {
+      permission_requests: requests,
+      active_sessions: sessions,
+    });
+  const listed = () =>
+    document.querySelector(".wait-notices")?.textContent ?? "";
+  const focused = () =>
+    document.activeElement?.getAttribute("data-attention-target");
+  const advance =
+    (live: ReturnType<typeof liveHarness>) => (state: AppState) => {
+      live.waits.at(-1)!.resolve(changedTo(state));
+      return settle();
+    };
   const hasEnable = () =>
     [...document.querySelectorAll("button")].some((button) =>
       button.textContent === "Enable browser notifications"
     );
   localStorage.clear();
   try {
-    await mountLiveApp("board", at("service-a", "1", [request("pr1", "shell")]));
+    await mountLiveApp(
+      "board",
+      at("service-a", "1", [request("pr1", "shell")]),
+    );
     check(
       document.body.textContent?.includes("cannot show notifications here") &&
         listed().includes("wants to use shell"),
@@ -9507,10 +12560,16 @@ Deno.test("Browser notifications need this page's opt-in, announce each new wait
     });
     // Blocked for the origin: the page still lists and opens every exact wait.
     FakeNotification.permission = "denied";
-    const blocked = await mountLiveApp("board", at("service-a", "1", [request("pr1", "shell")]));
-    await advance(blocked)(at("service-a", "2", [request("pr1", "shell"), request("pr2", "python")]));
+    const blocked = await mountLiveApp(
+      "board",
+      at("service-a", "1", [request("pr1", "shell")]),
+    );
+    await advance(blocked)(
+      at("service-a", "2", [request("pr1", "shell"), request("pr2", "python")]),
+    );
     check(
-      document.body.textContent?.includes("blocked for this site") && !hasEnable() &&
+      document.body.textContent?.includes("blocked for this site") &&
+        !hasEnable() &&
         shown.length === 0 && listed().includes("wants to use python"),
       "a blocked origin offered Enable, raised an alert, or hid the in-page wait",
     );
@@ -9519,7 +12578,8 @@ Deno.test("Browser notifications need this page's opt-in, announce each new wait
     act(() => pythonWait!.querySelector("button")!.click());
     await settle();
     check(
-      focused() === "permission_request:pr2" && !document.querySelector('[role="dialog"]'),
+      focused() === "permission_request:pr2" &&
+        !document.querySelector('[role="dialog"]'),
       `a blocked origin lost exact navigation: ${focused()}`,
     );
     unmount();
@@ -9527,12 +12587,18 @@ Deno.test("Browser notifications need this page's opt-in, announce each new wait
     // Denied when asked: the same in-page fallback, still no alert.
     FakeNotification.permission = "default";
     FakeNotification.answer = "denied";
-    const refused = await mountLiveApp("board", at("service-a", "1", [request("pr1", "shell")]));
+    const refused = await mountLiveApp(
+      "board",
+      at("service-a", "1", [request("pr1", "shell")]),
+    );
     click("Enable browser notifications");
     await settle();
-    await advance(refused)(at("service-a", "2", [request("pr1", "shell"), request("pr2", "python")]));
+    await advance(refused)(
+      at("service-a", "2", [request("pr1", "shell"), request("pr2", "python")]),
+    );
     check(
-      document.body.textContent?.includes("blocked for this site") && !hasEnable() &&
+      document.body.textContent?.includes("blocked for this site") &&
+        !hasEnable() &&
         shown.length === 0 && listed().includes("wants to use python"),
       "a denied request raised an alert or hid the in-page wait",
     );
@@ -9541,13 +12607,23 @@ Deno.test("Browser notifications need this page's opt-in, announce each new wait
     // Permission granted to the origin earlier is not this page's opt-in.
     FakeNotification.permission = "granted";
     FakeNotification.answer = "granted";
-    const live = await mountLiveApp("board", at("service-a", "10", [request("pr1", "shell")]));
+    const live = await mountLiveApp(
+      "board",
+      at("service-a", "10", [request("pr1", "shell")]),
+    );
     const next = advance(live);
     check(
-      document.body.textContent?.includes("Browser notifications are optional") && hasEnable(),
+      document.body.textContent?.includes(
+        "Browser notifications are optional",
+      ) && hasEnable(),
       "a previously granted origin switched alerts on without Enable",
     );
-    await next(at("service-a", "11", [request("pr1", "shell"), request("pr2", "python")]));
+    await next(
+      at("service-a", "11", [
+        request("pr1", "shell"),
+        request("pr2", "python"),
+      ]),
+    );
     check(
       shown.length === 0 && listed().includes("wants to use python"),
       "a granted origin alerted before the page opted in",
@@ -9555,30 +12631,47 @@ Deno.test("Browser notifications need this page's opt-in, announce each new wait
     click("Enable browser notifications");
     await settle();
     check(
-      document.body.textContent?.includes("Browser notifications are on") && shown.length === 0,
+      document.body.textContent?.includes("Browser notifications are on") &&
+        shown.length === 0,
       "enabling notifications replayed waits that were already listed",
     );
-    const current = [request("pr1", "shell"), request("pr2", "python"), request("pr3", "npm")];
+    const current = [
+      request("pr1", "shell"),
+      request("pr2", "python"),
+      request("pr3", "npm"),
+    ];
     await next(at("service-a", "12", current));
     check(
-      shown.length === 1 && shown[0].options?.tag === "llmrelay:service-a:permission:pr3" &&
+      shown.length === 1 &&
+        shown[0].options?.tag === "llmrelay:service-a:permission:pr3" &&
         !!shown[0].options?.body?.includes("does not approve or run anything"),
-      `a new wait was not announced exactly once: ${shown.map((item) => item.options?.tag)}`,
+      `a new wait was not announced exactly once: ${
+        shown.map((item) => item.options?.tag)
+      }`,
     );
     await next(at("service-a", "13", current, [managerSession, failed]));
     await next(at("service-a", "14", current, [managerSession, failed]));
     check(
       shown.length === 2 && shown[1].title.includes("latest turn stopped") &&
-        shown[1].options?.tag === "llmrelay:service-a:turn_failure:s-fail:hook-fail-1" &&
+        shown[1].options?.tag ===
+          "llmrelay:service-a:turn_failure:s-fail:hook-fail-1" &&
         listed().includes("model is overloaded or at capacity"),
       "a failed turn was not announced once with its plain failure explanation",
     );
     act(() => shown[0].onclick?.());
     await settle();
-    check(focused() === "permission_request:pr3", `the notification opened ${focused()}`);
+    check(
+      focused() === "permission_request:pr3",
+      `the notification opened ${focused()}`,
+    );
 
     pageFocused = true;
-    await next(at("service-a", "15", [...current, request("pr4", "cargo")], [managerSession, failed]));
+    await next(
+      at("service-a", "15", [...current, request("pr4", "cargo")], [
+        managerSession,
+        failed,
+      ]),
+    );
     check(
       shown.length === 2 && listed().includes("wants to use cargo"),
       "a focused page raised a browser notification instead of the in-page notice",
@@ -9588,7 +12681,10 @@ Deno.test("Browser notifications need this page's opt-in, announce each new wait
       outcome: "reset",
       incarnation: "service-b",
       revision: "1",
-      state: at("service-b", "1", [request("pr3", "npm"), request("pr5", "make")]),
+      state: at("service-b", "1", [
+        request("pr3", "npm"),
+        request("pr5", "make"),
+      ]),
     });
     await settle();
     check(
@@ -9596,43 +12692,93 @@ Deno.test("Browser notifications need this page's opt-in, announce each new wait
       "a reconnected service replayed alerts or hid its current waits",
     );
     await next(at("service-b", "2", [
-      { ...request("pr3", "npm"), actionable: false, native_resolution: answeredNatively },
+      {
+        ...request("pr3", "npm"),
+        actionable: false,
+        native_resolution: answeredNatively,
+      },
       request("pr5", "make"),
       request("pr6", "gradle"),
     ]));
     check(
-      shown.length === 3 && shown[2].options?.tag === "llmrelay:service-b:permission:pr6" &&
+      shown.length === 3 &&
+        shown[2].options?.tag === "llmrelay:service-b:permission:pr6" &&
         !listed().includes("wants to use npm"),
-      `the new incarnation's alert lost its identity or an answered wait stayed: ${shown[2]?.options?.tag}`,
+      `the new incarnation's alert lost its identity or an answered wait stayed: ${
+        shown[2]?.options?.tag
+      }`,
     );
-    const prompted: Session = { ...managerSession, native_prompt: {
-      hook_event_id: "displayed-notice", kind: "agent_needs_input", observed_at: "2026-10-01T00:00:00Z", dismissed: false,
-    } };
+    const prompted: Session = {
+      ...managerSession,
+      native_prompt: {
+        hook_event_id: "displayed-notice",
+        kind: "agent_needs_input",
+        observed_at: "2026-10-01T00:00:00Z",
+        dismissed: false,
+      },
+    };
     await next(at("service-b", "3", [request("pr6", "gradle")], [prompted]));
     const noticeAlert = shown.at(-1)!;
-    check(noticeAlert.options?.tag?.endsWith(":displayed-notice") && listed().includes("waiting for your input"), "a generic notice did not surface");
-    const dismissed: Session = { ...prompted, native_prompt: { ...prompted.native_prompt!, dismissed: true } };
-    const dismissedSnapshot = at("service-b", "4", [request("pr6", "gradle")], [dismissed]);
+    check(
+      noticeAlert.options?.tag?.endsWith(":displayed-notice") &&
+        listed().includes("waiting for your input"),
+      "a generic notice did not surface",
+    );
+    const dismissed: Session = {
+      ...prompted,
+      native_prompt: { ...prompted.native_prompt!, dismissed: true },
+    };
+    const dismissedSnapshot = at("service-b", "4", [request("pr6", "gradle")], [
+      dismissed,
+    ]);
     await next(dismissedSnapshot);
-    check(!listed().includes("waiting for your input") && listed().includes("wants to use gradle"), "dismissal hid an exact approval or kept the generic notification");
+    check(
+      !listed().includes("waiting for your input") &&
+        listed().includes("wants to use gradle"),
+      "dismissal hid an exact approval or kept the generic notification",
+    );
     const readsBeforeDismissedClick = live.reads.length;
     act(() => noticeAlert.onclick?.());
     await settle();
-    check(live.reads.length === readsBeforeDismissedClick + 1 && document.body.textContent?.includes("this notice changed or was dismissed"), "a dismissed browser alert acted on stale presentation");
+    check(
+      live.reads.length === readsBeforeDismissedClick + 1 &&
+        document.body.textContent?.includes(
+          "this notice changed or was dismissed",
+        ),
+      "a dismissed browser alert acted on stale presentation",
+    );
     live.reads.at(-1)!.resolve(dismissedSnapshot);
     await settle();
     const countBeforeLaterNotice = shown.length;
-    await next(at("service-b", "5", [request("pr6", "gradle")], [{ ...prompted, native_prompt: { ...prompted.native_prompt!, hook_event_id: "later-same-turn-notice" } }]));
-    check(shown.length === countBeforeLaterNotice + 1 && shown.at(-1)?.options?.tag?.endsWith(":later-same-turn-notice"), "a later same-turn notification was swallowed by dismissal");
+    await next(
+      at("service-b", "5", [request("pr6", "gradle")], [{
+        ...prompted,
+        native_prompt: {
+          ...prompted.native_prompt!,
+          hook_event_id: "later-same-turn-notice",
+        },
+      }]),
+    );
+    check(
+      shown.length === countBeforeLaterNotice + 1 &&
+        shown.at(-1)?.options?.tag?.endsWith(":later-same-turn-notice"),
+      "a later same-turn notification was swallowed by dismissal",
+    );
     const reads = live.reads.length;
     act(() => shown[0].onclick?.());
     await settle();
     check(
-      document.body.textContent?.includes("this notice changed or was dismissed") &&
-        live.reads.length === reads + 1 && focused() !== "permission_request:pr3",
+      document.body.textContent?.includes(
+        "this notice changed or was dismissed",
+      ) &&
+        live.reads.length === reads + 1 &&
+        focused() !== "permission_request:pr3",
       "a stale notification opened a resolved request or did not refresh",
     );
-    check(methods.every((method) => method === "GET"), `notifications dispatched a mutation: ${methods}`);
+    check(
+      methods.every((method) => method === "GET"),
+      `notifications dispatched a mutation: ${methods}`,
+    );
   } finally {
     unmount();
     Reflect.deleteProperty(window, "Notification");
@@ -9649,7 +12795,12 @@ Deno.test("Session Access keeps the open process apart from reports, accepted tu
     routes: {},
     discarding: {},
     routeFor: () => undefined,
-    view: () => Promise.resolve<CmuxViewOutcome>({ state: "pending", message: "", retry_available: false }),
+    view: () =>
+      Promise.resolve<CmuxViewOutcome>({
+        state: "pending",
+        message: "",
+        retry_available: false,
+      }),
     take: () => Promise.resolve(),
     release: () => Promise.resolve(),
     discard: () => Promise.resolve(),
@@ -9663,7 +12814,11 @@ Deno.test("Session Access keeps the open process apart from reports, accepted tu
     role: "implementer",
     readiness: "busy",
     reported_in_latest_invocation: true,
-    native_turn: { accepted_hook_event_id: "hook-accept", accepted_at: acceptedAt, failure: null },
+    native_turn: {
+      accepted_hook_event_id: "hook-accept",
+      accepted_at: acceptedAt,
+      failure: null,
+    },
   };
   const failed: Session = {
     ...managerSession,
@@ -9675,7 +12830,8 @@ Deno.test("Session Access keeps the open process apart from reports, accepted tu
       failure: {
         hook_event_id: "hook-fail",
         kind: "overloaded",
-        provider_error: "Selected model is at capacity. Please try a different model.",
+        provider_error:
+          "Selected model is at capacity. Please try a different model.",
         details: null,
         observed_at: "2026-09-30T10:05:00Z",
       },
@@ -9684,10 +12840,25 @@ Deno.test("Session Access keeps the open process apart from reports, accepted tu
   const prompted: Session = {
     ...managerSession,
     id: "s-prompt",
-    native_prompt: { hook_event_id: "hook-prompt", kind: "elicitation_dialog", observed_at: acceptedAt },
+    native_prompt: {
+      hook_event_id: "hook-prompt",
+      kind: "elicitation_dialog",
+      observed_at: acceptedAt,
+    },
   };
-  const waiting: Session = { ...managerSession, id: "s-perm" };
-  const candidate = (consumedAt: string | null, createdAt = "2026-09-30T10:10:00Z") => ({
+  const waiting: Session = {
+    ...managerSession,
+    id: "s-perm",
+    native_prompt: {
+      hook_event_id: "hook-app-permission",
+      kind: "permission_prompt",
+      observed_at: acceptedAt,
+    },
+  };
+  const candidate = (
+    consumedAt: string | null,
+    createdAt = "2026-09-30T10:10:00Z",
+  ) => ({
     id: "report-1",
     outcome: "candidate_ready",
     created_at: createdAt,
@@ -9738,93 +12909,155 @@ Deno.test("Session Access keeps the open process apart from reports, accepted tu
           failedThenPrompted,
         ]}
         access={access}
-        permissionRequests={[{ ...pendingPermission, session_id: "s-perm" }]}
+        permissionRequests={[
+          { ...pendingPermission, session_id: "s-perm" },
+          {
+            ...pendingPermission,
+            id: "pr-elicitation",
+            session_id: "s-prompt",
+          },
+        ]}
         setupProjectId={() => undefined}
         onOpenSetup={noop}
       />,
     );
     const article = (id: string) =>
       document.querySelector(`[data-attention-target="session:${id}"]`)!;
-    const label = (id: string) => article(id).querySelector(".session-state")?.textContent;
+    const label = (id: string) =>
+      article(id).querySelector(".session-state")?.textContent;
     const text = (id: string) => article(id).textContent ?? "";
     check(
-      label("s-report") === "Report submitted" && text("s-report").includes("Session open") &&
+      label("s-report") === "Report submitted" &&
+        text("s-report").includes("Session open") &&
         text("s-report").includes(
-          `Latest turn accepted by the agent ${new Date(acceptedAt).toLocaleString()}`,
+          `Latest turn accepted by the agent ${
+            new Date(acceptedAt).toLocaleString()
+          }`,
         ) && text("s-report").includes("does not mean the task is complete"),
-      `a submitted report read as active work or completion: ${text("s-report")}`,
+      `a submitted report read as active work or completion: ${
+        text("s-report")
+      }`,
     );
     check(
-      label("s-fail") === "Turn stopped with an error" && text("s-fail").includes("Session open") &&
+      label("s-fail") === "Turn stopped with an error" &&
+        text("s-fail").includes("Session open") &&
         text("s-fail").includes("the model is overloaded or at capacity") &&
-        text("s-fail").includes("Selected model is at capacity. Please try a different model.") &&
-        text("s-fail").includes("does not retry or switch models in response to this notice"),
-      `a failed turn was not explained apart from its open process: ${text("s-fail")}`,
+        text("s-fail").includes(
+          "Selected model is at capacity. Please try a different model.",
+        ) &&
+        text("s-fail").includes(
+          "does not retry or switch models in response to this notice",
+        ),
+      `a failed turn was not explained apart from its open process: ${
+        text("s-fail")
+      }`,
     );
     const promptButtons = [...article("s-prompt").querySelectorAll("button")]
       .map((button) => button.textContent ?? "");
     check(
-      label("s-prompt") === "Waiting in its own terminal" &&
+      label("s-prompt") === "Waiting for your approval" &&
         text("s-prompt").includes("LLMRelay cannot answer this prompt") &&
         promptButtons.includes("Take control") &&
         !promptButtons.some((button) => /Approve|Deny/.test(button)),
       `a native prompt offered an app decision: ${promptButtons}`,
     );
-    check(label("s-perm") === "Waiting for your approval", `permission wait reads ${label("s-perm")}`);
     check(
-      label("s-candidate") === "Implementation submitted — awaiting processing" &&
-        label("s-processed") === "Implementation submitted — awaiting verification" &&
+      label("s-perm") === "Waiting for your approval",
+      `permission wait reads ${label("s-perm")}`,
+    );
+    check(
+      text("s-perm").includes("Open Approvals") &&
+        !article("s-perm").querySelector(".session-native-prompt"),
+      "a generic permission notification contradicted the app's actionable approval",
+    );
+    check(
+      label("s-candidate") ===
+          "Implementation submitted — awaiting processing" &&
+        label("s-processed") ===
+          "Implementation submitted — awaiting verification" &&
         text("s-processed").includes("Session open") &&
         text("s-processed").includes("does not mean the task is complete"),
-      `candidate submission read as ${label("s-candidate")} / ${label("s-processed")}`,
+      `candidate submission read as ${label("s-candidate")} / ${
+        label("s-processed")
+      }`,
     );
     check(
       label("s-moved-on") === "Running" &&
-        text("s-moved-on").includes("is history: the agent accepted a newer turn") &&
+        text("s-moved-on").includes(
+          "is history: the agent accepted a newer turn",
+        ) &&
         !text("s-moved-on").includes("Implementation submitted"),
-      `a report older than the accepted turn still set the state: ${label("s-moved-on")}`,
+      `a report older than the accepted turn still set the state: ${
+        label("s-moved-on")
+      }`,
     );
     check(
       label("s-fail-report") === "Turn stopped with an error",
-      `a pending candidate report hid the failed turn: ${label("s-fail-report")}`,
+      `a pending candidate report hid the failed turn: ${
+        label("s-fail-report")
+      }`,
     );
     const bothButtons = [...article("s-fail-prompt").querySelectorAll("button")]
       .map((button) => button.textContent ?? "");
     check(
       label("s-fail-prompt") === "Turn stopped with an error" &&
         text("s-fail-prompt").includes("Session open") &&
-        text("s-fail-prompt").includes("does not retry or switch models in response to this notice") &&
+        text("s-fail-prompt").includes(
+          "does not retry or switch models in response to this notice",
+        ) &&
         text("s-fail-prompt").includes("LLMRelay cannot answer this prompt") &&
         !text("s-fail-prompt").includes("Implementation submitted") &&
         !text("s-fail-prompt").includes("Finished its turn") &&
         bothButtons.includes("Take control") &&
-        !bothButtons.some((button) => /Approve|Deny|Retry|Switch model/.test(button)),
-      `a later prompt replaced the failed turn or dropped its output route: ${text("s-fail-prompt")}`,
+        !bothButtons.some((button) =>
+          /Approve|Deny|Retry|Switch model/.test(button)
+        ),
+      `a later prompt replaced the failed turn or dropped its output route: ${
+        text("s-fail-prompt")
+      }`,
     );
-    const verifying: Task = { ...task, active_attempt: { ...task.active_attempt!, phase: "final_review" } };
-    const stopped = taskStatus(verifying, { sessions: [{ ...failed, attempt_id: "a1" }] });
+    const verifying: Task = {
+      ...task,
+      active_attempt: { ...task.active_attempt!, phase: "final_review" },
+    };
+    const stopped = taskStatus(verifying, {
+      sessions: [{ ...failed, attempt_id: "a1" }],
+    });
     check(
       stopped.label === "Agent turn stopped" && stopped.tone === "danger" &&
         stopped.detail.includes("Its session is still open"),
       `a failed turn still read as verification: ${stopped.label}`,
     );
     check(
-      taskStatus({ ...verifying, attention: "needs_recovery" }, { sessions: [failed] }).label ===
+      taskStatus({ ...verifying, attention: "needs_recovery" }, {
+        sessions: [failed],
+      }).label ===
         "Manual action needed",
       "a failed turn replaced an independent hold",
     );
-    const stoppedThenPrompted = taskStatus(verifying, { sessions: [failedThenPrompted] });
+    const stoppedThenPrompted = taskStatus(verifying, {
+      sessions: [failedThenPrompted],
+    });
     check(
-      stoppedThenPrompted.label === "Agent turn stopped" && stoppedThenPrompted.tone === "danger" &&
-        stoppedThenPrompted.detail.includes("LLMRelay does not retry or switch models in response to this notice.") &&
-        stoppedThenPrompted.detail.includes("asking for permission in its own terminal") &&
+      stoppedThenPrompted.label === "Agent turn stopped" &&
+        stoppedThenPrompted.tone === "danger" &&
+        stoppedThenPrompted.detail.includes(
+          "LLMRelay does not retry or switch models in response to this notice.",
+        ) &&
+        stoppedThenPrompted.detail.includes(
+          "asking for permission in its own terminal",
+        ) &&
         !stoppedThenPrompted.completed,
       `a later prompt hid the failed turn on the task: ${stoppedThenPrompted.label}`,
     );
     check(
-      taskStatus({ ...verifying, permission_waiting: true }, { sessions: [failedThenPrompted] })
-          .label === "Waiting for your approval" &&
-        taskStatus({ ...verifying, attention: "needs_recovery" }, { sessions: [failedThenPrompted] })
+      taskStatus({ ...verifying, permission_waiting: true }, {
+            sessions: [failedThenPrompted],
+          })
+            .label === "Waiting for your approval" &&
+        taskStatus({ ...verifying, attention: "needs_recovery" }, {
+            sessions: [failedThenPrompted],
+          })
             .label === "Manual action needed",
       "failed-turn precedence displaced a permission wait or an independent hold",
     );
@@ -9838,86 +13071,229 @@ Deno.test("Failed session stop and native notice dismissal keep exact requests a
   let refreshes = 0;
   let output = "";
   let fail: (error: Error) => void = noop;
-  let respond: () => Response | Promise<Response> = () => new Promise((_resolve, reject) => { fail = reject; });
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    requests.push(JSON.parse(String(init?.body)));
-    return respond();
-  }) as typeof fetch;
+  let respond: () => Response | Promise<Response> = () =>
+    new Promise((_resolve, reject) => {
+      fail = reject;
+    });
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return respond();
+    }) as typeof fetch;
   const stopped: Session = {
-    ...managerSession, readiness: "busy",
-    native_turn: { accepted_hook_event_id: "accepted", accepted_at: "2026-10-01T00:00:00Z",
-      failure: { hook_event_id: "failure", kind: "overloaded", provider_error: "raw-provider-error",
-        details: null, observed_at: "2026-10-01T00:00:01Z" } },
+    ...managerSession,
+    readiness: "busy",
+    native_turn: {
+      accepted_hook_event_id: "accepted",
+      accepted_at: "2026-10-01T00:00:00Z",
+      failure: {
+        hook_event_id: "failure",
+        kind: "overloaded",
+        provider_error: "raw-provider-error",
+        details: null,
+        observed_at: "2026-10-01T00:00:01Z",
+      },
+    },
     failed_session_stop: {
-      task_id: "AJ-1", attempt_id: "a1", expected_task_version: 7, session_id: managerSession.id,
-      role_generation_id: managerSession.role_generation_id, transcript_epoch: "epoch",
-      process_identity: { pid: 42, process_group_id: 42, native_start_marker: "start", observed_started_at: "2026-10-01T00:00:00Z" },
-      accepted_hook_event_id: "accepted", failure_hook_event_id: "failure",
+      task_id: "AJ-1",
+      attempt_id: "a1",
+      expected_task_version: 7,
+      session_id: managerSession.id,
+      role_generation_id: managerSession.role_generation_id,
+      transcript_epoch: "epoch",
+      process_identity: {
+        pid: 42,
+        process_group_id: 42,
+        native_start_marker: "start",
+        observed_started_at: "2026-10-01T00:00:00Z",
+      },
+      accepted_hook_event_id: "accepted",
+      failure_hook_event_id: "failure",
     },
   };
   const prompted: Session = {
-    ...managerSession, id: "prompt-session", role_generation_id: "prompt-generation",
-    native_prompt: { hook_event_id: "notice-1", kind: "agent_needs_input", observed_at: "2026-10-01T00:00:00Z",
-      dismissed: false, dismissal: { task_id: "AJ-1", attempt_id: "a1", session_id: "prompt-session",
-        role_generation_id: "prompt-generation", transcript_epoch: "prompt-epoch", accepted_hook_event_id: "prompt-turn",
-        raw_wait_start_hook_event_id: "prompt-turn", displayed_boundary_hook_event_id: "notice-2" } },
+    ...managerSession,
+    id: "prompt-session",
+    role_generation_id: "prompt-generation",
+    native_prompt: {
+      hook_event_id: "notice-1",
+      kind: "agent_needs_input",
+      observed_at: "2026-10-01T00:00:00Z",
+      dismissed: false,
+      dismissal: {
+        task_id: "AJ-1",
+        attempt_id: "a1",
+        session_id: "prompt-session",
+        role_generation_id: "prompt-generation",
+        transcript_epoch: "prompt-epoch",
+        accepted_hook_event_id: "prompt-turn",
+        raw_wait_start_hook_event_id: "prompt-turn",
+        displayed_boundary_hook_event_id: "notice-2",
+      },
+    },
   };
   const access = {
-    routes: {}, discarding: {}, routeFor: () => undefined,
-    view: (id: string) => { output = id; return Promise.resolve<CmuxViewOutcome>({ state: "pending", message: "", retry_available: false }); },
-    take: () => Promise.resolve(), release: () => Promise.resolve(), discard: () => Promise.resolve(),
-    close: noop, refresh: () => { refreshes += 1; },
+    routes: {},
+    discarding: {},
+    routeFor: () => undefined,
+    view: (id: string) => {
+      output = id;
+      return Promise.resolve<CmuxViewOutcome>({
+        state: "pending",
+        message: "",
+        retry_available: false,
+      });
+    },
+    take: () => Promise.resolve(),
+    release: () => Promise.resolve(),
+    discard: () => Promise.resolve(),
+    close: noop,
+    refresh: () => {
+      refreshes += 1;
+    },
   };
-  const render = (failed: Session, notice: Session) => <SessionTree sessions={[failed, notice]} access={access}
-    permissionRequests={[{ ...pendingPermission, session_id: notice.id }]} setupProjectId={() => undefined} onOpenSetup={noop} />;
-  const article = (id: string) => document.querySelector(`[data-attention-target="session:${id}"]`)!;
-  const receipt = (state: string) => new Response(JSON.stringify({ result: {
-    operation_id: requests.at(-1)?.operation_id, entity_kind: "session", entity_id: requests.at(-1)?.session_id,
-    version: null, state, detail: {},
-  } }));
+  const render = (failed: Session, notice: Session) => (
+    <SessionTree
+      sessions={[failed, notice]}
+      access={access}
+      permissionRequests={[{ ...pendingPermission, session_id: notice.id }]}
+      setupProjectId={() => undefined}
+      onOpenSetup={noop}
+    />
+  );
+  const article = (id: string) =>
+    document.querySelector(`[data-attention-target="session:${id}"]`)!;
+  const receipt = (state: string) =>
+    new Response(JSON.stringify({
+      result: {
+        operation_id: requests.at(-1)?.operation_id,
+        entity_kind: "session",
+        entity_id: requests.at(-1)?.session_id,
+        version: null,
+        state,
+        detail: {},
+      },
+    }));
   try {
     mount(render(stopped, prompted));
     click("Stop failed session and pause task");
     await settle();
-    const pending = [...article(stopped.id).querySelectorAll("button")].find((button) => button.textContent === "Checking stop and exit…");
-    check(pending?.disabled && requests.length === 1, "the pending stop allowed a second click");
+    const pending = [...article(stopped.id).querySelectorAll("button")].find((
+      button,
+    ) => button.textContent === "Checking stop and exit…");
+    check(
+      pending?.disabled && requests.length === 1,
+      "the pending stop allowed a second click",
+    );
     const { operation_id: stopId, kind, ...binding } = requests[0];
-    check(kind === "stop_failed_session" && typeof stopId === "string" && JSON.stringify(binding) === JSON.stringify(stopped.failed_session_stop), "the stop did not submit its projected exact binding");
+    check(
+      kind === "stop_failed_session" && typeof stopId === "string" &&
+        JSON.stringify(binding) === JSON.stringify(stopped.failed_session_stop),
+      "the stop did not submit its projected exact binding",
+    );
     fail(new TypeError("connection ended after dispatch"));
     await settle();
-    check(article(stopped.id).textContent?.includes("outcome is uncertain") && refreshes > 0, "unknown stop delivery was presented as success");
-    const stopping = { ...stopped, status: "interrupt_requested", failed_session_stop: null,
-      failure_stop_pause: { control_id: "pause", state: "requested" } };
+    check(
+      article(stopped.id).textContent?.includes("outcome is uncertain") &&
+        refreshes > 0,
+      "unknown stop delivery was presented as success",
+    );
+    const stopping = {
+      ...stopped,
+      status: "interrupt_requested",
+      failed_session_stop: null,
+      failure_stop_pause: { control_id: "pause", state: "requested" },
+    };
     rerender(render(stopping, prompted));
     respond = () => receipt("stop_recovery_required");
     click("Check previous stop request");
     await settle();
-    check(JSON.stringify(requests[1]) === JSON.stringify(requests[0]), "stop reconciliation invented new authority or an operation ID");
-    const paused = { ...stopping, status: "exited", failure_stop_pause: { control_id: "pause", state: "finished" } };
+    check(
+      JSON.stringify(requests[1]) === JSON.stringify(requests[0]),
+      "stop reconciliation invented new authority or an operation ID",
+    );
+    const paused = {
+      ...stopping,
+      status: "exited",
+      failure_stop_pause: { control_id: "pause", state: "finished" },
+    };
     rerender(render(paused, prompted));
-    check(article(stopped.id).textContent?.includes("task is paused") && article(stopped.id).textContent?.includes("Continue or Run next"), "verified exit lost the persistent task pause");
-    check(![...article(stopped.id).querySelectorAll("button")].some((button) => button.textContent?.includes("Stop failed")), "a paused exited session offered another stop");
+    check(
+      article(stopped.id).textContent?.includes("task is paused") &&
+        article(stopped.id).textContent?.includes("Continue or Run next"),
+      "verified exit lost the persistent task pause",
+    );
+    check(
+      ![...article(stopped.id).querySelectorAll("button")].some((button) =>
+        button.textContent?.includes("Stop failed")
+      ),
+      "a paused exited session offered another stop",
+    );
     respond = () => receipt("native_prompt_dismissed");
     click("Dismiss notice");
     await settle();
-    const { operation_id: dismissId, kind: dismissKind, ...dismissal } = requests[2];
-    check(dismissKind === "dismiss_native_prompt" && dismissId !== stopId && JSON.stringify(dismissal) === JSON.stringify(prompted.native_prompt?.dismissal), "dismissal did not bind the displayed frontier");
-    const dismissed = { ...prompted, native_prompt: { ...prompted.native_prompt!, dismissed: true } };
+    const { operation_id: dismissId, kind: dismissKind, ...dismissal } =
+      requests[2];
+    check(
+      dismissKind === "dismiss_native_prompt" && dismissId !== stopId &&
+        JSON.stringify(dismissal) ===
+          JSON.stringify(prompted.native_prompt?.dismissal),
+      "dismissal did not bind the displayed frontier",
+    );
+    const dismissed = {
+      ...prompted,
+      native_prompt: { ...prompted.native_prompt!, dismissed: true },
+    };
     rerender(render(paused, dismissed));
-    check(article(prompted.id).textContent?.includes("Notice dismissed; native status unknown") &&
-      article(prompted.id).textContent?.includes("Waiting for your approval"), "dismissal claimed resolution or hid an actionable approval");
-    const view = [...article(prompted.id).querySelectorAll("button")].find((button) => button.textContent === "View output")!;
+    check(
+      article(prompted.id).textContent?.includes(
+        "Notice dismissed; native status unknown",
+      ) &&
+        article(prompted.id).textContent?.includes("Waiting for your approval"),
+      "dismissal claimed resolution or hid an actionable approval",
+    );
+    const view = [...article(prompted.id).querySelectorAll("button")].find((
+      button,
+    ) => button.textContent === "View output")!;
     act(() => view.click());
     await settle();
-    check(output === prompted.id, "dismissal lost the exact session output action");
-    check(taskStatus(task, { sessions: [dismissed] }).label !== "Waiting in the agent's terminal", "board still promoted the dismissed wait");
-    const later = { ...dismissed, native_prompt: { ...dismissed.native_prompt, dismissed: false, hook_event_id: "notice-3",
-      dismissal: { ...prompted.native_prompt!.dismissal!, displayed_boundary_hook_event_id: "notice-3" } } };
+    check(
+      output === prompted.id,
+      "dismissal lost the exact session output action",
+    );
+    check(
+      taskStatus(task, { sessions: [dismissed] }).label !==
+        "Waiting in the agent's terminal",
+      "board still promoted the dismissed wait",
+    );
+    const later = {
+      ...dismissed,
+      native_prompt: {
+        ...dismissed.native_prompt,
+        dismissed: false,
+        hook_event_id: "notice-3",
+        dismissal: {
+          ...prompted.native_prompt!.dismissal!,
+          displayed_boundary_hook_event_id: "notice-3",
+        },
+      },
+    };
     rerender(render(paused, later));
     click("Dismiss notice");
     await settle();
-    check(requests[3].displayed_boundary_hook_event_id === "notice-3" && requests[3].operation_id !== dismissId, "a later same-turn notice reused the old dismissal frontier");
-    check(requests.every((request) => ["stop_failed_session", "dismiss_native_prompt"].includes(String(request.kind))), "a presentation control issued downstream work");
+    check(
+      requests[3].displayed_boundary_hook_event_id === "notice-3" &&
+        requests[3].operation_id !== dismissId,
+      "a later same-turn notice reused the old dismissal frontier",
+    );
+    check(
+      requests.every((request) =>
+        ["stop_failed_session", "dismiss_native_prompt"].includes(
+          String(request.kind),
+        )
+      ),
+      "a presentation control issued downstream work",
+    );
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -9938,15 +13314,21 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
         detail: {},
       },
     }));
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    requests.push(JSON.parse(String(init?.body)));
-    return respond();
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return respond();
+    }) as typeof fetch;
   const access = {
     routes: {},
     discarding: {},
     routeFor: () => undefined,
-    view: () => Promise.resolve<CmuxViewOutcome>({ state: "pending", message: "", retry_available: false }),
+    view: () =>
+      Promise.resolve<CmuxViewOutcome>({
+        state: "pending",
+        message: "",
+        retry_available: false,
+      }),
     take: () => Promise.resolve(),
     release: () => Promise.resolve(),
     discard: () => Promise.resolve(),
@@ -10010,7 +13392,9 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
     );
   const primary = (sessionId: string) =>
     [...notice(sessionId)!.children]
-      .filter((element) => element.tagName === "STRONG" || element.tagName === "P")
+      .filter((element) =>
+        element.tagName === "STRONG" || element.tagName === "P"
+      )
       .map((element) => element.textContent ?? "").join(" ");
   const releaseButton = (sessionId: string) =>
     [...notice(sessionId)!.querySelectorAll("button")].find((button) =>
@@ -10019,25 +13403,36 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
   try {
     mount(render([exited, cooling]));
     check(
-      primary("s-exited").includes("Manager is on hold after a provider error") &&
-        primary("s-exited").includes("The provider reported a failure: a billing problem") &&
+      primary("s-exited").includes(
+        "Manager is on hold after a provider error",
+      ) &&
+        primary("s-exited").includes(
+          "The provider reported a failure: a billing problem",
+        ) &&
         primary("s-exited").includes("This needs your action") &&
         primary("s-exited").includes("will not start, resume or send input") &&
         primary("s-exited").includes("does not restart the agent") &&
         !primary("s-exited").includes("ended"),
-      `a startup-attributed hold claimed an ended turn or lost its plain explanation: ${primary("s-exited")}`,
+      `a startup-attributed hold claimed an ended turn or lost its plain explanation: ${
+        primary("s-exited")
+      }`,
     );
     check(
-      primary("s-cooling").includes("The provider reported a failure: a rate limit was reached") &&
+      primary("s-cooling").includes(
+        "The provider reported a failure: a rate limit was reached",
+      ) &&
         primary("s-cooling").includes("short cooldown of its own") &&
         primary("s-cooling").includes("not the provider's reset time") &&
         !primary("s-cooling").includes("will not start") &&
         !primary("s-cooling").includes("ended"),
-      `a cooldown claimed an ended turn, a provider reset or human-only release: ${primary("s-cooling")}`,
+      `a cooldown claimed an ended turn, a provider reset or human-only release: ${
+        primary("s-cooling")
+      }`,
     );
     const details = notice("s-exited")!.querySelector("details")!;
     check(
-      !details.open && details.textContent?.includes("startup_invocation attribution") &&
+      !details.open &&
+        details.textContent?.includes("startup_invocation attribution") &&
         details.textContent.includes("no app cooldown; needs your action") &&
         !details.textContent.includes("only by release") &&
         details.textContent.includes("hold-billing") &&
@@ -10049,10 +13444,12 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
     act(() => releaseButton("s-exited").click());
     await settle();
     check(
-      requests.length === 1 && requests[0].kind === "release_provider_failure_hold" &&
+      requests.length === 1 &&
+        requests[0].kind === "release_provider_failure_hold" &&
         typeof requests[0].operation_id === "string" &&
         requests[0].task_id === "AJ-1" && requests[0].attempt_id === "a1" &&
-        requests[0].session_id === "s-exited" && requests[0].hold_id === "hold-billing" &&
+        requests[0].session_id === "s-exited" &&
+        requests[0].hold_id === "hold-billing" &&
         requests[0].expected_task_version === 7,
       `Release provider hold posted ${JSON.stringify(requests)}`,
     );
@@ -10060,23 +13457,30 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
       refreshes === 1 && primary("s-exited").includes("Hold released") &&
         primary("s-exited").includes("not restarted or sent anything") &&
         !releaseButton("s-exited"),
-      `a release was not confirmed without restarting work: ${primary("s-exited")}`,
+      `a release was not confirmed without restarting work: ${
+        primary("s-exited")
+      }`,
     );
 
-    respond = () => new Response(JSON.stringify({ error: "task version is stale" }), { status: 409 });
+    respond = () =>
+      new Response(JSON.stringify({ error: "task version is stale" }), {
+        status: 409,
+      });
     act(() => releaseButton("s-cooling").click());
     await settle();
     check(
-      notice("s-cooling")!.querySelector('[role="alert"] strong')?.textContent?.includes(
-        "older version",
-      ) && refreshes === 1 && !!releaseButton("s-cooling"),
+      notice("s-cooling")!.querySelector('[role="alert"] strong')?.textContent
+        ?.includes(
+          "older version",
+        ) && refreshes === 1 && !!releaseButton("s-cooling"),
       "a stale release was not explained or was treated as released",
     );
 
     let finish: (response: Response) => void = noop;
-    respond = () => new Promise<Response>((resolve) => {
-      finish = resolve;
-    });
+    respond = () =>
+      new Promise<Response>((resolve) => {
+        finish = resolve;
+      });
     act(() => releaseButton("s-cooling").click());
     await settle();
     check(
@@ -10084,7 +13488,11 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
         releaseButton("s-cooling").textContent === "Releasing provider hold…",
       "a pending release could be submitted twice",
     );
-    finish(new Response(JSON.stringify({ error: "task version is stale" }), { status: 409 }));
+    finish(
+      new Response(JSON.stringify({ error: "task version is stale" }), {
+        status: 409,
+      }),
+    );
     await settle();
 
     respond = () => {
@@ -10093,14 +13501,22 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
     act(() => releaseButton("s-cooling").click());
     await settle();
     check(
-      notice("s-cooling")!.querySelector('[role="alert"]')?.textContent?.includes(
-        "Refresh the dashboard and check the task or session before retrying",
-      ),
+      notice("s-cooling")!.querySelector('[role="alert"]')?.textContent
+        ?.includes(
+          "Refresh the dashboard and check the task or session before retrying",
+        ),
       "an uncertain release did not ask for a refresh before retrying",
     );
     respond = () =>
       new Response(JSON.stringify({
-        result: { operation_id: "release", entity_kind: "provider_failure_hold", entity_id: "hold-rate", version: 7, state: "expired", detail: {} },
+        result: {
+          operation_id: "release",
+          entity_kind: "provider_failure_hold",
+          entity_id: "hold-rate",
+          version: 7,
+          state: "expired",
+          detail: {},
+        },
       }));
     act(() => releaseButton("s-cooling").click());
     await settle();
@@ -10108,12 +13524,19 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
     check(
       requests.length === 5 && operations[4] === operations[3] &&
         operations[3] !== operations[2] && operations[2] !== operations[1] &&
-        primary("s-cooling").includes("cooldown had already ended, so nothing changed"),
-      `a refused release kept its operation, an uncertain one did not, or the outcome was misreported: ${JSON.stringify(requests.slice(1))}`,
+        primary("s-cooling").includes(
+          "cooldown had already ended, so nothing changed",
+        ),
+      `a refused release kept its operation, an uncertain one did not, or the outcome was misreported: ${
+        JSON.stringify(requests.slice(1))
+      }`,
     );
 
     rerender(render([{ ...exited, provider_failure_holds: [] }, cooling]));
-    check(!notice("s-exited"), "a released hold stayed after the authoritative snapshot");
+    check(
+      !notice("s-exited"),
+      "a released hold stayed after the authoritative snapshot",
+    );
     rerender(render([exited, { ...cooling, provider_failure_holds: [] }]));
     check(
       !!notice("s-exited") && !notice("s-cooling"),
@@ -10145,21 +13568,29 @@ Deno.test("H3/H15 attention opens the exact old exited session beyond 200 and re
     id: "attention_observation:old",
     category: "blocked",
     title: "Manager exited while still recorded as working",
-    reason: "The session exited without a report explaining its readiness. Open agent output to check.",
+    reason:
+      "The session exited without a report explaining its readiness. Open agent output to check.",
     task_title: task.title,
     role: "manager",
     action: { kind: "open_agent_output", label: "Open agent output" },
     target: {
-      kind: "session", project_id: "p1", task_id: "AJ-1", attempt_id: "a1",
-      session_id: old.id, role_generation_id: old.role_generation_id,
+      kind: "session",
+      project_id: "p1",
+      task_id: "AJ-1",
+      attempt_id: "a1",
+      session_id: old.id,
+      role_generation_id: old.role_generation_id,
     },
     held_tasks: [],
     details: "Two observations; exact invocation old-epoch.",
   };
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    if (String(input) === "/api/command") commands.push(JSON.parse(String(init?.body)));
-    return new Response("[]");
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input) === "/api/command") {
+        commands.push(JSON.parse(String(init?.body)));
+      }
+      return new Response("[]");
+    }) as typeof fetch;
   try {
     for (const mode of ["current", "missing", "epoch"] as const) {
       const live = liveHarness();
@@ -10167,43 +13598,100 @@ Deno.test("H3/H15 attention opens the exact old exited session beyond 200 and re
       liveEnvironment.scheduler = live.environment.scheduler;
       localStorage.clear();
       localStorage.setItem("agenticjira.page", "workspace");
-      const state = snapshotAt("service-a", mode === "current" ? "71" : mode === "missing" ? "72" : "73", {
-        tasks: [task],
-        active_sessions: mode === "missing" ? newest : [...newest,
-          mode === "epoch" ? { ...old, status: "running", transcript_epoch: "resumed-epoch" } : old],
-        attention: [mode === "epoch" ? { ...observation, target: null,
-          reason: "The original agent invocation is no longer available. Refresh to check its current state." } : observation,
-          railItem("independent", "blocked", "Independent hold", null)],
-      });
+      const state = snapshotAt(
+        "service-a",
+        mode === "current" ? "71" : mode === "missing" ? "72" : "73",
+        {
+          tasks: [task],
+          active_sessions: mode === "missing" ? newest : [
+            ...newest,
+            mode === "epoch"
+              ? {
+                ...old,
+                status: "running",
+                transcript_epoch: "resumed-epoch",
+              }
+              : old,
+          ],
+          attention: [
+            mode === "epoch"
+              ? {
+                ...observation,
+                target: null,
+                reason:
+                  "The original agent invocation is no longer available. Refresh to check its current state.",
+              }
+              : observation,
+            railItem("independent", "blocked", "Independent hold", null),
+          ],
+        },
+      );
       mount(<App />);
       await settle();
       live.reads[0].resolve(state);
       await settle();
       const reads = live.reads.length;
-      act(() => document.querySelector<HTMLButtonElement>('[data-attention-id="attention_observation:old"] button')!.click());
+      act(() =>
+        document.querySelector<HTMLButtonElement>(
+          '[data-attention-id="attention_observation:old"] button',
+        )!.click()
+      );
       await settle();
       if (mode === "missing") {
-        check(!document.querySelector('[role="dialog"]'), "a stale observation opened a replacement session");
-        check(live.reads.length > reads && document.body.textContent?.includes("changed before it could open"),
-          "a stale exact session was not explained and refreshed");
+        check(
+          !document.querySelector('[role="dialog"]'),
+          "a stale observation opened a replacement session",
+        );
+        check(
+          live.reads.length > reads &&
+            document.body.textContent?.includes("changed before it could open"),
+          "a stale exact session was not explained and refreshed",
+        );
       } else if (mode === "epoch") {
-        check(state.active_sessions[200].id === old.id &&
-          state.active_sessions[200].role_generation_id === old.role_generation_id &&
-          state.active_sessions[200].transcript_epoch !== old.transcript_epoch,
-          "the invocation replacement changed the session or generation instead of its epoch");
-        check(!document.querySelector('[role="dialog"]') && live.reads.length > reads,
-          "Refresh for a replaced invocation opened the resumed session or failed to refresh");
-        check(document.querySelector('[data-attention-id="attention_observation:old"]')?.textContent?.includes("Refresh"),
-          "the replaced invocation did not retain its nonactionable observation");
+        check(
+          state.active_sessions[200].id === old.id &&
+            state.active_sessions[200].role_generation_id ===
+              old.role_generation_id &&
+            state.active_sessions[200].transcript_epoch !==
+              old.transcript_epoch,
+          "the invocation replacement changed the session or generation instead of its epoch",
+        );
+        check(
+          !document.querySelector('[role="dialog"]') &&
+            live.reads.length > reads,
+          "Refresh for a replaced invocation opened the resumed session or failed to refresh",
+        );
+        check(
+          document.querySelector(
+            '[data-attention-id="attention_observation:old"]',
+          )?.textContent?.includes("Refresh"),
+          "the replaced invocation did not retain its nonactionable observation",
+        );
       } else {
-        check(state.active_sessions.length === 201 && state.active_sessions[200].id === old.id,
-          "the old session fixture did not exercise the merged page");
-        check(document.activeElement?.getAttribute("data-attention-target") === `session:${old.id}` &&
-          !!document.activeElement?.closest('[role="dialog"]'), "the observation did not focus its exact exited session");
-        check(document.querySelector('[data-attention-id="independent"]'), "routing dropped an independent reason");
+        check(
+          state.active_sessions.length === 201 &&
+            state.active_sessions[200].id === old.id,
+          "the old session fixture did not exercise the merged page",
+        );
+        check(
+          document.activeElement?.getAttribute("data-attention-target") ===
+              `session:${old.id}` &&
+            !!document.activeElement?.closest('[role="dialog"]'),
+          "the observation did not focus its exact exited session",
+        );
+        check(
+          document.querySelector('[data-attention-id="independent"]'),
+          "routing dropped an independent reason",
+        );
       }
-      check(document.querySelector('[data-attention-id="independent"]'), "refresh dropped an independent reason");
-      check(commands.length === 0, "opening classification attention submitted a command");
+      check(
+        document.querySelector('[data-attention-id="independent"]'),
+        "refresh dropped an independent reason",
+      );
+      check(
+        commands.length === 0,
+        "opening classification attention submitted a command",
+      );
       unmount();
     }
   } finally {
@@ -10219,20 +13707,21 @@ Deno.test("A provider hold's attention item opens its exited session, whose Rele
   const live = liveHarness();
   const priorEnvironment = { ...liveEnvironment };
   const commands: Record<string, unknown>[] = [];
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    if (String(input) !== "/api/command") return new Response("[]");
-    commands.push(JSON.parse(String(init?.body)));
-    return new Response(JSON.stringify({
-      result: {
-        operation_id: "release",
-        entity_kind: "provider_failure_hold",
-        entity_id: "hold-billing",
-        version: 8,
-        state: "released",
-        detail: {},
-      },
-    }));
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input) !== "/api/command") return new Response("[]");
+      commands.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({
+        result: {
+          operation_id: "release",
+          entity_kind: "provider_failure_hold",
+          entity_id: "hold-billing",
+          version: 8,
+          state: "released",
+          detail: {},
+        },
+      }));
+    }) as typeof fetch;
   liveEnvironment.transport = live.environment.transport;
   liveEnvironment.scheduler = live.environment.scheduler;
   localStorage.clear();
@@ -10264,7 +13753,8 @@ Deno.test("A provider hold's attention item opens its exited session, whose Rele
       id: itemId,
       category: "blocked",
       title: "Manager is on hold after a provider error",
-      reason: "The provider reported a failure for Manager. This needs your action.",
+      reason:
+        "The provider reported a failure for Manager. This needs your action.",
       task_title: "Held task",
       role: "manager",
       action: { kind: "open_agent_output", label: "Open agent output" },
@@ -10285,18 +13775,29 @@ Deno.test("A provider hold's attention item opens its exited session, whose Rele
     live.reads[0].resolve(state);
     await settle();
     act(() =>
-      document.querySelector<HTMLButtonElement>(`[data-attention-id="${itemId}"] button`)!.click()
+      document.querySelector<HTMLButtonElement>(
+        `[data-attention-id="${itemId}"] button`,
+      )!.click()
     );
     await settle();
     const session = document.activeElement;
     check(
       session?.getAttribute("data-attention-target") === "session:s-exited" &&
         !!session.closest('[role="dialog"]'),
-      `the hold's attention item focused ${session?.getAttribute("data-attention-target")}`,
+      `the hold's attention item focused ${
+        session?.getAttribute("data-attention-target")
+      }`,
     );
-    const release = [...session!.querySelectorAll<HTMLButtonElement>(".session-provider-hold button")]
+    const release = [
+      ...session!.querySelectorAll<HTMLButtonElement>(
+        ".session-provider-hold button",
+      ),
+    ]
       .find((button) => button.textContent === "Release provider hold");
-    check(!!release, "the opened exited session offers no Release provider hold");
+    check(
+      !!release,
+      "the opened exited session offers no Release provider hold",
+    );
     act(() => release!.click());
     await settle();
     const sent: Record<string, unknown> = commands[0] ?? {};
@@ -10312,7 +13813,9 @@ Deno.test("A provider hold's attention item opens its exited session, whose Rele
     check(
       commands.length === 1 && typeof operation_id === "string" &&
         Object.keys(binding).length === Object.keys(expected).length &&
-        Object.entries(expected).every(([key, value]) => binding[key] === value),
+        Object.entries(expected).every(([key, value]) =>
+          binding[key] === value
+        ),
       `the routed release posted ${JSON.stringify(commands)}`,
     );
   } finally {
@@ -10340,7 +13843,13 @@ Deno.test("Awaiting your review leads the board and list in reading order", () =
     attention: "needs_human_review",
   };
   const board = (tasks: Task[]) => (
-    <TaskBoard tasks={tasks} projects={[initialized]} onOpen={noop} onEdit={noop} onChanged={noop} />
+    <TaskBoard
+      tasks={tasks}
+      projects={[initialized]}
+      onOpen={noop}
+      onEdit={noop}
+      onChanged={noop}
+    />
   );
   localStorage.clear();
   try {
@@ -10353,17 +13862,21 @@ Deno.test("Awaiting your review leads the board and list in reading order", () =
     );
     check(
       document.querySelector(".lane-backlog .count")?.textContent === "3" &&
-        document.querySelector(".lane-backlog .status-badge.tone-draft")?.textContent === "Draft",
+        document.querySelector(".lane-backlog .status-badge.tone-draft")
+            ?.textContent === "Draft",
       "Drafts lost their count or text label",
     );
     rerender(board([...drafts, review]));
     check(
-      document.querySelector(".lane .card-body")?.textContent?.includes("Ready to accept"),
+      document.querySelector(".lane .card-body")?.textContent?.includes(
+        "Ready to accept",
+      ),
       "Drafts came before your review in reading order",
     );
     click("List");
     check(
-      document.querySelector(".task-list > article button")?.textContent?.includes("Ready to accept"),
+      document.querySelector(".task-list > article button")?.textContent
+        ?.includes("Ready to accept"),
       "the list buried your review under drafts",
     );
   } finally {
@@ -10383,8 +13896,10 @@ Deno.test("Appearance follows System or an explicit choice and survives unavaila
     get matches() {
       return os.dark;
     },
-    addEventListener: (_type: string, listener: () => void) => os.listeners.add(listener),
-    removeEventListener: (_type: string, listener: () => void) => os.listeners.delete(listener),
+    addEventListener: (_type: string, listener: () => void) =>
+      os.listeners.add(listener),
+    removeEventListener: (_type: string, listener: () => void) =>
+      os.listeners.delete(listener),
   })) as unknown as typeof window.matchMedia;
   const theme = () => document.documentElement.dataset.theme;
   const osChanges = (dark: boolean) => {
@@ -10394,23 +13909,37 @@ Deno.test("Appearance follows System or an explicit choice and survives unavaila
   localStorage.clear();
   try {
     localStorage.setItem("llmrelay.appearance", "sepia");
-    check(storedAppearance() === "system", "an unknown stored appearance was trusted");
-    await mountLiveApp("board", snapshotAt("service-a", "1", {
-      attention: Array.from({ length: 21 }, (_, index) =>
-        railItem(`item-${index}`, "blocked", `Item ${index}`, null)),
-    }));
+    check(
+      storedAppearance() === "system",
+      "an unknown stored appearance was trusted",
+    );
+    await mountLiveApp(
+      "board",
+      snapshotAt("service-a", "1", {
+        attention: Array.from(
+          { length: 21 },
+          (_, index) =>
+            railItem(`item-${index}`, "blocked", `Item ${index}`, null),
+        ),
+      }),
+    );
     const workspace = [...document.querySelectorAll(".sidebar nav button")]
       .find((button) => button.textContent?.includes("Workspace"));
     check(
-      workspace?.querySelector('.nav-badge [aria-hidden="true"]')?.textContent === "21" &&
+      workspace?.querySelector('.nav-badge [aria-hidden="true"]')
+            ?.textContent === "21" &&
         workspace.textContent?.includes(", 21 waiting for you"),
       `the Workspace badge lost its exact count or accessible name: ${workspace?.textContent}`,
     );
     const select = findSelect("Appearance");
-    check(select.value === "system", "an invalid preference did not fall back to System");
+    check(
+      select.value === "system",
+      "an invalid preference did not fall back to System",
+    );
     change(select, "light");
     check(
-      theme() === "light" && localStorage.getItem("llmrelay.appearance") === "light",
+      theme() === "light" &&
+        localStorage.getItem("llmrelay.appearance") === "light",
       "Light did not apply synchronously or persist",
     );
     osChanges(true);
@@ -10424,20 +13953,31 @@ Deno.test("Appearance follows System or an explicit choice and survives unavaila
     // A reload applies the stored explicit choice before rendering, against the OS.
     localStorage.setItem("llmrelay.appearance", "dark");
     applyAppearance(storedAppearance());
-    check(theme() === "dark", "a stored Dark choice was not applied before render");
+    check(
+      theme() === "dark",
+      "a stored Dark choice was not applied before render",
+    );
     await mountLiveApp("board", snapshotAt("service-a", "2"));
-    check(findSelect("Appearance").value === "dark", "the stored choice was not selected after reload");
+    check(
+      findSelect("Appearance").value === "dark",
+      "the stored choice was not selected after reload",
+    );
     unmount();
 
     const refuse = (key: string) => {
-      if (key === "llmrelay.appearance") throw new DOMException("denied", "SecurityError");
+      if (key === "llmrelay.appearance") {
+        throw new DOMException("denied", "SecurityError");
+      }
     };
     Object.defineProperty(globalThis, "localStorage", {
       configurable: true,
       writable: true,
       value: {
         getItem: (key: string) => (refuse(key), realStorage.getItem(key)),
-        setItem: (key: string, value: string) => (refuse(key), realStorage.setItem(key, value)),
+        setItem: (
+          key: string,
+          value: string,
+        ) => (refuse(key), realStorage.setItem(key, value)),
         removeItem: (key: string) => realStorage.removeItem(key),
         clear: () => realStorage.clear(),
         key: (index: number) => realStorage.key(index),
@@ -10446,10 +13986,16 @@ Deno.test("Appearance follows System or an explicit choice and survives unavaila
         },
       },
     });
-    check(storedAppearance() === "system", "unavailable storage did not fall back to System");
+    check(
+      storedAppearance() === "system",
+      "unavailable storage did not fall back to System",
+    );
     await mountLiveApp("board", snapshotAt("service-a", "3"));
     change(findSelect("Appearance"), "dark");
-    check(theme() === "dark", "unavailable storage blocked the selected appearance");
+    check(
+      theme() === "dark",
+      "unavailable storage blocked the selected appearance",
+    );
   } finally {
     unmount();
     Object.defineProperty(globalThis, "localStorage", {
@@ -10492,18 +14038,26 @@ Deno.test("H8 a render failure offers Reload page without showing the error", ()
   };
   document.documentElement.dataset.theme = "dark";
   try {
-    mount(<AppErrorBoundary><BrokenTaskView /></AppErrorBoundary>);
+    mount(
+      <AppErrorBoundary>
+        <BrokenTaskView />
+      </AppErrorBoundary>,
+    );
     const page = document.body.textContent ?? "";
     const heading = document.querySelector("main h1");
     check(
       heading?.textContent === "The dashboard stopped working" &&
-        heading.getAttribute("tabindex") === "-1" && document.activeElement === heading &&
+        heading.getAttribute("tabindex") === "-1" &&
+        document.activeElement === heading &&
         page.includes("check whether it completed before trying it again"),
       `the failure page did not explain itself or take focus: ${page}`,
     );
     const details = document.querySelector<HTMLDetailsElement>("main details");
     check(
-      !details?.open && details?.textContent?.includes("Dashboard render error · TypeError · ") &&
+      !details?.open &&
+        details?.textContent?.includes(
+          "Dashboard render error · TypeError · ",
+        ) &&
         !page.includes(privateText) && !page.includes("BrokenTaskView"),
       `technical details were open or showed the error message or stack: ${page}`,
     );
@@ -10518,7 +14072,11 @@ Deno.test("H8 a render failure offers Reload page without showing the error", ()
       `Reload page did not reload exactly once without requests: ${reloads} ${requests}`,
     );
 
-    mount(<AppErrorBoundary><ThrowsText /></AppErrorBoundary>);
+    mount(
+      <AppErrorBoundary>
+        <ThrowsText />
+      </AppErrorBoundary>,
+    );
     check(
       document.querySelector("main details")?.textContent?.includes(
         "Dashboard render error · Non-Error value · ",
@@ -10526,7 +14084,11 @@ Deno.test("H8 a render failure offers Reload page without showing the error", ()
       "a thrown text value was shown instead of a fixed label",
     );
 
-    mount(<AppErrorBoundary><p>Dashboard ready</p></AppErrorBoundary>);
+    mount(
+      <AppErrorBoundary>
+        <p>Dashboard ready</p>
+      </AppErrorBoundary>,
+    );
     check(
       document.body.textContent === "Dashboard ready",
       "the boundary replaced a dashboard that rendered normally",
@@ -10568,12 +14130,15 @@ Deno.test("H1 Controls and attention reach the exact failed step, and a stale re
   const priorEnvironment = { ...liveEnvironment };
   const requests: Record<string, unknown>[] = [];
   let reply = () =>
-    new Response(JSON.stringify({ error: "task version is stale" }), { status: 409 });
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    if (init?.method !== "POST") return new Response("[]");
-    requests.push(JSON.parse(String(init.body)));
-    return reply();
-  }) as typeof fetch;
+    new Response(JSON.stringify({ error: "task version is stale" }), {
+      status: 409,
+    });
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method !== "POST") return new Response("[]");
+      requests.push(JSON.parse(String(init.body)));
+      return reply();
+    }) as typeof fetch;
   const heldTask: Task = {
     ...task,
     attention: "needs_recovery",
@@ -10595,13 +14160,20 @@ Deno.test("H1 Controls and attention reach the exact failed step, and a stale re
   const held = snapshotAt("service-a", "60", {
     tasks: [heldTask],
     recovery: [
-      { id: "r-session", session_id: "s-other", attempt_id: "a1", state: "attention_required", detail: {} },
+      {
+        id: "r-session",
+        session_id: "s-other",
+        attempt_id: "a1",
+        state: "attention_required",
+        detail: {},
+      },
       step,
     ],
     continuation_actions: [{
       kind: "recover_failed_step",
       enabled: true,
-      reason: "An automatic step failed. Review it before automatic work continues.",
+      reason:
+        "An automatic step failed. Review it before automatic work continues.",
       owner: "human",
       waiting_for: null,
       since: "2026-10-01T00:00:00Z",
@@ -10621,18 +14193,37 @@ Deno.test("H1 Controls and attention reach the exact failed step, and a stale re
         "Retry step only lets LLMRelay evaluate the task again from its current state; it never repeats a step whose outcome is unknown.",
     }],
     attention: [
-      railItem("recovery_record:r-step", "recovery", "An automatic step failed", recoveryTarget("r-step")),
-      railItem("recovery_record:r-session", "recovery", "Manual action needed", recoveryTarget("r-session")),
+      railItem(
+        "recovery_record:r-step",
+        "recovery",
+        "An automatic step failed",
+        recoveryTarget("r-step"),
+      ),
+      railItem(
+        "recovery_record:r-session",
+        "recovery",
+        "Manual action needed",
+        recoveryTarget("r-session"),
+      ),
     ],
   });
   const dialog = () => document.querySelector(".task-dialog");
   const stepPanel = () =>
-    dialog()?.querySelector<HTMLElement>('[data-attention-target="recovery_record:r-step"]');
+    dialog()?.querySelector<HTMLElement>(
+      '[data-attention-target="recovery_record:r-step"]',
+    );
   const controlButton = (label: string) =>
-    [...(dialog()?.querySelectorAll<HTMLButtonElement>(".controls button") ?? [])]
+    [
+      ...(dialog()?.querySelectorAll<HTMLButtonElement>(".controls button") ??
+        []),
+    ]
       .find((button) => button.textContent === label);
   const openItem = (id: string) =>
-    act(() => document.querySelector<HTMLButtonElement>(`[data-attention-id="${id}"] button`)!.click());
+    act(() =>
+      document.querySelector<HTMLButtonElement>(
+        `[data-attention-id="${id}"] button`,
+      )!.click()
+    );
   localStorage.clear();
   try {
     const live = await mountLiveApp("workspace", held);
@@ -10642,33 +14233,47 @@ Deno.test("H1 Controls and attention reach the exact failed step, and a stale re
     await settle();
     check(
       document.activeElement === stepPanel() &&
-        !dialog()?.querySelector('[data-attention-target="recovery_record:r-session"]') &&
-        !dialog()?.textContent?.includes("changed before it could open") && requests.length === 0,
+        !dialog()?.querySelector(
+          '[data-attention-target="recovery_record:r-session"]',
+        ) &&
+        !dialog()?.textContent?.includes("changed before it could open") &&
+        requests.length === 0,
       "Controls did not switch the attention-opened record to the exact failed step",
     );
 
     click("Board");
     act(() =>
       [...document.querySelectorAll<HTMLButtonElement>(".card-body")]
-        .find((card) => card.querySelector("strong")?.textContent === heldTask.title)!.click()
+        .find((card) =>
+          card.querySelector("strong")?.textContent === heldTask.title
+        )!.click()
     );
     await settle();
     check(
-      !!stepPanel() && !!dialog()?.querySelector('[data-attention-target="recovery_record:r-session"]') &&
-        controlButton("Pause now")?.disabled === false && controlButton("Cancel")?.disabled === false,
+      !!stepPanel() &&
+        !!dialog()?.querySelector(
+          '[data-attention-target="recovery_record:r-session"]',
+        ) &&
+        controlButton("Pause now")?.disabled === false &&
+        controlButton("Cancel")?.disabled === false,
       "a direct open hid an independent hold, or the failed step blocked Pause or Cancel",
     );
 
     click("Workspace");
     openItem("recovery_record:r-step");
     await settle();
-    const primary = stepPanel()?.textContent?.replace(/Technical details[\s\S]*/, "") ?? "";
+    const primary =
+      stepPanel()?.textContent?.replace(/Technical details[\s\S]*/, "") ?? "";
     const details = stepPanel()?.querySelector("details");
     check(
-      document.activeElement === stepPanel() && primary.startsWith("An automatic step failed") &&
-        primary.includes("does not start agent actions") && primary.includes("choose Retry failed step") &&
+      document.activeElement === stepPanel() &&
+        primary.startsWith("An automatic step failed") &&
+        primary.includes("does not start agent actions") &&
+        primary.includes("choose Retry failed step") &&
         !primary.includes("attempt_classification") && !details?.open &&
-        details?.textContent?.includes("attempt_classification · effect none") &&
+        details?.textContent?.includes(
+          "attempt_classification · effect none",
+        ) &&
         details.textContent.includes("fixture classification failure") &&
         !dialog()?.textContent?.includes("Check recovery and continue"),
       `attention did not open only the plainly explained failed step: ${primary}`,
@@ -10679,29 +14284,51 @@ Deno.test("H1 Controls and attention reach the exact failed step, and a stale re
     await settle();
     const stale = requests[0];
     check(
-      requests.length === 1 && stale.kind === "resolve_recovery" && stale.task_id === "AJ-1" &&
-        stale.attempt_id === "a1" && stale.recovery_id === "r-step" && "session_id" in stale &&
+      requests.length === 1 && stale.kind === "resolve_recovery" &&
+        stale.task_id === "AJ-1" &&
+        stale.attempt_id === "a1" && stale.recovery_id === "r-step" &&
+        "session_id" in stale &&
         stale.session_id === null && stale.expected_version === 7 &&
         stale.decision === "retry_failed_step" &&
         stale.evidence === "Activity shows classification never finished" &&
         typeof stale.operation_id === "string",
-      `the retry was resent or did not bind the exact displayed hold: ${JSON.stringify(requests)}`,
+      `the retry was resent or did not bind the exact displayed hold: ${
+        JSON.stringify(requests)
+      }`,
     );
     const alert = stepPanel()?.querySelector('[role="alert"]');
     check(
-      alert?.querySelector("strong")?.textContent === "This page is showing an older version of the item." &&
-        alert.querySelector("p")?.textContent?.startsWith("Refresh the dashboard") &&
-        alert.querySelector("details pre")?.textContent === "task version is stale" &&
-        stepPanel()?.querySelector("textarea")?.value === "Activity shows classification never finished" &&
-        !!document.querySelector('[data-attention-id="recovery_record:r-session"]'),
+      alert?.querySelector("strong")?.textContent ===
+          "This page is showing an older version of the item." &&
+        alert.querySelector("p")?.textContent?.startsWith(
+          "Refresh the dashboard",
+        ) &&
+        alert.querySelector("details pre")?.textContent ===
+          "task version is stale" &&
+        stepPanel()?.querySelector("textarea")?.value ===
+          "Activity shows classification never finished" &&
+        !!document.querySelector(
+          '[data-attention-id="recovery_record:r-session"]',
+        ),
       "a stale refusal was hidden, lost the evidence, or dropped the unrelated hold",
     );
 
     reply = () =>
       new Response(JSON.stringify({
-        result: { entity_kind: "attempt", entity_id: "a1", version: 9, state: "failed_step_released" },
+        result: {
+          entity_kind: "attempt",
+          entity_id: "a1",
+          version: 9,
+          state: "failed_step_released",
+        },
       }));
-    live.waits[0].resolve(changedTo({ ...held, revision: "61", tasks: [{ ...heldTask, version: 8 }] }));
+    live.waits[0].resolve(
+      changedTo({
+        ...held,
+        revision: "61",
+        tasks: [{ ...heldTask, version: 8 }],
+      }),
+    );
     await settle();
     click("Retry failed step");
     await settle();
@@ -10709,7 +14336,9 @@ Deno.test("H1 Controls and attention reach the exact failed step, and a stale re
       requests.length === 2 && requests[1].expected_version === 8 &&
         requests[1].operation_id !== stale.operation_id &&
         requests.every((request) => request.recovery_id === "r-step"),
-      `the refreshed retry reused the stale version or operation: ${JSON.stringify(requests)}`,
+      `the refreshed retry reused the stale version or operation: ${
+        JSON.stringify(requests)
+      }`,
     );
 
     // The post-retry read releases the step; Review is clicked before that renders.
@@ -10724,7 +14353,9 @@ Deno.test("H1 Controls and attention reach the exact failed step, and a stale re
         record.id === "r-step" ? { ...record, state: "resolved_retry" } : record
       ),
       continuation_actions: [],
-      attention: held.attention.filter((item) => item.id !== "recovery_record:r-step"),
+      attention: held.attention.filter((item) =>
+        item.id !== "recovery_record:r-step"
+      ),
     };
     const reads = live.reads.length;
     await act(async () => {
@@ -10734,9 +14365,13 @@ Deno.test("H1 Controls and attention reach the exact failed step, and a stale re
     });
     await settle();
     check(
-      document.activeElement?.getAttribute("data-attention-target") === "recovery_record:r-session" &&
-        !stepPanel() && requests.length === 2 && live.reads.length === reads + 1 &&
-        dialog()?.textContent?.includes("That failed step changed before it could open"),
+      document.activeElement?.getAttribute("data-attention-target") ===
+          "recovery_record:r-session" &&
+        !stepPanel() && requests.length === 2 &&
+        live.reads.length === reads + 1 &&
+        dialog()?.textContent?.includes(
+          "That failed step changed before it could open",
+        ),
       "a stale failed-step route substituted a record, sent a request, or was not refreshed and explained",
     );
   } finally {
@@ -10750,10 +14385,11 @@ Deno.test("H1 Controls and attention reach the exact failed step, and a stale re
 
 Deno.test("H1 failed-step retry waits for unknown outcomes and an exact selection never falls back", async () => {
   const requests: unknown[] = [];
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    requests.push(init?.body);
-    return new Response(JSON.stringify({ result: {} }));
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(init?.body);
+      return new Response(JSON.stringify({ result: {} }));
+    }) as typeof fetch;
   const sessionHold = {
     id: "r-session",
     session_id: "s-other",
@@ -10785,21 +14421,31 @@ Deno.test("H1 failed-step retry waits for unknown outcomes and an exact selectio
     await settle();
     check(
       retry()?.disabled === true && requests.length === 0 &&
-        text().includes("becomes available after LLMRelay records the outcome") &&
+        text().includes(
+          "becomes available after LLMRelay records the outcome",
+        ) &&
         document.querySelector("details")?.textContent?.includes(
           "effect e-1 guidance_delivery delivery_unknown",
         ) &&
-        !text().includes("Check recovery and continue") && !text().includes("Verify and cancel"),
+        !text().includes("Check recovery and continue") &&
+        !text().includes("Verify and cancel"),
       `an unsettled failed step offered a retry or a process check: ${text()}`,
     );
     rerender(panel({ ...unsettled, retry_blocked_by: [] }));
-    check(retry()?.disabled === false, "a failed step with settled outcomes stayed blocked");
-    for (const mismatch of [{ session_id: "s-other" }, { attempt_id: "a-old" }]) {
+    check(
+      retry()?.disabled === false,
+      "a failed step with settled outcomes stayed blocked",
+    );
+    for (
+      const mismatch of [{ session_id: "s-other" }, { attempt_id: "a-old" }]
+    ) {
       rerender(panel({ ...unsettled, retry_blocked_by: [], ...mismatch }));
       check(
         !retry() && !text().includes("Check recovery and continue") &&
           text().includes("do not match the task shown here"),
-        `a failed step bound to ${JSON.stringify(mismatch)} still offered an action`,
+        `a failed step bound to ${
+          JSON.stringify(mismatch)
+        } still offered an action`,
       );
     }
     rerender(panel());
@@ -10900,49 +14546,102 @@ Deno.test("Planned documentation recovery previews content and approves only its
 });
 
 Deno.test("exhausted review limit keeps Cancel and removes empty resume advice", () => {
-  mount(<WorkflowControls task={task} onChanged={() => {}} decision={{
-    decision_schema: 1, reason_code: "workflow.review_budget_exhausted", disposition: "held",
-    subject: { task_id: task.id }, observed_revision: { task_version: task.version },
-    primary_blocker: { code: "review_limit", state: "pending", owner: "human", evidence: null,
-      message: "This attempt has used 5 of 5 allowed code reviews. The latest candidate is saved." },
-    prerequisites: [], ownership: { owner: "human", state: "held", binding: {} }, next_action: null,
-    control_policy: { allowed_controls: ["cancel"] },
-  }} />);
+  mount(
+    <WorkflowControls
+      task={task}
+      onChanged={() => {}}
+      decision={{
+        decision_schema: 1,
+        reason_code: "workflow.review_budget_exhausted",
+        disposition: "held",
+        subject: { task_id: task.id },
+        observed_revision: { task_version: task.version },
+        primary_blocker: {
+          code: "review_limit",
+          state: "pending",
+          owner: "human",
+          evidence: null,
+          message:
+            "This attempt has used 5 of 5 allowed code reviews. The latest candidate is saved.",
+        },
+        prerequisites: [],
+        ownership: { owner: "human", state: "held", binding: {} },
+        next_action: null,
+        control_policy: { allowed_controls: ["cancel"] },
+      }}
+    />,
+  );
   try {
     const buttons = [...document.querySelectorAll<HTMLButtonElement>("button")];
     for (const label of ["Continue", "Run next", "Retry"]) {
-      const button = buttons.find((button) => button.textContent?.trim() === label);
-      if (!button?.disabled) throw new Error(`${label} can still loop an exhausted attempt`);
+      const button = buttons.find((button) =>
+        button.textContent?.trim() === label
+      );
+      if (!button?.disabled) {
+        throw new Error(`${label} can still loop an exhausted attempt`);
+      }
     }
-    const cancel = buttons.find((button) => button.textContent?.trim() === "Cancel");
-    if (!cancel || cancel.disabled) throw new Error("Cancel is unavailable at the review limit");
+    const cancel = buttons.find((button) =>
+      button.textContent?.trim() === "Cancel"
+    );
+    if (!cancel || cancel.disabled) {
+      throw new Error("Cancel is unavailable at the review limit");
+    }
     const text = document.body.textContent || "";
-    if (!text.includes("5 of 5") || !text.includes("saved candidate") ||
-      text.includes("Continue resumes automatic work")) throw new Error("The cap still promises progress");
-  } finally { unmount(); }
+    if (
+      !text.includes("5 of 5") || !text.includes("saved candidate") ||
+      text.includes("Continue resumes automatic work")
+    ) throw new Error("The cap still promises progress");
+  } finally {
+    unmount();
+  }
 });
 
 Deno.test("allowing one review uses the bounded command without starting a session", async () => {
   const requests: Record<string, unknown>[] = [];
   const previousFetch = globalThis.fetch;
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    requests.push(JSON.parse(String(init?.body)));
-    return new Response(JSON.stringify({ result: { state: "review_budget_extended" } }));
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(
+        JSON.stringify({ result: { state: "review_budget_extended" } }),
+      );
+    }) as typeof fetch;
   try {
-    mount(<WorkflowControls task={task} onChanged={() => {}} actions={[{
-      kind: "authorization_required", enabled: true,
-      reason: "The review used the last authorized round without a verdict.", owner: "human",
-      operation: "extend_review_budget", binding: { task_id: task.id, attempt_id: "a", review_kind: "code" },
-      accounting_note: "Allows one additional paid review. This button does not launch it.",
-    }]} />);
+    mount(
+      <WorkflowControls
+        task={task}
+        onChanged={() => {}}
+        actions={[{
+          kind: "authorization_required",
+          enabled: true,
+          reason:
+            "The review used the last authorized round without a verdict.",
+          owner: "human",
+          operation: "extend_review_budget",
+          binding: { task_id: task.id, attempt_id: "a", review_kind: "code" },
+          accounting_note:
+            "Allows one additional paid review. This button does not launch it.",
+        }]}
+      />,
+    );
     click("Allow one more code review");
     await settle();
-    if (requests.length !== 1 || requests[0].kind !== "extend_review_budget" ||
+    if (
+      requests.length !== 1 || requests[0].kind !== "extend_review_budget" ||
       requests[0].additional !== 1 || requests[0].attempt_id !== "a" ||
-      requests[0].task_id !== task.id || requests[0].expected_version !== task.version ||
-      requests[0].review_kind !== "code") throw new Error("Review extension did not preserve its exact bounded command");
-  } finally { unmount(); globalThis.fetch = previousFetch; }
+      requests[0].task_id !== task.id ||
+      requests[0].expected_version !== task.version ||
+      requests[0].review_kind !== "code"
+    ) {
+      throw new Error(
+        "Review extension did not preserve its exact bounded command",
+      );
+    }
+  } finally {
+    unmount();
+    globalThis.fetch = previousFetch;
+  }
 });
 
 Deno.test("Reliability: obsolete transition proposals leave Overview while current proposals remain", () => {
@@ -11939,13 +15638,14 @@ Deno.test("Stopped session recorded output survives historical cmux failures and
       "recorded output was described as a failed terminal",
     );
     const historyRequests: Record<string, unknown>[] = [];
-    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      historyRequests.push(body);
-      return new Response(JSON.stringify({
-        result: body.kind === "history_page" ? recorded.recorded_output : [],
-      }));
-    }) as typeof fetch;
+    globalThis.fetch =
+      (async (_input: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        historyRequests.push(body);
+        return new Response(JSON.stringify({
+          result: body.kind === "history_page" ? recorded.recorded_output : [],
+        }));
+      }) as typeof fetch;
     mount(<Card />);
     check(
       !document.body.textContent?.includes("View fresh view-only surface"),
@@ -11954,7 +15654,9 @@ Deno.test("Stopped session recorded output survives historical cmux failures and
     click("View recorded output");
     await settle();
     rerender(<Card />);
-    const pages = historyRequests.filter((body) => body.kind === "history_page");
+    const pages = historyRequests.filter((body) =>
+      body.kind === "history_page"
+    );
     check(
       viewed === 0 && pages.length === 1 && pages[0].transcript_epoch === "e" &&
         document.querySelector(".session-history-text")?.textContent ===
@@ -12452,9 +16154,15 @@ Deno.test("Recorded output decoding matches the service's named literal vectors"
   const { recordedOutputText } = await import("./cmuxRouting");
   const bytes = (value: number[] | string) =>
     encodedBytes(
-      typeof value === "string" ? new TextEncoder().encode(value) : new Uint8Array(value),
+      typeof value === "string"
+        ? new TextEncoder().encode(value)
+        : new Uint8Array(value),
     );
-  const frame = (epoch: string, sequence: number, value: number[] | string) => ({
+  const frame = (
+    epoch: string,
+    sequence: number,
+    value: number[] | string,
+  ) => ({
     epoch,
     sequence,
     captured_at: "2026-01-01T00:00:00Z",
@@ -12473,7 +16181,10 @@ Deno.test("Recorded output decoding matches the service's named literal vectors"
   // The same names, frames and expected text as transcript.rs's
   // recorded_history_vectors, so both readers stay byte-for-byte equivalent.
   const vectors = [
-    ["split_utf8", [frame("epoch-a", 1, [0xe2, 0x82]), frame("epoch-a", 2, [0xac, 0x21])], "€!"],
+    ["split_utf8", [
+      frame("epoch-a", 1, [0xe2, 0x82]),
+      frame("epoch-a", 2, [0xac, 0x21]),
+    ], "€!"],
     ["split_csi_osc", [
       frame("epoch-a", 1, "red\x1b[3"),
       frame("epoch-a", 2, "1mtext\x1b]0;tit"),
@@ -12494,7 +16205,11 @@ Deno.test("Recorded output decoding matches the service's named literal vectors"
       state: "recorded_output",
       message: "",
       retry_available: false,
-      recorded_output: { frames: [...frames], next_sequence: 0, has_more: false },
+      recorded_output: {
+        frames: [...frames],
+        next_sequence: 0,
+        has_more: false,
+      },
     });
     check(text === expected, `${name} decoded to ${JSON.stringify(text)}`);
   }
@@ -12512,7 +16227,11 @@ Deno.test("Stopped output reaches its final retained page, searches the full sav
     data,
     gap: false,
   });
-  const paneView = (id: string, operation: string, state: "unknown" | "opened") => ({
+  const paneView = (
+    id: string,
+    operation: string,
+    state: "unknown" | "opened",
+  ) => ({
     id,
     operation_id: operation,
     session_id: "hist-s",
@@ -12531,31 +16250,52 @@ Deno.test("Stopped output reaches its final retained page, searches the full sav
   });
   // The first page alone exceeds the old single 64 KiB view.
   const longLine = `${"x".repeat(70_000)}\n`;
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    bodies.push(body);
-    const result = body.kind === "history_page"
-      ? body.session_id === "hist-x"
-        ? { frames: [pageFrame("epoch-y", 1, "another invocation")], next_sequence: 1, has_more: false }
-        : body.after_sequence === 0
-        ? { frames: [pageFrame("epoch-a", 1, longLine)], next_sequence: 1, has_more: true }
-        : { frames: [pageFrame("epoch-a", 2, "final retained line\n")], next_sequence: 2, has_more: false }
-      : body.kind === "history_pane_views"
-      ? [paneView("view-unknown", "op-unknown", "unknown")]
-      : body.kind === "history_export_text"
-      ? {
-        session_id: "hist-s",
-        transcript_epoch: "epoch-a",
-        export_hash: "export",
-        high_water_sequence: 3,
-        retention: { first_retained_sequence: 1, high_water_sequence: 3, gap_count: 0, complete: true },
-        text: "alpha\nbeta needle\ngamma needle\n",
-      }
-      : body.kind === "history_pane_open"
-      ? { view: paneView("view-new", String(body.operation_id), "opened"), message: "History pane opened in cmux." }
-      : null;
-    return new Response(JSON.stringify({ result }));
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      const result = body.kind === "history_page"
+        ? body.session_id === "hist-x"
+          ? {
+            frames: [pageFrame("epoch-y", 1, "another invocation")],
+            next_sequence: 1,
+            has_more: false,
+          }
+          : body.after_sequence === 0
+          ? {
+            frames: [pageFrame("epoch-a", 1, longLine)],
+            next_sequence: 1,
+            has_more: true,
+          }
+          : {
+            frames: [pageFrame("epoch-a", 2, "final retained line\n")],
+            next_sequence: 2,
+            has_more: false,
+          }
+        : body.kind === "history_pane_views"
+        ? [paneView("view-unknown", "op-unknown", "unknown")]
+        : body.kind === "history_export_text"
+        ? {
+          session_id: "hist-s",
+          transcript_epoch: "epoch-a",
+          export_hash: "export",
+          high_water_sequence: 3,
+          retention: {
+            first_retained_sequence: 1,
+            high_water_sequence: 3,
+            gap_count: 0,
+            complete: true,
+          },
+          text: "alpha\nbeta needle\ngamma needle\n",
+        }
+        : body.kind === "history_pane_open"
+        ? {
+          view: paneView("view-new", String(body.operation_id), "opened"),
+          message: "History pane opened in cmux.",
+        }
+        : null;
+      return new Response(JSON.stringify({ result }));
+    }) as typeof fetch;
   const stopped = (id: string, epoch: string): Session => ({
     ...managerSession,
     id,
@@ -12600,7 +16340,8 @@ Deno.test("Stopped output reaches its final retained page, searches the full sav
     );
     click("Load more output");
     await settle();
-    const shown = document.querySelector(".session-history-text")?.textContent ?? "";
+    const shown =
+      document.querySelector(".session-history-text")?.textContent ?? "";
     const pages = bodies.filter((body) => body.kind === "history_page");
     check(
       shown.length > 70_000 && shown.endsWith("final retained line\n") &&
@@ -12609,18 +16350,26 @@ Deno.test("Stopped output reaches its final retained page, searches the full sav
         document.body.textContent?.includes("It ends at frame 2"),
       "paging did not reach the final retained frame of the exact epoch",
     );
-    const search = document.querySelector<HTMLFormElement>(".session-history-search")!;
+    const search = document.querySelector<HTMLFormElement>(
+      ".session-history-search",
+    )!;
     field("Search all saved output", "needle");
     act(() => {
-      search.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      search.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
     });
     await settle();
     check(
-      document.body.textContent?.includes("2 matching lines for “needle” in the saved output through frame 3"),
+      document.body.textContent?.includes(
+        "2 matching lines for “needle” in the saved output through frame 3",
+      ),
       "search did not cover the complete saved copy beyond the loaded pages",
     );
     check(
-      document.body.textContent?.includes("could not confirm whether an earlier history pane"),
+      document.body.textContent?.includes(
+        "could not confirm whether an earlier history pane",
+      ),
       "an unknown pane outcome was not shown",
     );
     click("Open another history pane");
@@ -12628,7 +16377,8 @@ Deno.test("Stopped output reaches its final retained page, searches the full sav
     const open = bodies.find((body) => body.kind === "history_pane_open");
     check(
       open?.acknowledged_unknown_view_id === "view-unknown" &&
-        typeof open.operation_id === "string" && open.operation_id !== "op-unknown" &&
+        typeof open.operation_id === "string" &&
+        open.operation_id !== "op-unknown" &&
         document.body.textContent?.includes("History pane opened in cmux."),
       "a new pane did not acknowledge the exact unknown view with a new identity",
     );
@@ -12644,8 +16394,12 @@ Deno.test("Stopped output reaches its final retained page, searches the full sav
     click("View recorded output");
     await settle();
     check(
-      document.body.textContent?.includes("different invocation than the one selected") &&
-        !document.querySelector(".session-history-text")?.textContent?.includes("another invocation"),
+      document.body.textContent?.includes(
+        "different invocation than the one selected",
+      ) &&
+        !document.querySelector(".session-history-text")?.textContent?.includes(
+          "another invocation",
+        ),
       "a page from another invocation was shown under the selected one",
     );
   } finally {
@@ -12656,11 +16410,15 @@ Deno.test("Stopped output reaches its final retained page, searches the full sav
 
 Deno.test("Roles holds agent settings, Activity keeps output, and the full plan window is topmost and read-only", async () => {
   const sent: string[] = [];
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    if (init?.method && init.method !== "GET") sent.push(String(input));
-    return new Response("[]");
-  }) as typeof fetch;
-  const plan = ["# Plan", ...Array.from({ length: 150 }, (_, index) => `- Step ${index + 1}`)]
+  globalThis.fetch =
+    (async (input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method && init.method !== "GET") sent.push(String(input));
+      return new Response("[]");
+    }) as typeof fetch;
+  const plan = [
+    "# Plan",
+    ...Array.from({ length: 150 }, (_, index) => `- Step ${index + 1}`),
+  ]
     .join("\n");
   const planning: Task = {
     ...task,
@@ -12689,7 +16447,9 @@ Deno.test("Roles holds agent settings, Activity keeps output, and the full plan 
     await settle();
     check(
       !!document.querySelector(".role-settings") &&
-        !!document.querySelector('[data-attention-target="role_settings:AJ-1:manager"]'),
+        !!document.querySelector(
+          '[data-attention-target="role_settings:AJ-1:manager"]',
+        ),
       "Roles did not show the agent settings",
     );
     click("Activity");
@@ -12715,11 +16475,16 @@ Deno.test("Roles holds agent settings, Activity keeps output, and the full plan 
     );
     act(() => {
       document.activeElement!.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+        new KeyboardEvent("keydown", {
+          key: "Escape",
+          bubbles: true,
+          cancelable: true,
+        }),
       );
     });
     check(
-      !document.querySelector(".plan-viewer") && !!document.querySelector(".task-dialog") &&
+      !document.querySelector(".plan-viewer") &&
+        !!document.querySelector(".task-dialog") &&
         closed === 0 && document.body.classList.contains("dialog-open") &&
         document.activeElement === opener &&
         !document.querySelector(".task-dialog")?.hasAttribute("inert"),
@@ -12739,19 +16504,27 @@ Deno.test("Roles holds agent settings, Activity keeps output, and the full plan 
       },
     }));
     check(
-      !document.querySelector(".plan-viewer")?.textContent?.includes("Step 150") &&
-        document.body.textContent?.includes("This plan changed after you opened it"),
+      !document.querySelector(".plan-viewer")?.textContent?.includes(
+        "Step 150",
+      ) &&
+        document.body.textContent?.includes(
+          "This plan changed after you opened it",
+        ),
       "a changed plan kept showing the earlier text",
     );
     click("Show the current plan");
-    const viewerText = () => document.querySelector(".plan-viewer")?.textContent ?? "";
+    const viewerText = () =>
+      document.querySelector(".plan-viewer")?.textContent ?? "";
     check(
       viewerText().includes("New step") &&
         viewerText().includes("Opened for: Review the plan for “Existing”"),
       "the current plan could not be reopened under its current decision",
     );
     const closePlan = () =>
-      act(() => document.querySelector<HTMLButtonElement>('[aria-label="Close plan"]')!.click());
+      act(() =>
+        document.querySelector<HTMLButtonElement>('[aria-label="Close plan"]')!
+          .click()
+      );
     closePlan();
 
     // Phase-only changes: attempt, plan hash, text and content revision stay
@@ -12777,9 +16550,14 @@ Deno.test("Roles holds agent settings, Activity keeps output, and the full plan 
       viewerText().includes("Opened for: Review the plan for “Existing”"),
       "the approval decision did not label its plan",
     );
-    rerender(detail(inPhase("awaiting_implementation_authorization"), [exactAuthorization]));
+    rerender(
+      detail(inPhase("awaiting_implementation_authorization"), [
+        exactAuthorization,
+      ]),
+    );
     check(
-      viewerText().includes("Step 150") && !viewerText().includes("Opened for") &&
+      viewerText().includes("Step 150") &&
+        !viewerText().includes("Opened for") &&
         viewerText().includes("no longer waiting for you"),
       "approval → authorization kept the ended approval decision",
     );
@@ -12795,18 +16573,26 @@ Deno.test("Roles holds agent settings, Activity keeps output, and the full plan 
     );
     rerender(detail(inPhase("implementation")));
     check(
-      viewerText().includes("Step 150") && !viewerText().includes("Opened for") &&
+      viewerText().includes("Step 150") &&
+        !viewerText().includes("Opened for") &&
         viewerText().includes("no longer waiting for you"),
       "authorization → implementation kept the ended authorization decision",
     );
     closePlan();
     check(
-      document.activeElement?.getAttribute("aria-label") === "Close task details",
+      document.activeElement?.getAttribute("aria-label") ===
+        "Close task details",
       "closing a plan whose decision panel disappeared did not return focus to the task",
     );
-    check(sent.length === 0, "reading the plan or switching tabs sent a request");
+    check(
+      sent.length === 0,
+      "reading the plan or switching tabs sent a request",
+    );
     unmount();
-    check(!document.body.classList.contains("dialog-open"), "closing every dialog left the page locked");
+    check(
+      !document.body.classList.contains("dialog-open"),
+      "closing every dialog left the page locked",
+    );
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -12817,15 +16603,26 @@ Deno.test("A Single agent run sends only the service's offered decisions with th
   localStorage.clear();
   const bodies: Record<string, unknown>[] = [];
   let failNext = false;
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    bodies.push(body);
-    if (failNext) {
-      failNext = false;
-      throw new TypeError("Connection lost");
-    }
-    return workflowResult(body);
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).includes("/content")) {
+        return new Response(
+          JSON.stringify({
+            task_id: "SA-1",
+            attempt_id: "sa-attempt",
+            records: [],
+            current_input: null,
+          }),
+        );
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      if (failNext) {
+        failNext = false;
+        throw new TypeError("Connection lost");
+      }
+      return workflowResult(body);
+    }) as typeof fetch;
   const commands = () => workflowCommands(bodies);
   const selectedCheck: SingleAgentCheck = {
     check_id: "check-1",
@@ -12844,32 +16641,96 @@ Deno.test("A Single agent run sends only the service's offered decisions with th
     latest_run_passed: null,
   };
   try {
+    const authorizationTask = singleAgentTask(
+      singleAgentRun({
+        stage: "needs_action",
+        selected_check_ids: ["check-1"],
+        checks: [selectedCheck],
+        available_actions: ["authorize_check", "cancel"],
+        resume: {
+          session_id: "sa-session",
+          transcript_epoch: "epoch-1",
+          resume_count: 0,
+          available: false,
+          reason: "The result is waiting for its selected checks",
+        },
+      }),
+      {
+        attention: "needs_input",
+        active_attempt: {
+          id: "sa-attempt",
+          phase: "awaiting_checks",
+          status: "needs_input",
+          base_revision: "abc",
+        },
+      },
+    );
     mount(
-      <ReviewPanel
-        task={singleAgentTask(singleAgentRun({
-          stage: "awaiting_selected_checks",
-          stage_reason: "The selected checks must pass against the captured candidate.",
-          selected_check_ids: ["check-1"],
-          checks: [selectedCheck],
-          available_actions: ["authorize_check", "cancel"],
-        }))}
+      <TaskDetail
+        task={authorizationTask}
+        state={{ ...liveBase, tasks: [authorizationTask] }}
+        onClose={noop}
         onChanged={noop}
       />,
     );
+    await settle();
     check(
       !document.body.textContent?.includes("Accept result") &&
-        document.body.textContent?.includes("deno task test"),
-      "checks waiting showed Accept or hid the exact command",
+        document.body.textContent?.includes("deno task test") &&
+        !document.getElementById("task-question-title") &&
+        !document.body.textContent?.includes("Resume agent is not available"),
+      "check authorization was presented as a question, premature acceptance or unavailable resume",
     );
     click("Allow once");
     await settle();
     const authorize = commands().at(-1);
     check(
-      authorize?.kind === "authorize_check" && authorize.check_id === "check-1" &&
+      authorize?.kind === "authorize_check" &&
+        authorize.check_id === "check-1" &&
         authorize.exact_command_hash === "command-hash" &&
-        authorize.scope_hash === "scope-hash" && authorize.decision === "authorized" &&
+        authorize.scope_hash === "scope-hash" &&
+        authorize.decision === "authorized" &&
         authorize.lifetime === "once" && authorize.attempt_id === "sa-attempt",
       "check authorization lost its exact binding",
+    );
+    const passedCheck: SingleAgentCheck = {
+      ...selectedCheck,
+      latest_run_id: "check-run-1",
+      latest_run_status: "finished",
+      latest_run_passed: true,
+    };
+    const passedRun = singleAgentRun({
+      selected_check_ids: ["check-1"],
+      checks: [passedCheck],
+      available_actions: ["accept_result", "authorize_check"],
+    });
+    const passed = singleAgentTask(passedRun);
+    mount(<ReviewPanel task={passed} onChanged={noop} />);
+    check(
+      document.querySelector(".verification-row .badge")?.textContent ===
+          "Passed" &&
+        !document.body.textContent?.includes(
+          "Waiting for your authorization",
+        ) &&
+        ![...document.querySelectorAll("button")].some((button) =>
+          button.textContent?.trim() === "Allow once"
+        ),
+      "a consumed authorization hid the passing outcome or offered another authorization",
+    );
+    mount(
+      <ReviewPanel
+        task={singleAgentTask(singleAgentRun({
+          stage: "needs_action",
+          selected_check_ids: ["check-1"],
+          checks: [{ ...passedCheck, latest_run_passed: false }],
+          available_actions: ["authorize_check"],
+        }))}
+        onChanged={noop}
+      />,
+    );
+    check(
+      !findButton("Allow one more run").disabled,
+      "a failed check lost its explicit retry authorization",
     );
 
     const guided = singleAgentTask(singleAgentRun({
@@ -12893,7 +16754,8 @@ Deno.test("A Single agent run sends only the service's offered decisions with th
     await settle();
     const unknown = commands().at(-1);
     check(
-      unknown?.kind === "accept_result" && unknown.result_binding_id === "result-1" &&
+      unknown?.kind === "accept_result" &&
+        unknown.result_binding_id === "result-1" &&
         unknown.candidate_hash === "candidate-1" &&
         unknown.guidance_change_hash === "guidance-hash" &&
         unknown.expected_version === guided.version &&
@@ -12903,7 +16765,8 @@ Deno.test("A Single agent run sends only the service's offered decisions with th
     click("Accept result");
     await settle();
     check(
-      commands().length === 3 && commands()[2].operation_id === unknown?.operation_id,
+      commands().length === 3 &&
+        commands()[2].operation_id === unknown?.operation_id,
       "an identical retry after an unknown outcome changed its identity",
     );
 
@@ -12914,7 +16777,12 @@ Deno.test("A Single agent run sends only the service's offered decisions with th
     await settle();
     const before = commands().length;
     const held = commands().at(-1);
-    rerender(<ReviewPanel task={{ ...guided, version: guided.version + 1 }} onChanged={noop} />);
+    rerender(
+      <ReviewPanel
+        task={{ ...guided, version: guided.version + 1 }}
+        onChanged={noop}
+      />,
+    );
     click("Accept result");
     await settle();
     check(
@@ -12931,14 +16799,18 @@ Deno.test("A Single agent run sends only the service's offered decisions with th
       "the reviewed changed request was not sent as a new current request",
     );
 
-    mount(<ReviewPanel task={singleAgentTask(singleAgentRun())} onChanged={noop} />);
+    mount(
+      <ReviewPanel task={singleAgentTask(singleAgentRun())} onChanged={noop} />,
+    );
     field("Changes to request", "Handle empty input");
     click("Request changes");
     await settle();
     const rework = commands().at(-1);
     check(
-      rework?.kind === "request_rework" && rework.feedback === "Handle empty input" &&
-        rework.result_binding_id === "result-1" && rework.candidate_hash === "candidate-1",
+      rework?.kind === "request_rework" &&
+        rework.feedback === "Handle empty input" &&
+        rework.result_binding_id === "result-1" &&
+        rework.candidate_hash === "candidate-1",
       "request changes lost its exact result binding",
     );
 
@@ -12950,9 +16822,119 @@ Deno.test("A Single agent run sends only the service's offered decisions with th
     );
     check(
       ![...document.querySelectorAll("button")].some((button) =>
-        button.textContent === "Accept result" || button.textContent === "Request changes"
+        button.textContent === "Accept result" ||
+        button.textContent === "Request changes"
       ) && document.body.textContent?.includes("does not offer Accept result"),
       "a decision the service did not offer was shown",
+    );
+    const completed = singleAgentTask({
+      ...passedRun,
+      stage: "accepted",
+      available_actions: [],
+      result: passedRun.result && { ...passedRun.result, state: "accepted" },
+    }, {
+      lifecycle: "done",
+      attention: "none",
+      active_attempt: {
+        id: "sa-attempt",
+        phase: "awaiting_human",
+        status: "done",
+        base_revision: "abc",
+        accepted_snapshot_id: "snapshot-1",
+      },
+      snapshots: [{
+        id: "snapshot-1",
+        attempt_id: "sa-attempt",
+        kind: "candidate",
+        manifest_hash: "candidate-1",
+        complete: true,
+        created_at: "2026-10-12T00:00:00Z",
+        manifest: {
+          total_entries: 103,
+          entries: [
+            { path: "AGENTS.md", kind: "file", mode: 33188, deleted: false },
+            { path: "label.py", kind: "file", mode: 33188, deleted: false },
+            { path: "obsolete.py", kind: "file", mode: 33188, deleted: true },
+          ],
+        },
+      }],
+    });
+    mount(
+      <TaskDetail
+        task={completed}
+        state={{ ...liveBase, tasks: [completed] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    check(
+      document.querySelector(".verification-summary")?.textContent?.includes(
+        "1 of 1 selected checks passed",
+      ) &&
+        !document.querySelector(".verification-summary")?.textContent?.includes(
+          "before you can accept",
+        ) &&
+        ![...document.querySelectorAll("button")].some((button) =>
+          ["Accept result", "Allow once", "Resume agent"].includes(
+            button.textContent?.trim() ?? "",
+          )
+        ),
+      "completed verification regressed or offered a new execution or decision",
+    );
+    click("Changes");
+    const inventory = document.querySelector(
+      '[aria-labelledby="changes-title"]',
+    );
+    check(
+      inventory?.textContent?.includes("Captured files") &&
+        inventory.textContent.includes("includes unchanged files") &&
+        inventory.textContent.includes("Showing the first 3 of 103 files") &&
+        inventory.querySelector(".file-changes li code")?.textContent ===
+          "AGENTS.md" &&
+        inventory.querySelector(".file-changes li .badge")?.textContent ===
+          "Present" &&
+        inventory.querySelector(".file-changes li:last-child code")
+            ?.textContent === "obsolete.py" &&
+        inventory.querySelector(".file-changes li:last-child .badge")
+            ?.textContent === "Deleted",
+      "the saved inventory called unchanged guidance a change, hid deletions or implied full coverage",
+    );
+    const cancelled = singleAgentTask({
+      ...passedRun,
+      stage: "blocked",
+      checks: [],
+      available_actions: [],
+      result: passedRun.result &&
+        { ...passedRun.result, state: "awaiting_checks" },
+    }, {
+      lifecycle: "cancelled",
+      attention: "none",
+      active_attempt: {
+        id: "sa-attempt",
+        phase: "awaiting_checks",
+        status: "cancelled",
+        base_revision: "abc",
+      },
+    });
+    mount(
+      <TaskDetail
+        task={cancelled}
+        state={{ ...liveBase, tasks: [cancelled] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    check(
+      document.querySelector(".verification-summary")?.textContent?.includes(
+        "outcomes are unavailable",
+      ) &&
+        document.querySelector(".verification-summary")?.textContent?.includes(
+          "run was cancelled",
+        ) &&
+        !document.querySelector(".verification-summary")?.textContent?.includes(
+          "before you can accept",
+        ),
+      "cancelled verification inferred a pass or instructed the user to accept",
     );
   } finally {
     unmount();
@@ -12964,21 +16946,111 @@ Deno.test("A Single agent run sends only the service's offered decisions with th
 Deno.test("Board and task detail show the same Single agent stage and reason", () => {
   const working = singleAgentTask(singleAgentRun({
     stage: "result_submitted_waiting_for_stop",
-    stage_reason: "The agent submitted its result; waiting for its processes to stop before capturing the worktree.",
+    stage_reason:
+      "The agent submitted its result; waiting for its processes to stop before capturing the worktree.",
     result: null,
     available_actions: [],
   }));
   try {
-    mount(<TaskBoard tasks={[working]} projects={[initialized]} onOpen={noop} onEdit={noop} onChanged={noop} />);
-    const boardBadge = document.querySelector(".task-card .status-badge")?.textContent;
-    mount(<TaskDetail task={working} state={{ ...liveBase, tasks: [working] }} onClose={noop} onChanged={noop} />);
+    mount(
+      <TaskBoard
+        tasks={[working]}
+        projects={[initialized]}
+        onOpen={noop}
+        onEdit={noop}
+        onChanged={noop}
+      />,
+    );
+    const boardBadge = document.querySelector(".task-card .status-badge")
+      ?.textContent;
+    mount(
+      <TaskDetail
+        task={working}
+        state={{ ...liveBase, tasks: [working] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
     check(
       boardBadge === "Result submitted" &&
-        document.querySelector(".task-dialog-title-row .status-badge")?.textContent === boardBadge &&
+        document.querySelector(".task-dialog-title-row .status-badge")
+            ?.textContent === boardBadge &&
         document.getElementById("task-dialog-status")?.textContent ===
           working.workflow?.run?.stage_reason &&
-        document.querySelector('.phase-progress [aria-current="step"]')?.textContent?.startsWith("Result"),
+        document.querySelector('.phase-progress [aria-current="step"]')
+          ?.textContent?.startsWith("Result"),
       "board and detail disagreed on the Single agent stage",
+    );
+    const draft: Task = {
+      ...working,
+      lifecycle: "backlog",
+      active_attempt: undefined,
+      workflow: {
+        ...working.workflow!,
+        admission_state: "draft",
+        check_ids: ["draft-check"],
+        run: null,
+      },
+    };
+    mount(
+      <TaskDetail
+        task={draft}
+        state={{ ...liveBase, tasks: [draft] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    check(
+      document.querySelector(".verification-summary")?.textContent?.includes(
+        "1 check is selected for this draft",
+      ) &&
+        document.querySelector(".verification-summary")?.textContent?.includes(
+          "Not run yet",
+        ) &&
+        !document.querySelector(".verification-summary")?.textContent?.includes(
+          "No checks are selected",
+        ),
+      "the draft's selected check was presented as absent or completed",
+    );
+    const queued = { ...draft, lifecycle: "ready" };
+    mount(
+      <TaskDetail
+        task={queued}
+        state={{ ...liveBase, tasks: [queued] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    check(
+      document.querySelector(".verification-summary")?.textContent?.includes(
+        "selected for this queued task",
+      ) &&
+        document.querySelector(".verification-summary")?.textContent?.includes(
+          "Not run yet",
+        ),
+      "a Ready task's selection was presented as a draft or completed run",
+    );
+    const frozen = {
+      ...draft,
+      lifecycle: "in_progress",
+      workflow: {
+        ...draft.workflow!,
+        run: singleAgentRun({ selected_check_ids: [], checks: [] }),
+      },
+    };
+    mount(
+      <TaskDetail
+        task={frozen}
+        state={{ ...liveBase, tasks: [frozen] }}
+        onClose={noop}
+        onChanged={noop}
+      />,
+    );
+    check(
+      document.querySelector(".verification-summary")?.textContent?.includes(
+        "No checks are selected for this run",
+      ),
+      "a run used the draft selection instead of its frozen checks",
     );
   } finally {
     unmount();
@@ -12989,14 +17061,15 @@ Deno.test("New tasks follow the project default workflow, and draft choices bind
   localStorage.clear();
   const bodies: Record<string, unknown>[] = [];
   let saved = 0;
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    if (!init?.body) return new Response("[]");
-    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
-    bodies.push(body);
-    return body.kind === "workflow"
-      ? workflowResult(body)
-      : new Response(JSON.stringify({ result: { entity_id: "AJ-9", version: 1 } }));
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (!init?.body) return new Response("[]");
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      bodies.push(body);
+      return body.kind === "workflow" ? workflowResult(body) : new Response(
+        JSON.stringify({ result: { entity_id: "AJ-9", version: 1 } }),
+      );
+    }) as typeof fetch;
   try {
     mount(
       <TaskForm
@@ -13021,11 +17094,12 @@ Deno.test("New tasks follow the project default workflow, and draft choices bind
     check(
       created?.kind === "create_task" && created.title === "Write the guide" &&
         JSON.stringify(created.selection) === JSON.stringify({
-          family: "single_agent",
-          execution_config_revision_id: "cfg-1",
-          profile_revision_id: "prof-rev-1",
-          check_ids: ["check-1"],
-        }) && !("ready" in created) && saved === 1,
+            family: "single_agent",
+            execution_config_revision_id: "cfg-1",
+            profile_revision_id: "prof-rev-1",
+            check_ids: ["check-1"],
+          }) &&
+        !("ready" in created) && saved === 1,
       "the Single agent create did not bind its exact selection",
     );
 
@@ -13036,7 +17110,10 @@ Deno.test("New tasks follow the project default workflow, and draft choices bind
         selectedProjectId="p1"
         onSaved={noop}
         onClose={noop}
-        workflowExecution={[{ ...singleAgentExecution, default_family: "trip" }]}
+        workflowExecution={[{
+          ...singleAgentExecution,
+          default_family: "trip",
+        }]}
       />,
     );
     check(
@@ -13046,7 +17123,11 @@ Deno.test("New tasks follow the project default workflow, and draft choices bind
       "a TRIP default lost the TRIP create path",
     );
 
-    const ready: Task = { ...task, lifecycle: "ready", active_attempt: undefined };
+    const ready: Task = {
+      ...task,
+      lifecycle: "ready",
+      active_attempt: undefined,
+    };
     mount(
       <RoleSettings
         task={ready}
@@ -13061,7 +17142,9 @@ Deno.test("New tasks follow the project default workflow, and draft choices bind
     act(() => choiceFor("Single agent (one agent").click());
     change(findSelect("Agent profile"), "prof-rev-1");
     check(
-      document.body.textContent?.includes("moves this Ready task back to the drafts"),
+      document.body.textContent?.includes(
+        "moves this Ready task back to the drafts",
+      ),
       "changing a Ready task's workflow did not warn about admission",
     );
     click("Save workflow choice");
@@ -13071,11 +17154,11 @@ Deno.test("New tasks follow the project default workflow, and draft choices bind
       selected?.kind === "set_task_workflow" && selected.task_id === ready.id &&
         selected.expected_version === ready.version &&
         JSON.stringify(selected.selection) === JSON.stringify({
-          family: "single_agent",
-          execution_config_revision_id: "cfg-1",
-          profile_revision_id: "prof-rev-1",
-          check_ids: [],
-        }),
+            family: "single_agent",
+            execution_config_revision_id: "cfg-1",
+            profile_revision_id: "prof-rev-1",
+            check_ids: [],
+          }),
       "the workflow choice lost its exact task version or selection",
     );
   } finally {
@@ -13090,38 +17173,46 @@ Deno.test("Project Single agent settings show the service's probe blocker and se
   const bodies: Record<string, unknown>[] = [];
   let loseNextResponse = false;
   let refuseNextRequest = false;
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    if (!init?.body) return new Response("[]");
-    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
-    bodies.push(body);
-    if (loseNextResponse) {
-      loseNextResponse = false;
-      throw new TypeError("Connection lost");
-    }
-    if (refuseNextRequest) {
-      refuseNextRequest = false;
-      return new Response(
-        JSON.stringify({ error: "browser session required" }),
-        { status: 401 },
-      );
-    }
-    const command = body.command as Record<string, unknown> | undefined;
-    if (command?.kind === "save_agent_profile" && command.profile_id === null) {
-      return new Response(JSON.stringify({
-        result: {
-          operation_id: command.operation_id,
-          entity_kind: "agent_profile",
-          entity_id: "profile-new",
-          version: 1,
-          state: "created",
-          detail: {},
-        },
-      }));
-    }
-    return workflowResult(body);
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (!init?.body) return new Response("[]");
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      bodies.push(body);
+      if (loseNextResponse) {
+        loseNextResponse = false;
+        throw new TypeError("Connection lost");
+      }
+      if (refuseNextRequest) {
+        refuseNextRequest = false;
+        return new Response(
+          JSON.stringify({ error: "browser session required" }),
+          { status: 401 },
+        );
+      }
+      const command = body.command as Record<string, unknown> | undefined;
+      if (
+        command?.kind === "save_agent_profile" && command.profile_id === null
+      ) {
+        return new Response(JSON.stringify({
+          result: {
+            operation_id: command.operation_id,
+            entity_kind: "agent_profile",
+            entity_id: "profile-new",
+            version: 1,
+            state: "created",
+            detail: {},
+          },
+        }));
+      }
+      return workflowResult(body);
+    }) as typeof fetch;
   const settings = (execution: ProjectExecution, tasks: Task[] = []) => (
-    <ProjectSettings project={initialized} execution={execution} tasks={tasks} onChanged={noop} />
+    <ProjectSettings
+      project={initialized}
+      execution={execution}
+      tasks={tasks}
+      onChanged={noop}
+    />
   );
   try {
     mount(settings(singleAgentExecution));
@@ -13133,7 +17224,9 @@ Deno.test("Project Single agent settings show the service's probe blocker and se
         !document.body.textContent.includes("Queue the probe run"),
       "an unavailable probe was offered or its reason hidden",
     );
-    act(() => choiceFor("TRIP", document.querySelector(".workflow-default")!).click());
+    act(() =>
+      choiceFor("TRIP", document.querySelector(".workflow-default")!).click()
+    );
     click("Save default workflow");
     await settle();
     const defaulted = workflowCommands(bodies).at(-1);
@@ -13153,12 +17246,16 @@ Deno.test("Project Single agent settings show the service's probe blocker and se
     };
     rerender(settings(available));
     click("Probe this profile");
-    check(workflowCommands(bodies).length === 1, "probing started without confirmation");
+    check(
+      workflowCommands(bodies).length === 1,
+      "probing started without confirmation",
+    );
     click("Queue the probe run");
     await settle();
     const probe = workflowCommands(bodies).at(-1);
     check(
-      probe?.kind === "probe_profile_admission" && probe.admission_id === "adm-1" &&
+      probe?.kind === "probe_profile_admission" &&
+        probe.admission_id === "adm-1" &&
         probe.project_id === "p1",
       "the probe lost its exact admission",
     );
@@ -13168,8 +17265,44 @@ Deno.test("Project Single agent settings show the service's probe blocker and se
       ),
       "activation was offered without recorded probe evidence",
     );
+    const cancelledProbe = singleAgentTask(
+      singleAgentRun({
+        stage: "blocked",
+        probe_admission_id: "adm-1",
+        available_actions: [],
+      }),
+      { id: "cancelled-probe", lifecycle: "cancelled" },
+    );
+    rerender(
+      settings({
+        ...available,
+        admissions: [{
+          ...available.admissions[0],
+          probe_task_id: cancelledProbe.id,
+          state_reason:
+            "The previous probe was cancelled. Its history is kept; choose Probe this profile to start a new explicit probe.",
+        }],
+      }, [cancelledProbe]),
+    );
+    const beforeReplacement = workflowCommands(bodies).length;
+    click("Probe this profile");
+    check(
+      workflowCommands(bodies).length === beforeReplacement &&
+        document.body.textContent?.includes("paid model call") &&
+        document.body.textContent?.includes("previous probe was cancelled") &&
+        ![...document.querySelectorAll("button")].some((button) =>
+          button.textContent === "Activate admission"
+        ),
+      "cancelled probe history offered activation or started a replacement without explicit confirmation",
+    );
+    click("Don't probe");
     const probeTask = singleAgentTask(
-      singleAgentRun({ stage: "probe_evidence_recorded", probe_admission_id: "adm-1", result: null, available_actions: [] }),
+      singleAgentRun({
+        stage: "probe_evidence_recorded",
+        probe_admission_id: "adm-1",
+        result: null,
+        available_actions: [],
+      }),
       { id: "probe-task", lifecycle: "done" },
     );
     rerender(settings({
@@ -13180,7 +17313,8 @@ Deno.test("Project Single agent settings show the service's probe blocker and se
     await settle();
     const activated = workflowCommands(bodies).at(-1);
     check(
-      activated?.kind === "activate_profile_admission" && activated.admission_id === "adm-1",
+      activated?.kind === "activate_profile_admission" &&
+        activated.admission_id === "adm-1",
       "activation lost its exact admission",
     );
 
@@ -13190,7 +17324,9 @@ Deno.test("Project Single agent settings show the service's probe blocker and se
     const editorField = (label: string) =>
       [...editor().querySelectorAll("label")]
         .find((item) => item.textContent?.startsWith(label))!
-        .querySelector<HTMLInputElement | HTMLTextAreaElement>("input, textarea")!;
+        .querySelector<HTMLInputElement | HTMLTextAreaElement>(
+          "input, textarea",
+        )!;
     const editorButton = (text: string) =>
       [...editor().querySelectorAll<HTMLButtonElement>("button")]
         .find((button) => button.textContent?.includes(text))!;
@@ -13212,7 +17348,9 @@ Deno.test("Project Single agent settings show the service's probe blocker and se
     check(
       creations().length === 1 && editorButton("Save profile").disabled &&
         editorField("Profile exact model").value === "gpt-6.2-sol" &&
-        editor().textContent?.includes("“Reviewer” (codex · gpt-6.1-sol · medium)"),
+        editor().textContent?.includes(
+          "“Reviewer” (codex · gpt-6.1-sol · medium)",
+        ),
       "an edited creation was sent while the earlier one was unresolved, or the edit was lost",
     );
     act(() => editorButton("Cancel").click());
@@ -13230,8 +17368,10 @@ Deno.test("Project Single agent settings show the service's probe blocker and se
     await settle();
     const refused = creations().at(-1);
     check(
-      creations().length === 2 && refused?.operation_id === original?.operation_id &&
-        localStorage.getItem("llmrelay.workflow.project.p1") === storedOriginal &&
+      creations().length === 2 &&
+        refused?.operation_id === original?.operation_id &&
+        localStorage.getItem("llmrelay.workflow.project.p1") ===
+          storedOriginal &&
         editorButton("Save profile").disabled &&
         !!editorButton("Check the earlier profile creation") &&
         document.body.textContent?.includes("browser session required"),
@@ -13241,9 +17381,11 @@ Deno.test("Project Single agent settings show the service's probe blocker and se
     await settle();
     const replay = creations().at(-1);
     check(
-      creations().length === 3 && replay?.operation_id === original?.operation_id &&
+      creations().length === 3 &&
+        replay?.operation_id === original?.operation_id &&
         JSON.stringify(replay) === JSON.stringify(original) &&
-        editor().querySelector("legend")?.textContent === "Edit the recovered profile",
+        editor().querySelector("legend")?.textContent ===
+          "Edit the recovered profile",
       "recovery did not resend the exact earlier creation",
     );
     change(editorField("Instructions for the agent"), "Review very carefully.");
@@ -13268,68 +17410,95 @@ Deno.test("Providers makes no request on open, starts only an authorized preview
   const bodies: Record<string, unknown>[] = [];
   let failStart = true;
   let reconcileReply: (body: Record<string, unknown>) => unknown = () => null;
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    bodies.push(body);
-    if (body.kind === "provider_validation_reconcile") {
-      return new Response(JSON.stringify({ result: reconcileReply(body) }));
-    }
-    if (body.kind === "provider_validation_preview") {
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      if (body.kind === "provider_validation_reconcile") {
+        return new Response(JSON.stringify({ result: reconcileReply(body) }));
+      }
+      if (body.kind === "provider_validation_preview") {
+        return new Response(JSON.stringify({
+          result: {
+            preview_hash: "preview-1",
+            installations: ["codex", "claude"].map((provider) => ({
+              provider,
+              ready: true,
+              executable_path: `/usr/local/bin/${provider}`,
+              executable_version: "1.0.0",
+              account_identity: provider === "codex" ? "account-1" : null,
+              authentication: "signed in",
+              model_calls_disabled_reason: null,
+              guidance: null,
+            })),
+            checks: [{
+              ordinal: 0,
+              provider: "codex",
+              model: "gpt-6.1-sol",
+              effort: "high",
+              plan: "reuse_proof",
+              reason: "A current confirmation exists.",
+              proof_observed_at: "2026-10-10T00:00:00Z",
+              proof_expires_at: "2026-10-11T00:00:00Z",
+              model_listed: true,
+            }, {
+              ordinal: 1,
+              provider: "claude",
+              model: "claude-opus-5-5",
+              effort: "medium",
+              plan: "model_call",
+              reason: "No current confirmation.",
+              proof_observed_at: null,
+              proof_expires_at: null,
+              model_listed: null,
+            }],
+            model_calls_required: 1,
+          },
+        }));
+      }
+      if (body.kind === "provider_validation_start" && failStart) {
+        failStart = false;
+        throw new TypeError("Connection lost");
+      }
       return new Response(JSON.stringify({
         result: {
-          preview_hash: "preview-1",
-          installations: ["codex", "claude"].map((provider) => ({
-            provider,
-            ready: true,
-            executable_path: `/usr/local/bin/${provider}`,
-            executable_version: "1.0.0",
-            account_identity: provider === "codex" ? "account-1" : null,
-            authentication: "signed in",
-            model_calls_disabled_reason: null,
-            guidance: null,
-          })),
+          id: "batch-1",
+          operation_id: body.operation_id,
+          state: "finished",
+          model_calls_authorized: true,
+          max_model_calls: 1,
+          created_at: "2026-10-10T00:00:00Z",
+          updated_at: "2026-10-10T00:01:00Z",
+          finished_at: "2026-10-10T00:01:00Z",
           checks: [{
-            ordinal: 0, provider: "codex", model: "gpt-6.1-sol", effort: "high",
-            plan: "reuse_proof", reason: "A current confirmation exists.",
-            proof_observed_at: "2026-10-10T00:00:00Z", proof_expires_at: "2026-10-11T00:00:00Z",
-            model_listed: true,
+            id: "check-codex",
+            ordinal: 0,
+            provider: "codex",
+            model: "gpt-6.1-sol",
+            effort: "high",
+            state: "succeeded",
+            reused_proof: true,
+            reason: null,
+            proof_observed_at: "2026-10-10T00:00:00Z",
+            proof_expires_at: "2026-10-11T00:00:00Z",
+            updated_at: "2026-10-10T00:01:00Z",
           }, {
-            ordinal: 1, provider: "claude", model: "claude-opus-5-5", effort: "medium",
-            plan: "model_call", reason: "No current confirmation.",
-            proof_observed_at: null, proof_expires_at: null, model_listed: null,
+            id: "check-claude",
+            ordinal: 1,
+            provider: "claude",
+            model: "claude-opus-5-5",
+            effort: "medium",
+            state: "failed",
+            reused_proof: false,
+            reason:
+              "The provider refused this model for the signed-in account.",
+            proof_observed_at: null,
+            proof_expires_at: null,
+            updated_at: "2026-10-10T00:01:00Z",
           }],
-          model_calls_required: 1,
         },
       }));
-    }
-    if (body.kind === "provider_validation_start" && failStart) {
-      failStart = false;
-      throw new TypeError("Connection lost");
-    }
-    return new Response(JSON.stringify({
-      result: {
-        id: "batch-1",
-        operation_id: body.operation_id,
-        state: "finished",
-        model_calls_authorized: true,
-        max_model_calls: 1,
-        created_at: "2026-10-10T00:00:00Z",
-        updated_at: "2026-10-10T00:01:00Z",
-        finished_at: "2026-10-10T00:01:00Z",
-        checks: [{
-          id: "check-codex", ordinal: 0, provider: "codex", model: "gpt-6.1-sol",
-          effort: "high", state: "succeeded", reused_proof: true, reason: null,
-          proof_observed_at: "2026-10-10T00:00:00Z", proof_expires_at: "2026-10-11T00:00:00Z",
-          updated_at: "2026-10-10T00:01:00Z",
-        }, {
-          id: "check-claude", ordinal: 1, provider: "claude", model: "claude-opus-5-5",
-          effort: "medium", state: "failed", reused_proof: false,
-          reason: "The provider refused this model for the signed-in account.",
-          proof_observed_at: null, proof_expires_at: null, updated_at: "2026-10-10T00:01:00Z",
-        }],
-      },
-    }));
-  }) as typeof fetch;
+    }) as typeof fetch;
   const listedBatch = (day: number) => ({
     id: `batch-listed-${day}`,
     operation_id: `listed-${day}`,
@@ -13358,26 +17527,34 @@ Deno.test("Providers makes no request on open, starts only an authorized preview
   try {
     mount(<ProviderSettings validation={validation} onChanged={noop} />);
     check(bodies.length === 0, "opening Providers sent a request");
-    act(() => document.querySelectorAll<HTMLInputElement>(".provider-row input[type=checkbox]")[1].click());
+    act(() =>
+      document.querySelectorAll<HTMLInputElement>(
+        ".provider-row input[type=checkbox]",
+      )[1].click()
+    );
     field("Claude model to check", "claude-opus-5-5");
     click("Preview checks");
     await settle();
     check(
       bodies.length === 1 && bodies[0].kind === "provider_validation_preview" &&
         JSON.stringify(bodies[0].selections) === JSON.stringify([
-          { provider: "codex", model: "gpt-6.1-sol", effort: "high" },
-          { provider: "claude", model: "claude-opus-5-5", effort: "medium" },
-        ]) &&
+            { provider: "codex", model: "gpt-6.1-sol", effort: "high" },
+            { provider: "claude", model: "claude-opus-5-5", effort: "medium" },
+          ]) &&
         document.body.textContent?.includes("Account identity unavailable"),
       "the preview lost the exact selection or hid unavailable account identity",
     );
-    check(findButton("Start these checks").disabled, "model calls started without authorization");
+    check(
+      findButton("Start these checks").disabled,
+      "model calls started without authorization",
+    );
     act(() => choiceFor("Allow up to 1 new model call").click());
     click("Start these checks");
     await settle();
     const first = bodies.at(-1);
     check(
-      first?.kind === "provider_validation_start" && first.preview_hash === "preview-1" &&
+      first?.kind === "provider_validation_start" &&
+        first.preview_hash === "preview-1" &&
         first.authorize_model_calls === true && first.max_model_calls === 1 &&
         localStorage.getItem("llmrelay.providers.start") !== null &&
         !document.body.textContent?.includes("Forget"),
@@ -13400,7 +17577,8 @@ Deno.test("Providers makes no request on open, starts only an authorized preview
     const stale = bodies.at(-1);
     check(
       stale?.kind === "provider_validation_reconcile" &&
-        JSON.stringify({ ...stale, kind: "" }) === JSON.stringify({ ...first, kind: "" }) &&
+        JSON.stringify({ ...stale, kind: "" }) ===
+          JSON.stringify({ ...first, kind: "" }) &&
         localStorage.getItem("llmrelay.providers.start") === stored &&
         choiceFor("Allow up to 1 new model call").checked &&
         !findButton("Start these checks").disabled,
@@ -13431,7 +17609,10 @@ Deno.test("Providers makes no request on open, starts only an authorized preview
       "a recovered request older than the recent checks was hidden, or its identity was kept",
     );
     // Settling leaves no preview or call approval to start from.
-    check(!startShown(), "a settled request left its preview available for a new start");
+    check(
+      !startShown(),
+      "a settled request left its preview available for a new start",
+    );
 
     // A new start needs a new preview and approval, and gets a new identity;
     // its identical replay never starts twice.
@@ -13458,13 +17639,16 @@ Deno.test("Providers makes no request on open, starts only an authorized preview
     const replay = bodies.at(-1);
     check(
       replay?.operation_id === second?.operation_id &&
-        JSON.stringify({ ...replay, operation_id: "" }) === JSON.stringify({ ...second, operation_id: "" }) &&
+        JSON.stringify({ ...replay, operation_id: "" }) ===
+          JSON.stringify({ ...second, operation_id: "" }) &&
         localStorage.getItem("llmrelay.providers.start") === null,
       "the replay changed the request or kept a settled identity",
     );
     check(
       document.body.textContent?.includes("Reused a current confirmation") &&
-        document.body.textContent.includes("The provider refused this model for the signed-in account."),
+        document.body.textContent.includes(
+          "The provider refused this model for the signed-in account.",
+        ),
       "one provider's failure hid the other provider's result",
     );
 
@@ -13565,7 +17749,10 @@ Deno.test("Retry stays off while an instruction file still differs, and the revi
     );
     mount(detail(null));
     field("Recovery evidence", "README.md was restored");
-    check(!findButton("Retry failed step").disabled, "a settled cause kept Retry off");
+    check(
+      !findButton("Retry failed step").disabled,
+      "a settled cause kept Retry off",
+    );
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -13584,13 +17771,21 @@ Deno.test("Instruction-file review labels its comparison source and keeps the co
     plan_hash: "approved-plan",
     config_revision_id: "config",
     policy_hash: "policy",
-    workspace: { path: "/tmp/llmrelay/worktrees/AJ-1", base_revision: "0123456789abcdef" },
+    workspace: {
+      path: "/tmp/llmrelay/worktrees/AJ-1",
+      base_revision: "0123456789abcdef",
+    },
     files: [{
       path: "README.md",
       previous_sha256: pin,
       sha256: current,
       content: "# Title\nNew line\n",
-      baseline: { source: "pinned", revision: "0123456789abcdef", sha256: malformed ? "c".repeat(64) : pin, reason: null },
+      baseline: {
+        source: "pinned",
+        revision: "0123456789abcdef",
+        sha256: malformed ? "c".repeat(64) : pin,
+        reason: null,
+      },
       diff: [
         { kind: "context", text: "# Title\n" },
         { kind: "removed", text: "Old line\n" },
@@ -13602,7 +17797,12 @@ Deno.test("Instruction-file review labels its comparison source and keeps the co
       previous_sha256: pin,
       sha256: current,
       content: "guide\n",
-      baseline: { source: "base_commit", revision: "0123456789abcdef", sha256: "d".repeat(64), reason: null },
+      baseline: {
+        source: "base_commit",
+        revision: "0123456789abcdef",
+        sha256: "d".repeat(64),
+        reason: null,
+      },
       diff: [{ kind: "added", text: "guide\n" }],
     }, {
       path: "AGENTS.md",
@@ -13618,13 +17818,16 @@ Deno.test("Instruction-file review labels its comparison source and keeps the co
       diff: null,
     }],
   });
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    if (String(input).endsWith("/guidance-reauthorization")) {
-      return new Response(JSON.stringify(preview()));
-    }
-    requests.push(JSON.parse(String(init?.body)));
-    return new Response(JSON.stringify({ result: { state: "guidance_reauthorized" } }));
-  }) as typeof fetch;
+  globalThis.fetch =
+    (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/guidance-reauthorization")) {
+        return new Response(JSON.stringify(preview()));
+      }
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(
+        JSON.stringify({ result: { state: "guidance_reauthorized" } }),
+      );
+    }) as typeof fetch;
   const section = (path: string) =>
     [...document.querySelectorAll("details")].find((item) =>
       item.querySelector("summary")?.textContent === `Changed file: ${path}`
@@ -13633,18 +17836,26 @@ Deno.test("Instruction-file review labels its comparison source and keeps the co
     mount(<GuidanceRecovery task={task} onChanged={noop} />);
     click("Review planned documentation update");
     await settle();
-    const diff = section("README.md")?.querySelector(".guidance-diff")?.textContent ?? "";
+    const diff =
+      section("README.md")?.querySelector(".guidance-diff")?.textContent ?? "";
     check(
       document.body.textContent?.includes("/tmp/llmrelay/worktrees/AJ-1") &&
-        section("README.md")?.textContent?.includes("compared with the approved copy") &&
+        section("README.md")?.textContent?.includes(
+          "compared with the approved copy",
+        ) &&
         diff.includes("- Old line") && diff.includes("+ New line") &&
         diff.includes("… 4 unchanged lines …"),
       "the pinned comparison or its workspace was not shown",
     );
     check(
-      section("docs/GUIDE.md")?.textContent?.includes("This is not the approved copy") &&
-        section("AGENTS.md")?.textContent?.includes("larger than the preview limit") &&
-        section("AGENTS.md")?.querySelector("pre")?.textContent === "the whole agents file\n",
+      section("docs/GUIDE.md")?.textContent?.includes(
+        "This is not the approved copy",
+      ) &&
+        section("AGENTS.md")?.textContent?.includes(
+          "larger than the preview limit",
+        ) &&
+        section("AGENTS.md")?.querySelector("pre")?.textContent ===
+          "the whole agents file\n",
       "a base-commit or unavailable comparison was presented as the approved copy",
     );
     click("Approve planned documentation update");
@@ -13652,12 +17863,12 @@ Deno.test("Instruction-file review labels its comparison source and keeps the co
     check(
       requests.length === 1 &&
         JSON.stringify(requests[0].files) === JSON.stringify(
-          ["README.md", "docs/GUIDE.md", "AGENTS.md"].map((path) => ({
-            path,
-            previous_sha256: pin,
-            sha256: current,
-          })),
-        ),
+            ["README.md", "docs/GUIDE.md", "AGENTS.md"].map((path) => ({
+              path,
+              previous_sha256: pin,
+              sha256: current,
+            })),
+          ),
       "approval sent comparison content as authority",
     );
     malformed = true;
@@ -13689,10 +17900,15 @@ Deno.test("Verification and replacement wait until the role's generation has set
         status: "unverified",
         reason: "verification required",
         compatibility: {
-          status: "matched", observed_version: "codex-cli 0.155.1",
-          pack_id: "codex", pack_revision: "1", contract_id: "implementer",
-          contract_revision: "1", short_hash: "123456789abc",
-          predicate_id: "codex-exact", missing_evidence: [],
+          status: "matched",
+          observed_version: "codex-cli 0.155.1",
+          pack_id: "codex",
+          pack_revision: "1",
+          contract_id: "implementer",
+          contract_revision: "1",
+          short_hash: "123456789abc",
+          predicate_id: "codex-exact",
+          missing_evidence: [],
           action: "requalify_exact_profile",
           message: "Eligible for qualification.",
         },
@@ -13700,7 +17916,11 @@ Deno.test("Verification and replacement wait until the role's generation has set
     }
     return new Response("{}");
   }) as typeof fetch;
-  const config = { provider: "codex" as const, model: "gpt-5.6-sol", effort: "high" };
+  const config = {
+    provider: "codex" as const,
+    model: "gpt-5.6-sol",
+    effort: "high",
+  };
   const configured: Task = {
     ...task,
     role_settings: [{
@@ -13737,7 +17957,12 @@ Deno.test("Verification and replacement wait until the role's generation has set
     ...fields,
   });
   const roles = (session: Session) => (
-    <RoleSettings task={configured} project={initialized} sessions={[session]} onChanged={noop} />
+    <RoleSettings
+      task={configured}
+      project={initialized}
+      sessions={[session]}
+      onChanged={noop}
+    />
   );
   try {
     mount(roles(exited("s-impl", "g-impl", "implementer", {
@@ -13747,7 +17972,9 @@ Deno.test("Verification and replacement wait until the role's generation has set
     await settle();
     check(
       findButton("Prepare verification").disabled &&
-        document.body.textContent?.includes("has not yet confirmed that it fully stopped"),
+        document.body.textContent?.includes(
+          "has not yet confirmed that it fully stopped",
+        ),
       "verification was offered while the generation was still stopping",
     );
     rerender(roles(exited("s-impl", "g-impl", "implementer", {
@@ -13755,7 +17982,10 @@ Deno.test("Verification and replacement wait until the role's generation has set
       has_newer_generation: 0,
     })));
     await settle();
-    check(!findButton("Prepare verification").disabled, "a settled generation kept verification off");
+    check(
+      !findButton("Prepare verification").disabled,
+      "a settled generation kept verification off",
+    );
     rerender(roles(exited("s-impl", "g-impl", "implementer", {})));
     await settle();
     check(
@@ -13763,7 +17993,11 @@ Deno.test("Verification and replacement wait until the role's generation has set
       "an older snapshot without generation fields was treated as settled",
     );
     const controls = (session: Session) => (
-      <WorkflowControls task={configured} sessions={[session]} onChanged={noop} />
+      <WorkflowControls
+        task={configured}
+        sessions={[session]}
+        onChanged={noop}
+      />
     );
     mount(controls(exited("s1", "g1", "manager", {
       generation_status: "stopping",
@@ -13789,23 +18023,40 @@ Deno.test("Verification and replacement wait until the role's generation has set
 });
 
 Deno.test("Attention groups one obligation's notices without merging items that have no target", () => {
-  const target: AttentionTarget = { kind: "task", project_id: "p1", task_id: "AJ-1", task_version: 7 };
+  const target: AttentionTarget = {
+    kind: "task",
+    project_id: "p1",
+    task_id: "AJ-1",
+    task_version: 7,
+  };
   const state: AppState = {
     ...liveBase,
     attention: [
-      { ...railItem("first", "decision", "Plan needs review", target), action: { kind: "open_task", label: "Open task" } },
-      { ...railItem("second", "decision", "Plan reviewer finished", target), action: { kind: "open_task", label: "Open task" } },
+      {
+        ...railItem("first", "decision", "Plan needs review", target),
+        action: { kind: "open_task", label: "Open task" },
+      },
+      {
+        ...railItem("second", "decision", "Plan reviewer finished", target),
+        action: { kind: "open_task", label: "Open task" },
+      },
       railItem("old-1", "recovery", "Earlier safety record", null),
       railItem("old-2", "recovery", "Earlier safety record", null),
     ],
   };
   try {
-    mount(<AttentionInbox state={state} onNavigate={() => undefined} onChanged={noop} />);
+    mount(
+      <AttentionInbox
+        state={state}
+        onNavigate={() => undefined}
+        onChanged={noop}
+      />,
+    );
     const related = document.querySelector(".attention-related");
     check(
       [...document.querySelectorAll("button")].filter((button) =>
-          button.textContent?.startsWith("Open task")
-        ).length === 1 &&
+            button.textContent?.startsWith("Open task")
+          ).length === 1 &&
         related?.textContent?.includes("1 more notice about the same step") &&
         related.textContent.includes("Plan reviewer finished reason") &&
         !!related.querySelector('[data-attention-id="second"]'),
@@ -13834,7 +18085,10 @@ Deno.test("Stored draft deletions settle only from a complete snapshot, not the 
   localStorage.setItem("agenticjira.project", "p2");
   localStorage.setItem(
     "llmrelay.task.operations.AJ-del",
-    JSON.stringify([pending("delete_draft_task:AJ-del:4:"), pending("add_dependency:AJ-del:4:AJ-x")]),
+    JSON.stringify([
+      pending("delete_draft_task:AJ-del:4:"),
+      pending("add_dependency:AJ-del:4:AJ-x"),
+    ]),
   );
   localStorage.setItem(
     "llmrelay.task.operations.AJ-kept",
@@ -13855,7 +18109,10 @@ Deno.test("Stored draft deletions settle only from a complete snapshot, not the 
     pending("delete_draft_task:AJ-odd:-1:"),
     pending("delete_draft_task:AJ-odd:2.5:"),
   ];
-  localStorage.setItem("llmrelay.task.operations.AJ-odd", JSON.stringify(malformed));
+  localStorage.setItem(
+    "llmrelay.task.operations.AJ-odd",
+    JSON.stringify(malformed),
+  );
   const draft = (id: string, version: number): Task => ({
     ...task,
     id,
@@ -13873,7 +18130,11 @@ Deno.test("Stored draft deletions settle only from a complete snapshot, not the 
     );
     live.reads[0].resolve(snapshotAt("dq03", "1", {
       projects: [initialized, secondProject],
-      tasks: [draft("AJ-kept", 3), draft("AJ-moved", 5), draft("AJ-restored", 3)],
+      tasks: [
+        draft("AJ-kept", 3),
+        draft("AJ-moved", 5),
+        draft("AJ-restored", 3),
+      ],
     }));
     await settle();
     check(
@@ -13883,8 +18144,10 @@ Deno.test("Stored draft deletions settle only from a complete snapshot, not the 
     const remaining = (taskId: string) =>
       localStorage.getItem(`llmrelay.task.operations.${taskId}`);
     check(
-      remaining("AJ-del") === JSON.stringify([pending("add_dependency:AJ-del:4:AJ-x")]) &&
-        remaining("AJ-kept") === JSON.stringify([pending("delete_draft_task:AJ-kept:3:")]) &&
+      remaining("AJ-del") ===
+          JSON.stringify([pending("add_dependency:AJ-del:4:AJ-x")]) &&
+        remaining("AJ-kept") ===
+          JSON.stringify([pending("delete_draft_task:AJ-kept:3:")]) &&
         remaining("AJ-moved") === null &&
         remaining("AJ-restored") ===
           JSON.stringify([pending("delete_draft_task:AJ-restored:4:")]) &&

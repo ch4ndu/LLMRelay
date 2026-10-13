@@ -235,7 +235,11 @@ function currentWaits(state: AppState): WaitNotice[] {
           target,
         });
       }
-      if (session.native_prompt && !session.native_prompt.dismissed) {
+      const awaitingApproval = state.permission_requests.some((request) =>
+        request.actionable && request.session_id === session.id
+      );
+      if (session.native_prompt && !session.native_prompt.dismissed &&
+        (!awaitingApproval || session.native_prompt.kind !== "permission_prompt")) {
         waits.push({
           key: `native_prompt:${session.id}:${session.native_prompt.hook_event_id}`,
           title: `${roleLabel(session.role)} is ${
@@ -1144,7 +1148,10 @@ export function App() {
                   {item.gaps.length > 0 && (
                     <small>Missing evidence: {item.gaps.join(" · ")}</small>
                   )}
-                  <CompatibilityDetails compatibility={item.compatibility} />
+                  <CompatibilityDetails
+                    compatibility={item.compatibility}
+                    verification={item.status === "supported" ? "saved_record" : undefined}
+                  />
                 </div>
               ))}
             </section>

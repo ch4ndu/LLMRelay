@@ -3726,11 +3726,25 @@ impl Application {
         admission_id: &str,
         role: crate::domain::RoleKind,
     ) -> Result<ValidationLaunchResult> {
-        let attempt: String = {
+        let runtime = crate::trip::CapabilityRuntime::from_store(
+            &self.store,
+            self.hooks.clone(),
+            self.paths.role_socket.clone(),
+            self.executable.clone(),
+        );
+        let (attempt, current_scope) = {
             let connection = self.store.lock()?;
-            connection.query_row("SELECT p.attempt_id FROM trip_runtime_probes p JOIN trip_runtime_admissions a ON a.id=p.admission_id WHERE p.admission_id=?1 AND p.role=?2 AND p.state='authorized' AND a.state IN ('authorized','running') AND NOT EXISTS(SELECT 1 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id WHERE rg.attempt_id=p.attempt_id AND s.status IN ('launch_reserved','running','interrupt_requested','recovery_required'))",rusqlite::params![admission_id,role.to_string()],|row|row.get(0)).optional()?.ok_or_else(||anyhow!("ordinary runtime probe is not explicitly authorized or already has active, consumed, or recorded evidence; prepare corrected runtime verification for a fresh scope"))?
+            let attempt: String = connection.query_row("SELECT p.attempt_id FROM trip_runtime_probes p JOIN trip_runtime_admissions a ON a.id=p.admission_id WHERE p.admission_id=?1 AND p.role=?2 AND p.state='authorized' AND a.state IN ('authorized','running') AND NOT EXISTS(SELECT 1 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id WHERE rg.attempt_id=p.attempt_id AND s.status IN ('launch_reserved','running','interrupt_requested','recovery_required'))",rusqlite::params![admission_id,role.to_string()],|row|row.get(0)).optional()?.ok_or_else(||anyhow!("ordinary runtime probe is not explicitly authorized or already has active, consumed, or recorded evidence; prepare corrected runtime verification for a fresh scope"))?;
+            let current_scope = crate::trip::require_current_runtime_admission_scope(
+                &connection,
+                &runtime,
+                admission_id,
+            );
+            (attempt, current_scope)
         };
-        match self.dispatch_trip_setup_role_inner(&attempt, role, true, None) {
+        match current_scope
+            .and_then(|()| self.dispatch_trip_setup_role_inner(&attempt, role, true, None))
+        {
             Ok(result) => {
                 let now = Utc::now().to_rfc3339();
                 let connection = self.store.lock()?;

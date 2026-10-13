@@ -103,21 +103,29 @@ const setupStages: Array<{ id: SetupStage; label: string }> = [
   { id: "review", label: "Review changes" },
   { id: "activate", label: "Activate" },
 ];
-const freshQualificationUnavailable = (compatibility?: CompatibilityExplanation | null) =>
+const freshQualificationUnavailable = (
+  compatibility?: CompatibilityExplanation | null,
+) =>
   compatibility?.status === "unknown_version" ||
   compatibility?.status === "ambiguous_manifest" ||
   compatibility?.status === "manifest_invalid";
-const exactResumeUnavailable = (compatibility?: CompatibilityExplanation | null) =>
+const exactResumeUnavailable = (
+  compatibility?: CompatibilityExplanation | null,
+) =>
   freshQualificationUnavailable(compatibility) ||
   compatibility?.status === "contract_changed" ||
   compatibility?.status === "evidence_stale";
-const qualificationResumeUnavailable = (compatibility?: CompatibilityExplanation | null) => {
+const qualificationResumeUnavailable = (
+  compatibility?: CompatibilityExplanation | null,
+) => {
   // A qualification probe must resume before it can produce its first receipt.
   // The resume endpoint still validates the frozen session and launch identity.
-  if (compatibility?.status === "evidence_stale" &&
+  if (
+    compatibility?.status === "evidence_stale" &&
     compatibility.observed_version === null &&
     compatibility.missing_evidence.length === 1 &&
-    compatibility.missing_evidence[0] === "exact_selected_profile_observation") {
+    compatibility.missing_evidence[0] === "exact_selected_profile_observation"
+  ) {
     return false;
   }
   return exactResumeUnavailable(compatibility);
@@ -540,6 +548,8 @@ export function ProjectSetup({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [cmuxSocketPath, setCmuxSocketPath] = useState("");
+  const cmuxSocketInstruction =
+    "Enter the live cmux socket path before preparing Claude verification.";
   const [editingRevision, setEditingRevision] = useState(
     persistedSetupDraft?.editingRevision || false,
   );
@@ -629,16 +639,19 @@ export function ProjectSetup({
   const detectedKind = String(
     detected.kind || trip.detected_installation || "unknown",
   );
-  const migrationItems = useMemo(() =>
-    ["compatible", "absent"].includes(detectedKind) ? [] : [
-    ...((detected.conflicts as string[] | undefined) || []),
-    ...((detected.partial_paths as string[] | undefined) || []).map((path) =>
-      `partial:${path}`
-    ),
-    ...((detected.alternate_roots as string[] | undefined) || []).map((path) =>
-      `alternate_root:${path}`
-    ),
-  ], [detected, detectedKind]);
+  const migrationItems = useMemo(
+    () =>
+      ["compatible", "absent"].includes(detectedKind) ? [] : [
+        ...((detected.conflicts as string[] | undefined) || []),
+        ...((detected.partial_paths as string[] | undefined) || []).map((
+          path,
+        ) => `partial:${path}`),
+        ...((detected.alternate_roots as string[] | undefined) || []).map((
+          path,
+        ) => `alternate_root:${path}`),
+      ],
+    [detected, detectedKind],
+  );
   const existingAdapters =
     (setup?.proposal?.adapters || detected.adapters || { adapters: {} })
       .adapters || {};
@@ -703,11 +716,12 @@ export function ProjectSetup({
             JSON.stringify([...commandIdentities.current]),
           );
         } catch (storageCause) {
-          storageFailure = ` Browser storage also failed while clearing the rejected request: ${
-            storageCause instanceof Error
-              ? storageCause.message
-              : String(storageCause)
-          }`;
+          storageFailure =
+            ` Browser storage also failed while clearing the rejected request: ${
+              storageCause instanceof Error
+                ? storageCause.message
+                : String(storageCause)
+            }`;
         }
       }
       const message = cause instanceof Error ? cause.message : String(cause);
@@ -974,9 +988,22 @@ export function ProjectSetup({
       expected_project_version: project.version,
       configuration: setup.proposal,
     });
-  const prepareRuntime = (role?: Role) => {
-    setRuntimeAdmissionId(null);
-    return runTrip(
+  const prepareRuntime = async (role?: Role) => {
+    const requestedRoles: Role[] = role
+      ? [role]
+      : ["manager", ...delegatedRoles];
+    const projectRoles = isRecord(project.settings.roles)
+      ? project.settings.roles
+      : {};
+    const includesClaude = requestedRoles.some((requestedRole) => {
+      const config = projectRoles[requestedRole];
+      return isRecord(config) && config.provider === "claude";
+    });
+    if (includesClaude && !cmuxSocketPath.trim()) {
+      setError(cmuxSocketInstruction);
+      return;
+    }
+    const result = await runTrip(
       role ? `prepare-runtime:${role}` : "prepare-runtime",
       {
         action: "prepare_runtime_admission",
@@ -988,6 +1015,9 @@ export function ProjectSetup({
           : {}),
       },
     );
+    if (typeof result?.entity_id === "string" && result.entity_id.trim()) {
+      setRuntimeAdmissionId(result.entity_id);
+    }
   };
   const authorizeRuntime = (admissionId: string, scopeHash: string) =>
     runTrip(`authorize-runtime:${admissionId}`, {
@@ -1245,11 +1275,26 @@ export function ProjectSetup({
   const showProposalEditor = !!setup &&
     !discoveryManagerHeld &&
     (editingRevision || ["discovery", "draft"].includes(setup.state));
-  const [runtimeAdmissionId, setRuntimeAdmissionId] = useState<string | null>(null);
-  const runtimeAdmissions = setup?.runtime_admissions?.filter((item) =>
-    !item.task_id
-  ) || [];
-  const runtimeAdmission = runtimeAdmissions.find((item) => item.id === runtimeAdmissionId) ||
+  const [runtimeAdmissionId, setRuntimeAdmissionId] = useState<string | null>(
+    null,
+  );
+  const runtimeAdmissions =
+    setup?.runtime_admissions?.filter((item) => !item.task_id) || [];
+  const actionableRuntimeAdmission = runtimeAdmissions.find((item) =>
+    item.id.trim() !== "" && item.project_id === project.id &&
+    item.task_id === null &&
+    setup?.project_id === project.id &&
+    setup.continuation_actions?.some((action) =>
+      action.kind === "prepare_corrected_runtime" && action.enabled &&
+      action.operation === "prepare_runtime_admission" &&
+      action.binding.project_id === project.id &&
+      action.binding.task_id === null &&
+      action.binding.admission_id === item.id
+    )
+  );
+  const runtimeAdmission =
+    runtimeAdmissions.find((item) => item.id === runtimeAdmissionId) ||
+    actionableRuntimeAdmission ||
     runtimeAdmissions[0];
   const setupContinuationActions = (setup?.continuation_actions || []).filter(
     (action) => action.operation === "trip_setup_dispatch",
@@ -1327,10 +1372,52 @@ export function ProjectSetup({
         proposalProblem.includes("existing-installation")
     ? "review"
     : "project-settings";
-  // Recorded setup results stay visible; this names which of them are stale.
-  const staleSelections = (setup?.selected_profiles || []).filter((selection) =>
-    selection.selection_state === "selected" && selection.compatibility &&
-    selection.compatibility.status !== "matched"
+  const setupVerifications = (setup?.selected_profiles || [])
+    .filter((selection) => selection.selection_state === "selected")
+    .map((selection) => {
+      const receipt = setup?.probe_receipts.filter((item) =>
+        item.role === selection.role
+      )
+        .sort((left, right) =>
+          right.created_at.localeCompare(left.created_at)
+        )[0];
+      const profile = selection.profile;
+      const authority = selection.role === "implementer"
+        ? "workspace-write"
+        : "read-only";
+      const sessionMode = selection.role === "final_verifier"
+        ? "fresh"
+        : "retained";
+      const matchesSelection = !!receipt && !!profile &&
+        !!selection.profile_hash &&
+        receipt.profile_hash === selection.profile_hash &&
+        receipt.provider === profile.provider &&
+        receipt.authority === authority &&
+        receipt.session_mode === sessionMode &&
+        (selection.role === "manager" ||
+          ("authority" in profile && profile.authority === authority &&
+            "session" in profile && profile.session === sessionMode));
+      const bound = !!receipt && matchesSelection &&
+        !!selection.current_adapter_hash &&
+        receipt.adapter_hash === selection.current_adapter_hash &&
+        !!receipt.capability_key &&
+        !!receipt.generation_id && !!receipt.model_evidence.trim() &&
+        !!receipt.created_at &&
+        receipt.evidence.session_mode_observed === sessionMode;
+      const passed = receipt?.result === "success" && bound;
+      const message = !receipt
+        ? "This profile has not been checked for setup yet."
+        : !matchesSelection
+        ? "The latest setup receipt does not match the selected profile. Verify the current selection again."
+        : receipt.result !== "success"
+        ? "The latest setup check for this profile did not succeed. Review its result before verifying again."
+        : !bound
+        ? "A historical or mismatched setup receipt is recorded; current profile and adapter bindings are unverified."
+        : "Setup check passed for the selected profile.";
+      return { selection, passed, message };
+    });
+  const unverifiedSetupProfiles = setupVerifications.filter((item) =>
+    !item.passed
   );
   return (
     <section
@@ -1355,48 +1442,67 @@ export function ProjectSetup({
             : trip.readiness.replaceAll("_", " ")}
         </span>
       </header>
-      {staleSelections.length > 0 && (
-        <p className={trip.readiness === "ready" ? "hint" : "warning"} role="status">
+      {unverifiedSetupProfiles.length > 0 && (
+        <p
+          className={trip.readiness === "ready" ? "hint" : "warning"}
+          role="status"
+        >
           {trip.readiness === "ready"
             ? "Recorded setup verification needs review for:"
             : "The current setup draft needs agent verification for:"}{" "}
-          {staleSelections.map((selection) => roleName(selection.role)).join(
+          {unverifiedSetupProfiles.map(({ selection }) =>
+            roleName(selection.role)
+          ).join(
             ", ",
           )}. {trip.readiness === "ready"
             ? "These are installation records, not the current permission to run task agents. Check Runtime verification here and the Roles tab of each task for current runtime evidence."
             : "See Agent verification below for what changed before continuing setup."}
         </p>
       )}
-      {setup?.selected_profiles.some((selection) => selection.selection_state === "selected") && (
+      {setupVerifications.length > 0 && (
         <section className="panel" aria-label="Agent verification">
-          <h5>{trip.readiness === "ready" ? "Setup verification history" : "Agent verification"}</h5>
-          {setup.selected_profiles.filter((selection) => selection.selection_state === "selected")
-            .map((selection) => {
-              const profile = selection.profile;
-              return (
-                <div key={selection.role}>
-                  <strong>
-                    {roleName(selection.role)} ·{" "}
-                    {profile?.provider === "claude"
-                      ? "Claude"
-                      : profile?.provider === "codex"
-                      ? "Codex"
-                      : "not selected"}
-                  </strong>
-                  {trip.readiness === "ready"
-                    ? (
-                      <details>
-                        <summary>View recorded setup verification</summary>
-                        <CompatibilityDetails compatibility={selection.compatibility} />
-                        {!selection.compatibility && <p className="hint">No setup verification is recorded for this profile.</p>}
-                      </details>
-                    )
-                    : selection.compatibility
-                    ? <CompatibilityDetails compatibility={selection.compatibility} />
-                    : <p className="hint">No verification is recorded for this profile yet.</p>}
-                </div>
-              );
-            })}
+          <h5>
+            {trip.readiness === "ready"
+              ? "Setup verification history"
+              : "Agent verification"}
+          </h5>
+          <p>
+            {setupVerifications.length -
+              unverifiedSetupProfiles.length}/{setupVerifications.length}{" "}
+            selected profiles have current successful setup checks. These are
+            installation records; runtime verification is separate. Check
+            Runtime verification here and the Roles tab of each task for
+            permission to run ordinary task agents.
+          </p>
+          {setupVerifications.map(({ selection, passed, message }) => {
+            const profile = selection.profile;
+            return (
+              <div key={selection.role}>
+                <strong>
+                  {roleName(selection.role)} · {profile?.provider === "claude"
+                    ? "Claude"
+                    : profile?.provider === "codex"
+                    ? "Codex"
+                    : "not selected"}
+                </strong>
+                <p className={passed ? "success" : "hint"}>{message}</p>
+                {selection.compatibility && (trip.readiness !== "ready" &&
+                    qualificationResumeUnavailable(selection.compatibility)
+                  ? (
+                    <CompatibilityDetails
+                      compatibility={selection.compatibility}
+                    />
+                  )
+                  : (
+                    <TechnicalDetails>
+                      <CompatibilityDetails
+                        compatibility={selection.compatibility}
+                      />
+                    </TechnicalDetails>
+                  ))}
+              </div>
+            );
+          })}
         </section>
       )}
       <div className="setup-summary">
@@ -1442,7 +1548,10 @@ export function ProjectSetup({
               local draft. Discovery does not authorize installation.
             </p>
           </div>
-          <button disabled={!!busy} onClick={() => void inspect()}>
+          <button
+            disabled={!!busy}
+            onClick={() => void inspect()}
+          >
             Inspect existing setup
           </button>
         </div>
@@ -1685,7 +1794,9 @@ export function ProjectSetup({
                   </div>
                   <button
                     className="primary"
-                    disabled={!managerValid || (managerMatchesCurrent && !managerRestartAllowed) || !!busy}
+                    disabled={!managerValid ||
+                      (managerMatchesCurrent && !managerRestartAllowed) ||
+                      !!busy}
                     title={managerMatchesCurrent && !managerRestartAllowed
                       ? "Choose a different exact provider, model, or reasoning effort"
                       : undefined}
@@ -1699,8 +1810,9 @@ export function ProjectSetup({
                   </button>
                   {managerMatchesCurrent && managerRestartAllowed && (
                     <p className="hint">
-                      Create a fresh discovery session with the same agent settings.
-                      The previous session stays in history. Launch it separately after preparing the restart.
+                      Create a fresh discovery session with the same agent
+                      settings. The previous session stays in history. Launch it
+                      separately after preparing the restart.
                     </p>
                   )}
                   {managerMatchesCurrent && !managerRestartAllowed && (
@@ -2477,12 +2589,12 @@ export function ProjectSetup({
                     {!setup.installation_source_binding_complete && (
                       <>
                         <p className="hint">
-                          First prepare the final preview. It records the
-                          exact content setup would write and each file's
-                          current content in the project, so you can compare
-                          them below. Preparing the preview does not change
-                          the project or approve anything. LLMRelay prepares
-                          it only after every probe session has exited.
+                          First prepare the final preview. It records the exact
+                          content setup would write and each file's current
+                          content in the project, so you can compare them below.
+                          Preparing the preview does not change the project or
+                          approve anything. LLMRelay prepares it only after
+                          every probe session has exited.
                         </p>
                         <button
                           className="primary"
@@ -2525,15 +2637,16 @@ export function ProjectSetup({
               <TechnicalDetails>
                 <p>
                   Proposal {setup.proposal_hash} · destination preimages{" "}
-                  {setup.approved_preimages_hash ?? "not recorded"} · final
-                  source set {setup.final_source_set_hash || "not frozen"} ·
-                  {" "}{setup.installation_source_binding_reason}
+                  {setup.approved_preimages_hash ?? "not recorded"}{" "}
+                  · final source set{" "}
+                  {setup.final_source_set_hash || "not frozen"} ·{" "}
+                  {setup.installation_source_binding_reason}
                 </p>
                 {[...(setup.destination_preview ?? []), ...setup.final_files]
                   .map((entry, index) => (
                     <p key={`${index}:${entry.relative_path}`}>
-                      {entry.relative_path} · source {entry.source_sha256} ·
-                      preimage {entry.preimage_sha256 ?? "absent"}
+                      {entry.relative_path} · source {entry.source_sha256}{" "}
+                      · preimage {entry.preimage_sha256 ?? "absent"}
                     </p>
                   ))}
               </TechnicalDetails>
@@ -2637,15 +2750,18 @@ export function ProjectSetup({
           runtimeAdmission={runtimeAdmission}
         />
       )}
-      {activeStage === "activate" && setup?.recoveries?.filter((recovery) =>
-        !runtimeAdmission?.probes.some((probe) => probe.session_id === recovery.session_id)
-      ).map((recovery) => (
-        <SetupRecovery
-          key={recovery.record_id}
-          recovery={recovery}
-          onChanged={onChanged}
-        />
-      ))}
+      {activeStage === "activate" &&
+        setup?.recoveries?.filter((recovery) =>
+          !runtimeAdmission?.probes.some((probe) =>
+            probe.session_id === recovery.session_id
+          )
+        ).map((recovery) => (
+          <SetupRecovery
+            key={recovery.record_id}
+            recovery={recovery}
+            onChanged={onChanged}
+          />
+        ))}
       {activeStage === "activate" && trip.readiness === "ready" && (
         <fieldset className="setup-step">
           <legend>Runtime capability readiness</legend>
@@ -2655,6 +2771,14 @@ export function ProjectSetup({
             role, model, effort, confinement, and native-session proof. Setup
             receipts are never promoted into this authority.
           </p>
+          {setupVerifications.filter(({ selection }) =>
+            qualificationResumeUnavailable(selection.compatibility)
+          ).map(({ selection }) => (
+            <div key={selection.role}>
+              <strong>{roleName(selection.role)} runtime verification</strong>
+              <CompatibilityDetails compatibility={selection.compatibility} />
+            </div>
+          ))}
           <label>
             Live cmux Unix socket for Claude requalification
             <input
@@ -2686,11 +2810,15 @@ export function ProjectSetup({
                   Runtime verification group
                   <select
                     value={runtimeAdmission.id}
-                    onChange={(event) => setRuntimeAdmissionId(event.target.value)}
+                    onChange={(event) =>
+                      setRuntimeAdmissionId(event.target.value)}
                   >
                     {runtimeAdmissions.map((item) => (
                       <option key={item.id} value={item.id}>
-                        {item.probes.map((probe) => roleName(probe.role)).join(", ")} · {item.state.replaceAll("_", " ")} · {item.id.slice(0, 8)}
+                        {item.probes.map((probe) =>
+                          roleName(probe.role)
+                        ).join(", ")} · {item.state.replaceAll("_", " ")} ·{" "}
+                        {item.id.slice(0, 8)}
                       </option>
                     ))}
                   </select>
@@ -2722,9 +2850,9 @@ export function ProjectSetup({
           {notice.replaceAll("_", " ")}
         </p>
       )}
-      {error && (
-        <ErrorNotice error={error} />
-      )}
+      {error && (error === cmuxSocketInstruction
+        ? <p className="error" role="alert">{error}</p>
+        : <ErrorNotice error={error} />)}
     </section>
   );
 }
@@ -2752,9 +2880,17 @@ function CmuxRouteNotice(
       <p>{terminalGuidance(outcome)}</p>
       <TechnicalDetails>
         <p>{outcome.message}</p>
-        {outcome.surface && <p>
-          route revision {outcome.surface.binding_revision} · surface {outcome.surface.surface_state} · attachment {outcome.surface.attachment_state} · desired {outcome.surface.desired_input_state} · actual {outcome.surface.actual_input_state} · control revision {outcome.surface.applied_revision}/{outcome.surface.control_revision}
-        </p>}
+        {outcome.surface && (
+          <p>
+            route revision {outcome.surface.binding_revision} · surface{" "}
+            {outcome.surface.surface_state} · attachment{" "}
+            {outcome.surface.attachment_state} · desired{" "}
+            {outcome.surface.desired_input_state} · actual{" "}
+            {outcome.surface.actual_input_state} · control revision{" "}
+            {outcome.surface.applied_revision}/{outcome.surface
+              .control_revision}
+          </p>
+        )}
         {presentation.diagnostic && <p>{presentation.diagnostic}</p>}
       </TechnicalDetails>
       {output && <pre className="recorded-output">{output}</pre>}
@@ -2864,7 +3000,9 @@ function SetupInvocation(
     dispatchHeld?: boolean;
   },
 ) {
-  const [sessionView, setSessionView] = useState<{ sessionId: string; outcome: CmuxViewOutcome }>();
+  const [sessionView, setSessionView] = useState<
+    { sessionId: string; outcome: CmuxViewOutcome }
+  >();
   const [discarding, setDiscarding] = useState(false);
   const discardOperation = useRef<
     | { surfaceRouteId: string; sessionId: string; operationId: string }
@@ -2878,7 +3016,9 @@ function SetupInvocation(
     item.attempt_id === attemptId && item.role === role
   );
   const dispatchWait = probeDispatchWait(role, attemptId, sessions);
-  const viewOutcome = sessionView?.sessionId === session?.id ? sessionView?.outcome : undefined;
+  const viewOutcome = sessionView?.sessionId === session?.id
+    ? sessionView?.outcome
+    : undefined;
   const setViewOutcome = (outcome: CmuxViewOutcome) => {
     if (session) setSessionView({ sessionId: session.id, outcome });
   };
@@ -3051,7 +3191,9 @@ function SetupInvocation(
               !presentationActionability.viewAvailable}
             onClick={() => void viewOutput()}
           >
-            {session.status === "running" ? presentationActionability.viewLabel : "View recorded output"}
+            {session.status === "running"
+              ? presentationActionability.viewLabel
+              : "View recorded output"}
           </button>
           {session.status === "running" && (
             <button
@@ -3188,8 +3330,8 @@ function SetupRecovery(
         LLMRelay needs to check whether the earlier {roleName(recovery.role)}
         {recovery.validation_cell === "trip_runtime_probe"
           ? " verification session has stopped"
-          : " setup session has stopped"}. Describe what happened below, then choose
-        Check recovery and continue. LLMRelay will check the recorded
+          : " setup session has stopped"}. Describe what happened below, then
+        choose Check recovery and continue. LLMRelay will check the recorded
         processes before letting you continue. After the check, use the resume
         or retry action shown for this session.
       </p>
@@ -3420,7 +3562,11 @@ function RuntimeAdmission(
           const publish = probe.state === "evidence_recorded" &&
             probe.session_status === "exited";
           const launch = contractReady && probe.state === "authorized";
-          const dispatchWait = probeDispatchWait(probe.role, probe.attempt_id, sessions);
+          const dispatchWait = probeDispatchWait(
+            probe.role,
+            probe.attempt_id,
+            sessions,
+          );
           const cmuxOutcome = probe.session_id
             ? presentationOutcomeForSession(probe.session_id)
             : undefined;
@@ -3446,12 +3592,13 @@ function RuntimeAdmission(
                 <code>{probe.capability_key.slice(0, 12)}</code>
               </small>
               {probe.failure_reason && (
-                <ErrorNotice error={
-                  probe.failure_reason === "ordinary runtime probe reported an observed failure" &&
-                    probe.failure_category === "observation_unavailable"
+                <ErrorNotice
+                  error={probe.failure_reason ===
+                        "ordinary runtime probe reported an observed failure" &&
+                      probe.failure_category === "observation_unavailable"
                     ? `${probe.failure_reason}\nFailure category: ${probe.failure_category}`
-                    : probe.failure_reason
-                } />
+                    : probe.failure_reason}
+                />
               )}
               {probe.session_id && (
                 <>
@@ -3460,7 +3607,9 @@ function RuntimeAdmission(
                       !cmuxPresentation.viewAvailable}
                     onClick={() => void viewOutput(probe.session_id!)}
                   >
-                    {probe.session_status === "running" ? cmuxPresentation.viewLabel : "View recorded output"}
+                    {probe.session_status === "running"
+                      ? cmuxPresentation.viewLabel
+                      : "View recorded output"}
                   </button>
                   {probe.session_status === "running" && (
                     <button
@@ -3497,7 +3646,9 @@ function RuntimeAdmission(
               {recovery && (
                 <SetupRecovery recovery={recovery} onChanged={onChanged} />
               )}
-              {dispatchWait && <p className="hint" role="status">{dispatchWait}</p>}
+              {dispatchWait && (
+                <p className="hint" role="status">{dispatchWait}</p>
+              )}
               {launch && (
                 <button
                   disabled={!!busy || !!dispatchWait}
@@ -3601,8 +3752,10 @@ function ActiveConfiguration(
           </span>
           {runtimeAdmission && (
             <span>
-              Covers {runtimeAdmission.probes.map((probe) => roleName(probe.role)).join(", ") || "no roles"}.
-              {" "}This is not a readiness count for all project roles.
+              Covers{" "}
+              {runtimeAdmission.probes.map((probe) => roleName(probe.role))
+                .join(", ") || "no roles"}.{" "}
+              This is not a readiness count for all project roles.
             </span>
           )}
         </article>

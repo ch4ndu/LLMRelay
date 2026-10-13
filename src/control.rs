@@ -20,7 +20,9 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
-const MAX_CONTROL_MESSAGE_BYTES: usize = 1024 * 1024;
+// Bounds apply to JSON payload bytes; the newline is framing.
+const MAX_CONTROL_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_CONTROL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 // Healthy attachment polling occurs every 50 ms. This deadline leaves ample
 // scheduling room while ensuring a silent authenticated peer cannot retain a
 // live route or input lease indefinitely.
@@ -304,7 +306,11 @@ impl ControlConnection {
         writer.write_all(&frame).await?;
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(8),
-            read_control_message(&mut reader),
+            read_control_message(
+                &mut reader,
+                MAX_CONTROL_REQUEST_BYTES,
+                "control protocol response",
+            ),
         )
         .await
         .map_err(|_| anyhow!("Protocol negotiation timed out. {}", protocol::GUIDANCE))??;
@@ -372,7 +378,14 @@ impl ControlConnection {
     }
 
     pub async fn request(&mut self, request: &ControlRequest) -> Result<ControlResponse> {
-        Self::require_success(self.request_raw(request).await?)
+        let response = match self.request_raw(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.poison();
+                return Err(error);
+            }
+        };
+        Self::require_success(response)
     }
 
     /// Uses a deadline only for callers whose interactive terminal state must
@@ -412,7 +425,7 @@ impl ControlConnection {
 
     async fn request_raw(&mut self, request: &ControlRequest) -> Result<ControlResponse> {
         let encoded = serde_json::to_vec(request)?;
-        if encoded.len() > MAX_CONTROL_MESSAGE_BYTES {
+        if encoded.len() > MAX_CONTROL_REQUEST_BYTES {
             bail!("control request exceeds the 1 MiB message limit")
         }
         self.writer
@@ -425,11 +438,14 @@ impl ControlConnection {
             .ok_or_else(|| anyhow!("control connection is unavailable after a request failure"))?
             .write_all(b"\n")
             .await?;
-        let Some(line) =
-            read_control_message(self.reader.as_mut().ok_or_else(|| {
+        let Some(line) = read_control_message(
+            self.reader.as_mut().ok_or_else(|| {
                 anyhow!("control connection is unavailable after a request failure")
-            })?)
-            .await?
+            })?,
+            MAX_CONTROL_RESPONSE_BYTES,
+            "control response",
+        )
+        .await?
         else {
             bail!("control connection closed before its response")
         };
@@ -839,7 +855,7 @@ async fn serve_connection(
 ) -> Result<()> {
     let mut stop = shutdown.subscribe();
     let result = async {
-        let first = tokio::time::timeout(idle_read_deadline, read_until_shutdown(reader, &mut stop))
+        let first = tokio::time::timeout(idle_read_deadline, read_until_shutdown(reader, &mut stop, protocol::MAX_DECLARATION_BYTES, "control protocol declaration"))
             .await
             .map_err(|_| anyhow!("control connection idle read deadline expired"))?;
         let first = match first {
@@ -884,7 +900,7 @@ async fn serve_connection(
             }
         };
         loop {
-            let line = tokio::time::timeout(idle_read_deadline, read_until_shutdown(reader, &mut stop))
+            let line = tokio::time::timeout(idle_read_deadline, read_until_shutdown(reader, &mut stop, MAX_CONTROL_REQUEST_BYTES, "control request"))
                 .await
                 .map_err(|_| anyhow!("control connection idle read deadline expired"))??;
             let Some(line) = line else {
@@ -952,11 +968,13 @@ async fn serve_connection(
 async fn read_until_shutdown(
     reader: &mut BufReader<OwnedReadHalf>,
     stop: &mut watch::Receiver<bool>,
+    max_bytes: usize,
+    direction: &str,
 ) -> Result<Option<Vec<u8>>> {
     tokio::select! {
         biased;
         _ = stop.wait_for(|stopping| *stopping) => Ok(None),
-        result = read_control_message(reader) => result,
+        result = read_control_message(reader, max_bytes, direction) => result,
     }
 }
 
@@ -965,6 +983,9 @@ async fn write_protocol_response(
     response: &serde_json::Value,
 ) -> Result<()> {
     let mut frame = serde_json::to_vec(response)?;
+    if frame.len() > MAX_CONTROL_REQUEST_BYTES {
+        bail!("control protocol response exceeds the 1 MiB message limit")
+    }
     frame.push(b'\n');
     tokio::time::timeout(CONTROL_WRITE_DEADLINE, writer.write_all(&frame))
         .await
@@ -1759,20 +1780,27 @@ fn signal_shutdown(shutdown: &watch::Sender<bool>) -> Result<()> {
     }
 }
 
-async fn read_control_message<R>(reader: &mut R) -> Result<Option<Vec<u8>>>
+async fn read_control_message<R>(
+    reader: &mut R,
+    max_bytes: usize,
+    direction: &str,
+) -> Result<Option<Vec<u8>>>
 where
     R: AsyncBufRead + Unpin,
 {
     let mut line = Vec::new();
     let read = reader
-        .take((MAX_CONTROL_MESSAGE_BYTES + 1) as u64)
+        .take((max_bytes + 1) as u64)
         .read_until(b'\n', &mut line)
         .await?;
     if read == 0 {
         return Ok(None);
     }
-    if read > MAX_CONTROL_MESSAGE_BYTES || line.last() != Some(&b'\n') {
-        bail!("control messages must be newline-delimited and no larger than 1 MiB")
+    if line.last() != Some(&b'\n') {
+        if read > max_bytes {
+            bail!("{direction} exceeds the {max_bytes} byte message limit")
+        }
+        bail!("{direction} must be newline-delimited")
     }
     line.pop();
     Ok(Some(line))
@@ -1783,9 +1811,9 @@ async fn write_control_response(
     response: &ControlResponse,
 ) -> Result<()> {
     let mut encoded = serde_json::to_vec(response)?;
-    if encoded.len() > MAX_CONTROL_MESSAGE_BYTES {
+    if encoded.len() > MAX_CONTROL_RESPONSE_BYTES {
         encoded = serde_json::to_vec(&ControlResponse::failure(anyhow!(
-            "control response exceeds the 1 MiB message limit"
+            "control response exceeds the 16 MiB message limit"
         )))?;
     }
     encoded.push(b'\n');
@@ -2429,7 +2457,7 @@ mod tests {
         let (root, app, _) = control_test_application();
         let listener = bind(&app).unwrap();
         let (shutdown, _) = watch::channel(false);
-        let padding = "x".repeat(900_000);
+        let padding = "x".repeat(2_500_000);
         let mut service = tokio::spawn(serve_bound(
             app.clone(),
             shutdown.clone(),
@@ -2445,6 +2473,9 @@ mod tests {
         let mut client = ControlConnection::connect(&app.paths.control_socket)
             .await
             .unwrap();
+        let complete = client.request(&ControlRequest::Status).await.unwrap();
+        assert!(serde_json::to_vec(&complete).unwrap().len() > MAX_CONTROL_REQUEST_BYTES);
+        assert_eq!(complete.result["instance"]["padding"], padding);
         client
             .writer
             .as_mut()
@@ -2496,6 +2527,182 @@ mod tests {
         assert_eq!(after_hello_error.kind(), std::io::ErrorKind::UnexpectedEof);
         drop((client, idle_before_hello, idle_after_hello, app));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn oversized_control_requests_do_not_reach_business_dispatch() {
+        let (root, app, _) = control_test_application();
+        app.store
+            .lock()
+            .unwrap()
+            .execute("UPDATE projects SET queue_paused=0 WHERE id='project'", [])
+            .unwrap();
+        let listener = bind(&app).unwrap();
+        let (shutdown, _) = watch::channel(false);
+        let service = tokio::spawn(serve_bound(
+            app.clone(),
+            shutdown.clone(),
+            serde_json::json!({"instance_id":"fixture"}),
+            listener,
+        ));
+        let small = ControlRequest::HumanCommand {
+            command: HumanCommand::SetQueuePaused {
+                operation_id: "bounded-pause".into(),
+                project_id: "project".into(),
+                expected_version: 1,
+                paused: true,
+            },
+        };
+        let mut frame = serde_json::to_value(&small).unwrap();
+        frame["padding"] = serde_json::json!("x".repeat(MAX_CONTROL_REQUEST_BYTES));
+        let mut frame = serde_json::to_vec(&frame).unwrap();
+        assert!(serde_json::from_slice::<ControlRequest>(&frame).is_ok());
+        frame.push(b'\n');
+        let mut raw = ControlConnection::connect(&app.paths.control_socket)
+            .await
+            .unwrap();
+        let written = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            raw.writer.as_mut().unwrap().write_all(&frame),
+        )
+        .await
+        .unwrap();
+        if let Err(error) = written {
+            assert!(matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ));
+        }
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            raw.reader.as_mut().unwrap().read_u8(),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            closed.kind(),
+            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+        ));
+        let state: (bool, i64) = app
+            .store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT queue_paused,version FROM projects WHERE id='project'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (false, 1));
+        let mut valid = ControlConnection::connect(&app.paths.control_socket)
+            .await
+            .unwrap();
+        valid.request(&small).await.unwrap();
+        let paused: bool = app
+            .store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT queue_paused FROM projects WHERE id='project'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            paused,
+            "the same bounded command must actually mutate the fixture"
+        );
+        shutdown.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), service)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop((raw, valid, app));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn response_bound_preserves_exact_frames_and_poisons_oversized_reads() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (server, client) = UnixStream::pair().unwrap();
+            let (server_reader, mut server_writer) = server.into_split();
+            let (client_reader, client_writer) = client.into_split();
+            let mut client = ControlConnection {
+                reader: Some(BufReader::new(client_reader)),
+                writer: Some(client_writer),
+            };
+            let mut response = ControlResponse::success(serde_json::json!({"padding":""})).unwrap();
+            let overhead = serde_json::to_vec(&response).unwrap().len();
+            let payload_bytes = MAX_CONTROL_RESPONSE_BYTES - overhead;
+            response.result["padding"] = serde_json::json!("x".repeat(payload_bytes));
+            let server = tokio::spawn(async move {
+                let mut reader = BufReader::new(server_reader);
+                read_control_message(&mut reader, MAX_CONTROL_REQUEST_BYTES, "control request")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                write_control_response(&mut server_writer, &response)
+                    .await
+                    .unwrap();
+                response.result["padding"] = serde_json::json!("x".repeat(payload_bytes + 1));
+                read_control_message(&mut reader, MAX_CONTROL_REQUEST_BYTES, "control request")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                write_control_response(&mut server_writer, &response)
+                    .await
+                    .unwrap();
+                read_control_message(&mut reader, MAX_CONTROL_REQUEST_BYTES, "control request")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut encoded = serde_json::to_vec(&response).unwrap();
+                encoded.push(b'\n');
+                if let Err(error) = server_writer.write_all(&encoded).await {
+                    assert!(matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ));
+                }
+            });
+            let exact = client.request(&ControlRequest::Status).await.unwrap();
+            assert_eq!(
+                exact.result["padding"].as_str().unwrap().len(),
+                payload_bytes
+            );
+            assert!(!client.is_poisoned());
+            let bounded = client
+                .request(&ControlRequest::Status)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(bounded.contains("control response exceeds the 16 MiB message limit"));
+            assert!(
+                !client.is_poisoned(),
+                "a complete bounded failure is still a valid frame"
+            );
+            let corrupt = client
+                .request(&ControlRequest::Status)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(corrupt.contains(&format!(
+                "control response exceeds the {} byte message limit",
+                MAX_CONTROL_RESPONSE_BYTES
+            )));
+            assert!(client.is_poisoned());
+            assert!(client
+                .request(&ControlRequest::Status)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable after a request failure"));
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

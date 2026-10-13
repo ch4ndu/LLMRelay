@@ -2011,6 +2011,10 @@ pub fn execute_with_runtime(
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
                 validate_task(&title, &serde_json::from_str::<Vec<String>>(&criteria)?)?;
+                if let Some(problem) = single_agent_selection_problem(&transaction, task_id, false)?
+                {
+                    bail!("{problem}")
+                }
                 admit_single_agent_ready(
                     &transaction,
                     &store.compatibility_bundles,
@@ -4275,9 +4279,9 @@ fn selected_setup_capability<'a>(
 mod m7_setup_projection_tests {
     use super::{
         continuation_actions, missing_selection_observation, permanent_resume_rejection_is_current,
-        selected_setup_capability, workspace_recovery_reason,
+        selected_setup_capability, workspace_recovery_reason, AttentionSources,
     };
-    use crate::domain::TaskDto;
+    use crate::domain::{AttentionTarget, ProjectDto, RoleKind, TaskDto};
     use serde_json::{json, Value};
 
     #[test]
@@ -4373,6 +4377,274 @@ mod m7_setup_projection_tests {
     }
 
     #[test]
+    fn runtime_failure_attention_tracks_exact_published_replacements() {
+        let probe = |role: &str, state: &str| {
+            json!({
+                "role":role,"state":state,"settings_revision":null,
+                "profile":{"provider":"codex","model":"model","effort":"high"},
+                "profile_hash":format!("profile-{role}"),"project_config_revision_id":"config",
+                "project_configuration_hash":"configuration-hash","adapter":"codex",
+                "adapter_hash":"adapter-hash","capability_key":format!("key-{role}"),
+                "capability_id":format!("capability-{role}"),"published_at":"2026-01-02T01:00:00Z",
+                "failure_category":"model_refusal","failure_reason":"model_refusal"
+            })
+        };
+        let old = json!({
+            "id":"original","project_id":"project","task_id":null,"state":"failed",
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T01:00:00Z",
+            "failure_reason":"GROUP-IDENTITY-DUMP",
+            "probes":[probe("manager","published"),probe("explorer","published"),
+                probe("final_verifier","failed"),probe("plan_reviewer","failed"),
+                probe("implementer","failed"),probe("code_reviewer","failed")]
+        });
+        let corrections = json!({
+            "id":"corrections","project_id":"project","task_id":null,"state":"ready",
+            "created_at":"2026-01-02T00:00:00Z",
+            "probes":[probe("final_verifier","published"),probe("plan_reviewer","published"),
+                probe("implementer","published")]
+        });
+        let capabilities = corrections["probes"].as_array().unwrap().iter().map(|probe| json!({
+            "rowid":1,"provider":"codex","version":crate::provider_compatibility::CODEX_EXACT_VERSION,
+            "role":probe["role"],"mode":"interactive_pty","config_hash":probe["capability_key"],
+            "status":"supported","checked_at":"2026-01-02T00:59:00Z",
+            "compatibility":{"status":"matched"},
+            "proof":{"provider":"codex","version":crate::provider_compatibility::CODEX_EXACT_VERSION,
+                "role":probe["role"],"config_hash":probe["capability_key"],"model":"model","effort":"high",
+                "runtime_scopes":[{"project_id":"project","task_id":null,"profiles":[probe]}]}
+        })).collect::<Vec<_>>();
+        let projects = [ProjectDto {
+            id: "project".into(),
+            display_name: "Project".into(),
+            repository_path: "/tmp/project".into(),
+            repository_identity: "/tmp/project".into(),
+            base_revision: "base".into(),
+            queue_paused: false,
+            version: 1,
+            settings: json!({}),
+            trip: json!({"readiness":"ready","setup_operation_id":"setup"}),
+        }];
+        let tasks = [TaskDto {
+            id: "task".into(),
+            project_id: "project".into(),
+            title: "Task-specific profile".into(),
+            description: String::new(),
+            acceptance_criteria: vec![],
+            priority: 0,
+            manual_order: 0,
+            lifecycle: "backlog".into(),
+            attention: "none".into(),
+            version: 7,
+            archived: false,
+            can_archive: false,
+            draft_deletion: None,
+            recipe_provenance: None,
+            permission_waiting: false,
+            role_overrides: json!({}),
+            dependencies: vec![],
+            active_attempt: None,
+            role_settings: vec![
+                json!({"role":"code_reviewer","revision":1,"config":{"provider":"codex","model":"model","effort":"high"}}),
+            ],
+            reviews: vec![],
+            snapshots: vec![],
+            review_budgets: vec![],
+            legacy: json!({}),
+            progress: None,
+            observed_usage: None,
+            workflow: None,
+        }];
+        let attention = |admissions: &[Value], capabilities: &[Value]| {
+            let setups = [json!({"project_id":"project","runtime_admissions":admissions})];
+            let actions = continuation_actions(
+                &projects,
+                &tasks,
+                capabilities,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &setups,
+                &[],
+                &[],
+                &[],
+            );
+            AttentionSources {
+                projects: &projects,
+                workflow_execution: &[],
+                tasks: &tasks,
+                sessions: &[],
+                recovery: &[],
+                permission_requests: &[],
+                trip_setups: &setups,
+                decisions: &[],
+                continuation_actions: &actions,
+                coordinator_deferral: None,
+                observations: &[],
+                codex_capacity: &[],
+            }
+            .items()
+        };
+        let unresolved = attention(&[old.clone(), corrections.clone()], &capabilities);
+        assert_eq!(unresolved.len(), 1);
+        let reviewer = &unresolved[0];
+        assert_eq!(reviewer.role, Some(RoleKind::CodeReviewer));
+        assert_eq!(
+            reviewer.id,
+            "continuation:prepare_runtime_admission:original:code_reviewer"
+        );
+        assert!(reviewer.title.contains("Code reviewer"));
+        assert!(reviewer
+            .reason
+            .contains("declined a required verification check"));
+        assert!(reviewer
+            .reason
+            .contains("Project setup > Runtime verification"));
+        assert!(reviewer
+            .reason
+            .contains("inspect the Code reviewer's recorded output"));
+        assert!(reviewer.reason.contains("Prepare a new verification"));
+        assert!(!reviewer.reason.contains("GROUP-IDENTITY-DUMP"));
+        assert!(reviewer
+            .details
+            .as_deref()
+            .unwrap()
+            .contains("model_refusal"));
+        assert_eq!(
+            reviewer.target,
+            Some(AttentionTarget::ProjectSetup {
+                project_id: "project".into(),
+                setup_operation_id: Some("setup".into()),
+            })
+        );
+
+        let mut task_admission = old.clone();
+        task_admission["task_id"] = json!("task");
+        task_admission["probes"] = json!([probe("code_reviewer", "failed")]);
+        task_admission["probes"][0]["settings_revision"] = json!(1);
+        let task_attention = attention(&[task_admission], &capabilities);
+        assert_eq!(task_attention.len(), 1);
+        assert_eq!(task_attention[0].role, Some(RoleKind::CodeReviewer));
+        assert!(task_attention[0]
+            .reason
+            .contains("Open the task's Roles tab"));
+        assert!(task_attention[0]
+            .reason
+            .contains("inspect the Code reviewer's recorded output"));
+        assert!(!task_attention[0].reason.contains("Project setup"));
+        assert_eq!(
+            task_attention[0].target,
+            Some(AttentionTarget::Task(crate::domain::TaskAttentionTarget {
+                project_id: "project".into(),
+                task_id: "task".into(),
+                task_version: 7,
+            }))
+        );
+
+        let separate = attention(&[old.clone()], &capabilities);
+        assert_eq!(
+            separate
+                .iter()
+                .map(|item| item.role.unwrap())
+                .collect::<Vec<_>>(),
+            [
+                RoleKind::FinalReviewer,
+                RoleKind::PlanReviewer,
+                RoleKind::Implementer,
+                RoleKind::CodeReviewer,
+            ]
+        );
+        assert_eq!(
+            separate
+                .iter()
+                .map(|item| &item.id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4
+        );
+
+        let mut unpublished = corrections.clone();
+        for probe in unpublished["probes"].as_array_mut().unwrap() {
+            probe["state"] = json!("evidence_recorded");
+        }
+        assert_eq!(
+            attention(&[old.clone(), unpublished], &capabilities).len(),
+            4
+        );
+        let mut foreign_scope = corrections.clone();
+        foreign_scope["task_id"] = json!("another-task");
+        assert_eq!(
+            attention(&[old.clone(), foreign_scope], &capabilities).len(),
+            4
+        );
+        let mut simultaneous = corrections.clone();
+        simultaneous["created_at"] = old["created_at"].clone();
+        assert_eq!(
+            attention(&[old.clone(), simultaneous], &capabilities).len(),
+            4
+        );
+
+        let mut superseded = capabilities.clone();
+        let mut latest = superseded[2].clone();
+        latest["rowid"] = json!(2);
+        latest["config_hash"] = json!("unrelated-key");
+        latest["status"] = json!("unverified");
+        latest["proof"] = json!({});
+        superseded.push(latest);
+        assert_eq!(
+            attention(&[old.clone(), corrections.clone()], &superseded)
+                .iter()
+                .map(|item| item.role.unwrap())
+                .collect::<Vec<_>>(),
+            [RoleKind::Implementer, RoleKind::CodeReviewer,]
+        );
+        let mut incomplete_old = old.clone();
+        let mut incomplete_corrections = corrections.clone();
+        incomplete_old["probes"][4]
+            .as_object_mut()
+            .unwrap()
+            .remove("adapter_hash");
+        incomplete_corrections["probes"][2]
+            .as_object_mut()
+            .unwrap()
+            .remove("adapter_hash");
+        assert_eq!(
+            attention(&[incomplete_old, incomplete_corrections], &capabilities).len(),
+            2
+        );
+        let mut unrelated_proof = capabilities.clone();
+        unrelated_proof[2]["proof"]["runtime_scopes"][0]["project_id"] = json!("another-project");
+        assert_eq!(
+            attention(&[old.clone(), corrections.clone()], &unrelated_proof).len(),
+            2
+        );
+
+        let mut newer_failure = corrections.clone();
+        newer_failure["id"] = json!("newer-failure");
+        newer_failure["created_at"] = json!("2026-01-03T00:00:00Z");
+        newer_failure["state"] = json!("failed");
+        newer_failure["probes"] = json!([probe("code_reviewer", "failed")]);
+        let newest = attention(&[old.clone(), corrections, newer_failure], &capabilities);
+        assert_eq!(newest.len(), 1);
+        assert_eq!(
+            newest[0].id,
+            "continuation:prepare_runtime_admission:newer-failure:code_reviewer"
+        );
+        let mut legacy = old;
+        legacy["probes"] = json!([]);
+        let fallback = attention(&[legacy], &capabilities);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].role, None);
+        assert!(!fallback[0].reason.contains("GROUP-IDENTITY-DUMP"));
+        assert!(fallback[0]
+            .details
+            .as_deref()
+            .unwrap()
+            .contains("GROUP-IDENTITY-DUMP"));
+    }
+
+    #[test]
     fn invalid_manifest_rejection_retires_only_for_newer_exact_proof() {
         let task = TaskDto {
             id: "task".into(),
@@ -4455,6 +4727,7 @@ mod m7_setup_projection_tests {
         ];
         let decision_actions = |evidence: &[Value]| {
             continuation_actions(
+                &[],
                 &[task.clone()],
                 evidence,
                 &[session.clone()],
@@ -5204,6 +5477,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         });
     }
     let mut continuation_actions = continuation_actions(
+        &projects,
         &tasks,
         &capabilities,
         &active_sessions,
@@ -5403,16 +5677,31 @@ fn backlog_readiness_decision(
     task: &TaskDto,
     start_baseline: Option<&str>,
 ) -> Result<DecisionExplanation> {
-    let project = crate::trip::require_project_ready(connection, &task.project_id);
-    let scope = validate_task(&task.title, &task.acceptance_criteria);
-    let configured: i64 = connection.query_row(
+    let single_agent =
+        task_family(connection, &task.id)? == crate::domain::WorkflowFamily::SingleAgent;
+    let project = if single_agent {
+        Ok(())
+    } else {
+        crate::trip::require_project_ready(connection, &task.project_id)
+    };
+    let scope = validate_task(&task.title, &task.acceptance_criteria).and_then(|()| {
+        if single_agent && task.acceptance_criteria.is_empty() {
+            bail!("A Single agent task needs at least one acceptance criterion so its result can account for it")
+        }
+        Ok(())
+    });
+    let configured: i64 = if single_agent {
+        0
+    } else {
+        connection.query_row(
         "SELECT COUNT(DISTINCT role)
          FROM role_settings WHERE task_id=?1 AND role IN
          ('manager','explorer','plan_reviewer','implementer','code_reviewer','final_verifier')
          AND revision=(SELECT MAX(latest.revision) FROM role_settings latest
                        WHERE latest.task_id=role_settings.task_id AND latest.role=role_settings.role)",
         params![task.id], |row| row.get(0),
-    )?;
+        )?
+    };
     let prerequisite =
         |code: &str, state: DecisionEvidenceState, message: Option<String>| DecisionPrerequisite {
             code: code.into(),
@@ -5421,13 +5710,38 @@ fn backlog_readiness_decision(
             evidence: serde_json::json!({"task_id":task.id,"project_id":task.project_id}),
             message,
         };
-    let prerequisites = vec![
+    let prerequisites = if single_agent {
+        let problem = single_agent_selection_problem(connection, &task.id, false)
+            .unwrap_or_else(|error| Some(format!("{error:#}")));
+        vec![
+            prerequisite(
+                "task.valid_scope",
+                if scope.is_ok() {
+                    DecisionEvidenceState::Satisfied
+                } else {
+                    DecisionEvidenceState::Missing
+                },
+                scope.as_ref().err().map(|error| format!("{error:#}")),
+            ),
+            prerequisite(
+                "task.single_agent_admission",
+                if problem.is_none() {
+                    DecisionEvidenceState::Satisfied
+                } else {
+                    DecisionEvidenceState::Missing
+                },
+                problem,
+            ),
+        ]
+    } else {
+        vec![
         prerequisite("task.project_ready", if project.is_ok() { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Missing }, project.as_ref().err().map(|error| format!("{error:#}"))),
         prerequisite("task.start_baseline_current", if start_baseline.is_none() { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Stale }, start_baseline.map(str::to_owned)),
         prerequisite("task.valid_scope", if scope.is_ok() { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Missing }, scope.as_ref().err().map(|error| format!("{error:#}"))),
         prerequisite("task.six_role_settings", if configured == 6 { DecisionEvidenceState::Satisfied } else { DecisionEvidenceState::Missing }, (configured != 6).then(|| format!("{configured} of six app roles have current settings. Open Agent settings and choose Use project defaults to copy the project role choices, then check their verification status."))),
         prerequisite("task.profile_activation_and_runtime", DecisionEvidenceState::Unknown, Some("Exact project-default or task-override activation and current runtime capability are checked by Make Ready".into())),
-    ];
+        ]
+    };
     let blocker = prerequisites
         .iter()
         .find(|item| {
@@ -5454,7 +5768,11 @@ fn backlog_readiness_decision(
         next_action: Some(DecisionNextAction {
             operation: if project.is_ok() { "make_ready" } else { "inspect_project" }.into(),
             enabled: enabled || project.is_err(), owner: DecisionOwner::Human, binding,
-            accounting_note: Some("Make Ready rechecks project, scope, six settings, activations, and current runtime authority".into()),
+            accounting_note: Some(if single_agent {
+                "Make Ready rechecks the repository baseline, task scope, selected configuration and profile admission"
+            } else {
+                "Make Ready rechecks project, scope, six settings, activations, and current runtime authority"
+            }.into()),
         }),
         control_policy: DecisionControlPolicy {
             allowed_controls: if enabled { vec!["make_ready".into()] } else if project.is_err() { vec!["inspect_project".into()] } else { Vec::new() },
@@ -7054,7 +7372,179 @@ fn workspace_recovery_reason(detail: &serde_json::Value) -> String {
     "LLMRelay could not confirm that this task's workspace was set up correctly. Check the folder shown in Technical details, then choose Inspect and retry workspace reservation, or Verify and cancel reservation, which cancels this task.".into()
 }
 
+fn runtime_probe_identity_matches(
+    expected: &serde_json::Value,
+    observed: &serde_json::Value,
+) -> bool {
+    [
+        "role",
+        "profile_hash",
+        "project_config_revision_id",
+        "project_configuration_hash",
+        "adapter",
+        "adapter_hash",
+        "capability_key",
+    ]
+    .into_iter()
+    .all(|key| {
+        json_text(expected, key)
+            .filter(|value| !value.is_empty())
+            .is_some_and(|value| json_text(observed, key) == Some(value))
+    }) && expected.get("settings_revision").is_some_and(|revision| {
+        // A project profile has no task override revision; absence is not that binding.
+        (revision.is_null() || revision.as_i64().is_some_and(|value| value > 0))
+            && observed.get("settings_revision") == Some(revision)
+    })
+}
+
+fn runtime_probe_attention_is_superseded(
+    project_id: &str,
+    admission: &serde_json::Value,
+    probe: &serde_json::Value,
+    admissions: &[serde_json::Value],
+    capabilities: &[serde_json::Value],
+) -> bool {
+    let Some(created_at) = json_text(admission, "created_at")
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+    else {
+        return false;
+    };
+    let Some(task_id) = admission
+        .get("task_id")
+        .filter(|value| value.is_null() || value.as_str().is_some_and(|value| !value.is_empty()))
+    else {
+        return false;
+    };
+    if project_id.is_empty()
+        || json_text(admission, "project_id") != Some(project_id)
+        || !json_text(admission, "id").is_some_and(|value| !value.is_empty())
+    {
+        return false;
+    }
+    admissions.iter().any(|replacement| {
+        let Some(replacement_created_at) = json_text(replacement, "created_at")
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        else {
+            return false;
+        };
+        if json_text(replacement, "project_id") != Some(project_id)
+            || replacement.get("task_id") != Some(task_id)
+            || replacement_created_at <= created_at
+            || !json_text(replacement, "id").is_some_and(|value| !value.is_empty())
+            || replacement.get("id") == admission.get("id")
+        {
+            return false;
+        }
+        replacement
+            .get("probes")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|probes| {
+                probes.iter().any(|replacement_probe| {
+                    if !runtime_probe_identity_matches(probe, replacement_probe)
+                        || !probe.get("profile").is_some_and(|profile| {
+                            ["provider", "model", "effort"].into_iter().all(|key| {
+                                json_text(profile, key).is_some_and(|value| !value.is_empty())
+                            }) && replacement_probe.get("profile") == Some(profile)
+                        })
+                    {
+                        return false;
+                    }
+                    if matches!(
+                        json_text(replacement_probe, "state"),
+                        Some("failed" | "stale")
+                    ) {
+                        return true;
+                    }
+                    if json_text(replacement_probe, "state") != Some("published")
+                        || !json_text(replacement_probe, "capability_id")
+                            .is_some_and(|value| !value.is_empty())
+                        || !json_text(replacement_probe, "published_at")
+                            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                            .is_some_and(|value| value >= replacement_created_at)
+                    {
+                        return false;
+                    }
+                    let provider = replacement_probe.pointer("/profile/provider");
+                    capabilities.iter().any(|capability| {
+                        if capability.get("provider") != provider
+                            || capability.get("role") != probe.get("role")
+                            || json_text(capability, "mode") != Some("interactive_pty")
+                            || capability.get("config_hash") != probe.get("capability_key")
+                            || !json_text(capability, "version")
+                                .is_some_and(|value| !value.is_empty())
+                        {
+                            return false;
+                        }
+                        let latest = capabilities
+                            .iter()
+                            .filter(|candidate| {
+                                ["provider", "version", "role", "mode"]
+                                    .into_iter()
+                                    .all(|key| candidate.get(key) == capability.get(key))
+                            })
+                            .max_by_key(|candidate| {
+                                (
+                                    json_text(candidate, "checked_at")
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    candidate
+                                        .get("rowid")
+                                        .and_then(serde_json::Value::as_i64)
+                                        .unwrap_or_default(),
+                                )
+                            });
+                        let Some(current) = latest.filter(|current| {
+                            json_text(current, "status") == Some("supported")
+                                && current
+                                    .pointer("/compatibility/status")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some("matched")
+                                && current.get("config_hash") == probe.get("capability_key")
+                                && json_text(current, "checked_at")
+                                    .is_some_and(|value| !value.is_empty())
+                                && current
+                                    .get("rowid")
+                                    .and_then(serde_json::Value::as_i64)
+                                    .is_some_and(|value| value > 0)
+                        }) else {
+                            return false;
+                        };
+                        let Some(proof) = current.get("proof").filter(|proof| {
+                            ["provider", "version", "role"]
+                                .into_iter()
+                                .all(|key| proof.get(key) == current.get(key))
+                                && proof.get("config_hash") == probe.get("capability_key")
+                                && proof.get("model") == probe.pointer("/profile/model")
+                                && proof.get("effort") == probe.pointer("/profile/effort")
+                        }) else {
+                            return false;
+                        };
+                        proof
+                            .get("runtime_scopes")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .chain(proof.get("runtime_scope"))
+                            .any(|scope| {
+                                json_text(scope, "project_id") == Some(project_id)
+                                    && scope.get("task_id") == Some(task_id)
+                                    && scope
+                                        .get("profiles")
+                                        .and_then(serde_json::Value::as_array)
+                                        .is_some_and(|profiles| {
+                                            profiles.iter().any(|profile| {
+                                                runtime_probe_identity_matches(probe, profile)
+                                            })
+                                        })
+                            })
+                    })
+                })
+            })
+    })
+}
+
 fn continuation_actions(
+    projects: &[ProjectDto],
     tasks: &[TaskDto],
     capabilities: &[serde_json::Value],
     sessions: &[serde_json::Value],
@@ -7150,21 +7640,96 @@ fn continuation_actions(
                     .get("probe_state")
                     .or_else(|| admission.get("state"))
                     .and_then(serde_json::Value::as_str);
-                if matches!(admission_state, Some("failed" | "stale")) {
+                let probes = admission
+                    .get("probes")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let mut failures = probes
+                    .iter()
+                    .filter(|probe| matches!(json_text(probe, "state"), Some("failed" | "stale")))
+                    .map(Some)
+                    .collect::<Vec<_>>();
+                if matches!(admission_state, Some("failed" | "stale"))
+                    && (failures.is_empty()
+                        || probes.iter().any(|probe| {
+                            !matches!(
+                                json_text(probe, "state"),
+                                Some(
+                                    "current"
+                                        | "published"
+                                        | "authorized"
+                                        | "running"
+                                        | "awaiting_resume"
+                                        | "pending_approval"
+                                        | "evidence_recorded"
+                                        | "failed"
+                                        | "stale"
+                                )
+                            )
+                        }))
+                {
+                    failures.push(None);
+                }
+                for probe in failures {
+                    let role = probe
+                        .and_then(|probe| json_text(probe, "role"))
+                        .and_then(|role| role.parse::<RoleKind>().ok());
+                    if role.is_some()
+                        && probe.is_some_and(|probe| {
+                            runtime_probe_attention_is_superseded(
+                                json_text(setup, "project_id").unwrap_or_default(),
+                                admission,
+                                probe,
+                                admissions,
+                                capabilities,
+                            )
+                        })
+                    {
+                        continue;
+                    }
+                    let failure_reason = probe
+                        .and_then(|probe| json_text(probe, "failure_reason"))
+                        .or_else(|| json_text(admission, "failure_reason"));
+                    let category = probe
+                        .and_then(|probe| json_text(probe, "failure_category"))
+                        .or_else(|| {
+                            failure_reason.filter(|reason| {
+                                matches!(
+                                    *reason,
+                                    "model_refusal"
+                                        | "authentication_missing"
+                                        | "observation_unavailable"
+                                        | "os_denial"
+                                        | "provider_denial"
+                                        | "shell_construction"
+                                        | "unexpected_result"
+                                )
+                            })
+                        });
+                    let problem = match category {
+                        Some("model_refusal") => format!("{} declined a required verification check, so this profile is not verified.", role_name(role)),
+                        Some("authentication_missing") => format!("{} could not complete verification because agent sign-in was unavailable.", role_name(role)),
+                        Some("observation_unavailable") => format!("{} did not provide enough evidence to complete verification.", role_name(role)),
+                        Some("os_denial" | "provider_denial" | "shell_construction" | "unexpected_result") => format!("{}'s recorded check did not meet the verification requirements.", role_name(role)),
+                        _ if probe.is_some_and(|probe| json_text(probe, "state") == Some("stale")) => format!("{}'s verification no longer matches its settings or application environment.", role_name(role)),
+                        _ => format!("{}'s earlier verification could not be used.", role_name(role)),
+                    };
+                    let verification_location = if json_text(admission, "task_id").is_some() {
+                        "the task's Roles tab"
+                    } else {
+                        "Project setup > Runtime verification"
+                    };
                     actions.push(continuation(
                         ContinuationActionKind::PrepareCorrectedRuntime,
                         true,
-                        admission
-                            .get("failure_reason")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("The earlier profile verification can no longer be used. Prepare a new verification for this profile.")
-                            .to_owned(),
+                        format!("{problem} Open {verification_location}, inspect {} recorded output, correct the cause, then use Prepare a new verification.", role.map_or("the group's".to_owned(), |role| format!("the {}'s", role.label()))),
                         "human",
                         None,
                         admission.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
                         None,
                         "prepare_runtime_admission",
-                        serde_json::json!({"project_id":setup.get("project_id"),"task_id":admission.get("task_id"),"admission_id":admission.get("id"),"role":admission.get("role")}),
+                        serde_json::json!({"project_id":setup.get("project_id"),"task_id":admission.get("task_id"),"admission_id":admission.get("id"),"role":role,"failure_category":category,"failure_reason":failure_reason}),
                         Some("The new verification is a separate agent call that you approve before it runs."),
                     ));
                 }
@@ -7655,10 +8220,304 @@ fn continuation_actions(
                     }),
                     accounting_note,
                 ));
+            } else if session
+                .get("validation_cell")
+                .and_then(serde_json::Value::as_str)
+                == Some("trip_runtime_probe")
+            {
+                let runtime_admission = session
+                    .get("runtime_admission_id")
+                    .and_then(serde_json::Value::as_str);
+                let bound_probe = trip_setups.iter().find_map(|setup| {
+                    let admissions = setup.get("runtime_admissions")?.as_array()?;
+                    let admission = admissions.iter().find(|admission| {
+                        admission.get("id").and_then(serde_json::Value::as_str) == runtime_admission
+                            && matches!(
+                                admission.get("state").and_then(serde_json::Value::as_str),
+                                Some("running" | "awaiting_publication")
+                            )
+                    })?;
+                    let created_at = admission.get("created_at")?.as_str()?;
+                    let superseded = admissions.iter().any(|newer| {
+                        newer.get("id") != admission.get("id")
+                            && newer.get("task_id") == admission.get("task_id")
+                            && newer
+                                .get("created_at")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|time| time >= created_at)
+                            && matches!(
+                                newer.get("state").and_then(serde_json::Value::as_str),
+                                Some("authorized" | "running" | "awaiting_publication" | "ready")
+                            )
+                            && newer
+                                .get("probes")
+                                .and_then(serde_json::Value::as_array)
+                                .is_some_and(|probes| {
+                                    probes.iter().any(|probe| {
+                                        probe.get("role") == session.get("role")
+                                            && matches!(
+                                                probe
+                                                    .get("state")
+                                                    .and_then(serde_json::Value::as_str),
+                                                Some(
+                                                    "authorized"
+                                                        | "running"
+                                                        | "awaiting_resume"
+                                                        | "evidence_recorded"
+                                                        | "current"
+                                                        | "published"
+                                                )
+                                            )
+                                    })
+                                })
+                    });
+                    if superseded {
+                        return None;
+                    }
+                    let probes = admission.get("probes")?.as_array()?;
+                    let probe = probes.iter().find(|probe| {
+                        matches!(
+                            probe.get("state").and_then(serde_json::Value::as_str),
+                            Some("running" | "awaiting_resume")
+                        ) && probe.get("session_id").and_then(serde_json::Value::as_str) == id
+                            && probe.get("role") == session.get("role")
+                            && probe.get("attempt_id") == session.get("attempt_id")
+                            && probe.pointer("/profile/provider") == session.get("provider")
+                            && probe.pointer("/profile/model") == session.pointer("/launch/model")
+                            && probe.pointer("/profile/effort") == session.pointer("/launch/effort")
+                            && probe
+                                .pointer("/profile/session")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("retained")
+                            && probe.get("hook_trust").and_then(serde_json::Value::as_str)
+                                == Some("observed_unverified")
+                    })?;
+                    let current_binding = projects
+                        .iter()
+                        .find(|project| {
+                            setup.get("project_id").and_then(serde_json::Value::as_str)
+                                == Some(project.id.as_str())
+                        })
+                        .is_some_and(|project| {
+                            probes.iter().all(|profile_probe| {
+                                let Some(role) = profile_probe
+                                    .get("role")
+                                    .and_then(serde_json::Value::as_str)
+                                else {
+                                    return false;
+                                };
+                                let Some(project_profile) = project
+                                    .settings
+                                    .get("roles")
+                                    .and_then(|roles| roles.get(role))
+                                else {
+                                    return false;
+                                };
+                                if ["provider", "model", "effort"].iter().any(|field| {
+                                    project_profile
+                                        .get(*field)
+                                        .and_then(serde_json::Value::as_str)
+                                        .is_none_or(|value| value.trim().is_empty())
+                                }) {
+                                    return false;
+                                }
+                                let current_profile = if let Some(task_id) =
+                                    admission.get("task_id").and_then(serde_json::Value::as_str)
+                                {
+                                    tasks
+                                        .iter()
+                                        .find(|task| {
+                                            task.id == task_id
+                                                && task.project_id == project.id
+                                                && !task.archived
+                                                && !matches!(
+                                                    task.lifecycle.as_str(),
+                                                    "done" | "cancelled"
+                                                )
+                                        })
+                                        .and_then(|task| {
+                                            let setting = task
+                                                .role_settings
+                                                .iter()
+                                                .filter(|setting| {
+                                                    setting
+                                                        .get("role")
+                                                        .and_then(serde_json::Value::as_str)
+                                                        == Some(role)
+                                                })
+                                                .max_by_key(|setting| {
+                                                    setting
+                                                        .get("revision")
+                                                        .and_then(serde_json::Value::as_i64)
+                                                })?;
+                                            let revision = setting.get("revision")?.as_i64()?;
+                                            if profile_probe
+                                                .get("settings_revision")
+                                                .and_then(serde_json::Value::as_i64)
+                                                != Some(revision)
+                                            {
+                                                return None;
+                                            }
+                                            let config = setting.get("config")?;
+                                            if ["provider", "model", "effort"].iter().all(|field| {
+                                                config.get(*field) == project_profile.get(*field)
+                                            }) {
+                                                return None;
+                                            }
+                                            Some(config)
+                                        })
+                                } else if admission
+                                    .get("task_id")
+                                    .is_some_and(serde_json::Value::is_null)
+                                    && profile_probe
+                                        .get("settings_revision")
+                                        .is_some_and(serde_json::Value::is_null)
+                                {
+                                    Some(project_profile)
+                                } else {
+                                    None
+                                };
+                                project
+                                    .trip
+                                    .get("readiness")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some("ready")
+                                    && project
+                                        .trip
+                                        .get("active_config_revision_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .is_some_and(|revision| {
+                                            !revision.is_empty()
+                                                && project
+                                                    .settings
+                                                    .get("trip_config_revision_id")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    == Some(revision)
+                                                && project
+                                                    .trip
+                                                    .pointer("/configuration/id")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    == Some(revision)
+                                                && profile_probe
+                                                    .get("project_config_revision_id")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    == Some(revision)
+                                        })
+                                    && project
+                                        .trip
+                                        .pointer("/configuration/configuration_hash")
+                                        .and_then(serde_json::Value::as_str)
+                                        .is_some_and(|hash| {
+                                            !hash.is_empty()
+                                                && profile_probe
+                                                    .get("project_configuration_hash")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    == Some(hash)
+                                        })
+                                    && current_profile.is_some_and(|profile| {
+                                        ["provider", "model", "effort"].iter().all(|field| {
+                                            profile
+                                                .get(*field)
+                                                .and_then(serde_json::Value::as_str)
+                                                .is_some_and(|value| {
+                                                    profile_probe
+                                                        .get("profile")
+                                                        .and_then(|profile| profile.get(*field))
+                                                        .and_then(serde_json::Value::as_str)
+                                                        == Some(value)
+                                                })
+                                        })
+                                    })
+                            })
+                        });
+                    Some((probe, current_binding))
+                });
+                let quiescent = session.get("process_group_quiescent").is_some_and(|value| {
+                    value.as_bool() == Some(true) || value.as_i64() == Some(1)
+                });
+                let first_retained_exit = !rejection_authority_replaced
+                    && !historical_role_session
+                    && runtime_admission.is_some()
+                    && id.is_some()
+                    && bound_probe.is_some()
+                    && session
+                        .get("role")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|role| role != "final_verifier")
+                    && session
+                        .get("resume_count")
+                        .and_then(serde_json::Value::as_i64)
+                        == Some(0)
+                    && session
+                        .get("launch_state")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("finished")
+                    && session
+                        .get("generation_status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("exited")
+                    && session
+                        .get("process_identity")
+                        .is_some_and(serde_json::Value::is_object)
+                    && session.get("has_newer_generation").is_some_and(|value| {
+                        value.as_bool() == Some(false) || value.as_i64() == Some(0)
+                    })
+                    && session
+                        .get("native_session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty())
+                    && session
+                        .get("role_generation_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                    && session
+                        .get("attempt_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                    && session
+                        .get("transcript_epoch")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                    && session
+                        .get("capability_key")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                    && quiescent;
+                if first_retained_exit {
+                    let current_binding = bound_probe.is_some_and(|(_, current)| current);
+                    actions.push(continuation(
+                        if current_binding {
+                            ContinuationActionKind::ExactResume
+                        } else {
+                            ContinuationActionKind::AuthorizationRequired
+                        },
+                        current_binding,
+                        if current_binding {
+                            "The first verification phase finished. Resume the same native session to submit its remembered result without repeating the probes."
+                        } else {
+                            "The selected agent settings or project configuration no longer match this verification. Open Runtime verification and prepare a new verification for the current selection."
+                        },
+                        "human", None,
+                        session.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
+                        None, if current_binding { "runtime_probe_resume" } else { "authorization_required" },
+                        serde_json::json!({"task_id":session.get("task_id"),"attempt_id":session.get("attempt_id"),"session_id":id,"role_generation_id":session.get("role_generation_id"),"transcript_epoch":session.get("transcript_epoch"),"runtime_admission_id":runtime_admission,"role":session.get("role")}),
+                        Some(if current_binding {
+                            "This continues the retained conversation for one reporting turn; it does not repeat the probes."
+                        } else {
+                            "Existing evidence is preserved. A new verification requires separate approval."
+                        }),
+                    ));
+                }
             } else if !rejection_authority_replaced
                 && !historical_role_session
                 && session.get("role").and_then(serde_json::Value::as_str) != Some("final_verifier")
                 && !restart_candidate_managed
+                && !matches!(
+                    session
+                        .get("validation_cell")
+                        .and_then(serde_json::Value::as_str),
+                    Some("trip_setup_discovery" | "trip_setup_probe")
+                )
             {
                 let quiescent = session
                     .get("process_group_quiescent")
@@ -7672,10 +8531,6 @@ fn continuation_actions(
                     .get("native_session_id")
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|value| !value.is_empty());
-                let runtime_probe = session
-                    .get("validation_cell")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("trip_runtime_probe");
                 let runtime_admission = session
                     .get("runtime_admission_id")
                     .and_then(serde_json::Value::as_str);
@@ -7688,10 +8543,7 @@ fn continuation_actions(
                             .and_then(serde_json::Value::as_bool)
                             == Some(true)
                     });
-                let resumable = quiescent
-                    && native_session
-                    && production_capability_current
-                    && (!runtime_probe || runtime_admission.is_some());
+                let resumable = quiescent && native_session && production_capability_current;
                 actions.push(continuation(
                     if resumable {
                         ContinuationActionKind::ExactResume
@@ -7701,9 +8553,7 @@ fn continuation_actions(
                         ContinuationActionKind::AuthorizationRequired
                     },
                     resumable,
-                    if resumable && runtime_probe {
-                        "The profile verification stopped before finishing. You can resume that same verification."
-                    } else if resumable {
+                    if resumable {
                         "The session stopped before reporting its result. You can resume the same session where it left off."
                     } else if !quiescent {
                         "The session stopped before reporting its result. It can be resumed once LLMRelay confirms it has fully exited."
@@ -7717,18 +8567,14 @@ fn continuation_actions(
                     session.get("updated_at").and_then(serde_json::Value::as_str).map(str::to_owned),
                     None,
                     if resumable {
-                        if runtime_probe { "runtime_probe_resume" } else { "role_resume" }
+                        "role_resume"
                     } else if !quiescent {
                         "wait_for_exit"
                     } else {
                         "authorization_required"
                     },
                     serde_json::json!({"task_id":session.get("task_id"),"attempt_id":session.get("attempt_id"),"session_id":id,"role_generation_id":session.get("role_generation_id"),"transcript_epoch":session.get("transcript_epoch"),"runtime_admission_id":runtime_admission,"role":session.get("role")}),
-                    Some(if runtime_probe {
-                        "Resuming continues the same verification; it does not start a new agent call."
-                    } else {
-                        "Resuming continues the same conversation; it does not start a new agent call."
-                    }),
+                    Some("Resuming continues the same conversation; it does not start a new agent call."),
                 ));
             }
         }
@@ -8494,6 +9340,11 @@ impl AttentionSources<'_> {
                 json_text(&action.binding, "session_id")
                     .and_then(|session_id| self.session_role(session_id))
             });
+        let identity = if matches!(action.kind, ContinuationActionKind::PrepareCorrectedRuntime) {
+            role.map_or_else(|| identity.to_owned(), |role| format!("{identity}:{role}"))
+        } else {
+            identity.to_owned()
+        };
         let task_title = match &target {
             Some(AttentionTarget::ProjectSetup { .. }) => None,
             Some(target) => attention_task_id(target),
@@ -8518,8 +9369,8 @@ impl AttentionSources<'_> {
         };
         AttentionItem {
             id: format!("continuation:{}:{identity}", action.operation),
-            category: continuation_category(&action.kind),
-            title: continuation_title(&action.kind, role),
+            category: continuation_category(&action.kind, &action.operation),
+            title: continuation_title(&action.kind, &action.operation, role),
             reason: match &action.waiting_for {
                 Some(waiting_for) => format!("{} Waiting for {waiting_for}.", action.reason),
                 None => action.reason.clone(),
@@ -8529,7 +9380,15 @@ impl AttentionSources<'_> {
             action: action_kind.into(),
             target,
             held_tasks: Vec::new(),
-            details: None,
+            details: matches!(action.kind, ContinuationActionKind::PrepareCorrectedRuntime).then(
+                || {
+                    format!(
+                        "Failure category: {}. Recorded failure: {}",
+                        json_text(&action.binding, "failure_category").unwrap_or("unavailable"),
+                        json_text(&action.binding, "failure_reason").unwrap_or("unavailable")
+                    )
+                },
+            ),
         }
     }
 
@@ -8583,6 +9442,19 @@ impl AttentionSources<'_> {
             .and_then(|attempt| json_text(attempt, "phase"))
             .filter(|_| !terminal);
         let task_scope = || Some(AttentionTarget::Task(task_target(task)));
+        let result_decision = task
+            .workflow
+            .as_ref()
+            .and_then(|workflow| workflow.run.as_ref())
+            .is_some_and(|run| {
+                run.result.is_some()
+                    && run.available_actions.iter().any(|action| {
+                        matches!(
+                            action.as_str(),
+                            "authorize_check" | "accept_result" | "request_rework"
+                        )
+                    })
+            });
         let mut details = None;
         let (id, category, title, reason, action, target) = match (phase, task.attention.as_str()) {
             (Some(phase @ "awaiting_plan_approval"), _) => (
@@ -8611,6 +9483,23 @@ impl AttentionSources<'_> {
                 AttentionActionKind::ReviewResult,
                 attempt_target(task, attempt_id?),
             ),
+            (Some(phase @ ("awaiting_checks" | "awaiting_human")), "needs_input")
+                if result_decision =>
+            {
+                let run = task.workflow.as_ref()?.run.as_ref()?;
+                (
+                    format!("attempt:{}:{phase}", attempt_id?),
+                    AttentionCategory::Decision,
+                    if phase == "awaiting_checks" {
+                        "Selected checks need your decision".to_owned()
+                    } else {
+                        "Result ready for your review".to_owned()
+                    },
+                    run.stage_reason.clone(),
+                    AttentionActionKind::ReviewResult,
+                    attempt_target(task, attempt_id?),
+                )
+            }
             (Some(phase @ "awaiting_human"), "none") => {
                 let run = task.workflow.as_ref()?.run.as_ref()?;
                 // A probe's result is admission evidence LLMRelay settles itself.
@@ -8646,6 +9535,9 @@ impl AttentionSources<'_> {
                             .as_ref()
                             .is_some_and(|blocker| blocker.owner == DecisionOwner::Human)
                 })?;
+                if decision.reason_code == "scheduler.queue_paused" {
+                    return None;
+                }
                 let reason = decision
                     .primary_blocker
                     .as_ref()
@@ -9442,9 +10334,10 @@ pub(crate) fn plain_scheduler_reason(reason_code: &str) -> Option<String> {
     .to_owned())
 }
 
-fn continuation_category(kind: &ContinuationActionKind) -> AttentionCategory {
+fn continuation_category(kind: &ContinuationActionKind, operation: &str) -> AttentionCategory {
     use AttentionCategory::{Blocked, Compatibility, Decision, Recovery};
     match kind {
+        ContinuationActionKind::ExactResume if operation == "runtime_probe_resume" => Decision,
         ContinuationActionKind::WaitForCapacity | ContinuationActionKind::WaitForService => Blocked,
         ContinuationActionKind::PrepareCorrectedRuntime
         | ContinuationActionKind::MigrateAttempt
@@ -9468,9 +10361,16 @@ fn continuation_category(kind: &ContinuationActionKind) -> AttentionCategory {
     }
 }
 
-fn continuation_title(kind: &ContinuationActionKind, role: Option<RoleKind>) -> String {
+fn continuation_title(
+    kind: &ContinuationActionKind,
+    operation: &str,
+    role: Option<RoleKind>,
+) -> String {
     let who = role_name(role);
     match kind {
+        ContinuationActionKind::ExactResume if operation == "runtime_probe_resume" => {
+            format!("{who} verification is ready to finish")
+        }
         ContinuationActionKind::ExactResume => format!("{who} stopped before finishing"),
         ContinuationActionKind::FreshAccountedRetry => format!("{who} needs a fresh start"),
         ContinuationActionKind::ReplaceStaleAuthority => format!("{who} needs updated settings"),
@@ -10382,6 +11282,14 @@ pub(crate) fn single_agent_admission_problem(
     connection: &Connection,
     task_id: &str,
 ) -> Result<Option<String>> {
+    single_agent_selection_problem(connection, task_id, true)
+}
+
+fn single_agent_selection_problem(
+    connection: &Connection,
+    task_id: &str,
+    require_ready: bool,
+) -> Result<Option<String>> {
     let row: Option<(String, String, Option<i64>, Option<String>, Option<String>, Option<String>, String, String, i64)> = connection
         .query_row(
             "SELECT t.project_id,s.admission_state,s.admitted_task_version,s.definition_id,
@@ -10409,7 +11317,7 @@ pub(crate) fn single_agent_admission_problem(
     else {
         return Ok(Some("The task has no Single agent selection".into()));
     };
-    if state != "admitted" || admitted_version != Some(version) {
+    if require_ready && (state != "admitted" || admitted_version != Some(version)) {
         return Ok(Some(
             "The task changed after Make Ready; make it Ready again".into(),
         ));
@@ -10419,6 +11327,18 @@ pub(crate) fn single_agent_admission_problem(
     else {
         return Ok(Some("The Single agent selection is incomplete".into()));
     };
+    if !require_ready {
+        crate::recipes::require_binding_current(connection, task_id)?;
+        let (path, identity, base): (String, String, String) = connection.query_row(
+            "SELECT repository_path,repository_identity,base_revision FROM projects WHERE id=?1",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let repository = crate::workspace::inspect(std::path::Path::new(&path))?;
+        if repository.identity != identity || repository.head != base {
+            return Ok(Some("The project repository no longer matches its registered starting commit. Validate and relink it in Project settings before Make Ready.".into()));
+        }
+    }
     let definition_hash = crate::workflow_resources::single_agent_definition_hash();
     let available: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM workflow_definitions WHERE id=?1 AND content_hash=?2 AND definition_text=?3)",
@@ -10447,11 +11367,24 @@ pub(crate) fn single_agent_admission_problem(
     )?;
     if hash != stored_hash {
         return Ok(Some(
-            "The selected configuration or profile changed after Make Ready".into(),
+            if require_ready {
+                "The selected configuration or profile changed after Make Ready"
+            } else {
+                "The selected configuration or profile changed after it was chosen; choose the workflow again"
+            }.into(),
         ));
     }
     let admitted_scope =
-        run_admission(connection, task_id, &profile_id, &config_id)?.map(|(_, scope)| scope);
+        if require_ready {
+            run_admission(connection, task_id, &profile_id, &config_id)?.map(|(_, scope)| scope)
+        } else {
+            connection.query_row(
+            "SELECT prepared_scope_hash FROM profile_admissions WHERE profile_revision_id=?1
+             AND execution_config_revision_id=?2 AND state='activated'",
+            params![profile_id, config_id],
+            |row| row.get::<_, String>(0),
+        ).optional()?
+        };
     let scope = admission_scope_hash(
         connection,
         &project_id,
@@ -10462,7 +11395,11 @@ pub(crate) fn single_agent_admission_problem(
     )?;
     if admitted_scope.as_deref() != Some(scope.as_str()) {
         return Ok(Some(
-            "The selected agent profile is no longer admitted for this configuration".into(),
+            if require_ready {
+                "The selected agent profile is no longer admitted for this configuration"
+            } else {
+                "The selected agent profile is not admitted for this execution configuration. Prepare and activate its admission in Project settings."
+            }.into(),
         ));
     }
     Ok(None)
@@ -11266,6 +12203,11 @@ pub(crate) fn task_workflow_projection(
                 ),
                 ("done", _, _) => (SingleAgentStage::Accepted, "You accepted this result. Integration into the repository is recorded separately.".to_owned()),
                 (_, _, Some("changes_requested")) => (SingleAgentStage::ChangesRequested, "You requested changes; a linked new run continues the work.".to_owned()),
+                ("needs_input", _, _) if probe_admission_id.is_some()
+                    && held_reason.as_deref().is_some_and(|reason| reason.starts_with("The probe did not prove the profile:")) => (
+                    SingleAgentStage::Blocked,
+                    held_reason.clone().unwrap_or_default(),
+                ),
                 ("needs_input", _, _) => (
                     SingleAgentStage::NeedsAction,
                     held_reason.unwrap_or_else(|| "The run needs your decision.".into()),
@@ -11442,6 +12384,9 @@ fn single_agent_check_projection(
     attempt_id: &str,
     result: &crate::domain::SingleAgentResultDto,
 ) -> Result<Vec<crate::domain::SingleAgentCheckDto>> {
+    if result.state == "accepted" {
+        return accepted_single_agent_checks(connection, attempt_id, result);
+    }
     use crate::checks::SingleAgentCheckAuthorization;
     let selected = {
         let mut statement = connection.prepare(
@@ -11501,6 +12446,133 @@ fn single_agent_check_projection(
             latest_run_status: latest.as_ref().map(|(_, status, _, _)| status.clone()),
             latest_run_id: latest.map(|(id, _, _, _)| id),
         });
+    }
+    Ok(checks)
+}
+
+fn accepted_single_agent_checks(
+    connection: &Connection,
+    attempt_id: &str,
+    result: &crate::domain::SingleAgentResultDto,
+) -> Result<Vec<crate::domain::SingleAgentCheckDto>> {
+    let acceptance: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT ac.check_receipts_json,b.execution_config_hash
+             FROM workflow_result_acceptances ac
+             JOIN workflow_result_bindings r ON r.id=ac.result_binding_id AND r.state='accepted'
+             JOIN attempts a ON a.id=r.attempt_id AND a.status='done'
+               AND a.candidate_hash=r.candidate_hash AND a.accepted_snapshot_id=r.snapshot_id
+             JOIN workflow_run_bindings b ON b.attempt_id=a.id AND b.family='single_agent'
+             WHERE r.id=?1 AND r.attempt_id=?2 AND r.candidate_hash=?3
+               AND r.selected_check_revision=?4 AND ac.decision='accepted'
+               AND ac.candidate_hash=r.candidate_hash AND ac.definition_hash=b.definition_hash
+               AND ac.profile_binding_hash=r.profile_binding_hash AND ac.criteria_hash=r.criteria_hash",
+            params![result.id, attempt_id, result.candidate_hash, result.selected_check_revision],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((receipts_json, Some(configuration_hash))) = acceptance else {
+        return Ok(Vec::new());
+    };
+    let Some(receipts) = serde_json::from_str::<serde_json::Value>(&receipts_json)
+        .ok()
+        .filter(|value| {
+            value["execution_config_hash"].as_str() == Some(configuration_hash.as_str())
+        })
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value["check_runs"].clone()).ok())
+    else {
+        return Ok(Vec::new());
+    };
+    let receipts_json = serde_json::to_string(&receipts)?;
+    let mut statement = connection.prepare(
+        "SELECT c.id,c.check_key,c.original_text,c.command_kind,c.executable,c.arguments_json,
+                c.shell_command,c.cwd,c.timeout_seconds
+         FROM workflow_check_selections s JOIN workflow_run_bindings b ON b.attempt_id=s.attempt_id
+         JOIN execution_verification_checks c ON c.id=s.check_id
+           AND c.execution_config_revision_id=b.execution_config_revision_id
+         WHERE s.attempt_id=?1 AND s.revision=?2 ORDER BY c.check_key",
+    )?;
+    let selected = statement
+        .query_map(params![attempt_id, result.selected_check_revision], |row| {
+            Ok((
+                crate::domain::SingleAgentCheckDto {
+                    check_id: row.get(0)?,
+                    check_key: row.get(1)?,
+                    original_text: row.get(2)?,
+                    command_kind: row.get(3)?,
+                    executable: row.get(4)?,
+                    arguments: Vec::new(),
+                    shell_command: row.get(6)?,
+                    cwd: row.get(7)?,
+                    exact_command_hash: String::new(),
+                    scope_hash: String::new(),
+                    authorization: "missing".into(),
+                    latest_run_id: None,
+                    latest_run_status: Some("unavailable".into()),
+                    latest_run_passed: None,
+                },
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut checks = Vec::new();
+    for (mut check, arguments_json, timeout_seconds) in selected {
+        let Ok(arguments) =
+            serde_json::from_str::<Vec<String>>(arguments_json.as_deref().unwrap_or("[]"))
+        else {
+            continue;
+        };
+        check.arguments = arguments;
+        check.exact_command_hash = json_hash(&serde_json::json!({
+            "kind":check.command_kind,"executable":check.executable,"arguments":arguments_json,
+            "shell":check.shell_command,"cwd":check.cwd,"timeout_seconds":timeout_seconds,
+        }))?;
+        check.scope_hash = json_hash(&serde_json::json!({
+            "family":"single_agent","attempt_id":attempt_id,"candidate_hash":result.candidate_hash,
+            "check_id":check.check_id,"selected_revision":result.selected_check_revision,
+            "cwd":check.cwd,"execution_config_hash":configuration_hash,
+        }))?;
+        // Accepted receipts are history; they never restore execution eligibility.
+        let mut runs = connection.prepare(
+            "SELECT cr.id,cr.status,cr.exit_code,cr.freshness_state FROM check_runs cr
+             WHERE cr.id IN (SELECT value FROM json_each(?1)) AND cr.attempt_id=?2
+               AND cr.candidate_hash=?3 AND cr.check_id=?4 AND cr.selected_check_revision=?5
+               AND cr.inputs_hash IS NOT NULL
+               AND (SELECT wa.decision FROM workflow_check_authorizations wa
+                    WHERE wa.attempt_id=cr.attempt_id AND wa.check_id=cr.check_id
+                      AND wa.selected_revision=cr.selected_check_revision
+                      AND wa.exact_command_hash=?6 AND wa.scope_hash=?7 AND wa.created_at<=cr.created_at
+                    ORDER BY wa.created_at DESC,wa.rowid DESC LIMIT 1)='authorized'",
+        )?;
+        let runs = runs
+            .query_map(
+                params![
+                    receipts_json,
+                    attempt_id,
+                    result.candidate_hash,
+                    check.check_id,
+                    result.selected_check_revision,
+                    check.exact_command_hash,
+                    check.scope_hash
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if let [(id, status, exit_code, freshness)] = runs.as_slice() {
+            check.latest_run_id = Some(id.clone());
+            check.latest_run_status = Some(status.clone());
+            check.latest_run_passed =
+                Some(status == "finished" && *exit_code == Some(0) && freshness == "current");
+        }
+        checks.push(check);
     }
     Ok(checks)
 }
@@ -11639,6 +12711,30 @@ fn workflow_execution_projection(
             rows
         };
         for admission in &mut admissions {
+            if admission.state == "pending" {
+                if let Some(task_id) = &admission.probe_task_id {
+                    let lifecycle: String = connection.query_row(
+                        "SELECT lifecycle FROM tasks WHERE id=?1",
+                        params![task_id],
+                        |row| row.get(0),
+                    )?;
+                    let run = task_workflow_projection(connection, task_id)?
+                        .and_then(|selection| selection.run);
+                    admission.state_reason = Some(if lifecycle == "cancelled" {
+                        "The previous probe was cancelled. Its history is kept; choose Probe this profile to start a new explicit probe."
+                    } else if run.as_ref().is_some_and(|run| run.stage == crate::domain::SingleAgentStage::ProbeEvidenceRecorded) {
+                        "Native probe evidence is recorded; activate this admission to use the profile."
+                    } else if run.as_ref().is_some_and(|run| run.stage == crate::domain::SingleAgentStage::Blocked) {
+                        "The probe is blocked and has not recorded admission evidence. Open its task, review the failure and choose Cancel under Controls before starting another probe."
+                    } else if run.as_ref().is_some_and(|run| run.stage == crate::domain::SingleAgentStage::NeedsAction) {
+                        "The probe is waiting for your input. Open its task to respond; admission evidence has not been recorded yet."
+                    } else if lifecycle == "ready" {
+                        "A probe is queued. It must record native evidence before this admission can be activated."
+                    } else {
+                        "The probe is still open. Finish or cancel it before starting another probe; admission evidence has not been recorded."
+                    }.into());
+                }
+            }
             if let Err(blocker) =
                 single_agent_probe_inputs(connection, bundles, project_id, &admission.id)
             {

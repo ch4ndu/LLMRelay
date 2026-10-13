@@ -1199,6 +1199,12 @@ pub enum LaunchHandshake {
         leader: ProcessGenerationAnchor,
         provider: ProcessGenerationAnchor,
     },
+    ProviderExited {
+        leader: ProcessGenerationAnchor,
+        provider: ProcessGenerationAnchor,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+    },
     PreProviderSpawnFailed {
         reason: String,
     },

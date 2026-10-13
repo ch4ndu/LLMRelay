@@ -557,6 +557,12 @@ function SingleAgentRunPanel(
     }
   };
   const held = run.stage === "needs_action" || run.stage === "blocked";
+  const resultDecision = !!result?.candidate_hash &&
+    (run.stage === "awaiting_selected_checks" || run.stage === "awaiting_human" ||
+      offered.has("authorize_check") || offered.has("accept_result") ||
+      offered.has("request_rework"));
+  const failedProbe = !!run.probe_admission_id &&
+    run.stage_reason.startsWith("The probe did not prove the profile:");
   const resumeKey = run.resume
     ? `resume:${run.attempt_id}:${run.resume.session_id}:${run.resume.transcript_epoch}`
     : "";
@@ -613,7 +619,23 @@ function SingleAgentRunPanel(
       tabIndex={-1}
     >
       <span className="eyebrow">Single agent run</span>
-      <h3>{stageHeadings[run.stage]}</h3>
+      <h3>{failedProbe ? "Profile probe failed" : stageHeadings[run.stage]}</h3>
+      {failedProbe && (
+        <div className="warning">
+          <p>
+            {run.stage_reason.includes("hooks never named its native conversation")
+              ? "The probe finished without the startup hooks needed to identify its conversation. Review and trust this profile's LLMRelay hook definitions in the provider's native interface before starting another probe."
+              : "The probe did not establish the native evidence needed to admit this profile."}
+          </p>
+          <p>
+            This failed run cannot activate admission. Choose Cancel under Controls
+            to keep its history. Then open Projects &gt; Single agent profiles and
+            configuration and choose Probe this profile. Starting another probe is
+            an explicit paid model call; it does not retry this run automatically.
+          </p>
+          <TechnicalDetails><p>{run.stage_reason}</p></TechnicalDetails>
+        </div>
+      )}
       {run.parent_attempt_id && (
         <p className="hint">
           This run continues the task after you requested changes. The earlier
@@ -656,8 +678,8 @@ function SingleAgentRunPanel(
               ))}
             </ul>
             <p className="hint">
-              These rows are the agent's own report. LLMRelay captured the files
-              it changed as the result; only the selected checks and your review
+              These rows are the agent's own report. LLMRelay captured the
+              worktree as the result; only the selected checks and your review
               verify it.
             </p>
             <TechnicalDetails>
@@ -675,13 +697,14 @@ function SingleAgentRunPanel(
         <div className="single-agent-checks">
           <h4>Selected checks</h4>
           <p className="hint">
-            Selected checks are required. Each runs only after you authorize
-            its exact command, and only against the captured result. A failed
-            check runs again only after you authorize it again.
+            {terminal
+              ? "Recorded checks for this captured result."
+              : "Selected checks are required. Each runs only after you authorize its exact command, and only against the captured result. A failed check runs again only after you authorize it again."}
           </p>
           {run.checks.map((check) => {
             const authorizable = !terminal &&
               offered.has("authorize_check") &&
+              check.latest_run_passed !== true &&
               (check.authorization !== "authorized" ||
                 check.latest_run_passed === false);
             return (
@@ -703,7 +726,11 @@ function SingleAgentRunPanel(
                   {checkRunLabel(check)}
                 </span>
                 <small>
-                  {check.authorization === "authorized"
+                  {check.latest_run_passed === true
+                    ? "This check passed on the captured result."
+                    : terminal
+                    ? "Recorded check history; no further authorization is needed."
+                    : check.authorization === "authorized"
                     ? "You authorized this command."
                     : check.authorization === "denied"
                     ? "You denied this command."
@@ -831,7 +858,7 @@ function SingleAgentRunPanel(
             : "Not integrated yet. After you merge the accepted changes yourself, record the integrated commit in the Changes tab of a task that depends on this one. Dependent tasks wait until then."}
         </p>
       )}
-      {!terminal && run.resume && (
+      {!terminal && !failedProbe && !resultDecision && run.resume && (
         offered.has("resume_run")
           ? (
             <div className="inline-form">

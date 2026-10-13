@@ -1,7 +1,6 @@
 import { TechnicalDetails } from "./ErrorNotice";
 import type { Task } from "../types";
 
-/** The frozen file changes of the task's current or accepted result. */
 export function WorkSummary({ task }: { task: Task }) {
   const attempt = task.active_attempt;
   const snapshot =
@@ -19,18 +18,22 @@ export function WorkSummary({ task }: { task: Task }) {
   return (
     <section className="panel summary" aria-labelledby="changes-title">
       <header>
-        <h3 id="changes-title">Changed files</h3>
+        <h3 id="changes-title">Captured files</h3>
         {entries.length > 0 && <span className="count">{total}</span>}
       </header>
       {entries.length
         ? (
           <>
+            <p className="hint">
+              This saved result inventory includes unchanged files. It does not
+              show differences from the starting commit.
+            </p>
             <ul className="file-changes">
               {entries.map((entry, index) => (
                 <li key={`${String(entry.path)}-${index}`}>
                   <code>{String(entry.path)}</code>
                   <span className={entry.deleted ? "badge danger" : "badge"}>
-                    {entry.deleted ? "Deleted" : "Changed"}
+                    {entry.deleted ? "Deleted" : "Present"}
                   </span>
                 </li>
               ))}
@@ -45,7 +48,7 @@ export function WorkSummary({ task }: { task: Task }) {
         : (
           <p className="empty">
             {attempt
-              ? "No changes are frozen for review yet. They appear here after the implementer finishes."
+              ? "No result files have been captured for review yet."
               : "Work has not started yet."}
           </p>
         )}

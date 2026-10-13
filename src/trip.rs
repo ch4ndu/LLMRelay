@@ -4516,6 +4516,21 @@ fn validate_current_runtime_admission_scope(
     })))
 }
 
+pub(crate) fn require_current_runtime_admission_scope(
+    connection: &Connection,
+    runtime: &CapabilityRuntime,
+    admission_id: &str,
+) -> Result<()> {
+    match validate_current_runtime_admission_scope(connection, runtime, admission_id)
+        .context("The current verification scope could not be checked; no agent was started.")?
+    {
+        RuntimeScopeValidation::Current(_) => Ok(()),
+        RuntimeScopeValidation::Drift(reason) => Err(anyhow!(reason)).context(
+            "This verification no longer matches the current app or agent settings. Prepare a new verification in Runtime verification.",
+        ),
+    }
+}
+
 pub(crate) fn validate_runtime_probe_resume_authority(
     connection: &Connection,
     runtime: Option<&CapabilityRuntime>,
@@ -8029,11 +8044,6 @@ fn bound_runtime_first_invocation_hooks(
     if starts.is_empty() {
         return Ok(None);
     }
-    let requested_model: String = connection.query_row(
-        "SELECT json_extract(launch_config_json,'$.model') FROM sessions WHERE id=?1",
-        params![session_id],
-        |row| row.get(0),
-    )?;
     // This relays one bounded provider claim, not remote model attestation.
     // Missing, conflicting or ambiguous payloads cannot fall back to settings.
     let provider_model = if starts.len() == 1 {
@@ -8041,8 +8051,7 @@ fn bound_runtime_first_invocation_hooks(
             .ok()
             .and_then(|payload| payload.get("model")?.as_str().map(str::to_owned))
             .filter(|model| {
-                model == &requested_model
-                    && !model.is_empty()
+                !model.is_empty()
                     && model.len() <= 256
                     && model
                         .bytes()
@@ -10990,7 +10999,7 @@ fn setup_state_rows(connection: &Connection) -> Result<Vec<serde_json::Value>> {
                 "SELECT role,selection_state,profile_json,profile_hash,selected_at
                  FROM trip_setup_profile_selections WHERE setup_operation_id=?1 ORDER BY role",
             )?;
-            let rows = statement
+            let mut rows = statement
                 .query_map(params![setup_id], |row| {
                     let profile = row
                         .get::<_, Option<String>>(2)?
@@ -11002,6 +11011,23 @@ fn setup_state_rows(connection: &Connection) -> Result<Vec<serde_json::Value>> {
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            for selection in &mut rows {
+                if selection["selection_state"] != "selected" {
+                    continue;
+                }
+                let role = selection["role"]
+                    .as_str()
+                    .context("setup selection has no role")?;
+                let adapter_hash = match setup_adapter_hash(connection, &setup_id, role) {
+                    Ok(hash) => Some(hash),
+                    Err(error) => {
+                        tracing::warn!(setup_operation_id = %setup_id, role, error = %error,
+                            "current setup adapter binding is unavailable");
+                        None
+                    }
+                };
+                selection["current_adapter_hash"] = serde_json::json!(adapter_hash);
+            }
             rows
         };
         let probe_receipts = {

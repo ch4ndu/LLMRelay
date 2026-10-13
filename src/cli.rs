@@ -11,6 +11,7 @@ use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -1111,28 +1112,66 @@ fn run_internal_launch(args: InternalLaunchArgs) -> Result<()> {
     let child_pid = child.id();
     let provider_group = unsafe { libc::getpgid(child_pid as libc::pid_t) };
     if provider_group <= 0 || provider_group != process_group_id {
-        let _ = child.kill();
-        let _ = child.wait();
-        bail!("provider child did not inherit the supervised process group")
+        let diagnostic = stop_failed_launch_child(&mut child);
+        bail!("provider child did not inherit the supervised process group; {diagnostic}")
     }
-    let publish = (|| -> Result<()> {
+    let publish = (|| -> Result<ProcessGenerationAnchor> {
         let provider = ProcessGenerationAnchor {
             pid: child_pid,
             process_group_id: provider_group,
             native_start_marker: crate::supervisor::native_start_marker(child_pid)?,
             boot_identity,
         };
-        let handshake = LaunchHandshake::ProviderSpawned { leader, provider };
+        let handshake = LaunchHandshake::ProviderSpawned {
+            leader: leader.clone(),
+            provider: provider.clone(),
+        };
         crate::config::atomic_write(&args.anchor, &serde_json::to_vec(&handshake)?)?;
-        Ok(())
+        Ok(provider)
     })();
-    if let Err(error) = publish {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error).context("publish provider generation anchor");
-    }
+    let provider = match publish {
+        Ok(provider) => provider,
+        Err(error) => {
+            let diagnostic = stop_failed_launch_child(&mut child);
+            return Err(error).context(format!("publish provider generation anchor; {diagnostic}"));
+        }
+    };
     let status = child.wait().context("wait for supervised provider")?;
+    if args.anchor.exists() {
+        let receipt = LaunchHandshake::ProviderExited {
+            leader,
+            provider,
+            exit_code: status.code(),
+            signal: status.signal(),
+        };
+        if let Err(error) = serde_json::to_vec(&receipt)
+            .context("encode supervised provider exit")
+            .and_then(|bytes| crate::config::atomic_write(&args.anchor, &bytes))
+        {
+            eprintln!(
+                "record supervised provider exit code={:?}, signal={:?}: {error:#}",
+                status.code(),
+                status.signal()
+            );
+        }
+    }
     std::process::exit(status.code().unwrap_or(128));
+}
+
+fn stop_failed_launch_child(child: &mut std::process::Child) -> String {
+    let observed = child.try_wait();
+    if let Ok(Some(status)) = &observed {
+        return format!(
+            "provider already exited: code={:?}, signal={:?}",
+            status.code(),
+            status.signal()
+        );
+    }
+    let kill = child.kill();
+    let exit = child.wait();
+    format!(
+        "provider cleanup requested: prior_observation={observed:?}, kill={kill:?}, exit={exit:?}"
+    )
 }
 
 fn publish_pre_provider_failure(path: &std::path::Path, reason: &str) {

@@ -137,6 +137,7 @@ export interface TripSetupSelection {
   selection_state: "selected" | "unselected";
   profile?: RoleConfig | TripSetupProfile | null;
   profile_hash?: string | null;
+  current_adapter_hash?: string | null;
   selected_at?: string | null;
   compatibility?: CompatibilityExplanation | null;
 }
