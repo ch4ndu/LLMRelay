@@ -44694,6 +44694,105 @@ fn h3h15_projection_merges_exact_old_sessions_and_folds_only_matching_sources() 
 }
 
 #[test]
+fn startup_freeze_abandonment_rolls_back_with_its_audit_and_retries_once() {
+    let fixture = Fixture::new("startup-freeze-abandonment");
+    seed_attempt(&fixture, "implementation");
+    fixture.execute_batch(
+        "INSERT INTO freeze_intents(id,attempt_id,kind,state,created_at,updated_at)
+         VALUES('startup-freeze','a','candidate','capturing',
+           '2026-01-01T00:00:00Z','2026-01-01T00:00:01Z');",
+    );
+    let intent_state = "SELECT json_object('id',id,'attempt_id',attempt_id,'kind',kind,
+           'source_role_generation_id',source_role_generation_id,'state',state,
+           'result_snapshot_id',result_snapshot_id,'error',error,'created_at',created_at,'updated_at',updated_at)
+         FROM freeze_intents WHERE id='startup-freeze'";
+    let preserved_state =
+        "SELECT json_array(plan_hash,candidate_hash,scope_hash,configuration_hash,
+           phase,status,updated_at,
+           (SELECT attention FROM tasks WHERE id=attempts.task_id),
+           (SELECT version FROM tasks WHERE id=attempts.task_id),
+           (SELECT COUNT(*) FROM snapshots),
+           (SELECT COUNT(*) FROM role_results),
+           (SELECT COUNT(*) FROM role_results WHERE consumed_at IS NOT NULL),
+           (SELECT COUNT(*) FROM recovery_records)) FROM attempts WHERE id='a'";
+    let before = fixture.scalar::<String>(intent_state);
+    let preserved_before = fixture.scalar::<String>(preserved_state);
+    let abandonment_events = "SELECT COUNT(*) FROM audit_events
+         WHERE event_code='snapshot.freeze.abandoned_after_restart' AND entity_id='startup-freeze'";
+    fixture.execute_batch(
+        "CREATE TRIGGER fail_freeze_abandonment_audit BEFORE INSERT ON audit_events
+         WHEN NEW.event_code='snapshot.freeze.abandoned_after_restart' AND NEW.entity_id='startup-freeze'
+         BEGIN SELECT RAISE(ABORT,'injected freeze abandonment audit failure'); END;",
+    );
+
+    let error = recovery::reconcile_prior_boot(&fixture.store).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("injected freeze abandonment audit failure"),
+        "{error:#}"
+    );
+    assert_eq!(
+        fixture.scalar::<String>(intent_state),
+        before,
+        "failed freeze abandonment audit must roll back the complete intent"
+    );
+    fixture.assert_scalar::<i64>(abandonment_events, 0);
+    assert_eq!(fixture.scalar::<String>(preserved_state), preserved_before);
+
+    fixture.execute_batch("DROP TRIGGER fail_freeze_abandonment_audit;");
+    let results = recovery::reconcile_prior_boot(&fixture.store).unwrap();
+    assert_eq!(
+        results,
+        vec![serde_json::json!({
+            "freeze_intent_id":"startup-freeze","attempt_id":"a",
+            "state":"abandoned","published":false,
+        })]
+    );
+    let abandoned_state = fixture.scalar::<String>(intent_state);
+    let abandoned: serde_json::Value = serde_json::from_str(&abandoned_state).unwrap();
+    assert_eq!(abandoned["attempt_id"], "a");
+    assert_eq!(abandoned["kind"], "candidate");
+    assert_eq!(abandoned["state"], "abandoned");
+    assert_eq!(
+        abandoned["error"],
+        "service restarted before atomic snapshot publication"
+    );
+    assert_eq!(abandoned["created_at"], "2026-01-01T00:00:00Z");
+    assert_eq!(
+        abandoned["source_role_generation_id"],
+        serde_json::Value::Null
+    );
+    assert_eq!(abandoned["result_snapshot_id"], serde_json::Value::Null);
+    fixture.assert_scalar::<i64>(abandonment_events, 1);
+    let audit_state = "SELECT json_object('id',id,'operation_id',operation_id,'actor_kind',actor_kind,
+           'event_code',event_code,'entity_kind',entity_kind,'entity_id',entity_id,
+           'detail',json(detail_json),'created_at',created_at)
+         FROM audit_events WHERE event_code='snapshot.freeze.abandoned_after_restart' AND entity_id='startup-freeze'";
+    let published_audit = fixture.scalar::<String>(audit_state);
+    let audit: serde_json::Value = serde_json::from_str(&published_audit).unwrap();
+    assert_eq!(audit["actor_kind"], "service");
+    assert_eq!(
+        audit["event_code"],
+        "snapshot.freeze.abandoned_after_restart"
+    );
+    assert_eq!(audit["entity_kind"], "freeze_intent");
+    assert_eq!(audit["entity_id"], "startup-freeze");
+    assert_eq!(audit["created_at"], abandoned["updated_at"]);
+    assert_eq!(
+        audit["detail"],
+        serde_json::json!({"attempt_id":"a","kind":"candidate","published":false})
+    );
+    assert_eq!(fixture.scalar::<String>(preserved_state), preserved_before);
+
+    assert!(recovery::reconcile_prior_boot(&fixture.store)
+        .unwrap()
+        .is_empty());
+    assert_eq!(fixture.scalar::<String>(intent_state), abandoned_state);
+    assert_eq!(fixture.scalar::<String>(audit_state), published_audit);
+    fixture.assert_scalar::<i64>(abandonment_events, 1);
+    assert_eq!(fixture.scalar::<String>(preserved_state), preserved_before);
+}
+
+#[test]
 fn startup_reserved_resume_restoration_rolls_back_and_retries_exact_prior_epoch() {
     let fixture = Fixture::new("startup-prior-epoch-restoration");
     let repository_path = fixture.repository("repo");

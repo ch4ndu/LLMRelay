@@ -1310,8 +1310,10 @@ pub fn reconcile_prior_boot(store: &Store) -> Result<Vec<serde_json::Value>> {
     };
     for (id, attempt, kind) in freezes {
         let now = Utc::now().to_rfc3339();
-        connection.execute("UPDATE freeze_intents SET state='abandoned',error='service restarted before atomic snapshot publication',updated_at=?1 WHERE id=?2 AND state IN ('reserved','capturing')",params![now,id])?;
-        connection.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'service','snapshot.freeze.abandoned_after_restart','freeze_intent',?3,?4,?5)",params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),id,serde_json::json!({"attempt_id":attempt,"kind":kind,"published":false}).to_string(),now])?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("UPDATE freeze_intents SET state='abandoned',error='service restarted before atomic snapshot publication',updated_at=?1 WHERE id=?2 AND state IN ('reserved','capturing')",params![now,id])?;
+        transaction.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'service','snapshot.freeze.abandoned_after_restart','freeze_intent',?3,?4,?5)",params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),id,serde_json::json!({"attempt_id":attempt,"kind":kind,"published":false}).to_string(),now])?;
+        transaction.commit()?;
         results.push(serde_json::json!({"freeze_intent_id":id,"attempt_id":attempt,"state":"abandoned","published":false}));
     }
     Ok(results)
