@@ -42,7 +42,7 @@ authority, including when no process is attached to the current service boot.
 
 ## Supported Codex installation
 
-The v1 Codex path additionally requires exact `codex-cli 0.160.0`, the ordinary native CLI signed in through file-backed personal ChatGPT Free/Plus/Pro credentials, no parent `CODEX_HOME`, no shared app-server control socket or cloud-config bundle cache beneath `~/.codex`, and no `/etc/codex/managed_config.toml` or `/etc/codex/requirements.toml`. On macOS the native managed preferences `config_toml_base64` and `requirements_toml_base64` under `com.openai.codex` must also be absent. LLMRelay reports an actionable preflight error for an unsupported form; it does not modify provider configuration, credentials, organization policy, or native approvals to make the check pass.
+The v1 Codex path additionally requires exact `codex-cli 0.162.1`, the ordinary native CLI signed in through file-backed personal ChatGPT Free/Plus/Pro credentials, no parent `CODEX_HOME`, no cloud-config bundle cache beneath `~/.codex`, and no `/etc/codex/managed_config.toml` or `/etc/codex/requirements.toml`. On macOS the native managed preferences `config_toml_base64` and `requirements_toml_base64` under `com.openai.codex` must also be absent. LLMRelay reports an actionable preflight error for an unsupported form; it does not modify provider configuration, credentials, organization policy, or native approvals to make the check pass.
 
 Codex implementer sessions restrict the inherited system temporary-directory
 grants to read-only access. The assigned worktree remains writable, including
@@ -114,9 +114,11 @@ Select a request's project/task heading to open its exact requesting session. Us
 
 The source review uses upstream tag `rust-v0.160.0` (`a956835`), including the hook schemas, permission/network configuration and native session/response-usage protocol. Hook schemas and the relevant permission/network definitions match the previously reviewed 0.157.1 snapshot. Native enforcement still requires current local qualification.
 
-Codex 0.160.0 launches and resumes with `--no-daemon`, with daemon auto-start and enterprise MCP authorization disabled. Preflight rejects `~/.codex/environments.toml` without reading or changing it: configured executor environments are outside the local adapter contract. These checks complement the cleared child environment and existing shared-server restrictions. Like the other local configuration checks, the file-absence observation is prelaunch evidence, not protection against external configuration changes after launch.
+Codex 0.162.1 launches and resumes with `--no-daemon`, with daemon auto-start and enterprise MCP authorization disabled. Preflight rejects `~/.codex/environments.toml` without reading or changing it: configured executor environments are outside the local adapter contract. These checks complement the cleared child environment and observation checks that require the shared app-server control socket to be absent. Like the other local configuration checks, the file-absence observation is prelaunch evidence, not protection against external configuration changes after launch.
 
-The adapter accepts exact Codex CLI 0.160.0. Older and future versions are not
+Interactive launches use standalone `--no-daemon` execution and do not attach to a shared app-server; a shared control socket may be present. Observation exec still requires its absence. The updated local MCP coverage identity invalidates historical TRIP and Single agent proofs; it does not establish live standalone coexistence or native enforcement.
+
+The adapter accepts exact Codex CLI 0.162.1. Older and future versions are not
 implicitly supported. Updating adapter compatibility does not mark a role or
 profile Supported: current role-bound native observations and a matching
 capability proof are still required. Proofs from an older executable or policy

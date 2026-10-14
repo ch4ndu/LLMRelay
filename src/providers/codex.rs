@@ -16,7 +16,7 @@ pub const IMPLEMENTER_NATIVE_POLICY_REASON: &str = "Codex Implementer requires e
 pub const DENIED_READ_FLOOR_VERSION: &str = "codex-denied-read-floor-v3";
 pub const DENIED_READ_FLOOR_PROFILE: &str = "agenticjira_role";
 pub const LEGACY_DENIED_READ_FLOOR_GAP: &str = "historical Codex configuration does not match the current canonical control-socket denied-read and restricted-proxy contract; fresh exact-version native validation is required";
-pub const MCP_COVERAGE_REVISION: &str = "codex-local-mcp-coverage-v1-0.162.1";
+pub const MCP_COVERAGE_REVISION: &str = "codex-local-mcp-coverage-v2-0.162.1";
 pub const MCP_COVERAGE_CLASS: &str = "personal_ineligible_observed_prelaunch";
 pub const APPROVAL_OWNERSHIP_REVISION: &str = "codex-native-approval-ownership-v2";
 pub const LEGACY_MCP_COVERAGE_GAP: &str = "historical Codex configuration does not match the current exact local MCP-source coverage contract; fresh exact-version native validation is required";
@@ -30,6 +30,7 @@ pub const OBSERVATION_LAUNCH_REVISION: &str = "llmrelay-codex-observation-launch
 pub const OBSERVATION_POLICY_REVISION: &str = "codex-observation-empty-scope-v3";
 pub const SINGLE_AGENT_LAUNCH_REVISION: &str = "llmrelay-codex-single-agent-launch-v3";
 pub const SINGLE_AGENT_POLICY_REVISION: &str = "codex-single-agent-writer-v3";
+const INTERACTIVE_STANDALONE_MODE: &str = "standalone_no_daemon_v1";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_AUTH_BYTES: u64 = 256 * 1024;
 const ACCESS_TOKEN_MARGIN_SECONDS: i64 = 15 * 60;
@@ -82,6 +83,12 @@ struct NativeCompatibility {
 enum NativeUserConfig {
     Load,
     Ignore,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum NativeLaunchMode {
+    InteractiveStandalone,
+    ObservationExec,
 }
 
 /// Only these validated fields leave the bounded auth parser; token and JWT
@@ -145,7 +152,12 @@ pub(crate) fn prepare_with_bundles(
 ) -> Result<PreparedLaunch> {
     let (executable, version) = super::executable_and_version(Provider::Codex)?;
     let contract_binding = bundles.resolve(Provider::Codex, &version, role)?;
-    let compatibility = inspect_native_compatibility(cwd, &version, NativeUserConfig::Load)?;
+    let compatibility = inspect_native_compatibility(
+        cwd,
+        &version,
+        NativeUserConfig::Load,
+        NativeLaunchMode::InteractiveStandalone,
+    )?;
     let hook_command = shell_quote(&assets.runner.to_string_lossy());
     let (canonical_role_socket, canonical_control_socket) =
         canonical_socket_endpoints(role_socket)?;
@@ -410,8 +422,12 @@ pub(crate) fn single_agent_native(
             None,
         )
     } else {
-        let compatibility =
-            inspect_native_compatibility(request.cwd, &version, NativeUserConfig::Load)?;
+        let compatibility = inspect_native_compatibility(
+            request.cwd,
+            &version,
+            NativeUserConfig::Load,
+            NativeLaunchMode::InteractiveStandalone,
+        )?;
         (
             compatibility.disabled_mcp_servers,
             compatibility.identity,
@@ -673,6 +689,7 @@ pub fn require_native_policy_identity(identity: &CapabilityIdentity) -> Result<(
         });
     let coverage_matches = coverage.get("revision").and_then(serde_json::Value::as_str)
         == Some(MCP_COVERAGE_REVISION)
+        && identity.executable_version == EXACT_CODEX_VERSION
         && coverage.get("class").and_then(serde_json::Value::as_str) == Some(MCP_COVERAGE_CLASS)
         && coverage
             .get("codex_version")
@@ -701,7 +718,7 @@ pub fn require_native_policy_identity(identity: &CapabilityIdentity) -> Result<(
         && coverage
             .get("shared_app_server")
             .and_then(serde_json::Value::as_str)
-            == Some("absent")
+            == Some(INTERACTIVE_STANDALONE_MODE)
         && coverage
             .get("capability_roots")
             .and_then(serde_json::Value::as_str)
@@ -756,6 +773,8 @@ pub fn require_native_policy_identity(identity: &CapabilityIdentity) -> Result<(
         || identity.effective_argv.iter().any(|argument| {
             argument == "--profile"
                 || argument.starts_with("--profile=")
+                || argument == "--remote"
+                || argument.starts_with("--remote=")
                 || argument == "app-server"
         })
     {
@@ -796,8 +815,12 @@ pub fn require_current_native_policy(identity: &CapabilityIdentity, cwd: &Path) 
         return Ok(());
     }
     require_native_policy_identity(identity)?;
-    let current =
-        inspect_native_compatibility(cwd, &identity.executable_version, NativeUserConfig::Load)?;
+    let current = inspect_native_compatibility(
+        cwd,
+        &identity.executable_version,
+        NativeUserConfig::Load,
+        NativeLaunchMode::InteractiveStandalone,
+    )?;
     if identity.security_policy.get("local_mcp_coverage") != Some(&current.identity) {
         bail!("current Codex local configuration no longer matches the validated MCP and personal-account compatibility policy")
     }
@@ -900,6 +923,7 @@ fn inspect_native_compatibility(
     cwd: &Path,
     version: &str,
     user_config: NativeUserConfig,
+    launch_mode: NativeLaunchMode,
 ) -> Result<NativeCompatibility> {
     if version != EXACT_CODEX_VERSION {
         bail!("Codex local compatibility requires exact {EXACT_CODEX_VERSION}")
@@ -933,11 +957,15 @@ fn inspect_native_compatibility(
     if path_exists(&codex_home.join("cloud-config-bundle-cache.json"))? {
         bail!("Codex local compatibility requires cloud-config-bundle-cache.json to be absent; AgenticJira never deletes or parses it")
     }
-    if path_exists(
-        &codex_home
-            .join("app-server-control")
-            .join("app-server-control.sock"),
-    )? {
+    // Interactive --no-daemon selects standalone execution without attaching.
+    // Observation exec retains strict absence until separately qualified.
+    if launch_mode == NativeLaunchMode::ObservationExec
+        && path_exists(
+            &codex_home
+                .join("app-server-control")
+                .join("app-server-control.sock"),
+        )?
+    {
         bail!("Codex local compatibility does not support a shared app-server attachment")
     }
 
@@ -1013,7 +1041,10 @@ fn inspect_native_compatibility(
         "ancestor_configs": "no_additional_mcp_names",
         "managed_sources": "absent",
         "profile_selector": "absent",
-        "shared_app_server": "absent",
+        "shared_app_server": match launch_mode {
+            NativeLaunchMode::InteractiveStandalone => INTERACTIVE_STANDALONE_MODE,
+            NativeLaunchMode::ObservationExec => "absent",
+        },
         "capability_roots": "not_supplied_by_local_cli_adapter",
         "remote_executor": "not_forwarded_by_cleared_child_environment",
         "executor_environment_config": "absent_at_prelaunch_check",
@@ -1036,7 +1067,12 @@ pub fn inspect_observation_account(
     scope: &Path,
     version: &str,
 ) -> Result<super::ProviderAccountObservation> {
-    let compatibility = inspect_native_compatibility(scope, version, NativeUserConfig::Ignore)?;
+    let compatibility = inspect_native_compatibility(
+        scope,
+        version,
+        NativeUserConfig::Ignore,
+        NativeLaunchMode::ObservationExec,
+    )?;
     Ok(super::ProviderAccountObservation {
         account_identity: compatibility
             .account
@@ -1058,8 +1094,12 @@ pub(crate) fn observation_arguments(
     scope: &Path,
     prompt: &str,
 ) -> Result<Vec<String>> {
-    let compatibility =
-        inspect_native_compatibility(scope, EXACT_CODEX_VERSION, NativeUserConfig::Ignore)?;
+    let compatibility = inspect_native_compatibility(
+        scope,
+        EXACT_CODEX_VERSION,
+        NativeUserConfig::Ignore,
+        NativeLaunchMode::ObservationExec,
+    )?;
     let mut arguments = vec![
         "exec".to_owned(),
         "--strict-config".to_owned(),

@@ -34,8 +34,11 @@ use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::PathBuf,
     process::Command,
-    sync::{Arc, Barrier, OnceLock},
+    sync::{Arc, Barrier, Mutex, OnceLock},
 };
+
+// Observation tests require the shared synthetic HOME to be socket-free.
+static SYNTHETIC_CODEX_HOME_LOCK: Mutex<()> = Mutex::new(());
 
 fn install_synthetic_codex_home() {
     static HOME: OnceLock<PathBuf> = OnceLock::new();
@@ -34572,6 +34575,9 @@ fn t18_permission_rules_match_only_current_verified_scope_and_reservation() {
 
 #[test]
 fn codex_provider_check_account_is_allowlisted_and_never_carries_credentials() {
+    let _home_guard = SYNTHETIC_CODEX_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_synthetic_codex_home();
     let scope = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
         "agenticjira-provider-check-scope-{}",
@@ -34666,6 +34672,9 @@ fn app_wide_provider_model_starts_require_a_project_without_reserving_authority(
 /// provider honors these options, which stays with native qualification.
 #[test]
 fn provider_check_candidate_arguments_request_no_tools_and_no_customization() {
+    let _home_guard = SYNTHETIC_CODEX_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_synthetic_codex_home();
     let home = PathBuf::from(std::env::var_os("HOME").unwrap());
     let root = home.join(format!(
@@ -38919,6 +38928,7 @@ fn single_agent_probe_is_refused_while_the_writer_contract_is_unqualified() {
 
 #[test]
 fn c8_codex_native_policy_identity_and_current_admission_are_fail_closed() {
+    const PREVIOUS_MCP_COVERAGE_REVISION: &str = "codex-local-mcp-coverage-v1-0.162.1";
     let floor = Fixture::new("c8-codex-denied-read-floor");
     let floor_repo = floor.repository("repo");
     let floor_hooks = test_hooks(&floor);
@@ -39289,6 +39299,176 @@ args = ["--unicode"]
         providers::capability_key(&manager_fresh.config).unwrap(),
         providers::capability_key(&manager_resume.config).unwrap()
     );
+    {
+        let _home_guard = SYNTHETIC_CODEX_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_codex_home();
+        let socket_directory =
+            PathBuf::from(std::env::var_os("HOME").unwrap()).join(".codex/app-server-control");
+        std::fs::create_dir_all(&socket_directory).unwrap();
+        let socket_path = socket_directory.join("app-server-control.sock");
+        struct SyntheticSocketCleanup(PathBuf);
+        impl Drop for SyntheticSocketCleanup {
+            fn drop(&mut self) {
+                // Remove the marker during unwinding before the shared HOME lock is released.
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let socket_cleanup = SyntheticSocketCleanup(socket_path.clone());
+        // Admission observes endpoint presence; the marker starts no shared server.
+        std::fs::write(&socket_path, b"synthetic shared control socket").unwrap();
+
+        let account_error = providers::codex::inspect_observation_account(
+            &floor_repo,
+            providers::codex::EXACT_CODEX_VERSION,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            account_error.contains("shared app-server"),
+            "{account_error}"
+        );
+        let observation_installation = providers::ProviderInstallation {
+            provider: Provider::Codex,
+            executable: providers::capability_identity(&manager_fresh.config)
+                .unwrap()
+                .executable,
+            executable_version: providers::codex::EXACT_CODEX_VERSION.to_owned(),
+        };
+        let observation_policy = agenticjira::provider_compatibility::BundleSet::embedded()
+            .resolve_policy(
+                Provider::Codex,
+                providers::codex::EXACT_CODEX_VERSION,
+                agenticjira::provider_compatibility::PolicyMode::ProviderObservation,
+            )
+            .unwrap();
+        let observation_error = providers::prepare_observation_launch(
+            &observation_installation,
+            observation_policy,
+            "gpt-5.6-sol",
+            "high",
+            &floor_repo,
+            "socket-present observation must be refused",
+            &supervision_executable,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            observation_error.contains("shared app-server"),
+            "{observation_error}"
+        );
+
+        for (role, effort, socket_absent_launch) in [
+            (RoleKind::Implementer, "medium", &implementer),
+            (RoleKind::Manager, "high", &manager_fresh),
+        ] {
+            for native_session_id in [None, Some("native-session")] {
+                let socket_present_launch = providers::prepare_role_launch(
+                    Provider::Codex,
+                    role,
+                    "gpt-5.6-sol",
+                    effort,
+                    &floor_repo,
+                    "standalone launch with a shared socket present",
+                    &floor.root.join("role.sock"),
+                    "standalone-token",
+                    "standalone-generation",
+                    "standalone-session",
+                    native_session_id,
+                    &floor_hooks,
+                    &supervision_executable,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "synthetic shared socket presence must permit interactive standalone {role:?} launch (retained={native_session_id:?}): {error:#}"
+                    )
+                });
+                let identity =
+                    providers::capability_identity(&socket_present_launch.config).unwrap();
+                providers::codex::require_current_native_policy(&identity, &floor_repo).unwrap();
+                assert_eq!(
+                    providers::capability_identity_key(&identity).unwrap(),
+                    providers::capability_key(&socket_absent_launch.config).unwrap()
+                );
+                assert_eq!(
+                    socket_present_launch
+                        .arguments
+                        .iter()
+                        .filter(|argument| *argument == "--no-daemon")
+                        .count(),
+                    1
+                );
+                if let Some(native_id) = native_session_id {
+                    assert!(has_pair(
+                        &socket_present_launch.arguments,
+                        "resume",
+                        native_id
+                    ));
+                } else {
+                    assert!(!socket_present_launch
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "resume"));
+                }
+                assert_ne!(
+                    identity.security_policy["local_mcp_coverage"]["shared_app_server"], "absent",
+                    "interactive identity must not claim the existing shared socket is absent"
+                );
+                assert_ne!(
+                    identity.security_policy["local_mcp_coverage"]["revision"],
+                    PREVIOUS_MCP_COVERAGE_REVISION
+                );
+
+                let mut missing_standalone_flag = identity.clone();
+                missing_standalone_flag
+                    .effective_argv
+                    .retain(|argument| argument != "--no-daemon");
+                assert!(
+                    providers::codex::require_native_policy_identity(&missing_standalone_flag)
+                        .is_err(),
+                    "an interactive launch without --no-daemon must be refused"
+                );
+                let mut duplicate_standalone_flag = identity.clone();
+                duplicate_standalone_flag
+                    .effective_argv
+                    .push("--no-daemon".into());
+                assert!(
+                    providers::codex::require_native_policy_identity(&duplicate_standalone_flag)
+                        .is_err(),
+                    "an interactive launch with duplicate --no-daemon must be refused"
+                );
+                for selector in [
+                    &["--remote", "unix:///synthetic/remote.sock"][..],
+                    &["--remote=unix:///synthetic/remote.sock"][..],
+                ] {
+                    let mut remote_identity = identity.clone();
+                    remote_identity
+                        .effective_argv
+                        .extend(selector.iter().map(|argument| (*argument).to_owned()));
+                    assert!(
+                        providers::codex::require_native_policy_identity(&remote_identity).is_err(),
+                        "remote backend selection {selector:?} must be refused"
+                    );
+                }
+                let mut old_coverage_identity = identity.clone();
+                old_coverage_identity.security_policy["local_mcp_coverage"]["revision"] =
+                    PREVIOUS_MCP_COVERAGE_REVISION.into();
+                assert!(
+                    providers::codex::require_native_policy_identity(&old_coverage_identity)
+                        .unwrap_err()
+                        .to_string()
+                        .contains(providers::codex::LEGACY_MCP_COVERAGE_GAP)
+                );
+                assert_ne!(
+                    providers::capability_identity_key(&old_coverage_identity).unwrap(),
+                    providers::capability_identity_key(&identity).unwrap()
+                );
+            }
+        }
+        drop(socket_cleanup);
+        assert!(!socket_path.exists());
+    }
     let prepare_project_config = |name: &str, config: &str| {
         let cwd = floor.root.join(name);
         std::fs::create_dir_all(cwd.join(".codex")).unwrap();
@@ -40154,6 +40334,52 @@ args = ["--unicode"]
         fixture.scalar::<i64>(
             "SELECT COUNT(*) FROM resume_invocations WHERE session_id='legacy-codex-session'"
         ),
+        0
+    );
+    let mut old_coverage_launch = prepared.config.clone();
+    old_coverage_launch.security_policy["local_mcp_coverage"]["revision"] =
+        PREVIOUS_MCP_COVERAGE_REVISION.into();
+    old_coverage_launch.security_policy["local_mcp_coverage"]["shared_app_server"] =
+        "absent".into();
+    let old_coverage_identity = providers::capability_identity(&old_coverage_launch).unwrap();
+    let old_coverage_key = providers::capability_identity_key(&old_coverage_identity).unwrap();
+    assert_ne!(old_coverage_key, current_implementer_key);
+    fixture.execute(
+        "UPDATE sessions SET launch_config_json=?1,executable_version=?2,capability_key=?3,
+            capability_identity_json=?4 WHERE id='legacy-codex-session'",
+        params![
+            serde_json::to_string(&old_coverage_launch).unwrap(),
+            old_coverage_launch.executable_version,
+            old_coverage_key,
+            serde_json::to_string(&old_coverage_identity).unwrap(),
+        ],
+    );
+    assert!(fixture
+        .store
+        .record_capability_proof(&proof)
+        .unwrap_err()
+        .to_string()
+        .contains(providers::codex::LEGACY_MCP_COVERAGE_GAP));
+    assert_eq!(
+        fixture
+            .connection()
+            .query_row(
+                "SELECT COUNT(*),MAX(result_json) FROM operation_receipts WHERE operation_id=?1",
+                params![proof.operation_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+        (1, r#"{"status":"supported","historical":true}"#.into())
+    );
+    assert_eq!(
+        fixture
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM capabilities WHERE config_hash=?1 AND status='supported'",
+                params![old_coverage_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
         0
     );
     let hook_trust_error = recovery_application
