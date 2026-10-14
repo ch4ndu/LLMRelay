@@ -40,6 +40,13 @@ export type TaskRoleDraft = Omit<RoleConfig, "provider"> & {
 };
 
 type PendingTaskOperation = { body: string; id: string };
+
+const removeStoredValue = (key: string, expectedValue: string | undefined) => {
+  if (expectedValue !== undefined && localStorage.getItem(key) === expectedValue) {
+    localStorage.removeItem(key);
+  }
+};
+
 type TaskCreateRequest = {
   kind: "create_task";
   project_id: string;
@@ -514,7 +521,10 @@ export function TaskForm(
     const criteria = draft.criteria.split("\n").map((value) => value.trim())
       .filter(Boolean);
     let submittedCreate = false;
+    let submittedOperation: PendingTaskOperation | undefined;
+    let submittedOperationRecord: string | undefined;
     try {
+      const submittedDraft = JSON.stringify(draft);
       if (editing) {
         const body = {
           kind: "update_task",
@@ -531,10 +541,12 @@ export function TaskForm(
         const id = pendingOperation.current?.body === serialized
           ? pendingOperation.current.id
           : operationId();
-        pendingOperation.current = { body: serialized, id };
+        submittedOperation = { body: serialized, id };
+        pendingOperation.current = submittedOperation;
+        submittedOperationRecord = JSON.stringify(submittedOperation);
         localStorage.setItem(
           `${key}.operation`,
-          JSON.stringify(pendingOperation.current),
+          submittedOperationRecord,
         );
         await command({ ...body, operation_id: id });
       } else {
@@ -567,11 +579,13 @@ export function TaskForm(
         const id = pendingOperation.current?.body === serialized
           ? pendingOperation.current.id
           : operationId();
-        pendingOperation.current = { body: serialized, id };
+        submittedOperation = { body: serialized, id };
+        pendingOperation.current = submittedOperation;
         submittedCreate = true;
+        submittedOperationRecord = JSON.stringify(submittedOperation);
         localStorage.setItem(
           `${key}.operation`,
-          JSON.stringify(pendingOperation.current),
+          submittedOperationRecord,
         );
         if ("selection" in body) {
           await submitWorkflowCommand({ ...body, operation_id: id });
@@ -581,18 +595,18 @@ export function TaskForm(
       }
       pendingOperation.current = undefined;
       setUnresolvedCreate(undefined);
-      localStorage.removeItem(`${key}.operation`);
-      localStorage.removeItem(key);
+      removeStoredValue(`${key}.operation`, submittedOperationRecord);
+      removeStoredValue(key, submittedDraft);
       onSaved();
     } catch (cause) {
       const ambiguous = cause instanceof ApiError && cause.ambiguous;
       if (submittedCreate) {
         if (ambiguous) {
-          setUnresolvedCreate(pendingOperation.current);
+          setUnresolvedCreate(submittedOperation);
         } else {
           pendingOperation.current = undefined;
           setUnresolvedCreate(undefined);
-          localStorage.removeItem(`${key}.operation`);
+          removeStoredValue(`${key}.operation`, submittedOperationRecord);
         }
       }
       const message = cause instanceof Error ? cause.message : String(cause);
@@ -608,7 +622,8 @@ export function TaskForm(
   };
   const retryUnresolvedCreate = async () => {
     if (saveGuard.current || !unresolvedCreate) return;
-    const request = pendingCreateRequest(unresolvedCreate);
+    const submittedOperation = unresolvedCreate;
+    const request = pendingCreateRequest(submittedOperation);
     if (!request) {
       setError(
         "The saved unresolved create request is invalid. Leave it unchanged and refresh the task board before taking another create action.",
@@ -641,27 +656,30 @@ export function TaskForm(
         role_overrides: currentRoleOverrides,
       };
     const preserveEditedDraft = JSON.stringify(currentRequest) !==
-      unresolvedCreate.body;
+      submittedOperation.body;
+    let submittedOperationRecord: string | undefined;
     try {
+      const submittedDraft = JSON.stringify(draft);
+      submittedOperationRecord = JSON.stringify(submittedOperation);
       if ("selection" in request) {
         await submitWorkflowCommand({
           ...request,
-          operation_id: unresolvedCreate.id,
+          operation_id: submittedOperation.id,
         });
       } else {
-        await command({ ...request, operation_id: unresolvedCreate.id });
+        await command({ ...request, operation_id: submittedOperation.id });
       }
       pendingOperation.current = undefined;
       setUnresolvedCreate(undefined);
-      localStorage.removeItem(`${key}.operation`);
-      if (!preserveEditedDraft) localStorage.removeItem(key);
+      removeStoredValue(`${key}.operation`, submittedOperationRecord);
+      if (!preserveEditedDraft) removeStoredValue(key, submittedDraft);
       onSaved();
     } catch (cause) {
       const ambiguous = cause instanceof ApiError && cause.ambiguous;
       if (!ambiguous) {
         pendingOperation.current = undefined;
         setUnresolvedCreate(undefined);
-        localStorage.removeItem(`${key}.operation`);
+        removeStoredValue(`${key}.operation`, submittedOperationRecord);
       }
       const message = cause instanceof Error ? cause.message : String(cause);
       setError(

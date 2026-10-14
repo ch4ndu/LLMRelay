@@ -58,6 +58,19 @@ build and archive integrity checks; fresh final verification approved the checkp
 The package incorporates all four refactoring slices above;
 previous package/browser evidence remains historical, not a new browser run.
 
+## Newer draft preservation
+
+TaskForm now removes saved draft and operation records only when their current
+stored bytes still match the values captured by the settling request. Older
+create/edit successes and exact-create reconciliation cannot clear newer content
+written during their pending response. Definitive create/refusal cleanup likewise
+preserves a newer operation record. Exact replay identities and edited-draft
+preservation remain intact; this does not introduce cross-tab synchronization.
+Five races failed before the fix and passed afterward with unchanged tests;
+independent review, seven focused cases, frontend typecheck/build and all 118
+frontend tests passed. Fresh final verification approved the checkpoint. The local package
+predates this fix and will be refreshed at the final completion checkpoint.
+
 ## Provider error recovery checkpoint
 
 Selected by the user on October 13, 2026 as essential. Start after the current

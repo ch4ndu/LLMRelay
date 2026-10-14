@@ -3208,6 +3208,10 @@ Deno.test("T14 New task inherits roles, submits explicit overrides, and retains 
         JSON.stringify({ implementer: roleOverride })
     ) throw new Error("repaired draft command did not preserve exact fields");
     const rejectedCreateOperation = requests.at(-1)?.operation_id;
+    check(
+      localStorage.getItem("agenticjira.new-task.operation") === null,
+      "definitively rejected create retained its own operation record",
+    );
     fail = false;
     if (
       !document.querySelector<HTMLButtonElement>(".primary")!.disabled ||
@@ -3226,6 +3230,11 @@ Deno.test("T14 New task inherits roles, submits explicit overrides, and retains 
         "definitively rejected create did not retain the draft with a fresh identity",
       );
     }
+    check(
+      localStorage.getItem("agenticjira.new-task") === null &&
+        localStorage.getItem("agenticjira.new-task.operation") === null,
+      "successful create retained its own draft or operation record",
+    );
 
     unmount();
     localStorage.removeItem("agenticjira.new-task");
@@ -3293,100 +3302,261 @@ Deno.test("T14 New task inherits roles, submits explicit overrides, and retains 
   }
 });
 
-Deno.test("A09 unresolved task create blocks edited intent and reloads its exact reconciliation", async () => {
-  localStorage.clear();
-  const requests: Record<string, unknown>[] = [];
-  const committedOperations = new Set<string>();
-  let committedCreates = 0;
-  let saved = 0;
-  globalThis.fetch = (async (
-    _input: string | URL | Request,
-    init?: RequestInit,
-  ) => {
-    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    requests.push(body);
-    const operation = String(body.operation_id);
-    if (!committedOperations.has(operation)) {
-      committedOperations.add(operation);
-      committedCreates++;
-    }
-    if (requests.length === 1) {
-      throw new ApiError(
-        "task committed but its response was lost",
-        0,
-        operation,
-        true,
-      );
-    }
-    return new Response(JSON.stringify({
-      result: { entity_id: "AJ-ambiguous", version: 1 },
-    }));
-  }) as typeof fetch;
-  const form = () => (
-    <TaskForm
-      projects={[initialized]}
-      onSaved={() => saved++}
-      onClose={noop}
-    />
-  );
-  try {
-    mount(form());
-    field("Title", "Original unresolved task");
-    click("Save draft");
-    await settle();
-    const original = requests[0];
-    check(
-      original?.kind === "create_task" && original.ready === false &&
-        document.body.textContent?.includes("may already be committed") &&
-        localStorage.getItem("agenticjira.new-task.operation")?.includes(
-          String(original.operation_id),
-        ),
-      "ambiguous task create did not retain its exact persisted request",
-    );
-
-    field("Title", "Edited after response loss");
-    unmount();
-    mount(form());
-    check(
-      findField("Title").value === "Edited after response loss" &&
-        document.body.textContent?.includes("Retry exact unresolved create"),
-      "reload lost the edited draft or unresolved-create recovery",
-    );
-    click("Save draft");
-    await settle();
-    check(
-      requests.length === 1 && committedCreates === 1 &&
-        document.body.textContent?.includes(
-          "earlier task create still has an unknown result",
-        ),
-      "edited task submission bypassed the unresolved-create guard",
-    );
-    field("Title", "Original unresolved task");
-    click("Create Ready task");
-    await settle();
-    check(
-      requests.length === 1 && committedCreates === 1,
-      "a different Ready mode bypassed the unresolved-create guard",
-    );
-
-    field("Title", "Edited after response loss");
-    click("Retry exact unresolved create");
-    await settle();
-    check(
-      requests.length === 2 && committedCreates === 1 && saved === 1 &&
-        JSON.stringify(requests[1]) === JSON.stringify(original) &&
-        localStorage.getItem("agenticjira.new-task.operation") === null &&
-        localStorage.getItem("agenticjira.new-task")?.includes(
-          "Edited after response loss",
-        ),
-      "exact task-create reconciliation changed intent, duplicated the commit, stayed pending, or discarded edited draft fields",
-    );
-  } finally {
-    unmount();
+for (
+  const scenario of ["create success", "edit success", "create refusal"] as const
+) {
+  Deno.test(`TaskForm older ${scenario} preserves newer draft and operation storage`, async () => {
     localStorage.clear();
-    globalThis.fetch = nativeFetch;
-  }
-});
+    const editing = scenario === "edit success" ? task : undefined;
+    const refused = scenario === "create refusal";
+    const key = editing ? `agenticjira.edit.${editing.id}` : "agenticjira.new-task";
+    const requests: Record<string, unknown>[] = [];
+    const responses: Array<(response: Response) => void> = [];
+    let saved = 0;
+    globalThis.fetch = (async (
+      _input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return await new Promise<Response>((resolve) => responses.push(resolve));
+    }) as typeof fetch;
+    const form = () => (
+      <TaskForm
+        projects={[initialized]}
+        editing={editing}
+        onSaved={() => saved++}
+        onClose={noop}
+      />
+    );
+    try {
+      mount(form());
+      field("Title", "Older submitted draft");
+      click(editing ? "Save changes" : "Save draft");
+      await settle();
+      check(
+        requests.length === 1 && responses.length === 1 && saved === 0 &&
+          requests[0].kind === (editing ? "update_task" : "create_task") &&
+          requests[0].title === "Older submitted draft",
+        "the older save did not remain pending with its submitted fields",
+      );
+      const { operation_id: submittedId, ...submittedBody } = requests[0];
+      check(
+        localStorage.getItem(`${key}.operation`) === JSON.stringify({
+          body: JSON.stringify(submittedBody),
+          id: submittedId,
+        }),
+        "the pending save did not persist its exact operation",
+      );
+      const submittedDraft = JSON.parse(localStorage.getItem(key)!) as Record<
+        string,
+        unknown
+      >;
+      const newerTitle = "Newer draft from another dashboard";
+      const newerDraft = JSON.stringify({ ...submittedDraft, title: newerTitle });
+      const newerOperation = JSON.stringify({
+        body: JSON.stringify({ ...submittedBody, title: newerTitle }),
+        id: "newer-dashboard-operation",
+      });
+      localStorage.setItem(key, newerDraft);
+      localStorage.setItem(`${key}.operation`, newerOperation);
+      responses[0](
+        refused
+          ? new Response(JSON.stringify({ error: "base revision changed" }), {
+            status: 409,
+          })
+          : new Response(JSON.stringify({ result: { state: "saved" } })),
+      );
+      await settle();
+      check(
+        saved === (refused ? 0 : 1) && requests.length === 1 &&
+          (!refused ||
+            document.body.textContent?.includes("Your draft is still here")),
+        "the older save did not settle with the expected success or refusal",
+      );
+      check(
+        localStorage.getItem(key) === newerDraft &&
+          localStorage.getItem(`${key}.operation`) === newerOperation,
+        `older ${scenario} erased newer draft or operation storage`,
+      );
+      unmount();
+      mount(form());
+      check(
+        findField("Title").value === newerTitle &&
+          (!!editing ||
+            document.body.textContent?.includes("Retry exact unresolved create")) &&
+          requests.length === 1,
+        "remount lost the newer draft or its unresolved create, or replayed it automatically",
+      );
+    } finally {
+      unmount();
+      localStorage.clear();
+      globalThis.fetch = nativeFetch;
+    }
+  });
+}
+
+for (
+  const scenario of [
+    "edited draft",
+    "newer storage on success",
+    "newer storage on refusal",
+  ] as const
+) {
+  Deno.test(`A09 unresolved task create blocks edited intent and reloads its exact reconciliation (${scenario})`, async () => {
+    localStorage.clear();
+    const refused = scenario === "newer storage on refusal";
+    const requests: Record<string, unknown>[] = [];
+    const responses: Array<(response: Response) => void> = [];
+    const committedOperations = new Set<string>();
+    let committedCreates = 0;
+    let saved = 0;
+    globalThis.fetch = (async (
+      _input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      const operation = String(body.operation_id);
+      if (!refused && !committedOperations.has(operation)) {
+        committedOperations.add(operation);
+        committedCreates++;
+      }
+      if (requests.length === 1) {
+        throw new ApiError(
+          refused ? "task response was lost" : "task committed but its response was lost",
+          0,
+          operation,
+          true,
+        );
+      }
+      return await new Promise<Response>((resolve) => responses.push(resolve));
+    }) as typeof fetch;
+    const form = () => (
+      <TaskForm
+        projects={[initialized]}
+        onSaved={() => saved++}
+        onClose={noop}
+      />
+    );
+    try {
+      mount(form());
+      field("Title", "Original unresolved task");
+      click("Save draft");
+      await settle();
+      const original = requests[0];
+      check(
+        original?.kind === "create_task" && original.ready === false &&
+          document.body.textContent?.includes("may already be committed") &&
+          localStorage.getItem("agenticjira.new-task.operation")?.includes(
+            String(original.operation_id),
+          ),
+        "ambiguous task create did not retain its exact persisted request",
+      );
+
+      const { operation_id: originalId, ...originalBody } = original;
+      field("Title", "Edited after response loss");
+      unmount();
+      mount(form());
+      check(
+        findField("Title").value === "Edited after response loss" &&
+          document.body.textContent?.includes("Retry exact unresolved create"),
+        "reload lost the edited draft or unresolved-create recovery",
+      );
+      click("Save draft");
+      await settle();
+      check(
+        requests.length === 1 && committedCreates === (refused ? 0 : 1) &&
+          document.body.textContent?.includes(
+            "earlier task create still has an unknown result",
+          ),
+        "edited task submission bypassed the unresolved-create guard",
+      );
+      field("Title", "Original unresolved task");
+      click("Create Ready task");
+      await settle();
+      check(
+        requests.length === 1 && committedCreates === (refused ? 0 : 1),
+        "a different Ready mode bypassed the unresolved-create guard",
+      );
+
+      field(
+        "Title",
+        scenario === "edited draft"
+          ? "Edited after response loss"
+          : "Original unresolved task",
+      );
+      click("Retry exact unresolved create");
+      await settle();
+      check(
+        requests.length === 2 && responses.length === 1 && saved === 0 &&
+          JSON.stringify(requests[1]) === JSON.stringify(original) &&
+          localStorage.getItem("agenticjira.new-task.operation") === JSON.stringify({
+            body: JSON.stringify(originalBody),
+            id: originalId,
+          }),
+        "pending exact reconciliation changed the original request or operation identity",
+      );
+      const newerTitle = "Newer draft during exact reconciliation";
+      const submittedDraft = JSON.parse(
+        localStorage.getItem("agenticjira.new-task")!,
+      ) as Record<string, unknown>;
+      const newerDraft = JSON.stringify({ ...submittedDraft, title: newerTitle });
+      const newerOperation = JSON.stringify({
+        body: JSON.stringify({ ...originalBody, title: newerTitle }),
+        id: "newer-reconciliation-operation",
+      });
+      if (scenario !== "edited draft") {
+        localStorage.setItem("agenticjira.new-task", newerDraft);
+        localStorage.setItem("agenticjira.new-task.operation", newerOperation);
+      }
+      responses[0](
+        refused
+          ? new Response(JSON.stringify({ error: "base revision changed" }), {
+            status: 409,
+          })
+          : new Response(JSON.stringify({
+            result: { entity_id: "AJ-ambiguous", version: 1 },
+          })),
+      );
+      await settle();
+      check(
+        requests.length === 2 && committedCreates === (refused ? 0 : 1) &&
+          saved === (refused ? 0 : 1) &&
+          JSON.stringify(requests[1]) === JSON.stringify(original) &&
+          (!refused ||
+            document.body.textContent?.includes("Your draft is still here")),
+        "exact task-create reconciliation changed intent, duplicated the commit, or reported the wrong result",
+      );
+      if (scenario === "edited draft") {
+        check(
+          localStorage.getItem("agenticjira.new-task.operation") === null &&
+            localStorage.getItem("agenticjira.new-task")?.includes(
+              "Edited after response loss",
+            ),
+          "exact reconciliation retained its own operation or discarded edited draft fields",
+        );
+      } else {
+        check(
+          localStorage.getItem("agenticjira.new-task") === newerDraft &&
+            localStorage.getItem("agenticjira.new-task.operation") === newerOperation,
+          `exact reconciliation with ${scenario} erased newer draft or operation storage`,
+        );
+        unmount();
+        mount(form());
+        check(
+          findField("Title").value === newerTitle &&
+            document.body.textContent?.includes("Retry exact unresolved create") &&
+            requests.length === 2,
+          "remount lost the newer draft or unresolved create, or replayed it automatically",
+        );
+      }
+    } finally {
+      unmount();
+      localStorage.clear();
+      globalThis.fetch = nativeFetch;
+    }
+  });
+}
 
 Deno.test("A04 setup clears definite stale identity but preserves an ambiguous exact retry", async () => {
   localStorage.clear();
