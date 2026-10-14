@@ -13607,7 +13607,7 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
     rerender(render([exited, settledCooling, usage]));
 
     respond = () =>
-      new Response(JSON.stringify({ error: "task version is stale" }), {
+      new Response(JSON.stringify({ error: "task version is stale", operation_id: requests.at(-1)?.operation_id }), {
         status: 409,
       });
     act(() => releaseButton("s-cooling").click());
@@ -13616,10 +13616,13 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
       notice("s-cooling")!.querySelector('[role="alert"] strong')?.textContent
         ?.includes(
           "older version",
-        ) && refreshes === 1 && !!releaseButton("s-cooling"),
-      "a stale release was not explained or was treated as released",
+        ) && refreshes === 1 && !releaseButton("s-cooling") &&
+        primary("s-cooling").includes("The service refused this release request") &&
+        !localStorage.getItem("llmrelay.failure.release.hold-rate"),
+      "a correlated stale release was not terminally refused or offered a retry",
     );
 
+    mount(render([exited, settledCooling, usage]));
     let finish: (response: Response) => void = noop;
     respond = () =>
       new Promise<Response>((resolve) => {
@@ -13633,12 +13636,13 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
       "a pending release could be submitted twice",
     );
     finish(
-      new Response(JSON.stringify({ error: "task version is stale" }), {
+      new Response(JSON.stringify({ error: "task version is stale", operation_id: requests.at(-1)?.operation_id }), {
         status: 409,
       }),
     );
     await settle();
 
+    mount(render([exited, settledCooling, usage]));
     respond = () => {
       throw new TypeError("Failed to fetch");
     };
@@ -13693,34 +13697,259 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
       !!notice("s-exited") && !notice("s-cooling"),
       "the session list did not follow the authoritative hold state",
     );
-    const late: Session = {
-      ...exited, id: "s-late", provider_failure_holds: [],
-    };
-    for (const exitSuccess of [0, false] as const) {
-      rerender(render([{ ...late, exit_success: exitSuccess }]));
-      const lateSession = document.querySelector('[data-attention-target="session:s-late"]')!;
-      check(lateSession.textContent?.includes("No attributable provider failure is recorded") &&
-        lateSession.textContent.includes("only after exit cannot be classified") &&
-        !notice(late.id) && !lateSession.querySelector(".session-failure-stop") &&
-        [...lateSession.querySelectorAll("button")].some((button) => button.textContent === "View recorded output") &&
-        requests.length === 5,
-        `Failed exit ${exitSuccess} lost its explanation, classified a post-exit observation or granted stop authority`);
-    }
-    const otherExits: Session[] = [
-      { ...late, exit_success: null }, late,
-      { ...late, exit_success: 1 }, { ...late, exit_success: true },
-    ];
-    for (const otherExit of otherExits) {
-      rerender(render([otherExit]));
-      const lateSession = document.querySelector('[data-attention-target="session:s-late"]')!;
-      check(!lateSession.textContent?.includes("No attributable provider failure is recorded") &&
-        !notice(late.id) && !lateSession.querySelector(".session-failure-stop") && requests.length === 5,
-        `Exit success ${otherExit.exit_success} was treated as a failed exit or granted recovery authority`);
-    }
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
     localStorage.clear();
+  }
+});
+
+Deno.test("Unclassified sessions offer optional live help and factual exit guidance only for current unfinished invocations", async () => {
+  localStorage.clear();
+  const viewed: string[] = [];
+  const opened: Session[] = [];
+  const setups: string[] = [];
+  let route: CmuxViewOutcome | undefined;
+  const access = {
+    routes: {}, discarding: {}, routeFor: () => route,
+    view: async (id: string) => { viewed.push(id); route = await cmuxFixture(id); return route; },
+    take: () => Promise.resolve(), release: () => Promise.resolve(), discard: () => Promise.resolve(), close: noop, refresh: noop,
+  };
+  const render = (session: Session, controls = true) => <SessionTree sessions={[session]} access={access}
+    setupProjectId={() => "p1"} onOpenSetup={(id) => setups.push(id)}
+    onOpenControls={controls ? (source) => opened.push(source) : undefined} />;
+  const help = () => document.querySelector<HTMLDetailsElement>(".session-unclassified-help");
+  try {
+    mount(render(managerSession, false));
+    check(help()?.querySelector("summary")?.textContent === "Having trouble?" && !help()?.open &&
+      document.querySelector(".session-state")?.textContent === "Running" &&
+      !document.querySelector(".session-turn-failure, .session-unclassified-exit") &&
+      ![...document.querySelectorAll("button")].some((button) => button.textContent === "Open task controls"),
+      "An ordinary live session was labelled failed or offered a dead task callback");
+    act(() => help()!.querySelector("summary")!.click());
+    click("View output");
+    await settle();
+    rerender(render(managerSession, false));
+    check(viewed.join() === managerSession.id && !!document.querySelector(".session-output.recorded_output") &&
+      help()?.textContent?.includes("Read recorded output"), "Optional help did not retain the existing output fallback");
+    rerender(render(managerSession));
+    check(help()?.textContent?.includes("Pause now") && !help()?.textContent?.includes("Pause after this step"),
+      "Live trouble guidance did not recommend immediate interruption");
+    click("Open task controls");
+    check(opened[0] === managerSession, "Trouble guidance navigated to another session's task");
+    rerender(render({ ...managerSession, status: "interrupt_requested" }));
+    check(!!help() && help()?.textContent?.includes("View recorded output"), "Stopping lost optional inspect-output help");
+
+    const current: Session = { ...managerSession, status: "exited", generation_status: "exited", has_newer_generation: false, exit_success: false };
+    const busy: Session = { ...current, provider: "claude", exit_success: true, readiness: "busy",
+      native_turn: { accepted_hook_event_id: "accepted", accepted_at: "2026-10-01T15:00:00Z", failure: null } };
+    for (const unfinished of [current, { ...current, provider: "claude" as const, exit_success: 0 as const, has_newer_generation: 0 }, busy]) {
+      rerender(render(unfinished));
+      check(document.querySelector(".session-unclassified-exit")?.textContent?.includes("stopped without a recorded result") &&
+        !help() && !document.querySelector(".session-turn-failure, .session-failure-stop, .session-provider-hold") &&
+        !!findButton("View recorded output"), "A current unfinished exit was hidden, classified or given failed-stop authority");
+    }
+    const completedOrUnproven: Session[] = [
+      { ...current, exit_success: true },
+      { ...busy, reported_in_latest_invocation: 1 },
+      { ...busy, latest_invocation_report: { id: "report", outcome: "candidate_ready", created_at: "2026-10-01T15:01:00Z", consumed_at: null } },
+      { ...current, generation_status: "replaced" }, { ...current, generation_status: "revoked" },
+      { ...current, has_newer_generation: true }, { ...current, generation_status: undefined }, { ...current, has_newer_generation: undefined },
+      { ...busy, native_turn: { ...busy.native_turn!, accepted_at: null } },
+    ];
+    for (const source of completedOrUnproven) {
+      rerender(render(source));
+      check(!document.querySelector(".session-unclassified-exit"), "A completed, historical or unproven exit was labelled unfinished");
+    }
+    rerender(render({ ...managerSession, setup_operation_id: "setup-help" }));
+    check(!help()?.textContent?.includes("Pause now") &&
+      ![...help()!.querySelectorAll("button")].some((button) => button.textContent === "Open task controls"),
+      "Setup help promised ordinary task controls");
+    click("Open project setup controls");
+    check(setups.join() === "p1", "Setup help did not reach its existing setup route");
+    rerender(render({ ...managerSession, role: "single_agent" }));
+    check(help()?.textContent?.includes("actions available for this Single agent run") && !help()?.textContent?.includes("Pause now"),
+      "Single agent help promised unsupported ordinary controls");
+    click("Open task controls");
+    check(opened.at(-1)?.role === "single_agent", "Single agent help lost its supplied policy-controls route");
+    rerender(render({ ...managerSession, role: "single_agent" }, false));
+    check(!help()?.querySelector("button"), "Single agent help created a callback without an available route");
+  } finally {
+    unmount(); localStorage.clear();
+  }
+});
+
+Deno.test("Unclassified trouble help opens the exact task controls and Pause now uses the existing command", async () => {
+  localStorage.clear();
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input) !== "/api/command") return new Response("[]");
+    const request = JSON.parse(String(init?.body));
+    requests.push(request);
+    return new Response(JSON.stringify({ result: { operation_id: request.operation_id, state: "requested" } }));
+  }) as typeof fetch;
+  try {
+    mount(<TaskDetail task={task} state={{ ...liveBase, tasks: [task], active_sessions: [managerSession] }}
+      onClose={noop} onChanged={noop} onOpenSetup={noop} />);
+    click("Activity");
+    act(() => document.querySelector<HTMLElement>(".session-unclassified-help summary")!.click());
+    click("Open task controls");
+    check(document.activeElement?.getAttribute("data-attention-target") === `workflow_controls:${task.id}` && requests.length === 0,
+      "Trouble help did not focus the exact task's controls or sent work during navigation");
+    click("Pause now");
+    await settle();
+    check(requests.length === 1 && requests[0].kind === "control" && requests[0].action === "pause_now" &&
+      requests[0].task_id === task.id && requests[0].expected_version === task.version,
+      "Immediate interruption used another task, another control or bypassed the existing command");
+  } finally {
+    unmount(); globalThis.fetch = nativeFetch; localStorage.clear();
+  }
+});
+
+Deno.test("An uncertain provider release remains checkable after its hold disappears and reload never replays it", async () => {
+  localStorage.clear();
+  const requests: Record<string, unknown>[] = [];
+  const hold: ProviderFailureHold = {
+    id: "lost-release", task_id: managerSession.task_id, task_version: 7,
+    attempt_id: managerSession.attempt_id, session_id: managerSession.id,
+    role_generation_id: managerSession.role_generation_id, transcript_epoch: "lost-epoch",
+    accepted_hook_event_id: null, source: "failure_hook", failure_hook_event_id: "lost-hook",
+    kind: "billing_error", cause: "a billing problem", remedy: "Check the provider account.",
+    attribution: "startup_invocation", created_at: "2026-10-01T15:00:00Z", expires_at: null,
+  };
+  let serviceSession: Session = {
+    ...managerSession, status: "exited", process_group_quiescent: true, provider_failure_holds: [hold],
+  };
+  const key = `llmrelay.failure.release.${hold.id}`;
+  let respond: () => Response | Promise<Response> = () => {
+    serviceSession = { ...serviceSession, provider_failure_holds: [] };
+    throw new TypeError("Reply lost after release was applied");
+  };
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return await respond();
+  }) as typeof fetch;
+  let refreshes = 0;
+  const access = {
+    routes: {}, discarding: {}, routeFor: () => undefined,
+    view: () => Promise.resolve<CmuxViewOutcome>({ state: "pending", message: "", retry_available: false }),
+    take: () => Promise.resolve(), release: () => Promise.resolve(), discard: () => Promise.resolve(),
+    close: noop, refresh: () => { refreshes += 1; },
+  };
+  const render = (session: Session) => <SessionTree sessions={[session]} access={access}
+    setupProjectId={() => undefined} onOpenSetup={noop} />;
+  try {
+    mount(render(serviceSession));
+    click("Release provider hold");
+    await settle();
+    const captured = localStorage.getItem(key)!;
+    check(requests.length === 1 && !!captured, "A lost applied reply discarded its exact request");
+    click("Refresh provider recovery");
+    rerender(render(serviceSession));
+    check(!document.querySelector(".session-provider-hold") &&
+      document.querySelectorAll(".session-provider-release-request").length === 1 && requests.length === 1,
+      "Refresh replayed the release or restored an absent restriction");
+    mount(render(serviceSession));
+    check(requests.length === 1 && findButton("Check previous release request"), "Reload replayed or hid the saved release");
+    let finish: (response: Response) => void = noop;
+    respond = () => new Promise<Response>((resolve) => { finish = resolve; });
+    act(() => {
+      findButton("Check previous release request").click();
+      findButton("Check previous release request").click();
+    });
+    await settle();
+    rerender(render(serviceSession));
+    check(requests.length === 2 && JSON.stringify(requests[1]) === captured &&
+      findButton("Releasing provider hold…").disabled,
+      "Explicit reconciliation changed the payload or duplicated the operation");
+    finish(new Response(JSON.stringify({ result: {
+      operation_id: requests[0].operation_id, state: "released", entity_id: hold.id,
+    } })));
+    await settle();
+    check(!localStorage.getItem(key) && refreshes === 2 &&
+      document.querySelector(".session-provider-release-request")?.textContent?.includes("Hold released. The agent was not restarted or sent anything") && requests.length === 2,
+      "A definitive release receipt left uncertainty or chained another action");
+    rerender(render(serviceSession));
+    check(!document.querySelector(".session-provider-release-request"), "Confirmed release history remained after refresh");
+
+    localStorage.setItem(key, captured);
+    mount(render(serviceSession));
+    respond = () => new Response(JSON.stringify({ error: "task version is stale", operation_id: "unrelated" }), { status: 409 });
+    click("Check previous release request");
+    await settle();
+    check(localStorage.getItem(key) === captured && findButton("Check previous release request"),
+      "An uncorrelated refusal cleared the uncertain request");
+    respond = () => new Response(JSON.stringify({
+      error: "operation ID was already used with different input", operation_id: requests[0].operation_id,
+    }), { status: 409 });
+    click("Check previous release request");
+    await settle();
+    check(!localStorage.getItem(key) &&
+      document.querySelector(".session-provider-release-request")?.textContent?.includes("The service refused this release request. Refresh") &&
+      ![...document.querySelectorAll("button")].some((button) => button.textContent === "Check previous release request") &&
+      requests.slice(1).every((request) => JSON.stringify(request) === captured),
+      "A correlated exact-request refusal retained a retry or changed the saved command");
+  } finally {
+    unmount(); globalThis.fetch = nativeFetch; localStorage.clear();
+  }
+});
+
+Deno.test("Saved provider releases validate their complete context and deduplicate active holds without sweeping storage", async () => {
+  localStorage.clear();
+  const saved = { kind: "release_provider_failure_hold", operation_id: "saved-release", hold_id: "saved-hold",
+    task_id: managerSession.task_id, attempt_id: managerSession.attempt_id, session_id: managerSession.id, expected_task_version: 7 };
+  const entries: [string, unknown][] = [
+    ["saved-hold", saved], ["wrong-key", saved],
+    ["wrong-task", { ...saved, hold_id: "wrong-task", task_id: "another-task" }],
+    ["wrong-attempt", { ...saved, hold_id: "wrong-attempt", attempt_id: "another-attempt" }],
+    ["wrong-session", { ...saved, hold_id: "wrong-session", session_id: "another-session" }],
+    ["wrong-kind", { ...saved, hold_id: "wrong-kind", kind: "stop_failed_session" }],
+    ["empty-id", { ...saved, hold_id: "empty-id", operation_id: "" }],
+    ["fraction", { ...saved, hold_id: "fraction", expected_task_version: 7.5 }],
+    ["missing", { ...saved, hold_id: "missing", expected_task_version: undefined }],
+  ];
+  for (const [id, value] of entries) localStorage.setItem(`llmrelay.failure.release.${id}`, JSON.stringify(value));
+  localStorage.setItem("llmrelay.failure.release.malformed", "{");
+  const before = localStorage.length;
+  const requests: unknown[] = [];
+  let loseReply: () => void = noop;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return await new Promise<Response>((_resolve, reject) => { loseReply = () => reject(new TypeError("reply lost")); });
+  }) as typeof fetch;
+  const access = {
+    routes: {}, discarding: {}, routeFor: () => undefined,
+    view: () => Promise.resolve<CmuxViewOutcome>({ state: "pending", message: "", retry_available: false }),
+    take: () => Promise.resolve(), release: () => Promise.resolve(), discard: () => Promise.resolve(), close: noop, refresh: noop,
+  };
+  const held: ProviderFailureHold = {
+    id: saved.hold_id, task_id: saved.task_id, task_version: 99, attempt_id: saved.attempt_id, session_id: saved.session_id,
+    role_generation_id: "g1", transcript_epoch: "saved-epoch", accepted_hook_event_id: null,
+    source: "failure_hook", failure_hook_event_id: "saved-hook", kind: "billing_error", cause: "a billing problem", remedy: "Check billing.",
+    attribution: "startup_invocation", created_at: "2026-10-01T15:00:00Z", expires_at: null,
+  };
+  const render = (holds: ProviderFailureHold[]) => <SessionTree sessions={[{ ...managerSession, provider_failure_holds: holds }]}
+    access={access} setupProjectId={() => undefined} onOpenSetup={noop} />;
+  try {
+    mount(render([]));
+    check(document.querySelectorAll(".session-provider-release-request").length === 1 && requests.length === 0 && localStorage.length === before,
+      "Malformed/context-mismatched storage became actionable, replayed or was swept");
+    rerender(render([held]));
+    check(!document.querySelector(".session-provider-release-request") &&
+      [...document.querySelectorAll("button")].filter((button) => button.textContent === "Check previous release request").length === 1,
+      "Active and saved hold rows exposed duplicate reconciliation controls");
+    click("Check previous release request");
+    await settle();
+    rerender(render([]));
+    check(findButton("Releasing provider hold…").disabled && !document.querySelector(".session-provider-hold"),
+      "Hold disappearance replaced the pending operation with another actionable control");
+    click("Releasing provider hold…");
+    loseReply();
+    await settle();
+    check(requests.length === 1 && JSON.stringify(requests[0]) === JSON.stringify(saved) && localStorage.length === before,
+      "Active reconciliation rewrote the stored version or changed unrelated storage");
+  } finally {
+    unmount(); globalThis.fetch = nativeFetch; localStorage.clear();
   }
 });
 

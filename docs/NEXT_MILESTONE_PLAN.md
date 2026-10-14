@@ -1,5 +1,18 @@
 # LLMRelay roadmap and next task
 
+## Verified stabilization checkpoint — recovery escape paths and local build
+
+Selected October 14: harden unclassified-failure navigation and vanished-hold
+release reconciliation; verify the recovery journey across UI, authenticated
+HTTP and owned-process boundaries; then produce a verified local package and
+[acceptance checklist](STABILIZATION_CHECKLIST.md) before refactoring.
+The two UI fixes and HTTP regression passed independent review and the package
+verification matrix. Packaged login/navigation and core browser flows passed;
+remaining responsive checks stopped on a cmux JavaScript timeout. All application
+instances were drained and absence verified. Fresh final verification approved
+the checkpoint; the checklist records the exact evidence boundaries. The next
+step is a measured, behavior-preserving refactoring plan.
+
 ## Provider error recovery checkpoint
 
 Selected by the user on October 13, 2026 as essential. Start after the current

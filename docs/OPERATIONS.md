@@ -880,6 +880,28 @@ added. The [signal matrix](PERMISSION_SIGNAL_MATRIX.md) records the older source
 and native-observation versions separately from the current runtime pin; usage
 recognition is source-confirmed, not a live quota-exhaustion qualification.
 
+### Recovery when a failure cannot be classified
+
+For a live session without a recognized failure, expand **Having trouble?** to
+reach output and the existing task controls. This help does not label the agent
+failed. Use **Pause now** to interrupt current work where the task offers it;
+**Pause after this step** waits for the step to finish. Cancel remains subject to
+the task's existing rules. Setup and Single agent sessions retain their own
+available controls. A view without task navigation still offers output access.
+
+Current exited sessions without a result show factual recovery guidance when the
+recorded exit or unfinished accepted turn supports it. Completed, replaced and
+historical sessions are not inferred to have failed. Inspect output and current
+recovery options; an unclassified exit does not establish a provider quota error.
+
+If a release response is lost and the hold subsequently disappears, **Previous
+provider hold release request** keeps **Check previous release request** available
+for that exact saved request. Refresh and reload send nothing. A confirmed receipt
+settles the request; a correlated service refusal ends that request and asks you
+to refresh. Authentication, connection and uncorrelated failures stay uncertain.
+This saved-request display is history, not an active hold or permission to resume.
+It never changes the stored task version or invents another operation identity.
+
 ### Durable attention observations
 
 The existing coordinator cycle classifies observations after its workflow step.

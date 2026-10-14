@@ -329,6 +329,59 @@ const releaseOutcomes: ProviderFailureHoldRelease[] = [
   "superseded",
 ];
 
+type ProviderHoldReleaseCommand = Command & {
+  kind: "release_provider_failure_hold";
+  task_id: string;
+  attempt_id: string;
+  session_id: string;
+  hold_id: string;
+  expected_task_version: number;
+};
+
+const releaseStoragePrefix = "llmrelay.failure.release.";
+
+function pendingReleaseMatches(
+  value: unknown,
+  key: string,
+  session: Session,
+): value is ProviderHoldReleaseCommand {
+  return !!value && typeof value === "object" &&
+    Object.keys(value).length === 7 &&
+    "kind" in value && value.kind === "release_provider_failure_hold" &&
+    "operation_id" in value && typeof value.operation_id === "string" && !!value.operation_id.trim() &&
+    "hold_id" in value && typeof value.hold_id === "string" && !!value.hold_id.trim() &&
+    key === `${releaseStoragePrefix}${value.hold_id}` &&
+    "task_id" in value && typeof value.task_id === "string" && !!value.task_id.trim() && value.task_id === session.task_id &&
+    "attempt_id" in value && typeof value.attempt_id === "string" && !!value.attempt_id.trim() && value.attempt_id === session.attempt_id &&
+    "session_id" in value && typeof value.session_id === "string" && !!value.session_id.trim() && value.session_id === session.id &&
+    "expected_task_version" in value && typeof value.expected_task_version === "number" && Number.isSafeInteger(value.expected_task_version);
+}
+
+function readPendingRelease(key: string, session: Session): ProviderHoldReleaseCommand | undefined {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(key) || "null");
+    return pendingReleaseMatches(value, key, session) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function pendingReleasesWithoutHold(session: Session): ProviderHoldReleaseCommand[] {
+  const requests: ProviderHoldReleaseCommand[] = [];
+  try {
+    const activeIds = new Set(session.provider_failure_holds?.map((hold) => hold.id));
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (!key?.startsWith(releaseStoragePrefix) || activeIds.has(key.slice(releaseStoragePrefix.length))) continue;
+      const request = readPendingRelease(key, session);
+      if (request) requests.push(request);
+    }
+  } catch {
+    return requests;
+  }
+  return requests;
+}
+
 function FailedSessionStopNotice({ session, onChanged }: { session: Session; onChanged: () => void }) {
   const storageKey = `llmrelay.failure.stop.${session.id}`;
   const request = useRef<Command | undefined>((() => {
@@ -477,8 +530,9 @@ function NativePromptNotice({ prompt, onChanged }: { prompt: NativePrompt; onCha
 }
 
 function ProviderFailureHoldNotice(
-  { hold, session, onReleased, onOpenRoleSettings, onOpenControls, onOpenSetup }: {
-    hold: ProviderFailureHold;
+  { holdId, hold, session, onReleased, onOpenRoleSettings, onOpenControls, onOpenSetup }: {
+    holdId: string;
+    hold?: ProviderFailureHold;
     session: Session;
     onReleased: () => void;
     onOpenRoleSettings?: (session: Session) => void;
@@ -486,29 +540,24 @@ function ProviderFailureHoldNotice(
     onOpenSetup?: () => void;
   },
 ) {
-  const storageKey = `llmrelay.failure.release.${hold.id}`;
-  const request = useRef<Command | undefined>((() => {
-    try {
-      const value: unknown = JSON.parse(localStorage.getItem(storageKey) || "null");
-      if (value && typeof value === "object" && "kind" in value &&
-        value.kind === "release_provider_failure_hold" && "hold_id" in value &&
-        value.hold_id === hold.id && "operation_id" in value && typeof value.operation_id === "string") {
-        return { ...value, kind: "release_provider_failure_hold", operation_id: value.operation_id };
-      }
-    } catch { return undefined; }
-    return undefined;
-  })());
+  const storageKey = `${releaseStoragePrefix}${holdId}`;
+  const request = useRef(readPendingRelease(storageKey, session));
   const inFlight = useRef(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [uncertain, setUncertain] = useState(!!request.current);
-  const [outcome, setOutcome] = useState<ProviderFailureHoldRelease>();
+  const [outcome, setOutcome] = useState<ProviderFailureHoldRelease | "refused">();
+  useEffect(() => {
+    if (!request.current) {
+      setOutcome(undefined);
+      setError("");
+    }
+  }, [hold?.task_version]);
   const stopped = session.status === "exited" &&
     (session.process_group_quiescent === true || session.process_group_quiescent === 1);
   const release = async () => {
-    if (inFlight.current || (!stopped && !request.current)) return;
-    const reconciling = !!request.current;
-    const captured = request.current ?? {
+    if (inFlight.current || outcome || (!request.current && (!hold || !stopped))) return;
+    const captured: ProviderHoldReleaseCommand | undefined = request.current ?? (hold ? {
       kind: "release_provider_failure_hold",
       operation_id: operationId(),
       task_id: hold.task_id,
@@ -516,7 +565,8 @@ function ProviderFailureHoldNotice(
       session_id: hold.session_id,
       hold_id: hold.id,
       expected_task_version: hold.task_version,
-    };
+    } : undefined);
+    if (!captured) return;
     request.current = captured;
     inFlight.current = true;
     setBusy(true);
@@ -538,11 +588,14 @@ function ProviderFailureHoldNotice(
       setOutcome(state);
       onReleased();
     } catch (cause) {
-      const ambiguous = reconciling || !(cause instanceof ApiError) || cause.ambiguous;
-      setUncertain(ambiguous);
-      if (!ambiguous) {
+      // Release rejection is receipt-first; stop commands can fail after commit.
+      const refused = cause instanceof ApiError && cause.status === 409 &&
+        cause.operationId === captured.operation_id && !cause.ambiguous;
+      setUncertain(!refused);
+      if (refused) {
         localStorage.removeItem(storageKey);
         request.current = undefined;
+        setOutcome("refused");
       }
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -550,6 +603,28 @@ function ProviderFailureHoldNotice(
       setBusy(false);
     }
   };
+  const releaseNotice = <>
+    {outcome
+      ? <p>{outcome === "refused"
+        ? "The service refused this release request. Refresh to see the current hold and recovery options."
+        : releaseOutcomeMessage[outcome]}</p>
+      : <div className="button-row">
+        <button disabled={busy || (!stopped && !uncertain)} onClick={() => void release()}>
+          {busy ? "Releasing provider hold…" : uncertain ? "Check previous release request" : "Release provider hold"}
+        </button>
+      </div>}
+    {uncertain && <p role="status">The release outcome is uncertain. Refresh, then check the same request; refresh sends no release or resume.</p>}
+    {error && <ErrorNotice error={error} />}
+    {request.current && <TechnicalDetails><pre>{JSON.stringify(request.current, null, 2)}</pre></TechnicalDetails>}
+  </>;
+  if (!hold) return (
+    <div className="session-provider-release-request" role="status">
+      <strong>Previous provider hold release request</strong>
+      <p>The current session state no longer shows this hold. This saved request is history; it does not pause or resume the task.</p>
+      {releaseNotice}
+      <button disabled={busy} onClick={onReleased}>Refresh provider recovery</button>
+    </div>
+  );
   return (
     <div className="session-provider-hold warning" role="status">
       <strong>{roleLabel(session.role)} is on hold after a provider error</strong>
@@ -575,19 +650,10 @@ function ProviderFailureHoldNotice(
         restart the agent or send it anything. Continue, Run next or exact
         resume is a separate action, available only when the service offers it.
       </p>
-      {outcome
-        ? <p>{releaseOutcomeMessage[outcome]}</p>
-        : (
-          <div className="button-row">
-            <button disabled={busy || (!stopped && !uncertain)} onClick={() => void release()}>
-              {busy ? "Releasing provider hold…" : uncertain ? "Check previous release request" : "Release provider hold"}
-            </button>
-          </div>
-        )}
+      {releaseNotice}
       {!stopped && !uncertain && <p>Release becomes available after LLMRelay confirms this invocation and its process group have stopped. {session.failed_session_stop
         ? "Use Stop failed session and pause task above."
         : "No current failed-session stop binding is available. Use the task's Pause or Cancel controls, or inspect its recovery controls."}</p>}
-      {uncertain && <p role="status">The release outcome is uncertain. Refresh, then check the same request; refresh sends no release or resume.</p>}
       {session.role === "manager" && !session.setup_operation_id &&
         <p>Save and verify the requested model or provider in Manager settings, then use Open manager change controls to apply it under the existing replacement checks.</p>}
       {session.setup_operation_id || session.role === "explorer" || session.role === "single_agent"
@@ -600,9 +666,7 @@ function ProviderFailureHoldNotice(
         <button onClick={() => onOpenControls(session, true)}>Open manager change controls</button>}
       {session.setup_operation_id && onOpenSetup && <button onClick={onOpenSetup}>Open project setup</button>}
       <button disabled={busy} onClick={onReleased}>Refresh provider recovery</button>
-      {error && <ErrorNotice error={error} />}
       <TechnicalDetails>
-        {request.current && <pre>{JSON.stringify(request.current, null, 2)}</pre>}
         <p>
           {hold.kind} · {hold.attribution} attribution · held since{" "}
           {new Date(hold.created_at).toLocaleString()}
@@ -1659,6 +1723,34 @@ export function SessionTree(
           request.actionable && request.session_id === session.id
         );
         const failure = session.native_turn?.failure;
+        const unclassified = !failure && !session.provider_failure_holds?.length && !session.failure_stop_pause;
+        const exitedWithoutResult = unclassified && session.status === "exited" &&
+          session.generation_status === "exited" &&
+          (session.has_newer_generation === false || session.has_newer_generation === 0) &&
+          !session.latest_invocation_report &&
+          !session.reported_in_latest_invocation &&
+          (session.exit_success === false || session.exit_success === 0 ||
+            (!!session.native_turn?.accepted_hook_event_id && !!session.native_turn.accepted_at && session.readiness === "busy"));
+        const recoveryRows: { id: string; hold?: ProviderFailureHold }[] = [
+          ...(session.provider_failure_holds ?? []).map((hold) => ({ id: hold.id, hold })),
+          ...pendingReleasesWithoutHold(session).map((request) => ({ id: request.hold_id })),
+        ];
+        const unclassifiedHelp = <>
+          <p>{exitedWithoutResult
+            ? "This invocation stopped without a recorded result. Inspect its recorded output to decide what to do next; no provider failure reason is recorded."
+            : `If the agent seems stuck or its output needs attention, choose ${running ? "View output" : "View recorded output"} to inspect it. Opening output does not stop the agent.`}</p>
+          {running && <p>If the live terminal is unavailable, choose Read recorded output to inspect saved activity.</p>}
+          {session.setup_operation_id
+            ? projectId && <p>Use Open project setup controls below to stop or replace this setup session.</p>
+            : onOpenControls && <>
+              <p>{session.role === "single_agent"
+                ? "Open task controls to check the Pause or Cancel actions available for this Single agent run."
+                : exitedWithoutResult
+                ? "Open task controls to check the current recovery and continuation options."
+                : "To interrupt current work, open task controls and choose Pause now. Cancel is also available where the task allows it."}</p>
+              <button onClick={() => onOpenControls(session)}>Open task controls</button>
+            </>}
+        </>;
         const acceptedAt = session.native_turn?.accepted_at;
         const state = sessionStateLabel(session, awaitingApproval);
         const owner = session.setup_operation_id
@@ -1733,9 +1825,10 @@ export function SessionTree(
                 </div>
               )}
               <FailedSessionStopNotice session={session} onChanged={access.refresh} />
-              {session.provider_failure_holds?.map((hold) => (
+              {recoveryRows.map(({ id, hold }) => (
                 <ProviderFailureHoldNotice
-                  key={hold.id}
+                  key={JSON.stringify([session.task_id, session.attempt_id, id])}
+                  holdId={id}
                   hold={hold}
                   session={session}
                   onReleased={access.refresh}
@@ -1751,10 +1844,12 @@ export function SessionTree(
                   {onOpenControls && <button onClick={() => onOpenControls(session)}>Open task controls</button>}
                 </p>
               )}
-              {session.provider === "codex" && session.status === "exited" &&
-                (session.exit_success === false || session.exit_success === 0) &&
-                !failure && !session.provider_failure_holds?.length && (
-                <p>No attributable provider failure is recorded for this stopped invocation. Inspect recorded output and the task's recovery controls. An error observed only after exit cannot be classified by the current history reader.</p>
+              {exitedWithoutResult && <div className="session-unclassified-exit" role="status">{unclassifiedHelp}</div>}
+              {unclassified && (running || session.status === "interrupt_requested") && (
+                <details className="session-unclassified-help">
+                  <summary>Having trouble?</summary>
+                  {unclassifiedHelp}
+                </details>
               )}
               {running && session.native_prompt &&
                 (!awaitingApproval || session.native_prompt.kind !== "permission_prompt") && (

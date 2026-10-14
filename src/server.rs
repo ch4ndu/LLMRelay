@@ -2463,38 +2463,235 @@ mod web_operation_tests {
     async fn every_operational_route_rejects_before_body_or_query_extraction() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let (root, app, _, _) = server_test_application();
-        let (state, headers, _) = browser_state(app);
+        let (root, app, target, other) = server_test_application();
+        let hold_id = uuid::Uuid::new_v4().to_string();
+        let hook_id = uuid::Uuid::new_v4().to_string();
+        // Synthetic exited rows exercise HTTP recovery, not real-process stop evidence.
+        {
+            let connection = app.store.lock().unwrap();
+            let exit = serde_json::json!({"success":true,"process_group_quiescent":true,"source":"synthetic_http_fixture"}).to_string();
+            for binding in [&target, &other] {
+                connection
+                    .execute(
+                        "UPDATE sessions SET status='exited',readiness_state='busy',exit_json=?1 WHERE id=?2",
+                        params![exit, binding.session_id],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "UPDATE role_generations SET status='exited' WHERE id=?1",
+                        params![binding.role_generation_id],
+                    )
+                    .unwrap();
+            }
+            connection
+                .execute(
+                    "INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,payload_json,
+                   peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+                 VALUES(?1,?2,?3,'codex','StopFailure','{}',?4,?5,?6,
+                   'managed_process_group_untrusted_payload','2026-01-01T00:00:00Z')",
+                    params![
+                        hook_id,
+                        target.session_id,
+                        target.role_generation_id,
+                        target.process.pid,
+                        target.process.process_group_id,
+                        target.process.native_start_marker,
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO provider_failure_holds(id,attempt_id,role_generation_id,session_id,transcript_epoch,
+                   failure_hook_event_id,failure_kind,attribution,created_at,state)
+                 VALUES(?1,'attempt',?2,?3,?4,?5,'billing_error','startup_invocation','2026-01-01T00:00:00Z','active')",
+                    params![
+                        hold_id,
+                        target.role_generation_id,
+                        target.session_id,
+                        target.transcript_epoch,
+                        hook_id,
+                    ],
+                )
+                .unwrap();
+        }
+        let inventory = |app: &Application| -> String {
+            app.store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT json_array((SELECT COUNT(*) FROM sessions),(SELECT COUNT(*) FROM role_generations),
+                   (SELECT COUNT(*) FROM launch_permits),(SELECT COUNT(*) FROM resume_invocations),
+                   (SELECT COALESCE(SUM(resume_count),0) FROM sessions),(SELECT COUNT(*) FROM guidance_messages),
+                   (SELECT COUNT(*) FROM guidance_messages WHERE state='queued'),(SELECT COUNT(*) FROM role_results),
+                   (SELECT COUNT(*) FROM snapshots),(SELECT COUNT(*) FROM controls))",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let preserved = inventory(&app);
+        let version: i64 = app
+            .store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT version FROM tasks WHERE id=?1",
+                params!["task"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (state, headers, _shutdown) = browser_state(app.clone());
         let cookie = headers[header::COOKIE].to_str().unwrap().to_owned();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server =
             tokio::spawn(async move { axum::serve(listener, web_router(state)).await.unwrap() });
-        for (method, path) in [
-            ("GET", "/api/health"),
-            ("GET", "/api/state"),
-            ("GET", "/api/state/wait?revision=invalid"),
-            ("GET", "/api/restart-preview"),
-            ("GET", "/api/model-catalog?provider=invalid"),
-            ("GET", "/api/tasks/fixture/role-preparations"),
-            ("GET", "/api/tasks/fixture/guidance-reauthorization"),
-            ("GET", "/api/diagnostics"),
-            ("POST", "/api/command"),
-            ("POST", "/api/operation"),
-        ] {
-            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
-            let request = format!(
-                "{method} {path} HTTP/1.1\r\nHost: server-boundary.test\r\nCookie: {cookie}\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{{"
+        let checked_app = app.clone();
+        // Assertion panics must not skip joining the listener and deleting its fixture.
+        let checks = tokio::spawn(async move {
+            let exchange = |method: &str, path: &str, declaration: &str, body: &str| {
+                let request = format!(
+                    "{method} {path} HTTP/1.1\r\nHost: server-boundary.test\r\nCookie: {cookie}\r\n{declaration}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                );
+                async move {
+                    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+                    stream.write_all(request.as_bytes()).await.unwrap();
+                    let mut response = Vec::new();
+                    stream.read_to_end(&mut response).await.unwrap();
+                    let text = String::from_utf8(response).unwrap();
+                    let body: serde_json::Value =
+                        serde_json::from_str(text.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    (text, body)
+                }
+            };
+            for (method, path) in [
+                ("GET", "/api/health"),
+                ("GET", "/api/state"),
+                ("GET", "/api/state/wait?revision=invalid"),
+                ("GET", "/api/restart-preview"),
+                ("GET", "/api/model-catalog?provider=invalid"),
+                ("GET", "/api/tasks/fixture/role-preparations"),
+                ("GET", "/api/tasks/fixture/guidance-reauthorization"),
+                ("GET", "/api/diagnostics"),
+                ("POST", "/api/command"),
+                ("POST", "/api/operation"),
+            ] {
+                let (text, _) = exchange(method, path, "", "{").await;
+                assert!(text.starts_with("HTTP/1.1 409"), "{path}: {text}");
+                assert!(text.contains("\"reason\":\"missing\""), "{path}: {text}");
+            }
+            let declaration = format!(
+                "{}: {}\r\n",
+                protocol::HTTP_HEADER,
+                serde_json::json!({"generation":1,"client_kind":"browser","required_features":["http_operational_v1"]}),
             );
-            stream.write_all(request.as_bytes()).await.unwrap();
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.unwrap();
-            let text = String::from_utf8(response).unwrap();
-            assert!(text.starts_with("HTTP/1.1 409"), "{path}: {text}");
-            assert!(text.contains("\"reason\":\"missing\""), "{path}: {text}");
-        }
+            let (text, before) = exchange("GET", "/api/state", &declaration, "").await;
+            assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+            let session = before["active_sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|session| session["id"] == target.session_id)
+                .unwrap();
+            assert_eq!(session["status"], "exited");
+            assert_eq!(session["readiness"], "busy");
+            assert_eq!(session["provider_failure_holds"][0]["id"], hold_id);
+            let attention_id = format!("provider_failure_hold:{hold_id}");
+            assert!(before["attention"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == attention_id));
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            let mut release = serde_json::json!({"kind":"release_provider_failure_hold","operation_id":operation_id,
+                "task_id":"task","attempt_id":"attempt","session_id":target.session_id,"hold_id":hold_id,"expected_task_version":version});
+            let stale_id = uuid::Uuid::new_v4().to_string();
+            let mut stale = release.clone();
+            stale["operation_id"] = serde_json::json!(stale_id);
+            stale["expected_task_version"] = serde_json::json!(version - 1);
+            let (text, refused) =
+                exchange("POST", "/api/command", &declaration, &stale.to_string()).await;
+            assert!(text.starts_with("HTTP/1.1 409"), "{text}");
+            assert_eq!(refused["operation_id"], stale_id);
+            assert_eq!(refused["error"], "task version is stale");
+            assert!(refused.get("protocol_error").is_none());
+            let (text, unchanged) = exchange("GET", "/api/state", &declaration, "").await;
+            assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+            assert_eq!(unchanged["tasks"][0]["version"], version);
+            assert_eq!(unchanged["active_sessions"], before["active_sessions"]);
+            assert_eq!(inventory(&checked_app), preserved);
+            let receipt_count = |id: &str| -> i64 {
+                checked_app.store.lock().unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id=?1 AND actor_key='human_control' AND operation_kind='human_command'",
+                        params![id],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(receipt_count(&stale_id), 0);
+            let stored_request = release.to_string();
+            let (text, released) =
+                exchange("POST", "/api/command", &declaration, &stored_request).await;
+            assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+            assert_eq!(released["result"]["operation_id"], operation_id);
+            assert_eq!(released["result"]["entity_kind"], "provider_failure_hold");
+            assert_eq!(released["result"]["entity_id"], hold_id);
+            assert_eq!(released["result"]["state"], "released");
+            assert_eq!(released["result"]["version"], version + 1);
+            let (text, after) = exchange("GET", "/api/state", &declaration, "").await;
+            assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+            let mut preserved_sessions = before["active_sessions"].clone();
+            preserved_sessions
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|session| session["id"] == target.session_id)
+                .unwrap()["provider_failure_holds"] = serde_json::json!([]);
+            assert_eq!(after["active_sessions"], preserved_sessions);
+            assert!(!after["attention"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == attention_id));
+            assert_eq!(after["tasks"][0]["version"], version + 1);
+            assert_eq!(after["guidance"], before["guidance"]);
+            assert_eq!(
+                after["tasks"][0]["snapshots"],
+                before["tasks"][0]["snapshots"]
+            );
+            assert_eq!(inventory(&checked_app), preserved);
+            let (text, replayed) =
+                exchange("POST", "/api/command", &declaration, &stored_request).await;
+            assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+            assert_eq!(replayed, released);
+            assert_eq!(receipt_count(&operation_id), 1);
+            release["expected_task_version"] = serde_json::json!(version + 1);
+            let (text, conflict) =
+                exchange("POST", "/api/command", &declaration, &release.to_string()).await;
+            assert!(text.starts_with("HTTP/1.1 409"), "{text}");
+            assert_eq!(conflict["operation_id"], operation_id);
+            assert_eq!(
+                conflict["error"],
+                "operation ID was already used with different input"
+            );
+            assert!(conflict.get("protocol_error").is_none());
+            let (text, final_state) = exchange("GET", "/api/state", &declaration, "").await;
+            assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+            for field in ["active_sessions", "guidance", "tasks"] {
+                assert_eq!(final_state[field], after[field], "{field}");
+            }
+            assert_eq!(receipt_count(&operation_id), 1);
+            assert_eq!(receipt_count(&stale_id), 0);
+            assert_eq!(inventory(&checked_app), preserved);
+        })
+        .await;
         server.abort();
-        let _ = std::fs::remove_dir_all(root);
+        let _ = server.await;
+        drop((headers, _shutdown, app));
+        std::fs::remove_dir_all(root).unwrap();
+        checks.unwrap();
     }
 
     #[tokio::test]
