@@ -25,6 +25,17 @@ passed; fresh final verification approved the checkpoint. The local packaged sta
 build remains the prior `76d0b29` checkpoint and has not been rebuilt for this
 source-only refactor.
 
+## Failure-notice refactoring
+
+Failure-stop and provider-hold presentation and saved-request reconciliation
+moved into `SessionFailureNotices.tsx`. Native prompt dismissal, public labels,
+recovery-row construction and component keys remain in `SessionTree.tsx`, now
+912 lines. Both moved blocks and the remaining parent body match their prior
+source apart from exports/imports. Independent code review, five focused recovery
+tests, frontend typecheck/build and all 113 frontend tests passed; fresh final
+verification approved the checkpoint. This source-only checkpoint does not rebuild the local
+packaged stabilization build.
+
 ## Provider error recovery checkpoint
 
 Selected by the user on October 13, 2026 as essential. Start after the current
