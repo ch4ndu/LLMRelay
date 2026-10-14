@@ -11,7 +11,19 @@ verification matrix. Packaged login/navigation and core browser flows passed;
 remaining responsive checks stopped on a cmux JavaScript timeout. All application
 instances were drained and absence verified. Fresh final verification approved
 the checkpoint; the checklist records the exact evidence boundaries. The next
-step is a measured, behavior-preserving refactoring plan.
+step is the bounded saved-output history extraction below.
+
+## Saved-output history refactoring
+
+The existing history reader moved from `SessionTree.tsx` to `SessionHistory.tsx`,
+separating transcript paging, decoding, search and export from live-session and
+recovery controls. The moved body and remaining parent body match the prior
+source, apart from exports/imports. Parent request-map ownership, mounting keys
+and uncertain-request behavior are preserved. Independent code review, three
+focused history tests, frontend typecheck/build and all 113 frontend tests
+passed; fresh final verification approved the checkpoint. The local packaged stabilization
+build remains the prior `76d0b29` checkpoint and has not been rebuilt for this
+source-only refactor.
 
 ## Provider error recovery checkpoint
 
