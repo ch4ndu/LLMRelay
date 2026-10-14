@@ -1,62 +1,50 @@
 # Recovery stabilization acceptance checklist
 
-Status: implementation, independent code review, package matrix, cleanup and
-fresh final verification passed. This checklist does not declare
-publication or native-provider qualification.
+## Current local package — October 14
+
+Source through `17e6be4` is packaged. Implementation and refactor review gates
+passed; final evidence/documentation verification approved the checkpoint. This checklist
+does not declare publication, personal acceptance or native-provider qualification.
 
 | Outcome | Evidence and status |
 | --- | --- |
-| Unclassified live help reaches output and exact task controls; current unfinished exits show factual guidance | 113 frontend tests passed; source trace and independent code review passed. |
-| Lost release reply remains explicitly checkable after its hold disappears, including reload | DOM regression passed; real HTTP receipt replay check passed. |
-| Correlated release refusal settles the saved request; uncertain failures retain it | DOM regression passed; HTTP stale-version and changed-payload checks passed. |
-| Stop pauses safely, verifies process settlement and fences continuation | Existing real-process supervisor/runtime checks passed. |
-| Release sends no work; eligible resume/replacement respects current checkpoints | Focused HTTP and resume/replacement contract checks passed. |
-| Matching local CLI/dashboard archive and actual browser login/navigation | Package matrix and archive inspection passed. Packaged login and 21 browser checks passed; remaining checks hit a cmux JavaScript timeout (see below). |
-| All temporary instances and owned test processes stopped | Initial old instance and disposable package instance drained. Final process inventory found no LLMRelay or AgenticJira application processes. |
-
-The package matrix passed 113 frontend, 203 library, 262 contract and 3 runtime
-tests (581 total; 2 library tests ignored), plus formatting and frontend build.
-The archive contains matching CLI/dashboard assets and passed ZIP integrity
-inspection. Browser checks covered all navigation destinations, editing/reload,
-archive/restore, Markdown safety, dialog keyboard behavior and desktop layout.
-The runner stopped on a cmux JavaScript timeout after the 1440px layout check;
-remaining responsive widths, enlarged text and narrow role controls were not
-verified by this package run. This is partial browser evidence, not a complete
-smoke-suite pass.
+| Failure escape, explicit release, safe continuation and uncertain-request retention | Existing assembled DOM, authenticated HTTP and process/contract checks passed; original independent reviews approved. |
+| Draft cleanup preserves newer stored edits | Five causal regressions plus controls passed; included in the current 118-test frontend suite. |
+| Refactoring preserves behavior | Saved history, failure notices, session access, task dialogs, task content/reports and coordinator containment passed independent review and final verification. Direct moves preserve action wiring, error identity and transaction boundaries. |
+| Matching local CLI/dashboard archive | 586 tests passed: 118 frontend, 203 library, 262 contract and 3 runtime; 2 live-provider tests ignored. Format, compile, frontend/release builds and archive integrity passed. Both ZIP binaries match staging and release outputs. |
+| Actual packaged browser flows | Login succeeded and all 32 checks passed: navigation, draft create/edit/reload, filtering, Markdown safety, setup route, keyboard focus/Escape, tabs, archive/restore and browser-error inspection. |
+| Responsive layout and controls | No page overflow or covered board controls at 1440px, 900px, 390px and 1440px with 200% root text. Approvals reachable; role-edit fields usable at 407px/193px; narrow task dialog opens full screen and closes with X. |
+| Cleanup | Disposable service drained with no active or unknown workers; final process inventory found no LLMRelay or AgenticJira application process. |
 
 ## Evidence boundaries
 
-DOM tests drive assembled React actions with mocked transport. The server test
-uses real authenticated HTTP routes with synthetic exited-session rows; those
-rows do not prove process quiescence. The supervisor and runtime tests separately
-exercise actual owned child processes and PTY/IPC behavior. The HTTP fixture has
-no populated reports/checkpoints or queued guidance, so its unchanged counts
-prove absence of new effects, not preservation of populated examples.
+DOM tests use mocked transport. HTTP recovery tests use authenticated routes
+with synthetic exited-session rows, which do not establish process quiescence.
+Supervisor/runtime tests separately exercise owned processes and PTY/IPC.
+The recovery HTTP fixture has no populated reports/checkpoints or queued guidance;
+unchanged counts prove no new effects, not preservation of populated examples.
 
-Packaged browser smoke verifies the actual embedded application, authentication
-and navigation. A single browser-driven live-provider stop/release/resume journey
-has not been demonstrated by these fixtures. Live allowance exhaustion and
-missing-hook classification remain unqualified. No reset time, automatic retry,
-provider readiness or native compatibility is inferred from these tests.
+Report-specific Refresh and Open Activity callbacks retain their source wiring
+and existing DOM coverage. The packaged browser task is unstarted: populated
+reports, permission requests, live output/control, recovery controls, real task
+acceptance, guidance and provider-switch journeys were not exercised there.
+These are covered only to the extent documented by deterministic tests.
+A single browser-driven live-provider stop/release/resume journey, live allowance
+exhaustion and missing-hook classification remain unqualified. No provider reset,
+automatic retry, safe idle or native compatibility is inferred from local tests.
 
-## Optional hands-on acceptance after the checkpoint
+The browser run used native dark appearance and root text scaling. Light
+appearance and actual browser page zoom were not tested. The older partial
+21-check run hit a cmux timeout; the current 32-check run completed successfully.
 
-In a task you choose, confirm **Having trouble?** opens useful output and task
-controls; use **Pause now** when immediate interruption is intended. For an
-attributed provider hold, wait for confirmed stop, release it separately, then
-use only the continuation or replacement offered by the current task state.
-Refresh between actions and verify no duplicate request is sent. Do not exhaust
-an account merely to create this scenario. This optional native journey is
-separate from the automated engineering evidence above.
+## Optional hands-on native acceptance
 
-## Refactoring package refresh
+Use a task you choose to inspect Having trouble?, Pause now, explicit hold release
+and the continuation offered by its current state. Confirm stop before release,
+refresh between actions and check that nothing is sent twice. Do not exhaust an
+account solely to manufacture an error. This remains separate from the completed
+local engineering checks; no provider process was launched for the browser run.
 
-The October 14 task-dialog extraction follows the saved-history, failure-notice
-and session-access extractions. Its local package refresh passed 113 frontend,
-203 library, 262 contract and 3 runtime tests (581 total, 2 library tests ignored),
-plus frontend/release builds and ZIP integrity checks. Fresh final verification
-approved the checkpoint.
-All four slices preserve the moved code and parent behavior. The new archive
-has its own full test/build and integrity evidence; the 21 browser
-checks above belong to the earlier `76d0b29` package. No new browser, live-provider
-or native recovery qualification is claimed by this refresh.
+The archive documentation was refreshed after final review. Only bundled docs
+changed; the verified binaries were not rebuilt. ZIP integrity and binary
+equality were checked again after this documentation refresh.

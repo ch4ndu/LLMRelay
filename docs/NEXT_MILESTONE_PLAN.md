@@ -1,5 +1,34 @@
 # LLMRelay roadmap and next task
 
+## Current status — October 14 completion checkpoint
+
+The finite stabilization/refactoring queue has delivered the draft cleanup fix,
+revision-bound task content/report extraction and coordinator failure-containment
+extraction. Source through `17e6be4` is included in the refreshed local package.
+The package matrix passed 586 tests (118 frontend, 203 library, 262 contract,
+3 runtime), with two live-provider qualification tests intentionally ignored.
+Formatting, compilation, release build and archive integrity passed. All 32
+packaged browser smoke checks passed, including 900px/390px layouts, 200% root
+text size, 407px/193px role settings and the narrow task dialog. The disposable
+service was drained and the process inventory found no application instances.
+Final evidence/documentation verification approved the checkpoint; no publication is planned.
+
+| Disposition | Scope |
+| --- | --- |
+| Completed local engineering | Provider recovery and Claude hook projection within documented signal coverage; draft preservation; saved history, failure notices, session access, task dialogs, task content/reports and coordinator containment refactors. |
+| Completed package/browser checks | Matching local archive and 32 smoke checks; details and evidence limits in [Stabilization checklist](STABILIZATION_CHECKLIST.md). |
+| Provider-dependent qualification | Live allowance delivery, missing-hook detection and one complete native stop/release/resume journey remain unqualified. Existing deterministic tests do not establish these provider facts. |
+| Optional/future product scope | Menu-bar/LaunchAgent integration, signing/notarization, publication/updater and additional product features are outside this finite queue. No further speculative refactor is selected. |
+| Historical record | The sections below preserve earlier plans and checkpoint evidence. Their “next” wording and package counts describe those dates, not the current queue. |
+
+Report-specific Refresh and Open Activity wiring was verified by source trace
+and the existing DOM suite. The packaged smoke uses an unstarted task and does
+not exercise a populated live report or native recovery controls. Browser
+coverage is the current dark appearance and root text scaling, not light
+appearance or browser page zoom. These limits remain explicit.
+
+## Historical checkpoints and planning record
+
 ## Verified stabilization checkpoint — recovery escape paths and local build
 
 Selected October 14: harden unclassified-failure navigation and vanished-hold
