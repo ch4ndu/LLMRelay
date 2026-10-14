@@ -36,6 +36,16 @@ tests, frontend typecheck/build and all 113 frontend tests passed; fresh final
 verification approved the checkpoint. This source-only checkpoint does not rebuild the local
 packaged stabilization build.
 
+## Session-access refactoring
+
+The unchanged `useSessionAccess` hook and its interfaces now live in
+`frontend/src/useSessionAccess.ts`. `SessionTree.tsx` keeps direct compatibility
+exports for existing consumers and is now 670 lines. Durable-surface precedence,
+keyboard control, discard-request identity and local close behavior are unchanged.
+Independent code review, three focused tests, frontend typecheck/build and all
+113 frontend tests passed; fresh final verification approved the checkpoint. The local
+packaged stabilization build remains unchanged.
+
 ## Provider error recovery checkpoint
 
 Selected by the user on October 13, 2026 as essential. Start after the current
