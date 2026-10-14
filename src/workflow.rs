@@ -1558,6 +1558,22 @@ pub fn execute_with_runtime(
     if operation_id.trim().is_empty() {
         bail!("operation_id is required")
     }
+    if let Some(recorded) = store.operation_receipt(
+        operation_id,
+        "human_control",
+        "human_command",
+        &request_hash,
+    )? {
+        return Ok(serde_json::from_value(recorded)?);
+    }
+    let checked_checkout = match command {
+        HumanCommand::HumanReview {
+            attempt_id,
+            decision,
+            ..
+        } if decision == "accept" => crate::workspace::check_reviewed_checkout(store, attempt_id)?,
+        _ => None,
+    };
     if let HumanCommand::ResolveRecovery {
         recovery_id,
         task_id,
@@ -1987,6 +2003,7 @@ pub fn execute_with_runtime(
         HumanCommand::MakeReady {
             task_id,
             expected_version,
+            checkout_authorization,
             ..
         } => {
             require_task_state(&transaction, task_id, *expected_version, &["backlog"])?;
@@ -2003,6 +2020,24 @@ pub fn execute_with_runtime(
                 params![task_id],
                 |row| row.get(0),
             )?;
+            let checkout_scope = match task_workspace_mode(&transaction, task_id)? {
+                crate::domain::WorkspaceMode::IsolatedWorktree => {
+                    if checkout_authorization.is_some() {
+                        bail!("The task now uses Isolated worktree. Refresh its workspace choice before Make Ready.")
+                    }
+                    None
+                }
+                crate::domain::WorkspaceMode::MainCheckout => {
+                    let current = task_checkout_scope(&transaction, task_id)?;
+                    match checkout_authorization {
+                        Some(authorization) if authorization.scope_hash == current.scope_hash => {}
+                        Some(_) => bail!("The checkout or writer configuration changed. Refresh this task and authorize the displayed checkout again with Make Ready."),
+                        None if recorded_checkout_authorization(&transaction, task_id)?.as_ref() == Some(&current) => {}
+                        None => bail!("Authorize write access to the displayed Main checkout before Make Ready."),
+                    }
+                    Some(current)
+                }
+            };
             if task_family(&transaction, task_id)? == crate::domain::WorkflowFamily::SingleAgent {
                 crate::recipes::require_binding_current(&transaction, task_id)?;
                 let (title, criteria): (String, String) = transaction.query_row(
@@ -2059,13 +2094,17 @@ pub fn execute_with_runtime(
             if changed != 1 {
                 bail!("task version or lifecycle changed while becoming Ready")
             }
-            result(
+            let mut ready = result(
                 operation_id,
                 "task",
                 task_id.clone(),
                 Some(expected_version + 1),
                 "ready",
-            )
+            );
+            if let Some(scope) = checkout_scope {
+                ready.detail = serde_json::json!({"checkout_authorization": scope});
+            }
+            ready
         }
         HumanCommand::SetQueuePaused {
             project_id,
@@ -3072,6 +3111,9 @@ pub fn execute_with_runtime(
             crate::trip::require_attempt_ready(&transaction, attempt_id, None)?;
             match decision.as_str() {
                 "accept" => {
+                    if let Some(checked) = &checked_checkout {
+                        checked.recheck(&transaction, attempt_id)?;
+                    }
                     let (snapshot,candidate_hash,attempt_status): (Option<String>,Option<String>,String) = transaction.query_row(
                         "SELECT accepted_snapshot_id,candidate_hash,status FROM attempts WHERE id=?1 AND task_id=?2",
                         params![attempt_id, task_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
@@ -4426,6 +4468,7 @@ mod m7_setup_projection_tests {
         let tasks = [TaskDto {
             id: "task".into(),
             project_id: "project".into(),
+            workspace_mode: Default::default(),
             title: "Task-specific profile".into(),
             description: String::new(),
             acceptance_criteria: vec![],
@@ -4649,6 +4692,7 @@ mod m7_setup_projection_tests {
         let task = TaskDto {
             id: "task".into(),
             project_id: "project".into(),
+            workspace_mode: Default::default(),
             title: String::new(),
             description: String::new(),
             acceptance_criteria: vec![],
@@ -4859,7 +4903,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
     let mut migration_actions = Vec::new();
     for id in task_ids {
         let mut task = connection.query_row(&format!("SELECT id,project_id,title,description,acceptance_criteria_json,priority,manual_order,lifecycle,attention,version,archived_at,role_overrides_json,legacy_json,EXISTS(SELECT 1 FROM permission_requests pr WHERE pr.task_id=tasks.id AND {}),(archived_at IS NULL AND (lifecycle='done' OR (lifecycle='backlog' AND ready_at IS NULL AND NOT EXISTS(SELECT 1 FROM attempts WHERE task_id=tasks.id)))) FROM tasks WHERE id=?1", crate::permissions::ACTIONABLE_REQUEST_SQL),
-            params![id], |row| Ok(TaskDto { id:row.get(0)?,project_id:row.get(1)?,title:row.get(2)?,description:row.get(3)?,acceptance_criteria:serde_json::from_str(&row.get::<_,String>(4)?).unwrap_or_default(),priority:row.get(5)?,manual_order:row.get(6)?,lifecycle:row.get(7)?,attention:row.get(8)?,version:row.get(9)?,archived:row.get::<_,Option<String>>(10)?.is_some(),can_archive:row.get(14)?,draft_deletion:None,recipe_provenance:None,role_overrides:parse(row.get(11)?),legacy:parse(row.get(12)?),permission_waiting:row.get(13)?,dependencies:vec![],active_attempt:None,role_settings:vec![],reviews:vec![],snapshots:vec![],review_budgets:vec![],progress:None,observed_usage:None,workflow:None }))?;
+            params![id], |row| Ok(TaskDto { id:row.get(0)?,project_id:row.get(1)?,workspace_mode:Default::default(),title:row.get(2)?,description:row.get(3)?,acceptance_criteria:serde_json::from_str(&row.get::<_,String>(4)?).unwrap_or_default(),priority:row.get(5)?,manual_order:row.get(6)?,lifecycle:row.get(7)?,attention:row.get(8)?,version:row.get(9)?,archived:row.get::<_,Option<String>>(10)?.is_some(),can_archive:row.get(14)?,draft_deletion:None,recipe_provenance:None,role_overrides:parse(row.get(11)?),legacy:parse(row.get(12)?),permission_waiting:row.get(13)?,dependencies:vec![],active_attempt:None,role_settings:vec![],reviews:vec![],snapshots:vec![],review_budgets:vec![],progress:None,observed_usage:None,workflow:None }))?;
         if task.lifecycle == "backlog" {
             let reason = draft_deletion_blocker(&connection, &id)?;
             task.draft_deletion = Some(crate::domain::DraftDeletion {
@@ -5224,7 +5268,13 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
                 serde_json::to_value(provider_failure_holds(&connection, &session_id)?)?;
         }
     }
-    let controls = json_rows_no_param(&connection, "SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,'kind',kind,'state',state,'payload',json(payload_json),'updated_at',updated_at) FROM controls WHERE state NOT IN ('finished','cancelled') ORDER BY created_at")?;
+    let controls = json_rows_no_param(&connection, "SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,'kind',kind,'state',state,'payload',json(payload_json),'updated_at',updated_at)
+        FROM controls WHERE state NOT IN ('finished','cancelled') OR (kind='main_checkout_verify' AND state='cancelled'
+          AND NOT EXISTS(SELECT 1 FROM controls newer WHERE newer.kind='main_checkout_verify'
+            AND newer.attempt_id IS controls.attempt_id
+            AND json_extract(newer.payload_json,'$.task_id') IS json_extract(controls.payload_json,'$.task_id')
+            AND (newer.created_at>controls.created_at OR (newer.created_at=controls.created_at AND newer.rowid>controls.rowid))))
+        ORDER BY created_at,rowid")?;
     let mut guidance=json_rows_no_param(&connection,"SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,'body',body,'state',state,'reason',reason,'created_at',created_at,'acknowledged_at',acknowledged_at) FROM guidance_messages ORDER BY created_at DESC LIMIT 200")?;
     for message in &mut guidance {
         if let Some(id) = message.get("id").and_then(serde_json::Value::as_str) {
@@ -5594,6 +5644,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
     }
     let observations = crate::store::open_attention_observations(&connection)?;
     for task in &mut tasks {
+        task.workspace_mode = task_workspace_mode(&connection, &task.id)?;
         task.workflow = task_workflow_projection(&connection, &task.id)?;
     }
     let workflow_execution = workflow_execution_projection(
@@ -5625,7 +5676,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
     }
     let resources = serde_json::json!({
         "active_sessions":active_sessions.iter().filter(|value|!matches!(value.get("status").and_then(|state|state.as_str()),Some("exited"|"launch_failed"))).count(),
-        "active_controls":controls.len(),
+        "active_controls":controls.iter().filter(|value|value.get("state").and_then(|state|state.as_str())!=Some("cancelled")).count(),
         "queued_guidance":guidance.iter().filter(|value|value.get("state").and_then(|state|state.as_str())==Some("queued")).count(),
         "running_checks":checks.iter().filter(|value|matches!(value.get("status").and_then(|state|state.as_str()),Some("launch_reserved"|"running"|"recovery_required"))).count(),
         "capacity":capacity,
@@ -10664,6 +10715,272 @@ const MAX_PROFILE_INSTRUCTIONS_BYTES: usize = 32 * 1024;
 const MAX_REWORK_FEEDBACK_BYTES: usize = 16 * 1024;
 const WORKFLOW_COMMAND_RECEIPT: &str = "workflow_command";
 
+pub(crate) fn task_workspace_mode(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<crate::domain::WorkspaceMode> {
+    connection
+        .query_row(
+            "SELECT workspace_mode FROM task_workflow_selections WHERE task_id=?1",
+            params![task_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map_or(Ok(crate::domain::WorkspaceMode::IsolatedWorktree), |mode| {
+            mode.parse().map_err(|error: String| anyhow!(error))
+        })
+}
+
+pub(crate) fn task_checkout_scope(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<crate::domain::TaskCheckoutScope> {
+    use crate::domain::{TaskCheckoutScope, WorkspaceMode};
+    let workspace_mode = task_workspace_mode(connection, task_id)?;
+    if workspace_mode != WorkspaceMode::MainCheckout {
+        bail!("Checkout authorization applies only to a Main checkout task")
+    }
+    let (
+        project_id,
+        path,
+        repository_identity,
+        selection_revision,
+        selected_hash,
+        config_id,
+        profile_id,
+    ): (
+        String,
+        String,
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = connection.query_row(
+        "SELECT p.id,p.repository_path,p.repository_identity,s.selection_revision,s.selection_hash,
+                s.execution_config_revision_id,s.profile_revision_id
+         FROM tasks t JOIN projects p ON p.id=t.project_id
+         JOIN task_workflow_selections s ON s.task_id=t.id WHERE t.id=?1",
+        params![task_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        },
+    )?;
+    if !std::path::Path::new(&path).is_absolute() {
+        bail!("The selected checkout must have an absolute registered path. Relink it in Project settings.")
+    }
+    let root = std::path::Path::new(&path)
+        .canonicalize()
+        .context("The selected checkout cannot be resolved. Relink it in Project settings.")?;
+    if !root.is_dir() {
+        bail!("The selected checkout is not a directory. Relink it in Project settings.")
+    }
+    if root.parent().is_none() {
+        bail!("A Main checkout must be a repository directory below the filesystem root. Relink the project to its checkout.")
+    }
+    let checkout_root = root.to_str()
+        .context("The selected checkout path cannot be represented exactly. Relink a checkout with a UTF-8 path.")?
+        .to_owned();
+    let (writer_policy_hash, configuration_hash) = match task_family(connection, task_id)? {
+        crate::domain::WorkflowFamily::SingleAgent => {
+            let config_id = config_id
+                .context("Choose an execution configuration before authorizing the checkout")?;
+            let profile_id =
+                profile_id.context("Choose a writer profile before authorizing the checkout")?;
+            let profile = writer_profile_revision(connection, &project_id, &profile_id)?;
+            let current = crate::provider_compatibility::ExecutionPolicy::single_agent_writer(
+                profile.provider,
+            );
+            if profile.policy_hash != current.content_hash()
+                || profile.adapter_hash != current.adapter_hash()
+            {
+                bail!("The writer policy changed. Save and admit the profile again before authorizing the checkout.")
+            }
+            (
+                profile.policy_hash,
+                execution_configuration_hash(connection, &project_id, &config_id)?,
+            )
+        }
+        crate::domain::WorkflowFamily::Trip => {
+            let revision: i64 = connection.query_row(
+                "SELECT MAX(revision) FROM role_settings WHERE task_id=?1 AND role='implementer'",
+                params![task_id], |row| row.get(0),
+            ).context("Choose TRIP Implementer settings before authorizing the checkout")?;
+            let (descriptor, profile) =
+                crate::trip::task_profile_descriptor(connection, task_id, "implementer", revision)?;
+            let version = match profile.provider {
+                crate::domain::Provider::Codex => crate::providers::codex::EXACT_CODEX_VERSION,
+                crate::domain::Provider::Claude => crate::providers::claude::EXACT_CLAUDE_VERSION,
+            };
+            let binding = crate::provider_compatibility::BundleSet::embedded().resolve(
+                profile.provider,
+                version,
+                crate::domain::RoleKind::Implementer,
+            )?;
+            (
+                json_hash(&serde_json::json!({
+                    "profile_hash": descriptor.profile_hash,
+                    "adapter_hash": descriptor.adapter_hash,
+                    "native_contract_hash": binding.effective_hash,
+                }))?,
+                descriptor.project_configuration_hash,
+            )
+        }
+    };
+    // Native worktree proof and permission to write this exact checkout are separate.
+    let scope_hash = json_hash(&serde_json::json!({
+        "kind": "task_checkout_authorization_v1",
+        "task_id": task_id,
+        "project_id": project_id,
+        "checkout_root": checkout_root,
+        "repository_identity": repository_identity,
+        "workspace_mode": workspace_mode,
+        "selection_revision": selection_revision,
+        "selection_hash": selected_hash,
+        "writer_policy_hash": writer_policy_hash,
+        "configuration_hash": configuration_hash,
+    }))?;
+    Ok(TaskCheckoutScope {
+        task_id: task_id.into(),
+        project_id,
+        checkout_root,
+        repository_identity,
+        workspace_mode,
+        selection_revision,
+        selection_hash: selected_hash,
+        writer_policy_hash,
+        configuration_hash,
+        scope_hash,
+    })
+}
+
+pub(crate) fn require_workspace_execution_supported(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<()> {
+    if task_workspace_mode(connection, task_id)? == crate::domain::WorkspaceMode::MainCheckout {
+        let scope = task_checkout_scope(connection, task_id)?;
+        if recorded_checkout_authorization(connection, task_id)?.as_ref() != Some(&scope) {
+            bail!("The Main checkout scope changed. Stop or cancel the current run, then authorize the displayed checkout with Make Ready.")
+        }
+        let verified: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capabilities WHERE mode='main_checkout' AND status='supported'
+             AND json_extract(proof_json,'$.authorization.scope_hash')=?1)
+             OR EXISTS(SELECT 1 FROM controls WHERE kind='main_checkout_verify' AND state IN ('native_requested','native_running')
+               AND json_extract(payload_json,'$.authorization.scope_hash')=?1)",
+            params![scope.scope_hash], |row| row.get(0),
+        )?;
+        if !verified && pending_checkout_verification(connection, task_id)?.is_none() {
+            bail!("Verify this Main checkout's native permissions before starting it. Existing worktree proof cannot authorize Main checkout execution.")
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn pending_checkout_verification(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Option<(String, serde_json::Value)>> {
+    let row: Option<(String,String)> = connection.query_row(
+        "SELECT operation_id,json_extract(result_json,'$.detail') FROM operation_receipts receipt
+         WHERE actor_key='human_control' AND operation_kind='workflow_command'
+           AND json_extract(result_json,'$.entity_id')=?1
+           AND json_extract(result_json,'$.state')='main_verification_requested'
+           AND json_extract(result_json,'$.detail.deadline_at')>?2
+           AND NOT EXISTS(SELECT 1 FROM controls WHERE id=receipt.operation_id)
+         ORDER BY created_at DESC,rowid DESC LIMIT 1",
+        params![task_id,Utc::now().to_rfc3339()], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).optional()?;
+    row.map(|(id, json)| Ok((id, serde_json::from_str(&json)?)))
+        .transpose()
+}
+
+pub(crate) fn workspace_policy_for_task(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<serde_json::Value> {
+    let mode = task_workspace_mode(connection, task_id)?;
+    let mut policy = serde_json::json!({
+        "workspace_mode": mode,
+        "workspace_ownership": "owned_worktree",
+        "no_auto_commit": true, "no_auto_merge": true, "eligible_untracked": true,
+    });
+    if mode == crate::domain::WorkspaceMode::MainCheckout {
+        let scope = task_checkout_scope(connection, task_id)?;
+        if recorded_checkout_authorization(connection, task_id)?.as_ref() != Some(&scope) {
+            bail!("Authorize the displayed checkout with Make Ready before preparing this task.")
+        }
+        policy["workspace_ownership"] = "borrowed_checkout".into();
+        policy["checkout_authorization"] = serde_json::to_value(scope)?;
+        policy["writing_lane"] = "default".into();
+    }
+    Ok(policy)
+}
+
+pub(crate) fn validate_workspace_checkout(
+    connection: &Connection,
+    task_id: &str,
+    policy: &serde_json::Value,
+) -> Result<()> {
+    if crate::workspace::policy_mode(policy)? == crate::domain::WorkspaceMode::MainCheckout {
+        let frozen: crate::domain::TaskCheckoutScope =
+            serde_json::from_value(policy["checkout_authorization"].clone())
+                .context("The workspace is missing its checkout authorization")?;
+        let current = task_checkout_scope(connection, task_id)?;
+        if policy["workspace_ownership"].as_str() != Some("borrowed_checkout")
+            || policy["writing_lane"].as_str() != Some("default")
+            || frozen != current
+            || recorded_checkout_authorization(connection, task_id)?.as_ref() != Some(&current)
+        {
+            bail!("The checkout or writer configuration changed. Refresh the task and authorize the displayed checkout with Make Ready.")
+        }
+    } else if task_workspace_mode(connection, task_id)?
+        != crate::domain::WorkspaceMode::IsolatedWorktree
+    {
+        bail!("The task workspace choice changed after reservation. Authorize it again with Make Ready.")
+    }
+    Ok(())
+}
+
+fn recorded_checkout_authorization(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Option<crate::domain::TaskCheckoutScope>> {
+    let scope: Option<String> = connection.query_row(
+        "SELECT json_extract(result_json,'$.detail.checkout_authorization')
+         FROM operation_receipts WHERE actor_key='human_control' AND operation_kind='human_command'
+           AND json_extract(result_json,'$.entity_kind')='task'
+           AND json_extract(result_json,'$.entity_id')=?1 AND json_extract(result_json,'$.state')='ready'
+           AND json_type(result_json,'$.detail.checkout_authorization')='object'
+         ORDER BY created_at DESC,rowid DESC LIMIT 1",
+        params![task_id], |row| row.get(0),
+    ).optional()?;
+    // Unrecognized receipts cannot grant checkout authority.
+    Ok(scope.and_then(|scope| serde_json::from_str(&scope).ok()))
+}
+
+pub(crate) fn checkout_authorization_problem(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Option<String>> {
+    if task_workspace_mode(connection, task_id)? == crate::domain::WorkspaceMode::IsolatedWorktree {
+        return Ok(None);
+    }
+    let current = task_checkout_scope(connection, task_id)?;
+    if recorded_checkout_authorization(connection, task_id)?.as_ref() != Some(&current) {
+        return Ok(Some("The checkout, workspace choice or writer configuration needs authorization. Refresh this task and authorize the displayed checkout with Make Ready.".into()));
+    }
+    Ok(None)
+}
+
 /// The family the task's next attempt uses. Ready, claim and recovery all
 /// resolve it here, so no caller infers it from a display label.
 pub(crate) fn task_family(
@@ -11172,8 +11489,9 @@ fn selection_hash(
     config: (&str, &str),
     profile: (&str, &str),
     check_ids: &[String],
+    workspace_mode: crate::domain::WorkspaceMode,
 ) -> Result<String> {
-    json_hash(&serde_json::json!({
+    let mut selection = serde_json::json!({
         "family": crate::domain::WorkflowFamily::SingleAgent,
         "definition_id": definition.0,
         "definition_hash": definition.1,
@@ -11182,7 +11500,12 @@ fn selection_hash(
         "profile_revision_id": profile.0,
         "profile_hash": profile.1,
         "check_ids": check_ids,
-    }))
+    });
+    // Omitting the default mode preserves historical selection and probe hashes.
+    if workspace_mode == crate::domain::WorkspaceMode::MainCheckout {
+        selection["workspace_mode"] = serde_json::to_value(workspace_mode)?;
+    }
+    json_hash(&selection)
 }
 
 /// Pins a Single agent task's selection for Ready. Admission is exact: the
@@ -11239,6 +11562,7 @@ fn admit_single_agent_ready(
         (&config_id, &config_hash),
         (&profile_id, &profile.profile_hash),
         &check_ids,
+        task_workspace_mode(transaction, task_id)?,
     )? != stored_hash
     {
         bail!("The selected configuration or profile changed after it was chosen; choose the workflow again")
@@ -11364,6 +11688,7 @@ fn single_agent_selection_problem(
         (&config_id, &config_hash),
         (&profile_id, &profile.profile_hash),
         &check_ids,
+        task_workspace_mode(connection, task_id)?,
     )?;
     if hash != stored_hash {
         return Ok(Some(
@@ -11401,6 +11726,11 @@ fn single_agent_selection_problem(
                 "The selected agent profile is not admitted for this execution configuration. Prepare and activate its admission in Project settings."
             }.into(),
         ));
+    }
+    if require_ready {
+        if let Some(problem) = checkout_authorization_problem(connection, task_id)? {
+            return Ok(Some(problem));
+        }
     }
     Ok(None)
 }
@@ -11477,6 +11807,15 @@ pub(crate) fn single_agent_resume_target(
     connection: &Connection,
     attempt_id: &str,
     mode: Option<SingleAgentResumeMode>,
+) -> Result<std::result::Result<SingleAgentResumeTarget, String>> {
+    single_agent_resume_target_for_verification(connection, attempt_id, mode, false)
+}
+
+pub(crate) fn single_agent_resume_target_for_verification(
+    connection: &Connection,
+    attempt_id: &str,
+    mode: Option<SingleAgentResumeMode>,
+    verification: bool,
 ) -> Result<std::result::Result<SingleAgentResumeTarget, String>> {
     type ResumeRow = (
         (String, String, String, String, bool),
@@ -11586,6 +11925,15 @@ pub(crate) fn single_agent_resume_target(
         );
     }
     for (blocker, sql) in SINGLE_AGENT_RESUME_FENCES {
+        if verification && *blocker == "a control is pending" {
+            let other: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
+                AND kind NOT IN ('transition_proposal','main_checkout_verify')
+                AND state NOT IN ('finished','cancelled','superseded','rejected','failed','abandoned'))",params![attempt_id], |row|row.get(0))?;
+            if other {
+                return refuse("Another control owns this verification's retained turn");
+            }
+            continue;
+        }
         if connection.query_row(sql, params![attempt_id], |row| row.get::<_, bool>(0))? {
             return refuse(&format!("The writer cannot resume while {blocker}"));
         }
@@ -11761,6 +12109,7 @@ fn start_single_agent_probe(
         (&config_id, &config_hash),
         (&profile_revision_id, &profile.profile_hash),
         &[],
+        crate::domain::WorkspaceMode::IsolatedWorktree,
     )?;
     transaction.execute(
         "INSERT INTO task_workflow_selections(task_id,family,definition_id,execution_config_revision_id,
@@ -12129,6 +12478,38 @@ pub(crate) fn task_workflow_projection(
     else {
         return Ok(None);
     };
+    let workspace_mode = task_workspace_mode(connection, task_id)?;
+    let selected_profile_revision = if family == "single_agent" {
+        let selected: Option<String> = connection.query_row(
+            "SELECT json_object('id',r.id,'provider',r.provider,'model',r.model,'effort',r.effort)
+             FROM tasks t JOIN agent_profiles p ON p.project_id=t.project_id
+             JOIN agent_profile_revisions r ON r.profile_id=p.id
+             WHERE t.id=?1 AND r.id=?2",
+            params![task_id, profile_id],
+            |row| row.get(0),
+        ).optional()?;
+        selected
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?
+    } else {
+        None
+    };
+    let (checkout_scope, checkout_authorized, checkout_authorization_reason) =
+        if workspace_mode == crate::domain::WorkspaceMode::MainCheckout {
+            match task_checkout_scope(connection, task_id) {
+                Ok(scope) => {
+                    let authorized = recorded_checkout_authorization(connection, task_id)?.as_ref()
+                        == Some(&scope);
+                    let reason = (!authorized).then(|| {
+                        "Authorize write access to the displayed checkout with Make Ready.".into()
+                    });
+                    (Some(scope), authorized, reason)
+                }
+                Err(error) => (None, false, Some(format!("{error:#}"))),
+            }
+        } else {
+            (None, false, None)
+        };
     let run_row: Option<(String, Option<String>, String, Option<String>, Option<String>, String, String, Option<String>)> = connection
         .query_row(
             "SELECT a.id,b.definition_id,b.definition_state,b.execution_config_revision_id,a.parent_attempt_id,
@@ -12368,9 +12749,14 @@ pub(crate) fn task_workflow_projection(
     };
     Ok(Some(TaskWorkflowDto {
         family: family.parse().map_err(|error: String| anyhow!(error))?,
+        workspace_mode,
+        checkout_scope,
+        checkout_authorized,
+        checkout_authorization_reason,
         definition_id,
         execution_config_revision_id: config_id,
         profile_revision_id: profile_id,
+        selected_profile_revision,
         check_ids: serde_json::from_str(&checks_json)?,
         selection_revision: revision,
         admission_state,
@@ -12822,6 +13208,12 @@ pub fn execute_workflow_command(
         )?),
         _ => None,
     };
+    let checked_checkout = match command {
+        WorkflowCommand::AcceptResult { attempt_id, .. } => {
+            crate::workspace::check_reviewed_checkout(store, attempt_id)?
+        }
+        _ => None,
+    };
     let mut connection = store.lock()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some((stored_hash, result)) = transaction
@@ -12840,6 +13232,84 @@ pub fn execute_workflow_command(
     }
     let now = Utc::now().to_rfc3339();
     let result = match command {
+        WorkflowCommand::VerifyMainCheckout {
+            task_id,
+            expected_version,
+            role,
+            ..
+        } => {
+            require_task_state(
+                &transaction,
+                task_id,
+                *expected_version,
+                &["ready", "in_progress"],
+            )?;
+            let authorization = task_checkout_scope(&transaction, task_id)?;
+            if authorization.workspace_mode != crate::domain::WorkspaceMode::MainCheckout {
+                bail!("Project verification requires an explicit Main checkout selection")
+            }
+            if recorded_checkout_authorization(&transaction, task_id)?.as_ref()
+                != Some(&authorization)
+            {
+                bail!("Authorize this Main checkout with Make Ready before verifying its native permissions")
+            }
+            let actor = match task_family(&transaction, task_id)? {
+                crate::domain::WorkflowFamily::SingleAgent if role.is_none() => {
+                    "single_agent".to_owned()
+                }
+                crate::domain::WorkflowFamily::SingleAgent => {
+                    bail!("Single agent verification has no TRIP role")
+                }
+                crate::domain::WorkflowFamily::Trip => role
+                    .unwrap_or(crate::domain::RoleKind::Implementer)
+                    .to_string(),
+            };
+            let actor_settings: String = if actor == "single_agent" {
+                transaction.query_row("SELECT json_object('provider',r.provider,'model',r.model,'effort',r.effort,'profile_revision_id',r.id)
+                    FROM task_workflow_selections s JOIN agent_profile_revisions r ON r.id=s.profile_revision_id WHERE s.task_id=?1",params![task_id], |row|row.get(0))?
+            } else {
+                transaction.query_row("SELECT json_set(config_json,'$.settings_revision',revision) FROM role_settings WHERE task_id=?1 AND role=?2 ORDER BY revision DESC LIMIT 1",params![task_id,actor], |row|row.get(0))?
+            };
+            let pending: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM controls WHERE kind='main_checkout_verify' AND state IN ('native_requested','native_running','native_stopping','awaiting_native_evidence')
+                 AND json_extract(payload_json,'$.task_id')=?1)", params![task_id], |row| row.get(0),
+            )?;
+            if pending || pending_checkout_verification(&transaction, task_id)?.is_some() {
+                bail!("This checkout already has a verification in progress; reconcile or cancel that exact verification before starting another")
+            }
+            let detail = serde_json::json!({"task_id":task_id,"actor":actor,"authorization":authorization,
+                "actor_settings":serde_json::from_str::<serde_json::Value>(&actor_settings)?,
+                "phase":"first","deadline_at":(Utc::now()+chrono::Duration::seconds(300)).to_rfc3339(),
+                "max_turns":if actor=="final_verifier" {1} else {2},"nonce":uuid::Uuid::new_v4().simple().to_string(),"probe_id":uuid::Uuid::new_v4().simple().to_string()});
+            let mut queued = result(
+                operation_id,
+                "task",
+                task_id.to_owned(),
+                Some(*expected_version),
+                "main_verification_requested",
+            );
+            queued.detail = detail;
+            let existing: Option<String>=transaction.query_row("SELECT a.id FROM attempts a JOIN workspaces w ON w.attempt_id=a.id
+                WHERE a.task_id=?1 AND a.status IN ('running','held','needs_input') AND w.state='ready'
+                ORDER BY a.created_at DESC LIMIT 1",params![task_id], |row|row.get(0)).optional()?;
+            if let Some(attempt) = existing {
+                if actor == "single_agent" {
+                    let retained: bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM role_generations WHERE attempt_id=?1 AND role='single_agent')",params![attempt], |row|row.get(0))?;
+                    if retained {
+                        bail!("This run already owns a retained writer. Finish its recorded Main evidence, or cancel and verify fresh authorized lineage when native inputs changed")
+                    }
+                }
+                let active: bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+                    WHERE g.attempt_id=?1 AND (s.status NOT IN ('exited','launch_failed') OR (s.status='exited' AND COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)!=1)))
+                    OR EXISTS(SELECT 1 FROM check_runs WHERE attempt_id=?1 AND status IN ('launch_reserved','running','recovery_required'))",params![attempt], |row|row.get(0))?;
+                if active {
+                    bail!("Stop the exact current owners before verifying another Main role")
+                }
+                transaction.execute("INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at,requested_operation_id)
+                    VALUES(?1,?2,'main_checkout_verify','native_requested',?3,?4,?5,?5,?1)",params![operation_id,attempt,expected_version,queued.detail.to_string(),now])?;
+            }
+            queued
+        }
         WorkflowCommand::SaveExecutionConfiguration {
             project_id,
             expected_revision,
@@ -13238,6 +13708,9 @@ pub fn execute_workflow_command(
             guidance_change_hash,
             ..
         } => {
+            if let Some(checked) = &checked_checkout {
+                checked.recheck(&transaction, attempt_id)?;
+            }
             let decision = SingleAgentDecision {
                 task_id,
                 attempt_id,
@@ -13439,17 +13912,20 @@ fn set_task_workflow(
             {
                 bail!("TRIP uses its own role settings; it takes no Single agent configuration, profile or checks")
             }
-            let hash =
-                json_hash(&serde_json::json!({"family": crate::domain::WorkflowFamily::Trip}))?;
+            let mut selected = serde_json::json!({"family": crate::domain::WorkflowFamily::Trip});
+            if selection.workspace_mode == crate::domain::WorkspaceMode::MainCheckout {
+                selected["workspace_mode"] = serde_json::to_value(selection.workspace_mode)?;
+            }
+            let hash = json_hash(&selected)?;
             transaction.execute(
                 "INSERT INTO task_workflow_selections(task_id,family,definition_id,execution_config_revision_id,
-                   profile_revision_id,check_ids_json,selection_revision,selection_hash,admission_state,created_at,updated_at)
-                 VALUES(?1,'trip',NULL,NULL,NULL,'[]',?2,?3,'draft',?4,?4)
+                   profile_revision_id,check_ids_json,selection_revision,selection_hash,admission_state,created_at,updated_at,workspace_mode)
+                 VALUES(?1,'trip',NULL,NULL,NULL,'[]',?2,?3,'draft',?4,?4,?5)
                  ON CONFLICT(task_id) DO UPDATE SET family='trip',definition_id=NULL,execution_config_revision_id=NULL,
                    profile_revision_id=NULL,check_ids_json='[]',selection_revision=excluded.selection_revision,
                    selection_hash=excluded.selection_hash,admission_state='draft',admitted_task_version=NULL,
-                   admission_reason=NULL,updated_at=excluded.updated_at",
-                params![task_id, revision, hash, now],
+                   admission_reason=NULL,updated_at=excluded.updated_at,workspace_mode=excluded.workspace_mode",
+                params![task_id, revision, hash, now, selection.workspace_mode.as_str()],
             )?;
         }
         crate::domain::WorkflowFamily::SingleAgent => {
@@ -13484,17 +13960,18 @@ fn set_task_workflow(
                 (config_id, &config_hash),
                 (profile_id, &profile.profile_hash),
                 &selection.check_ids,
+                selection.workspace_mode,
             )?;
             transaction.execute(
                 "INSERT INTO task_workflow_selections(task_id,family,definition_id,execution_config_revision_id,
-                   profile_revision_id,check_ids_json,selection_revision,selection_hash,admission_state,created_at,updated_at)
-                 VALUES(?1,'single_agent',?2,?3,?4,?5,?6,?7,'draft',?8,?8)
+                   profile_revision_id,check_ids_json,selection_revision,selection_hash,admission_state,created_at,updated_at,workspace_mode)
+                 VALUES(?1,'single_agent',?2,?3,?4,?5,?6,?7,'draft',?8,?8,?9)
                  ON CONFLICT(task_id) DO UPDATE SET family='single_agent',definition_id=excluded.definition_id,
                    execution_config_revision_id=excluded.execution_config_revision_id,
                    profile_revision_id=excluded.profile_revision_id,check_ids_json=excluded.check_ids_json,
                    selection_revision=excluded.selection_revision,selection_hash=excluded.selection_hash,
                    admission_state='draft',admitted_task_version=NULL,admission_reason=NULL,
-                   updated_at=excluded.updated_at",
+                   updated_at=excluded.updated_at,workspace_mode=excluded.workspace_mode",
                 params![
                     task_id,
                     definition.0,
@@ -13503,7 +13980,8 @@ fn set_task_workflow(
                     serde_json::to_string(&selection.check_ids)?,
                     revision,
                     hash,
-                    now
+                    now,
+                    selection.workspace_mode.as_str()
                 ],
             )?;
         }
@@ -13711,6 +14189,14 @@ pub(crate) fn single_agent_guidance_changes(
         else {
             bail!("the run's execution configuration has a malformed guidance identity")
         };
+        if manifest.baseline_snapshot_id.is_some()
+            && !manifest
+                .task_changed_paths
+                .iter()
+                .any(|changed| changed == path)
+        {
+            continue;
+        }
         let candidate_sha256 = manifest
             .entries
             .iter()

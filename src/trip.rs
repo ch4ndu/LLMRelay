@@ -10158,6 +10158,11 @@ pub fn configure_lanes(
     context: &RoleContext,
     input: &serde_json::Value,
 ) -> Result<serde_json::Value> {
+    if crate::workflow::task_workspace_mode(&*store.lock()?, &context.task_id)?
+        == crate::domain::WorkspaceMode::MainCheckout
+    {
+        bail!("Main checkout uses the default single writing lane; choose Isolated worktree for parallel implementation lanes")
+    }
     if context.role != RoleKind::Manager {
         bail!("only the current manager can admit implementation lanes")
     }
@@ -12996,6 +13001,21 @@ pub fn materialize_project_policy(
     attempt_id: &str,
     workspace: &Path,
 ) -> Result<serde_json::Value> {
+    let resolved_workspace = workspace
+        .canonicalize()
+        .context("Resolve the workspace before TRIP policy preparation")?;
+    let (frozen_policy_json, frozen_workspace_path): (String, String) = store.lock()?.query_row(
+        "SELECT policy_json,path FROM workspaces WHERE attempt_id=?1",
+        params![attempt_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let workspace = Path::new(&frozen_workspace_path);
+    if workspace.canonicalize()? != resolved_workspace {
+        bail!("The workspace reservation path changed before TRIP policy preparation; no files were changed.")
+    }
+    let frozen_policy: serde_json::Value = serde_json::from_str(&frozen_policy_json)?;
+    let borrowed = crate::workspace::policy_mode(&frozen_policy)?
+        == crate::domain::WorkspaceMode::MainCheckout;
     let (root, manifest_hash, guidance, rework_source, migration_guidance): (
         String,
         String,
@@ -13050,11 +13070,58 @@ pub fn materialize_project_policy(
         )
     };
     let root = PathBuf::from(root).canonicalize()?;
+    if borrowed {
+        let connection = store.lock()?;
+        let task_id: String = connection.query_row(
+            "SELECT task_id FROM attempts WHERE id=?1",
+            params![attempt_id],
+            |row| row.get(0),
+        )?;
+        crate::workflow::validate_workspace_checkout(&connection, &task_id, &frozen_policy)?;
+        let claimed: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspaces w JOIN attempts a ON a.id=w.attempt_id JOIN claims c ON
+               (c.attempt_id=a.id OR (c.attempt_id=a.parent_attempt_id AND EXISTS(SELECT 1 FROM rework_intents ri
+                  WHERE ri.new_attempt_id=a.id AND ri.parent_attempt_id=c.attempt_id AND ri.state='materializing')))
+             JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
+             WHERE a.id=?1 AND c.repository_identity=w.repository_identity
+               AND w.repository_identity=p.repository_identity
+               AND c.state IN ('reserved','running') AND w.state IN ('reserved','unknown','recovery_required'))",
+            params![attempt_id], |row| row.get(0),
+        )?;
+        if !claimed
+            || connection.query_row(
+                crate::review::ACTIVE_WRITER_SQL,
+                params![attempt_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            bail!("Main checkout policy preparation requires its physical repository claim and no active writer; stop the writer before retrying.")
+        }
+        if root != resolved_workspace
+            || Path::new(&frozen_workspace_path).canonicalize()? != root
+            || frozen_policy["checkout_authorization"]["checkout_root"].as_str() != root.to_str()
+        {
+            bail!("The authorized Main checkout changed. Relink the project and authorize it with Make Ready; TRIP did not change checkout files.")
+        }
+    } else if root == resolved_workspace {
+        bail!("TRIP preparation at the registered checkout requires explicit Main checkout authorization; no files were changed.")
+    }
     let manifest_path = root.join(".agents/trip-explorer/manifest.json");
     if hash_file(&manifest_path)?.as_deref() != Some(manifest_hash.as_str()) {
+        if borrowed {
+            bail!("The activated TRIP manifest is missing or changed. Restore matching files or review Project setup; Main checkout preparation never overwrites them.")
+        }
         bail!("activated manifest drifted before worktree materialization")
     }
     let manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let read_activated = |source: &Path, expected: &str| -> Result<Vec<u8>> {
+        let result = read_verified_regular(&root, source, expected);
+        if borrowed {
+            result.context("TRIP activated files are unavailable or changed. Restore matching files or review Project setup; Main checkout preparation never overwrites them")
+        } else {
+            result
+        }
+    };
     let mut copied = BTreeMap::new();
     let allowed_prefixes = [
         ".agents/skills/",
@@ -13076,9 +13143,10 @@ pub fn materialize_project_policy(
             .join(".agents/trip-explorer/base")
             .join(PACKAGE_VERSION)
             .join(relative);
-        let bytes = read_verified_regular(&root, &source, expected.as_str().unwrap_or_default())?;
+        let bytes = read_activated(&source, expected.as_str().unwrap_or_default())?;
         write_activated_policy_file(
             store,
+            borrowed,
             attempt_id,
             workspace,
             &destination,
@@ -13095,13 +13163,11 @@ pub fn materialize_project_policy(
         if let Some(rest) = relative.strip_prefix("skills/") {
             let active_source = root.join(".agents/skills").join(rest);
             let active_destination = workspace.join(".agents/skills").join(rest);
-            let active_bytes = read_verified_regular(
-                &root,
-                &active_source,
-                expected.as_str().unwrap_or_default(),
-            )?;
+            let active_bytes =
+                read_activated(&active_source, expected.as_str().unwrap_or_default())?;
             write_activated_policy_file(
                 store,
+                borrowed,
                 attempt_id,
                 workspace,
                 &active_destination,
@@ -13126,9 +13192,10 @@ pub fn materialize_project_policy(
         validate_relative(relative)?;
         let source = root.join(".agents/trip-explorer/bin").join(relative);
         let destination = workspace.join(".agents/trip-explorer/bin").join(relative);
-        let bytes = read_verified_regular(&root, &source, expected.as_str().unwrap_or_default())?;
+        let bytes = read_activated(&source, expected.as_str().unwrap_or_default())?;
         write_activated_policy_file(
             store,
+            borrowed,
             attempt_id,
             workspace,
             &destination,
@@ -13154,9 +13221,10 @@ pub fn materialize_project_policy(
             .and_then(|value| value.as_str())
             .ok_or_else(|| anyhow!("activated manifest is missing {hash_key}"))?;
         let source = root.join(relative);
-        let bytes = read_verified_regular(&root, &source, expected)?;
+        let bytes = read_activated(&source, expected)?;
         write_activated_policy_file(
             store,
+            borrowed,
             attempt_id,
             workspace,
             &workspace.join(relative),
@@ -13170,6 +13238,7 @@ pub fn materialize_project_policy(
     }
     write_activated_policy_file(
         store,
+        borrowed,
         attempt_id,
         workspace,
         &workspace.join(".agents/trip-explorer/manifest.json"),
@@ -13195,13 +13264,17 @@ pub fn materialize_project_policy(
             copied.insert(relative, expected.clone());
             continue;
         }
-        let source = contained_path(&root, &relative, true)?;
+        let source = contained_path(&root, &relative, true)
+            .with_context(|| format!("TRIP guidance {relative} is unavailable. Restore the activated guidance or review Project setup; Main checkout preparation never creates guidance files."))?;
         let bytes = fs::read(&source)?;
         let expected = sha256(&bytes);
         let destination = workspace.join(&relative);
         if destination.exists() {
             let observed = hash_file(&destination)?;
             if observed.as_deref() != Some(expected.as_str()) {
+                if borrowed {
+                    bail!("TRIP guidance {relative} differs from the activated source. Restore matching guidance or review Project setup; no Main checkout files were changed.")
+                }
                 // A rework child keeps its source's guidance only where the
                 // parent's policy pinned exactly that reauthorized content.
                 let kept = match (&rework_source, observed.as_deref()) {
@@ -13227,6 +13300,7 @@ pub fn materialize_project_policy(
         } else {
             write_activated_policy_file(
                 store,
+                borrowed,
                 attempt_id,
                 workspace,
                 &destination,
@@ -13237,6 +13311,14 @@ pub fn materialize_project_policy(
         copied.insert(relative, serde_json::Value::String(expected));
     }
     let connection = store.lock()?;
+    if borrowed {
+        let task_id: String = connection.query_row(
+            "SELECT task_id FROM attempts WHERE id=?1",
+            params![attempt_id],
+            |row| row.get(0),
+        )?;
+        crate::workflow::validate_workspace_checkout(&connection, &task_id, &frozen_policy)?;
+    }
     let task_profiles = {
         let mut statement=connection.prepare("SELECT json_object('role',role,'settings_revision',settings_revision,'source',source,'profile',json(profile_json),'profile_hash',profile_hash,'project_config_revision_id',project_config_revision_id,'project_configuration_hash',project_configuration_hash,'adapter',adapter_name,'adapter_hash',adapter_hash,'capability_id',capability_id,'capability_key',capability_key,'capability_proof_hash',capability_proof_hash) FROM trip_attempt_profiles WHERE attempt_id=?1 ORDER BY role")?;
         let rows = statement
@@ -13250,6 +13332,24 @@ pub fn materialize_project_policy(
         bail!("attempt policy materialization requires six frozen effective task profiles")
     }
     let mut policy = serde_json::json!({"kind":"activated_project","workflow_id":WORKFLOW_ID,"upstream_source_hash":source_hash(),"overlay_hash":overlay_hash(),"manifest_hash":manifest_hash,"files":copied,"allowed_prefixes":allowed_prefixes,"base_project_configuration_distinct":true,"task_profiles":task_profiles,"uncommitted_guidance":"approved overlay; not asserted present in base Git revision"});
+    for key in [
+        "baseline_snapshot_id",
+        "main_verification",
+        "lineage_snapshot_id",
+        "rework_start_snapshot_id",
+        "workspace_mode",
+        "workspace_ownership",
+        "checkout_authorization",
+        "checkout_identity",
+        "writing_lane",
+        "no_auto_commit",
+        "no_auto_merge",
+        "eligible_untracked",
+    ] {
+        if let Some(value) = frozen_policy.get(key) {
+            policy[key] = value.clone();
+        }
+    }
     if let Some(guidance) = migration_guidance {
         // Prior approvals remain provenance, never current planning authority.
         policy["migration_guidance"] = guidance;
@@ -13262,8 +13362,9 @@ pub fn materialize_project_policy(
     validate_materialized_policy(&policy.to_string())?;
     let now = Utc::now().to_rfc3339();
     let changed = connection.execute(
-        "UPDATE workspaces SET policy_json=?1,updated_at=?2 WHERE attempt_id=?3 AND state IN ('reserved','unknown','recovery_required')",
-        params![policy.to_string(),now,attempt_id],
+        "UPDATE workspaces SET policy_json=?1,updated_at=?2 WHERE attempt_id=?3
+         AND policy_json=?4 AND state IN ('reserved','unknown','recovery_required')",
+        params![policy.to_string(), now, attempt_id, frozen_policy_json],
     )?;
     if changed != 1 {
         bail!("workspace reservation changed before policy persistence")
@@ -14238,6 +14339,7 @@ fn ensure_safe_parent(root: &Path, path: &Path) -> Result<()> {
 }
 fn write_activated_policy_file(
     store: &Store,
+    borrowed: bool,
     attempt_id: &str,
     root: &Path,
     destination: &Path,
@@ -14246,6 +14348,12 @@ fn write_activated_policy_file(
 ) -> Result<()> {
     ensure_no_symlink_ancestry(root, destination)?;
     let observed = hash_file(destination)?;
+    if borrowed {
+        if observed.as_deref() != Some(expected) || sha256(bytes) != expected {
+            bail!("TRIP policy file {} is missing or differs from the activated configuration. Restore matching files or review Project setup; Main checkout preparation never copies or overwrites them.", destination.display())
+        }
+        return Ok(());
+    }
     if observed.is_none() || observed.as_deref() == Some(expected) {
         return write_new_verified(root, destination, bytes, expected);
     }

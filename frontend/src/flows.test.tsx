@@ -17,6 +17,7 @@ import type {
   Project,
   ProjectExecution,
   ProviderFailureHold,
+  ProviderValidationBatch,
   Session,
   SingleAgentCheck,
   SingleAgentRun,
@@ -17154,6 +17155,7 @@ Deno.test("New tasks follow the project default workflow, and draft choices bind
       selected?.kind === "set_task_workflow" && selected.task_id === ready.id &&
         selected.expected_version === ready.version &&
         JSON.stringify(selected.selection) === JSON.stringify({
+            workspace_mode: "isolated_worktree",
             family: "single_agent",
             execution_config_revision_id: "cfg-1",
             profile_revision_id: "prof-rev-1",
@@ -17161,6 +17163,378 @@ Deno.test("New tasks follow the project default workflow, and draft choices bind
           }),
       "the workflow choice lost its exact task version or selection",
     );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Main checkout creation and edits persist explicit mode without migrating legacy tasks", async () => {
+  localStorage.clear();
+  const bodies: Record<string, unknown>[] = [];
+  let loseWorkspaceResponse = false;
+  let saved = 0;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (!init?.body) return new Response("[]");
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    bodies.push(body);
+    if (loseWorkspaceResponse && (body.command as Record<string, unknown>)?.kind === "set_task_workflow") {
+      loseWorkspaceResponse = false;
+      throw new TypeError("Connection lost");
+    }
+    return body.kind === "workflow" ? workflowResult(body) :
+      new Response(JSON.stringify({ result: { state: "updated" } }));
+  }) as typeof fetch;
+  try {
+    for (const family of ["trip", "single_agent"] as const) {
+      mount(<TaskForm projects={[initialized]} selectedProjectId="p1"
+        workflowExecution={[{ ...singleAgentExecution, default_family: family }]}
+        onSaved={noop} onClose={noop} />);
+      check(choiceFor("Isolated worktree").checked, "a new task silently selected Main");
+      act(() => choiceFor("Main checkout").click());
+      field("Title", `Main ${family}`);
+      if (family === "single_agent") change(findSelect("Agent profile"), "prof-rev-1");
+      check(!document.body.textContent?.includes("Create Ready task"),
+        "Main creation bypassed checkout consent");
+      click("Save draft");
+      await settle();
+      const created = workflowCommands(bodies).at(-1);
+      check(created?.kind === "create_task" &&
+        (created.selection as Record<string, unknown>).family === family &&
+        (created.selection as Record<string, unknown>).workspace_mode === "main_checkout" &&
+        !("ready" in created), "Main draft lost its workflow or workspace mode");
+      localStorage.removeItem("agenticjira.new-task");
+    }
+
+    const legacy: Task = { ...singleAgentTask(singleAgentRun()), lifecycle: "ready", active_attempt: undefined };
+    mount(<TaskForm projects={[initialized]} editing={legacy}
+      workflowExecution={[singleAgentExecution]} onSaved={() => saved++} onClose={noop} />);
+    check(choiceFor("Isolated worktree").checked, "editing a legacy task migrated its mode");
+    act(() => choiceFor("Main checkout").click());
+    check(findButton("Save changes").disabled, "task fields saved an unsaved workspace choice");
+    loseWorkspaceResponse = true;
+    click("Save workspace mode only");
+    await settle();
+    const unknown = workflowCommands(bodies).at(-1);
+    check(saved === 0 && choiceFor("Main checkout").checked &&
+      document.body.textContent?.includes("may already have been applied"),
+      "an unknown workspace save closed the form or discarded its request");
+    click("Save workspace mode only");
+    await settle();
+    const changed = workflowCommands(bodies).at(-1);
+    check(changed?.kind === "set_task_workflow" && changed.task_id === legacy.id &&
+      saved === 1 && JSON.stringify(changed) === JSON.stringify(unknown) &&
+      changed.expected_version === legacy.version &&
+      JSON.stringify(changed.selection) === JSON.stringify({
+        family: "single_agent", workspace_mode: "main_checkout",
+        execution_config_revision_id: "cfg-1", profile_revision_id: "prof-rev-1", check_ids: [],
+      }) && !bodies.some((body) => body.kind === "update_task"),
+      "workspace editing changed task fields or lost the existing Single agent selection");
+
+    const main: Task = { ...legacy, version: legacy.version + 1,
+      workflow: { ...legacy.workflow!, workspace_mode: "main_checkout" } };
+    mount(<TaskForm projects={[initialized]} editing={main} workflowExecution={[singleAgentExecution]}
+      onSaved={noop} onClose={noop} />);
+    field("Title", "Revised task text");
+    click("Save changes");
+    await settle();
+    check(bodies.at(-1)?.kind === "update_task" &&
+      bodies.at(-1)?.expected_version === main.version &&
+      !("selection" in bodies.at(-1)!) &&
+      choiceFor("Main checkout").checked, "text editing silently changed the persisted workspace mode");
+
+    mount(<RoleSettings task={main} project={initialized} sessions={[]}
+      execution={singleAgentExecution} tasks={[main]} onChanged={noop} />);
+    act(() => choiceFor("TRIP (manager").click());
+    click("Save workflow choice");
+    await settle();
+    const rolesChange = workflowCommands(bodies).at(-1);
+    check(rolesChange?.kind === "set_task_workflow" &&
+      rolesChange.expected_version === main.version &&
+      JSON.stringify(rolesChange.selection) === JSON.stringify({ workspace_mode: "main_checkout", family: "trip" }),
+      "editing Roles silently reset Main to an isolated worktree");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Main checkout consent binds current scope and verification routes both workflows", async () => {
+  localStorage.clear();
+  const bodies: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (!init?.body) return new Response("[]");
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    bodies.push(body);
+    return body.kind === "workflow" ? workflowResult(body) :
+      new Response(JSON.stringify({ result: { state: "ready" } }));
+  }) as typeof fetch;
+  try {
+    for (const family of ["trip", "single_agent"] as const) {
+      const workflow = singleAgentTask(singleAgentRun()).workflow!;
+      const pinnedProfile = singleAgentExecution.profiles[0].current_revision!;
+      const revisedExecution: ProjectExecution = {
+        ...singleAgentExecution,
+        profiles: [{ ...singleAgentExecution.profiles[0], version: 3,
+          current_revision: { ...pinnedProfile, id: "prof-rev-2", revision: 2,
+            provider: "claude", model: "claude-new-fixture", effort: "max" } }],
+      };
+      const scope = { task_id: `main-${family}`, project_id: "p1",
+        checkout_root: "/canonical/selected-checkout", repository_identity: "/physical/repo.git",
+        workspace_mode: "main_checkout" as const, selection_revision: 2,
+        selection_hash: "selection", writer_policy_hash: "writer", configuration_hash: "configuration",
+        scope_hash: "scope-1" };
+      const draft: Task = { ...task, id: scope.task_id, lifecycle: "backlog", active_attempt: undefined,
+        role_settings: [{ id: "impl-settings", role: "implementer", revision: 1,
+          config: { provider: "codex", model: "gpt-6.1-sol", effort: "high" } },
+          { id: "manager-settings", role: "manager", revision: 1,
+            config: { provider: "claude", model: "claude-opus-5-5", effort: "medium" } }],
+        workflow: { ...workflow, family, run: null, workspace_mode: "main_checkout",
+          selected_profile_revision: family === "single_agent"
+            ? { id: pinnedProfile.id, provider: pinnedProfile.provider, model: pinnedProfile.model, effort: pinnedProfile.effort }
+            : null,
+          checkout_scope: scope, checkout_authorized: false } };
+      const view = (subject: Task, controls: AppState["controls"] = [], sessions: Session[] = []) =>
+        <WorkflowControls task={subject} project={initialized} execution={revisedExecution}
+          controls={controls} sessions={sessions} onChanged={noop} />;
+      mount(view({ ...draft, workflow: { ...draft.workflow!, checkout_scope: null } }));
+      check(findButton("Make Ready").disabled &&
+        ![...document.querySelectorAll("label")].some((label) => label.textContent?.includes("Authorize writer access")),
+        "the UI constructed consent from the project's display path without a backend scope");
+      mount(view(draft));
+      check(findButton("Make Ready").disabled &&
+        document.body.textContent?.includes(scope.checkout_root) &&
+        document.body.textContent.includes("uncommitted work") &&
+        document.body.textContent.includes("Ignored files are outside snapshots") &&
+        document.body.textContent.includes("external editors are not locked"),
+        "Main access or snapshot limits were hidden before consent");
+      act(() => choiceFor("Authorize writer access").click());
+      check(!findButton("Make Ready").disabled, "current scope consent did not enable Make Ready");
+      const moved: Task = { ...draft,
+        workflow: { ...draft.workflow!, checkout_scope: { ...scope, checkout_root: "/canonical/other", scope_hash: "scope-2" } } };
+      rerender(view(moved));
+      check(findButton("Make Ready").disabled && !choiceFor("Authorize writer access").checked,
+        "changed checkout scope reused earlier consent");
+      act(() => choiceFor("Authorize writer access").click());
+      const changed: Task = { ...moved, version: moved.version + 1 };
+      rerender(view(changed));
+      check(findButton("Make Ready").disabled && !choiceFor("Authorize writer access").checked,
+        "a changed task version reused earlier consent");
+      act(() => choiceFor("Authorize writer access").click());
+      click("Make Ready");
+      await settle();
+      const readyRequest = bodies.at(-1);
+      check(readyRequest?.kind === "make_ready" && readyRequest.task_id === changed.id &&
+        readyRequest.expected_version === changed.version &&
+        JSON.stringify(readyRequest.checkout_authorization) === JSON.stringify({ scope_hash: "scope-2" }),
+        "Make Ready constructed authority instead of sending the backend's exact current scope");
+
+      const ready: Task = { ...changed, lifecycle: "ready",
+        workflow: { ...changed.workflow!, checkout_authorized: true } };
+      let currentReady = ready;
+      rerender(view(ready));
+      check(!findButton("Verify Main checkout access").disabled &&
+        document.body.textContent?.includes("codex · gpt-6.1-sol · high") &&
+        !document.body.textContent.includes("claude-new-fixture"),
+        "verification lost the pinned profile or substituted the project's newer revision");
+      if (family === "single_agent") {
+        for (const selected_profile_revision of [null, revisedExecution.profiles[0].current_revision]) {
+          rerender(view({ ...ready, workflow: { ...ready.workflow!, selected_profile_revision } }));
+          check(findButton("Verify Main checkout access").disabled,
+            "missing or mismatched selected-profile facts enabled verification");
+        }
+        rerender(view(ready));
+      }
+      click("Verify Main checkout access");
+      await settle();
+      const verification = workflowCommands(bodies).at(-1);
+      check(verification?.kind === "verify_main_checkout" && verification.task_id === ready.id &&
+        verification.expected_version === ready.version &&
+        (family === "trip" ? verification.role === "implementer" : !("role" in verification)) &&
+        !workflowCommands(bodies).some((request) => request.kind === "set_task_workflow" && request.task_id === ready.id),
+        "verification used a new endpoint, omitted the exact version or confused actor authority");
+      rerender(view({ ...ready, active_attempt: task.active_attempt }, [{
+        id: "main-control", attempt_id: "a1", kind: "main_checkout_verify",
+        state: "awaiting_native_evidence", payload: { task_id: ready.id }, updated_at: "2026-10-14T00:00:00Z",
+      }]));
+      check(findButton("Verify Main checkout access").disabled &&
+        document.body.textContent?.includes("Waiting for reviewed native permission evidence"),
+        "waiting evidence offered a duplicate verification or fabricated proof");
+      if (family === "trip") {
+        rerender(view(ready, [{ id: "main-control", attempt_id: "a1", kind: "main_checkout_verify",
+          state: "finished", payload: { task_id: ready.id }, updated_at: "2026-10-14T00:01:00Z" }]));
+        change(findSelect("Role to verify"), "manager");
+        check(!findButton("Verify Main checkout access").disabled &&
+          document.body.textContent?.includes("claude · claude-opus-5-5 · medium"),
+          "a finished writing-role check blocked the selected read-only role");
+        click("Verify Main checkout access");
+        await settle();
+        check(workflowCommands(bodies).at(-1)?.role === "manager",
+          "read-only verification changed the selected actor");
+        const earlierVerification = workflowCommands(bodies).at(-1)!;
+        const refreshed: Task = { ...ready, version: ready.version + 1, active_attempt: task.active_attempt };
+        const failedControl: AppState["controls"][number] = {
+          id: "failed-main-control", attempt_id: "a1", kind: "main_checkout_verify",
+          state: "failed", payload: { task_id: ready.id }, updated_at: "2026-10-14T00:02:00Z",
+        };
+        const failedSession: Session = { ...managerSession, task_id: ready.id, attempt_id: "a1",
+          status: "launch_failed", generation_status: "launch_failed", process_group_quiescent: 0 };
+        const beforeRefresh = bodies.length;
+        for (const process_group_quiescent of [0, undefined]) {
+          rerender(view(refreshed, [failedControl], [{ ...failedSession, process_group_quiescent }]));
+          check(!findButton("Verify Main checkout access").disabled && bodies.length === beforeRefresh,
+            "a recorded launch failure blocked explicit verification or retried automatically");
+        }
+        click("Verify Main checkout access");
+        await settle();
+        const retry = workflowCommands(bodies).at(-1);
+        check(bodies.length === beforeRefresh + 1 && retry?.kind === "verify_main_checkout" &&
+          retry.task_id === refreshed.id && retry.expected_version === refreshed.version &&
+          retry.role === "manager" && retry.operation_id !== earlierVerification.operation_id,
+          "the explicit retry lost the refreshed version, actor or new request identity");
+        for (const status of ["reserved", "running", "stopping", "recovery_required", "exited"] as const) {
+          rerender(view(refreshed, [failedControl], [{ ...failedSession, status,
+            generation_status: status === "reserved" ? "launch_reserved" : status,
+            process_group_quiescent: status === "exited" ? 0 : true }]));
+          check(findButton("Verify Main checkout access").disabled,
+            `verification ignored an unsettled current-attempt session: ${status}`);
+        }
+        rerender(view(refreshed, [failedControl], [{ ...failedSession, status: "exited", generation_status: "exited", process_group_quiescent: undefined }]));
+        check(findButton("Verify Main checkout access").disabled,
+          "an exited session without proven quiescence enabled verification");
+        rerender(view(refreshed, [failedControl], [{ ...failedSession, status: "exited", generation_status: "exited", process_group_quiescent: true }]));
+        check(!findButton("Verify Main checkout access").disabled,
+          "proven current-attempt quiescence blocked verification");
+        rerender(view(refreshed, [failedControl], [{ ...failedSession, attempt_id: "older-attempt", status: "running", generation_status: "running" }]));
+        check(!findButton("Verify Main checkout access").disabled,
+          "a different attempt's historical session blocked current verification");
+        currentReady = refreshed;
+      }
+      rerender(view({ ...currentReady, lifecycle: "in_progress", active_attempt: task.active_attempt }));
+      click("Continue");
+      await settle();
+      check(bodies.at(-1)?.kind === "control" && bodies.at(-1)?.action === "continue" &&
+        !("checkout_authorization" in bodies.at(-1)!),
+        "ordinary continuation required new consent or replayed verification");
+      rerender(view({ ...currentReady, active_attempt: undefined,
+        workflow: { ...currentReady.workflow!, checkout_authorized: false } }));
+      check(findButton("Verify Main checkout access").disabled,
+        "scope drift kept verification authorized");
+      click("Return to draft to authorize checkout");
+      await settle();
+      const readmission = workflowCommands(bodies).at(-1);
+      check(readmission?.kind === "set_task_workflow" && readmission.expected_version === currentReady.version &&
+        (readmission.selection as Record<string, unknown>).workspace_mode === "main_checkout" &&
+        (readmission.selection as Record<string, unknown>).family === family,
+        "readmission silently changed workflow or workspace mode");
+    }
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Main verification evidence wait stops through one pause request and refresh never retries", async () => {
+  localStorage.clear();
+  const requests: Record<string, unknown>[] = [];
+  let refreshes = 0;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (!init?.body) return new Response("[]");
+    requests.push(JSON.parse(String(init.body)));
+    return new Response(JSON.stringify({ result: { state: "control_requested" } }));
+  }) as typeof fetch;
+  const waiting: Task = {
+    ...task, version: 7, attention: "needs_input",
+    active_attempt: { ...task.active_attempt!, phase: "planning", status: "needs_input" },
+    role_settings: [{ id: "main-impl", role: "implementer", revision: 1,
+      config: { provider: "codex", model: "gpt-6.1-sol", effort: "xhigh" } }],
+    workflow: { ...singleAgentTask(singleAgentRun()).workflow!, family: "trip", run: null,
+      workspace_mode: "main_checkout", checkout_authorized: true,
+      checkout_scope: { task_id: task.id, project_id: task.project_id,
+        checkout_root: "/canonical/checkout", repository_identity: "/physical/repo.git",
+        workspace_mode: "main_checkout", selection_revision: 2, selection_hash: "selection",
+        writer_policy_hash: "writer", configuration_hash: "configuration", scope_hash: "scope" } },
+  };
+  const evidence: AppState["controls"][number] = {
+    id: "awaiting-main-evidence", attempt_id: "a1", kind: "main_checkout_verify",
+    state: "awaiting_native_evidence", payload: { task_id: task.id, actor: "manager" },
+    updated_at: "2026-10-14T00:01:00Z",
+  };
+  const older = { ...evidence, id: "older-main-stop", state: "cancelled",
+    updated_at: "2026-10-14T00:00:00Z" };
+  const view = (subject: Task, controls: AppState["controls"], allowed_controls = ["pause_now", "continue"]) => {
+    const decision: DecisionExplanation = {
+      decision_schema: 1, reason_code: "workflow.awaiting_native_evidence", disposition: "waiting",
+      subject: { task_id: subject.id }, observed_revision: { task_version: subject.version },
+      primary_blocker: null, prerequisites: [],
+      ownership: { owner: "human", state: "recorded_task_status",
+        binding: { task_id: subject.id, expected_task_version: subject.version } },
+      next_action: { operation: "pause_now", enabled: allowed_controls.includes("pause_now"),
+        owner: "human", binding: { task_id: subject.id, expected_task_version: subject.version } },
+      control_policy: { allowed_controls },
+    };
+    return <WorkflowControls task={subject} project={initialized} controls={controls}
+      decision={decision} onChanged={() => refreshes++} />;
+  };
+  try {
+    mount(view(waiting, [evidence, older]));
+    check(document.body.textContent?.includes("refused or missing observations cannot count as proof") &&
+      !document.body.textContent.includes("Stopped without proof"),
+      "cancelled history masked current evidence waiting or granted proof from completion");
+    check(findButton("Continue").disabled && findButton("Verify Main checkout access").disabled,
+      "evidence waiting enabled ordinary continuation or duplicate verification");
+    check([...document.querySelectorAll("button")].filter((button) =>
+      button.textContent?.trim() === "Stop verification and keep task paused").length === 1 &&
+      ![...document.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Pause now"),
+      "the evidence stop duplicated the ordinary pause control");
+    rerender(view(waiting, [evidence, older], []));
+    check(![...document.querySelectorAll("button")].some((button) =>
+      button.textContent?.trim() === "Stop verification and keep task paused"),
+      "the UI offered a pause absent from current action authority");
+    rerender(view(waiting, [evidence, older]));
+    click("Stop verification and keep task paused");
+    await settle();
+    check(requests.length === 1 && refreshes === 1 && requests[0].kind === "control" &&
+      requests[0].action === "pause_now" && requests[0].task_id === waiting.id &&
+      requests[0].expected_version === waiting.version && typeof requests[0].operation_id === "string" &&
+      JSON.stringify(requests[0].payload) === JSON.stringify({ verification_control_id: evidence.id }),
+      "stopping evidence wait lost its exact version, control binding or one-request semantics");
+    rerender(view({ ...waiting, version: 8, attention: "pause_requested" }, [older, evidence], []));
+    check(!document.body.textContent?.includes("Stopped without proof"),
+      "a queued pause was presented as recorded diagnostic cancellation");
+    const stopped = { ...evidence, state: "cancelled", updated_at: "2026-10-14T00:02:00Z" };
+    const paused: Task = { ...waiting, version: 9, attention: "paused",
+      active_attempt: { ...waiting.active_attempt!, status: "held" } };
+    for (let refresh = 0; refresh < 3; refresh++) {
+      rerender(view(paused, [older, stopped]));
+      check(document.body.textContent?.includes("Stopped without proof") &&
+        document.body.textContent.includes("Ordinary work still requires current proof for this actor") &&
+        document.body.textContent.includes("Manager verification did not establish Main checkout access") &&
+        !findButton("Continue").disabled &&
+        ![...document.querySelectorAll("button")].some((button) =>
+          button.textContent?.trim() === "Stop verification and keep task paused"),
+        "recorded cancellation lost its no-proof status or remained an active diagnostic");
+    }
+    const newer = { ...evidence, id: "new-main-verification", state: "native_requested",
+      updated_at: "2026-10-14T00:03:00Z" };
+    rerender(view(paused, [older, stopped, newer]));
+    check(!document.body.textContent?.includes("Stopped without proof") &&
+      document.body.textContent?.includes("Verification is in progress") &&
+      findButton("Verify Main checkout access").disabled,
+      "an older cancellation masked a newer active verification");
+    for (let refresh = 0; refresh < 3; refresh++) {
+      rerender(view(paused, []));
+      check(!document.body.textContent?.includes("Stopped without proof") &&
+        !document.body.textContent?.includes("Verification is in progress") &&
+        !findButton("Continue").disabled && requests.length === 1,
+        "the finished verification projection resurrected cancellation, fenced ordinary controls or retried on refresh");
+    }
+    rerender(view(paused, [{ ...stopped, attempt_id: "previous-attempt" }]));
+    check(!document.body.textContent?.includes("Stopped without proof") && requests.length === 1,
+      "historical attempt cancellation leaked into current status or refresh retried a request");
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -17405,286 +17779,195 @@ Deno.test("Project Single agent settings show the service's probe blocker and se
   }
 });
 
-Deno.test("Providers makes no request on open, starts only an authorized previewed plan, and keeps an unknown start's identity", async () => {
+Deno.test("Providers reconciles historical requests without starting coding sessions", async () => {
   localStorage.clear();
   const bodies: Record<string, unknown>[] = [];
-  let failStart = true;
-  let reconcileReply: (body: Record<string, unknown>) => unknown = () => null;
+  const pending = {
+    id: "historical-start", preview_hash: "historical-preview",
+    selections: [{ provider: "codex", model: "gpt-6.1-sol", effort: "high" }],
+    authorize_model_calls: true, max_model_calls: 1,
+  };
+  const listedBatch = (day: number): ProviderValidationBatch => ({
+    id: `batch-listed-${day}`, operation_id: `listed-${day}`,
+    state: "finished", model_calls_authorized: false, max_model_calls: 0,
+    created_at: `2026-05-0${day}T00:00:00Z`, updated_at: `2026-05-0${day}T00:00:00Z`,
+    finished_at: `2026-05-0${day}T00:00:00Z`, checks: [],
+  });
+  let reply: (body: Record<string, unknown>) => unknown = () => ({
+    outcome: "closed_without_start", operation_id: "another-request",
+    closed_at: "2026-10-10T00:02:00Z",
+  });
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    bodies.push(body);
+    if (body.kind !== "provider_validation_reconcile") throw new Error("Unexpected new provider action");
+    return new Response(JSON.stringify({ result: reply(body) }));
+  }) as typeof fetch;
+  localStorage.setItem("llmrelay.providers.start", JSON.stringify(pending));
+  try {
+    mount(<ProviderSettings validation={{ batches: [1, 2, 3, 4, 5].map(listedBatch), proofs: [] }} onChanged={noop} />);
+    check(bodies.length === 0, "opening Providers sent a request");
+    check(!document.body.textContent?.includes("Start these checks") &&
+      !document.body.textContent?.includes("Send the identical request again"),
+      "Providers offered a new coding-session start");
+    const stored = localStorage.getItem("llmrelay.providers.start");
+    click("Check or close the earlier request");
+    await settle();
+    check(bodies[0].kind === "provider_validation_reconcile" &&
+      bodies[0].operation_id === pending.id && bodies[0].preview_hash === pending.preview_hash &&
+      bodies[0].authorize_model_calls === true && bodies[0].max_model_calls === 1 &&
+      JSON.stringify(bodies[0].selections) === JSON.stringify(pending.selections) &&
+      localStorage.getItem("llmrelay.providers.start") === stored,
+      "reconciliation changed the historical request or a mismatched reply cleared it");
+    reply = (body) => ({ outcome: "started", batch: {
+      ...listedBatch(1), id: "batch-recovered", operation_id: body.operation_id,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z", finished_at: "2026-01-01T00:00:00Z",
+    } });
+    click("Check or close the earlier request");
+    await settle();
+    check(JSON.stringify(bodies[1]) === JSON.stringify(bodies[0]) &&
+      localStorage.getItem("llmrelay.providers.start") === null &&
+      document.querySelectorAll(".provider-batch").length === 6 &&
+      document.body.textContent?.includes("The earlier request had started"),
+      "the exact retry changed identity or hid an older recovered batch");
+
+    unmount();
+    localStorage.setItem("llmrelay.providers.start", JSON.stringify({ ...pending, id: "never-started" }));
+    reply = (body) => ({ outcome: "closed_without_start", operation_id: body.operation_id,
+      closed_at: "2026-10-10T00:03:00Z" });
+    mount(<ProviderSettings validation={{ batches: [], proofs: [] }} onChanged={noop} />);
+    click("Check or close the earlier request");
+    await settle();
+    check(bodies.at(-1)?.operation_id === "never-started" &&
+      localStorage.getItem("llmrelay.providers.start") === null &&
+      document.body.textContent?.includes("never started") &&
+      document.body.textContent.includes("No model was contacted") &&
+      bodies.every((body) => body.kind === "provider_validation_reconcile"),
+      "closing a historical request started it, lost its identity or left it unresolved");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Providers inspects local facts without sessions and preserves historical refresh and cancellation", async () => {
+  localStorage.clear();
+  const bodies: Record<string, unknown>[] = [];
+  const providers = ["codex", "claude"] as const;
+  const model = (provider: (typeof providers)[number]) =>
+    provider === "codex" ? "gpt-6.1-sol" : "claude-opus-5-5";
+  let history: ProviderValidationBatch = {
+    id: "history-batch",
+    operation_id: "history-start",
+    state: "running",
+    model_calls_authorized: true,
+    max_model_calls: 2,
+    created_at: "2026-10-12T00:00:00Z",
+    updated_at: "2026-10-12T00:01:00Z",
+    finished_at: null,
+    checks: providers.map((provider, ordinal) => ({
+      id: `history-${provider}`,
+      ordinal,
+      provider,
+      model: model(provider),
+      effort: "medium",
+      state: ordinal === 0 ? "cancelled" : "running",
+      reused_proof: false,
+      reason: ordinal === 0
+        ? "This check exceeded its five-minute limit. No result was recorded, and it was not retried."
+        : null,
+      proof_observed_at: null,
+      proof_expires_at: null,
+      updated_at: "2026-10-12T00:01:00Z",
+    })),
+  };
+  const disabled = "PROVIDER_CHECK_PROJECT_REQUIRED: authorize coding access within a project task";
   globalThis.fetch =
     (async (_input: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       bodies.push(body);
-      if (body.kind === "provider_validation_reconcile") {
-        return new Response(JSON.stringify({ result: reconcileReply(body) }));
-      }
       if (body.kind === "provider_validation_preview") {
-        return new Response(JSON.stringify({
-          result: {
-            preview_hash: "preview-1",
-            installations: ["codex", "claude"].map((provider) => ({
-              provider,
-              ready: true,
-              executable_path: `/usr/local/bin/${provider}`,
-              executable_version: "1.0.0",
-              account_identity: provider === "codex" ? "account-1" : null,
-              authentication: "signed in",
-              model_calls_disabled_reason: null,
-              guidance: null,
-            })),
-            checks: [{
-              ordinal: 0,
-              provider: "codex",
-              model: "gpt-6.1-sol",
-              effort: "high",
-              plan: "reuse_proof",
-              reason: "A current confirmation exists.",
-              proof_observed_at: "2026-10-10T00:00:00Z",
-              proof_expires_at: "2026-10-11T00:00:00Z",
-              model_listed: true,
-            }, {
-              ordinal: 1,
-              provider: "claude",
-              model: "claude-opus-5-5",
-              effort: "medium",
-              plan: "model_call",
-              reason: "No current confirmation.",
-              proof_observed_at: null,
-              proof_expires_at: null,
-              model_listed: null,
-            }],
-            model_calls_required: 1,
-          },
-        }));
+        return new Response(JSON.stringify({ result: {
+          preview_hash: "unavailable-preview",
+          model_calls_required: 0,
+          installations: providers.map((provider) => ({
+            provider,
+            ready: true,
+            executable_path: `/fixture/${provider}`,
+            executable_version: provider === "codex" ? "codex-cli 0.162.1" : "2.1.296",
+            account_identity: provider === "codex" ? "account-1" : null,
+            authentication: "signed in",
+            model_calls_disabled_reason: disabled,
+            guidance: null,
+          })),
+          checks: providers.map((provider, ordinal) => ({
+            ordinal, provider, model: model(provider), effort: "medium",
+            plan: "unavailable", reason: disabled, model_listed: true,
+            proof_observed_at: null, proof_expires_at: null,
+          })),
+        } }));
       }
-      if (body.kind === "provider_validation_start" && failStart) {
-        failStart = false;
-        throw new TypeError("Connection lost");
+      if (body.kind === "provider_validation_inspect") {
+        history = { ...history, updated_at: "2026-10-12T00:02:00Z",
+          checks: history.checks.map((check) => check.state === "running"
+            ? { ...check, state: "delivery_unknown", updated_at: "2026-10-12T00:02:00Z" }
+            : check) };
+        return new Response(JSON.stringify({ result: history }));
       }
-      return new Response(JSON.stringify({
-        result: {
-          id: "batch-1",
-          operation_id: body.operation_id,
-          state: "finished",
-          model_calls_authorized: true,
-          max_model_calls: 1,
-          created_at: "2026-10-10T00:00:00Z",
-          updated_at: "2026-10-10T00:01:00Z",
-          finished_at: "2026-10-10T00:01:00Z",
-          checks: [{
-            id: "check-codex",
-            ordinal: 0,
-            provider: "codex",
-            model: "gpt-6.1-sol",
-            effort: "high",
-            state: "succeeded",
-            reused_proof: true,
-            reason: null,
-            proof_observed_at: "2026-10-10T00:00:00Z",
-            proof_expires_at: "2026-10-11T00:00:00Z",
-            updated_at: "2026-10-10T00:01:00Z",
-          }, {
-            id: "check-claude",
-            ordinal: 1,
-            provider: "claude",
-            model: "claude-opus-5-5",
-            effort: "medium",
-            state: "failed",
-            reused_proof: false,
-            reason:
-              "The provider refused this model for the signed-in account.",
-            proof_observed_at: null,
-            proof_expires_at: null,
-            updated_at: "2026-10-10T00:01:00Z",
-          }],
-        },
-      }));
+      if (body.kind === "provider_validation_cancel") {
+        history = { ...history, state: "cancel_requested", updated_at: "2026-10-12T00:03:00Z",
+          checks: history.checks.map((check) => check.state === "delivery_unknown"
+            ? { ...check, state: "cancel_requested", updated_at: "2026-10-12T00:03:00Z" }
+            : check) };
+        return new Response(JSON.stringify({ result: history }));
+      }
+      throw new Error("Unexpected provider-settings request");
     }) as typeof fetch;
-  const listedBatch = (day: number) => ({
-    id: `batch-listed-${day}`,
-    operation_id: `listed-${day}`,
-    state: "finished" as const,
-    model_calls_authorized: false,
-    max_model_calls: 0,
-    created_at: `2026-05-0${day}T00:00:00Z`,
-    updated_at: `2026-05-0${day}T00:00:00Z`,
-    finished_at: `2026-05-0${day}T00:00:00Z`,
-    checks: [],
-  });
-  const validation = {
-    // The five recent batches are all newer than the recovered request.
-    batches: [1, 2, 3, 4, 5].map(listedBatch),
-    proofs: [{
-      provider: "codex" as const,
-      model: "gpt-6.1-sol",
-      effort: "high",
-      executable_version: "1.0.0",
-      account_identity: "account-1",
-      observed_at: "2026-10-10T00:00:00Z",
-      expires_at: "2026-10-11T00:00:00Z",
-      expired: false,
-    }],
-  };
   try {
-    mount(<ProviderSettings validation={validation} onChanged={noop} />);
+    mount(<ProviderSettings validation={{ batches: [history], proofs: [] }} onChanged={noop} />);
     check(bodies.length === 0, "opening Providers sent a request");
-    act(() =>
-      document.querySelectorAll<HTMLInputElement>(
-        ".provider-row input[type=checkbox]",
-      )[1].click()
-    );
-    field("Claude model to check", "claude-opus-5-5");
-    click("Preview checks");
+    check(document.body.textContent?.includes("Other checks keep their own limits") &&
+      document.body.textContent.includes("No result was recorded"),
+      "the timed-out check hid its unaffected running sibling or timeout reason");
+    click("Refresh this check");
     await settle();
-    check(
-      bodies.length === 1 && bodies[0].kind === "provider_validation_preview" &&
-        JSON.stringify(bodies[0].selections) === JSON.stringify([
-            { provider: "codex", model: "gpt-6.1-sol", effort: "high" },
-            { provider: "claude", model: "claude-opus-5-5", effort: "medium" },
-          ]) &&
-        document.body.textContent?.includes("Account identity unavailable"),
-      "the preview lost the exact selection or hid unavailable account identity",
-    );
-    check(
-      findButton("Start these checks").disabled,
-      "model calls started without authorization",
-    );
-    act(() => choiceFor("Allow up to 1 new model call").click());
-    click("Start these checks");
+    check(bodies.at(-1)?.kind === "provider_validation_inspect" &&
+      bodies.at(-1)?.batch_id === "history-batch" &&
+      document.body.textContent?.includes("possible running session stays uncertain"),
+      "refresh changed the batch binding or hid the uncertain session");
+    click("Cancel remaining checks");
     await settle();
-    const first = bodies.at(-1);
-    check(
-      first?.kind === "provider_validation_start" &&
-        first.preview_hash === "preview-1" &&
-        first.authorize_model_calls === true && first.max_model_calls === 1 &&
-        localStorage.getItem("llmrelay.providers.start") !== null &&
-        !document.body.textContent?.includes("Forget"),
-      "an unknown start lost its persisted identity or offered to forget it",
-    );
-    const stored = localStorage.getItem("llmrelay.providers.start");
-    check(
-      !document.body.textContent?.includes("Check for the saved result") &&
-        !findButton("Check or close the earlier request").disabled,
-      "an unknown start offered only a refresh that cannot settle it",
-    );
-    // A reply for another request settles nothing.
-    reconcileReply = () => ({
-      outcome: "closed_without_start",
-      operation_id: "another-request",
-      closed_at: "2026-10-10T00:02:00Z",
-    });
-    click("Check or close the earlier request");
+    check(bodies.at(-1)?.kind === "provider_validation_cancel" &&
+      bodies.at(-1)?.batch_id === "history-batch" &&
+      document.body.textContent?.includes("Stop requested") &&
+      document.body.textContent.includes("No replacement session"),
+      "cancellation lost its exact batch or promised confirmed exit before settlement");
+    act(() => document.querySelectorAll<HTMLInputElement>(".provider-row input[type=checkbox]")
+      .forEach((input) => input.click()));
+    field("Codex model catalog entry", model("codex"));
+    field("Claude model catalog entry", model("claude"));
+    click("Inspect providers");
     await settle();
-    const stale = bodies.at(-1);
-    check(
-      stale?.kind === "provider_validation_reconcile" &&
-        JSON.stringify({ ...stale, kind: "" }) ===
-          JSON.stringify({ ...first, kind: "" }) &&
-        localStorage.getItem("llmrelay.providers.start") === stored &&
-        choiceFor("Allow up to 1 new model call").checked &&
-        !findButton("Start these checks").disabled,
-      "reconciling changed the exact request, or another request's reply cleared it or its approval",
-    );
-    const startShown = () =>
-      [...document.querySelectorAll("button")].some((button) =>
-        button.textContent?.includes("Start these checks")
-      );
-    // The matching reply settles it, and its older batch stays shown.
-    reconcileReply = (body) => ({
-      outcome: "started",
-      batch: {
-        ...listedBatch(1),
-        id: "batch-recovered",
-        operation_id: body.operation_id,
-        created_at: "2026-01-01T00:00:00Z",
-        updated_at: "2026-01-01T00:00:00Z",
-        finished_at: "2026-01-01T00:00:00Z",
-      },
-    });
-    click("Check or close the earlier request");
-    await settle();
-    check(
-      localStorage.getItem("llmrelay.providers.start") === null &&
-        document.querySelectorAll(".provider-batch").length === 6 &&
-        document.body.textContent?.includes("The earlier request had started"),
-      "a recovered request older than the recent checks was hidden, or its identity was kept",
-    );
-    // Settling leaves no preview or call approval to start from.
-    check(
-      !startShown(),
-      "a settled request left its preview available for a new start",
-    );
-
-    // A new start needs a new preview and approval, and gets a new identity;
-    // its identical replay never starts twice.
-    click("Preview checks");
-    await settle();
-    check(
-      findButton("Start these checks").disabled &&
-        !choiceFor("Allow up to 1 new model call").checked,
-      "the new preview reused the earlier call approval",
-    );
-    act(() => choiceFor("Allow up to 1 new model call").click());
-    failStart = true;
-    click("Start these checks");
-    await settle();
-    const second = bodies.at(-1);
-    check(
-      second?.kind === "provider_validation_start" &&
-        second.operation_id !== first?.operation_id &&
-        localStorage.getItem("llmrelay.providers.start") !== null,
-      "a new explicitly approved start reused the settled identity",
-    );
-    click("Send the identical request again");
-    await settle();
-    const replay = bodies.at(-1);
-    check(
-      replay?.operation_id === second?.operation_id &&
-        JSON.stringify({ ...replay, operation_id: "" }) ===
-          JSON.stringify({ ...second, operation_id: "" }) &&
-        localStorage.getItem("llmrelay.providers.start") === null,
-      "the replay changed the request or kept a settled identity",
-    );
-    check(
-      document.body.textContent?.includes("Reused a current confirmation") &&
-        document.body.textContent.includes(
-          "The provider refused this model for the signed-in account.",
-        ),
-      "one provider's failure hid the other provider's result",
-    );
-
-    // A start that never arrived is closed without running anything.
-    click("Preview checks");
-    await settle();
-    act(() => choiceFor("Allow up to 1 new model call").click());
-    failStart = true;
-    click("Start these checks");
-    await settle();
-    const lost = bodies.at(-1);
-    const sentBeforeClosing = bodies.length;
-    reconcileReply = (body) => ({
-      outcome: "closed_without_start",
-      operation_id: body.operation_id,
-      closed_at: "2026-10-10T00:03:00Z",
-    });
-    click("Check or close the earlier request");
-    await settle();
-    check(
-      bodies.at(-1)?.operation_id === lost?.operation_id &&
-        localStorage.getItem("llmrelay.providers.start") === null &&
-        document.body.textContent?.includes("never started") &&
-        lost?.kind === "provider_validation_start" &&
-        !bodies.slice(sentBeforeClosing).some((body) =>
-          body.kind === "provider_validation_start"
-        ) && !startShown(),
-      "closing a request that never started kept it, started it, or left it startable",
-    );
-    click("Preview checks");
-    await settle();
-    check(
-      findButton("Start these checks").disabled &&
-        !choiceFor("Allow up to 1 new model call").checked,
-      "a closed request's call approval carried over to the new preview",
-    );
+    check(document.body.textContent?.includes("installed and signed in") &&
+      document.body.textContent.includes("Version codex-cli 0.162.1") &&
+      document.body.textContent.includes("Listed in the local model catalog; account access is not tested") &&
+      document.body.textContent.includes("No new app-wide coding checks") &&
+      document.body.textContent.includes("Local facts cannot replace that native permission evidence") &&
+      !document.querySelector(".provider-preview input[type=checkbox]"),
+      "local inspection was presented as model access, checkout authority or a coding-session approval");
+    check([...document.querySelectorAll<HTMLDetailsElement>("details.technical-details")]
+      .some((details) => !details.open && details.textContent?.includes(disabled)),
+      "the qualification diagnostic was not retained in collapsed Technical details");
+    const inspection = bodies.at(-1);
+    check(inspection?.kind === "provider_validation_preview" &&
+      JSON.stringify(inspection.selections) === JSON.stringify(providers.map((provider) =>
+        ({ provider, model: model(provider), effort: "medium" }))) &&
+      bodies.filter((body) => body.kind === "provider_validation_preview").length === 1 &&
+      !bodies.some((body) => body.kind === "provider_validation_start") &&
+      !document.body.textContent?.includes("Start these checks"),
+      "inspection started a session, changed selections or repeated the request");
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;

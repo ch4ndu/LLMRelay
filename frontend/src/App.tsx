@@ -1164,8 +1164,8 @@ export function App() {
                 <span className="eyebrow">App-wide</span>
                 <h1>Providers</h1>
                 <p>
-                  Installed agent providers and the models your accounts can
-                  use. These checks are not tied to any project.
+                  Inspect local installations, versions, sign-in and model
+                  catalogs. Project permissions are verified within each task.
                 </p>
               </div>
             </header>

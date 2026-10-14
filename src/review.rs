@@ -106,6 +106,164 @@ impl ReviewService {
         }
     }
 
+    fn bind_checkout_delta(
+        &self,
+        attempt: &str,
+        manifest: &mut SnapshotManifest,
+    ) -> Result<String> {
+        let connection = self.store.lock()?;
+        let (task,policy): (String,String)=connection.query_row("SELECT a.task_id,w.policy_json FROM attempts a JOIN workspaces w ON w.attempt_id=a.id WHERE a.id=?1",
+            params![attempt], |row|Ok((row.get(0)?,row.get(1)?)))?;
+        let policy: serde_json::Value = serde_json::from_str(&policy)?;
+        crate::workflow::validate_workspace_checkout(&connection, &task, &policy)?;
+        if crate::workspace::policy_mode(&policy)? == crate::domain::WorkspaceMode::MainCheckout {
+            crate::workspace::require_checkout_environment()?;
+            let baseline = policy["baseline_snapshot_id"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Main result has no original checkout baseline"))?;
+            let json: String=connection.query_row("SELECT s.manifest_json FROM snapshots s JOIN attempts original ON original.id=s.attempt_id
+                JOIN attempts current ON current.task_id=original.task_id WHERE s.id=?1 AND s.kind='baseline' AND s.complete=1 AND current.id=?2",
+                params![baseline,attempt], |row|row.get(0))?;
+            manifest.task_changed_paths =
+                crate::snapshot::task_changed_paths(&serde_json::from_str(&json)?, manifest)?;
+            manifest.baseline_snapshot_id = Some(baseline.to_owned());
+        }
+        crate::store::json_hash(manifest)
+    }
+
+    pub(crate) fn capture_workspace_baseline(
+        &self,
+        attempt_id: &str,
+        workspace_id: &str,
+    ) -> Result<SnapshotManifest> {
+        use anyhow::Context;
+        let (task_id, path, repository_path, base, policy_json): (
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = {
+            let connection = self.store.lock()?;
+            let value = connection.query_row(
+                "SELECT a.task_id,w.path,p.repository_path,w.base_revision,w.policy_json
+                 FROM workspaces w JOIN attempts a ON a.id=w.attempt_id
+                 JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
+                 JOIN claims c ON c.attempt_id=a.id AND c.repository_identity=w.repository_identity
+                 WHERE w.id=?1 AND a.id=?2 AND w.state='reserved'
+                   AND w.repository_identity=p.repository_identity
+                   AND w.base_revision=a.base_revision AND w.base_revision=p.base_revision
+                   AND a.status='workspace_reserved' AND c.state='reserved'",
+                params![workspace_id, attempt_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+            if connection.query_row(ACTIVE_WRITER_SQL, params![attempt_id], |row| {
+                row.get::<_, bool>(0)
+            })? {
+                bail!("Stop the active writer before capturing the checkout's starting snapshot")
+            }
+            value
+        };
+        let policy: serde_json::Value = serde_json::from_str(&policy_json)?;
+        if crate::workspace::policy_mode(&policy)? != crate::domain::WorkspaceMode::MainCheckout {
+            bail!("Starting checkout capture requires a borrowed Main checkout reservation")
+        }
+        {
+            let connection = self.store.lock()?;
+            crate::workflow::validate_workspace_checkout(&connection, &task_id, &policy)?;
+        }
+        let repository = crate::workspace::inspect(Path::new(&repository_path))?;
+        crate::workspace::prepare(&repository, Path::new(&path), &base, &policy)?;
+        let checkout_identity = crate::workspace::checkout_identity(&repository)?;
+        let snapshots_root = self
+            .snapshots_root
+            .parent()
+            .context("snapshot artifacts parent")?
+            .canonicalize()?
+            .join("snapshots");
+        crate::snapshot::require_artifacts_excluded(&repository.root, &snapshots_root)?;
+        let snapshot_id = uuid::Uuid::new_v4().to_string();
+        let (first, hash) = crate::snapshot::capture(
+            &repository, Path::new(&path), &snapshots_root.join(&snapshot_id),
+        ).context("Cannot preserve the checkout's starting files; resolve the unsupported snapshot input before retrying preparation")?;
+        let (second, _) = crate::snapshot::capture(
+            &repository,
+            Path::new(&path),
+            &snapshots_root.join(uuid::Uuid::new_v4().to_string()),
+        )?;
+        crate::snapshot::require_stable_preparation(&first, &second)?;
+        if crate::workspace::checkout_identity(&crate::workspace::inspect(Path::new(&path))?)?
+            != checkout_identity
+        {
+            bail!("The physical checkout changed during its starting capture; no files were reset or removed")
+        }
+        crate::snapshot::require_artifacts_excluded(&repository.root, &snapshots_root)?;
+        crate::workspace::prepare(&repository, Path::new(&path), &base, &policy)?;
+        if !crate::snapshot::verify_materialized(&first, Path::new(&path))? {
+            bail!("The checkout changed after its starting snapshot. Finish external edits, then retry preparation; no checkout files were changed.")
+        }
+        let mut connection = self.store.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::workflow::validate_workspace_checkout(&transaction, &task_id, &policy)?;
+        let reserved: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspaces w JOIN attempts a ON a.id=w.attempt_id
+             JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
+             JOIN claims c ON c.attempt_id=a.id AND c.repository_identity=w.repository_identity
+             WHERE w.id=?1 AND a.id=?2 AND w.policy_json=?3 AND w.path=?4
+               AND w.base_revision=?5 AND a.base_revision=?5 AND p.base_revision=?5
+               AND w.repository_identity=p.repository_identity
+               AND w.state='reserved' AND a.status='workspace_reserved' AND c.state='reserved')",
+            params![workspace_id, attempt_id, policy_json, path, base],
+            |row| row.get(0),
+        )?;
+        if !reserved
+            || transaction.query_row(ACTIVE_WRITER_SQL, params![attempt_id], |row| {
+                row.get::<_, bool>(0)
+            })?
+        {
+            bail!("Workspace or writer ownership changed while the starting snapshot was captured")
+        }
+        let mut updated_policy = policy;
+        updated_policy["checkout_identity"] = checkout_identity;
+        if let Some(existing) = updated_policy["baseline_snapshot_id"].as_str() {
+            let manifest_json: String = transaction.query_row(
+                "SELECT manifest_json FROM snapshots WHERE id=?1 AND attempt_id=?2
+                 AND workspace_id=?3 AND kind='baseline' AND complete=1",
+                params![existing, attempt_id, workspace_id],
+                |row| row.get(0),
+            )?;
+            let original: SnapshotManifest = serde_json::from_str(&manifest_json)?;
+            crate::snapshot::require_stable_preparation(&original, &first)?;
+        } else {
+            transaction.execute(
+                "INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,
+                    created_at,original_base,candidate_head,workspace_id,workspace_hash)
+                 VALUES(?1,?2,'baseline',?3,?4,?5,1,?6,?7,?8,?9,?4)",
+                params![snapshot_id,attempt_id,first.snapshot_base,hash,serde_json::to_string(&first)?,
+                    Utc::now().to_rfc3339(),first.original_base,first.candidate_head,workspace_id],
+            )?;
+            updated_policy["baseline_snapshot_id"] = snapshot_id.into();
+        }
+        if updated_policy.to_string() != policy_json {
+            if transaction.execute(
+                "UPDATE workspaces SET policy_json=?1,updated_at=?2 WHERE id=?3 AND policy_json=?4 AND state='reserved'",
+                params![updated_policy.to_string(),Utc::now().to_rfc3339(),workspace_id,policy_json],
+            )? != 1 {
+                bail!("Workspace changed before its starting snapshot could be published")
+            }
+        }
+        transaction.commit()?;
+        Ok(first)
+    }
+
     pub fn freeze(&self, attempt_id: &str, kind: &str) -> Result<serde_json::Value> {
         if !["plan", "candidate", "checkpoint", "accepted"].contains(&kind) {
             bail!("unsupported snapshot kind")
@@ -206,8 +364,10 @@ impl ReviewService {
         repository.head = attempt_base;
         let snapshot_id = uuid::Uuid::new_v4().to_string();
         let destination = self.snapshots_root.join(&snapshot_id);
-        let (manifest, hash) =
+        let (mut manifest, _) =
             crate::snapshot::capture(&repository, Path::new(&workspace_path), &destination)?;
+        self.bind_checkout_delta(attempt_id, &mut manifest)?;
+        let hash = crate::snapshot::write_manifest(&manifest, &destination)?;
         let now = Utc::now().to_rfc3339();
         let mut connection = self.store.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -515,8 +675,10 @@ impl ReviewService {
         repository.head = attempt_base;
         let snapshot_id = uuid::Uuid::new_v4().to_string();
         let destination = self.snapshots_root.join(&snapshot_id);
-        let (manifest, hash) =
+        let (mut manifest, _) =
             crate::snapshot::capture(&repository, Path::new(&workspace_path), &destination)?;
+        self.bind_checkout_delta(attempt_id, &mut manifest)?;
+        let hash = crate::snapshot::write_manifest(&manifest, &destination)?;
         let now = Utc::now().to_rfc3339();
         let mut connection = self.store.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -592,8 +754,16 @@ impl ReviewService {
         } else {
             expected.original_base.clone()
         };
-        let (observed, _) =
+        let (mut observed, _) =
             crate::snapshot::capture(&repository, Path::new(&workspace_path), &temp)?;
+        if expected.baseline_snapshot_id.is_some() {
+            let attempt: String = self.store.lock()?.query_row(
+                "SELECT attempt_id FROM snapshots WHERE id=?1",
+                params![snapshot_id],
+                |row| row.get(0),
+            )?;
+            self.bind_checkout_delta(&attempt, &mut observed)?;
+        }
         std::fs::remove_dir_all(temp)?;
         Ok(serde_json::to_vec(&expected)? == serde_json::to_vec(&observed)?)
     }

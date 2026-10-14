@@ -97,6 +97,52 @@ An activated setup keeps showing its recorded results. When a selected profile's
 
 During supported Implementer sessions, the Workspace **Approvals** list handles native action requests the CLI actually emits with **Approve once**, **Always approve matching actions**, and **Deny**. Codex honors approvals already granted through its native policy, so a natively allowed or sandbox-allowed action may run without a new inbox item. LLMRelay does not enumerate, create, edit, or revoke native Codex approvals; dashboard **Revoke** affects only LLMRelay-owned reusable rules. Workflow approvals, review-budget changes, role switching, and final acceptance remain separate decisions you make in the dashboard. Trusting a folder does not grant those actions to an agent.
 
+## Providers: local inspection
+
+Open **Providers**, select local catalog entries, and choose **Inspect providers**.
+This reads installation, version, authentication and local catalog facts. It
+starts no provider conversation and does not establish model availability,
+project permissions or coding capability. New app-wide coding-check starts are
+unavailable; authorize and verify coding access in the selected project task.
+
+Historical batches remain visible with refresh and cancellation controls.
+**Check or close the earlier request** reconciles a saved uncertain request by
+its original identity without contacting a model. An uncertain response retains
+that identity. Refreshing a page never retries a model call or changes a profile.
+
+## Choose a task checkout
+
+In a new task's Workflow section, choose **Main checkout** or **Isolated worktree**.
+Main tasks are saved as drafts. Existing tasks without a saved mode remain
+Isolated worktree; editing role profiles does not change their mode. For an
+eligible queued task, use **Save workspace mode only** to change placement
+without discarding edits to its other fields.
+
+In Task Overview, review the canonical checkout path and the displayed access
+scope, select the authorization checkbox, then choose **Make Ready**. Main
+permission covers writing the selected checkout for this task, subject to the
+protected app-data, credential and Git metadata boundaries. The checkbox is
+bound to the displayed scope and task version; refresh or changed scope may
+require reviewing it again. A ready task without an attempt can return to draft
+to renew admission after a scope change.
+
+**Prepare task** captures a baseline without replacing existing Main files.
+Choose **Verify Main checkout access** for the selected Single-agent profile or
+the explicitly selected TRIP role. A task pinned to an older profile revision
+keeps that exact revision even after the project profile changes. Pending native
+evidence is not a pass: reviewed observations must be published through the
+existing capability proof route before ordinary execution is admitted. Consent,
+a completed conversation and worktree evidence cannot replace Main evidence.
+
+Unchanged continuations and rework retain the task's scoped authorization.
+Changed roots, effective permissions or provider identities require current
+admission and matching proof. Only one app-managed writer may own a physical
+repository at a time; external editors are not locked. Cancel and rework leave
+Main files intact. Results compare against the starting snapshot so existing
+edits are not attributed to the task; ignored files are outside snapshot
+coverage. Accepting a result does not commit or merge it, and changed live files
+can make an earlier result stale.
+
 ## Single agent setup
 
 A project does not need a TRIP installation to run [Single agent](WORKFLOWS.md#single-agent-workflow)

@@ -678,6 +678,90 @@ fn validate_runtime_probe_policy(policy: &RuntimeProbeCommandPolicy) -> Result<(
     Ok(())
 }
 
+fn validate_main_readonly_policy(
+    policy: &RuntimeProbeCommandPolicy,
+    scope: &serde_json::Value,
+) -> Result<()> {
+    let roots: Vec<PathBuf> = serde_json::from_value(scope["protected_roots"].clone())?;
+    let mut writes = roots.clone();
+    writes.push(PathBuf::from(
+        scope["root"]
+            .as_str()
+            .context("Main policy has no checkout root")?,
+    ));
+    writes.sort();
+    writes.dedup();
+    if policy.read_denials != roots
+        || policy.write_denials != writes
+        || policy
+            .commands
+            .iter()
+            .map(|entry| entry.operation.as_str())
+            .ne(["boundary", "direct", "compound", "redirect"])
+        || policy.commands.iter().any(|entry| {
+            entry.command.is_empty()
+                || entry.command.len() > 16 * 1024
+                || entry
+                    .command
+                    .chars()
+                    .any(|c| matches!(c, '\n' | '\r' | '*' | '?'))
+        })
+        || policy
+            .commands
+            .iter()
+            .map(|entry| &entry.command)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != 4
+    {
+        bail!("Main read-only policy requires four exact representable commands and its complete checkout protections")
+    }
+    Ok(())
+}
+
+pub(crate) fn bind_main_readonly_policy(
+    launch: &mut PreparedLaunch,
+    policy: &RuntimeProbeCommandPolicy,
+) -> Result<()> {
+    if launch.config.role == RoleKind::Implementer {
+        bail!("Main read-only command authority cannot be assigned to a writer")
+    }
+    validate_main_readonly_policy(policy, &launch.config.security_policy["checkout_scope"])?;
+    let settings_index = launch
+        .arguments
+        .iter()
+        .position(|arg| arg == "--settings")
+        .context("Claude Main launch omitted settings")?
+        + 1;
+    let mut settings: serde_json::Value = serde_json::from_str(
+        launch
+            .arguments
+            .get(settings_index)
+            .context("Claude Main settings value is missing")?,
+    )?;
+    settings["sandbox"]["filesystem"]["denyWrite"] = serde_json::to_value(&policy.write_denials)?;
+    launch.arguments[settings_index] = serde_json::to_string(&settings)?;
+    let commands = policy
+        .commands
+        .iter()
+        .map(|entry| format!("Bash({})", entry.command))
+        .collect::<Vec<_>>();
+    let index = launch
+        .arguments
+        .iter()
+        .position(|arg| arg == "--disallowedTools")
+        .context("Claude Main launch omitted tool restrictions")?;
+    launch.arguments.splice(index..index, commands.clone());
+    launch.config.security_policy["allowed_operations"]
+        .as_array_mut()
+        .context("Claude Main launch omitted exact allowed operations")?
+        .extend(commands.into_iter().map(serde_json::Value::String));
+    launch.config.security_policy["native_sandbox"]["filesystem_deny_write"] =
+        serde_json::to_value(&policy.write_denials)?;
+    launch.config.argv = launch.arguments.clone();
+    Ok(())
+}
+
 pub fn require_native_sandbox(
     identity: &CapabilityIdentity,
     expected_denials: &std::collections::BTreeSet<PathBuf>,
@@ -769,6 +853,126 @@ pub fn require_native_sandbox(
             if !allowed.contains(format!("Bash({})", command.command).as_str()) {
                 bail!("Claude runtime policy omits a frozen exact Bash command")
             }
+        }
+    }
+    if let Some(policy) = identity.security_policy.get("main_readonly_command_policy") {
+        let policy: RuntimeProbeCommandPolicy = serde_json::from_value(policy.clone())?;
+        validate_main_readonly_policy(&policy, &identity.security_policy["checkout_scope"])?;
+        if identity.role == RoleKind::Implementer
+            || identity.security_policy["permission_mode"] != "dontAsk"
+            || identity
+                .security_policy
+                .get("runtime_probe_command_policy")
+                .is_some()
+        {
+            bail!("Main read-only commands cannot inherit writer or runtime-probe authority")
+        }
+        if [
+            "--allowedTools",
+            "--disallowedTools",
+            "--settings",
+            "--tools",
+            "--permission-mode",
+            "--restricted",
+        ]
+        .iter()
+        .any(|flag| {
+            identity
+                .effective_argv
+                .iter()
+                .filter(|arg| arg.as_str() == *flag)
+                .count()
+                != 1
+        }) || !identity
+            .effective_argv
+            .windows(2)
+            .any(|pair| pair[0] == "--tools" && pair[1] == "Read,Grep,Glob,Bash")
+            || identity.security_policy["tools"] != "Read,Grep,Glob,Bash"
+            || !identity
+                .effective_argv
+                .windows(2)
+                .any(|pair| pair[0] == "--permission-mode" && pair[1] == "dontAsk")
+            || identity.effective_argv.iter().any(|arg| {
+                arg.starts_with("--dangerously-skip-permissions")
+                    || arg.starts_with("--allow-dangerously-skip-permissions")
+            })
+        {
+            bail!("Claude Main read-only launch has duplicate, writing or bypass tool authority")
+        }
+        let actual: Vec<PathBuf> =
+            serde_json::from_value(value["sandbox"]["filesystem"]["denyWrite"].clone())?;
+        if actual != policy.write_denials
+            || identity.security_policy["native_sandbox"]["filesystem_deny_write"]
+                != serde_json::to_value(&actual)?
+        {
+            bail!("Claude Main native settings lost exact write-denial roots")
+        }
+        let allowed: Vec<String> =
+            serde_json::from_value(identity.security_policy["allowed_operations"].clone())?;
+        let scope = &identity.security_policy["checkout_scope"];
+        let root = scope["root"]
+            .as_str()
+            .context("Claude Main policy omitted checkout")?
+            .trim_start_matches('/');
+        let helper = scope["helper_executable"]["canonical_path"]
+            .as_str()
+            .context("Claude Main policy omitted app helper")?;
+        let mut expected = vec![
+            format!("Read(//{root}/**)"),
+            format!("Grep(//{root}/**)"),
+            format!("Glob(//{root}/**)"),
+            format!("Bash({helper} role context)"),
+            format!("Bash({helper} role report:*)"),
+        ];
+        if identity.role == RoleKind::Manager {
+            for operation in [
+                "propose-transition",
+                "acknowledge-guidance",
+                "record-explorer-decision",
+                "configure-lanes",
+                "request-integration",
+                "select-checks",
+                "submit-conformance",
+                "setup-read",
+            ] {
+                expected.push(format!("Bash({helper} role {operation}:*)"));
+            }
+        }
+        expected.extend(
+            policy
+                .commands
+                .iter()
+                .map(|entry| format!("Bash({})", entry.command)),
+        );
+        if allowed != expected {
+            bail!("Claude Main policy contains missing or extra command authority")
+        }
+        let start = identity
+            .effective_argv
+            .iter()
+            .position(|arg| arg == "--allowedTools")
+            .context("Claude Main launch has no allow-list")?
+            + 1;
+        let end = identity
+            .effective_argv
+            .iter()
+            .position(|arg| arg == "--disallowedTools")
+            .context("Claude Main launch has no deny-list")?;
+        if start > end || identity.effective_argv[start..end] != allowed {
+            bail!("Claude Main argv differs from its exact allowed operations")
+        }
+        for command in &policy.commands {
+            if allowed
+                .iter()
+                .filter(|arg| **arg == format!("Bash({})", command.command))
+                .count()
+                != 1
+            {
+                bail!("Claude Main policy lost an exact observation command")
+            }
+        }
+        if !policy.read_denials.iter().all(|root| denied.contains(root)) {
+            bail!("Claude Main settings lost a protected read-denial root")
         }
     }
     let hooks = value

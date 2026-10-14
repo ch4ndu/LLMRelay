@@ -548,8 +548,8 @@ reuse old qualification evidence to bypass these checks.
 ## Database restore points
 
 The database commands operate on the instance selected by `--data-dir` and never
-migrate it. Inspect, check and manual backup require current schema 39. Verify
-and restore accept schema 39 and the supported prior schemas 31–38, requiring the
+migrate it. Inspect, check and manual backup require current schema 40. Verify
+and restore accept schema 40 and the supported prior schemas 31–39, requiring the
 manifest version to match the actual SQLite version. Unknown versions are refused.
 
 Service start holds the exclusive instance lock, reconciles an interrupted
@@ -560,7 +560,7 @@ the default backup directory. It checks migration space again after publication.
 A failed preflight or backup prevents migration. Missing and already-current
 databases do not require this extra snapshot.
 
-Supported schemas 31–38 then upgrade to 39 through the existing migration
+Supported schemas 31–39 then upgrade to 40 through the existing migration
 transactions. Each failed migration rolls back its own transaction; earlier
 successful steps may remain committed. The failure identifies the verified
 restore point and offline recovery command. Startup never automatically restores
@@ -571,7 +571,7 @@ durable attention observations; 37 adds TRIP migration receipts; 38 adds
 Codex observed usage; 39 adds the Single agent workflow records, app-wide
 provider check records and read-only history pane records. Schema 39 rebuilds
 the sessions table so a session belongs to exactly one role generation or one
-provider check, keeping every existing session row and reference unchanged.
+provider check, keeping every existing session row and reference unchanged. Schema 40 adds task checkout mode and scoped authorization; existing tasks retain isolated-worktree mode.
 
 ```sh
 llmrelay database --data-dir <ABSOLUTE_INSTANCE_PATH> inspect
@@ -676,7 +676,7 @@ permission rules and automatic resume authority are invalidated. The dashboard
 may be available for inspection and safe recovery, but execution remains fenced.
 Restoring an older snapshot first installs its original schema and commits this
 hold. A later service start makes a new verified snapshot and attempts the
-supported forward upgrade while retaining the hold. This build serves schema 39;
+supported forward upgrade while retaining the hold. This build serves schema 40;
 a persistent migration defect still requires a corrected build or operator
 repair. Restoring the data does not promise that a failing migration will succeed
 or launch a compatible older executable.
@@ -930,3 +930,30 @@ checks do not establish live native delivery, provider accuracy, billing or
 complete account usage. Claude usage, quota/reset windows and costs are outside
 this increment. Usage display never starts work, changes models, approves tools,
 promotes readiness or releases a provider hold.
+
+## Main checkout verification recovery
+
+Task Overview shows the authorized checkout and **Verify Main checkout access**.
+A pending verification or possibly active current-attempt session blocks another
+request. For TRIP, a recorded pre-launch failure is terminal and can permit an
+explicit new verification after its control settles and the prerequisite is
+corrected, subject to the current admission and ownership checks. An exited
+session still requires proven process-group quiescence. Historical sessions
+from older attempts do not themselves block the current action. Refreshing never
+sends a new verification automatically.
+
+Single-agent retains one writer generation per attempt, including a generation
+whose native launch failed. If its existing verification is awaiting valid
+evidence, finish that recorded evidence flow. A failed reservation cannot be
+replaced by requesting verification again in the same attempt: cancel the run,
+wait for ownership to settle, and verify fresh authorized lineage. Correcting a
+launch prerequisite does not clear the retained-writer binding.
+
+When verification awaits native evidence, inspect its exact session output and
+review the recorded observations before using `capability record-proof` with the
+matching evidence. The dashboard does not infer proof from consent or completion.
+Timeout/cancellation requests a stop and retains uncertainty until exit is
+established; neither authorizes a replacement. Do not overwrite files or reset
+the checkout to recover verification. Corrected scope or profile settings need
+current admission and matching proof. Unchanged ordinary resume and authorized
+rework reuse valid bindings without copying an ancestor's active session authority.

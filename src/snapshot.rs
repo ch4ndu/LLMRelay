@@ -24,9 +24,13 @@ pub struct SnapshotManifest {
     pub repository_identity: String,
     pub entries: Vec<SnapshotEntry>,
     pub total_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_changed_paths: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotEntry {
     pub path: String,
     pub kind: String,
@@ -150,13 +154,20 @@ pub fn capture(
         repository_identity: repository.identity.clone(),
         entries,
         total_bytes: total,
+        baseline_snapshot_id: None,
+        task_changed_paths: Vec::new(),
     };
-    let hash = hex::encode(Sha256::digest(serde_json::to_vec(&manifest)?));
+    let hash = write_manifest(&manifest, destination)?;
+    Ok((manifest, hash))
+}
+
+pub(crate) fn write_manifest(manifest: &SnapshotManifest, destination: &Path) -> Result<String> {
+    let hash = hex::encode(Sha256::digest(serde_json::to_vec(manifest)?));
     crate::config::atomic_write(
         &destination.join(METADATA_DIR).join("manifest.json"),
-        &serde_json::to_vec_pretty(&manifest)?,
+        &serde_json::to_vec_pretty(manifest)?,
     )?;
-    Ok((manifest, hash))
+    Ok(hash)
 }
 
 pub fn materialize(
@@ -212,6 +223,67 @@ pub fn materialize(
     }
     if !verify_materialized(manifest, worktree)? {
         bail!("materialized snapshot inventory, content, or identity did not verify")
+    }
+    Ok(())
+}
+
+pub(crate) fn require_stable_preparation(
+    first: &SnapshotManifest,
+    second: &SnapshotManifest,
+) -> Result<()> {
+    if serde_json::to_vec(first)? != serde_json::to_vec(second)? {
+        bail!("The checkout changed while its starting snapshot was captured. Finish external edits, then retry preparation; no checkout files were reset or removed.")
+    }
+    Ok(())
+}
+
+pub(crate) fn task_changed_paths(
+    baseline: &SnapshotManifest,
+    candidate: &SnapshotManifest,
+) -> Result<Vec<String>> {
+    if baseline.repository_identity != candidate.repository_identity {
+        bail!("The candidate does not belong to its original checkout baseline")
+    }
+    let before = baseline
+        .entries
+        .iter()
+        .filter(|entry| !entry.deleted)
+        .map(|entry| (&entry.path, entry))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let after = candidate
+        .entries
+        .iter()
+        .filter(|entry| !entry.deleted)
+        .map(|entry| (&entry.path, entry))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let paths = before
+        .keys()
+        .chain(after.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    Ok(paths
+        .into_iter()
+        .filter(|path| before.get(path) != after.get(path))
+        .cloned()
+        .collect())
+}
+
+pub(crate) fn require_artifacts_excluded(worktree: &Path, artifacts: &Path) -> Result<()> {
+    let Ok(relative) = artifacts.strip_prefix(worktree) else {
+        return Ok(());
+    };
+    let contains_eligible_paths = snapshot_paths(worktree)?
+        .iter()
+        .any(|path| Path::new(path).starts_with(relative));
+    let ignored = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["check-ignore", "--no-index", "--quiet", "--"])
+        .arg(format!("{}/", relative.to_string_lossy()))
+        .status()?
+        .success();
+    if relative.as_os_str().is_empty() || contains_eligible_paths || !ignored {
+        bail!("The app's snapshot artifacts would be included in this checkout's starting snapshot. Move the app data directory outside the checkout, or exclude its snapshot artifacts from Git before retrying preparation.")
     }
     Ok(())
 }

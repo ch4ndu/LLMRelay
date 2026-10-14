@@ -94,3 +94,88 @@ Final handoff exposed a recovery defect: the current manager turn had more termi
 After the controlled upgrade, **Resume after restart** restored the same native manager conversation, and the task reached human review. Inspection found only `label.py` and `test_label.py` changed in the tracked source diff; the additional untracked `.agents` content was the app-materialized workflow installation. A single **Accept result** action persisted `done` with no attention, and every task-role process group was confirmed quiescent. After reload, the dashboard showed Completed, zero active tasks and no acceptance or mutation controls in the read-only task history. Acceptance did not commit, merge or publish the fixture changes.
 
 The upgraded executable SHA-256 was `10ff434fc6213de5913989e352df8b6b5e3ce32e158398ca2db0e7dd7d37960a`. Its CLI successfully returned the accumulated 2,501,603-byte state. Request limits remain 1 MiB; business responses are bounded at 16 MiB. This proves the observed large-state case, not unbounded history support. The task, checks, reviews, controlled restart, native identities and acceptance evidence remain in the ignored qualification ledger. OS sleep, abrupt crash and machine-reboot recovery remain untested.
+
+## Superseded app-wide coding-check investigation (2026-10-13)
+
+This section records the abandoned app-wide coding-session proposal. The current
+Providers screen performs local inspection only; it does not launch these checks.
+The task-scoped replacement is described below.
+
+The observation diagnostics above retain their original contract scope. They
+do not qualify the revised app-wide disposable coding-session mode, and the
+qualified Single agent writer/TRIP results do not grant it authority. Ordinary
+dispatch remains disabled for the unqualified Codex check contract
+`codex-provider-disposable-check-v1`; Claude remains independently unavailable
+because managed-hook confinement is unproven. No new policy has received native
+qualification.
+
+The revised consent authorizes fresh session starts with the selected provider,
+exact model, effort and installed version. A session may use coding tools and
+write/read a temporary challenge file in its app-owned folder, and may consume
+quota through multiple provider requests. The legacy `max_model_calls` field is
+the fresh-session budget, not an internal API-request limit. No automatic retry,
+model change or project admission follows from a check. Tool writes are intended
+to remain scope-only; native OS/minimal-helper reads are accepted exceptions,
+with explicit enumerated protected-root denials still required. Parent provider
+authentication, network and runtime activity are separate.
+
+Independent backend and diagnostic collector review and focused checks passed.
+Those are implementation evidence. The diagnostic's direct-pipe Codex process
+case can correlate one prescribed command and its complete native permission
+results, but publishes no production session/access proof and cannot establish
+Supervisor deadline or settlement behavior. The separately selected timeout
+case retains that lifecycle path. The production deadline is 300 seconds per
+invocation; uncertain stop waits for verified exit/quiescence, siblings remain
+independent, and expired checks cannot publish success.
+
+Native launch readiness remains unresolved: the prescribed shell and selected
+Python interpreter, modules and libraries are not established under the exact
+effective policy. The proposed offline sandbox smoke check also needs proven
+configuration equivalence before it can justify a paid call. Accepted helper
+runtime reads do not establish this prerequisite, and broad runtime-directory
+grants are not a remedy.
+
+Built-in filesystem-helper protected-read denial remains unproven. The pinned
+JSON projection merges failed and declined patch status and supplies no helper
+errno or denial reason. A failed patch can reflect refusal, malformed input or
+another failure; it is not OS-denial evidence. A successful in-scope patch can
+establish positive helper activity only. The process collector therefore leaves
+helper protection false and overall evidence incomplete, even if its process
+probes pass. This finite protected-root inventory makes no universal
+host-secret-isolation claim. Current consent and operational boundaries are
+documented in [App-wide provider checks](SECURITY.md#app-wide-provider-checks).
+
+
+## Task-scoped Main checkout verification (2026-10-14)
+
+The revised product supports explicit Main checkout consent alongside isolated
+worktrees. App-wide Providers inspection does not launch a model or grant task
+admission. Main checkout capability evidence is bound to the selected task, actor,
+provider installation and effective scope; it is not a general provider approval.
+See [Trusted task checkouts](SECURITY.md#trusted-task-checkouts).
+
+In the disposable acceptance instance, all six selected role profiles obtained
+current runtime evidence. Main checkout consent, Make Ready and task preparation
+succeeded. The Codex implementer completed both native verification turns,
+including the retained-session recall, exact challenge-file writes, authenticated
+tool events, safe stops and confirmed process-group quiescence. Independent review
+correlated the native public tool records with all eight required protected-root
+denials. The service accepted the resulting proof for that exact task and actor.
+This does not qualify another installation, role, scope or later binary.
+
+Claude refused both native verification turns without tool activity or the recall
+nonce. No Claude Main proof was published. The existing Pause now action safely
+settled the diagnostic and preserved the task, checkout claim and Codex proof.
+Selected Claude Main execution therefore remains an unresolved acceptance gap;
+ordinary work requiring its proof cannot proceed. No fallback model or relaxed
+permission policy was used. This run does not establish a complete ordinary TRIP
+task through Main checkout.
+
+The dashboard recovery path now explains that native evidence is still required
+and offers Stop verification and keep task paused through the existing versioned
+pause action. A recorded cancellation displays Stopped without proof. Regression
+coverage verifies that a newer verification supersedes that historical message,
+including after successful proof publication, and that refresh performs no retry.
+These lifecycle fixtures use synthetic evidence and do not replace native Claude
+qualification. The source checks, independent reviews and native acceptance records
+are retained in the ignored provider_sandbox_check_20261013 ledger.

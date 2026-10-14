@@ -166,26 +166,48 @@ accepted.
 
 ## App-wide provider checks
 
-**Providers** checks provider installations and model access outside any project.
-Opening the page makes no request; refreshing model suggestions reads only the
-local model catalog. **Preview checks** inspects the local installation and plans
-each check without contacting a model. Model calls happen only after you allow the
-displayed number of calls and choose **Start these checks**; they are short
-requests with no project files and no tools, are never retried automatically and
-never switch models. A start whose outcome is unknown keeps its request identity.
-**Check or close the earlier request** retrieves its recorded batch, including
-older results, or closes a request that never started so a delayed delivery
-cannot start it afterward. This action makes no model call. An uncertain response
-keeps the same identity for another check. **Send the identical request again**
-reuses the original identity and cannot start a second batch.
+**Providers** now performs local installation, version, authentication and catalog
+inspection only. It neither starts a model session nor grants project coding
+permission. New legacy app-wide coding-check starts are refused. Historical
+batches retain observation, reconciliation, cancellation and settlement; their
+old evidence does not qualify a selected task checkout.
 
-A confirmation shows only that the observed account could call that model when
-checked. It is not repository access: it never satisfies a project's setup,
-hook, permission-delivery, session or profile admission requirements. When the
-provider cannot supply a trustworthy account identity, the page says so and the
-confirmation is not reused across projects. LLMRelay does not edit, trust or
-enable provider hooks or settings for these checks, and stores no credential
-contents.
+## Trusted task checkouts
+
+A task selects Main checkout or Isolated worktree. Main authorization binds the
+canonical checkout, physical repository identity, mode and effective writer
+policy to that task. Existing records default to Isolated worktree. Placement,
+task authorization and native capability evidence are separate decisions.
+
+Main writers may read and write the selected checkout subject to explicit
+protected descendants, credentials, app data/control sockets and native Git
+metadata safeguards. Arbitrary project `.local` content is not denied solely
+by its name; identified app-owned archives and the actual instance paths are
+protected. Unrepresentable overlaps and retargeted paths are refused. Native
+system/runtime read exceptions remain provider-specific; this is not a claim
+of root-only read confinement. Provider sign-in and runtime activity remain
+separate from tool authority. No global bypass, hook auto-trust or permission
+change follows from choosing Main.
+
+A physical repository claim serializes app-managed writers, including aliases
+and linked worktrees. It does not lock out external editors. Baseline snapshots
+preserve tracked and eligible untracked bytes; ignored files are not covered.
+Preparation refuses unstable state rather than replacing Main files. Cancellation
+waits for verified quiescence before releasing ownership and does not reset or
+remove a borrowed checkout. Rework transfers the claim and preserves the original
+baseline. Acceptance checks the current reviewed candidate; it is not Git
+integration authority.
+
+Main proof binds the exact actor, provider identity, scope, native session and
+observation request. Read-only roles remain read-only. Their approved probe
+commands and protected-root partition are frozen; absent roots are distinguished
+from observed denials, and appearance or disappearance invalidates that scope.
+Narration, an unchanged file, a provider refusal or a missing path cannot prove
+an OS permission denial. Consent and synthetic tests do not qualify native
+behavior. A finished matching read-only policy may follow authorized rework
+lineage; active verification and stopped-session resume authority never transfer.
+Live qualification must be established independently for the exact effective
+policy before ordinary Main execution is admitted.
 
 ## Local transport compatibility gate
 

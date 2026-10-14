@@ -766,7 +766,22 @@ impl Application {
             .coordinator_lock
             .lock()
             .map_err(|_| anyhow!("coordinator mutex is poisoned"))?;
-        let ticked = crate::coordinator::tick(self);
+        let ticked = if let Some(action) = self.settle_one_provider_check()? {
+            Ok(action)
+        } else {
+            match self.settle_main_checkout_verification()? {
+                Some(action) if action["action"] == "waiting" => crate::coordinator::tick(self)
+                    .map(|other| {
+                        if matches!(other["action"].as_str(), Some("waiting" | "idle")) {
+                            action
+                        } else {
+                            other
+                        }
+                    }),
+                Some(action) => Ok(action),
+                None => crate::coordinator::tick(self),
+            }
+        };
         self.observe_attention();
         ticked
     }
@@ -2836,6 +2851,7 @@ impl Application {
                 &self.store.compatibility_bundles,
             )?
         };
+        let prompt_hash = launch.request_prompt_hash(&resume_prompt)?;
         let attempted = PreparedResumeIdentity::from_launch(&launch.config)?;
         let runtime = crate::trip::CapabilityRuntime::from_store(
             &self.store,
@@ -2849,6 +2865,7 @@ impl Application {
                     session_id,
                     &epoch,
                     &launch.config,
+                    &prompt_hash,
                     &token,
                     &runtime,
                     receipt,
@@ -2859,6 +2876,7 @@ impl Application {
                     session_id,
                     &epoch,
                     &launch.config,
+                    &prompt_hash,
                     &token,
                     &runtime,
                 )
@@ -3434,18 +3452,40 @@ impl Application {
             bail!("final verifier sessions are always fresh and cannot resume")
         }
         let invocation = self.store.invocation_input(session_id)?;
+        let verification_resume: bool=self.store.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM controls WHERE kind='main_checkout_verify'
+            AND state='native_running' AND json_extract(payload_json,'$.session_id')=?1 AND json_extract(payload_json,'$.prompt_hash')=?2
+            AND json_extract(payload_json,'$.turns_reserved')=1)",rusqlite::params![session_id,json_hash(&prompt)?], |row|row.get(0))?;
+        let ordinary_binding: Option<Option<String>> = self.store.lock()?.query_row(
+            "SELECT json_extract(payload_json,'$.ordinary_input_hash') FROM controls WHERE kind='main_checkout_verify'
+             AND state='finished' AND json_extract(payload_json,'$.session_id')=?1",
+            rusqlite::params![session_id], |row| row.get(0),
+        ).optional()?;
+        if let Some(binding) = ordinary_binding {
+            if binding.as_deref() != Some(json_hash(&invocation)?.as_str()) {
+                bail!("The verified session lost its ordinary task input binding; reconcile its recorded verification before resuming")
+            }
+        }
         let persisted_prompt = invocation
             .get("prompt")
             .and_then(|value| value.as_str())
             .ok_or_else(|| {
                 anyhow!("session has no persisted invocation input; exact resume is blocked")
             })?;
-        if !prompt.trim().is_empty() && prompt != persisted_prompt {
+        if !verification_resume && !prompt.trim().is_empty() && prompt != persisted_prompt {
             bail!("resume input differs from the persisted invocation; create a fresh role or review request")
         }
-        self.store.validate_resume_input(session_id, &invocation)?;
-        let mut delivered_prompt = persisted_prompt.to_owned();
-        if prior.role == crate::domain::RoleKind::Manager && record["validation_cell"].is_null() {
+        if !verification_resume {
+            self.store.validate_resume_input(session_id, &invocation)?;
+        }
+        let mut delivered_prompt = if verification_resume {
+            prompt.to_owned()
+        } else {
+            persisted_prompt.to_owned()
+        };
+        if prior.role == crate::domain::RoleKind::Manager
+            && record["validation_cell"].is_null()
+            && !verification_resume
+        {
             let approvals = {
                 let connection = self.store.lock()?;
                 crate::trip::human_approval_context(
@@ -3469,11 +3509,16 @@ impl Application {
             .to_owned();
         let token = auth::issue_secret();
         let epoch = uuid::Uuid::new_v4().to_string();
-        let read_denials = crate::trip::setup_target_read_denials(
+        let checkout_scope =
+            self.checkout_scope(record["attempt_id"].as_str().unwrap_or_default())?;
+        let mut read_denials = crate::trip::setup_target_read_denials(
             &self.store,
             record["attempt_id"].as_str().unwrap_or_default(),
         )?;
-        let launch = providers::prepare_role_launch_with_read_denials_and_bundles(
+        if let Some(scope) = &checkout_scope {
+            read_denials = serde_json::from_value(scope["protected_roots"].clone())?;
+        }
+        let mut launch = providers::prepare_role_launch_with_read_denials_and_bundles(
             prior.provider,
             prior.role,
             &prior.model,
@@ -3490,6 +3535,17 @@ impl Application {
             &read_denials,
             &self.store.compatibility_bundles,
         )?;
+        if let Some(scope) = &checkout_scope {
+            let policy = self.main_readonly_policy(
+                record["attempt_id"]
+                    .as_str()
+                    .context("Session attempt is missing")?,
+                prior.role,
+                scope,
+            )?;
+            providers::bind_checkout_launch(&mut launch, scope, policy.as_ref())?;
+        }
+        let prompt_hash = launch.request_prompt_hash(&delivered_prompt)?;
         let attempted = PreparedResumeIdentity::from_launch(&launch.config)?;
         if native_id.is_none() {
             let error = anyhow!("native session identity is unavailable");
@@ -3503,6 +3559,7 @@ impl Application {
                 session_id,
                 &epoch,
                 &launch.config,
+                &prompt_hash,
                 &token,
                 receipt,
             )
@@ -3512,13 +3569,20 @@ impl Application {
                     session_id,
                     &epoch,
                     &launch.config,
+                    &prompt_hash,
                     &token,
                     admission,
                 )
                 .map(|()| BrowserLaunchReservation::Reserved)
         } else {
             self.store
-                .reserve_role_resume(session_id, &epoch, &launch.config, &token)
+                .reserve_role_resume_with_prompt_hash(
+                    session_id,
+                    &epoch,
+                    &launch.config,
+                    &prompt_hash,
+                    &token,
+                )
                 .map(|()| BrowserLaunchReservation::Reserved)
         };
         let reservation = match reservation {
@@ -3532,6 +3596,13 @@ impl Application {
         };
         if let BrowserLaunchReservation::Existing(existing) = reservation {
             return Ok(BrowserLaunchDispatch::Existing(existing));
+        }
+        if self.checkout_scope(record["attempt_id"].as_str().unwrap_or_default())? != checkout_scope
+        {
+            let error=anyhow!("Checkout protections changed after resume reservation; the native conversation was not started");
+            self.store
+                .restore_resume_after_proven_nondelivery(session_id, &error.to_string())?;
+            return Err(error);
         }
         let process = if self.synthetic_dispatch_for_tests {
             self.store
@@ -4117,7 +4188,11 @@ impl Application {
                 "dispatch rejected while service draining",
             ));
         }
-        let read_denials = match crate::trip::setup_target_read_denials(&self.store, attempt_id) {
+        let checkout_scope = self.checkout_scope(attempt_id).map_err(|error| {
+            release_permit(error, "checkout authority could not be established")
+        })?;
+        let mut read_denials = match crate::trip::setup_target_read_denials(&self.store, attempt_id)
+        {
             Ok(paths) => paths,
             Err(error) => {
                 return Err(release_permit(
@@ -4126,6 +4201,9 @@ impl Application {
                 ))
             }
         };
+        if let Some(scope) = &checkout_scope {
+            read_denials = serde_json::from_value(scope["protected_roots"].clone())?;
+        }
         if runtime_probe_policy.is_some() && !read_denials.is_empty() {
             return Err(release_permit(
                 anyhow!("runtime probe launch cannot inherit setup target read denials"),
@@ -4169,10 +4247,19 @@ impl Application {
                 &self.store.compatibility_bundles,
             )
         };
-        let launch = match prepared_launch {
+        let mut launch = match prepared_launch {
             Ok(launch) => launch,
             Err(error) => return Err(release_permit(error, "provider launch preparation failed")),
         };
+        if let Some(scope) = &checkout_scope {
+            let policy = self
+                .main_readonly_policy(attempt_id, role, scope)
+                .map_err(|error| {
+                    release_permit(error, "Main read-only command preparation failed")
+                })?;
+            providers::bind_checkout_launch(&mut launch, scope, policy.as_ref())
+                .map_err(|error| release_permit(error, "Main checkout launch binding failed"))?;
+        }
         if runtime_probe_policy.is_some() {
             if let Err(error) = crate::trip::require_runtime_probe_launch_policy(
                 &self.store,
@@ -4186,12 +4273,16 @@ impl Application {
                 ));
             }
         }
+        let prompt_hash = launch.request_prompt_hash(prompt).map_err(|error| {
+            release_permit(error, "prepared provider request differs from launch input")
+        })?;
         let reservation = if let Some(receipt) = browser_receipt {
             if let Some(fresh_resume_rejection) = fresh_resume_rejection {
                 self.store
                     .reserve_role_invocation_with_browser_receipt_and_fresh_rejection(
                         &context,
                         &launch.config,
+                        &prompt_hash,
                         receipt,
                         fresh_resume_rejection,
                     )
@@ -4199,12 +4290,13 @@ impl Application {
                 self.store.reserve_role_invocation_with_browser_receipt(
                     &context,
                     &launch.config,
+                    &prompt_hash,
                     receipt,
                 )
             }
         } else {
             self.store
-                .reserve_role_invocation(&context, &launch.config)
+                .reserve_role_invocation_with_prompt_hash(&context, &launch.config, &prompt_hash)
                 .map(|()| BrowserLaunchReservation::Reserved)
         };
         match reservation {
@@ -4218,6 +4310,14 @@ impl Application {
                     "authoritative role reservation rejected",
                 ));
             }
+        }
+        if self.checkout_scope(attempt_id)? != checkout_scope {
+            let error = anyhow!(
+                "Checkout protections changed after reservation; no role process was started"
+            );
+            self.store
+                .update_session_launch_failed(&context.session_id, &error.to_string())?;
+            return Err(error);
         }
         if let Some((cell, operation, hash)) = validation {
             self.store
@@ -4911,7 +5011,37 @@ impl Application {
             state => bail!("rework intent has unsupported state {state}"),
         }
         let workspace_id = uuid::Uuid::new_v4().to_string();
-        let destination = self.paths.artifacts.join("worktrees").join(attempt_id);
+        let (parent_path, parent_policy): (String, String) = self.store.lock()?.query_row(
+            "SELECT path,policy_json FROM workspaces WHERE attempt_id=?1",
+            params![parent],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut child_policy: serde_json::Value = serde_json::from_str(&parent_policy)?;
+        let borrowed = crate::workspace::policy_mode(&child_policy)?
+            == crate::domain::WorkspaceMode::MainCheckout;
+        let destination = if borrowed {
+            std::path::PathBuf::from(parent_path).canonicalize()?
+        } else {
+            self.paths.artifacts.join("worktrees").join(attempt_id)
+        };
+        if borrowed {
+            crate::workflow::validate_workspace_checkout(
+                &*self.store.lock()?,
+                &task,
+                &child_policy,
+            )?;
+            if child_policy["baseline_snapshot_id"].as_str().is_none() {
+                bail!("Main rework has no original checkout baseline")
+            }
+            child_policy
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("Main workspace policy must be an object"))?
+                .remove("main_verification");
+            child_policy["lineage_snapshot_id"] = snapshot.clone().into();
+            child_policy["rework_start_snapshot_id"] = snapshot.clone().into();
+        } else {
+            child_policy = serde_json::json!({"lineage_snapshot_id":snapshot,"no_auto_commit":true,"no_auto_merge":true});
+        }
         let base: String = {
             let connection = self.store.lock()?;
             connection.query_row(
@@ -4947,10 +5077,13 @@ impl Application {
             if reserved != 1 {
                 return Ok(false);
             }
-            transaction.execute("INSERT OR IGNORE INTO workspaces(id,attempt_id,repository_identity,path,base_revision,worktree_head,policy_json,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5,?6,'reserved',?7,?7)",params![workspace_id,attempt_id,identity,destination.to_string_lossy(),base,serde_json::json!({"lineage_snapshot_id":snapshot,"no_auto_commit":true,"no_auto_merge":true}).to_string(),now])?;
+            if borrowed {
+                crate::workflow::validate_workspace_checkout(&transaction, &task, &child_policy)?;
+            }
+            transaction.execute("INSERT OR IGNORE INTO workspaces(id,attempt_id,repository_identity,path,base_revision,worktree_head,policy_json,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5,?6,'reserved',?7,?7)",params![workspace_id,attempt_id,identity,destination.to_string_lossy(),base,child_policy.to_string(),now])?;
             transaction.commit()?;
         }
-        let materialized = if destination.exists() {
+        let materialized = if borrowed || destination.exists() {
             self.reviews.verify_rework_source(&intent, &destination)
         } else {
             self.reviews
@@ -5036,6 +5169,20 @@ impl Application {
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let finished = chrono::Utc::now().to_rfc3339();
+        if borrowed {
+            crate::workflow::validate_workspace_checkout(&transaction, &task, &child_policy)?;
+            let policy: String = transaction.query_row(
+                "SELECT policy_json FROM workspaces WHERE attempt_id=?1",
+                params![attempt_id],
+                |row| row.get(0),
+            )?;
+            let policy: serde_json::Value = serde_json::from_str(&policy)?;
+            if policy["checkout_authorization"] != child_policy["checkout_authorization"]
+                || policy["baseline_snapshot_id"] != child_policy["baseline_snapshot_id"]
+            {
+                bail!("Main rework authority or original baseline changed before claim transfer")
+            }
+        }
         let eligible: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM rework_intents ri
              JOIN attempts a ON a.id=ri.new_attempt_id JOIN tasks t ON t.id=a.task_id
@@ -5705,6 +5852,7 @@ impl Application {
                 session_id,
                 transcript_epoch,
             }),
+            false,
         )?;
         let stored = self
             .store
@@ -5730,6 +5878,7 @@ impl Application {
             Some(crate::workflow::SingleAgentResumeMode::Automatic),
             message,
             None,
+            false,
         )
     }
 
@@ -5737,7 +5886,459 @@ impl Application {
     /// conversation. The reservation rechecks every launch condition; a later
     /// launch of the same run is refused because its conversation is retained.
     pub fn dispatch_single_agent(&self, attempt_id: &str) -> Result<serde_json::Value> {
-        self.launch_single_agent_turn(attempt_id, None, None, None)
+        self.launch_single_agent_turn(attempt_id, None, None, None, false)
+    }
+
+    fn checkout_scope(&self, attempt_id: &str) -> Result<Option<serde_json::Value>> {
+        let policy = {
+            let connection = self.store.lock()?;
+            let (task, policy): (String, Option<String>) = connection.query_row(
+                "SELECT a.task_id,w.policy_json FROM attempts a
+                LEFT JOIN workspaces w ON w.attempt_id=a.id WHERE a.id=?1",
+                rusqlite::params![attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let Some(policy) = policy else {
+                if crate::workflow::task_workspace_mode(&connection, &task)?
+                    == crate::domain::WorkspaceMode::MainCheckout
+                {
+                    bail!("Main execution requires its prepared borrowed checkout before launch or resume")
+                }
+                return Ok(None);
+            };
+            let policy: serde_json::Value = serde_json::from_str(&policy)?;
+            crate::workflow::validate_workspace_checkout(&connection, &task, &policy)?;
+            policy
+        };
+        if crate::workspace::policy_mode(&policy)? != crate::domain::WorkspaceMode::MainCheckout {
+            return Ok(None);
+        }
+        let scope = providers::checkout_launch_scope(
+            &policy,
+            &self.paths.root,
+            &self.paths.role_socket,
+            &self.store.repository_inventory()?,
+            &self.executable,
+        )?;
+        self.store.check_checkout_preparation(Some(&scope))?;
+        Ok(Some(scope))
+    }
+
+    fn main_readonly_policy(
+        &self,
+        attempt: &str,
+        role: crate::domain::RoleKind,
+        scope: &serde_json::Value,
+    ) -> Result<Option<providers::RuntimeProbeCommandPolicy>> {
+        if role == crate::domain::RoleKind::Implementer {
+            return Ok(None);
+        }
+        let payload =
+            crate::store::main_readonly_control_payload_in(&*self.store.lock()?, attempt, role)?
+                .context("Verify this Main read-only role before preparing its native commands")?;
+        providers::require_main_protection_partition(&payload["scope"])?;
+        let request = providers::main_checkout_observation_request(scope, &self.paths.database)?;
+        let policy = providers::main_readonly_command_policy(
+            scope,
+            &request,
+            &payload["readonly_probe_paths"],
+        )?;
+        if payload["scope"] != *scope
+            || payload["observation_request"] != request
+            || payload["scope_hash"].as_str() != Some(json_hash(scope)?.as_str())
+            || payload["observation_request_hash"].as_str() != Some(json_hash(&request)?.as_str())
+            || payload["readonly_command_policy"] != serde_json::to_value(&policy)?
+        {
+            bail!("The frozen Main read-only commands or protections changed; verify the current scope again")
+        }
+        Ok(Some(policy))
+    }
+
+    fn settle_main_checkout_verification(&self) -> Result<Option<serde_json::Value>> {
+        use rusqlite::{params, OptionalExtension};
+        let pending: Option<(String,String,String)> = self.store.lock()?.query_row("SELECT c.id,c.attempt_id,c.payload_json FROM controls c
+            JOIN workspaces w ON w.attempt_id=c.attempt_id AND w.state='ready' WHERE c.kind='main_checkout_verify'
+            AND (c.state IN ('native_requested','native_running','native_stopping')
+              OR (c.state='awaiting_native_evidence' AND (EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
+                  WHERE a.id=c.attempt_id AND t.lifecycle='cancelled')
+                OR EXISTS(SELECT 1 FROM controls stop WHERE stop.attempt_id=c.attempt_id
+                  AND stop.kind IN ('cancel','pause_now','pause_after_role') AND stop.state IN ('requested','draining')))))
+            ORDER BY c.created_at,c.rowid LIMIT 1",
+            [], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+        let Some((control, attempt, json)) = pending else {
+            return Ok(None);
+        };
+        let mut payload: serde_json::Value = serde_json::from_str(&json)?;
+        let task = payload["task_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Verification has no task"))?
+            .to_owned();
+        let actor = payload["actor"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Verification has no actor"))?
+            .to_owned();
+        let nonce = payload["nonce"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Verification has no nonce"))?
+            .to_owned();
+        let probe = payload["probe_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Verification has no owned output identity"))?
+            .to_owned();
+        if [nonce.as_str(), probe.as_str()]
+            .iter()
+            .any(|value| value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            bail!("Malformed Main verification output binding")
+        }
+        let expired = payload["deadline_at"]
+            .as_str()
+            .is_none_or(|deadline| deadline <= Utc::now().to_rfc3339().as_str());
+        let cancelled: bool=self.store.lock()?.query_row("SELECT t.lifecycle='cancelled' OR EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
+            AND kind IN ('cancel','pause_now','pause_after_role') AND state IN ('requested','draining')) FROM tasks t WHERE t.id=?2",
+            params![attempt,task], |row|row.get(0))?;
+        let turns = payload["turns_reserved"].as_u64().unwrap_or(0);
+        let evidence_pending: bool = self.store.lock()?.query_row(
+            "SELECT state='awaiting_native_evidence' FROM controls WHERE id=?1",
+            params![control],
+            |row| row.get(0),
+        )?;
+        if evidence_pending && !cancelled {
+            return Ok(None);
+        }
+        if turns == 0 && !expired && !cancelled {
+            let root = self
+                .checkout_scope(&attempt)?
+                .ok_or_else(|| anyhow!("Verification lost Main scope"))?;
+            let path = std::path::Path::new(root["root"].as_str().unwrap())
+                .join(format!(".llmrelay-main-{probe}-first"));
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => bail!(
+                    "Verification output {} already exists; cancel without overwriting it",
+                    path.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Cannot inspect verification output {}", path.display())
+                    })
+                }
+            }
+            let request =
+                providers::main_checkout_observation_request(&root, &self.paths.database)?;
+            payload["observation_request_hash"] = json_hash(&request)?.into();
+            payload["observation_request"] = request.clone();
+            payload["scope"] = root.clone();
+            payload["scope_hash"] = json_hash(&root)?.into();
+            let writable = actor == "single_agent" || actor == "implementer";
+            let readonly_probes = if writable {
+                String::new()
+            } else {
+                let compound = format!(".llmrelay-main-{probe}-compound");
+                let redirect = format!(".llmrelay-main-{probe}-redirect");
+                for name in [&compound, &redirect] {
+                    let artifact = std::path::Path::new(root["root"].as_str().unwrap()).join(name);
+                    match std::fs::symlink_metadata(&artifact) {
+                        Ok(_) => bail!("Read-only verification output {} already exists; cancel without overwriting it",artifact.display()),
+                        Err(error) if error.kind()==std::io::ErrorKind::NotFound => {},
+                        Err(error) => return Err(error).with_context(||format!("Cannot inspect read-only verification output {}",artifact.display())),
+                    }
+                }
+                payload["readonly_probe_paths"] = serde_json::json!([
+                    format!(".llmrelay-main-{probe}-first"),
+                    compound,
+                    redirect
+                ]);
+                let policy = providers::main_readonly_command_policy(
+                    &root,
+                    &request,
+                    &payload["readonly_probe_paths"],
+                )?;
+                payload["readonly_command_policy"] = serde_json::to_value(&policy)?;
+                format!("Remain read-only: writing tools are disabled. Run only these four exact commands once each and preserve their native tool results:\n{}\nThe three write probes use fixed harmless bytes, not the conversation nonce. If a probe leaves an artifact, report its exact path without deleting or resetting it.",
+                    policy.commands.iter().map(|entry|entry.command.as_str()).collect::<Vec<_>>().join("\n"))
+            };
+            let command = request["command"].as_str().unwrap();
+            let action = if writable {
+                format!("Retain the nonce in this native conversation. Use the native file tool to write exactly {nonce} followed by a single LF newline, with no other bytes, to .llmrelay-main-{probe}-first. Run this exact harmless boundary command once:\n{command}")
+            } else {
+                format!("Remember {nonce} only in this native conversation. {readonly_probes}")
+            };
+            let prompt=format!("LLMRelay Main verification first. This is only the authorized permission check; do not implement the task or submit a completion report. {action}\nThe boundary command only opens and closes paths without reading, creating, truncating or writing bytes, and connects then closes without an application protocol request. Preserve actual native commands and tool results. Do not print contents, enumerate directories, read credentials, send app-control requests, install runtimes, bypass a refusal or retry. Missing paths/runtime, tool refusal, connection failure, narration and unchanged files do not prove OS denial; report them as unavailable. Finish this turn and wait.");
+            payload["prompt_hash"] = json_hash(&prompt)?.into();
+            let connection = self.store.lock()?;
+            connection.execute(
+                "UPDATE controls SET payload_json=?1 WHERE id=?2 AND state='native_requested'",
+                params![payload.to_string(), control],
+            )?;
+            connection.execute("UPDATE attempts SET status='running' WHERE id=?1 AND status IN ('held','needs_input')",params![attempt])?;
+            connection.execute("UPDATE tasks SET attention='none' WHERE id=?1 AND attention IN ('paused','needs_input')",params![task])?;
+            drop(connection);
+            let launch = if actor == "single_agent" {
+                self.launch_single_agent_turn(&attempt, None, Some(&prompt), None, true)?
+            } else {
+                let role = actor.parse().map_err(|error: String| anyhow!(error))?;
+                let launched = self.dispatch_role(&attempt, role, &prompt, None)?;
+                serde_json::to_value(launched)?
+            };
+            self.hold_main_verification(&control, &attempt, &task)?;
+            return Ok(Some(
+                serde_json::json!({"action":"main_verification_started","control_id":control,"launch":launch}),
+            ));
+        }
+        if turns == 0 {
+            self.store.lock()?.execute("UPDATE controls SET state='cancelled',updated_at=?1 WHERE id=?2 AND state='native_requested'",params![Utc::now().to_rfc3339(),control])?;
+            return Ok(Some(
+                serde_json::json!({"action":"main_verification_not_started","expired":expired,"control_id":control}),
+            ));
+        }
+        let session = payload["session_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Verification reservation lost its session"))?
+            .to_owned();
+        self.supervisor.reconcile()?;
+        let record = self.store.session_json(&session)?;
+        if record["transcript_epoch"] != payload["transcript_epoch"]
+            || record["role_generation_id"] != payload["role_generation_id"]
+        {
+            let nondelivery: bool = self.store.lock()?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM resume_invocations WHERE session_id=?1
+                AND transcript_epoch=?2 AND state='proven_nondelivery')",
+                params![session, payload["transcript_epoch"].as_str()],
+                |row| row.get(0),
+            )?;
+            if nondelivery
+                && record["role_generation_id"] == payload["role_generation_id"]
+                && record["status"] == "exited"
+                && record["exit"]["process_group_quiescent"] == true
+            {
+                self.store.lock()?.execute(
+                    "UPDATE controls SET state='failed',updated_at=?1 WHERE id=?2",
+                    params![Utc::now().to_rfc3339(), control],
+                )?;
+                return Ok(Some(
+                    serde_json::json!({"action":"main_verification_failed","session_id":session,"proven_nondelivery":true,"retry_started":false}),
+                ));
+            }
+            bail!("This Main verification no longer owns the recorded turn. Reconcile its exact reservation before any stop or additional provider call.")
+        }
+        if record["status"] == "launch_failed" {
+            let mut connection = self.store.lock()?;
+            let tx =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute(
+                "UPDATE controls SET state='failed',updated_at=?1 WHERE id=?2",
+                params![Utc::now().to_rfc3339(), control],
+            )?;
+            tx.execute("UPDATE attempts SET status='needs_input' WHERE id=?1 AND status IN ('running','held')",params![attempt])?;
+            tx.execute(
+                "UPDATE tasks SET attention='needs_input' WHERE id=?1 AND lifecycle='in_progress'",
+                params![task],
+            )?;
+            tx.commit()?;
+            return Ok(Some(
+                serde_json::json!({"action":"main_verification_failed","session_id":session,"retry_started":false,"reason":record["launch_error"]}),
+            ));
+        }
+        if record["status"] != "exited" || record["exit"]["process_group_quiescent"] != true {
+            let idle: bool=self.store.lock()?.query_row("SELECT s.readiness_state='idle_candidate' AND s.native_session_id IS NOT NULL
+                AND EXISTS(SELECT 1 FROM hook_events h JOIN audit_events a ON a.entity_id=s.id AND json_extract(a.detail_json,'$.hook_event_id')=h.id
+                WHERE h.session_id=s.id AND h.event_name='Stop' AND h.native_session_id=s.native_session_id
+                  AND a.event_code='provider.hook.received' AND json_extract(a.detail_json,'$.safe_idle_boundary')=1
+                  AND h.rowid>COALESCE((SELECT hook_event_boundary_rowid FROM resume_invocations WHERE session_id=s.id
+                    AND transcript_epoch=s.transcript_epoch),0)) FROM sessions s WHERE s.id=?1",params![session], |row|row.get(0))?;
+            if (expired || cancelled || idle)
+                && payload["stop_requested_turn"].as_u64() != Some(turns)
+            {
+                payload["stop_requested_turn"] = turns.into();
+                let changed = self.store.lock()?.execute(
+                    "UPDATE controls SET state='native_stopping',payload_json=?1,updated_at=?2
+                    WHERE id=?3 AND payload_json=?4",
+                    params![payload.to_string(), Utc::now().to_rfc3339(), control, json],
+                )?;
+                if changed == 1 {
+                    let stop = self.store.session_owner(&session).and_then(|owner| {
+                        if owner
+                            != SessionOwner::RoleGeneration(
+                                payload["role_generation_id"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .into(),
+                            )
+                        {
+                            bail!("Verification owner changed before stop")
+                        }
+                        self.supervisor.interrupt(&session)
+                    });
+                    if let Err(error) = stop {
+                        payload["stop_error"] = format!("{error:#}").into();
+                        self.store.lock()?.execute(
+                            "UPDATE controls SET payload_json=?1 WHERE id=?2",
+                            params![payload.to_string(), control],
+                        )?;
+                    }
+                }
+            }
+            return Ok(Some(
+                serde_json::json!({"action":"waiting","for":"main_verification_quiescence","session_id":session,"expired":expired}),
+            ));
+        }
+        if expired || cancelled {
+            self.store.lock()?.execute(
+                "UPDATE controls SET state='cancelled',updated_at=?1 WHERE id=?2",
+                params![Utc::now().to_rfc3339(), control],
+            )?;
+            return Ok(Some(
+                serde_json::json!({"action":"main_verification_stopped","expired":expired,"session_id":session,"success_proof":false}),
+            ));
+        }
+        let completed_turn: bool=self.store.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM hook_events h JOIN audit_events a
+            ON a.entity_id=s.id AND json_extract(a.detail_json,'$.hook_event_id')=h.id WHERE h.session_id=s.id
+            AND h.event_name='Stop' AND h.native_session_id=s.native_session_id AND a.event_code='provider.hook.received'
+            AND json_extract(a.detail_json,'$.safe_idle_boundary')=1 AND h.rowid>COALESCE((SELECT hook_event_boundary_rowid
+                FROM resume_invocations WHERE session_id=s.id AND transcript_epoch=s.transcript_epoch),0)) FROM sessions s WHERE s.id=?1",
+            params![session], |row|row.get(0))?;
+        if !completed_turn {
+            bail!("Main verification stopped without an authenticated complete turn; no retained call or success proof was started")
+        }
+        let root = self
+            .checkout_scope(&attempt)?
+            .ok_or_else(|| anyhow!("Verification lost Main checkout authority"))?;
+        providers::require_main_protection_partition(&payload["scope"])?;
+        if payload["scope"] != root {
+            bail!("Checkout protections changed during Main verification; no proof was published")
+        }
+        let writable = actor == "single_agent" || actor == "implementer";
+        let filename = format!(
+            ".llmrelay-main-{probe}-{}",
+            if turns == 1 { "first" } else { "recall" }
+        );
+        let path = std::path::Path::new(root["root"].as_str().unwrap()).join(&filename);
+        let observed = if writable {
+            remove_owned_verification_output(&path, &nonce)?
+        } else {
+            for name in payload["readonly_probe_paths"]
+                .as_array()
+                .context("Read-only verification lost its probe paths")?
+            {
+                let artifact = std::path::Path::new(root["root"].as_str().unwrap())
+                    .join(name.as_str().context("Invalid readonly probe path")?);
+                match std::fs::symlink_metadata(&artifact) {
+                    Ok(_) => bail!("Read-only probe left artifact {}; preserve it for review, no file was deleted",artifact.display()),
+                    Err(error) if error.kind()==std::io::ErrorKind::NotFound => {},
+                    Err(error) => return Err(error).with_context(||format!("Cannot inspect read-only probe {}",artifact.display())),
+                }
+            }
+            true
+        };
+        if !observed {
+            bail!("Main verification did not produce the exact owned nonce result; no success proof was published")
+        }
+        let first = turns == 1;
+        payload[if first {
+            "first_turn_complete"
+        } else {
+            "retained_turn_complete"
+        }] = true.into();
+        payload[if first {
+            "first_file_observed"
+        } else {
+            "retained_recall_observed"
+        }] = writable.into();
+        if first && payload["max_turns"].as_u64() == Some(2) {
+            let recall_path = std::path::Path::new(root["root"].as_str().unwrap())
+                .join(format!(".llmrelay-main-{probe}-recall"));
+            if writable && std::fs::symlink_metadata(recall_path).is_ok() {
+                bail!("The retained verification output already exists; no replacement or overwrite was authorized")
+            }
+            let recall = if writable {
+                format!("Recall the earlier nonce from conversation memory into .llmrelay-main-{probe}-recall using the native file tool; write the remembered nonce followed by a single LF newline, with no other bytes.")
+            } else {
+                "Remain read-only. State the remembered nonce in your final answer for independent native UI review. Do not run tools or attempt any file write.".into()
+            };
+            let prompt=format!("LLMRelay Main verification recall. Continue only this diagnostic in the same native conversation. {recall} Do not read prior files, transcripts or fixture records. Finish and wait; do not implement, submit a result, bypass a denial or retry.");
+            payload["prompt_hash"] = json_hash(&prompt)?.into();
+            payload["phase"] = "recall".into();
+            self.store.lock()?.execute(
+                "UPDATE controls SET state='native_running',payload_json=?1 WHERE id=?2",
+                params![payload.to_string(), control],
+            )?;
+            if actor == "single_agent" {
+                let connection = self.store.lock()?;
+                connection.execute(
+                    "UPDATE attempts SET status='needs_input' WHERE id=?1",
+                    params![attempt],
+                )?;
+                connection.execute(
+                    "UPDATE tasks SET attention='needs_input' WHERE id=?1",
+                    params![task],
+                )?;
+                drop(connection);
+                self.launch_single_agent_turn(
+                    &attempt,
+                    Some(crate::workflow::SingleAgentResumeMode::Explicit),
+                    Some(&prompt),
+                    None,
+                    true,
+                )?;
+            } else {
+                let connection = self.store.lock()?;
+                connection.execute(
+                    "UPDATE attempts SET status='running' WHERE id=?1 AND status='held'",
+                    params![attempt],
+                )?;
+                connection.execute(
+                    "UPDATE tasks SET attention='none' WHERE id=?1 AND attention='paused'",
+                    params![task],
+                )?;
+                drop(connection);
+                self.resume_role_session_inner(&session, &prompt, None, false, None)?;
+            }
+            self.hold_main_verification(&control, &attempt, &task)?;
+            return Ok(Some(
+                serde_json::json!({"action":"main_verification_resume_started","session_id":session}),
+            ));
+        }
+        if payload["max_turns"] == 1 {
+            payload["retained_recall_observed"] = false.into();
+        }
+        payload["completed_at"] = Utc::now().to_rfc3339().into();
+        let mut connection = self.store.lock()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute("UPDATE controls SET state='awaiting_native_evidence',payload_json=?1,updated_at=?2 WHERE id=?3",params![payload.to_string(),Utc::now().to_rfc3339(),control])?;
+        transaction.execute(
+            "UPDATE attempts SET status='needs_input' WHERE id=?1 AND status IN ('running','held')",
+            params![attempt],
+        )?;
+        transaction.execute(
+            "UPDATE tasks SET attention='needs_input' WHERE id=?1",
+            params![task],
+        )?;
+        transaction.commit()?;
+        Ok(Some(
+            serde_json::json!({"action":"main_verification_requires_native_evidence","session_id":session,
+            "message":"Inspect exact native protected-root denial evidence and record it with capability record-proof. File/recall observations alone do not qualify Main permissions."}),
+        ))
+    }
+
+    fn hold_main_verification(&self, control: &str, attempt: &str, task: &str) -> Result<()> {
+        let mut connection = self.store.lock()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM controls WHERE id=?1 AND attempt_id=?2 AND state='native_running')",rusqlite::params![control,attempt], |row|row.get(0))?;
+        if !current {
+            bail!("Main verification ownership changed after dispatch")
+        }
+        tx.execute(
+            "UPDATE attempts SET status='held' WHERE id=?1 AND status='running'",
+            rusqlite::params![attempt],
+        )?;
+        tx.execute(
+            "UPDATE tasks SET attention='paused' WHERE id=?1 AND attention='none'",
+            rusqlite::params![task],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn launch_single_agent_turn(
@@ -5746,6 +6347,7 @@ impl Application {
         resume: Option<crate::workflow::SingleAgentResumeMode>,
         message: Option<&str>,
         human: Option<&crate::store::SingleAgentResumeBinding<'_>>,
+        verification: bool,
     ) -> Result<serde_json::Value> {
         self.store
             .require_execution_unheld("Single agent launches")?;
@@ -5756,14 +6358,33 @@ impl Application {
             let connection = self.store.lock()?;
             crate::store::require_failure_stop_released(&connection, attempt_id)?;
         }
-        let context = match resume {
-            Some(mode) => self.store.single_agent_resume_context(attempt_id, mode)?,
-            None => self.store.single_agent_launch_context(attempt_id)?,
+        let context = if verification {
+            self.store
+                .single_agent_verification_context(attempt_id, resume.is_some())?
+        } else {
+            match resume {
+                Some(mode) => self.store.single_agent_resume_context(attempt_id, mode)?,
+                None => self.store.single_agent_launch_context(attempt_id)?,
+            }
         };
-        let prompt = match (
+        let verified_main_resume = if let Some(target) = context.resume.as_ref() {
+            !verification && self.store.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM controls WHERE kind='main_checkout_verify'
+                AND state='finished' AND json_extract(payload_json,'$.session_id')=?1 AND COALESCE(json_extract(payload_json,'$.coding_started'),0)=0)",rusqlite::params![target.session_id], |row|row.get::<_,bool>(0))?
+        } else {
+            false
+        };
+        let prompt = if verification {
+            message
+                .ok_or_else(|| anyhow!("Main verification omitted its exact prompt"))?
+                .to_owned()
+        } else {
+            match (
             &context.resume,
             message.map(str::trim).filter(|text| !text.is_empty()),
         ) {
+            (Some(_), guidance) if verified_main_resume => format!("{}\nRun binding: {}\nProfile revision: {}\nThe project permission diagnostic is complete. Begin the actual task from authenticated role context. Profile instructions: {}\n{}",
+                crate::workflow_resources::SINGLE_AGENT_PROMPT.trim(),context.attempt_id,context.profile_revision_id,context.instructions_text,
+                guidance.map(|text|format!("A person added: {text}")).unwrap_or_default()),
             (Some(_), Some(text)) => format!("A person answered while you were stopped:\n{text}"),
             (Some(_), None) => HOST_RESTART_RESUME_NOTICE.to_owned(),
             (None, _) => {
@@ -5779,7 +6400,9 @@ impl Application {
                 }
                 prompt
             }
+        }
         };
+        let checkout_scope = self.checkout_scope(attempt_id)?;
         let executable = self.executable.canonicalize()?;
         let mut prepared =
             providers::prepare_single_agent_launch(&providers::SingleAgentLaunchRequest {
@@ -5801,6 +6424,7 @@ impl Application {
                 assets: &self.hooks,
                 executable_path: &executable,
                 bundles: &self.store.compatibility_bundles,
+                checkout_scope: checkout_scope.as_ref(),
             })?;
         prepared.record["prompt_hash"] = serde_json::json!(json_hash(&prompt)?);
         match resume {
@@ -5810,6 +6434,21 @@ impl Application {
             None => self
                 .store
                 .reserve_single_agent_invocation(&context, &prepared)?,
+        }
+        if self.checkout_scope(attempt_id)? != checkout_scope {
+            let error = anyhow!(
+                "The checkout protections changed after reservation; no process was started"
+            );
+            if resume.is_some() {
+                self.store.restore_resume_after_proven_nondelivery(
+                    &context.session_id,
+                    &error.to_string(),
+                )?;
+            } else {
+                self.store
+                    .update_session_launch_failed(&context.session_id, &error.to_string())?;
+            }
+            return Err(error);
         }
         let process = if self.synthetic_dispatch_for_tests {
             self.store.mark_session_spawning(
@@ -5870,11 +6509,40 @@ impl Application {
 }
 
 const PROVIDER_CHECK_PREFIX: &str = "LLMRELAY-CHECK-";
+
+fn remove_owned_verification_output(path: &std::path::Path, nonce: &str) -> Result<bool> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let expected = format!("{nonce}\n");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.len() != expected.len() as u64
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Ok(false);
+    }
+    let mut bytes = Vec::new();
+    file.by_ref().take(129).read_to_end(&mut bytes)?;
+    let current = std::fs::symlink_metadata(path)?;
+    if bytes != expected.as_bytes()
+        || current.ino() != metadata.ino()
+        || current.dev() != metadata.dev()
+        || current.nlink() != 1
+    {
+        return Ok(false);
+    }
+    std::fs::remove_file(path)?;
+    Ok(true)
+}
 const MAX_PROVIDER_CHECK_PAGES: usize = 32;
 
-/// A fresh provider-check prompt and the exact answer it asks for. Only the
-/// model can turn the lowercase nonce in the prompt into the uppercase
-/// answer, so an echoed prompt never counts as a reply.
+// Echoing the lowercase prompt cannot satisfy a historical nonce check.
+#[cfg(test)]
 pub(crate) fn provider_check_challenge() -> (String, String) {
     let nonce = uuid::Uuid::new_v4().simple().to_string();
     let answer = format!("{PROVIDER_CHECK_PREFIX}{nonce}").to_ascii_uppercase();
@@ -5912,9 +6580,6 @@ fn codex_setup_unconfirmed(error: &anyhow::Error) -> String {
     format!("Codex's local setup could not be confirmed for checks: {error:#}. Fix what this reports, then preview again.")
 }
 
-/// App-wide provider checks: local inspection, an optional nonce-only model
-/// call from an empty app folder, and settlement. They share the supervisor
-/// and session capacity with roles but belong to no project.
 impl Application {
     fn provider_validation_root(&self) -> Result<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
@@ -5942,6 +6607,7 @@ impl Application {
                 Ok(providers::claude::inspect_observation_account())
             }
         };
+        #[cfg(test)]
         let policy = installation
             .as_ref()
             .map_err(Clone::clone)
@@ -5960,6 +6626,7 @@ impl Application {
             provider,
             installation,
             account,
+            #[cfg(test)]
             policy,
             catalog: (catalog.state != "unavailable").then(|| {
                 catalog
@@ -6002,14 +6669,7 @@ impl Application {
         &self,
         request: &crate::domain::ProviderValidationStartRequest,
     ) -> Result<crate::domain::ProviderValidationBatchDto> {
-        // A replay settles first: local inspection may fail now even though
-        // the exact request already has an outcome.
-        if let Some(outcome) = self.store.provider_validation_start_outcome(request)? {
-            return crate::store::started_provider_batch(outcome);
-        }
-        let inspections = self.inspect_selected_providers(&request.selections)?;
-        self.store
-            .start_provider_validation(request, &inspections, self.dispatch_enabled())
+        self.store.start_provider_validation(request)
     }
 
     /// Returns the exact request's batch, or closes a request that never
@@ -6046,149 +6706,45 @@ impl Application {
         self.store.provider_validation_batch(batch_id)
     }
 
-    /// Launches at most one pending check. The coordinator calls this only
-    /// after service-wide holds and inventory checks; project task-pickup
-    /// pauses never apply to it.
     pub(crate) fn dispatch_one_provider_check(&self) -> Result<Option<serde_json::Value>> {
-        let pending = self.store.pending_provider_checks()?;
-        if pending.is_empty() {
-            return Ok(None);
-        }
-        let scope_root = self.provider_validation_root()?;
-        for check in pending {
-            if !self
-                .store
-                .provider_check_capacity_available(check.provider)?
-            {
-                continue;
-            }
-            let inspection = self.inspect_provider(check.provider, &scope_root);
-            if let Some(value) = self.dispatch_provider_check(&check, &inspection)? {
-                return Ok(Some(value));
+        for check in self.store.pending_provider_checks()? {
+            if self.store.skip_provider_check(
+                &check.invocation_id,
+                crate::store::PROVIDER_CHECK_PROJECT_REQUIRED,
+            )? {
+                return Ok(Some(serde_json::json!({
+                    "action": "provider_check_skipped",
+                    "provider_validation_invocation_id": check.invocation_id,
+                    "reason": crate::store::PROVIDER_CHECK_PROJECT_REQUIRED,
+                })));
             }
         }
         Ok(None)
     }
 
-    /// Runs one check with the exact inputs the user previewed. Any changed
-    /// input or missing qualification skips it; nothing is substituted.
-    pub(crate) fn dispatch_provider_check(
-        &self,
-        check: &crate::store::PendingProviderCheck,
-        inspection: &crate::store::ProviderLocalInspection,
-    ) -> Result<Option<serde_json::Value>> {
-        let skip = |reason: &str| -> Result<Option<serde_json::Value>> {
-            Ok(self
-                .store
-                .skip_provider_check(&check.invocation_id, reason)?
-                .then(|| serde_json::json!({"action":"provider_check_skipped","provider_validation_invocation_id":check.invocation_id,"reason":reason})))
-        };
-        let evidence = match inspection.evidence() {
-            Ok(evidence) => evidence,
-            Err(reason) => return skip(&reason),
-        };
-        let (Ok(installation), Ok(policy)) = (&inspection.installation, &inspection.policy) else {
-            bail!("provider evidence exists without its installation and policy")
-        };
-        if let Some(reason) = policy.native_calls_disabled_reason() {
-            return skip(reason);
-        }
-        if evidence.model_access_key(&check.model, &check.effort)? != check.evidence_key {
-            return skip("The provider's installation, sign-in or configuration changed after the preview. Preview again to check it.");
-        }
-        let scope = self.provider_validation_root()?.join(&check.invocation_id);
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            match std::fs::DirBuilder::new().mode(0o700).create(&scope) {
-                Ok(()) => {}
-                // Only an interrupted earlier dispatch of this check left it, still empty.
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::AlreadyExists
-                        && std::fs::read_dir(&scope)?.next().is_none() => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("create empty provider check folder {}", scope.display())
-                    })
-                }
-            }
-        }
-        let (prompt, answer) = provider_check_challenge();
-        let launch = match providers::prepare_observation_launch(
-            installation,
-            policy.clone(),
-            &check.model,
-            &check.effort,
-            &scope,
-            &prompt,
-            &self.executable,
-        ) {
-            Ok(launch) => launch,
-            Err(error) => {
-                let _ = std::fs::remove_dir(&scope);
-                return skip(&format!("LLMRelay could not prepare this check: {error:#}"));
-            }
-        };
-        let mut record = launch.record();
-        record["evidence"] = serde_json::to_value(&evidence)?;
-        let session_id = uuid::Uuid::new_v4().to_string();
-        let transcript_epoch = uuid::Uuid::new_v4().to_string();
-        let reserved = self.store.reserve_provider_validation_session(
-            &crate::store::ProviderValidationSessionReservation {
-                invocation_id: &check.invocation_id,
-                session_id: &session_id,
-                transcript_epoch: &transcript_epoch,
-                provider: check.provider,
-                executable_version: &installation.executable_version,
-                launch_json: &record.to_string(),
-                scope_root: &scope.to_string_lossy(),
-                nonce_hash: &hex::encode(sha2::Sha256::digest(answer.as_bytes())),
-            },
-        );
-        if !matches!(reserved, Ok(true)) {
-            let _ = std::fs::remove_dir(&scope);
-            return reserved.map(|_| None);
-        }
-        let owner = SessionOwner::ProviderValidationInvocation(check.invocation_id.clone());
-        let process = match self.supervisor.spawn_process(
-            &session_id,
-            &owner,
-            &transcript_epoch,
-            &launch.process(),
-        ) {
-            Ok(process) => process,
-            Err(error) => {
-                self.record_spawn_failure(&session_id, &error, false)?;
-                return Ok(Some(
-                    serde_json::json!({"action":"provider_check_launch_failed","provider_validation_invocation_id":check.invocation_id,"session_id":session_id,"reason":error.reason()}),
-                ));
-            }
-        };
-        // A cancel committed during spawn makes this fail; the call is then
-        // stopped and stays uncertain until its processes are gone.
-        if let Err(error) = self.store.update_session_running(
-            &session_id,
-            &transcript_epoch,
-            &serde_json::to_string(&process)?,
-        ) {
-            let stop = match self.supervisor.interrupt(&session_id) {
-                Ok(()) => String::new(),
-                Err(stop) => format!("; the stop signal was not confirmed ({stop:#})"),
-            };
-            self.store
-                .mark_session_delivery_ambiguous(&session_id, &format!("{error:#}{stop}"))?;
-            return Ok(Some(
-                serde_json::json!({"action":"provider_check_delivery_unknown","provider_validation_invocation_id":check.invocation_id,"session_id":session_id}),
-            ));
-        }
-        Ok(Some(
-            serde_json::json!({"action":"provider_check_started","provider_validation_invocation_id":check.invocation_id,"session_id":session_id}),
-        ))
-    }
-
-    /// Settles at most one launched check whose session stopped. An uncertain
-    /// session settles only after fresh proof that its processes are gone.
+    /// An expired check requests its stop once. Uncertain ownership settles
+    /// only after fresh proof that its processes are gone.
     pub(crate) fn settle_one_provider_check(&self) -> Result<Option<serde_json::Value>> {
-        use crate::store::ProviderCheckOutcome;
+        use crate::store::{ProviderCheckOutcome, PROVIDER_CHECK_TIMEOUT};
+        if let Some((session_id, owner)) = self.store.request_expired_provider_check_stop()? {
+            let stop = self.store.session_owner(&session_id).and_then(|current| {
+                if current != owner {
+                    bail!("provider-check stop owner changed")
+                }
+                self.supervisor.interrupt(&session_id)
+            });
+            if let Err(error) = stop {
+                self.store.record_provider_check_stop_failure(
+                    &session_id,
+                    &format!("{PROVIDER_CHECK_TIMEOUT} LLMRelay could not confirm the stop reached this check ({error:#}). Its result stays unknown until its processes are confirmed stopped."),
+                )?;
+            }
+            return Ok(Some(serde_json::json!({
+                "action": "provider_check_timeout_requested",
+                "provider_validation_invocation_id": owner.id(),
+                "session_id": session_id,
+            })));
+        }
         for check in self.store.unsettled_provider_checks()? {
             let mut exit_success = check.exit_success;
             if !check.quiescent {
@@ -6206,17 +6762,21 @@ impl Application {
                 }
                 exit_success &= check.session_exited;
             }
-            let outcome = if check.cancel_requested {
+            let outcome = if check.deadline_expired {
+                ProviderCheckOutcome::Cancelled(PROVIDER_CHECK_TIMEOUT)
+            } else if check.cancel_requested {
                 ProviderCheckOutcome::Cancelled("Cancelled. No result was recorded for this check.")
+            } else if check.challenge == crate::store::ProviderCheckChallenge::Invalid {
+                ProviderCheckOutcome::Failed(crate::store::PROVIDER_CHECK_PROJECT_REQUIRED)
             } else if !exit_success && !check.session_exited {
-                ProviderCheckOutcome::Failed("LLMRelay could not confirm this check finished normally. It was not retried; run the check again.")
+                ProviderCheckOutcome::Failed("LLMRelay could not confirm this historical check finished normally. It was not retried. Use Make Ready in a project for a new coding session.")
             } else if !exit_success {
-                ProviderCheckOutcome::Failed("The provider exited with an error before answering. Check its sign-in and the model name, then run the check again.")
+                ProviderCheckOutcome::Failed("The provider exited with an error before answering. Check its sign-in and model name, then use Make Ready in a project for a new coding session.")
             } else {
                 match self.provider_check_answered(&check) {
                     Ok(true) => ProviderCheckOutcome::Succeeded,
                     Ok(false) => ProviderCheckOutcome::Failed("The provider finished but did not return the expected answer. This model may not be available to this account."),
-                    Err(_) => ProviderCheckOutcome::Failed("LLMRelay could not read this check's output. Run the check again."),
+                    Err(_) => ProviderCheckOutcome::Failed("LLMRelay could not read this historical check's output. Use Make Ready in a project for a new coding session."),
                 }
             };
             if self
@@ -6243,6 +6803,9 @@ impl Application {
         let Some(expected) = check.nonce_hash.as_deref() else {
             return Ok(false);
         };
+        if check.challenge != crate::store::ProviderCheckChallenge::Answer {
+            return Ok(false);
+        }
         let mut frames = Vec::new();
         let mut after = 0;
         for _ in 0..MAX_PROVIDER_CHECK_PAGES {
@@ -6272,9 +6835,53 @@ impl Application {
 #[cfg(test)]
 mod provider_validation_tests {
     use super::*;
+
+    #[test]
+    fn main_checkout_verification_reads_and_removes_only_its_exact_regular_output() {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-main-output-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let expected = format!("{nonce}\n");
+        let target = root.join("user-file");
+        std::fs::write(&target, &expected).unwrap();
+        for case in [
+            "correct",
+            "wrong",
+            "missing_lf",
+            "crlf",
+            "extra_lf",
+            "space",
+            "symlink",
+            "hardlink",
+        ] {
+            let path = root.join(case);
+            match case {
+                "symlink" => std::os::unix::fs::symlink(&target, &path).unwrap(),
+                "hardlink" => std::fs::hard_link(&target, &path).unwrap(),
+                "wrong" => std::fs::write(&path, "fedcba9876543210fedcba9876543210\n").unwrap(),
+                "missing_lf" => std::fs::write(&path, nonce).unwrap(),
+                "crlf" => std::fs::write(&path, format!("{nonce}\r\n")).unwrap(),
+                "extra_lf" => std::fs::write(&path, format!("{nonce}\n\n")).unwrap(),
+                "space" => std::fs::write(&path, format!("{nonce} \n")).unwrap(),
+                _ => std::fs::write(&path, &expected).unwrap(),
+            }
+            let result = remove_owned_verification_output(&path, nonce);
+            if case == "correct" {
+                assert!(result.unwrap());
+                assert!(!path.exists());
+            } else {
+                assert!(!matches!(result, Ok(true)), "{case}");
+                assert!(std::fs::symlink_metadata(&path).is_ok());
+                std::fs::remove_file(path).unwrap();
+            }
+            assert_eq!(std::fs::read(&target).unwrap(), expected.as_bytes());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use crate::domain::Provider;
     use crate::store::provider_validation_tests::{
-        inspection, launch, policy_bundles, reserve_expecting, select, start,
+        historical_batch, inspection, launch, policy_bundles, reserve_expecting, select,
     };
     use crate::store::ProviderLocalInspection;
 
@@ -6355,7 +6962,7 @@ mod provider_validation_tests {
         );
         let wrong = format!("{PROVIDER_CHECK_PREFIX}{}\r\n", "F".repeat(32));
         let check_output = |session: &str, output: &str| {
-            let batch = start(
+            let batch = historical_batch(
                 &app.store,
                 session,
                 &[select(Provider::Claude, "model-a")],
@@ -6401,6 +7008,12 @@ mod provider_validation_tests {
             ("abnormal-exit", format!("{answer}\r\n"), false, "failed"),
         ] {
             let (batch_id, epoch) = check_output(session, &output);
+            if session == "exact" {
+                app.store.lock().unwrap().execute(
+                    "UPDATE sessions SET launch_config_json=json_remove(launch_config_json,'$.provider_check') WHERE id=?1",
+                    rusqlite::params![session],
+                ).unwrap();
+            }
             let exit = serde_json::json!({
                 "success": normal_exit, "process_group_quiescent": true
             });
@@ -6436,9 +7049,119 @@ mod provider_validation_tests {
     }
 
     #[test]
+    fn expired_provider_check_requests_only_its_owner_once_and_keeps_unknown_stop_visible() {
+        let (root, app, claude) = synthetic_app("deadline-stop");
+        let batch = historical_batch(
+            &app.store,
+            "deadline-stop",
+            &[
+                select(Provider::Claude, "model-a"),
+                select(Provider::Claude, "model-b"),
+            ],
+            &[claude.clone()],
+            2,
+        );
+        let pending = app.store.pending_provider_checks().unwrap();
+        for (check, session) in pending.iter().zip(["expired", "sibling"]) {
+            assert!(reserve_expecting(
+                &app.store, check, &claude, session, "hash"
+            ));
+            launch(&app.store, session);
+        }
+        let connection = app.store.lock().unwrap();
+        let (created, deadline): (String, String) = connection
+            .query_row(
+                "SELECT created_at,json_extract(launch_config_json,'$.provider_check.deadline_at') FROM sessions WHERE id='expired'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&deadline).unwrap()
+                - chrono::DateTime::parse_from_rfc3339(&created).unwrap(),
+            ChronoDuration::seconds(300),
+        );
+        connection.execute(
+            "UPDATE sessions SET launch_config_json=json_set(launch_config_json,'$.provider_check.deadline_at','2000-01-01T00:00:00Z') WHERE id='expired'",
+            [],
+        ).unwrap();
+        drop(connection);
+        let requested = app.settle_one_provider_check().unwrap().unwrap();
+        assert_eq!(requested["action"], "provider_check_timeout_requested");
+        assert_eq!(requested["session_id"], "expired");
+        assert_eq!(
+            requested["provider_validation_invocation_id"],
+            pending[0].invocation_id
+        );
+        let cancelled = app.store.provider_validation_batch(&batch.id).unwrap();
+        assert_eq!(cancelled.state, "running");
+        assert_eq!(cancelled.checks[0].state, "cancel_requested");
+        let reason = cancelled.checks[0].reason.as_deref().unwrap();
+        assert!(
+            reason.contains("five-minute limit")
+                && reason.contains("not attached to this service boot"),
+            "{reason}"
+        );
+        assert_eq!(cancelled.checks[1].state, "running");
+        let session = |store: &Store| -> (String, String, String, Option<String>, String, String) {
+            store.lock().unwrap().query_row(
+                "SELECT status,launch_config_json,transcript_epoch,process_identity_json,provider_validation_invocation_id,updated_at FROM sessions WHERE id='expired'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            ).unwrap()
+        };
+        let snapshot = session(&app.store);
+        assert_eq!(snapshot.0, "running");
+        assert_eq!(snapshot.4, pending[0].invocation_id);
+        assert_eq!(app.settle_one_provider_check().unwrap(), None);
+        assert_eq!(
+            app.store.provider_validation_batch(&batch.id).unwrap(),
+            cancelled
+        );
+        assert_eq!(session(&app.store), snapshot);
+        assert_eq!(model_proofs(&app), 0);
+
+        let reopened = Store::open(&app.paths.database).unwrap();
+        assert_eq!(session(&reopened), snapshot);
+        assert_eq!(
+            reopened.request_expired_provider_check_stop().unwrap(),
+            None
+        );
+        drop(reopened);
+        app.store
+            .mark_session_delivery_ambiguous("expired", "stop ownership is unproven")
+            .unwrap();
+        assert_eq!(app.settle_one_provider_check().unwrap(), None);
+        assert_eq!(model_proofs(&app), 0);
+        assert!(app
+            .store
+            .record_provider_check_quiescent(
+                "expired",
+                &pending[0].invocation_id,
+                &serde_json::json!({"source": "synthetic"}),
+            )
+            .unwrap());
+        assert_eq!(
+            app.settle_one_provider_check().unwrap().unwrap()["action"],
+            "provider_check_settled"
+        );
+        let settled = app.store.provider_validation_batch(&batch.id).unwrap();
+        assert_eq!(settled.checks[0].state, "cancelled");
+        assert_eq!(
+            settled.checks[0].reason.as_deref(),
+            Some(crate::store::PROVIDER_CHECK_TIMEOUT)
+        );
+        assert_eq!(settled.checks[1], cancelled.checks[1]);
+        assert_eq!(settled.state, "running");
+        assert_eq!(app.settle_one_provider_check().unwrap(), None);
+        assert!(app.store.pending_provider_checks().unwrap().is_empty());
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn unconfirmed_cancel_stop_stays_visible_on_the_check() {
         let (root, app, claude) = synthetic_app("cancel-stop");
-        let batch = start(
+        let batch = historical_batch(
             &app.store,
             "cancel-stop",
             &[select(Provider::Claude, "model-a")],
@@ -6483,102 +7206,65 @@ mod provider_validation_tests {
     }
 
     #[test]
-    fn provider_check_dispatch_refuses_synthetic_spawn_and_skips_changed_inputs() {
-        use std::os::unix::fs::PermissionsExt;
-        let (root, app, claude) = synthetic_app("dispatch");
-        let paths = app.paths.clone();
-
-        let batch = start(
-            &app.store,
-            "spawn",
-            &[select(Provider::Claude, "model-a")],
-            &[claude.clone()],
-            1,
-        );
-        let pending = app.store.pending_provider_checks().unwrap();
-        let launched = app
-            .dispatch_provider_check(&pending[0], &claude)
-            .unwrap()
-            .unwrap();
-        assert_eq!(launched["action"], "provider_check_launch_failed");
-        assert!(
-            launched["reason"]
-                .as_str()
+    fn retired_app_wide_start_and_dispatch_create_no_session_or_project_authority() {
+        let (root, app, claude) = synthetic_app("retired-dispatch");
+        let selections = [
+            select(Provider::Claude, "model-a"),
+            select(Provider::Claude, "model-b"),
+        ];
+        let batch = historical_batch(&app.store, "historical", &selections, &[claude], 2);
+        let request = crate::domain::ProviderValidationStartRequest {
+            operation_id: "historical".into(),
+            preview_hash: app
+                .store
+                .lock()
                 .unwrap()
-                .contains("synthetic compatibility"),
-            "{launched}"
-        );
-        let scope = paths
-            .artifacts
-            .join("provider-validation")
-            .join(&pending[0].invocation_id);
+                .query_row(
+                    "SELECT preview_hash FROM provider_validation_batches WHERE id=?1",
+                    rusqlite::params![batch.id],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            selections: selections.to_vec(),
+            authorize_model_calls: true,
+            max_model_calls: 2,
+        };
+        assert_eq!(app.start_provider_validation(&request).unwrap(), batch);
+        let mut fresh = request.clone();
+        fresh.operation_id = "fresh".into();
+        fresh.preview_hash = "stale-client".into();
         assert_eq!(
-            std::fs::metadata(&scope).unwrap().permissions().mode() & 0o777,
-            0o700
+            app.start_provider_validation(&fresh)
+                .unwrap_err()
+                .to_string(),
+            crate::store::PROVIDER_CHECK_PROJECT_REQUIRED
         );
-        assert_eq!(std::fs::read_dir(&scope).unwrap().count(), 0);
-        let failed = app.store.provider_validation_batch(&batch.id).unwrap();
-        assert_eq!(failed.checks[0].state, "failed");
-        assert_eq!(
-            app.settle_one_provider_check().unwrap().unwrap()["action"],
-            "provider_validation_finished"
-        );
-        assert_eq!(
-            app.store
-                .provider_validation_batch(&batch.id)
-                .unwrap()
-                .state,
-            "finished"
-        );
-
-        let batch = start(
-            &app.store,
-            "changed",
-            &[
-                select(Provider::Claude, "model-a"),
-                select(Provider::Claude, "model-b"),
-            ],
-            &[claude.clone()],
-            2,
-        );
-        let pending = app.store.pending_provider_checks().unwrap();
-        let unqualified = inspection(&policy_bundles(false), Provider::Claude, None);
-        let mut changed = claude.clone();
-        if let Ok(account) = &mut changed.account {
-            account.config_identity = serde_json::json!({"revision": "edited"});
-        }
-        for (check, current, expected) in [
-            (&pending[0], &unqualified, "not qualified"),
-            (&pending[1], &changed, "changed after the preview"),
-        ] {
-            let skipped = app
-                .dispatch_provider_check(check, current)
-                .unwrap()
-                .unwrap();
+        for check in &batch.checks {
+            let skipped = app.dispatch_one_provider_check().unwrap().unwrap();
             assert_eq!(skipped["action"], "provider_check_skipped");
-            assert!(
-                skipped["reason"].as_str().unwrap().contains(expected),
-                "{skipped}"
-            );
+            assert_eq!(skipped["provider_validation_invocation_id"], check.id);
         }
-        let batch = app.store.provider_validation_batch(&batch.id).unwrap();
-        assert_eq!(batch.state, "finished");
-        assert!(batch.checks.iter().all(|check| check.state == "skipped"));
-
+        assert_eq!(app.dispatch_one_provider_check().unwrap(), None);
+        let settled = app.inspect_provider_validation(&batch.id).unwrap();
+        assert_eq!(settled.state, "finished");
+        assert!(settled.checks.iter().all(|check| check.state == "skipped"
+            && check.reason.as_deref() == Some(crate::store::PROVIDER_CHECK_PROJECT_REQUIRED)));
+        assert_eq!(app.start_provider_validation(&request).unwrap(), settled);
         let connection = app.store.lock().unwrap();
-        let sessions: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(sessions, 1, "skipped checks reserve no session");
-        let workflow: i64 = connection
+        let authority: i64 = connection
             .query_row(
-                "SELECT (SELECT COUNT(*) FROM projects)+(SELECT COUNT(*) FROM role_generations)
-                   +(SELECT COUNT(*) FROM role_credentials)+(SELECT COUNT(*) FROM capabilities)",
+                "SELECT (SELECT COUNT(*) FROM sessions)+(SELECT COUNT(*) FROM projects)
+                +(SELECT COUNT(*) FROM role_generations)+(SELECT COUNT(*) FROM role_credentials)
+                +(SELECT COUNT(*) FROM capabilities)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(workflow, 0);
+        assert_eq!(authority, 0);
+        assert!(
+            !app.paths.artifacts.join("provider-validation").exists(),
+            "start refusal and historical dispatch perform no local preparation"
+        );
         drop(connection);
         drop(app);
         std::fs::remove_dir_all(root).unwrap();

@@ -16,13 +16,17 @@ import {
   type DecisionExplanation,
   type DecisionOwner,
   type Project,
+  type ProjectExecution,
+  type Role,
   roleLabel,
+  ROLES,
   type Session,
   type SwitchIntent,
   type Task,
   type WorkflowCommand,
   type WorkflowCommandResult,
   type WorkflowControl,
+  type WorkspaceMode,
 } from "../types";
 
 type StoredIdentity = { body: string; id: string };
@@ -278,6 +282,7 @@ export function WorkflowControls(
   {
     task,
     project,
+    execution,
     controls = [],
     sessions = [],
     switches = [],
@@ -289,6 +294,7 @@ export function WorkflowControls(
   }: {
     task: Task;
     project?: Project;
+    execution?: ProjectExecution;
     controls?: WorkflowControl[];
     sessions?: Session[];
     switches?: SwitchIntent[];
@@ -306,6 +312,24 @@ export function WorkflowControls(
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [routeNotice, setRouteNotice] = useState("");
+  const checkoutCommands = useWorkflowCommands(
+    `llmrelay.checkout.operations.${task.id}`, onChanged,
+  );
+  const [workspaceChoice, setWorkspaceChoice] = useState<
+    { version: number; mode: WorkspaceMode } | undefined
+  >();
+  const workspaceMode = task.workflow?.workspace_mode ?? "isolated_worktree";
+  const selectedWorkspace = workspaceChoice?.version === task.version
+    ? workspaceChoice.mode : workspaceMode;
+  const [consentedScope, setConsentedScope] = useState("");
+  const checkoutScope = task.workflow?.checkout_scope;
+  const scopeCurrent = checkoutScope?.task_id === task.id &&
+    checkoutScope.project_id === task.project_id &&
+    checkoutScope.workspace_mode === "main_checkout";
+  const consentBinding = scopeCurrent ? `${task.version}:${checkoutScope.scope_hash}` : "";
+  const consented = !!consentBinding && consentedScope === consentBinding;
+  const [verificationRole, setVerificationRole] = useState<Role>("implementer");
+  const [verificationNotice, setVerificationNotice] = useState("");
   const setupProblem = isSingleAgentTask(task)
     ? undefined
     : projectSetupProblem(
@@ -438,6 +462,51 @@ export function WorkflowControls(
     value.old_generation_id === effectiveManager?.effective_generation_id
   );
   const singleAgent = isSingleAgentTask(task);
+  const mainCheckout = workspaceMode === "main_checkout";
+  const selectedProfile = task.workflow?.selected_profile_revision === undefined &&
+      execution?.project_id === task.project_id
+    ? execution.profiles.map((profile) => profile.current_revision)
+      .find((revision) => revision?.id === task.workflow?.profile_revision_id)
+    : task.workflow?.selected_profile_revision;
+  const verificationConfig = singleAgent
+    ? selectedProfile?.id === task.workflow?.profile_revision_id ? selectedProfile : undefined
+    : task.role_settings.filter((setting) => setting.role === verificationRole)
+      .sort((a, b) => b.revision - a.revision)[0]?.config;
+  const mainControls = controls.filter((value) => value.kind === "main_checkout_verify" &&
+    (value.payload.task_id === task.id || (!!attemptId && value.attempt_id === attemptId)));
+  const currentMainControls = mainControls.filter((value) =>
+    !attemptId || !value.attempt_id || value.attempt_id === attemptId);
+  const pendingVerification = currentMainControls.find((value) =>
+    !["finished", "cancelled", "rejected", "failed", "expired", "superseded"].includes(value.state));
+  const latestVerification = pendingVerification ?? currentMainControls.at(-1);
+  const latestVerificationRole = ROLES.find((role) => role === latestVerification?.payload.actor);
+  const awaitingNativeEvidence = pendingVerification?.state === "awaiting_native_evidence";
+  const unsettledSession = !!attemptId && sessions.some((session) =>
+    session.task_id === task.id && session.attempt_id === attemptId &&
+    session.status !== "launch_failed" &&
+    !(session.status === "exited" &&
+      (session.process_group_quiescent === true || session.process_group_quiescent === 1)));
+  const saveWorkspace = () => checkoutCommands.submit("workspace", (operation_id) => ({
+    kind: "set_task_workflow", operation_id, task_id: task.id,
+    expected_version: task.version,
+    selection: {
+      family: task.workflow?.family ?? "trip",
+      workspace_mode: selectedWorkspace,
+      ...(singleAgent ? {
+        execution_config_revision_id: task.workflow?.execution_config_revision_id,
+        profile_revision_id: task.workflow?.profile_revision_id,
+        check_ids: task.workflow?.check_ids ?? [],
+      } : {}),
+    },
+  }));
+  const verifyCheckout = async () => {
+    const result = await checkoutCommands.submit("verification", (operation_id) => ({
+      kind: "verify_main_checkout", operation_id, task_id: task.id,
+      expected_version: task.version,
+      ...(singleAgent ? {} : { role: verificationRole }),
+    }));
+    if (result) setVerificationNotice("Verification requested. Refresh to follow its recorded state; no proof is granted by this request.");
+  };
   const failedProbe = !!task.workflow?.run?.probe_admission_id &&
     task.workflow?.run?.stage_reason.startsWith(
         "The probe did not prove the profile:",
@@ -726,11 +795,123 @@ export function WorkflowControls(
       <header>
         <h3>Controls</h3>
       </header>
+      <section aria-label="Task workspace">
+        <h4>Workspace: {mainCheckout ? "Main checkout" : "Isolated worktree"}</h4>
+        {mainCheckout && (
+          <>
+            {scopeCurrent
+              ? <p>Selected checkout: <strong>{checkoutScope.checkout_root}</strong></p>
+              : <p className="warning">The current checkout scope is unavailable. Review project paths and task roles, then refresh before authorizing.</p>}
+            <p className="hint">
+              The writer can edit this checkout, including existing files and uncommitted work.
+              App data, credentials and Git metadata remain protected; read-only roles stay read-only.
+              Ignored files are outside snapshots, and external editors are not locked.
+              Cancel leaves checkout files in place; Accept does not commit or merge them.
+            </p>
+            {!task.workflow?.checkout_authorized && (
+              <div className="warning">
+                This checkout needs authorization for its current path, workspace mode and writer policy.
+                {task.lifecycle === "backlog"
+                  ? " Review the current path, then authorize it with Make Ready."
+                  : !attemptId
+                  ? " Return to draft below, then review and authorize the current scope with Make Ready."
+                  : " Stop or cancel this attempt before changing its authority; use a new task for the changed scope."}
+                {task.workflow?.checkout_authorization_reason && <TechnicalDetails><p>{task.workflow.checkout_authorization_reason}</p></TechnicalDetails>}
+              </div>
+            )}
+            {!terminal && task.lifecycle === "backlog" && scopeCurrent && (
+              <label className="toggle">
+                <input type="checkbox" checked={consented} disabled={!!busy || checkoutCommands.busy}
+                  onChange={(event) => setConsentedScope(event.target.checked ? consentBinding : "")} />
+                Authorize writer access to this Main checkout for this task when I choose Make Ready.
+              </label>
+            )}
+            {checkoutScope && <TechnicalDetails>
+              <p>Native policies include provider runtime and system read exceptions. Checkout access is not whole-host secret isolation.</p>
+              <pre>{JSON.stringify(checkoutScope, null, 2)}</pre>
+            </TechnicalDetails>}
+          </>
+        )}
+        {!mainCheckout && <p className="hint">
+          {project && <>Registered project checkout: <strong>{project.repository_path}</strong>. </>}
+          Agents use a separate app-owned worktree, created during preparation.
+          Existing tasks without a saved workspace mode keep this behavior.
+        </p>}
+        {!terminal && !attemptId && (task.workflow || execution) && ["backlog", "ready"].includes(task.lifecycle) && (
+          <>
+            <label>Workspace mode
+              <select value={selectedWorkspace} disabled={!!busy || checkoutCommands.busy}
+                onChange={(event) => setWorkspaceChoice({ version: task.version,
+                  mode: event.target.value === "main_checkout" ? "main_checkout" : "isolated_worktree" })}>
+                <option value="isolated_worktree">Isolated worktree</option>
+                <option value="main_checkout">Main checkout</option>
+              </select>
+            </label>
+            <button disabled={!!busy || checkoutCommands.busy || selectedWorkspace === workspaceMode}
+              onClick={() => void saveWorkspace()}>Save workspace mode</button>
+            <small>Change workspace mode before the first attempt. Saving moves a Ready task back to drafts; review its current scope and choose Make Ready again.</small>
+            {mainCheckout && task.lifecycle === "ready" && !task.workflow?.checkout_authorized &&
+              <button disabled={!!busy || checkoutCommands.busy || selectedWorkspace !== workspaceMode}
+                onClick={() => void saveWorkspace()}>Return to draft to authorize checkout</button>}
+            {checkoutCommands.uncertain.has("workspace") && <UncertainRequestNotice changed={checkoutCommands.reviewed.has("workspace")} />}
+          </>
+        )}
+      </section>
+      {mainCheckout && !terminal && ["ready", "in_progress"].includes(task.lifecycle) && (
+        <section aria-label="Main checkout verification">
+          <h4>Verify Main checkout access</h4>
+          {!singleAgent && <label>Role to verify
+            <select value={verificationRole} disabled={!!busy || checkoutCommands.busy || !!pendingVerification}
+              onChange={(event) => {
+                const role = ROLES.find((role) => role === event.target.value);
+                if (role) setVerificationRole(role);
+              }}>
+              {ROLES.map((role) => <option key={role} value={role}>{roleLabel(role)}</option>)}
+            </select>
+          </label>}
+          <p>{singleAgent ? "Single agent" : roleLabel(verificationRole)} · {verificationConfig
+            ? `${verificationConfig.provider} · ${verificationConfig.model} · ${verificationConfig.effort}`
+            : "The task's exact selected profile details are unavailable. Refresh this task and inspect Roles if they remain unavailable."}</p>
+          <p className="hint">
+            This uses the selected provider and its installed version in this authorized checkout,
+            with harmless access probes and a retained-session recall where required.
+            It may consume provider quota across multiple requests. Each verification has a
+            five-minute deadline; uncertain stops wait for verified exit. LLMRelay does not
+            automatically retry, change models or approve hooks.
+          </p>
+          {pendingVerification && <p role="status">{pendingVerification.state === "awaiting_native_evidence"
+            ? "Waiting for reviewed native permission evidence. A completed conversation alone is not proof. The service operator must review actual native observations; refused or missing observations cannot count as proof. Stop this verification if the required observations are unavailable."
+            : "Verification is in progress. Review the task's sessions and refresh its recorded state; cancellation uses the ordinary task controls."}</p>}
+          {latestVerification?.state === "cancelled" && <p role="status">
+            Stopped without proof. {latestVerificationRole ? roleLabel(latestVerificationRole) : "This"}
+            {" "}verification did not establish Main checkout access.
+            Ordinary work still requires current proof for this actor.
+          </p>}
+          {pendingVerification?.state === "awaiting_native_evidence" && decision?.control_policy.allowed_controls.includes("pause_now") &&
+            <button disabled={!!busy || checkoutCommands.busy}
+              onClick={() => control("pause_now", { verification_control_id: pendingVerification.id })}>
+              Stop verification and keep task paused
+            </button>}
+          <button disabled={!!busy || checkoutCommands.busy || !scopeCurrent ||
+            selectedWorkspace !== workspaceMode ||
+            !task.workflow?.checkout_authorized || !verificationConfig || !!pendingVerification || unsettledSession}
+            onClick={() => void verifyCheckout()}>Verify Main checkout access</button>
+          {verificationNotice && <p role="status">{verificationNotice}</p>}
+          {checkoutCommands.uncertain.has("verification") && <UncertainRequestNotice changed={checkoutCommands.reviewed.has("verification")} />}
+          {!!mainControls.length && <TechnicalDetails>
+            <p>Reviewed evidence is published through the existing capability record-proof command; this dashboard does not manufacture an attestation.</p>
+            <pre>{JSON.stringify(mainControls, null, 2)}</pre>
+          </TechnicalDetails>}
+        </section>
+      )}
+      {checkoutCommands.error && <ErrorNotice error={checkoutCommands.error} />}
       {task.lifecycle === "ready" && (
         <p className="hint">
-          Prepare task creates its workspace and pauses before starting an
+          {mainCheckout
+            ? "Prepare task captures the checkout baseline without replacing your files. Verify Main checkout access for the selected actors; ordinary work requires current native proof."
+            : <>Prepare task creates its workspace and pauses before starting an
           agent. Then choose Continue to start this task. Other queued tasks
-          stay paused if project pickup is paused.
+          stay paused if project pickup is paused.</>}
         </p>
       )}
       {decision && decision.primary_blocker?.message && (
@@ -771,14 +952,17 @@ export function WorkflowControls(
           <div className="button-row">
             <button
               className="primary"
-              disabled={!!busy || !allows("make_ready")}
+              disabled={!!busy || checkoutCommands.busy || !allows("make_ready") ||
+                selectedWorkspace !== workspaceMode ||
+                (mainCheckout && (!scopeCurrent || !consented))}
               title={decision?.control_policy.disabled_reason_code
                 ? setupProblem || decision.primary_blocker?.message ||
                   decision.control_policy.disabled_reason_code
                 : !singleAgent && project?.trip?.readiness !== "ready"
                 ? projectSetupProblem(project, "task.project_ready")
                 : undefined}
-              onClick={() => send("make_ready")}
+              onClick={() => send("make_ready", mainCheckout && scopeCurrent
+                ? { checkout_authorization: { scope_hash: checkoutScope.scope_hash } } : {})}
             >
               Make Ready
             </button>
@@ -800,7 +984,7 @@ export function WorkflowControls(
         : (
           <div className="button-row">
             <button
-              disabled={!!busy || !allows("continue")}
+              disabled={!!busy || !!pendingVerification || !allows("continue")}
               onClick={() => control("continue")}
             >
               Continue
@@ -817,12 +1001,12 @@ export function WorkflowControls(
             >
               Pause after this step
             </button>
-            <button
+            {!awaitingNativeEvidence && <button
               disabled={!!busy || !allows("pause_now")}
               onClick={() => control("pause_now")}
             >
               Pause now
-            </button>
+            </button>}
             <button
               disabled={!!busy || !allows("retry")}
               onClick={() => control("retry")}

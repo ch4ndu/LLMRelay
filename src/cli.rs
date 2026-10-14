@@ -466,6 +466,7 @@ impl WorkflowSelectionArgs {
         };
         Ok(Some(crate::domain::TaskWorkflowSelectionInput {
             family: family.parse().map_err(|error: String| anyhow!(error))?,
+            workspace_mode: Default::default(),
             execution_config_revision_id: self.configuration,
             profile_revision_id: self.profile_revision,
             check_ids: self.checks,

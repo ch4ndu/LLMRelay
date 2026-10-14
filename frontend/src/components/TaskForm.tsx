@@ -2,6 +2,7 @@ import { ErrorNotice } from "./ErrorNotice";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 import { ApiError, command, operationId, submitWorkflowCommand } from "../api";
 import { ModelSelector } from "./ModelSelector";
+import { UncertainRequestNotice, useWorkflowCommands } from "./WorkflowControls";
 import {
   emptySingleAgentSelection,
   type SingleAgentSelection,
@@ -17,6 +18,7 @@ import {
   ROLES,
   type Task,
   type WorkflowFamily,
+  type WorkspaceMode,
 } from "../types";
 
 const efforts = ["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -28,6 +30,7 @@ export interface TaskDraft {
   criteria: string;
   priority: number;
   ready: boolean;
+  workspace_mode: WorkspaceMode;
   roles: Partial<Record<Role, TaskRoleDraft>>;
   roleOverrides: Partial<Record<Role, boolean>>;
 }
@@ -47,14 +50,16 @@ type TaskCreateRequest = {
   ready: boolean;
   role_overrides: Partial<Record<Role, RoleConfig>>;
 };
-type SingleAgentCreateRequest = {
+type WorkflowCreateRequest = {
   kind: "create_task";
   project_id: string;
   title: string;
   description: string;
   acceptance_criteria: string[];
   priority: number;
-  selection: { family: "single_agent" } & SingleAgentSelection;
+  selection:
+    | ({ family: "single_agent"; workspace_mode?: WorkspaceMode } & SingleAgentSelection)
+    | { family: "trip"; workspace_mode: "main_checkout" };
 };
 
 const blank = (project = ""): TaskDraft => ({
@@ -64,6 +69,7 @@ const blank = (project = ""): TaskDraft => ({
   criteria: "",
   priority: 0,
   ready: false,
+  workspace_mode: "isolated_worktree",
   roles: {},
   roleOverrides: {},
 });
@@ -94,9 +100,9 @@ const normalizeRole = (value: unknown): TaskRoleDraft | undefined => {
 const isStringList = (value: unknown): value is string[] =>
   Array.isArray(value) && value.every((item) => typeof item === "string");
 
-const pendingSingleAgentCreate = (
+const pendingWorkflowCreate = (
   value: Record<string, unknown>,
-): SingleAgentCreateRequest | undefined => {
+): WorkflowCreateRequest | undefined => {
   const selection = value.selection;
   if (
     value.kind !== "create_task" ||
@@ -106,11 +112,34 @@ const pendingSingleAgentCreate = (
     typeof value.description !== "string" ||
     !isStringList(value.acceptance_criteria) ||
     typeof value.priority !== "number" || !Number.isFinite(value.priority) ||
-    !isRecord(selection) || selection.family !== "single_agent" ||
-    typeof selection.execution_config_revision_id !== "string" ||
-    typeof selection.profile_revision_id !== "string" ||
-    !isStringList(selection.check_ids)
+    !isRecord(selection)
   ) return undefined;
+  if (
+    selection.workspace_mode !== undefined &&
+    selection.workspace_mode !== "isolated_worktree" &&
+    selection.workspace_mode !== "main_checkout"
+  ) return undefined;
+  let parsedSelection: WorkflowCreateRequest["selection"];
+  if (selection.family === "trip") {
+    if (selection.workspace_mode !== "main_checkout" ||
+      Object.keys(selection).sort().join() !== "family,workspace_mode") return undefined;
+    parsedSelection = { family: "trip", workspace_mode: "main_checkout" };
+  } else if (selection.family === "single_agent" &&
+    Object.keys(selection).sort().join() ===
+      (selection.workspace_mode === undefined
+        ? "check_ids,execution_config_revision_id,family,profile_revision_id"
+        : "check_ids,execution_config_revision_id,family,profile_revision_id,workspace_mode") &&
+    typeof selection.execution_config_revision_id === "string" &&
+    typeof selection.profile_revision_id === "string" &&
+    isStringList(selection.check_ids)) {
+    parsedSelection = {
+      family: "single_agent",
+      execution_config_revision_id: selection.execution_config_revision_id,
+      profile_revision_id: selection.profile_revision_id,
+      check_ids: selection.check_ids,
+      ...(selection.workspace_mode === undefined ? {} : { workspace_mode: selection.workspace_mode }),
+    };
+  } else return undefined;
   return {
     kind: "create_task",
     project_id: value.project_id,
@@ -118,23 +147,18 @@ const pendingSingleAgentCreate = (
     description: value.description,
     acceptance_criteria: value.acceptance_criteria,
     priority: value.priority,
-    selection: {
-      family: "single_agent",
-      execution_config_revision_id: selection.execution_config_revision_id,
-      profile_revision_id: selection.profile_revision_id,
-      check_ids: selection.check_ids,
-    },
+    selection: parsedSelection,
   };
 };
 
 const pendingCreateRequest = (
   pending: PendingTaskOperation | undefined,
-): TaskCreateRequest | SingleAgentCreateRequest | undefined => {
+): TaskCreateRequest | WorkflowCreateRequest | undefined => {
   if (!pending) return undefined;
   try {
     const value: unknown = JSON.parse(pending.body);
     if (isRecord(value) && "selection" in value) {
-      return pendingSingleAgentCreate(value);
+      return pendingWorkflowCreate(value);
     }
     if (
       !isRecord(value) || value.kind !== "create_task" ||
@@ -171,6 +195,8 @@ const pendingCreateRequest = (
 
 const normalizeDraft = (value: unknown): TaskDraft | undefined => {
   if (!isRecord(value)) return undefined;
+  if (value.workspace_mode !== undefined && value.workspace_mode !== "isolated_worktree" &&
+    value.workspace_mode !== "main_checkout") return undefined;
   const storedRoles = isRecord(value.roles) ? value.roles : {};
   const priority = value.priority === -1 || value.priority === 0 ||
       value.priority === 1
@@ -183,6 +209,7 @@ const normalizeDraft = (value: unknown): TaskDraft | undefined => {
     criteria: stringField(value, "criteria"),
     priority,
     ready: typeof value.ready === "boolean" ? value.ready : false,
+    workspace_mode: value.workspace_mode === "main_checkout" ? "main_checkout" : "isolated_worktree",
     roles: Object.fromEntries(ROLES.flatMap((role) => {
       const config = normalizeRole(storedRoles[role]);
       return config ? [[role, config]] : [];
@@ -228,7 +255,7 @@ export function TaskForm(
   const key = editing
     ? `agenticjira.edit.${editing.id}`
     : "agenticjira.new-task";
-  const [initial] = useState(() => {
+  const [initial] = useState<{ draft: TaskDraft; restored: boolean }>(() => {
     const stored = localStorage.getItem(key);
     if (stored) {
       try {
@@ -242,6 +269,7 @@ export function TaskForm(
               ...restored,
               project_id: editing ? editing.project_id : restored.project_id ||
                 (selectedIsValid ? selectedProjectId! : ""),
+              ...(editing ? { workspace_mode: editing.workflow?.workspace_mode ?? "isolated_worktree" } : {}),
             },
             restored: true,
           };
@@ -257,6 +285,7 @@ export function TaskForm(
           criteria: editing.acceptance_criteria.join("\n"),
           priority: editing.priority,
           ready: editing.lifecycle === "ready",
+          workspace_mode: editing.workflow?.workspace_mode ?? "isolated_worktree",
           roles: Object.fromEntries(
             ROLES.flatMap((role) => {
               const config = normalizeRole(editing.role_overrides[role]);
@@ -298,6 +327,7 @@ export function TaskForm(
   const [draft, setDraft] = useState<TaskDraft>(initial.draft);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const workspaceCommands = useWorkflowCommands(`llmrelay.checkout.operations.${editing?.id ?? "new"}`, () => {});
   const [unresolvedCreate, setUnresolvedCreate] = useState<
     PendingTaskOperation | undefined
   >(() =>
@@ -351,6 +381,7 @@ export function TaskForm(
     ? chosenFamily.family
     : execution?.default_family ?? "trip";
   const singleAgent = family === "single_agent";
+  const mainCheckout = draft.workspace_mode === "main_checkout";
   const [singleAgentChoice, setSingleAgentChoice] = useState<
     { project_id: string; selection: SingleAgentSelection } | undefined
   >(undefined);
@@ -419,10 +450,17 @@ export function TaskForm(
     if (Array.from(draft.title).length > 200) {
       return "Task titles are limited to 200 characters.";
     }
+    if (editing && draft.workspace_mode !== (editing.workflow?.workspace_mode ?? "isolated_worktree")) {
+      return "Save workspace mode only before saving task fields, or restore the current workspace choice.";
+    }
     if (missingRole) {
       return `Choose a provider, model, and effort for ${
         roleLabel(missingRole)
       }.`;
+    }
+    if (!editing && mainCheckout && !singleAgent &&
+      ROLES.some((role) => draft.roleOverrides[role])) {
+      return "Main checkout drafts use the project role settings. Turn off these overrides, then configure task-specific roles in the saved task's Roles tab.";
     }
     if (
       singleAgent &&
@@ -449,21 +487,22 @@ export function TaskForm(
       } differs from the project default. Save this as a draft, validate its exact ordinary capability, and explicitly activate the task-only profile before making it Ready.`
       : "");
   const missingProject = draft.project_id && !projectIsAvailable;
-  const singleAgentCreate = (criteria: string[]): SingleAgentCreateRequest => ({
+  const workflowCreate = (criteria: string[]): WorkflowCreateRequest => ({
     kind: "create_task",
     project_id: draft.project_id,
     title: draft.title,
     description: draft.description,
     acceptance_criteria: criteria,
     priority: draft.priority,
-    selection: { family: "single_agent", ...singleAgentSelection },
+    selection: singleAgent
+      ? { family: "single_agent", ...singleAgentSelection,
+        ...(mainCheckout ? { workspace_mode: "main_checkout" as const } : {}) }
+      : { family: "trip", workspace_mode: "main_checkout" },
   });
 
   const submit = async (requestedReady: boolean) => {
-    if (saveGuard.current) return;
-    // The typed Single agent create always makes a draft; Make Ready then
-    // checks its admission.
-    const ready = requestedReady && !singleAgent;
+    if (saveGuard.current || workspaceCommands.busy) return;
+    const ready = requestedReady && !singleAgent && !mainCheckout;
     const reason = ready ? readyReason : validationReason;
     if (reason) {
       setError(reason);
@@ -506,8 +545,8 @@ export function TaskForm(
               : []
           ),
         );
-        const body: TaskCreateRequest | SingleAgentCreateRequest = singleAgent
-          ? singleAgentCreate(criteria)
+        const body: TaskCreateRequest | WorkflowCreateRequest = singleAgent || mainCheckout
+          ? workflowCreate(criteria)
           : {
             kind: "create_task",
             project_id: draft.project_id,
@@ -590,7 +629,7 @@ export function TaskForm(
       value.trim()
     ).filter(Boolean);
     const currentRequest = "selection" in request
-      ? singleAgentCreate(currentCriteria)
+      ? workflowCreate(currentCriteria)
       : {
         kind: "create_task",
         project_id: draft.project_id,
@@ -638,6 +677,23 @@ export function TaskForm(
   const submitReady = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     void submit(editing ? draft.ready : true);
+  };
+  const saveWorkspace = async () => {
+    if (!editing) return;
+    const result = await workspaceCommands.submit("workspace", (operation_id) => ({
+      kind: "set_task_workflow", operation_id, task_id: editing.id,
+      expected_version: editing.version,
+      selection: {
+        family: editing.workflow?.family ?? "trip",
+        workspace_mode: draft.workspace_mode,
+        ...(editing.workflow?.family === "single_agent" ? {
+          execution_config_revision_id: editing.workflow.execution_config_revision_id,
+          profile_revision_id: editing.workflow.profile_revision_id,
+          check_ids: editing.workflow.check_ids,
+        } : {}),
+      },
+    }));
+    if (result) onSaved();
   };
 
   return (
@@ -760,12 +816,45 @@ export function TaskForm(
             </small>
           </fieldset>
         )}
+        {workflowExecution && (!editing || (!editing.active_attempt && ["backlog", "ready"].includes(editing.lifecycle))) && (
+          <fieldset disabled={saving || workspaceCommands.busy}>
+            <legend>Workspace</legend>
+            <div role="radiogroup" aria-label="Workspace">
+              {(["isolated_worktree", "main_checkout"] as const).map((mode) => (
+                <label className="toggle" key={mode}>
+                  <input
+                    type="radio"
+                    name="task-workspace"
+                    checked={draft.workspace_mode === mode}
+                    onChange={() => update("workspace_mode", mode)}
+                  />
+                  {mode === "main_checkout" ? "Main checkout" : "Isolated worktree"}
+                </label>
+              ))}
+            </div>
+            <p className="hint">
+              Main checkout lets the writer edit your selected checkout, including
+              existing files and uncommitted work. Isolated worktree uses a separate
+              app-owned checkout. Main tasks start as drafts; review the canonical
+              path and authorize access with Make Ready in the task's Overview.
+            </p>
+            {editing && <>
+              <button type="button" disabled={draft.workspace_mode === (editing.workflow?.workspace_mode ?? "isolated_worktree")}
+                onClick={() => void saveWorkspace()}>Save workspace mode only</button>
+              <small>This saves the workspace choice at the task's current version and returns a Ready task to drafts. Task field edits stay in this form's saved draft.</small>
+              {workspaceCommands.uncertain.has("workspace") && <UncertainRequestNotice changed={workspaceCommands.reviewed.has("workspace")} />}
+            </>}
+          </fieldset>
+        )}
         {editing
           ? (
             <p className="hint">
               Change the workflow, provider, model, or effort in the task's
               Roles tab. Saving this form changes only the queued task fields
               above. The project stays fixed for this versioned update.
+              {" "}Workspace: {draft.workspace_mode === "main_checkout" ? "Main checkout" : "Isolated worktree"}.
+              Change it above or in Overview before an attempt starts; that change requires
+              Make Ready again.
               {editing.workflow?.family === "single_agent" &&
                 editing.lifecycle === "ready" &&
                 " Saving changes to a Ready Single agent task moves it back to the drafts; choose Make Ready again afterwards."}
@@ -886,18 +975,21 @@ export function TaskForm(
             <small>Your draft is still here.</small>
           </div>
         )}
+        {workspaceCommands.error && <ErrorNotice error={workspaceCommands.error} />}
         <p
           className={`form-status${validationReason ? " invalid" : ""}`}
           id="task-form-status"
         >
           {saving
             ? "Saving the task…"
+            : editing
+            ? validationReason || "Save changes updates task fields at the current version and preserves its saved workspace mode."
+            : mainCheckout
+            ? validationReason || "Save this Main checkout task as a draft, then authorize its current checkout in Overview."
             : singleAgent
             ? validationReason ||
               "Single agent tasks are saved as drafts. Make one Ready from the task once its agent profile is admitted."
-            : (editing ? validationReason : readyReason) || (editing
-              ? "Save changes updates this queued task at its current version."
-              : "Ready uses the activated project defaults or exact task-only profiles explicitly activated with current ordinary capability evidence.")}
+            : readyReason || "Ready uses the activated project defaults or exact task-only profiles explicitly activated with current ordinary capability evidence."}
         </p>
         <footer>
           <button type="button" disabled={saving} onClick={onClose}>
@@ -906,8 +998,8 @@ export function TaskForm(
           {!editing && (
             <button
               type="button"
-              className={singleAgent ? "primary" : undefined}
-              disabled={saving || (singleAgent && !!validationReason)}
+              className={singleAgent || mainCheckout ? "primary" : undefined}
+              disabled={saving || ((singleAgent || mainCheckout) && !!validationReason)}
               aria-describedby="task-form-status"
               onClick={() => void submit(false)}
             >
@@ -924,12 +1016,12 @@ export function TaskForm(
               Open project setup
             </button>
           )}
-          {(editing || !singleAgent) && (
+          {(editing || (!singleAgent && !mainCheckout)) && (
             <button
               className="primary"
               type="submit"
               aria-describedby="task-form-status"
-              disabled={saving || !!(editing ? validationReason : readyReason)}
+              disabled={saving || workspaceCommands.busy || !!(editing ? validationReason : readyReason)}
               title={(editing ? validationReason : readyReason) || undefined}
             >
               {saving

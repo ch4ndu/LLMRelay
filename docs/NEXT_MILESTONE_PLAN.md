@@ -1,5 +1,56 @@
 # LLMRelay roadmap and next task
 
+## Next stabilization task — provider error recovery
+
+Selected by the user on October 13, 2026 as essential. Start after the current
+isolated provider-validation task, ahead of further refactoring and feature work.
+This is a queued task, not a claim of implemented or verified recovery.
+
+The committed-source audit found uneven provider coverage: Codex's structured
+capacity observation is informational and does not provide a complete retry or
+resume flow; its usage-exhaustion recovery is incomplete. Supported failure-hook
+handling already supplies durable role/lane holds, a 60-second app cooldown for
+rate limits/overload, explicit hold release, and eligible failed-session stop
+controls. Hold release does not itself resume a provider turn, establish safe
+idle, or prove that provider limits have reset. Reuse these mechanisms instead
+of introducing competing task states or retry paths.
+
+Required behavior and acceptance:
+
+- Classify supported, attributable provider errors: model capacity/overload,
+  rate limiting, exhausted usage, billing/account/authentication failures,
+  unavailable models, transient service failures, and unknown or ambiguous
+  outcomes. Prioritize Codex capacity and usage exhaustion; document exact
+  provider/version coverage and retain an honest fallback for unsupported signals.
+- Show a durable task-level explanation naming the affected role/provider/model,
+  whether work is paused, what progress is retained, and what the user can do.
+  Put IDs, hashes and raw diagnostics in technical details. Avoid a generic
+  Resolve issue action with no explanation.
+- Provide actionable recovery: Try again when eligible, choose a different
+  model/provider through explicit selection and existing validation, pause,
+  cancel, or resolve account/sign-in/billing and resume. Preserve the task,
+  worktree changes, reports, and accepted checkpoints; do not require deletion
+  and recreation as the normal escape route.
+- Prefer the retained session when safe and supported. If replacement is needed,
+  explain it, verify the previous process has stopped, and bind the replacement
+  to the current task checkpoint. Distinguish clearing a hold from actually
+  resuming; show the resulting state and prevent duplicate submissions.
+- Only positively identified transient failures may receive bounded retries
+  under explicit applicable policy. Preserve retry accounting across restart;
+  no endless usage/billing/auth retries, silent model fallback, or resubmission
+  after ambiguous delivery. A cooldown is an app delay, not a provider reset;
+  show provider reset times only with attributable evidence.
+- Test capacity, exhausted usage, account/auth failure and uncertain request
+  outcomes; repeated clicks and reconnect/restart; retained resume, safe
+  replacement, and cancellation. Trace the actual UI actions through their
+  backend effects, including disabled controls and unavailable native signals.
+  Native error characterization, host tests, UI verification and human acceptance
+  are separate evidence gates.
+
+Produce a repository-grounded plan and independent review before implementation.
+The existing session's autonomous-work authorization applies; this queue entry
+neither qualifies a provider nor changes running-task permissions.
+
 Planning baseline: `f8c7e29` (initial LLMRelay implementation).
 Status: M4A, M5, approved M4B and the M6 live-state/attention slice completed;
 M7 engineering implementation passed ordinary and fresh final review plus integrated

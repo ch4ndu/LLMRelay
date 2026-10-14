@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DispatchPlan {
@@ -192,6 +192,43 @@ fn evaluate_ready_task(
         compatibility_bundles: runtime.compatibility_bundles.clone(),
     });
     let mut prerequisites = Vec::new();
+    if crate::workflow::task_workspace_mode(connection, &task.task_id)?
+        == crate::domain::WorkspaceMode::MainCheckout
+        && crate::workflow::require_workspace_execution_supported(connection, &task.task_id)
+            .is_err()
+    {
+        let authorization =
+            crate::workflow::checkout_authorization_problem(connection, &task.task_id)
+                .unwrap_or_else(|error| Some(format!("{error:#}")));
+        let (reason_code, state, owner, mutation, message) = match authorization {
+            Some(reason) => (
+                "scheduler.checkout_authorization_stale",
+                DecisionEvidenceState::Stale,
+                DecisionOwner::Human,
+                SchedulerMutation::BacklogNeedsInput,
+                reason,
+            ),
+            None => (
+                "scheduler.main_checkout_pending",
+                DecisionEvidenceState::Pending,
+                DecisionOwner::Service,
+                SchedulerMutation::None,
+                "Verify this Main checkout's native permissions before starting it; worktree proof does not authorize its changed policy.".into(),
+            ),
+        };
+        return Ok(blocked_scheduler_evaluation(
+            &task,
+            reason_code,
+            state,
+            owner,
+            serde_json::json!({"workspace_mode":"main_checkout"}),
+            Some(message),
+            prerequisites,
+            mutation,
+            None,
+            Vec::new(),
+        ));
+    }
     if global_active >= 2 {
         return Ok(blocked_scheduler_evaluation(
             &task,
@@ -1061,10 +1098,30 @@ impl Scheduler {
             single_step,
             ..
         } = candidate;
+        crate::workflow::require_workspace_execution_supported(&transaction, &task_id)?;
         let attempt_id = uuid::Uuid::new_v4().to_string();
         let workspace_id = uuid::Uuid::new_v4().to_string();
         let claim_id = uuid::Uuid::new_v4().to_string();
-        let workspace_path = self.worktrees.join(&attempt_id);
+        let mut workspace_policy =
+            crate::workflow::workspace_policy_for_task(&transaction, &task_id)?;
+        let verification = crate::workflow::pending_checkout_verification(&transaction, &task_id)?;
+        if let Some((_, ref detail)) = verification {
+            if detail["authorization"] != workspace_policy["checkout_authorization"] {
+                bail!("The checkout changed after verification was requested; authorize it again before retrying")
+            }
+            workspace_policy["main_verification"] = detail.clone();
+        }
+        let workspace_path = if crate::workspace::policy_mode(&workspace_policy)?
+            == crate::domain::WorkspaceMode::MainCheckout
+        {
+            PathBuf::from(
+                workspace_policy["checkout_authorization"]["checkout_root"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("checkout authorization has no root"))?,
+            )
+        } else {
+            self.worktrees.join(&attempt_id)
+        };
         let scope: (String, String, String) = transaction.query_row(
             "SELECT title,description,acceptance_criteria_json FROM tasks WHERE id=?1",
             params![task_id],
@@ -1107,9 +1164,14 @@ impl Scheduler {
         }
         transaction.execute("INSERT INTO claims(id,task_id,attempt_id,repository_identity,state,created_at,updated_at) VALUES(?1,?2,?3,?4,'reserved',?5,?5)",
             params![claim_id,task_id,attempt_id,repository_identity,now])?;
+        if let Some((operation_id, detail)) = verification {
+            transaction.execute("INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at,requested_operation_id)
+                VALUES(?1,?2,'main_checkout_verify','native_requested',1,?3,?4,?4,?1)",
+                params![operation_id,attempt_id,detail.to_string(),now])?;
+        }
         transaction.execute("INSERT INTO workspaces(id,attempt_id,repository_identity,path,base_revision,worktree_head,policy_json,state,created_at,updated_at)
             VALUES(?1,?2,?3,?4,?5,?5,?6,'reserved',?7,?7)", params![workspace_id,attempt_id,repository_identity,workspace_path.to_string_lossy(),base_revision,
-                serde_json::json!({"no_auto_commit":true,"no_auto_merge":true,"eligible_untracked":true}).to_string(),now])?;
+                workspace_policy.to_string(),now])?;
         transaction.execute("INSERT INTO scheduler_projects(project_id,last_claimed_at) VALUES(?1,?2) ON CONFLICT(project_id) DO UPDATE SET last_claimed_at=excluded.last_claimed_at", params![project_id,now])?;
         transaction.execute("UPDATE tasks SET lifecycle='in_progress',attention='none',version=version+1,updated_at=?1 WHERE id=?2", params![now,task_id])?;
         transaction.commit()?;
@@ -1179,6 +1241,38 @@ impl Scheduler {
     }
 
     fn create_workspace(&self, mut plan: DispatchPlan) -> Result<Option<DispatchPlan>> {
+        let policy: serde_json::Value = {
+            let connection = self.store.lock()?;
+            let json: String = connection.query_row(
+                "SELECT w.policy_json FROM workspaces w JOIN claims c ON c.attempt_id=w.attempt_id
+                 JOIN attempts a ON a.id=w.attempt_id
+                 WHERE w.id=?1 AND w.attempt_id=?2 AND a.task_id=?3 AND w.path=?4
+                   AND w.repository_identity=?5 AND c.repository_identity=w.repository_identity
+                   AND w.state='reserved' AND c.state='reserved' AND a.status='workspace_reserved'",
+                params![
+                    plan.workspace_id,
+                    plan.attempt_id,
+                    plan.task_id,
+                    plan.workspace_path.to_string_lossy(),
+                    plan.repository_identity
+                ],
+                |row| row.get(0),
+            )?;
+            serde_json::from_str(&json)?
+        };
+        let main_checkout =
+            crate::workspace::policy_mode(&policy)? == crate::domain::WorkspaceMode::MainCheckout;
+        let authorization = {
+            let connection = self.store.lock()?;
+            crate::workflow::validate_workspace_checkout(&connection, &plan.task_id, &policy)
+        };
+        if let Err(error) = authorization {
+            return self.fail_claim(
+                &plan,
+                &format!("Checkout preparation needs authorization: {error:#}"),
+                serde_json::json!({"stage":"checkout_authorization","error":format!("{error:#}")}),
+            );
+        }
         let repository = match crate::workspace::inspect(&plan.repository_path) {
             Ok(repository) => repository,
             Err(error) => {
@@ -1236,11 +1330,16 @@ impl Scheduler {
                 &format!("dependency integration became stale: {error:#}"),
             );
         }
-        if let Err(error) = crate::workspace::create_detached_worktree(
+        if let Err(error) = crate::workspace::prepare(
             &repository,
             &plan.workspace_path,
             &plan.base_revision,
+            &policy,
         ) {
+            if main_checkout {
+                return self.fail_claim(&plan, &format!("Main checkout preparation was held: {error:#}"),
+                    serde_json::json!({"stage":"main_checkout_preparation","error":format!("{error:#}")}));
+            }
             record_workspace_reservation_recovery(
                 &self.store,
                 &plan.attempt_id,
@@ -1254,6 +1353,24 @@ impl Scheduler {
             )?;
             bail!("worktree creation outcome requires recovery: {error:#}")
         }
+        let baseline = if main_checkout {
+            let artifacts = self
+                .worktrees
+                .parent()
+                .ok_or_else(|| anyhow!("workspace artifacts parent"))?;
+            match crate::review::ReviewService::new(self.store.clone(), artifacts.to_path_buf())
+                .capture_workspace_baseline(&plan.attempt_id, &plan.workspace_id)
+            {
+                Ok(manifest) => Some(manifest),
+                Err(error) => return self.fail_claim(
+                    &plan,
+                    &format!("Starting snapshot preparation was held: {error:#}"),
+                    serde_json::json!({"stage":"baseline_snapshot","error":format!("{error:#}")}),
+                ),
+            }
+        } else {
+            None
+        };
         let trip_policy = {
             let connection = self.store.lock()?;
             crate::workflow::attempt_family(&connection, &plan.attempt_id)?
@@ -1284,14 +1401,44 @@ impl Scheduler {
                 }),
             );
         }
+        if let Some(baseline) = baseline {
+            let unchanged = crate::workspace::prepare(
+                &repository,
+                &plan.workspace_path,
+                &plan.base_revision,
+                &policy,
+            )
+            .and_then(|()| crate::snapshot::verify_materialized(&baseline, &plan.workspace_path));
+            if !matches!(unchanged, Ok(true)) {
+                return self.fail_claim(&plan,
+                    "The checkout changed before preparation could finish. Finish external edits, then retry preparation; no checkout files were reset or removed.",
+                    serde_json::json!({"stage":"baseline_verification","observation":format!("{unchanged:?}")}));
+            }
+        }
         let now = Utc::now().to_rfc3339();
         let mut connection = self.store.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let policy_json: String = transaction.query_row(
-            "SELECT policy_json FROM workspaces WHERE id=?1 AND attempt_id=?2 AND state='reserved'",
-            params![plan.workspace_id, plan.attempt_id],
+            "SELECT policy_json FROM workspaces WHERE id=?1 AND attempt_id=?2 AND repository_identity=?3
+             AND path=?4 AND base_revision=?5 AND state='reserved'",
+            params![plan.workspace_id, plan.attempt_id,plan.repository_identity,
+                plan.workspace_path.to_string_lossy(),plan.base_revision],
             |row| row.get(0),
         )?;
+        crate::workflow::validate_workspace_checkout(
+            &transaction,
+            &plan.task_id,
+            &serde_json::from_str(&policy_json)?,
+        )?;
+        if main_checkout
+            && transaction.query_row(
+                crate::review::ACTIVE_WRITER_SQL,
+                params![plan.attempt_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            bail!("A writer became active before Main checkout preparation was published")
+        }
         if trip_policy {
             crate::trip::validate_materialized_policy(&policy_json)?;
         }
@@ -1447,6 +1594,17 @@ impl Scheduler {
         drop(connection);
         let mut recovered = Vec::new();
         for (workspace, path, base, identity, attempt, policy_json) in rows {
+            if crate::workspace::policy_mode(&serde_json::from_str(&policy_json)?)?
+                == crate::domain::WorkspaceMode::MainCheckout
+            {
+                match validate_borrowed_reservation(&self.store,&attempt,&policy_json) {
+                    Ok(())=> {if promote_workspace_reservation(&self.store,&workspace,&attempt)? {recovered.push(attempt);} }
+                    Err(error)=>record_workspace_reservation_recovery(&self.store,&attempt,&workspace,
+                        &format!("Main checkout preparation needs recovery: {error:#}. The checkout was left unchanged."),
+                        serde_json::json!({"stage":"main_checkout_startup","workspace_ownership":"borrowed_checkout"}))?,
+                }
+                continue;
+            }
             {
                 let mut connection = self.store.lock()?;
                 let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1525,6 +1683,24 @@ impl Scheduler {
             "expected_version":expected_version,
         });
         let request_hash = crate::store::json_hash(&request)?;
+        {
+            let connection = self.store.lock()?;
+            let policy_json: Option<String> = connection
+                .query_row(
+                    "SELECT policy_json FROM workspaces WHERE id=?1",
+                    params![workspace_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(policy_json) = policy_json {
+                if crate::workspace::policy_mode(&serde_json::from_str(&policy_json)?)?
+                    == crate::domain::WorkspaceMode::MainCheckout
+                {
+                    let policy: serde_json::Value = serde_json::from_str(&policy_json)?;
+                    crate::workflow::validate_workspace_checkout(&connection, task_id, &policy)?;
+                }
+            }
+        }
         let Some(tuple) = reserve_workspace_recovery_operation(
             &self.store,
             operation_id,
@@ -1570,6 +1746,54 @@ impl Scheduler {
             );
         }
         let repository = source.expect("source inspection was checked");
+        let policy_json: String = self.store.lock()?.query_row(
+            "SELECT policy_json FROM workspaces WHERE id=?1",
+            params![workspace_id],
+            |row| row.get(0),
+        )?;
+        if crate::workspace::policy_mode(&serde_json::from_str(&policy_json)?)?
+            == crate::domain::WorkspaceMode::MainCheckout
+        {
+            if let Err(error) = validate_borrowed_reservation(&self.store, attempt_id, &policy_json)
+            {
+                return retain_workspace_recovery(
+                    &self.store,
+                    operation_id,
+                    &request_hash,
+                    &tuple,
+                    &format!("Main preparation cannot be restored safely: {error:#}"),
+                    serde_json::json!({"borrowed_checkout_unchanged":true}),
+                );
+            }
+            let trip = {
+                let connection = self.store.lock()?;
+                crate::workflow::attempt_family(&connection, attempt_id)?
+                    == crate::domain::WorkflowFamily::Trip
+            };
+            if trip {
+                crate::trip::materialize_project_policy(
+                    &self.store,
+                    attempt_id,
+                    &tuple.workspace_path,
+                )?;
+            }
+            let promoted = promote_workspace_reservation(&self.store, workspace_id, attempt_id)?;
+            let result = OperationResult {
+                operation_id: operation_id.into(),
+                entity_kind: "workspace".into(),
+                entity_id: workspace_id.into(),
+                version: Some(expected_version + i64::from(promoted)),
+                state: "workspace_reservation_recovered".into(),
+                detail: serde_json::json!({"attempt_id":attempt_id,"workspace_path":tuple.workspace_path,"borrowed_checkout_unchanged":true,"fresh_provider_call":false}),
+            };
+            finalize_workspace_recovery_operation(
+                &self.store,
+                operation_id,
+                &request_hash,
+                &result,
+            )?;
+            return Ok(result);
+        }
         let observed = inspect_workspace_tuple(&tuple);
         let valid_existing = observed
             .get("repository_identity")
@@ -2145,11 +2369,49 @@ pub(crate) fn record_workspace_reservation_recovery_in(
     Ok(())
 }
 
+fn validate_borrowed_reservation(store: &Store, attempt: &str, policy_json: &str) -> Result<()> {
+    let policy: serde_json::Value = serde_json::from_str(policy_json)?;
+    let (task, path, repository, base, baseline): (String, String, String, String, String) = {
+        let connection = store.lock()?;
+        connection.query_row("SELECT a.task_id,w.path,p.repository_path,w.base_revision,b.manifest_json FROM workspaces w
+            JOIN attempts a ON a.id=w.attempt_id JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
+            JOIN claims c ON c.attempt_id=a.id AND c.repository_identity=w.repository_identity AND c.state IN ('reserved','unknown','running')
+            JOIN snapshots b ON b.id=json_extract(w.policy_json,'$.baseline_snapshot_id') AND b.attempt_id=a.id AND b.workspace_id=w.id
+              AND b.kind='baseline' AND b.complete=1 WHERE a.id=?1 AND w.policy_json=?2",params![attempt,policy_json], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?
+    };
+    let connection = store.lock()?;
+    crate::workflow::validate_workspace_checkout(&connection, &task, &policy)?;
+    let active: bool =
+        connection.query_row(crate::review::ACTIVE_WRITER_SQL, params![attempt], |row| {
+            row.get(0)
+        })?;
+    drop(connection);
+    if active {
+        bail!("Exact writer quiescence is required before recovering Main preparation")
+    }
+    let repository = crate::workspace::inspect(Path::new(&repository))?;
+    crate::workspace::prepare(&repository, Path::new(&path), &base, &policy)?;
+    if !crate::snapshot::verify_materialized(&serde_json::from_str(&baseline)?, Path::new(&path))? {
+        bail!("Starting checkout bytes changed or the baseline is unavailable; restore the reviewed starting state or cancel and authorize a new task")
+    }
+    Ok(())
+}
+
 pub(crate) fn promote_workspace_reservation(
     store: &Store,
     workspace_id: &str,
     attempt_id: &str,
 ) -> Result<bool> {
+    let prepared_policy: String = store.lock()?.query_row(
+        "SELECT policy_json FROM workspaces WHERE id=?1 AND attempt_id=?2",
+        params![workspace_id, attempt_id],
+        |row| row.get(0),
+    )?;
+    let main = crate::workspace::policy_mode(&serde_json::from_str(&prepared_policy)?)?
+        == crate::domain::WorkspaceMode::MainCheckout;
+    if main {
+        validate_borrowed_reservation(store, attempt_id, &prepared_policy)?;
+    }
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2182,6 +2444,16 @@ pub(crate) fn promote_workspace_reservation(
         .optional()?
         .ok_or_else(|| anyhow!("workspace recovery tuple is stale or terminal"))?;
     crate::trip::validate_materialized_policy(&policy_json)?;
+    if main {
+        if policy_json != prepared_policy {
+            bail!("Main preparation policy changed before recovery publication")
+        }
+        crate::workflow::validate_workspace_checkout(
+            &transaction,
+            &task_id,
+            &serde_json::from_str(&policy_json)?,
+        )?;
+    }
     let validation = serde_json::from_str::<serde_json::Value>(&policy_json)
         .ok()
         .and_then(|value| value.get("validation").and_then(serde_json::Value::as_bool))

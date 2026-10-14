@@ -116,6 +116,7 @@ fn history_pane_view_where(
         .optional()?)
 }
 
+#[cfg(test)]
 pub(crate) struct ProviderValidationSessionReservation<'a> {
     pub(crate) invocation_id: &'a str,
     pub(crate) session_id: &'a str,
@@ -129,6 +130,12 @@ pub(crate) struct ProviderValidationSessionReservation<'a> {
 
 const MAX_PROVIDER_CHECKS: usize = 8;
 const PROVIDER_PROOF_HOURS: i64 = 24;
+#[cfg(test)]
+const PROVIDER_CHECK_SECONDS: i64 = 300;
+pub(crate) const PROVIDER_CHECK_PROJECT_REQUIRED: &str =
+    "App-wide model checks are no longer available. Select a project and use Make Ready to authorize a coding session for its checkout.";
+pub(crate) const PROVIDER_CHECK_TIMEOUT: &str =
+    "This check exceeded its five-minute limit. No result was recorded, and it was not retried.";
 const OBSERVATION_ADAPTER_MODE: &str = "provider_observation";
 const UNSETTLED_PROVIDER_CHECK_STATES: &str =
     "'pending','reserved','running','cancel_requested','delivery_unknown'";
@@ -140,6 +147,7 @@ pub(crate) struct ProviderLocalInspection {
     pub(crate) provider: Provider,
     pub(crate) installation: std::result::Result<crate::providers::ProviderInstallation, String>,
     pub(crate) account: std::result::Result<crate::providers::ProviderAccountObservation, String>,
+    #[cfg(test)]
     pub(crate) policy: std::result::Result<crate::provider_compatibility::PolicyBinding, String>,
     /// Advisory `(model, efforts)` entries from the provider's local catalog.
     pub(crate) catalog: Option<Vec<(String, Vec<String>)>>,
@@ -174,6 +182,7 @@ impl ProviderEvidence {
     }
 }
 
+#[cfg(test)]
 impl ProviderLocalInspection {
     pub(crate) fn evidence(&self) -> std::result::Result<ProviderEvidence, String> {
         let installation = self.installation.as_ref().map_err(Clone::clone)?;
@@ -209,15 +218,57 @@ pub(crate) struct UnsettledProviderCheck {
     pub(crate) quiescent: bool,
     pub(crate) exit_success: bool,
     pub(crate) cancel_requested: bool,
+    pub(crate) deadline_expired: bool,
+    pub(crate) challenge: ProviderCheckChallenge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderCheckChallenge {
+    Answer,
+    Invalid,
+}
+
+fn provider_check_challenge_in(launch: &serde_json::Value) -> ProviderCheckChallenge {
+    let legacy_adapter = matches!(
+        launch["evidence"]["adapter_id"].as_str(),
+        Some("codex-provider-observation" | "claude-provider-observation")
+    );
+    let legacy_authority =
+        launch.get("policy").is_none() || launch["policy"]["authority"] == "none";
+    let lifecycle = launch.get("provider_check");
+    let legacy_challenge = lifecycle.is_none_or(|value| {
+        value.is_object()
+            && value
+                .get("challenge")
+                .is_none_or(|challenge| challenge == "answer_v1")
+    });
+    let valid_deadline = lifecycle
+        .and_then(|value| value.get("deadline_at"))
+        .is_none_or(|deadline| {
+            deadline
+                .as_str()
+                .is_some_and(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).is_ok())
+        });
+    if legacy_adapter && legacy_authority && legacy_challenge && valid_deadline {
+        ProviderCheckChallenge::Answer
+    } else {
+        ProviderCheckChallenge::Invalid
+    }
+}
+
+fn provider_check_expired_in(launch: &serde_json::Value, observed_at: &str) -> bool {
+    let deadline = launch["provider_check"]["deadline_at"]
+        .as_str()
+        .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok());
+    let observed = chrono::DateTime::parse_from_rfc3339(observed_at).ok();
+    matches!((deadline, observed), (Some(deadline), Some(observed)) if observed >= deadline)
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PendingProviderCheck {
     pub(crate) invocation_id: String,
+    #[cfg(test)]
     pub(crate) provider: Provider,
-    pub(crate) model: String,
-    pub(crate) effort: String,
-    pub(crate) evidence_key: String,
 }
 
 pub(crate) enum ProviderCheckOutcome<'a> {
@@ -226,71 +277,27 @@ pub(crate) enum ProviderCheckOutcome<'a> {
     Cancelled(&'a str),
 }
 
-fn restore_hold_active_in(connection: &Connection) -> Result<bool> {
-    Ok(connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM recovery_records
-           WHERE id='database-restore-hold' AND state='attention_required')",
-        [],
-        |row| row.get(0),
-    )?)
-}
-
-/// Unknown account identity never reuses proof: the same local files could
-/// now belong to a different account.
-fn current_model_proof_in(
-    connection: &Connection,
-    evidence: &ProviderEvidence,
-    model: &str,
-    effort: &str,
-    now: &str,
-) -> Result<Option<(String, String)>> {
-    if evidence.account_identity.is_none() {
-        return Ok(None);
-    }
-    Ok(connection
-        .query_row(
-            "SELECT observed_at,expires_at FROM provider_observations
-             WHERE provider=?1 AND kind='model_access' AND evidence_key=?2 AND outcome='succeeded'
-               AND invalidated_at IS NULL AND julianday(expires_at)>julianday(?3)
-             ORDER BY observed_at DESC LIMIT 1",
-            params![
-                evidence.provider.to_string(),
-                evidence.model_access_key(model, effort)?,
-                now
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?)
-}
-
 fn provider_validation_preview_in(
-    connection: &Connection,
     selections: &[ProviderValidationSelection],
     inspections: &[ProviderLocalInspection],
-    now: &str,
 ) -> Result<ProviderValidationPreviewDto> {
     if selections.is_empty() || selections.len() > MAX_PROVIDER_CHECKS {
-        bail!("Choose between 1 and {MAX_PROVIDER_CHECKS} provider checks")
+        bail!("Choose between 1 and {MAX_PROVIDER_CHECKS} providers to inspect")
     }
     for (index, selection) in selections.iter().enumerate() {
         crate::providers::require_observation_selection(&selection.model, &selection.effort)?;
         if selections[..index].contains(selection) {
-            bail!("Each provider, model and effort can be checked only once per request")
+            bail!("Each provider, model and effort can be inspected only once per request")
         }
     }
-    let evidence = inspections
-        .iter()
-        .map(ProviderLocalInspection::evidence)
-        .collect::<Vec<_>>();
     let installations = inspections
         .iter()
-        .zip(&evidence)
-        .map(|(inspection, evidence)| {
+        .map(|inspection| {
             let installation = inspection.installation.as_ref().ok();
             let account = inspection.account.as_ref().ok();
             ProviderInstallationDto {
                 provider: inspection.provider,
-                ready: evidence.is_ok(),
+                ready: installation.is_some() && account.is_some(),
                 executable_path: installation.map(|value| {
                     value
                         .executable
@@ -301,13 +308,13 @@ fn provider_validation_preview_in(
                 executable_version: installation.map(|value| value.executable_version.clone()),
                 account_identity: account.and_then(|value| value.account_identity.clone()),
                 authentication: account.map(|value| value.authentication.clone()),
-                model_calls_disabled_reason: inspection
-                    .policy
+                model_calls_disabled_reason: Some(PROVIDER_CHECK_PROJECT_REQUIRED.into()),
+                guidance: inspection
+                    .installation
                     .as_ref()
-                    .ok()
-                    .and_then(|policy| policy.native_calls_disabled_reason())
-                    .map(str::to_owned),
-                guidance: evidence.as_ref().err().cloned(),
+                    .err()
+                    .or_else(|| inspection.account.as_ref().err())
+                    .cloned(),
             }
         })
         .collect::<Vec<_>>();
@@ -317,43 +324,15 @@ fn provider_validation_preview_in(
             .iter()
             .position(|inspection| inspection.provider == selection.provider)
             .ok_or_else(|| anyhow!("{} was not inspected", selection.provider))?;
-        let installation = &installations[index];
-        let (plan, reason, proof) = match (
-            &evidence[index],
-            &installation.model_calls_disabled_reason,
-        ) {
-            (Err(guidance), _) => (ProviderCheckPlan::Unavailable, guidance.clone(), None),
-            (Ok(_), Some(disabled)) => (ProviderCheckPlan::Unavailable, disabled.clone(), None),
-            (Ok(evidence), None) => {
-                match current_model_proof_in(
-                    connection,
-                    evidence,
-                    &selection.model,
-                    &selection.effort,
-                    now,
-                )? {
-                    Some(proof) => (
-                        ProviderCheckPlan::ReuseProof,
-                        "A check with these exact inputs succeeded recently, so it is reused without contacting the model.".to_owned(),
-                        Some(proof),
-                    ),
-                    None => (
-                        ProviderCheckPlan::ModelCall,
-                        "LLMRelay will send this model one short check message from an empty folder, with no tools and no project access.".to_owned(),
-                        None,
-                    ),
-                }
-            }
-        };
         checks.push(ProviderCheckPreviewDto {
             ordinal: ordinal as u32,
             provider: selection.provider,
             model: selection.model.clone(),
             effort: selection.effort.clone(),
-            plan,
-            reason,
-            proof_observed_at: proof.as_ref().map(|value| value.0.clone()),
-            proof_expires_at: proof.map(|value| value.1),
+            plan: ProviderCheckPlan::Unavailable,
+            reason: PROVIDER_CHECK_PROJECT_REQUIRED.into(),
+            proof_observed_at: None,
+            proof_expires_at: None,
             model_listed: inspections[index].catalog.as_ref().map(|catalog| {
                 catalog.iter().any(|(model, efforts)| {
                     model == &selection.model && efforts.contains(&selection.effort)
@@ -361,13 +340,8 @@ fn provider_validation_preview_in(
             }),
         });
     }
-    let model_calls_required = checks
-        .iter()
-        .filter(|check| check.plan == ProviderCheckPlan::ModelCall)
-        .count() as u32;
     let preview_hash = json_hash(&serde_json::json!({
         "selections": selections,
-        "evidence": evidence.iter().map(|value| value.as_ref().ok()).collect::<Vec<_>>(),
         "installations": installations,
         "checks": checks,
     }))?;
@@ -375,7 +349,7 @@ fn provider_validation_preview_in(
         preview_hash,
         installations,
         checks,
-        model_calls_required,
+        model_calls_required: 0,
     })
 }
 
@@ -439,6 +413,7 @@ fn insert_provider_observation_in(
 
 /// Records what was found locally for one provider and invalidates only that
 /// provider's model-access proof bound to a different identity.
+#[cfg(test)]
 fn record_local_provider_observations_in(
     connection: &Connection,
     batch_id: &str,
@@ -803,13 +778,63 @@ pub(crate) fn started_provider_batch(
     match outcome {
         crate::domain::ProviderValidationStartOutcome::Started { batch } => Ok(batch),
         crate::domain::ProviderValidationStartOutcome::ClosedWithoutStart { .. } => bail!(
-            "This provider check request was closed without starting, so it will never run. Preview the checks again and approve a new request."
+            "This provider check request was closed without starting, so it will never run. Select a project and use Make Ready to authorize a coding session for its checkout."
         ),
     }
 }
 
 impl Store {
-    /// Read-only, so an exact replay settles before any local inspection.
+    pub(crate) fn repository_inventory(&self) -> Result<Vec<(String, String, String)>> {
+        let connection = self.lock()?;
+        repository_inventory_in(&connection)
+    }
+
+    pub(crate) fn check_checkout_preparation(
+        &self,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let Some(scope) = scope else { return Ok(()) };
+        crate::providers::require_main_protection_partition(scope)?;
+        let policy = serde_json::json!({"checkout_authorization":scope["authorization"],"workspace_ownership":"borrowed_checkout",
+            "checkout_identity":{"root":scope["root_identity"],"common":scope["common_identity"]}});
+        let current = crate::providers::checkout_launch_scope(
+            &policy,
+            Path::new(
+                scope["service_root"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Missing protected instance root"))?,
+            ),
+            Path::new(
+                scope["role_socket"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Missing bound role socket"))?,
+            ),
+            &self.repository_inventory()?,
+            Path::new(
+                scope["helper_executable"]["canonical_path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Missing bound app helper executable"))?,
+            ),
+        )?;
+        if current != *scope {
+            bail!("The prepared Main protection scope changed; verify the current checkout before launch or resume")
+        }
+        let expected_head: String=self.lock()?.query_row("SELECT COALESCE((SELECT candidate_head FROM snapshots s WHERE s.attempt_id=a.id
+            AND s.complete=1 AND s.kind IN ('candidate','checkpoint','accepted') ORDER BY s.created_at DESC,s.rowid DESC LIMIT 1),w.worktree_head)
+            FROM attempts a JOIN workspaces w ON w.attempt_id=a.id WHERE a.task_id=?1 AND w.state='ready'
+              AND a.id=(SELECT id FROM attempts WHERE task_id=a.task_id ORDER BY created_at DESC,rowid DESC LIMIT 1)",
+            params![scope["authorization"]["task_id"].as_str()], |row|row.get(0))?;
+        let observed = crate::workspace::inspect(Path::new(
+            scope["root"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Main scope has no checkout root"))?,
+        ))?;
+        if observed.head != expected_head {
+            bail!("The checkout's commit changed since the last task checkpoint; stop or cancel and authorize fresh task state before continuing")
+        }
+        Ok(())
+    }
+    #[cfg(test)]
     pub(crate) fn provider_validation_start_outcome(
         &self,
         request: &ProviderValidationStartRequest,
@@ -863,146 +888,22 @@ impl Store {
         selections: &[ProviderValidationSelection],
         inspections: &[ProviderLocalInspection],
     ) -> Result<ProviderValidationPreviewDto> {
-        let connection = self.lock()?;
-        provider_validation_preview_in(
-            &connection,
-            selections,
-            inspections,
-            &Utc::now().to_rfc3339(),
-        )
+        provider_validation_preview_in(selections, inspections)
     }
 
-    /// Starts exactly the previewed plan. The same operation ID replays its
-    /// batch even while new work is refused; a changed request under it, a
-    /// closed request, or any changed local input since the preview, is
-    /// refused without effects.
     pub(crate) fn start_provider_validation(
         &self,
         request: &ProviderValidationStartRequest,
-        inspections: &[ProviderLocalInspection],
-        accepting_new_work: bool,
     ) -> Result<ProviderValidationBatchDto> {
         let request_hash = provider_validation_request_hash(request)?;
-        let now = Utc::now().to_rfc3339();
-        let mut connection = self.lock()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(outcome) = provider_validation_start_outcome_in(
-            &transaction,
-            &request.operation_id,
-            &request_hash,
-        )? {
+        let connection = self.lock()?;
+        // Historical requests replay before the retired start path refuses new work.
+        if let Some(outcome) =
+            provider_validation_start_outcome_in(&connection, &request.operation_id, &request_hash)?
+        {
             return started_provider_batch(outcome);
         }
-        if restore_hold_active_in(&transaction)? {
-            bail!("Provider checks are disabled by the database restore hold")
-        }
-        if !accepting_new_work {
-            bail!("LLMRelay is stopping, so new provider checks cannot start now")
-        }
-        let preview =
-            provider_validation_preview_in(&transaction, &request.selections, inspections, &now)?;
-        if preview.preview_hash != request.preview_hash {
-            bail!("The provider check preview is out of date. Review the preview again before starting.")
-        }
-        let required = preview.model_calls_required;
-        if request.max_model_calls as usize > MAX_PROVIDER_CHECKS {
-            bail!("At most {MAX_PROVIDER_CHECKS} model calls can be approved at once")
-        }
-        if required > 0 && !request.authorize_model_calls {
-            bail!("These checks need {required} model call(s). Approve model calls to start them.")
-        }
-        if required > request.max_model_calls {
-            bail!(
-                "These checks need {required} model call(s), but at most {} were approved",
-                request.max_model_calls
-            )
-        }
-        let batch_id = uuid::Uuid::new_v4().to_string();
-        let running = required > 0;
-        transaction.execute(
-            "INSERT INTO provider_validation_batches(id,operation_id,request_hash,preview_hash,selection_json,
-               max_fresh_calls,native_calls_authorized,state,created_at,updated_at,finished_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10)",
-            params![
-                batch_id,
-                request.operation_id,
-                request_hash,
-                preview.preview_hash,
-                serde_json::to_string(&request.selections)?,
-                request.max_model_calls,
-                request.authorize_model_calls,
-                if running { "running" } else { "finished" },
-                now,
-                (!running).then_some(&now)
-            ],
-        )?;
-        for inspection in inspections {
-            record_local_provider_observations_in(&transaction, &batch_id, inspection, &now)?;
-        }
-        for (check, selection) in preview.checks.iter().zip(&request.selections) {
-            let evidence = inspections
-                .iter()
-                .find(|inspection| inspection.provider == selection.provider)
-                .map(ProviderLocalInspection::evidence)
-                .ok_or_else(|| anyhow!("{} was not inspected", selection.provider))?;
-            let evidence_key = match &evidence {
-                Ok(evidence) => evidence.model_access_key(&selection.model, &selection.effort)?,
-                Err(_) => json_hash(&serde_json::json!({"unavailable": selection}))?,
-            };
-            let invocation_id = uuid::Uuid::new_v4().to_string();
-            let (state, reason) = match check.plan {
-                ProviderCheckPlan::ReuseProof => ("succeeded", None),
-                ProviderCheckPlan::ModelCall => ("pending", None),
-                ProviderCheckPlan::Unavailable => ("skipped", Some(check.reason.as_str())),
-            };
-            transaction.execute(
-                "INSERT INTO provider_validation_invocations(id,batch_id,ordinal,provider,model,effort,
-                   evidence_key,state,failure_reason,created_at,updated_at,finished_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10,?11)",
-                params![
-                    invocation_id,
-                    batch_id,
-                    check.ordinal,
-                    selection.provider.to_string(),
-                    selection.model,
-                    selection.effort,
-                    evidence_key,
-                    state,
-                    reason,
-                    now,
-                    (state != "pending").then_some(&now)
-                ],
-            )?;
-            if let (Ok(evidence), Some(listed)) = (&evidence, check.model_listed) {
-                insert_provider_observation_in(
-                    &transaction,
-                    &ProviderObservationRow {
-                        batch_id: &batch_id,
-                        invocation_id: Some(invocation_id.as_str()),
-                        provider: selection.provider,
-                        kind: "model_metadata",
-                        evidence_key: &json_hash(
-                            &serde_json::json!({"kind":"model_metadata","access":evidence_key}),
-                        )?,
-                        identity_key: &evidence.identity_key()?,
-                        evidence: Some(evidence),
-                        model: Some(selection.model.as_str()),
-                        effort: Some(selection.effort.as_str()),
-                        outcome: if listed { "succeeded" } else { "unknown" },
-                        reason: if listed {
-                            "The provider's local catalog lists this model and effort. This is advisory only."
-                        } else {
-                            "The provider's local catalog does not list this model and effort. This is advisory only."
-                        },
-                        detail: serde_json::json!({"listed": listed, "advisory_only": true}),
-                        observed_at: &now,
-                        expires_at: None,
-                    },
-                )?;
-            }
-        }
-        transaction.commit()?;
-        provider_validation_batch_in(&connection, &batch_id)
+        bail!("{PROVIDER_CHECK_PROJECT_REQUIRED}")
     }
 
     pub(crate) fn provider_validation_batch(
@@ -1016,17 +917,19 @@ impl Store {
     pub(crate) fn pending_provider_checks(&self) -> Result<Vec<PendingProviderCheck>> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT i.id,i.provider,i.model,i.effort,i.evidence_key
+            "SELECT i.id,i.provider
              FROM provider_validation_invocations i
              JOIN provider_validation_batches b ON b.id=i.batch_id
-             WHERE i.state='pending' AND b.state='running' AND b.native_calls_authorized=1
+             WHERE i.state='pending' AND b.state='running'
              ORDER BY b.created_at,b.id,i.ordinal LIMIT ?1",
         )?;
         let rows = statement
             .query_map(params![MAX_PROVIDER_CHECKS as i64], |row| {
+                #[cfg(test)]
                 let provider: String = row.get(1)?;
                 Ok(PendingProviderCheck {
                     invocation_id: row.get(0)?,
+                    #[cfg(test)]
                     provider: provider.parse().map_err(|error: String| {
                         rusqlite::Error::FromSqlConversionFailure(
                             1,
@@ -1034,9 +937,6 @@ impl Store {
                             error.into(),
                         )
                     })?,
-                    model: row.get(2)?,
-                    effort: row.get(3)?,
-                    evidence_key: row.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1058,27 +958,87 @@ impl Store {
         Ok(changed == 1)
     }
 
+    #[cfg(test)]
     pub(crate) fn provider_check_capacity_available(&self, provider: Provider) -> Result<bool> {
         let connection = self.lock()?;
         session_capacity_available(&connection, &provider.to_string(), false, None, None)
     }
 
+    pub(crate) fn request_expired_provider_check_stop(
+        &self,
+    ) -> Result<Option<(String, SessionOwner)>> {
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let running = {
+            let mut statement = transaction.prepare(
+                "SELECT i.id,s.id,s.launch_config_json FROM provider_validation_invocations i
+                 JOIN provider_validation_batches b ON b.id=i.batch_id
+                 JOIN sessions s ON s.provider_validation_invocation_id=i.id
+                 WHERE i.state='running' AND b.state='running' AND s.status='running'
+                   AND s.role_generation_id IS NULL
+                 ORDER BY i.updated_at,i.id LIMIT ?1",
+            )?;
+            let rows = statement
+                .query_map(params![MAX_PROVIDER_CHECKS as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (invocation_id, session_id, launch) in running {
+            let launch = launch
+                .and_then(|launch| serde_json::from_str(&launch).ok())
+                .unwrap_or_default();
+            if !provider_check_expired_in(&launch, &now) {
+                continue;
+            }
+            let changed = transaction.execute(
+                "UPDATE provider_validation_invocations SET state='cancel_requested',failure_reason=?1,updated_at=?2
+                 WHERE id=?3 AND state='running' AND EXISTS(SELECT 1 FROM sessions s
+                   WHERE s.id=?4 AND s.provider_validation_invocation_id=?3
+                     AND s.role_generation_id IS NULL AND s.status='running')",
+                params![PROVIDER_CHECK_TIMEOUT, now, invocation_id, session_id],
+            )?;
+            if changed == 1 {
+                transaction.commit()?;
+                return Ok(Some((
+                    session_id,
+                    SessionOwner::ProviderValidationInvocation(invocation_id),
+                )));
+            }
+        }
+        transaction.commit()?;
+        Ok(None)
+    }
+
     pub(crate) fn unsettled_provider_checks(&self) -> Result<Vec<UnsettledProviderCheck>> {
+        let now = Utc::now().to_rfc3339();
         let connection = self.lock()?;
         let mut statement = connection.prepare(
             "SELECT i.id,s.id,s.transcript_epoch,i.nonce_hash,s.status='exited',
                     COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)=1,
                     COALESCE(json_extract(s.exit_json,'$.success'),0)=1,
-                    i.state='cancel_requested' OR b.state IN ('cancel_requested','cancelled')
+                    i.state='cancel_requested' OR b.state IN ('cancel_requested','cancelled'),
+                    s.launch_config_json,
+                    CASE WHEN s.status='exited' THEN COALESCE(json_extract(s.exit_json,'$.observed_at'),s.updated_at) ELSE ?2 END
              FROM provider_validation_invocations i
              JOIN provider_validation_batches b ON b.id=i.batch_id
              JOIN sessions s ON s.provider_validation_invocation_id=i.id
              WHERE i.state IN ('running','cancel_requested','delivery_unknown')
-               AND s.status IN ('exited','recovery_required')
+               AND s.status IN ('exited','recovery_required') AND s.role_generation_id IS NULL
              ORDER BY i.updated_at,i.id LIMIT ?1",
         )?;
         let rows = statement
-            .query_map(params![MAX_PROVIDER_CHECKS as i64], |row| {
+            .query_map(params![MAX_PROVIDER_CHECKS as i64, now], |row| {
+                let launch: Option<String> = row.get(8)?;
+                let launch = launch
+                    .and_then(|launch| serde_json::from_str(&launch).ok())
+                    .unwrap_or_default();
                 Ok(UnsettledProviderCheck {
                     invocation_id: row.get(0)?,
                     session_id: row.get(1)?,
@@ -1088,6 +1048,8 @@ impl Store {
                     quiescent: row.get(5)?,
                     exit_success: row.get(6)?,
                     cancel_requested: row.get(7)?,
+                    deadline_expired: provider_check_expired_in(&launch, &row.get::<_, String>(9)?),
+                    challenge: provider_check_challenge_in(&launch),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1140,16 +1102,19 @@ impl Store {
             Option<String>,
             bool,
             bool,
+            String,
         );
         let bound: Option<Bound> = transaction
             .query_row(
                 "SELECT i.batch_id,i.provider,i.model,i.effort,i.evidence_key,s.launch_config_json,
                         i.state='cancel_requested' OR b.state IN ('cancel_requested','cancelled'),
-                        COALESCE(json_extract(s.exit_json,'$.success'),0)=1
+                        COALESCE(json_extract(s.exit_json,'$.success'),0)=1,
+                        COALESCE(json_extract(s.exit_json,'$.observed_at'),s.updated_at)
                  FROM provider_validation_invocations i
                  JOIN provider_validation_batches b ON b.id=i.batch_id
                  JOIN sessions s ON s.provider_validation_invocation_id=i.id
                  WHERE i.id=?1 AND s.id=?2 AND i.state IN ('running','cancel_requested','delivery_unknown')
+                   AND s.role_generation_id IS NULL
                    AND s.status='exited' AND COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)=1",
                 params![invocation_id, session_id],
                 |row| {
@@ -1162,6 +1127,7 @@ impl Store {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -1175,15 +1141,16 @@ impl Store {
             launch,
             cancelled,
             exited_normally,
+            exited_at,
         )) = bound
         else {
             return Ok(false);
         };
-        let evidence = launch
+        let launch = launch
             .and_then(|launch| serde_json::from_str::<serde_json::Value>(&launch).ok())
-            .and_then(|launch| {
-                serde_json::from_value::<ProviderEvidence>(launch["evidence"].clone()).ok()
-            })
+            .unwrap_or_default();
+        let evidence = serde_json::from_value::<ProviderEvidence>(launch["evidence"].clone())
+            .ok()
             .filter(|evidence| {
                 evidence.provider.to_string() == provider
                     && evidence
@@ -1191,19 +1158,30 @@ impl Store {
                         .is_ok_and(|key| key == evidence_key)
             });
         let (state, reason) = match (outcome, &evidence) {
+            _ if provider_check_expired_in(&launch, &exited_at) => {
+                ("cancelled", Some(PROVIDER_CHECK_TIMEOUT))
+            }
             (ProviderCheckOutcome::Cancelled(reason), _) => ("cancelled", Some(reason)),
             _ if cancelled => (
                 "cancelled",
                 Some("Cancelled. No result was recorded for this check."),
             ),
+            (ProviderCheckOutcome::Succeeded, _)
+                if provider_check_challenge_in(&launch) == ProviderCheckChallenge::Invalid =>
+            {
+                (
+                    "failed",
+                    Some(PROVIDER_CHECK_PROJECT_REQUIRED),
+                )
+            }
             (ProviderCheckOutcome::Succeeded, Some(_)) if exited_normally => ("succeeded", None),
             (ProviderCheckOutcome::Succeeded, Some(_)) => (
                 "failed",
-                Some("The provider did not exit normally, so its answer is not accepted. Run the check again."),
+                Some("The provider did not exit normally, so its answer is not accepted. Use Make Ready in a project for a new coding session."),
             ),
             (ProviderCheckOutcome::Succeeded, None) => (
                 "failed",
-                Some("The check answered, but its recorded inputs no longer match. Run it again."),
+                Some("The check answered, but its recorded inputs no longer match. Use Make Ready in a project for a new coding session."),
             ),
             (ProviderCheckOutcome::Failed(reason), _) => ("failed", Some(reason)),
         };
@@ -1326,6 +1304,502 @@ impl Store {
             running,
         ))
     }
+}
+
+pub(crate) fn repository_inventory_in(
+    connection: &Connection,
+) -> Result<Vec<(String, String, String)>> {
+    let mut statement = connection.prepare(
+        "SELECT id,repository_path,repository_identity FROM projects
+         WHERE internal_purpose IS NULL ORDER BY id",
+    )?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+#[derive(Clone, Copy)]
+struct CheckoutTurn<'a> {
+    session: &'a str,
+    epoch: &'a str,
+    generation: &'a str,
+}
+
+fn require_checkout_reservation(
+    connection: &Connection,
+    task_id: &str,
+    attempt_id: &str,
+    actor: &str,
+    cwd: &Path,
+    scope: Option<&serde_json::Value>,
+    key: &str,
+    prompt_hash: Option<&str>,
+    turn_owner: CheckoutTurn<'_>,
+    resumed: bool,
+) -> Result<bool> {
+    let session_id = turn_owner.session;
+    let workspace: Option<(String, String)> = connection
+        .query_row(
+            "SELECT policy_json,path FROM workspaces WHERE attempt_id=?1 AND state='ready'",
+            params![attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((policy, path)) = workspace else {
+        if scope.is_some()
+            || crate::workflow::task_workspace_mode(connection, task_id)?
+                == crate::domain::WorkspaceMode::MainCheckout
+        {
+            bail!("Main execution requires its ready borrowed checkout before reservation")
+        }
+        return Ok(false);
+    };
+    let policy: serde_json::Value = serde_json::from_str(&policy)?;
+    crate::workflow::validate_workspace_checkout(connection, task_id, &policy)?;
+    if crate::workspace::policy_mode(&policy)? != crate::domain::WorkspaceMode::MainCheckout {
+        if scope.is_some() {
+            bail!("An isolated worktree cannot inherit Main checkout authority")
+        }
+        return Ok(false);
+    }
+    let scope = scope.ok_or_else(|| anyhow!("Main launch omitted its protected checkout scope"))?;
+    let inventory_hash = json_hash(&repository_inventory_in(connection)?)?;
+    if scope["authorization"] != policy["checkout_authorization"]
+        || scope["root"].as_str() != cwd.to_str()
+        || cwd.to_str() != Some(path.as_str())
+        || policy["checkout_identity"]
+            != serde_json::json!({"root":scope["root_identity"],"common":scope["common_identity"]})
+        || scope["repository_inventory_hash"].as_str() != Some(inventory_hash.as_str())
+    {
+        bail!("The checkout or registered protection inventory changed before reservation; verify the current scope again")
+    }
+    let owned: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM claims c JOIN workspaces w ON w.attempt_id=c.attempt_id
+        JOIN snapshots b ON b.id=json_extract(w.policy_json,'$.baseline_snapshot_id') AND b.kind='baseline' AND b.complete=1
+        JOIN attempts original ON original.id=b.attempt_id JOIN attempts current ON current.id=w.attempt_id
+        WHERE c.attempt_id=?1 AND c.state='running' AND c.repository_identity=w.repository_identity
+          AND original.task_id=current.task_id AND json_extract(b.manifest_json,'$.repository_identity')=w.repository_identity)",
+        params![attempt_id], |row|row.get(0))?;
+    if !owned {
+        bail!("Main execution requires its retained physical claim and original baseline")
+    }
+    if resumed {
+        let prior_epoch: String = connection.query_row(
+            "SELECT transcript_epoch FROM sessions WHERE id=?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if turn_owner.epoch == prior_epoch {
+            bail!("Main resume requires a new epoch bound to its exact stopped turn")
+        }
+        let stopped_diagnostic: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM controls c JOIN sessions s ON s.id=?1
+             WHERE c.attempt_id=?2 AND c.kind='main_checkout_verify'
+               AND json_extract(c.payload_json,'$.session_id')=s.id
+               AND (c.state='native_running' OR (c.state='finished'
+                 AND COALESCE(json_extract(c.payload_json,'$.coding_started'),0)=0)))
+             AND NOT EXISTS(SELECT 1 FROM role_credentials WHERE role_generation_id=?3 AND revoked_at IS NULL)",
+            params![session_id,attempt_id,turn_owner.generation], |row| row.get(0),
+        )?;
+        if stopped_diagnostic
+            && !has_completed_main_verification_stop_authority(
+                connection,
+                session_id,
+                turn_owner.generation,
+            )?
+        {
+            bail!("The stopped Main verification has no current authenticated, quiescent resume authority")
+        }
+    }
+    let verification: Option<(String,String)> = connection.query_row("SELECT id,payload_json FROM controls
+        WHERE attempt_id=?1 AND kind='main_checkout_verify' AND state IN ('native_requested','native_running')
+          AND json_extract(payload_json,'$.actor')=?2",params![attempt_id,actor], |row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+    if let Some((id, payload)) = verification {
+        let mut payload: serde_json::Value = serde_json::from_str(&payload)?;
+        let prompt_hash = prompt_hash.ok_or_else(|| {
+            anyhow!("Main verification requires its exact prepared request binding")
+        })?;
+        let turn = payload["turns_reserved"].as_u64().unwrap_or(0);
+        if payload["authorization"] != policy["checkout_authorization"]
+            || payload["phase"].as_str() != Some(if resumed { "recall" } else { "first" })
+            || payload["prompt_hash"].as_str() != Some(prompt_hash)
+            || payload["deadline_at"]
+                .as_str()
+                .is_none_or(|deadline| deadline <= Utc::now().to_rfc3339().as_str())
+            || turn >= payload["max_turns"].as_u64().unwrap_or(0)
+            || (resumed
+                && (payload["scope"] != *scope || payload["capability_key"].as_str() != Some(key)))
+            || (resumed && payload["role_generation_id"].as_str() != Some(turn_owner.generation))
+            || resumed != (turn == 1)
+            || (resumed && payload["session_id"].as_str() != Some(session_id))
+        {
+            bail!("This turn has no current exact Main verification authority")
+        }
+        payload["turns_reserved"] = (turn + 1).into();
+        payload["session_id"] = session_id.into();
+        payload["transcript_epoch"] = turn_owner.epoch.into();
+        payload["role_generation_id"] = turn_owner.generation.into();
+        payload["capability_key"] = key.into();
+        payload["scope"] = scope.clone();
+        connection.execute(
+            "UPDATE controls SET state='native_running',payload_json=?1,updated_at=?2 WHERE id=?3",
+            params![payload.to_string(), Utc::now().to_rfc3339(), id],
+        )?;
+        return Ok(true);
+    }
+    let pending: bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1 AND kind='main_checkout_verify'
+        AND state IN ('native_requested','native_running','native_stopping','awaiting_native_evidence'))",params![attempt_id], |row|row.get(0))?;
+    if pending {
+        bail!("This Main verification still owns the attempt; finish its exact evidence or cancel it before ordinary execution")
+    }
+    let proven: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM capabilities WHERE mode='main_checkout' AND role=?1
+        AND config_hash=?2 AND status='supported' AND json_extract(proof_json,'$.authorization.scope_hash')=?3
+        AND json_extract(proof_json,'$.scope_hash')=?4)",params![actor,key,policy["checkout_authorization"]["scope_hash"].as_str(),json_hash(scope)?], |row|row.get(0))?;
+    if !proven {
+        bail!("Verify this actor's exact Main checkout policy before starting it; worktree proof cannot authorize this checkout")
+    }
+    if resumed {
+        let began=connection.execute("UPDATE controls SET payload_json=json_set(payload_json,'$.coding_started',json('true'))
+            WHERE attempt_id=?1 AND kind='main_checkout_verify' AND state='finished'
+              AND json_extract(payload_json,'$.session_id')=?2 AND json_extract(payload_json,'$.actor')=?3
+              AND json_extract(payload_json,'$.capability_key')=?4 AND COALESCE(json_extract(payload_json,'$.coding_started'),0)=0",params![attempt_id,session_id,actor,key])?;
+        if began == 1 && actor != "single_agent" {
+            connection.execute(
+                "UPDATE attempts SET status='running' WHERE id=?1 AND status='needs_input'",
+                params![attempt_id],
+            )?;
+            connection.execute("UPDATE tasks SET attention='none',version=version+1,updated_at=?1 WHERE id=?2 AND attention='needs_input'",params![Utc::now().to_rfc3339(),task_id])?;
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn main_readonly_control_payload_in(
+    connection: &Connection,
+    attempt: &str,
+    role: RoleKind,
+) -> Result<Option<serde_json::Value>> {
+    // Rework inherits published policy, never an ancestor's active turn or stop authority.
+    let payload: Option<String> = connection.query_row(
+        "WITH RECURSIVE lineage(id,task_id) AS (
+           SELECT id,task_id FROM attempts WHERE id=?1
+           UNION
+           SELECT parent.id,parent.task_id FROM lineage
+             JOIN attempts child ON child.id=lineage.id
+             JOIN rework_intents rework ON rework.new_attempt_id=child.id
+               AND rework.parent_attempt_id=child.parent_attempt_id AND rework.state='completed'
+             JOIN attempts parent ON parent.id=rework.parent_attempt_id
+               AND parent.task_id=lineage.task_id AND parent.status='reworked'
+         )
+         SELECT c.payload_json FROM lineage JOIN controls c ON c.attempt_id=lineage.id
+         WHERE c.kind='main_checkout_verify' AND json_extract(c.payload_json,'$.actor')=?2
+           AND ((c.attempt_id=?1 AND c.state IN ('native_requested','native_running','awaiting_native_evidence','finished'))
+             OR (c.attempt_id!=?1 AND c.state='finished' AND EXISTS(
+               SELECT 1 FROM capabilities proof JOIN sessions s
+                 ON s.id=json_extract(c.payload_json,'$.session_id')
+               WHERE proof.mode='main_checkout' AND proof.status='supported' AND proof.role=?2
+                 AND proof.provider=s.provider AND proof.executable_version=s.executable_version
+                 AND proof.config_hash=s.capability_key
+                 AND proof.config_hash=json_extract(c.payload_json,'$.capability_key')
+                 AND json_extract(proof.proof_json,'$.session_id')=s.id
+                 AND json_extract(proof.proof_json,'$.native_session_id')=s.native_session_id
+                 AND json_extract(proof.proof_json,'$.scope')=json_extract(c.payload_json,'$.scope')
+                 AND json_extract(proof.proof_json,'$.retained_observations.observation_request_hash')
+                   =json_extract(c.payload_json,'$.observation_request_hash')
+                 AND json_extract(proof.proof_json,'$.retained_observations.readonly_command_policy')
+                   =json_extract(c.payload_json,'$.readonly_command_policy')
+             )))
+         ORDER BY (c.attempt_id=?1) DESC,c.rowid DESC LIMIT 1",
+        params![attempt, role.to_string()], |row| row.get(0),
+    ).optional()?;
+    payload
+        .map(|payload| {
+            serde_json::from_str(&payload).context("Parse frozen Main command authority")
+        })
+        .transpose()
+}
+
+fn require_main_readonly_command_binding(
+    connection: &Connection,
+    attempt: &str,
+    launch: &LaunchConfig,
+) -> Result<()> {
+    let Some(scope) = launch.security_policy.get("checkout_scope") else {
+        return Ok(());
+    };
+    if launch.role == RoleKind::Implementer {
+        return Ok(());
+    }
+    let payload = main_readonly_control_payload_in(connection, attempt, launch.role)?
+        .context("Main read-only reservation has no frozen command authority")?;
+    let request = &payload["observation_request"];
+    let database = request["targets"]
+        .as_array()
+        .and_then(|targets| {
+            targets
+                .iter()
+                .find(|target| target["operation"] == "service_write_open")
+        })
+        .and_then(|target| target["path"].as_str())
+        .context("Main observation omitted its instance database")?;
+    let expected_request =
+        crate::providers::main_checkout_observation_request(scope, Path::new(database))?;
+    let expected = crate::providers::main_readonly_command_policy(
+        scope,
+        &expected_request,
+        &payload["readonly_probe_paths"],
+    )?;
+    if payload["scope"] != *scope
+        || payload["scope_hash"].as_str() != Some(json_hash(scope)?.as_str())
+        || *request != expected_request
+        || payload["observation_request_hash"].as_str() != Some(json_hash(request)?.as_str())
+        || payload["readonly_command_policy"] != serde_json::to_value(&expected)?
+        || launch.security_policy["main_readonly_command_policy"]
+            != payload["readonly_command_policy"]
+    {
+        bail!("The exact frozen Main read-only command authority changed before reservation")
+    }
+    Ok(())
+}
+
+fn record_main_checkout_proof_in(
+    transaction: &Transaction<'_>,
+    proof: &CapabilityProofInput,
+    request_hash: &str,
+    scope: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let (control,payload,actor,provider,version,key,native,exit,trust,hook): (String,String,String,String,String,String,String,String,String,String) = transaction.query_row(
+        "SELECT c.id,c.payload_json,g.role,s.provider,s.executable_version,s.capability_key,s.native_session_id,s.exit_json,s.hook_trust_state,
+            json_extract(s.capability_identity_json,'$.hook_revision') FROM controls c JOIN sessions s ON s.id=json_extract(c.payload_json,'$.session_id')
+            JOIN role_generations g ON g.id=s.role_generation_id WHERE s.id=?1 AND c.attempt_id=g.attempt_id
+            AND c.kind='main_checkout_verify' AND c.state='awaiting_native_evidence' AND s.status='exited' AND g.status='exited'
+            AND s.transcript_epoch=json_extract(c.payload_json,'$.transcript_epoch') AND g.id=json_extract(c.payload_json,'$.role_generation_id')
+            AND EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=c.attempt_id
+                AND a.status IN ('running','held','needs_input') AND t.lifecycle='in_progress' AND t.archived_at IS NULL)
+            AND NOT EXISTS(SELECT 1 FROM controls stop WHERE stop.attempt_id=c.attempt_id AND stop.kind IN ('cancel','pause_now','pause_after_role','manager_stop','manager_change')
+                AND stop.state IN ('requested','draining'))
+            AND NOT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=c.attempt_id AND state='attention_required')",
+        params![proof.session_id], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?))).optional()?
+        .ok_or_else(||anyhow!("Complete the exact Main verification and wait for verified process exit before recording proof; cancelled or replaced turns cannot qualify"))?;
+    let mut payload: serde_json::Value = serde_json::from_str(&payload)?;
+    let exit: serde_json::Value = serde_json::from_str(&exit)?;
+    let identity_json: String = transaction.query_row(
+        "SELECT capability_identity_json FROM sessions WHERE id=?1",
+        params![proof.session_id],
+        |row| row.get(0),
+    )?;
+    let identity: serde_json::Value = serde_json::from_str(&identity_json)?;
+    let expected_key = if actor == "single_agent" {
+        crate::providers::main_checkout_capability_key(&actor, scope, &identity)?
+    } else {
+        crate::providers::capability_identity_key(&serde_json::from_value(identity.clone())?)?
+    };
+    if expected_key != key {
+        bail!("Main proof's frozen native identity does not match its reserved actor key")
+    }
+    let evidence=proof.runtime_scope.as_ref().ok_or_else(||anyhow!("Main proof requires explicit native protected-root evidence; narration and unchanged files cannot prove a denial"))?;
+    let request = &payload["observation_request"];
+    crate::providers::require_main_protection_partition(scope)?;
+    let database = request["targets"]
+        .as_array()
+        .and_then(|targets| {
+            targets
+                .iter()
+                .find(|target| target["operation"] == "service_write_open")
+        })
+        .and_then(|target| target["path"].as_str())
+        .context("Main proof omitted its mandatory database observation")?;
+    if *request != crate::providers::main_checkout_observation_request(scope, Path::new(database))?
+    {
+        bail!("Main proof's observed and policy-only protected roots or exact request changed")
+    }
+    if payload["observation_request_hash"].as_str() != Some(json_hash(request)?.as_str())
+        || evidence["observation_request_hash"] != payload["observation_request_hash"]
+        || evidence["native_command"] != request["command"]
+        || evidence["native_session_id"].as_str() != Some(native.as_str())
+    {
+        bail!("Main denial evidence must bind the exact authorized native command and task conversation")
+    }
+    let targets = request["targets"]
+        .as_array()
+        .context("Main observation request has no targets")?;
+    let observations = evidence["denial_observations"]
+        .as_array()
+        .context("Main proof has no reviewed native denial observations")?;
+    if observations.len() != targets.len()
+        || observations.iter().zip(targets).any(|(observed, target)| {
+            observed["operation"] != target["operation"]
+                || observed["path"] != target["path"] || observed["access"] != target["access"]
+                || !matches!(observed["errno"].as_i64(), Some(value) if value == i64::from(libc::EACCES) || value == i64::from(libc::EPERM))
+        })
+    {
+        bail!("Every authorized protected-path and control operation needs actual permission-denial evidence; missing paths, refusal and connection failure cannot qualify Main")
+    }
+    let completed = payload["completed_at"].as_str().ok_or_else(|| {
+        anyhow!("Main verification has no durable completion before its deadline")
+    })?;
+    if payload["deadline_at"]
+        .as_str()
+        .is_none_or(|deadline| completed > deadline)
+    {
+        bail!("Expired Main verification cannot publish successful proof")
+    }
+    if payload["scope"] != *scope
+        || payload["scope_hash"].as_str() != Some(json_hash(scope)?.as_str())
+        || payload["actor"].as_str() != Some(actor.as_str())
+        || payload["capability_key"].as_str() != Some(key.as_str())
+        || proof.native_resume_session_id != native
+        || proof.history_nonce != payload["nonce"].as_str().unwrap_or_default()
+        || payload["first_turn_complete"] != true
+        || (actor != "final_verifier" && payload["retained_turn_complete"] != true)
+        || exit["process_group_quiescent"] != true
+        || !matches!(trust.as_str(), "observed_unverified" | "verified_live")
+        || !proof.service_data_write_denied
+        || !proof.human_control_denied
+        || evidence["native_hook_trust_observed"] != true
+        || evidence["native_identity_hash"].as_str() != Some(json_hash(&identity)?.as_str())
+        || evidence["checkout_scope_hash"].as_str() != Some(json_hash(scope)?.as_str())
+        || evidence["protected_roots_denied"] != scope["protected_read_targets"]
+        || evidence["policy_denied_unobserved"] != scope["policy_denied_unobserved"]
+        || evidence["native_denial_source"] != "native_os"
+    {
+        bail!("Main proof is incomplete or differs from its exact native scope; supply reviewed hook trust and OS denial evidence for observed roots, keeping policy-only roots unobserved")
+    }
+    if actor == "single_agent" || actor == "implementer" {
+        if !proof.workspace_write_observed
+            || payload["first_file_observed"] != true
+            || payload["retained_recall_observed"] != true
+        {
+            bail!("Main writer proof requires exact owned first/retained files after quiescence")
+        }
+    } else {
+        let policy = crate::providers::main_readonly_command_policy(
+            scope,
+            request,
+            &payload["readonly_probe_paths"],
+        )?;
+        if payload["readonly_command_policy"] != serde_json::to_value(&policy)?
+            || identity["security_policy"]["main_readonly_command_policy"]
+                != payload["readonly_command_policy"]
+            || evidence["readonly_probe_paths"] != payload["readonly_probe_paths"]
+        {
+            bail!("Main read-only proof lost its exact frozen commands and probe paths")
+        }
+        let observations = evidence["readonly_command_observations"]
+            .as_array()
+            .context("Main read-only proof needs native OS-denied command observations")?;
+        let paths = payload["readonly_probe_paths"]
+            .as_array()
+            .context("Main read-only proof lost probe paths")?;
+        if observations.len() != 3
+            || observations
+                .iter()
+                .zip(policy.commands.iter().skip(1))
+                .zip(paths)
+                .any(|((observed, command), path)| {
+                    observed["operation"] != command.operation
+                        || observed["native_command"] != command.command
+                        || observed["path"]
+                            != Path::new(scope["root"].as_str().unwrap())
+                                .join(path.as_str().unwrap())
+                                .to_string_lossy()
+                                .as_ref()
+                        || observed["source"] != "native_os"
+                        || observed["native_session_id"] != native
+                        || observed["observation_request_hash"]
+                            != payload["observation_request_hash"]
+                        || !observed["exit_code"]
+                            .as_i64()
+                            .is_some_and(|code| (1..=255).contains(&code))
+                        || !observed["stderr"].as_str().is_some_and(|text| {
+                            text.contains("Permission denied")
+                                || text.contains("Operation not permitted")
+                        })
+                })
+        {
+            bail!("Main read-only proof requires exact OS permission-denied tool results; refusal, narration and shell exit alone cannot qualify")
+        }
+        for path in paths {
+            let artifact = Path::new(scope["root"].as_str().unwrap()).join(path.as_str().unwrap());
+            match std::fs::symlink_metadata(&artifact) {
+                Ok(_) => bail!(
+                    "Read-only probe left artifact {}; preserve it for review",
+                    artifact.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Cannot inspect probe artifact {}", artifact.display())
+                    })
+                }
+            }
+        }
+        if actor != "final_verifier"
+            && (evidence["retained_nonce_observed"].as_str() != Some(proof.history_nonce.as_str())
+                || evidence["retained_nonce_source"] != "native_ui")
+        {
+            bail!("Main read-only proof requires independent native UI review of retained nonce recall; absent files do not prove retained history")
+        }
+    }
+    let count: i64=transaction.query_row("SELECT COUNT(DISTINCT native_session_id) FROM hook_events WHERE session_id=?1 AND native_session_id IS NOT NULL",params![proof.session_id], |row|row.get(0))?;
+    if count != 1 {
+        bail!("Main proof requires one observed retained native identity")
+    }
+    let (prompts,resumes): (i64,i64)=transaction.query_row("SELECT (SELECT COUNT(*) FROM hook_events WHERE session_id=s.id AND event_name='UserPromptSubmit'),resume_count FROM sessions s WHERE s.id=?1",params![proof.session_id], |row|Ok((row.get(0)?,row.get(1)?)))?;
+    if (actor == "final_verifier" && (prompts < 1 || resumes != 0))
+        || (actor != "final_verifier" && (prompts < 2 || resumes != 1))
+    {
+        bail!("Main proof does not have its exact fresh/retained native observation count")
+    }
+    let task = scope["authorization"]["task_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Main proof has no task authorization"))?;
+    crate::workflow::validate_workspace_checkout(
+        transaction,
+        task,
+        &serde_json::json!({"workspace_mode":"main_checkout","workspace_ownership":"borrowed_checkout","writing_lane":"default","checkout_authorization":scope["authorization"]}),
+    )?;
+    if scope["repository_inventory_hash"].as_str()
+        != Some(json_hash(&repository_inventory_in(transaction)?)?.as_str())
+    {
+        bail!("Main protection inventory changed before proof publication")
+    }
+    let ordinary_input = if actor != "single_agent" {
+        let input: String = transaction.query_row(
+            "SELECT invocation_input_json FROM sessions WHERE id=?1",
+            params![proof.session_id],
+            |row| row.get(0),
+        )?;
+        let mut input: serde_json::Value = serde_json::from_str(&input)?;
+        payload["diagnostic_input"] = input.clone();
+        let role: RoleKind = actor.parse().map_err(|error: String| anyhow!(error))?;
+        let prompt = format!("{}\nThe project permission diagnostic is complete. Continue the task's current workflow using authenticated role context and its existing human approvals.",crate::workflow_resources::role_prompt(role));
+        input["prompt_hash"] = json_hash(&prompt)?.into();
+        input["prompt"] = prompt.into();
+        payload["ordinary_input_hash"] = json_hash(&input)?.into();
+        Some(input)
+    } else {
+        None
+    };
+    let result = serde_json::json!({"mode":"main_checkout","status":"supported","actor":actor,"authorization":scope["authorization"],
+        "scope_hash":json_hash(scope)?,"scope":scope,"config_hash":key,"session_id":proof.session_id,"native_session_id":native,
+        "evidence_reference":proof.evidence_reference,"native_denial_evidence":evidence,"retained_observations":payload});
+    let now = Utc::now().to_rfc3339();
+    transaction.execute("INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,hook_hash,proof_json)
+        VALUES(?1,?2,?3,?4,'main_checkout',?5,'supported',?6,'[]',?7,?8,?9)
+        ON CONFLICT(provider,executable_version,role,mode,config_hash) DO UPDATE SET status='supported',evidence_reference=excluded.evidence_reference,
+            checked_at=excluded.checked_at,hook_hash=excluded.hook_hash,proof_json=excluded.proof_json,gaps_json='[]'",
+        params![uuid::Uuid::new_v4().to_string(),provider,version,actor,key,proof.evidence_reference,now,hook,result.to_string()])?;
+    transaction.execute("UPDATE controls SET state='finished',payload_json=?1,updated_at=?2 WHERE id=?3 AND state='awaiting_native_evidence'",params![payload.to_string(),now,control])?;
+    if let Some(input) = ordinary_input {
+        transaction.execute(
+            "UPDATE sessions SET invocation_input_json=?1 WHERE id=?2",
+            params![input.to_string(), proof.session_id],
+        )?;
+    }
+    transaction.execute("UPDATE sessions SET hook_trust_state='verified_live',native_identity_verified_at=?1,updated_at=?1 WHERE id=?2",params![now,proof.session_id])?;
+    transaction.execute("INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at) VALUES(?1,'human_control','capability_proof',?2,?3,?4)",params![proof.operation_id,request_hash,result.to_string(),now])?;
+    Ok(result)
 }
 
 #[derive(Debug)]
@@ -1811,6 +2285,7 @@ const MIGRATION_036: &str = include_str!("../migrations/036_attention_observatio
 const MIGRATION_037: &str = include_str!("../migrations/037_trip_workflow_migrations.sql");
 const MIGRATION_038: &str = include_str!("../migrations/038_codex_observed_usage.sql");
 const MIGRATION_039: &str = include_str!("../migrations/039_multi_workflow.sql");
+const MIGRATION_040: &str = include_str!("../migrations/040_trusted_checkout.sql");
 // Same value rusqlite installs at open; set explicitly before any pragma or DDL can contend.
 pub(crate) const STATE_DATABASE_BUSY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
@@ -5646,9 +6121,29 @@ impl Store {
             bail!("history nonce and evidence reference are required")
         }
         let request_hash = json_hash(proof)?;
+        let config = self.session_json(&proof.session_id)?["launch_config"].clone();
+        let main_scope = config
+            .get("checkout_scope")
+            .or_else(|| config.pointer("/security_policy/checkout_scope"));
+        if main_scope.is_some() {
+            if let Some(recorded) = self.operation_receipt(
+                &proof.operation_id,
+                "human_control",
+                "capability_proof",
+                &request_hash,
+            )? {
+                return Ok(recorded);
+            }
+        }
+        self.check_checkout_preparation(main_scope)?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         guard(&transaction)?;
+        if let Some(scope) = main_scope {
+            let result = record_main_checkout_proof_in(&transaction, proof, &request_hash, scope)?;
+            transaction.commit()?;
+            return Ok(result);
+        }
         let (provider,version,role,capability_key,capability_json,native_id,trust,exit_json,project_path,workspace_path): (String,String,String,Option<String>,Option<String>,Option<String>,String,Option<String>,String,Option<String>) = transaction.query_row(
             "SELECT s.provider,s.executable_version,rg.role,s.capability_key,s.capability_identity_json,s.native_session_id,s.hook_trust_state,s.exit_json,p.repository_path,w.path
              FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id JOIN attempts a ON a.id=rg.attempt_id
@@ -6012,10 +6507,16 @@ impl Store {
     ) -> Result<RoleLaunchContext> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let verifying: bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1 AND kind='main_checkout_verify'
+            AND state='native_requested' AND json_extract(payload_json,'$.actor')=?2)",params![attempt_id,role.to_string()], |row|row.get(0))?;
         // Each exploration is a fresh read-only session, so it starts on the
         // explorer's newest activated profile; reviewers do the same when
         // their request is reserved.
-        if role == RoleKind::Explorer && !validation_dispatch && setup_runtime_probe.is_none() {
+        if role == RoleKind::Explorer
+            && !validation_dispatch
+            && setup_runtime_probe.is_none()
+            && !verifying
+        {
             let now = Utc::now().to_rfc3339();
             if let crate::trip::ReadOnlyProfileBoundary::Pending { message, .. } =
                 crate::trip::materialize_read_only_profile(&transaction, attempt_id, role, &now)?
@@ -6032,6 +6533,21 @@ impl Store {
                (SELECT MAX(current.revision) FROM role_settings current WHERE current.task_id=a.task_id AND current.role=?2))
              LIMIT 1",params![attempt_id,role.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?))
         ).optional()?.ok_or_else(||anyhow!("attempt workspace or role settings are unavailable"))?;
+        crate::workflow::require_workspace_execution_supported(&transaction, &task_id)?;
+        let workspace_policy: String = transaction.query_row(
+            "SELECT policy_json FROM workspaces WHERE attempt_id=?1",
+            params![attempt_id],
+            |row| row.get(0),
+        )?;
+        let workspace_policy: serde_json::Value = serde_json::from_str(&workspace_policy)?;
+        crate::workflow::validate_workspace_checkout(&transaction, &task_id, &workspace_policy)?;
+        let main = crate::workspace::policy_mode(&workspace_policy)?
+            == crate::domain::WorkspaceMode::MainCheckout;
+        let main_verification: bool = main && transaction.query_row("SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
+            AND kind='main_checkout_verify' AND state='native_requested' AND json_extract(payload_json,'$.actor')=?2)",params![attempt_id,role.to_string()], |row|row.get::<_,bool>(0))?;
+        if main && role == RoleKind::Implementer && lane_key != "default" {
+            bail!("Main checkout permits only the default writing lane")
+        }
         let setup_permit: Option<(String, String)> = if setup_runtime_probe.is_some() {
             transaction
                 .query_row(
@@ -6074,6 +6590,7 @@ impl Store {
             bail!("attempt is not dispatchable")
         }
         let allowed = validation_dispatch
+            || main_verification
             || match role {
                 RoleKind::Manager => matches!(
                     phase.as_str(),
@@ -6099,7 +6616,7 @@ impl Store {
         if !allowed {
             bail!("role {role} cannot launch during attempt phase {phase}")
         }
-        if role == RoleKind::Explorer && !validation_dispatch {
+        if role == RoleKind::Explorer && !validation_dispatch && !main_verification {
             let authorized: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM trip_explorer_decisions d JOIN attempts a ON a.id=d.attempt_id
                  WHERE d.attempt_id=?1 AND d.activated=1 AND d.outcome_json IS NULL AND d.candidate_hash IS a.candidate_hash)",
@@ -6109,12 +6626,12 @@ impl Store {
                 bail!("Explorer launch requires a current activated planning, rescue, or final decision")
             }
         }
-        let reviewed_parallel_lanes = if role == RoleKind::Implementer && setup_permit_id.is_none()
-        {
-            crate::trip::reviewed_parallel_lane_count(&transaction, attempt_id)?
-        } else {
-            None
-        };
+        let reviewed_parallel_lanes =
+            if role == RoleKind::Implementer && setup_permit_id.is_none() && !main_verification {
+                crate::trip::reviewed_parallel_lane_count(&transaction, attempt_id)?
+            } else {
+                None
+            };
         if role == RoleKind::Implementer {
             let freeze_active: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM freeze_intents WHERE attempt_id=?1 AND state IN ('reserved','capturing','recovery_required'))",params![attempt_id],|row|row.get(0))?;
             if freeze_active {
@@ -6156,6 +6673,18 @@ impl Store {
             bail!("role capacity is reserved until the prior task context is quiescent")
         }
         let resolved_config = serde_json::from_str::<crate::domain::RoleOverride>(&config_json)?;
+        if main_verification {
+            let settings: String=transaction.query_row("SELECT json_extract(payload_json,'$.actor_settings') FROM controls WHERE attempt_id=?1
+                AND kind='main_checkout_verify' AND state='native_requested' AND json_extract(payload_json,'$.actor')=?2",params![attempt_id,role.to_string()], |row|row.get(0))?;
+            let settings: serde_json::Value = serde_json::from_str(&settings)?;
+            if settings["provider"].as_str() != Some(resolved_config.provider.to_string().as_str())
+                || settings["model"].as_str() != Some(resolved_config.model.as_str())
+                || settings["effort"].as_str() != Some(resolved_config.effort.as_str())
+                || settings["settings_revision"].as_i64() != Some(revision)
+            {
+                bail!("The selected verification role changed; review the current model and effort before starting a new check")
+            }
+        }
         if !validation_dispatch {
             crate::providers::require_production_role(resolved_config.provider, role)?;
             let bound:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM trip_attempt_profiles WHERE attempt_id=?1 AND role=?2 AND settings_revision=?3 AND json_extract(profile_json,'$.provider')=?4 AND json_extract(profile_json,'$.model')=?5 AND json_extract(profile_json,'$.effort')=?6)",params![attempt_id,role.to_string(),revision,resolved_config.provider.to_string(),resolved_config.model,resolved_config.effort],|row|row.get(0))?;
@@ -6524,7 +7053,21 @@ impl Store {
         context: &RoleLaunchContext,
         config: &LaunchConfig,
     ) -> Result<()> {
-        match self.reserve_role_invocation_inner(context, config, None, None)? {
+        match self.reserve_role_invocation_inner(context, config, None, None, None)? {
+            BrowserLaunchReservation::Reserved => Ok(()),
+            BrowserLaunchReservation::Existing(_) => {
+                bail!("non-browser role invocation unexpectedly found a browser receipt")
+            }
+        }
+    }
+
+    pub(crate) fn reserve_role_invocation_with_prompt_hash(
+        &self,
+        context: &RoleLaunchContext,
+        config: &LaunchConfig,
+        prompt_hash: &str,
+    ) -> Result<()> {
+        match self.reserve_role_invocation_inner(context, config, None, None, Some(prompt_hash))? {
             BrowserLaunchReservation::Reserved => Ok(()),
             BrowserLaunchReservation::Existing(_) => {
                 bail!("non-browser role invocation unexpectedly found a browser receipt")
@@ -6536,15 +7079,17 @@ impl Store {
         &self,
         context: &RoleLaunchContext,
         config: &LaunchConfig,
+        prompt_hash: &str,
         receipt: BrowserLaunchReceipt<'_>,
     ) -> Result<BrowserLaunchReservation> {
-        self.reserve_role_invocation_inner(context, config, Some(receipt), None)
+        self.reserve_role_invocation_inner(context, config, Some(receipt), None, Some(prompt_hash))
     }
 
     pub(crate) fn reserve_role_invocation_with_browser_receipt_and_fresh_rejection(
         &self,
         context: &RoleLaunchContext,
         config: &LaunchConfig,
+        prompt_hash: &str,
         receipt: BrowserLaunchReceipt<'_>,
         fresh_resume_rejection: &serde_json::Value,
     ) -> Result<BrowserLaunchReservation> {
@@ -6553,6 +7098,7 @@ impl Store {
             config,
             Some(receipt),
             Some(fresh_resume_rejection),
+            Some(prompt_hash),
         )
     }
 
@@ -6562,8 +7108,10 @@ impl Store {
         config: &LaunchConfig,
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
         fresh_resume_rejection: Option<&serde_json::Value>,
+        prompt_hash: Option<&str>,
     ) -> Result<BrowserLaunchReservation> {
         self.require_execution_unheld("role launch reservations")?;
+        self.check_checkout_preparation(config.security_policy.get("checkout_scope"))?;
         let capability_identity = crate::providers::capability_identity(config)?;
         crate::providers::require_current_capability_identity_with_bundles(
             &capability_identity,
@@ -6585,11 +7133,34 @@ impl Store {
                 return Ok(BrowserLaunchReservation::Existing(existing));
             }
         }
+        crate::workflow::require_workspace_execution_supported(&transaction, &context.task_id)?;
         let attempt_id: String = transaction.query_row(
-            "SELECT attempt_id FROM workspaces WHERE path=?1 AND state='ready'",
-            params![context.workspace.to_string_lossy()],
+            "SELECT w.attempt_id FROM workspaces w JOIN launch_permits lp ON lp.attempt_id=w.attempt_id
+             WHERE w.path=?1 AND w.state='ready' AND lp.id=?2",
+            params![context.workspace.to_string_lossy(),context.permit_id],
             |row| row.get(0),
         )?;
+        let main = config.security_policy.get("checkout_scope").is_some();
+        require_main_readonly_command_binding(&transaction, &attempt_id, config)?;
+        let main_verification = require_checkout_reservation(
+            &transaction,
+            &context.task_id,
+            &attempt_id,
+            &config.role.to_string(),
+            &config.cwd,
+            config.security_policy.get("checkout_scope"),
+            &capability_key,
+            prompt_hash,
+            CheckoutTurn {
+                session: &context.session_id,
+                epoch: &context.transcript_epoch,
+                generation: &context.role_generation_id,
+            },
+            false,
+        )?;
+        if main && config.role == RoleKind::Implementer && context.lane_id != "default" {
+            bail!("Main checkout permits only the default writing lane")
+        }
         require_failure_stop_released(&transaction, &attempt_id)?;
         let permit:Option<(bool,Option<String>,String,Option<String>)>=transaction.query_row("SELECT validation_dispatch,setup_permit_id,lane_id,switch_intent_id FROM launch_permits WHERE id=?1 AND attempt_id=?2 AND role=?3 AND settings_revision=?4 AND state='issued'",params![context.permit_id,attempt_id,config.role.to_string(),context.settings_revision],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
         let (validation_dispatch, setup_permit_id, permit_lane_id, switch_intent) =
@@ -6636,7 +7207,7 @@ impl Store {
                 bail!("validation role launch permit requires current validation task lifecycle")
             }
         }
-        if !validation_dispatch {
+        if !validation_dispatch && !main {
             require_supported_capability_in(&transaction, config, &self.compatibility_bundles)?;
             if switch_intent.is_some() {
                 crate::trip::current_task_profile_authority_with_bundles(
@@ -6656,6 +7227,15 @@ impl Store {
                     config,
                     &self.compatibility_bundles,
                 )?;
+            }
+        }
+        if main {
+            let bound: bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM trip_attempt_profiles WHERE attempt_id=?1 AND role=?2
+                AND settings_revision=?3 AND json_extract(profile_json,'$.provider')=?4
+                AND json_extract(profile_json,'$.model')=?5 AND json_extract(profile_json,'$.effort')=?6)",
+                params![attempt_id,config.role.to_string(),context.settings_revision,config.provider.to_string(),config.model,config.effort], |row|row.get(0))?;
+            if !bound {
+                bail!("Main launch differs from the attempt's frozen actor settings")
             }
         }
         let active:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM role_generations WHERE attempt_id=?1 AND role=?2 AND lane_id=?3 AND status IN ('launch_reserved','running','stopping'))",params![attempt_id,config.role.to_string(),context.lane_id],|row|row.get(0))?;
@@ -6697,6 +7277,7 @@ impl Store {
                 _ => false,
             };
         let allowed = typed_setup_phase_authority
+            || main_verification
             || match config.role {
                 RoleKind::Manager => matches!(
                     phase.as_str(),
@@ -6738,7 +7319,10 @@ impl Store {
         } else {
             None
         };
-        if config.role == RoleKind::Explorer && !validation_dispatch && explorer_decision.is_none()
+        if config.role == RoleKind::Explorer
+            && !validation_dispatch
+            && !main_verification
+            && explorer_decision.is_none()
         {
             bail!("Explorer reservation no longer matches a current activated decision")
         }
@@ -6747,7 +7331,7 @@ impl Store {
             if freeze_active {
                 bail!("writer reservation is fenced by an active or unresolved snapshot freeze")
             }
-            let reviewed = if setup_permit_id.is_none() {
+            let reviewed = if setup_permit_id.is_none() && !main_verification {
                 crate::trip::reviewed_parallel_lane_count(&transaction, &attempt_id)?
             } else {
                 None
@@ -9427,12 +10011,30 @@ impl Store {
     /// creates no project, task, attempt, generation or credential. Returns
     /// `false` and leaves the call pending while global or provider capacity
     /// is full; service holds refuse it outright.
+    #[cfg(test)]
     pub(crate) fn reserve_provider_validation_session(
         &self,
         reservation: &ProviderValidationSessionReservation<'_>,
     ) -> Result<bool> {
         self.require_execution_unheld("provider validation launches")?;
-        let now = Utc::now().to_rfc3339();
+        let reserved_at = Utc::now();
+        let now = reserved_at.to_rfc3339();
+        let mut launch: serde_json::Value = serde_json::from_str(reservation.launch_json)?;
+        let launch_object = launch
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("provider-check launch must be a JSON object"))?;
+        let lifecycle = launch_object
+            .entry("provider_check")
+            .or_insert_with(|| serde_json::json!({}));
+        let lifecycle = lifecycle
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("provider-check lifecycle must be a JSON object"))?;
+        lifecycle.insert(
+            "deadline_at".into(),
+            (reserved_at + chrono::Duration::seconds(PROVIDER_CHECK_SECONDS))
+                .to_rfc3339()
+                .into(),
+        );
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let pending: Option<(String, bool)> = transaction
@@ -9475,7 +10077,7 @@ impl Store {
                 reservation.session_id,
                 reservation.invocation_id,
                 provider,
-                reservation.launch_json,
+                launch.to_string(),
                 reservation.executable_version,
                 reservation.transcript_epoch,
                 now
@@ -9560,6 +10162,35 @@ impl Store {
         session_id: &str,
         now: &str,
     ) -> Result<()> {
+        transaction.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             SELECT ?1,?2,'service','main_verification.completed_turn.stop_claimed','session',s.id,
+               json_object('control_id',c.id,'session_id',s.id,'role_generation_id',g.id,
+                 'transcript_epoch',s.transcript_epoch,'native_session_id',s.native_session_id,
+                 'process_identity_json',s.process_identity_json,'credential_id',rc.id,
+                 'capability_key',s.capability_key,'turn',s.resume_count+1,'stop_event_id',h.id,'stop_event_rowid',h.rowid),?3
+             FROM controls c JOIN sessions s ON s.id=json_extract(c.payload_json,'$.session_id')
+             JOIN role_generations g ON g.id=s.role_generation_id
+             JOIN role_credentials rc ON rc.role_generation_id=g.id AND rc.revoked_at IS NULL
+             JOIN hook_events h ON h.session_id=s.id AND h.role_generation_id=g.id AND h.native_session_id=s.native_session_id
+             JOIN audit_events received ON received.entity_id=s.id AND received.actor_kind='hook'
+               AND received.event_code='provider.hook.received' AND json_extract(received.detail_json,'$.hook_event_id')=h.id
+               AND json_extract(received.detail_json,'$.safe_idle_boundary')=1
+             JOIN attempts a ON a.id=c.attempt_id JOIN tasks t ON t.id=a.task_id
+             WHERE s.id=?4 AND s.status='running' AND g.status='running' AND c.kind='main_checkout_verify'
+               AND c.state='native_stopping' AND g.attempt_id=c.attempt_id AND t.lifecycle='in_progress' AND t.archived_at IS NULL
+               AND json_extract(c.payload_json,'$.transcript_epoch')=s.transcript_epoch
+               AND json_extract(c.payload_json,'$.role_generation_id')=g.id
+               AND json_extract(c.payload_json,'$.capability_key')=s.capability_key
+               AND json_extract(c.payload_json,'$.turns_reserved')=s.resume_count+1
+               AND json_extract(c.payload_json,'$.deadline_at')>?3 AND h.event_name='Stop'
+               AND h.rowid>COALESCE((SELECT hook_event_boundary_rowid FROM resume_invocations
+                 WHERE session_id=s.id AND transcript_epoch=s.transcript_epoch),0)
+               AND NOT EXISTS(SELECT 1 FROM controls stop WHERE stop.attempt_id=c.attempt_id
+                 AND stop.kind IN ('cancel','pause_now','pause_after_role','manager_stop','manager_change') AND stop.state IN ('requested','draining'))
+             ORDER BY h.rowid DESC LIMIT 1",
+            params![uuid::Uuid::new_v4().to_string(),uuid::Uuid::new_v4().to_string(),now,session_id],
+        )?;
         let changed = transaction.execute(
             "UPDATE sessions SET status = 'interrupt_requested',
                     interrupt_requested_at=COALESCE(interrupt_requested_at,?1),updated_at = ?1
@@ -10619,7 +11250,9 @@ impl Store {
         launch: &LaunchConfig,
         token: &str,
     ) -> Result<()> {
-        match self.reserve_session_resume_inner(session_id, epoch, launch, token, None, None)? {
+        match self
+            .reserve_session_resume_inner(session_id, epoch, launch, token, None, None, None)?
+        {
             BrowserLaunchReservation::Reserved => Ok(()),
             BrowserLaunchReservation::Existing(_) => {
                 bail!("non-browser session resume unexpectedly found a browser receipt")
@@ -10632,6 +11265,7 @@ impl Store {
         session_id: &str,
         epoch: &str,
         launch: &LaunchConfig,
+        prompt_hash: &str,
         token: &str,
         runtime: &crate::trip::CapabilityRuntime,
     ) -> Result<()> {
@@ -10642,6 +11276,7 @@ impl Store {
             token,
             Some(runtime),
             None,
+            Some(prompt_hash),
         )? {
             BrowserLaunchReservation::Reserved => Ok(()),
             BrowserLaunchReservation::Existing(_) => {
@@ -10655,6 +11290,7 @@ impl Store {
         session_id: &str,
         epoch: &str,
         launch: &LaunchConfig,
+        prompt_hash: &str,
         token: &str,
         runtime: &crate::trip::CapabilityRuntime,
         receipt: BrowserLaunchReceipt<'_>,
@@ -10666,6 +11302,7 @@ impl Store {
             token,
             Some(runtime),
             Some(receipt),
+            Some(prompt_hash),
         )
     }
 
@@ -10677,8 +11314,10 @@ impl Store {
         token: &str,
         runtime: Option<&crate::trip::CapabilityRuntime>,
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
+        prompt_hash: Option<&str>,
     ) -> Result<BrowserLaunchReservation> {
         self.require_execution_unheld("session resume reservations")?;
+        self.check_checkout_preparation(launch.security_policy.get("checkout_scope"))?;
         {
             let connection = self.lock()?;
             refuse_validation_session_in(&connection, session_id, "session resume")?;
@@ -10708,6 +11347,40 @@ impl Store {
         let (admission_attempt, setup_permit, attempt_status): (String, Option<String>, String) = transaction.query_row(
             "SELECT rg.attempt_id,s.setup_permit_id,a.status FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id JOIN attempts a ON a.id=rg.attempt_id WHERE s.id=?1",
             params![session_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
+        )?;
+        let main = launch.security_policy.get("checkout_scope").is_some();
+        let task: String = transaction.query_row(
+            "SELECT task_id FROM attempts WHERE id=?1",
+            params![admission_attempt],
+            |row| row.get(0),
+        )?;
+        let generation: String = transaction.query_row(
+            "SELECT role_generation_id FROM sessions WHERE id=?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        let completed_main_turn_authority = main
+            && has_completed_main_verification_stop_authority(
+                &transaction,
+                session_id,
+                &generation,
+            )?;
+        require_main_readonly_command_binding(&transaction, &admission_attempt, launch)?;
+        let main_verification = require_checkout_reservation(
+            &transaction,
+            &task,
+            &admission_attempt,
+            &launch.role.to_string(),
+            &launch.cwd,
+            launch.security_policy.get("checkout_scope"),
+            &capability_key,
+            prompt_hash,
+            CheckoutTurn {
+                session: session_id,
+                epoch,
+                generation: &generation,
+            },
+            true,
         )?;
         require_failure_stop_released(&transaction, &admission_attempt)?;
         validate_frozen_capability(
@@ -10758,8 +11431,10 @@ impl Store {
             params![session_id],
             |row| row.get(0),
         )?;
-        let authorized_validation_resume =
-            legacy_or_runtime_validation_resume || typed_setup_resume || runtime_probe_resume;
+        let authorized_validation_resume = legacy_or_runtime_validation_resume
+            || typed_setup_resume
+            || runtime_probe_resume
+            || main_verification;
         if attempt_status == "capability_validation" {
             if !authorized_validation_resume {
                 bail!(
@@ -10896,7 +11571,8 @@ impl Store {
             || !generation_current
             || (!credential_current
                 && !resolved_recovery_authority
-                && !completed_setup_first_turn_authority)
+                && !completed_setup_first_turn_authority
+                && !completed_main_turn_authority)
         {
             bail!("session generation or credential no longer has current exited authority")
         }
@@ -10959,7 +11635,9 @@ impl Store {
                 params![session_id,generation],
                 |row| row.get(0),
             )?;
-        if (!phase_allowed && !typed_setup_resume) || !review_current {
+        if (!phase_allowed && !typed_setup_resume && !main_verification)
+            || (!review_current && !main_verification)
+        {
             bail!("session authority, phase, review request, or process ownership changed; exact resume is blocked")
         }
         if !authorized_validation_resume
@@ -10976,7 +11654,7 @@ impl Store {
         {
             bail!("session authority, phase, review request, or process ownership changed; exact resume is blocked")
         }
-        if !authorized_validation_resume && !capability_supported {
+        if !authorized_validation_resume && !main && !capability_supported {
             bail!("exact resume capability is not currently Supported for the complete frozen invocation identity")
         }
         let role: RoleKind = role_text.parse().map_err(|error: String| anyhow!(error))?;
@@ -11131,7 +11809,31 @@ impl Store {
         launch: &LaunchConfig,
         token: &str,
     ) -> Result<()> {
-        match self.reserve_role_resume_inner(session_id, epoch, launch, token, None, None)? {
+        match self.reserve_role_resume_inner(session_id, epoch, launch, token, None, None, None)? {
+            BrowserLaunchReservation::Reserved => Ok(()),
+            BrowserLaunchReservation::Existing(_) => {
+                bail!("non-browser role resume unexpectedly found a browser receipt")
+            }
+        }
+    }
+
+    pub(crate) fn reserve_role_resume_with_prompt_hash(
+        &self,
+        session_id: &str,
+        epoch: &str,
+        launch: &LaunchConfig,
+        prompt_hash: &str,
+        token: &str,
+    ) -> Result<()> {
+        match self.reserve_role_resume_inner(
+            session_id,
+            epoch,
+            launch,
+            token,
+            None,
+            None,
+            Some(prompt_hash),
+        )? {
             BrowserLaunchReservation::Reserved => Ok(()),
             BrowserLaunchReservation::Existing(_) => {
                 bail!("non-browser role resume unexpectedly found a browser receipt")
@@ -11144,6 +11846,7 @@ impl Store {
         session_id: &str,
         epoch: &str,
         launch: &LaunchConfig,
+        prompt_hash: &str,
         token: &str,
         admission: RestartAdmissionBinding<'_>,
     ) -> Result<()> {
@@ -11154,6 +11857,7 @@ impl Store {
             token,
             None,
             Some(admission),
+            Some(prompt_hash),
         )? {
             BrowserLaunchReservation::Reserved => Ok(()),
             BrowserLaunchReservation::Existing(_) => {
@@ -11167,10 +11871,19 @@ impl Store {
         session_id: &str,
         epoch: &str,
         launch: &LaunchConfig,
+        prompt_hash: &str,
         token: &str,
         receipt: BrowserLaunchReceipt<'_>,
     ) -> Result<BrowserLaunchReservation> {
-        self.reserve_role_resume_inner(session_id, epoch, launch, token, Some(receipt), None)
+        self.reserve_role_resume_inner(
+            session_id,
+            epoch,
+            launch,
+            token,
+            Some(receipt),
+            None,
+            Some(prompt_hash),
+        )
     }
 
     fn reserve_role_resume_inner(
@@ -11181,8 +11894,10 @@ impl Store {
         token: &str,
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
         restart_admission: Option<RestartAdmissionBinding<'_>>,
+        prompt_hash: Option<&str>,
     ) -> Result<BrowserLaunchReservation> {
         self.require_execution_unheld("role resume reservations")?;
+        self.check_checkout_preparation(launch.security_policy.get("checkout_scope"))?;
         if launch.role == RoleKind::FinalReviewer {
             bail!("final verifier sessions are always fresh and cannot resume")
         }
@@ -11265,6 +11980,34 @@ impl Store {
             "SELECT rg.attempt_id,s.setup_permit_id FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id WHERE s.id=?1",
             params![session_id], |row| Ok((row.get(0)?,row.get(1)?))
         )?;
+        let main = launch.security_policy.get("checkout_scope").is_some();
+        let task: String = tx.query_row(
+            "SELECT task_id FROM attempts WHERE id=?1",
+            params![admission_attempt],
+            |row| row.get(0),
+        )?;
+        let generation: String = tx.query_row(
+            "SELECT role_generation_id FROM sessions WHERE id=?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        require_main_readonly_command_binding(&tx, &admission_attempt, launch)?;
+        let main_verification = require_checkout_reservation(
+            &tx,
+            &task,
+            &admission_attempt,
+            &launch.role.to_string(),
+            &launch.cwd,
+            launch.security_policy.get("checkout_scope"),
+            &capability_key,
+            prompt_hash,
+            CheckoutTurn {
+                session: session_id,
+                epoch,
+                generation: &generation,
+            },
+            true,
+        )?;
         crate::trip::require_attempt_ready(&tx, &admission_attempt, setup_permit.as_deref())?;
         validate_frozen_capability(
             &tx,
@@ -11295,7 +12038,7 @@ impl Store {
             ],
             |row| row.get(0),
         )?;
-        if !capability_supported {
+        if !main && !capability_supported {
             bail!(
                 "exact resume capability is no longer supported for the frozen invocation identity"
             )
@@ -11334,7 +12077,7 @@ impl Store {
             params![attempt,&role_text,session_id,generation],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
         )?;
-        if !lifecycle_current || !phase_allowed || !review_current {
+        if !lifecycle_current || (!main_verification && (!phase_allowed || !review_current)) {
             bail!(
                 "terminal history, current phase, or review ownership cannot resume role authority"
             )
@@ -11875,6 +12618,9 @@ pub struct SingleAgentLaunchContext {
     pub attempt_id: String,
     pub workspace: std::path::PathBuf,
     pub read_denials: Vec<std::path::PathBuf>,
+    pub workspace_policy: serde_json::Value,
+    pub core_capability_key: Option<String>,
+    pub verification: bool,
     pub provider: Provider,
     pub model: String,
     pub effort: String,
@@ -11905,21 +12651,46 @@ impl SingleAgentLaunchContext {
         &self,
         native: &crate::providers::SingleAgentNativeIdentity,
     ) -> Result<String> {
-        let key = crate::workflow::single_agent_capability_key(
-            &crate::workflow::SingleAgentProfileIdentity {
-                provider: self.provider,
-                policy_hash: &self.policy_hash,
-                adapter_hash: &self.adapter_hash,
-                profile_hash: &self.profile_hash,
-                prepared_scope_hash: &self.prepared_scope_hash,
-            },
-            native,
-        )?;
+        let key = if crate::workspace::policy_mode(&self.workspace_policy)?
+            == crate::domain::WorkspaceMode::MainCheckout
+        {
+            crate::providers::main_checkout_capability_key(
+                "single_agent",
+                native
+                    .security_policy
+                    .get("checkout_scope")
+                    .ok_or_else(|| anyhow!("Main native preparation omitted its checkout scope"))?,
+                &serde_json::to_value(native)?,
+            )?
+        } else {
+            crate::workflow::single_agent_capability_key(
+                &crate::workflow::SingleAgentProfileIdentity {
+                    provider: self.provider,
+                    policy_hash: &self.policy_hash,
+                    adapter_hash: &self.adapter_hash,
+                    profile_hash: &self.profile_hash,
+                    prepared_scope_hash: &self.prepared_scope_hash,
+                },
+                native,
+            )?
+        };
+        if crate::workspace::policy_mode(&self.workspace_policy)?
+            == crate::domain::WorkspaceMode::MainCheckout
+            && self.capability_key.is_none()
+            && !self.verification
+        {
+            bail!("Verify the exact Main checkout policy before launching this writer; the admitted worktree identity does not prove it")
+        }
         if self
             .capability_key
             .as_ref()
             .is_some_and(|proven| *proven != key)
         {
+            if crate::workspace::policy_mode(&self.workspace_policy)?
+                == crate::domain::WorkspaceMode::MainCheckout
+            {
+                bail!("The exact Main checkout policy, installation or protection inputs changed; cancel or create fresh authorized lineage and verify its Main permissions")
+            }
             bail!("The agent's installation, account or local configuration changed since this profile was proven; probe the profile again before it runs")
         }
         Ok(key)
@@ -12510,7 +13281,7 @@ impl Store {
         &self,
         attempt_id: &str,
     ) -> Result<SingleAgentLaunchContext> {
-        self.single_agent_turn_context(attempt_id, None)
+        self.single_agent_turn_context(attempt_id, None, false)
     }
 
     /// The context of a turn continuing the run's retained conversation,
@@ -12520,20 +13291,38 @@ impl Store {
         attempt_id: &str,
         mode: crate::workflow::SingleAgentResumeMode,
     ) -> Result<SingleAgentLaunchContext> {
-        self.single_agent_turn_context(attempt_id, Some(mode))
+        self.single_agent_turn_context(attempt_id, Some(mode), false)
+    }
+
+    pub(crate) fn single_agent_verification_context(
+        &self,
+        attempt_id: &str,
+        resumed: bool,
+    ) -> Result<SingleAgentLaunchContext> {
+        self.single_agent_turn_context(
+            attempt_id,
+            resumed.then_some(crate::workflow::SingleAgentResumeMode::Explicit),
+            true,
+        )
     }
 
     fn single_agent_turn_context(
         &self,
         attempt_id: &str,
         resume_mode: Option<crate::workflow::SingleAgentResumeMode>,
+        verification: bool,
     ) -> Result<SingleAgentLaunchContext> {
         self.require_execution_unheld("Single agent launches")?;
         let connection = self.lock()?;
         let resume = match resume_mode {
             Some(mode) => Some(
-                crate::workflow::single_agent_resume_target(&connection, attempt_id, Some(mode))?
-                    .map_err(|reason| anyhow!(reason))?,
+                crate::workflow::single_agent_resume_target_for_verification(
+                    &connection,
+                    attempt_id,
+                    Some(mode),
+                    verification,
+                )?
+                .map_err(|reason| anyhow!(reason))?,
             ),
             None => {
                 if let Some(reason) = single_agent_launch_blocker(&connection, attempt_id)? {
@@ -12566,6 +13355,53 @@ impl Store {
             },
         )?;
         let provider: Provider = provider.parse().map_err(|error: String| anyhow!(error))?;
+        crate::workflow::require_workspace_execution_supported(&connection, &task_id)?;
+        let policy_json: String = connection.query_row(
+            "SELECT policy_json FROM workspaces WHERE attempt_id=?1",
+            params![attempt_id],
+            |row| row.get(0),
+        )?;
+        let workspace_policy: serde_json::Value = serde_json::from_str(&policy_json)?;
+        crate::workflow::validate_workspace_checkout(&connection, &task_id, &workspace_policy)?;
+        let main = crate::workspace::policy_mode(&workspace_policy)?
+            == crate::domain::WorkspaceMode::MainCheckout;
+        let core_capability_key = capability_key.clone();
+        let capability_key = if main && !verification {
+            connection.query_row("SELECT config_hash FROM capabilities WHERE mode='main_checkout' AND role='single_agent'
+                AND status='supported' AND json_extract(proof_json,'$.authorization.scope_hash')=?1
+                ORDER BY checked_at DESC,rowid DESC LIMIT 1",
+                params![workspace_policy["checkout_authorization"]["scope_hash"].as_str()], |row| row.get(0)).optional()?
+        } else if main {
+            None
+        } else {
+            capability_key
+        };
+        if verification {
+            let permitted: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
+                AND kind='main_checkout_verify' AND state IN ('native_requested','native_running')
+                AND json_extract(payload_json,'$.actor')='single_agent'
+                AND json_extract(payload_json,'$.authorization.scope_hash')=?2)",
+                params![
+                    attempt_id,
+                    workspace_policy["checkout_authorization"]["scope_hash"].as_str()
+                ],
+                |row| row.get(0),
+            )?;
+            if !main || !permitted {
+                bail!("No authenticated Main verification request owns this writer turn")
+            }
+            let settings: String=connection.query_row("SELECT json_extract(payload_json,'$.actor_settings') FROM controls WHERE attempt_id=?1
+                AND kind='main_checkout_verify' AND state IN ('native_requested','native_running') AND json_extract(payload_json,'$.actor')='single_agent'",params![attempt_id], |row|row.get(0))?;
+            let settings: serde_json::Value = serde_json::from_str(&settings)?;
+            if settings["provider"].as_str() != Some(provider.to_string().as_str())
+                || settings["model"].as_str() != Some(model.as_str())
+                || settings["effort"].as_str() != Some(effort.as_str())
+                || settings["profile_revision_id"].as_str() != Some(profile_revision_id.as_str())
+            {
+                bail!("The selected verification profile changed; review its current model and effort before starting a new check")
+            }
+        }
         let compiled =
             crate::provider_compatibility::ExecutionPolicy::single_agent_writer(provider)
                 .content_hash();
@@ -12592,11 +13428,22 @@ impl Store {
         {
             bail!("Single agent repository or worktree identity changed before preparation")
         }
+        if main {
+            let expected: String = self.lock()?.query_row(
+                "SELECT worktree_head FROM workspaces WHERE attempt_id=?1",
+                params![attempt_id],
+                |row| row.get(0),
+            )?;
+            crate::workspace::prepare(&repository, &workspace, &expected, &workspace_policy)?;
+        }
         Ok(SingleAgentLaunchContext {
             task_id,
             attempt_id: attempt_id.to_owned(),
             workspace,
             read_denials: vec![repository.root, repository.common_directory],
+            workspace_policy,
+            core_capability_key,
+            verification,
             provider,
             model,
             effort,
@@ -12678,14 +13525,36 @@ impl Store {
             .resume
             .as_ref()
             .ok_or_else(|| anyhow!("a resume needs the retained conversation it continues"))?;
+        self.check_checkout_preparation(launch.identity.security_policy.get("checkout_scope"))?;
         let capability_key = context.capability_key_for(&launch.identity)?;
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = crate::workflow::single_agent_resume_target(
+        crate::workflow::require_workspace_execution_supported(&transaction, &context.task_id)?;
+        let verifying = require_checkout_reservation(
+            &transaction,
+            &context.task_id,
+            &context.attempt_id,
+            "single_agent",
+            &context.workspace,
+            launch.identity.security_policy.get("checkout_scope"),
+            &capability_key,
+            launch.record["prompt_hash"].as_str(),
+            CheckoutTurn {
+                session: &context.session_id,
+                epoch: &context.transcript_epoch,
+                generation: &context.role_generation_id,
+            },
+            true,
+        )?;
+        if verifying != context.verification {
+            bail!("The writer's verification authority changed before resume")
+        }
+        let current = crate::workflow::single_agent_resume_target_for_verification(
             &transaction,
             &context.attempt_id,
             Some(mode),
+            context.verification,
         )?
         .map_err(|reason| anyhow!(reason))?;
         if current != *target {
@@ -12870,10 +13739,31 @@ impl Store {
         launch: &crate::providers::SingleAgentLaunch,
     ) -> Result<()> {
         self.require_execution_unheld("Single agent launch reservations")?;
+        self.check_checkout_preparation(launch.identity.security_policy.get("checkout_scope"))?;
         let capability_key = context.capability_key_for(&launch.identity)?;
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::workflow::require_workspace_execution_supported(&transaction, &context.task_id)?;
+        let verifying = require_checkout_reservation(
+            &transaction,
+            &context.task_id,
+            &context.attempt_id,
+            "single_agent",
+            &context.workspace,
+            launch.identity.security_policy.get("checkout_scope"),
+            &capability_key,
+            launch.record["prompt_hash"].as_str(),
+            CheckoutTurn {
+                session: &context.session_id,
+                epoch: &context.transcript_epoch,
+                generation: &context.role_generation_id,
+            },
+            false,
+        )?;
+        if verifying != context.verification {
+            bail!("The writer's verification authority changed before launch")
+        }
         if let Some(reason) = single_agent_launch_blocker(&transaction, &context.attempt_id)? {
             bail!("{reason}")
         }
@@ -12887,7 +13777,7 @@ impl Store {
                 context.profile_revision_id,
                 context.admission_id,
                 context.policy_hash,
-                context.capability_key,
+                context.core_capability_key,
                 context.prepared_scope_hash
             ],
             |row| row.get(0),
@@ -12969,7 +13859,7 @@ impl Store {
     }
 }
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 39;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 40;
 
 /// Reads the durable state cursor. It is committed state only when the
 /// connection is in autocommit mode.
@@ -12981,12 +13871,13 @@ pub(crate) fn read_state_revision(connection: &Connection) -> rusqlite::Result<i
 
 /// The prior schemas an existing database may be migrated from at service
 /// start. Every other non-current version is left unchanged and refused.
-pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 8] = [31, 32, 33, 34, 35, 36, 37, 38];
+pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 9] =
+    [31, 32, 33, 34, 35, 36, 37, 38, 39];
 
 pub(crate) fn require_maintenance_schema(connection: &Connection) -> Result<i64> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != CURRENT_SCHEMA_VERSION && !SERVICE_UPGRADABLE_SCHEMA_VERSIONS.contains(&version) {
-        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–39")
+        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–40")
     }
     Ok(version)
 }
@@ -13505,6 +14396,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     }
     if version <= 38 {
         migrate_multi_workflow(connection)?;
+    }
+    if version <= 39 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_040)?;
+        transaction.pragma_update(None, "user_version", 40)?;
+        transaction
+            .commit()
+            .context("commit trusted checkout migration")?;
     }
     Ok(())
 }
@@ -18117,6 +19016,54 @@ fn has_resolved_validation_recovery_authority(
     ).map_err(Into::into)
 }
 
+fn has_completed_main_verification_stop_authority(
+    connection: &Connection,
+    session_id: &str,
+    generation_id: &str,
+) -> Result<bool> {
+    let stopped: Option<(i64, String)> = connection.query_row(
+        "SELECT h.rowid,s.native_session_id FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+         JOIN controls c ON c.attempt_id=g.attempt_id AND c.id IN (SELECT json_extract(detail_json,'$.control_id')
+           FROM audit_events WHERE entity_id=s.id AND event_code='main_verification.completed_turn.stop_claimed')
+         JOIN audit_events stop ON stop.entity_id=s.id AND stop.actor_kind='service'
+           AND stop.event_code='main_verification.completed_turn.stop_claimed' AND json_extract(stop.detail_json,'$.control_id')=c.id
+         JOIN role_credentials revoked ON revoked.id=json_extract(stop.detail_json,'$.credential_id')
+           AND revoked.role_generation_id=g.id AND revoked.revoked_at IS NOT NULL
+         JOIN hook_events h ON h.id=json_extract(stop.detail_json,'$.stop_event_id') AND h.session_id=s.id
+           AND h.role_generation_id=g.id AND h.native_session_id=s.native_session_id AND h.event_name='Stop'
+         JOIN audit_events received ON received.entity_id=s.id AND received.actor_kind='hook'
+           AND received.event_code='provider.hook.received' AND json_extract(received.detail_json,'$.hook_event_id')=h.id
+           AND json_extract(received.detail_json,'$.safe_idle_boundary')=1
+         JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id
+         WHERE s.id=?1 AND g.id=?2 AND s.status='exited' AND g.status='exited'
+           AND COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)=1
+           AND c.kind='main_checkout_verify' AND c.state IN ('native_running','finished')
+           AND json_extract(c.payload_json,'$.session_id')=s.id AND json_extract(c.payload_json,'$.role_generation_id')=g.id
+           AND json_extract(c.payload_json,'$.transcript_epoch')=s.transcript_epoch
+           AND json_extract(c.payload_json,'$.capability_key')=s.capability_key
+           AND (c.state='finished' OR json_extract(c.payload_json,'$.deadline_at')>?3)
+           AND stop.created_at<=json_extract(c.payload_json,'$.deadline_at')
+           AND json_extract(stop.detail_json,'$.transcript_epoch')=s.transcript_epoch
+           AND json_extract(stop.detail_json,'$.native_session_id')=s.native_session_id
+           AND json_extract(stop.detail_json,'$.process_identity_json')=s.process_identity_json
+           AND json_extract(stop.detail_json,'$.capability_key')=s.capability_key
+           AND json_extract(stop.detail_json,'$.turn')=s.resume_count+1
+           AND json_extract(stop.detail_json,'$.stop_event_rowid')=h.rowid AND h.received_at<=stop.created_at
+           AND h.rowid>COALESCE((SELECT hook_event_boundary_rowid FROM resume_invocations
+             WHERE session_id=s.id AND transcript_epoch=s.transcript_epoch),0)
+           AND t.lifecycle='in_progress' AND t.archived_at IS NULL
+           AND NOT EXISTS(SELECT 1 FROM controls blocked WHERE blocked.attempt_id=a.id
+             AND blocked.kind IN ('cancel','pause_now','pause_after_role','manager_stop','manager_change') AND blocked.state IN ('requested','draining'))
+           AND NOT EXISTS(SELECT 1 FROM recovery_records WHERE session_id=s.id AND state!='resolved_quiescent')
+         ORDER BY stop.rowid DESC LIMIT 1",
+        params![session_id,generation_id,Utc::now().to_rfc3339()], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).optional()?;
+    let Some((rowid, native)) = stopped else {
+        return Ok(false);
+    };
+    setup_first_turn_stop_has_terminal_suffix(connection, session_id, generation_id, &native, rowid)
+}
+
 fn has_completed_setup_first_turn_stop_authority(
     connection: &rusqlite::Connection,
     session_id: &str,
@@ -18621,6 +19568,14 @@ pub(crate) fn require_supported_capability_in(
         bundles,
     )?;
     let key = crate::providers::capability_key(config)?;
+    if let Some(scope) = config.security_policy.get("checkout_scope") {
+        let exact: bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM capabilities WHERE role=?1 AND mode='main_checkout'
+            AND config_hash=?2 AND status='supported' AND json_extract(proof_json,'$.scope_hash')=?3)",params![config.role.to_string(),key,json_hash(scope)?], |row|row.get(0))?;
+        if !exact {
+            bail!("Verify the exact Main checkout actor, native policy and protected roots; worktree capability cannot authorize this launch")
+        }
+        return Ok(());
+    }
     let exact: bool = connection.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM capabilities current_capability
@@ -18894,6 +19849,17 @@ mod interruption_tests {
             36 => drop_schema_37.to_owned(),
             37 => String::new(),
             38 => return format!("{RESTORE_SCHEMA_38_SQL} PRAGMA user_version=38;"),
+            39 => {
+                let trigger_name = "CREATE TRIGGER state_revision_task_workflow_selections_update";
+                let trigger = MIGRATION_039.split_once(trigger_name).unwrap().1;
+                let trigger = trigger.split_once("END;").unwrap().0;
+                return format!(
+                    "DROP TRIGGER state_revision_task_workflow_selections_update;
+                     {trigger_name}{trigger}END;
+                     ALTER TABLE task_workflow_selections DROP COLUMN workspace_mode;
+                     PRAGMA user_version=39;"
+                );
+            }
             _ => panic!("unsupported fixture schema {version}"),
         };
         format!(
@@ -19840,7 +20806,7 @@ mod interruption_tests {
     }
 
     #[test]
-    fn service_start_upgrades_only_schemas_thirty_one_to_thirty_eight_and_preserves_receipts() {
+    fn service_start_upgrades_only_schemas_thirty_one_to_thirty_nine_and_preserves_receipts() {
         let root =
             std::env::temp_dir().join(format!("llmrelay-service-upgrade-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -19907,7 +20873,7 @@ mod interruption_tests {
 
         for _ in 0..2 {
             drop(Store::open_service(&database).unwrap());
-            assert_eq!(scalar(version), "Integer(39)");
+            assert_eq!(scalar(version), "Integer(40)");
             assert_eq!(scalar(history), expected_history);
             assert_eq!(scalar(schema), current_schema);
             assert_eq!(
@@ -19924,7 +20890,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(32))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(39)");
+        assert_eq!(scalar(version), "Integer(40)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         // Schema 33 gains only the guidance submitted form and the later migrations.
@@ -19933,7 +20899,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(33))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(39)");
+        assert_eq!(scalar(version), "Integer(40)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -19941,7 +20907,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(34))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(39)");
+        assert_eq!(scalar(version), "Integer(40)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -19949,7 +20915,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(35))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(39)");
+        assert_eq!(scalar(version), "Integer(40)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -19957,7 +20923,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(36))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(39)");
+        assert_eq!(scalar(version), "Integer(40)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -19965,7 +20931,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(37))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(39)");
+        assert_eq!(scalar(version), "Integer(40)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         assert_eq!(
@@ -19979,26 +20945,26 @@ mod interruption_tests {
             .unwrap();
         assert_eq!(scalar(version), "Integer(38)");
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(39)");
+        assert_eq!(scalar(version), "Integer(40)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         // An ordinary open of the current schema reopens it without migrating;
         // only a newer schema is refused as unknown.
         drop(Store::open(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(39)");
+        assert_eq!(scalar(version), "Integer(40)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         set_version(CURRENT_SCHEMA_VERSION + 1);
         let error = Store::open(&database).err().unwrap();
         assert!(
-            error.to_string().contains("database schema 40 is newer"),
+            error.to_string().contains("database schema 41 is newer"),
             "{error:#}"
         );
-        assert_eq!(scalar(version), "Integer(40)");
+        assert_eq!(scalar(version), "Integer(41)");
         assert_eq!(scalar(history), expected_history);
         set_version(CURRENT_SCHEMA_VERSION);
 
-        for unsupported in [0, 14, 29, 30, 40] {
+        for unsupported in [0, 14, 29, 30, 41] {
             set_version(unsupported);
             let error = Store::open_service(&database).err().unwrap();
             assert!(
@@ -20012,6 +20978,515 @@ mod interruption_tests {
             assert_eq!(scalar(schema), current_schema);
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trusted_checkout_migration_keeps_legacy_worktrees_and_rejects_unknown_modes() {
+        use crate::domain::{TaskWorkflowSelectionInput, WorkspaceMode};
+        let root = std::env::temp_dir().join(format!(
+            "llmrelay-trusted-checkout-migration-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("state.sqlite3");
+        let store = Store::open(&database).unwrap();
+        store.lock().unwrap().execute_batch(
+            "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+               VALUES('p','p','/tmp/llmrelay-trusted-checkout-fixture','trusted-checkout-fixture','base','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+             INSERT INTO tasks(id,project_id,title,lifecycle,created_at,updated_at)
+               VALUES('t','p','t','in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');"
+        ).unwrap();
+        let selected_hash = json_hash(&serde_json::json!({"family":"trip"})).unwrap();
+        store.lock().unwrap().execute(
+            "INSERT INTO task_workflow_selections(task_id,family,check_ids_json,selection_revision,
+                selection_hash,admission_state,created_at,updated_at)
+             VALUES('t','trip','[]',1,?1,'draft','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            params![selected_hash],
+        ).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(&prior_service_schema_sql(39))
+            .unwrap();
+        drop(store);
+        assert!(Store::open_current_readonly(&database).is_err());
+        let reopened = Store::open_service(&database).unwrap();
+        let connection = Connection::open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            40
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT workspace_mode||':'||selection_hash FROM task_workflow_selections WHERE task_id='t'",
+                [], |row| row.get::<_, String>(0),
+            ).unwrap(),
+            format!("isolated_worktree:{selected_hash}")
+        );
+        connection.execute_batch(
+            "INSERT INTO tasks(id,project_id,title,lifecycle,created_at,updated_at)
+             VALUES('legacy-unselected','p','Legacy','backlog','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+        ).unwrap();
+        let state = crate::workflow::state(&reopened).unwrap();
+        assert!(state
+            .tasks
+            .iter()
+            .all(|task| task.workspace_mode == WorkspaceMode::IsolatedWorktree));
+        assert!(state
+            .tasks
+            .iter()
+            .find(|task| task.id == "legacy-unselected")
+            .unwrap()
+            .workflow
+            .is_none());
+        let legacy: TaskWorkflowSelectionInput =
+            serde_json::from_value(serde_json::json!({"family":"trip"})).unwrap();
+        assert_eq!(legacy.workspace_mode, WorkspaceMode::IsolatedWorktree);
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::json!({
+                "family":"trip","execution_config_revision_id":null,"profile_revision_id":null,"check_ids":[]
+            })
+        );
+        assert!(serde_json::from_value::<TaskWorkflowSelectionInput>(
+            serde_json::json!({"family":"trip","workspace_mode":"unknown"})
+        )
+        .is_err());
+        let error = connection
+            .execute(
+                "UPDATE task_workflow_selections SET workspace_mode='unknown' WHERE task_id='t'",
+                [],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("CHECK constraint"), "{error}");
+        drop(connection);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn borrowed_checkout_baseline_requires_claim_and_preserves_start_identity() {
+        let paths = restorepoint_paths();
+        let checkout = paths.root.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        for args in [
+            vec!["init"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(checkout.join("preexisting.txt"), b"user bytes\n").unwrap();
+        let repository = crate::workspace::inspect(&checkout).unwrap();
+        let store = Store::open(&paths.database).unwrap();
+        let policy =
+            crate::provider_compatibility::ExecutionPolicy::single_agent_writer(Provider::Codex);
+        {
+            let connection = store.lock().unwrap();
+            connection.execute("INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+                VALUES('p','p',?1,?2,?3,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                params![repository.root.to_str().unwrap(),repository.identity,repository.head]).unwrap();
+            connection.execute_batch(
+                "INSERT INTO tasks(id,project_id,title,lifecycle,created_at,updated_at)
+                   VALUES('t','p','t','in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO execution_config_revisions(id,project_id,revision,config_json,content_hash,approved_at,created_at)
+                   VALUES('config','p',1,'{}','config-hash','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO agent_profiles(id,project_id,display_name,created_at,updated_at)
+                   VALUES('profile','p','writer','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');"
+            ).unwrap();
+            connection.execute("INSERT INTO agent_profile_revisions(id,profile_id,revision,provider,adapter_id,adapter_hash,model,effort,instructions_text,instructions_hash,policy_id,policy_revision,policy_hash,authority,session_contract,profile_hash,created_at)
+                VALUES('revision','profile',1,'codex','adapter',?1,'fixture','high','','instructions','writer',1,?2,'workspace_write','retained','profile-hash','2026-01-01T00:00:00Z')",
+                params![policy.adapter_hash(),policy.content_hash()]).unwrap();
+            let (definition, _) = crate::workflow::ensure_single_agent_definition(
+                &connection,
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+            connection.execute(
+                "INSERT INTO task_workflow_selections(task_id,family,definition_id,execution_config_revision_id,profile_revision_id,check_ids_json,selection_revision,selection_hash,admission_state,workspace_mode,created_at,updated_at)
+                   VALUES('t','single_agent',?1,'config','revision','[]',1,'selection','draft','main_checkout','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                params![definition],
+            ).unwrap();
+            let scope = crate::workflow::task_checkout_scope(&connection, "t").unwrap();
+            let receipt = serde_json::json!({"entity_kind":"task","entity_id":"t","state":"ready",
+                "detail":{"checkout_authorization":scope}});
+            connection.execute("INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at)
+                VALUES('ready','human_control','human_command','request',?1,'2026-01-01T00:00:00Z')",
+                params![receipt.to_string()]).unwrap();
+            let frozen = crate::workflow::workspace_policy_for_task(&connection, "t").unwrap();
+            connection.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+                VALUES('a','t','context','agent_execution',?1,1,'workspace_reserved','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                params![repository.head]).unwrap();
+            connection.execute("INSERT INTO claims(id,task_id,attempt_id,repository_identity,state,created_at,updated_at)
+                VALUES('claim','t','a',?1,'failed','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                params![repository.identity]).unwrap();
+            connection.execute("INSERT INTO workspaces(id,attempt_id,repository_identity,path,base_revision,worktree_head,policy_json,state,created_at,updated_at)
+                VALUES('w','a',?1,?2,?3,?3,?4,'reserved','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                params![repository.identity,repository.root.to_str().unwrap(),repository.head,frozen.to_string()]).unwrap();
+            assert!(
+                crate::workflow::require_workspace_execution_supported(&connection, "t").is_err()
+            );
+        }
+        let reviews = crate::review::ReviewService::new(store.clone(), paths.artifacts.clone());
+        assert!(reviews.capture_workspace_baseline("a", "w").is_err());
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            std::fs::read(checkout.join("preexisting.txt")).unwrap(),
+            b"user bytes\n"
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE claims SET state='reserved' WHERE id='claim'", [])
+            .unwrap();
+        let first = reviews.capture_workspace_baseline("a", "w").unwrap();
+        let policy_json: String = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT policy_json FROM workspaces WHERE id='w'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let frozen: serde_json::Value = serde_json::from_str(&policy_json).unwrap();
+        assert_eq!(frozen["workspace_mode"], "main_checkout");
+        assert_eq!(frozen["workspace_ownership"], "borrowed_checkout");
+        let baseline_id = frozen["baseline_snapshot_id"].as_str().unwrap();
+        assert_eq!(
+            std::fs::read(
+                paths
+                    .artifacts
+                    .join("snapshots")
+                    .join(baseline_id)
+                    .join("preexisting.txt")
+            )
+            .unwrap(),
+            b"user bytes\n"
+        );
+        let repeated = reviews.capture_workspace_baseline("a", "w").unwrap();
+        crate::snapshot::require_stable_preparation(&first, &repeated).unwrap();
+        store.lock().unwrap().execute_batch("UPDATE claims SET state='running' WHERE id='claim'; UPDATE workspaces SET state='ready' WHERE id='w'; UPDATE attempts SET status='running' WHERE id='a';").unwrap();
+        let scope = crate::providers::checkout_launch_scope(
+            &frozen,
+            &paths.root,
+            &paths.role_socket,
+            &store.repository_inventory().unwrap(),
+            &std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        let proof = serde_json::json!({"authorization":frozen["checkout_authorization"],"scope_hash":json_hash(&scope).unwrap()});
+        {
+            let connection = store.lock().unwrap();
+            let turn = CheckoutTurn {
+                session: "session",
+                epoch: "epoch",
+                generation: "generation",
+            };
+            assert!(require_checkout_reservation(
+                &connection,
+                "t",
+                "a",
+                "single_agent",
+                &checkout,
+                Some(&scope),
+                "main-key",
+                Some("prompt"),
+                turn,
+                false
+            )
+            .is_err());
+            connection.execute("INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
+                VALUES('main-proof','codex','fixture','single_agent','main_checkout','main-key','supported','synthetic-boundary-proof','[]','2026-01-01T00:00:00Z',?1)",params![proof.to_string()]).unwrap();
+            assert!(!require_checkout_reservation(
+                &connection,
+                "t",
+                "a",
+                "single_agent",
+                &checkout,
+                Some(&scope),
+                "main-key",
+                Some("prompt"),
+                turn,
+                false
+            )
+            .unwrap());
+            assert!(require_checkout_reservation(
+                &connection,
+                "t",
+                "a",
+                "implementer",
+                &checkout,
+                Some(&scope),
+                "main-key",
+                Some("prompt"),
+                turn,
+                false
+            )
+            .is_err());
+            assert!(require_checkout_reservation(
+                &connection,
+                "t",
+                "a",
+                "single_agent",
+                &checkout,
+                Some(&scope),
+                "worktree-key",
+                Some("prompt"),
+                turn,
+                false
+            )
+            .is_err());
+        }
+        let alias = paths.root.join("checkout-alias");
+        std::os::unix::fs::symlink(&checkout, &alias).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE projects SET repository_path=?1 WHERE id='p'",
+                params![alias.to_str().unwrap()],
+            )
+            .unwrap();
+        assert!(store.check_checkout_preparation(Some(&scope)).is_err());
+        {
+            let connection = store.lock().unwrap();
+            let error = require_checkout_reservation(
+                &connection,
+                "t",
+                "a",
+                "single_agent",
+                &checkout,
+                Some(&scope),
+                "main-key",
+                Some("prompt"),
+                CheckoutTurn {
+                    session: "session",
+                    epoch: "epoch",
+                    generation: "generation",
+                },
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("protection inventory changed"),
+                "{error}"
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            connection
+                .execute(
+                    "UPDATE projects SET repository_path=?1 WHERE id='p'",
+                    params![checkout.to_str().unwrap()],
+                )
+                .unwrap();
+            connection.execute_batch("UPDATE claims SET state='reserved' WHERE id='claim'; UPDATE workspaces SET state='reserved' WHERE id='w'; UPDATE attempts SET status='workspace_reserved' WHERE id='a';").unwrap();
+        }
+        std::fs::write(checkout.join("preexisting.txt"), b"external edits\n").unwrap();
+        let error = reviews.capture_workspace_baseline("a", "w").unwrap_err();
+        assert!(error.to_string().contains("checkout changed"), "{error}");
+        let connection = store.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT policy_json FROM workspaces WHERE id='w'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            policy_json
+        );
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM snapshots WHERE kind='baseline' AND attempt_id='a' AND workspace_id='w'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM workflow_run_bindings WHERE source_snapshot_id IS NOT NULL", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            std::fs::read(checkout.join("preexisting.txt")).unwrap(),
+            b"external edits\n"
+        );
+        drop(connection);
+        std::fs::write(checkout.join("preexisting.txt"), b"user bytes\n").unwrap();
+        std::fs::write(checkout.join("task-output.txt"), b"task bytes\n").unwrap();
+        let candidate_id = uuid::Uuid::new_v4().to_string();
+        let (mut candidate, _) = crate::snapshot::capture(
+            &repository,
+            &checkout,
+            &paths.artifacts.join("snapshots").join(&candidate_id),
+        )
+        .unwrap();
+        candidate.baseline_snapshot_id = Some(baseline_id.into());
+        candidate.task_changed_paths =
+            crate::snapshot::task_changed_paths(&first, &candidate).unwrap();
+        assert_eq!(candidate.task_changed_paths, vec!["task-output.txt"]);
+        let candidate_hash = crate::snapshot::write_manifest(
+            &candidate,
+            &paths.artifacts.join("snapshots").join(&candidate_id),
+        )
+        .unwrap();
+        {
+            let connection = store.lock().unwrap();
+            connection.execute("INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at,workspace_id,candidate_head)
+                VALUES(?1,'a','accepted',?2,?3,?4,1,'2026-01-01T00:00:00Z','w',?2)",params![candidate_id,candidate.candidate_head,candidate_hash,serde_json::to_string(&candidate).unwrap()]).unwrap();
+            connection.execute("UPDATE attempts SET status='running',phase='awaiting_human',candidate_hash=?1,accepted_snapshot_id=?2 WHERE id='a'",params![candidate_hash,candidate_id]).unwrap();
+            connection.execute_batch("UPDATE claims SET state='running' WHERE id='claim'; UPDATE workspaces SET state='ready' WHERE id='w'; UPDATE tasks SET lifecycle='awaiting_review',attention='none' WHERE id='t';").unwrap();
+        }
+        assert!(crate::workspace::check_reviewed_checkout(&store, "a")
+            .unwrap()
+            .is_some());
+        std::fs::write(
+            checkout.join("task-output.txt"),
+            b"external post-review bytes\n",
+        )
+        .unwrap();
+        let error = crate::workspace::check_reviewed_checkout(&store, "a")
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("changed after review"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(checkout.join("task-output.txt")).unwrap(),
+            b"external post-review bytes\n"
+        );
+        let connection = store.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT status FROM attempts WHERE id='a'", [], |row| row
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+            "held"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT state FROM claims WHERE id='claim'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "running"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM snapshots WHERE kind='baseline'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        drop(connection);
+        std::fs::write(checkout.join("task-output.txt"), b"task bytes\n").unwrap();
+        {
+            let connection = store.lock().unwrap();
+            let (definition, hash) = crate::workflow::ensure_single_agent_definition(
+                &connection,
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+            connection.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,parent_attempt_id,created_at,updated_at)
+                VALUES('child','t','child-context','agent_execution',?1,1,'materialization_pending','a','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z')",params![repository.head]).unwrap();
+            connection.execute("INSERT INTO workflow_run_bindings(attempt_id,family,definition_id,definition_hash,definition_state,evaluator_revision,
+                execution_config_revision_id,execution_config_hash,selection_hash,scope_hash,parent_attempt_id,source_snapshot_id,created_at)
+                VALUES('child','single_agent',?1,?2,'available',?3,'config','configuration','selection','scope','a',?4,'2026-01-02T00:00:00Z')",
+                params![definition,hash,crate::workflow_resources::SINGLE_AGENT_EVALUATOR_REVISION,candidate_id]).unwrap();
+            connection.execute("INSERT INTO rework_intents(id,operation_id,parent_attempt_id,new_attempt_id,snapshot_id,feedback,carry_plan_approval,scope_hash,configuration_hash,state,created_at,updated_at)
+                VALUES('rework','rework','a','child',?1,'Improve task output',0,'scope','configuration','reserved','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z')",params![candidate_id]).unwrap();
+            connection.execute_batch("UPDATE attempts SET status='rework_staging' WHERE id='a'; UPDATE tasks SET lifecycle='in_progress',attention='none' WHERE id='t';").unwrap();
+        }
+        let app = crate::operations::Application::new(
+            paths.clone(),
+            store.clone(),
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        assert!(app.prepare_rework("child").unwrap());
+        assert!(app.prepare_rework("child").unwrap());
+        assert_eq!(
+            std::fs::read(checkout.join("task-output.txt")).unwrap(),
+            b"task bytes\n"
+        );
+        assert_eq!(
+            std::fs::read(checkout.join("preexisting.txt")).unwrap(),
+            b"user bytes\n"
+        );
+        let connection = store.lock().unwrap();
+        let child_policy: String = connection
+            .query_row(
+                "SELECT policy_json FROM workspaces WHERE attempt_id='child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let child_policy: serde_json::Value = serde_json::from_str(&child_policy).unwrap();
+        assert_eq!(child_policy["baseline_snapshot_id"], baseline_id);
+        assert_eq!(child_policy["rework_start_snapshot_id"], candidate_id);
+        assert_eq!(
+            child_policy["checkout_authorization"],
+            frozen["checkout_authorization"]
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT attempt_id FROM claims WHERE id='claim'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "child"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT path FROM workspaces WHERE attempt_id='child'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            checkout.to_str().unwrap()
+        );
+        assert!(!paths.artifacts.join("worktrees/child").exists());
+        drop(connection);
+        drop(app);
+        drop(reviews);
+        drop(store);
+        std::fs::remove_dir_all(paths.root).unwrap();
     }
 
     const SCHEMA_38_SESSION_ROWS: &str = "SELECT group_concat(
@@ -20094,7 +21569,7 @@ mod interruption_tests {
             1
         );
         drop(store);
-        assert_eq!(scalar("PRAGMA user_version"), "Integer(39)");
+        assert_eq!(scalar("PRAGMA user_version"), "Integer(40)");
         assert_eq!(scalar(SCHEMA_38_SESSION_ROWS), sessions);
         assert_eq!(scalar(references), "Text(\"1:1:1\")");
         assert_eq!(
@@ -20762,7 +22237,7 @@ pub(crate) mod provider_validation_tests {
         (root, store)
     }
 
-    pub(crate) fn start(
+    pub(crate) fn historical_batch(
         store: &Store,
         operation: &str,
         selections: &[ProviderValidationSelection],
@@ -20772,13 +22247,65 @@ pub(crate) mod provider_validation_tests {
         let preview = store
             .preview_provider_validation(selections, inspections)
             .unwrap();
-        store
-            .start_provider_validation(
-                &request(operation, &preview.preview_hash, selections, max > 0, max),
-                inspections,
-                true,
+        let request = request(operation, &preview.preview_hash, selections, max > 0, max);
+        let batch_id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let mut connection = store.lock().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO provider_validation_batches(id,operation_id,request_hash,preview_hash,selection_json,
+                   max_fresh_calls,native_calls_authorized,state,created_at,updated_at,finished_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10)",
+                params![
+                    batch_id,
+                    operation,
+                    provider_validation_request_hash(&request).unwrap(),
+                    preview.preview_hash,
+                    serde_json::to_string(selections).unwrap(),
+                    max,
+                    max > 0,
+                    if max > 0 { "running" } else { "finished" },
+                    now,
+                    (max == 0).then_some(&now)
+                ],
             )
-            .unwrap()
+            .unwrap();
+        for inspection in inspections {
+            record_local_provider_observations_in(&transaction, &batch_id, inspection, &now)
+                .unwrap();
+        }
+        for (ordinal, selection) in selections.iter().enumerate() {
+            let evidence = inspections
+                .iter()
+                .find(|value| value.provider == selection.provider)
+                .unwrap()
+                .evidence()
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO provider_validation_invocations(id,batch_id,ordinal,provider,model,effort,
+                       evidence_key,state,created_at,updated_at,finished_at)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        batch_id,
+                        ordinal as i64,
+                        selection.provider.to_string(),
+                        selection.model,
+                        selection.effort,
+                        evidence.model_access_key(&selection.model, &selection.effort).unwrap(),
+                        if max > 0 { "pending" } else { "skipped" },
+                        now,
+                        (max == 0).then_some(&now)
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        provider_validation_batch_in(&connection, &batch_id).unwrap()
     }
 
     fn reserve(
@@ -20860,132 +22387,100 @@ pub(crate) mod provider_validation_tests {
     }
 
     #[test]
-    fn provider_check_start_binds_its_exact_preview_and_replays_by_operation() {
-        let (root, store) = open("start");
-        let bundles = policy_bundles(true);
+    fn provider_inspection_is_local_and_new_app_wide_starts_require_a_project() {
+        let (root, store) = open("local-inspection");
+        let bundles = policy_bundles(false);
         let selections = [
             select(Provider::Codex, "model-a"),
             select(Provider::Claude, "model-b"),
         ];
-        let inspections = [
+        let mut inspections = [
             inspection(&bundles, Provider::Codex, Some("chatgpt:one")),
             inspection(&bundles, Provider::Claude, None),
         ];
+        inspections[0].policy = Err("coding qualification unavailable".into());
         let preview = store
             .preview_provider_validation(&selections, &inspections)
             .unwrap();
-        assert_eq!(preview.model_calls_required, 2);
+        assert_eq!(preview.model_calls_required, 0);
+        assert!(preview
+            .installations
+            .iter()
+            .all(|value| value.ready && value.guidance.is_none()));
+        assert_eq!(
+            preview.installations[0].account_identity.as_deref(),
+            Some("chatgpt:one")
+        );
+        assert_eq!(
+            preview.installations[1].authentication.as_deref(),
+            Some("not_inspected")
+        );
         assert!(preview
             .checks
             .iter()
-            .all(|check| check.plan == ProviderCheckPlan::ModelCall));
+            .all(|value| value.plan == ProviderCheckPlan::Unavailable
+                && value.reason == PROVIDER_CHECK_PROJECT_REQUIRED
+                && value.proof_observed_at.is_none()));
         assert_eq!(preview.checks[0].model_listed, Some(true));
         assert_eq!(preview.checks[1].model_listed, Some(false));
+        inspections[0].policy =
+            inspection(&policy_bundles(true), Provider::Codex, Some("chatgpt:one")).policy;
         assert_eq!(
-            count(&store, "SELECT (SELECT COUNT(*) FROM provider_validation_batches)+(SELECT COUNT(*) FROM provider_observations)"),
-            0,
-            "a preview never writes"
+            preview,
+            store
+                .preview_provider_validation(&selections, &inspections)
+                .unwrap()
         );
-
-        let hash = preview.preview_hash.as_str();
-        for (refused, expected) in [
-            (
-                request("op", hash, &selections, false, 2),
-                "Approve model calls",
-            ),
-            (request("op", hash, &selections, true, 1), "at most 1"),
-            (request("op", "stale", &selections, true, 2), "out of date"),
+        inspections[0]
+            .installation
+            .as_mut()
+            .unwrap()
+            .executable_version = "changed-local-version".into();
+        assert_ne!(
+            preview.preview_hash,
+            store
+                .preview_provider_validation(&selections, &inspections)
+                .unwrap()
+                .preview_hash
+        );
+        inspections[1].installation = Err("Install Claude Code or fix PATH.".into());
+        let missing = store
+            .preview_provider_validation(&selections, &inspections)
+            .unwrap();
+        assert!(!missing.installations[1].ready);
+        assert_eq!(
+            missing.installations[1].guidance.as_deref(),
+            Some("Install Claude Code or fix PATH.")
+        );
+        for refused in [
+            request("authorized", &preview.preview_hash, &selections, true, 2),
+            request("stale-client", "old-preview", &selections, true, 8),
+            request("local-only", &preview.preview_hash, &selections, false, 0),
         ] {
-            let error = store
-                .start_provider_validation(&refused, &inspections, true)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(expected), "{error}");
+            assert_eq!(
+                store
+                    .start_provider_validation(&refused)
+                    .unwrap_err()
+                    .to_string(),
+                PROVIDER_CHECK_PROJECT_REQUIRED
+            );
         }
-        let accepted = request("op", hash, &selections, true, 2);
-        let error = store
-            .start_provider_validation(&accepted, &inspections, false)
-            .unwrap_err();
-        assert!(error.to_string().contains("stopping"), "{error}");
-        let changed = [
-            inspection(&bundles, Provider::Codex, Some("chatgpt:two")),
-            inspection(&bundles, Provider::Claude, None),
-        ];
-        let error = store
-            .start_provider_validation(&accepted, &changed, true)
-            .unwrap_err();
-        assert!(error.to_string().contains("out of date"), "{error}");
-
-        let batch = store
-            .start_provider_validation(&accepted, &inspections, true)
-            .unwrap();
-        assert_eq!(batch.state, "running");
-        assert!(batch.checks.iter().all(|check| check.state == "pending"));
-        let authentication = |provider: &str| -> String {
-            scalar(
+        assert_eq!(
+            count(
                 &store,
-                "SELECT group_concat(outcome) FROM provider_observations
-                 WHERE kind='authentication' AND provider=?1",
-                provider,
-            )
-        };
-        assert_eq!(authentication("codex"), "succeeded");
-        assert_eq!(
-            authentication("claude"),
-            "unknown",
-            "uninspected Claude sign-in is never recorded as successful"
-        );
-        // The same operation replays its batch even with changed inputs or new work refused.
-        let replay = store
-            .start_provider_validation(&accepted, &changed, false)
-            .unwrap();
-        assert_eq!(replay, batch);
-        let error = store
-            .start_provider_validation(
-                &request("op", hash, &selections, true, 3),
-                &inspections,
-                true,
-            )
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("different provider check request"),
-            "{error}"
-        );
-        assert_eq!(
-            count(&store, "SELECT COUNT(*) FROM provider_validation_batches"),
-            1
-        );
-
-        let unqualified = policy_bundles(false);
-        let blocked = store
-            .preview_provider_validation(
-                &selections,
-                &[
-                    inspection(&unqualified, Provider::Codex, Some("chatgpt:one")),
-                    inspection(&unqualified, Provider::Claude, None),
-                ],
-            )
-            .unwrap();
-        assert_eq!(blocked.model_calls_required, 0);
-        assert!(blocked
-            .checks
-            .iter()
-            .all(|check| check.plan == ProviderCheckPlan::Unavailable
-                && check.reason.contains("not qualified")));
-
-        assert_eq!(
-            count(&store, "SELECT (SELECT COUNT(*) FROM capabilities)+(SELECT COUNT(*) FROM projects)+(SELECT COUNT(*) FROM tasks)"),
-            0,
-            "app-wide checks never publish project authority"
+                "SELECT (SELECT COUNT(*) FROM provider_validation_batches)
+            +(SELECT COUNT(*) FROM provider_observations)+(SELECT COUNT(*) FROM sessions)
+            +(SELECT COUNT(*) FROM capabilities)+(SELECT COUNT(*) FROM projects)
+            +(SELECT COUNT(*) FROM role_generations)+(SELECT COUNT(*) FROM role_credentials)"
+            ),
+            0
         );
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn an_unknown_provider_check_start_settles_exactly_without_contacting_a_model() {
+    fn historical_start_replays_and_unknown_start_closes_without_new_work() {
         use crate::domain::ProviderValidationStartOutcome;
         let (root, store) = open("reconcile");
         let bundles = policy_bundles(true);
@@ -20995,28 +22490,18 @@ pub(crate) mod provider_validation_tests {
             .preview_provider_validation(&selections, &inspections)
             .unwrap();
         let first = request("first", &preview.preview_hash, &selections, true, 1);
-        let batch = store
-            .start_provider_validation(&first, &inspections, true)
-            .unwrap();
-        let unavailable = [inspection(
-            &policy_bundles(false),
-            Provider::Codex,
-            Some("chatgpt:one"),
-        )];
+        let batch = historical_batch(&store, "first", &selections, &inspections, 1);
         for index in 0..5 {
-            start(
+            historical_batch(
                 &store,
                 &format!("later-{index}"),
                 &selections,
-                &unavailable,
+                &inspections,
                 0,
             );
         }
         let recent = provider_validation_state_in(&store.lock().unwrap()).unwrap();
         assert!(recent.batches.iter().all(|listed| listed.id != batch.id));
-
-        // A started request is found exactly, however old, and settling it
-        // changes nothing.
         let started = ProviderValidationStartOutcome::Started {
             batch: batch.clone(),
         };
@@ -21028,37 +22513,39 @@ pub(crate) mod provider_validation_tests {
             store.reconcile_provider_validation_start(&first).unwrap(),
             started
         );
+        assert_eq!(store.start_provider_validation(&first).unwrap(), batch);
+        let changed = request("first", &preview.preview_hash, &selections, true, 2);
+        assert!(store
+            .start_provider_validation(&changed)
+            .unwrap_err()
+            .to_string()
+            .contains("different provider check request"));
 
-        // A request that never arrived is closed; its delayed original can
-        // never start, and the closure replays identically.
         let lost = request("lost", &preview.preview_hash, &selections, true, 1);
         let closed = store.reconcile_provider_validation_start(&lost).unwrap();
-        assert!(matches!(
-            &closed,
-            ProviderValidationStartOutcome::ClosedWithoutStart { operation_id, .. }
-                if operation_id == "lost"
-        ));
+        assert!(
+            matches!(&closed, ProviderValidationStartOutcome::ClosedWithoutStart { operation_id, .. }
+            if operation_id == "lost")
+        );
         assert_eq!(
             store.reconcile_provider_validation_start(&lost).unwrap(),
             closed
         );
         assert_eq!(
             store.provider_validation_start_outcome(&lost).unwrap(),
-            Some(closed.clone())
+            Some(closed)
         );
-        let late = store
-            .start_provider_validation(&lost, &inspections, true)
+        assert!(store
+            .start_provider_validation(&lost)
             .unwrap_err()
-            .to_string();
-        assert!(late.contains("closed without starting"), "{late}");
+            .to_string()
+            .contains("closed without starting"));
         let changed = request("lost", &preview.preview_hash, &selections, true, 2);
         for error in [
             store
                 .reconcile_provider_validation_start(&changed)
                 .unwrap_err(),
-            store
-                .start_provider_validation(&changed, &inspections, true)
-                .unwrap_err(),
+            store.start_provider_validation(&changed).unwrap_err(),
         ] {
             assert!(
                 error
@@ -21075,26 +22562,25 @@ pub(crate) mod provider_validation_tests {
             0
         );
         assert_eq!(store.pending_provider_checks().unwrap().len(), 1);
-
-        // A new, explicitly approved request still starts.
-        let preview = store
-            .preview_provider_validation(&selections, &inspections)
-            .unwrap();
-        let fresh = store
-            .start_provider_validation(
-                &request("fresh", &preview.preview_hash, &selections, true, 1),
-                &inspections,
-                true,
-            )
-            .unwrap();
-        assert_eq!(fresh.state, "running");
+        assert_eq!(
+            store
+                .start_provider_validation(&request("fresh", "stale-preview", &selections, true, 1))
+                .unwrap_err()
+                .to_string(),
+            PROVIDER_CHECK_PROJECT_REQUIRED
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM sessions"), 0);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM provider_validation_batches"),
+            6
+        );
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn provider_check_results_are_independent_and_proof_reuse_is_exact() {
-        let (root, store) = open("proof");
+    fn historical_provider_results_remain_visible_without_reusing_proof_for_new_checks() {
+        let (root, store) = open("historical-proof");
         let bundles = policy_bundles(true);
         let codex = inspection(&bundles, Provider::Codex, Some("chatgpt:one"));
         let claude = inspection(&bundles, Provider::Claude, None);
@@ -21104,9 +22590,8 @@ pub(crate) mod provider_validation_tests {
             select(Provider::Codex, "model-b"),
             select(Provider::Claude, "model-a"),
         ];
-        let batch = start(&store, "first", &selections, &inspections, 3);
+        let batch = historical_batch(&store, "historical", &selections, &inspections, 3);
         let pending = store.pending_provider_checks().unwrap();
-        assert_eq!(pending.len(), 3);
         for (index, succeeded) in [(0, true), (1, false), (2, true)] {
             let check = &pending[index];
             let session = format!("session-{index}");
@@ -21117,27 +22602,24 @@ pub(crate) mod provider_validation_tests {
             };
             assert!(reserve(&store, check, owner, &session));
             launch(&store, &session);
-            assert!(
-                !store
-                    .settle_provider_check(
-                        &check.invocation_id,
-                        &session,
-                        ProviderCheckOutcome::Succeeded
-                    )
-                    .unwrap(),
-                "a running check never settles"
-            );
+            assert!(!store
+                .settle_provider_check(
+                    &check.invocation_id,
+                    &session,
+                    ProviderCheckOutcome::Succeeded
+                )
+                .unwrap());
             exit(&store, &session, succeeded);
-            let unsettled = store.unsettled_provider_checks().unwrap();
-            assert_eq!(unsettled.len(), 1);
-            assert!(unsettled[0].quiescent && unsettled[0].exit_success == succeeded);
-            let outcome = if succeeded {
-                ProviderCheckOutcome::Succeeded
-            } else {
-                ProviderCheckOutcome::Failed("The provider exited with an error before answering.")
-            };
             assert!(store
-                .settle_provider_check(&check.invocation_id, &session, outcome)
+                .settle_provider_check(
+                    &check.invocation_id,
+                    &session,
+                    if succeeded {
+                        ProviderCheckOutcome::Succeeded
+                    } else {
+                        ProviderCheckOutcome::Failed("The provider exited with an error.")
+                    }
+                )
                 .unwrap());
         }
         let settled = store.provider_validation_batch(&batch.id).unwrap();
@@ -21159,64 +22641,128 @@ pub(crate) mod provider_validation_tests {
         )
         .unwrap();
         assert_eq!(expires - observed, chrono::Duration::hours(24));
-        assert!(!settled.checks[0].reused_proof);
-
-        // Only the exact codex inputs with a known account reuse proof.
+        let before = provider_validation_state_in(&store.lock().unwrap()).unwrap();
+        assert_eq!(before.proofs.len(), 2);
         let preview = store
             .preview_provider_validation(&selections, &inspections)
             .unwrap();
+        assert!(preview
+            .checks
+            .iter()
+            .all(|check| check.plan == ProviderCheckPlan::Unavailable
+                && check.proof_observed_at.is_none()
+                && check.proof_expires_at.is_none()));
         assert_eq!(
-            preview
-                .checks
-                .iter()
-                .map(|check| check.plan)
-                .collect::<Vec<_>>(),
-            [
-                ProviderCheckPlan::ReuseProof,
-                ProviderCheckPlan::ModelCall,
-                ProviderCheckPlan::ModelCall
-            ]
+            store
+                .start_provider_validation(&request(
+                    "fresh",
+                    &preview.preview_hash,
+                    &selections,
+                    true,
+                    3
+                ))
+                .unwrap_err()
+                .to_string(),
+            PROVIDER_CHECK_PROJECT_REQUIRED
         );
-        let reused = start(&store, "reuse", &selections[..1], &[codex.clone()], 0);
-        assert_eq!(reused.state, "finished");
-        assert!(reused.checks[0].reused_proof && reused.checks[0].state == "succeeded");
         assert_eq!(
-            reused.checks[0].proof_observed_at,
-            settled.checks[0].proof_observed_at
+            before,
+            provider_validation_state_in(&store.lock().unwrap()).unwrap()
         );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT (SELECT COUNT(*) FROM capabilities)+(SELECT COUNT(*) FROM projects)
+            +(SELECT COUNT(*) FROM attempts)"
+            ),
+            0
+        );
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
-        let codex_proof = "UPDATE provider_observations SET expires_at=?1 WHERE kind='model_access' AND provider='codex'";
-        store
-            .lock()
-            .unwrap()
-            .execute(codex_proof, params!["2000-01-01T00:00:00+00:00"])
-            .unwrap();
-        let expired = store
-            .preview_provider_validation(&selections[..1], &[codex.clone()])
-            .unwrap();
-        assert_eq!(expired.checks[0].plan, ProviderCheckPlan::ModelCall);
-        store
-            .lock()
-            .unwrap()
-            .execute(codex_proof, params!["2999-01-01T00:00:00+00:00"])
-            .unwrap();
-
-        // A different account invalidates only that provider's proof.
-        let switched = inspection(&bundles, Provider::Codex, Some("chatgpt:two"));
-        start(&store, "switched", &selections[..1], &[switched], 1);
-        let current = |provider: &str| -> i64 {
-            scalar(&store, "SELECT COUNT(*) FROM provider_observations WHERE kind='model_access' AND provider=?1 AND invalidated_at IS NULL", provider)
-        };
-        assert_eq!((current("codex"), current("claude")), (0, 1));
-        let restored = store
-            .preview_provider_validation(&selections[..1], &[codex])
-            .unwrap();
-        assert_eq!(restored.checks[0].plan, ProviderCheckPlan::ModelCall);
-
-        let state = provider_validation_state_in(&store.lock().unwrap()).unwrap();
-        assert_eq!(state.proofs.len(), 1);
-        assert_eq!(state.proofs[0].provider, Provider::Claude);
-        assert_eq!(state.proofs[0].account_identity, None);
+    #[test]
+    fn historical_check_deadline_and_retired_metadata_cannot_publish_success() {
+        let (root, store) = open("deadline-publication");
+        let codex = inspection(&policy_bundles(true), Provider::Codex, Some("chatgpt:one"));
+        for (session, expected_state) in [
+            ("late", "cancelled"),
+            ("malformed", "failed"),
+            ("retired", "failed"),
+            ("unknown", "failed"),
+            ("old-without-deadline", "succeeded"),
+        ] {
+            let batch = historical_batch(
+                &store,
+                session,
+                &[select(Provider::Codex, session)],
+                &[codex.clone()],
+                1,
+            );
+            let check = store.pending_provider_checks().unwrap().remove(0);
+            assert!(reserve(&store, &check, &codex, session));
+            launch(&store, session);
+            exit(&store, session, true);
+            let snapshot = store.unsettled_provider_checks().unwrap().remove(0);
+            assert!(snapshot.quiescent && snapshot.exit_success && !snapshot.deadline_expired);
+            assert_eq!(snapshot.challenge, ProviderCheckChallenge::Answer);
+            let expression = match session {
+                "late" => "json_set(launch_config_json,'$.provider_check.deadline_at','2000-01-01T00:00:00Z')",
+                "malformed" => "json_set(launch_config_json,'$.provider_check.deadline_at','invalid')",
+                "retired" => "json_set(launch_config_json,'$.policy.authority','disposable_scope_write','$.evidence.adapter_id','codex-provider-disposable-check','$.provider_check.challenge','owned_file_v1','$.evidence.protection_inputs_hash','old-hash')",
+                "unknown" => "json_set(launch_config_json,'$.provider_check.challenge','unknown')",
+                _ => "json_remove(launch_config_json,'$.provider_check')",
+            };
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    &format!("UPDATE sessions SET launch_config_json={expression} WHERE id=?1"),
+                    params![session],
+                )
+                .unwrap();
+            assert_eq!(store.request_expired_provider_check_stop().unwrap(), None);
+            let current = store.unsettled_provider_checks().unwrap().remove(0);
+            assert_eq!(current.deadline_expired, session == "late");
+            if matches!(session, "retired" | "unknown" | "malformed") {
+                assert_eq!(current.challenge, ProviderCheckChallenge::Invalid);
+            }
+            assert!(store
+                .settle_provider_check(
+                    &check.invocation_id,
+                    session,
+                    ProviderCheckOutcome::Succeeded
+                )
+                .unwrap());
+            let settled = store.provider_validation_batch(&batch.id).unwrap();
+            assert_eq!(settled.checks[0].state, expected_state, "{session}");
+            if session == "late" {
+                assert_eq!(
+                    settled.checks[0].reason.as_deref(),
+                    Some(PROVIDER_CHECK_TIMEOUT)
+                );
+            }
+            let result: Option<String> = scalar(
+                &store,
+                "SELECT result_hash FROM provider_validation_invocations WHERE id=?1",
+                &check.invocation_id,
+            );
+            assert_eq!(result.is_some(), expected_state == "succeeded");
+            assert!(!store
+                .settle_provider_check(
+                    &check.invocation_id,
+                    session,
+                    ProviderCheckOutcome::Succeeded
+                )
+                .unwrap());
+        }
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM provider_observations WHERE kind='model_access'"
+            ),
+            1
+        );
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -21231,7 +22777,7 @@ pub(crate) mod provider_validation_tests {
             select(Provider::Codex, "model-b"),
             select(Provider::Codex, "model-c"),
         ];
-        let batch = start(&store, "cancel", &selections, &[codex.clone()], 3);
+        let batch = historical_batch(&store, "cancel", &selections, &[codex.clone()], 3);
         let pending = store.pending_provider_checks().unwrap();
         assert!(reserve(&store, &pending[0], &codex, "running"));
         launch(&store, "running");
@@ -21297,7 +22843,7 @@ pub(crate) mod provider_validation_tests {
         );
 
         // A success computed before a later cancel commits cannot publish proof.
-        let batch = start(&store, "stale", &selections[..1], &[codex.clone()], 1);
+        let batch = historical_batch(&store, "stale", &selections[..1], &[codex.clone()], 1);
         let pending = store.pending_provider_checks().unwrap();
         assert!(reserve(&store, &pending[0], &codex, "answered"));
         launch(&store, "answered");
@@ -21327,7 +22873,7 @@ pub(crate) mod provider_validation_tests {
         );
 
         // A restart proves a never-spawned check was not run and leaves a launched one uncertain.
-        let batch = start(&store, "restart", &selections[..2], &[codex.clone()], 2);
+        let batch = historical_batch(&store, "restart", &selections[..2], &[codex.clone()], 2);
         let pending = store.pending_provider_checks().unwrap();
         assert!(reserve(&store, &pending[0], &codex, "unspawned"));
         assert!(reserve(&store, &pending[1], &codex, "launched"));

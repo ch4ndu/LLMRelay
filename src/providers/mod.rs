@@ -22,9 +22,8 @@ pub const CODEX_HOOK_REVISION: &str = "agenticjira-hook-v3-permission-events";
 /// to the earlier generated hook settings is superseded rather than reused.
 pub const CLAUDE_HOOK_REVISION: &str = "agenticjira-hook-v4-claude-notification";
 
-/// The narrow provider-side permissions needed for one service-owned runtime
-/// probe. These values are generated from the persisted probe row, never from
-/// its natural-language prompt.
+/// Exact verification commands and filesystem denials must come from persisted
+/// service-owned authority, never from a natural-language request.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeProbeCommandPolicy {
     pub commands: Vec<RuntimeProbeCommand>,
@@ -48,6 +47,33 @@ pub struct PreparedLaunch {
 }
 
 impl PreparedLaunch {
+    pub(crate) fn request_prompt_hash(&self, prompt: &str) -> Result<String> {
+        let mut sockets = self
+            .environment
+            .iter()
+            .filter(|(key, _)| key == "AGENTICJIRA_ROLE_SOCKET");
+        let (_, socket) = sockets
+            .next()
+            .context("prepared role launch has no role socket")?;
+        if sockets.next().is_some() {
+            bail!("prepared role launch has ambiguous role sockets")
+        }
+        let delivered = format!(
+            "{prompt}\n\n{}",
+            role_channel_instructions(
+                self.config.role,
+                &self.supervision_executable,
+                Path::new(socket),
+            )
+        );
+        if self.arguments != self.config.argv
+            || self.arguments.last().map(String::as_str) != Some(delivered.as_str())
+        {
+            bail!("prepared role launch does not carry the exact requested prompt")
+        }
+        crate::store::json_hash(&prompt)
+    }
+
     pub fn process(&self) -> ProviderProcess<'_> {
         ProviderProcess {
             provider: self.config.provider,
@@ -641,6 +667,7 @@ pub struct SingleAgentLaunchRequest<'a> {
     pub assets: &'a HookAssets,
     pub executable_path: &'a Path,
     pub bundles: &'a crate::provider_compatibility::BundleSet,
+    pub checkout_scope: Option<&'a serde_json::Value>,
 }
 
 struct SingleAgentReadScope {
@@ -650,6 +677,37 @@ struct SingleAgentReadScope {
 }
 
 fn single_agent_read_scope(request: &SingleAgentLaunchRequest<'_>) -> Result<SingleAgentReadScope> {
+    if let Some(scope) = request.checkout_scope {
+        let root = PathBuf::from(scope["root"].as_str().context("Main scope has no root")?);
+        if request.cwd.canonicalize()? != root
+            || scope["workspace_mode"] != "main_checkout"
+            || scope["service_root"].as_str() != request.service_root.canonicalize()?.to_str()
+        {
+            bail!("The Main checkout or app data scope changed before native preparation; verify the checkout again")
+        }
+        let executable = request.executable_path.canonicalize()?;
+        if executable.starts_with(&root) {
+            bail!("Install LLMRelay outside the writable Main checkout before verifying or launching it")
+        }
+        let denied_roots: Vec<PathBuf> = serde_json::from_value(scope["protected_roots"].clone())?;
+        let executable_read = if denied_roots
+            .iter()
+            .any(|denied| executable.starts_with(denied))
+        {
+            let metadata = executable.metadata()?;
+            if !metadata.is_file() || metadata.mode() & 0o222 != 0 || metadata.mode() & 0o111 == 0 {
+                bail!("Install an immutable LLMRelay executable outside protected data before verifying this checkout")
+            }
+            Some(executable)
+        } else {
+            None
+        };
+        return Ok(SingleAgentReadScope {
+            worktree: root,
+            denied_roots,
+            executable_read,
+        });
+    }
     if request.read_denials.len() != 2
         || !request.cwd.is_absolute()
         || !request.service_root.is_absolute()
@@ -713,6 +771,351 @@ fn single_agent_read_scope(request: &SingleAgentLaunchRequest<'_>) -> Result<Sin
         worktree,
         denied_roots: denied_roots.into_iter().collect(),
         executable_read,
+    })
+}
+
+pub(crate) fn checkout_launch_scope(
+    policy: &serde_json::Value,
+    service_root: &Path,
+    role_socket: &Path,
+    inventory: &[(String, String, String)],
+    helper_executable: &Path,
+) -> Result<serde_json::Value> {
+    let authorization: crate::domain::TaskCheckoutScope =
+        serde_json::from_value(policy["checkout_authorization"].clone())?;
+    crate::workspace::require_checkout_environment()?;
+    let repository = crate::workspace::inspect(Path::new(&authorization.checkout_root))?;
+    if authorization.workspace_mode != crate::domain::WorkspaceMode::MainCheckout
+        || policy["workspace_ownership"] != "borrowed_checkout"
+        || repository.root.to_str() != Some(authorization.checkout_root.as_str())
+        || repository.identity != authorization.repository_identity
+        || !inventory.iter().any(|(id, path, identity)| {
+            id == &authorization.project_id
+                && Path::new(path).canonicalize().ok().as_ref() == Some(&repository.root)
+                && identity == &repository.identity
+        })
+    {
+        bail!("The authorized checkout or registered repository inventory changed. Relink the project and authorize it with Make Ready.")
+    }
+    let service_root = service_root.canonicalize()?;
+    let helper_executable = executable_fingerprint(helper_executable)?;
+    let helper_metadata = helper_executable.canonical_path.metadata()?;
+    if !helper_metadata.is_file()
+        || helper_metadata.nlink() != 1
+        || helper_metadata.mode() & 0o022 != 0
+    {
+        bail!("Main checkout requires a regular app helper with one link and no group or other write permission; install it outside the checkout")
+    }
+    if helper_executable
+        .canonical_path
+        .starts_with(&repository.root)
+    {
+        bail!("Install LLMRelay outside the writable Main checkout before verifying or launching task roles")
+    }
+    if policy["checkout_identity"] != crate::workspace::checkout_identity(&repository)? {
+        bail!("The borrowed checkout changed physical identity or lacks its starting identity; recover preparation before verifying permissions")
+    }
+    let mut roots = std::collections::BTreeSet::from([
+        service_root.clone(),
+        repository.common_directory.clone(),
+    ]);
+    for (_, path, identity) in inventory {
+        let other = crate::workspace::inspect(Path::new(path))?;
+        if other.identity != *identity {
+            bail!("A registered repository changed identity. Relink it before verifying this Main checkout.")
+        }
+        if other.root != repository.root {
+            roots.insert(other.root);
+            roots.insert(other.common_directory);
+        }
+    }
+    for relative in [".local/trip-explorer", ".local/worktree-cleanup"] {
+        roots.insert(canonical_protection_path(&repository.root.join(relative))?);
+    }
+    let home = PathBuf::from(
+        std::env::var_os("HOME")
+            .context("Native credential protection requires the account home")?,
+    );
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    let claude_home = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude"));
+    for path in [
+        codex_home,
+        claude_home,
+        home.join(".claude.json"),
+        role_socket.with_file_name("control.sock"),
+    ] {
+        roots.insert(canonical_protection_path(&path)?);
+    }
+    if roots.contains(&repository.root) {
+        bail!("The Main checkout overlaps protected app or credential data. Select a separate checkout; its write grant cannot reopen protected data.")
+    }
+    for protected in &roots {
+        if repository.root.starts_with(protected) && protected != &service_root {
+            bail!("The selected checkout is inside a protected repository or credential root; use a separate checkout")
+        }
+    }
+    let metadata = repository.root.metadata()?;
+    let common = repository.common_directory.metadata()?;
+    let mut observed = Vec::new();
+    let mut unobserved = Vec::new();
+    for root in &roots {
+        if protection_target_exists(root)? {
+            observed.push(root.clone());
+        } else {
+            unobserved.push(root.clone());
+        }
+    }
+    Ok(
+        json!({"schema":1,"workspace_mode":"main_checkout","authorization":authorization,
+        "root":repository.root,"repository_identity":repository.identity,"common_directory":repository.common_directory,
+        "root_identity":{"device":metadata.dev(),"inode":metadata.ino()},
+        "common_identity":{"device":common.dev(),"inode":common.ino()},
+        "service_root":service_root,"role_socket":role_socket,"protected_roots":roots,"helper_executable":helper_executable,
+        "protected_read_targets":observed,"policy_denied_unobserved":unobserved,
+        "helper_admission":{"mode":helper_metadata.mode(),"uid":helper_metadata.uid(),"links":helper_metadata.nlink()},
+        "repository_inventory_hash":crate::store::json_hash(&inventory)?}),
+    )
+}
+
+fn canonical_protection_path(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("Protection paths must be absolute")
+    }
+    if protection_target_exists(path)? {
+        return path.canonicalize().with_context(|| {
+            format!(
+                "Cannot resolve protected path {}; check for a broken symlink",
+                path.display()
+            )
+        });
+    }
+    let parent = path.parent().context("Protection path has no parent")?;
+    Ok(canonical_protection_path(parent)?
+        .join(path.file_name().context("Protection path has no name")?))
+}
+
+fn protection_target_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("Cannot inspect protected path {}", path.display()))
+        }
+    }
+}
+
+pub(crate) fn require_main_protection_partition(scope: &serde_json::Value) -> Result<()> {
+    let roots: Vec<PathBuf> = serde_json::from_value(scope["protected_roots"].clone())
+        .context("Main verification lost its protected roots; verify the current checkout again")?;
+    let observed: Vec<PathBuf> = serde_json::from_value(scope["protected_read_targets"].clone())
+        .context(
+            "Main verification lacks observed-root bindings; verify the current checkout again",
+        )?;
+    let absent: Vec<PathBuf> = serde_json::from_value(scope["policy_denied_unobserved"].clone())
+        .context(
+            "Main verification lacks policy-only root bindings; verify the current checkout again",
+        )?;
+    let all = roots.iter().collect::<std::collections::BTreeSet<_>>();
+    let reads = observed.iter().collect::<std::collections::BTreeSet<_>>();
+    let missing = absent.iter().collect::<std::collections::BTreeSet<_>>();
+    if all.is_empty()
+        || roots.iter().any(|root| !root.is_absolute())
+        || roots.len() != all.len()
+        || observed.len() != reads.len()
+        || absent.len() != missing.len()
+        || !reads.is_disjoint(&missing)
+        || reads
+            .union(&missing)
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            != all
+    {
+        bail!("Main protection observations must partition every protected root exactly once")
+    }
+    for root in &roots {
+        if protection_target_exists(root)? != reads.contains(&root) {
+            bail!(
+                "Protected path {} appeared or disappeared; verify the current Main checkout again",
+                root.display()
+            )
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn main_checkout_capability_key(
+    actor: &str,
+    scope: &serde_json::Value,
+    native: &serde_json::Value,
+) -> Result<String> {
+    crate::store::json_hash(
+        &json!({"kind":"main_checkout_proof_v1","actor":actor,"scope":scope,"native_identity":native}),
+    )
+}
+
+pub(crate) fn bind_checkout_launch(
+    launch: &mut PreparedLaunch,
+    scope: &serde_json::Value,
+    readonly_policy: Option<&RuntimeProbeCommandPolicy>,
+) -> Result<()> {
+    let config = &mut launch.config;
+    if config.cwd.canonicalize()?.to_str() != scope["root"].as_str() {
+        bail!("Native preparation does not target the authorized Main checkout")
+    }
+    // Path normalization in ordinary capability keys must not erase checkout authority.
+    config.security_policy["checkout_scope_hash"] = crate::store::json_hash(scope)?.into();
+    config.security_policy["checkout_scope"] = scope.clone();
+    config.security_policy["execution_actor"] = config.role.to_string().into();
+    if let Some(policy) = readonly_policy {
+        config.security_policy["main_readonly_command_policy"] = serde_json::to_value(policy)?;
+        if config.provider == Provider::Claude {
+            claude::bind_main_readonly_policy(launch, policy)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn main_checkout_observation_request(
+    scope: &serde_json::Value,
+    database: &Path,
+) -> Result<serde_json::Value> {
+    require_main_protection_partition(scope)?;
+    let service_root = Path::new(
+        scope["service_root"]
+            .as_str()
+            .context("Main scope has no service root")?,
+    );
+    if !database.is_absolute() || !database.starts_with(service_root) {
+        bail!("Main verification's write-open target must be the selected app instance's database")
+    }
+    let roots = scope["protected_read_targets"]
+        .as_array()
+        .context("Main verification has no protected roots")?;
+    use std::os::unix::fs::FileTypeExt;
+    let mut targets = Vec::new();
+    for (index, root) in roots.iter().enumerate() {
+        let root = root
+            .as_str()
+            .context("Main protection root is not a path")?;
+        let metadata = std::fs::symlink_metadata(root)
+            .with_context(|| format!("Cannot inspect protected observation target {root}"))?;
+        let access = if metadata.file_type().is_socket() {
+            "connect"
+        } else {
+            "read"
+        };
+        targets.push(
+            json!({"operation":format!("protected_read_{index}"),"path":root,"access":access}),
+        );
+    }
+    targets.push(json!({"operation":"service_write_open","path":database,"access":"write"}));
+    let control = Path::new(
+        scope["role_socket"]
+            .as_str()
+            .context("Main scope has no role socket")?,
+    )
+    .with_file_name("control.sock");
+    if !std::fs::symlink_metadata(database)
+        .with_context(|| {
+            format!(
+                "Main verification needs the instance database {}",
+                database.display()
+            )
+        })?
+        .is_file()
+        || !std::fs::symlink_metadata(&control)
+            .with_context(|| {
+                format!(
+                    "Main verification needs the active control socket {}",
+                    control.display()
+                )
+            })?
+            .file_type()
+            .is_socket()
+    {
+        bail!("Main verification needs a regular instance database and active control socket")
+    }
+    targets.push(json!({"operation":"human_control_connect","path":control,"access":"connect"}));
+    let encoded = serde_json::to_string(&serde_json::to_string(&targets)?)?;
+    // Opens never read, create, truncate or write bytes; the socket sends no protocol request.
+    let script = format!("import json,os,socket\nfor target in json.loads({encoded}):\n try:\n  if target['access']=='connect':\n   with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as s:\n    s.settimeout(0.5)\n    s.connect(target['path'])\n  else:\n   fd=os.open(target['path'],(os.O_WRONLY if target['access']=='write' else os.O_RDONLY)|os.O_NOFOLLOW|os.O_NONBLOCK)\n   os.close(fd)\n  result=0\n except OSError as error:\n  result=error.errno\n print(json.dumps({{'operation':target['operation'],'path':target['path'],'access':target['access'],'errno':result}}),flush=True)\n");
+    let executable_script = format!("exec({})", serde_json::to_string(&script)?);
+    Ok(
+        json!({"command":format!("python3 -c {}",shell_quote(&executable_script)),"targets":targets,
+        "protected_read_targets":scope["protected_read_targets"],"policy_denied_unobserved":scope["policy_denied_unobserved"]}),
+    )
+}
+
+pub(crate) fn main_readonly_command_policy(
+    scope: &serde_json::Value,
+    request: &serde_json::Value,
+    paths: &serde_json::Value,
+) -> Result<RuntimeProbeCommandPolicy> {
+    let paths: Vec<String> = serde_json::from_value(paths.clone())?;
+    let root = Path::new(
+        scope["root"]
+            .as_str()
+            .context("Main policy has no checkout")?,
+    );
+    if paths.len() != 3
+        || paths
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != 3
+        || paths.iter().any(|path| {
+            !path.starts_with(".llmrelay-main-")
+                || path.contains('/')
+                || !path
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        })
+    {
+        bail!("Main read-only probes require three unique service-owned checkout filenames")
+    }
+    let direct = shell_quote(&root.join(&paths[0]).to_string_lossy());
+    let compound = shell_quote(&format!(
+        "/usr/bin/true ; /usr/bin/touch -- {}",
+        shell_quote(&root.join(&paths[1]).to_string_lossy())
+    ));
+    let redirect = shell_quote(&format!(
+        "/usr/bin/printf %s x > {}",
+        shell_quote(&root.join(&paths[2]).to_string_lossy())
+    ));
+    let commands = vec![
+        RuntimeProbeCommand {
+            operation: "boundary".into(),
+            command: request["command"]
+                .as_str()
+                .context("Main request has no boundary command")?
+                .into(),
+        },
+        RuntimeProbeCommand {
+            operation: "direct".into(),
+            command: format!("/usr/bin/touch -- {direct}"),
+        },
+        RuntimeProbeCommand {
+            operation: "compound".into(),
+            command: format!("/bin/sh -lc {compound}"),
+        },
+        RuntimeProbeCommand {
+            operation: "redirect".into(),
+            command: format!("/bin/sh -lc {redirect}"),
+        },
+    ];
+    let read_denials: Vec<PathBuf> = serde_json::from_value(scope["protected_roots"].clone())?;
+    let mut write_denials = read_denials.clone();
+    write_denials.push(root.to_path_buf());
+    write_denials.sort();
+    write_denials.dedup();
+    Ok(RuntimeProbeCommandPolicy {
+        commands,
+        read_denials,
+        write_denials,
     })
 }
 
@@ -799,7 +1202,7 @@ fn assemble_single_agent_launch(
     native: SingleAgentNative,
     binding: &crate::provider_compatibility::PolicyBinding,
 ) -> Result<SingleAgentLaunch> {
-    let identity = SingleAgentNativeIdentity {
+    let mut identity = SingleAgentNativeIdentity {
         provider: request.provider,
         executable: executable_fingerprint(&native.executable)?,
         executable_version: native.executable_version,
@@ -809,6 +1212,11 @@ fn assemble_single_agent_launch(
         hook_revision: native.hook_revision,
         policy_binding_hash: binding.effective_hash.clone(),
     };
+    if let Some(scope) = request.checkout_scope {
+        // The inherited workspace profile permits ambient reads beyond these explicit denials.
+        identity.security_policy["checkout_scope"] = scope.clone();
+        identity.security_policy["execution_actor"] = "single_agent".into();
+    }
     let policy =
         crate::provider_compatibility::ExecutionPolicy::single_agent_writer(request.provider);
     let mut arguments = native.arguments;
@@ -821,7 +1229,7 @@ fn assemble_single_agent_launch(
     if let Some(prompt) = recorded_arguments.last_mut() {
         *prompt = "<single-agent-prompt>".to_owned();
     }
-    let record = json!({
+    let mut record = json!({
         "schema": 1,
         "actor": crate::domain::ExecutionActor::SINGLE_AGENT_KEY,
         "provider": request.provider,
@@ -837,6 +1245,10 @@ fn assemble_single_agent_launch(
         "execution_policy_hash": policy.content_hash(),
         "policy_binding": binding,
     });
+    if let Some(scope) = request.checkout_scope {
+        record["checkout_scope"] = scope.clone();
+        record["native_identity"] = serde_json::to_value(&identity)?;
+    }
     Ok(SingleAgentLaunch {
         provider: request.provider,
         executable: native.executable,
@@ -1069,6 +1481,19 @@ fn normalize_value(value: serde_json::Value, config: &LaunchConfig) -> serde_jso
 }
 
 fn normalize_text(value: &str, config: &LaunchConfig) -> String {
+    // Main command authority binds literal requests, including paths with hook/socket suffixes.
+    if config.security_policy["main_readonly_command_policy"]["commands"]
+        .as_array()
+        .is_some_and(|commands| {
+            commands.iter().any(|entry| {
+                entry["command"]
+                    .as_str()
+                    .is_some_and(|command| value == command || value == format!("Bash({command})"))
+            })
+        })
+    {
+        return value.to_owned();
+    }
     let mut normalized = value.to_owned();
     let policy = config
         .security_policy
@@ -1092,8 +1517,13 @@ fn normalize_text(value: &str, config: &LaunchConfig) -> String {
     }
     let cwd = config.cwd.to_string_lossy();
     let cwd = cwd.trim_end_matches('/');
+    let main_checkout = config
+        .security_policy
+        .pointer("/checkout_scope/workspace_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("main_checkout");
     let mut paths = Vec::new();
-    if !cwd.is_empty() {
+    if !cwd.is_empty() && !main_checkout {
         paths.push((cwd.to_owned(), "<attempt-worktree>".to_owned()));
     }
     if let Some(policy) = &policy {
@@ -1328,6 +1758,113 @@ pub fn role_channel_instructions(role: RoleKind, executable: &Path, socket: &Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_checkout_observation_request_uses_connect_for_protected_sockets() {
+        let root = PathBuf::from("/tmp").join(format!(
+            "llmrelay-main-observations-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("protected-file");
+        let directory = root.join("protected-directory");
+        let database = root.join("database");
+        let control = root.join("control.sock");
+        std::fs::write(&file, b"protected surrogate").unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&database, b"instance surrogate").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&control).unwrap();
+        let protected = vec![file.clone(), directory.clone(), control.clone()];
+        let scope = json!({
+            "service_root":root,"role_socket":root.join("role.sock"),
+            "protected_roots":protected,"protected_read_targets":protected,
+            "policy_denied_unobserved":[]
+        });
+        let request = main_checkout_observation_request(&scope, &database).unwrap();
+        assert_eq!(
+            request["targets"],
+            json!([
+                {"operation":"protected_read_0","path":file,"access":"read"},
+                {"operation":"protected_read_1","path":directory,"access":"read"},
+                {"operation":"protected_read_2","path":control,"access":"connect"},
+                {"operation":"service_write_open","path":database,"access":"write"},
+                {"operation":"human_control_connect","path":control,"access":"connect"}
+            ])
+        );
+        assert_eq!(
+            request["protected_read_targets"],
+            scope["protected_read_targets"]
+        );
+        drop(listener);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_role_request_binding_preserves_exact_prompt_and_rejects_argument_drift() {
+        let helper = PathBuf::from("/fixture/llmrelay");
+        let socket = "/fixture/role.sock";
+        let instructions = role_channel_instructions(RoleKind::Manager, &helper, Path::new(socket));
+        let first = format!("  Main verification first\r\n\n\n{instructions}\nretain nonce  ");
+        let recall = "Main verification recall. Use conversation memory only.";
+        for provider in [Provider::Codex, Provider::Claude] {
+            let arguments = vec![
+                match provider {
+                    Provider::Codex => "--strict-config",
+                    Provider::Claude => "--restricted",
+                }
+                .to_owned(),
+                format!("{first}\n\n{instructions}"),
+            ];
+            let config = LaunchConfig {
+                provider,
+                role: RoleKind::Manager,
+                executable: PathBuf::from("/fixture/provider"),
+                executable_version: "fixture".into(),
+                model: "selected-model".into(),
+                effort: "selected-effort".into(),
+                cwd: PathBuf::from("/fixture/checkout"),
+                argv: arguments.clone(),
+                environment_keys: vec!["AGENTICJIRA_ROLE_SOCKET".into()],
+                permission_policy: "fixture".into(),
+                security_policy: json!({}),
+                hook_revision: "fixture".into(),
+                capability_status: crate::domain::CapabilityStatus::Unverified,
+                compatibility: None,
+            };
+            let mut launch = PreparedLaunch {
+                config,
+                executable: PathBuf::from("/fixture/provider"),
+                arguments,
+                environment: vec![("AGENTICJIRA_ROLE_SOCKET".into(), socket.into())],
+                supervision_executable: helper.clone(),
+            };
+            let first_hash = launch.request_prompt_hash(&first).unwrap();
+            assert_eq!(first_hash, crate::store::json_hash(&first).unwrap());
+            assert_ne!(first_hash, crate::store::json_hash(&launch.config).unwrap());
+            assert!(launch.request_prompt_hash(first.trim()).is_err());
+            assert!(launch.request_prompt_hash(recall).is_err());
+            let effective_argv = normalized_provider_argv(&launch.config);
+
+            launch.arguments[1] = format!("{recall}\n\n{instructions}");
+            assert!(launch.request_prompt_hash(recall).is_err());
+            launch.config.argv = launch.arguments.clone();
+            let recall_hash = launch.request_prompt_hash(recall).unwrap();
+            assert_eq!(recall_hash, crate::store::json_hash(&recall).unwrap());
+            assert_ne!(first_hash, recall_hash);
+            assert_eq!(effective_argv, normalized_provider_argv(&launch.config));
+            assert!(launch.request_prompt_hash(&first).is_err());
+
+            launch.arguments[1].push_str("\nother output");
+            launch.config.argv = launch.arguments.clone();
+            assert!(launch.request_prompt_hash(recall).is_err());
+            launch.arguments[1] = format!("{recall}\n\n{instructions}");
+            launch.config.argv = launch.arguments.clone();
+            launch.environment.push(launch.environment[0].clone());
+            assert!(launch.request_prompt_hash(recall).is_err());
+            launch.environment.clear();
+            assert!(launch.request_prompt_hash(recall).is_err());
+        }
+    }
 
     #[test]
     fn local_inspection_is_bounded_in_time_and_output() {

@@ -404,6 +404,62 @@ impl FromStr for WorkflowFamily {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMode {
+    #[default]
+    IsolatedWorktree,
+    MainCheckout,
+}
+
+impl WorkspaceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IsolatedWorktree => "isolated_worktree",
+            Self::MainCheckout => "main_checkout",
+        }
+    }
+
+    pub fn is_isolated_worktree(&self) -> bool {
+        *self == Self::IsolatedWorktree
+    }
+}
+
+impl FromStr for WorkspaceMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "isolated_worktree" => Ok(Self::IsolatedWorktree),
+            "main_checkout" => Ok(Self::MainCheckout),
+            _ => Err(format!(
+                "Unknown workspace mode {value:?}; choose isolated_worktree or main_checkout"
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutAuthorizationInput {
+    pub scope_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCheckoutScope {
+    pub task_id: String,
+    pub project_id: String,
+    pub checkout_root: String,
+    pub repository_identity: String,
+    pub workspace_mode: WorkspaceMode,
+    pub selection_revision: i64,
+    pub selection_hash: String,
+    pub writer_policy_hash: String,
+    pub configuration_hash: String,
+    pub scope_hash: String,
+}
+
 /// Who a role generation acts as. TRIP keeps its six exact role keys; the
 /// Single agent has its own `single_agent` slot and never borrows Implementer
 /// authority, context or report rules.
@@ -593,6 +649,8 @@ pub struct AgentProfileInput {
 #[serde(deny_unknown_fields)]
 pub struct TaskWorkflowSelectionInput {
     pub family: WorkflowFamily,
+    #[serde(default, skip_serializing_if = "WorkspaceMode::is_isolated_worktree")]
+    pub workspace_mode: WorkspaceMode,
     #[serde(default)]
     pub execution_config_revision_id: Option<String>,
     #[serde(default)]
@@ -639,6 +697,13 @@ pub enum WorkflowCommand {
         operation_id: String,
         project_id: String,
         admission_id: String,
+    },
+    VerifyMainCheckout {
+        operation_id: String,
+        task_id: String,
+        expected_version: i64,
+        #[serde(default)]
+        role: Option<RoleKind>,
     },
     SetProjectWorkflowDefault {
         operation_id: String,
@@ -733,6 +798,7 @@ impl WorkflowCommand {
             | Self::PrepareProfileAdmission { operation_id, .. }
             | Self::ProbeProfileAdmission { operation_id, .. }
             | Self::ActivateProfileAdmission { operation_id, .. }
+            | Self::VerifyMainCheckout { operation_id, .. }
             | Self::SetProjectWorkflowDefault { operation_id, .. }
             | Self::SetTaskWorkflow { operation_id, .. }
             | Self::AcceptResult { operation_id, .. }
@@ -845,11 +911,29 @@ pub struct SingleAgentRunDto {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskSelectedProfileRevisionDto {
+    pub id: String,
+    pub provider: Provider,
+    pub model: String,
+    pub effort: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskWorkflowDto {
     pub family: WorkflowFamily,
+    #[serde(default)]
+    pub workspace_mode: WorkspaceMode,
+    #[serde(default)]
+    pub checkout_scope: Option<TaskCheckoutScope>,
+    #[serde(default)]
+    pub checkout_authorized: bool,
+    #[serde(default)]
+    pub checkout_authorization_reason: Option<String>,
     pub definition_id: Option<String>,
     pub execution_config_revision_id: Option<String>,
     pub profile_revision_id: Option<String>,
+    #[serde(default)]
+    pub selected_profile_revision: Option<TaskSelectedProfileRevisionDto>,
     pub check_ids: Vec<String>,
     pub selection_revision: i64,
     pub admission_state: String,
@@ -1694,6 +1778,8 @@ pub struct ProjectDto {
 pub struct TaskDto {
     pub id: String,
     pub project_id: String,
+    #[serde(default)]
+    pub workspace_mode: WorkspaceMode,
     pub title: String,
     pub description: String,
     pub acceptance_criteria: Vec<String>,
@@ -3358,6 +3444,8 @@ pub enum HumanCommand {
         operation_id: String,
         task_id: String,
         expected_version: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkout_authorization: Option<CheckoutAuthorizationInput>,
     },
     SetQueuePaused {
         operation_id: String,

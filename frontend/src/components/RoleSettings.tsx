@@ -431,7 +431,10 @@ function WorkflowChoice(
       operation_id,
       task_id: task.id,
       expected_version: task.version,
-      selection: family === "trip" ? { family } : { family, ...selection },
+      selection: {
+        workspace_mode: current?.workspace_mode ?? "isolated_worktree",
+        ...(family === "trip" ? { family } : { family, ...selection }),
+      },
     }));
   return (
     <section className="panel workflow-choice">

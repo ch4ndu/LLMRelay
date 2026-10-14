@@ -992,11 +992,29 @@ export interface SingleAgentRun {
   /** Acceptance never records Git integration; that stays separate. */
   integration_recorded: boolean;
 }
+export type WorkspaceMode = "isolated_worktree" | "main_checkout";
+export interface TaskCheckoutScope {
+  task_id: string;
+  project_id: string;
+  checkout_root: string;
+  repository_identity: string;
+  workspace_mode: WorkspaceMode;
+  selection_revision: number;
+  selection_hash: string;
+  writer_policy_hash: string;
+  configuration_hash: string;
+  scope_hash: string;
+}
 export interface TaskWorkflow {
   family: WorkflowFamily;
+  workspace_mode?: WorkspaceMode;
+  checkout_scope?: TaskCheckoutScope | null;
+  checkout_authorized?: boolean;
+  checkout_authorization_reason?: string | null;
   definition_id: string | null;
   execution_config_revision_id: string | null;
   profile_revision_id: string | null;
+  selected_profile_revision?: Pick<AgentProfileRevision, "id" | "provider" | "model" | "effort"> | null;
   check_ids: string[];
   selection_revision: number;
   admission_state: "draft" | "admitted" | "invalidated";
@@ -1086,11 +1104,19 @@ export interface AgentProfileInput {
 }
 export interface TaskWorkflowSelectionInput {
   family: WorkflowFamily;
+  workspace_mode?: WorkspaceMode;
   execution_config_revision_id?: string | null;
   profile_revision_id?: string | null;
   check_ids?: string[];
 }
 export type WorkflowCommand =
+  | {
+    kind: "verify_main_checkout";
+    operation_id: string;
+    task_id: string;
+    expected_version: number;
+    role?: Role | null;
+  }
   | {
     kind: "save_execution_configuration";
     operation_id: string;

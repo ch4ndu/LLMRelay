@@ -1353,6 +1353,7 @@ export function TaskDetail(
         <WorkflowControls
           task={task}
           project={project}
+          execution={state.workflow_execution?.find((item) => item.project_id === task.project_id)}
           controls={state.controls}
           sessions={state.active_sessions}
           switches={state.switches}
