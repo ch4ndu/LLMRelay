@@ -48,3 +48,15 @@ use only the continuation or replacement offered by the current task state.
 Refresh between actions and verify no duplicate request is sent. Do not exhaust
 an account merely to create this scenario. This optional native journey is
 separate from the automated engineering evidence above.
+
+## Refactoring package refresh
+
+The October 14 task-dialog extraction follows the saved-history, failure-notice
+and session-access extractions. Its local package refresh passed 113 frontend,
+203 library, 262 contract and 3 runtime tests (581 total, 2 library tests ignored),
+plus frontend/release builds and ZIP integrity checks. Fresh final verification
+approved the checkpoint.
+All four slices preserve the moved code and parent behavior. The new archive
+has its own full test/build and integrity evidence; the 21 browser
+checks above belong to the earlier `76d0b29` package. No new browser, live-provider
+or native recovery qualification is claimed by this refresh.

@@ -46,6 +46,18 @@ Independent code review, three focused tests, frontend typecheck/build and all
 113 frontend tests passed; fresh final verification approved the checkpoint. The local
 packaged stabilization build remains unchanged.
 
+## Task-dialog refactoring and package refresh
+
+The shared focus hook and its single private dialog stack moved to
+`frontend/src/useDialogFocus.ts`; the read-only viewer moved to
+`frontend/src/components/PlanViewer.tsx`. Parent task state, request handling,
+approval ownership, inertness, mounting and focus targets are unchanged.
+Independent code review, five focused dialog/plan tests and frontend typecheck/
+build passed. The refreshed local package passed 581 tests (2 ignored), release
+build and archive integrity checks; fresh final verification approved the checkpoint.
+The package incorporates all four refactoring slices above;
+previous package/browser evidence remains historical, not a new browser run.
+
 ## Provider error recovery checkpoint
 
 Selected by the user on October 13, 2026 as essential. Start after the current

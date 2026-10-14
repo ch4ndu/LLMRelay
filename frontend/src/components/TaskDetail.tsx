@@ -1,7 +1,6 @@
 import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
-  type RefObject,
   useEffect,
   useRef,
   useState,
@@ -19,7 +18,6 @@ import {
   type CmuxKeyboardControlOutcome,
   type CmuxSessionSurface,
   type CmuxViewOutcome,
-  type ContinuationAction,
   type CurrentInputSource,
   type CurrentInputUnavailableReason,
   type PermissionRequest,
@@ -57,6 +55,8 @@ import {
   useSessionAccess,
 } from "./SessionTree";
 import { StatusBadge, taskStatus, taskSteps } from "./TaskBoard";
+import { useDialogFocus } from "../useDialogFocus";
+import { PlanViewer } from "./PlanViewer";
 
 export type TaskTab = "overview" | "changes" | "checks" | "roles" | "activity";
 const TABS: Array<{ id: TaskTab; label: string }> = [
@@ -66,78 +66,6 @@ const TABS: Array<{ id: TaskTab; label: string }> = [
   { id: "roles", label: "Roles" },
   { id: "activity", label: "Activity" },
 ];
-
-const focusableSelector =
-  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])';
-
-// Open dialogs, innermost last. Only the innermost answers Escape, and the
-// page stays scroll-locked until the last of them closes.
-const openDialogs: symbol[] = [];
-
-/**
- * Modal focus handling: focus moves into the dialog, Tab stays inside it,
- * Escape closes the innermost dialog unless something inside already handled
- * that key, and focus returns to `returnFocus` or to what opened it, or to
- * `fallbackFocus` when that is no longer shown.
- */
-function useDialogFocus(
-  dialog: RefObject<HTMLElement | null>,
-  initial: RefObject<HTMLElement | null>,
-  onClose: () => void,
-  returnFocus?: RefObject<HTMLElement | null>,
-  fallbackFocus?: RefObject<HTMLElement | null>,
-) {
-  const close = useRef(onClose);
-  close.current = onClose;
-  useEffect(() => {
-    const token = Symbol("dialog");
-    openDialogs.push(token);
-    const opener = returnFocus?.current ??
-      (document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : undefined);
-    const target = initial.current ?? dialog.current;
-    target?.focus({ preventScroll: true });
-    if (document.activeElement !== target) {
-      dialog.current?.focus({ preventScroll: true });
-    }
-    document.body.classList.add("dialog-open");
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (
-        event.key !== "Escape" || event.defaultPrevented ||
-        openDialogs.at(-1) !== token
-      ) return;
-      event.preventDefault();
-      close.current();
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("keydown", onKeyDown);
-      openDialogs.splice(openDialogs.indexOf(token), 1);
-      if (!openDialogs.length) document.body.classList.remove("dialog-open");
-      const restore = opener?.isConnected ? opener : fallbackFocus?.current;
-      restore?.focus({ preventScroll: true });
-    };
-  }, [dialog, initial, returnFocus, fallbackFocus]);
-  return (event: ReactKeyboardEvent<HTMLElement>) => {
-    if (event.key !== "Tab" || !dialog.current) return;
-    const focusable = [
-      ...dialog.current.querySelectorAll<HTMLElement>(focusableSelector),
-    ].filter((element) =>
-      element.getClientRects().length > 0 || element === document.activeElement
-    );
-    if (!focusable.length) return;
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  };
-}
 
 /**
  * Current-attempt plans and reports, refetched when the service reports a new
@@ -466,149 +394,6 @@ const when = (value: string | null) => {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 };
-
-/**
- * The complete plan the person chose to open, read-only. It shows only the
- * exact snapshot it was opened with; once the task's attempt, plan or content
- * revision moves on, the old text is withdrawn rather than shown under the
- * newer identity. A decision it was opened for is shown only while that same
- * decision still names this plan.
- */
-function PlanViewer(
-  { view, task, actions, returnFocus, fallbackFocus, onReopen, onClose }: {
-    view: PlanView;
-    task: Task;
-    actions: ContinuationAction[];
-    returnFocus: RefObject<HTMLElement | null>;
-    fallbackFocus: RefObject<HTMLElement | null>;
-    onReopen: (view: PlanView) => void;
-    onClose: () => void;
-  },
-) {
-  const dialog = useRef<HTMLElement>(null);
-  const closeButton = useRef<HTMLButtonElement>(null);
-  const trapTab = useDialogFocus(
-    dialog,
-    closeButton,
-    onClose,
-    returnFocus,
-    fallbackFocus,
-  );
-  const liveDecision = currentPlanDecision(task, actions);
-  const decisionEnded = !!view.decision &&
-    liveDecision?.phase !== view.decision.phase;
-  const current = currentPlanView(
-    task,
-    view.decision ? liveDecision : undefined,
-  );
-  const unchanged = !!current && current.task_id === view.task_id &&
-    current.attempt_id === view.attempt_id &&
-    current.plan_hash === view.plan_hash &&
-    current.content_revision === view.content_revision &&
-    current.text === view.text;
-  return (
-    <div className="plan-viewer-backdrop">
-      <section
-        ref={dialog}
-        className="plan-viewer"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="plan-viewer-title"
-        tabIndex={-1}
-        onKeyDown={trapTab}
-      >
-        <header className="plan-viewer-header">
-          <div>
-            <span className="eyebrow">Plan · read only</span>
-            <h2 id="plan-viewer-title">{task.title}</h2>
-          </div>
-          <button
-            ref={closeButton}
-            className="icon-button plan-viewer-close"
-            aria-label="Close plan"
-            onClick={onClose}
-          >
-            <span aria-hidden="true">×</span>
-          </button>
-        </header>
-        <div className="plan-viewer-body">
-          {unchanged
-            ? (
-              <>
-                {view.decision && !decisionEnded
-                  ? (
-                    <>
-                      <p>
-                        <strong>Opened for:</strong> {view.decision.title}
-                      </p>
-                      <p className="hint">
-                        This is the complete plan that decision applies to. Your
-                        decision covers the whole plan.
-                      </p>
-                    </>
-                  )
-                  : decisionEnded
-                  ? (
-                    <p className="warning" role="status">
-                      The decision you opened this plan for is no longer waiting
-                      for you, so it is shown only as the task's current plan.
-                      Check Your decision for what the task needs now.
-                    </p>
-                  )
-                  : (
-                    <p className="hint">
-                      This is the task's current plan, shown as context. It is
-                      not linked to any particular report or question; only an
-                      agent's own words say which plan or part of it they mean.
-                    </p>
-                  )}
-                <MarkdownContent className="plan-content" text={view.text} />
-              </>
-            )
-            : (
-              <div className="warning" role="status">
-                <p>
-                  This plan changed after you opened it, so the earlier text is
-                  no longer shown. Open the current plan to read it.
-                </p>
-                {current && (
-                  <button onClick={() => onReopen(current)}>
-                    Show the current plan
-                  </button>
-                )}
-              </div>
-            )}
-        </div>
-        <footer className="plan-viewer-footer">
-          <span className="hint">
-            Reading the plan does not approve it. Decide in the task's Your
-            decision panel.
-          </span>
-          <TechnicalDetails>
-            <dl className="technical-list">
-              <div>
-                <dt>Task</dt>
-                <dd>{view.task_id}</dd>
-              </div>
-              <div>
-                <dt>Attempt</dt>
-                <dd>{view.attempt_id}</dd>
-              </div>
-              <div>
-                <dt>Plan</dt>
-                <dd>{view.plan_hash ?? "not reported"}</dd>
-              </div>
-              <div>
-                <dt>Content revision</dt>
-                <dd>{view.content_revision ?? "not reported"}</dd>
-              </div>
-            </dl>
-          </TechnicalDetails>
-        </footer>
-      </section>
-    </div>
-  );
-}
 
 /** Who the task waits on, since when, and whether anything is advancing. */
 function ProgressFacts({ progress }: { progress: TaskProgress }) {
