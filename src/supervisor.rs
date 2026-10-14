@@ -4297,6 +4297,7 @@ exit 23
         }
         for mode in [
             "clean",
+            "history",
             "deadline",
             "validation",
             "reserved_only",
@@ -4309,6 +4310,10 @@ exit 23
             ));
             let paths = crate::config::InstancePaths::resolve(Some(root.clone())).unwrap();
             paths.create().unwrap();
+            let history_cwd = root.canonicalize().unwrap();
+            let history_root = history_cwd.join("sessions");
+            let history_path = history_root.join("turn.jsonl");
+            let history_native = "01a0fad3-1e45-71e2-8686-83184958e2c9";
             let store = Store::open(&paths.database).unwrap();
             let app = crate::operations::Application::new(
                 paths,
@@ -4408,17 +4413,99 @@ exit 23
                 }
                 assert!(root.join(format!("{session}.ready")).exists());
             }
+            if mode == "history" {
+                let launch = crate::domain::LaunchConfig {
+                    provider: crate::domain::Provider::Codex,
+                    role: crate::domain::RoleKind::Manager,
+                    executable: "/unused/codex".into(),
+                    executable_version: crate::providers::codex::EXACT_CODEX_VERSION.into(),
+                    model: "fixture".into(),
+                    effort: "max".into(),
+                    cwd: history_cwd.clone(),
+                    argv: Vec::new(),
+                    environment_keys: Vec::new(),
+                    permission_policy: "workspace-write".into(),
+                    security_policy: json!({}),
+                    hook_revision: crate::providers::CODEX_HOOK_REVISION.into(),
+                    capability_status: crate::domain::CapabilityStatus::Supported,
+                    compatibility: Some(
+                        crate::provider_compatibility::BundleSet::embedded()
+                            .resolve(
+                                crate::domain::Provider::Codex,
+                                crate::providers::codex::EXACT_CODEX_VERSION,
+                                crate::domain::RoleKind::Manager,
+                            )
+                            .unwrap(),
+                    ),
+                };
+                let connection = store.lock().unwrap();
+                connection
+                    .execute(
+                        "UPDATE projects SET repository_path=?1 WHERE id='p'",
+                        params![history_cwd.to_str().unwrap()],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "UPDATE role_generations SET provider='codex' WHERE id='g'",
+                        [],
+                    )
+                    .unwrap();
+                connection.execute("UPDATE sessions SET provider='codex',native_session_id=?1,launch_config_json=?2,executable_version=?3 WHERE id='s'",
+                    params![history_native, serde_json::to_string(&launch).unwrap(), launch.executable_version]).unwrap();
+                std::fs::create_dir_all(&history_root).unwrap();
+            }
             let hook = |id: &str, event: &str| {
+                let (provider, native, payload) = if mode == "history" {
+                    (
+                        "codex",
+                        history_native,
+                        json!({"session_id":history_native,"turn_id":id,
+                        "cwd":history_cwd,"transcript_path":history_path}),
+                    )
+                } else {
+                    ("claude", "s", json!({"error":"overloaded"}))
+                };
                 store.lock().unwrap().execute(
                     "INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,payload_json,
                        peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
-                     VALUES(?1,'s','g','claude',?2,'s','{\"error\":\"overloaded\"}',1,1,'fixture','managed_process_group_untrusted_payload',?3)",
-                    params![id,event,Utc::now().to_rfc3339()],
+                     VALUES(?1,'s','g',?2,?3,?4,?5,1,1,'fixture','managed_process_group_untrusted_payload',?6)",
+                    params![id,provider,event,native,payload.to_string(),Utc::now().to_rfc3339()],
                 ).unwrap();
+            };
+            let failure = |id: &str, turn: &str| {
+                if mode != "history" {
+                    hook(id, "StopFailure");
+                    return;
+                }
+                let records = [
+                    json!({"type":"session_meta","payload":{"id":history_native,"session_id":history_native,
+                        "cwd":history_cwd,"cli_version":crate::providers::codex::SOURCE_VERSION,
+                        "source":"cli","originator":"codex-tui","thread_source":"user"}}),
+                    json!({"type":"event_msg","payload":{"type":"task_started","turn_id":turn}}),
+                    json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":turn,
+                        "error":{"codex_error_info":"usage_limit_exceeded"}}}),
+                ];
+                std::fs::write(
+                    &history_path,
+                    records
+                        .iter()
+                        .map(|record| format!("{record}\n"))
+                        .collect::<String>(),
+                )
+                .unwrap();
+                let processes = app.supervisor.process_snapshot().unwrap();
+                let observations = store
+                    .read_codex_capacity(&history_root, &processes)
+                    .unwrap();
+                assert_eq!(observations.len(), 1);
+                store
+                    .record_codex_capacity(&observations[0].0, &observations[0].1, &processes)
+                    .unwrap();
             };
             hook("start", "SessionStart");
             hook("turn", "UserPromptSubmit");
-            hook("failed", "StopFailure");
+            failure("failed", "turn");
             let binding = || {
                 let connection = store.lock().unwrap();
                 crate::workflow::failed_session_stop_binding(&connection, "s")
@@ -4432,7 +4519,7 @@ exit 23
                 binding: stale,
             };
             assert!(app.execute_human_command(&stale_command).is_err());
-            hook("new-failure", "StopFailure");
+            failure("new-failure", "new-turn");
             let mut wrong = binding();
             wrong
                 .process_identity
@@ -4444,13 +4531,35 @@ exit 23
                     binding: wrong
                 })
                 .is_err());
-            store.lock().unwrap().execute("INSERT INTO provider_failure_holds(id,attempt_id,role_generation_id,session_id,transcript_epoch,
+            if mode != "history" {
+                store.lock().unwrap().execute("INSERT INTO provider_failure_holds(id,attempt_id,role_generation_id,session_id,transcript_epoch,
                  accepted_hook_event_id,failure_hook_event_id,failure_kind,attribution,created_at,expires_at,state)
                  VALUES('hold','a','g','s','epoch','new-turn','new-failure','overloaded','arrival_order','2026-01-01T00:00:00Z','9999-01-01','active')", []).unwrap();
+            }
             let command = HumanCommand::StopFailedSession {
                 operation_id: "stop".into(),
                 binding: binding(),
             };
+            if mode == "history" {
+                let state = crate::workflow::state(&store).unwrap();
+                let session = state
+                    .active_sessions
+                    .iter()
+                    .find(|value| value["id"] == "s")
+                    .unwrap();
+                assert!(session["native_turn"]["failure"].is_null());
+                assert_eq!(
+                    session["failed_session_stop"]["failure_source"]["source"],
+                    "codex_history"
+                );
+                let mut wrong_source = command.clone();
+                if let HumanCommand::StopFailedSession { binding, .. } = &mut wrong_source {
+                    binding.failure_source = crate::domain::ProviderFailureSource::FailureHook {
+                        failure_hook_event_id: "new-turn".into(),
+                    };
+                }
+                assert!(app.execute_human_command(&wrong_source).is_err());
+            }
             assert!(crate::workflow::execute(&store, &command).is_err());
             assert!(!root.join("s.signals").exists());
             let count = |sql: &str| {
@@ -4591,7 +4700,9 @@ exit 23
                 );
                 let mut changed_request = command.clone();
                 if let HumanCommand::StopFailedSession { binding, .. } = &mut changed_request {
-                    binding.failure_hook_event_id = "different-failure".into();
+                    binding.failure_source = crate::domain::ProviderFailureSource::FailureHook {
+                        failure_hook_event_id: "different-failure".into(),
+                    };
                 }
                 assert!(app.execute_human_command(&changed_request).is_err());
                 assert!(!root.join("s.signals").exists());
@@ -4684,7 +4795,9 @@ exit 23
             }
             let mut changed_request = command.clone();
             if let HumanCommand::StopFailedSession { binding, .. } = &mut changed_request {
-                binding.failure_hook_event_id = "different-failure".into();
+                binding.failure_source = crate::domain::ProviderFailureSource::FailureHook {
+                    failure_hook_event_id: "different-failure".into(),
+                };
             }
             assert!(app.execute_human_command(&changed_request).is_err());
             assert!(crate::workflow::execute(&store, &command).is_err());
@@ -4851,14 +4964,46 @@ exit 23
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             assert_eq!(app.coordinator_tick().unwrap()["action"], "paused");
-            store
-                .lock()
-                .unwrap()
-                .execute(
-                    "UPDATE provider_failure_holds SET expires_at='2000-01-01'",
-                    [],
-                )
-                .unwrap();
+            if mode == "history" {
+                let holds = store
+                    .lock()
+                    .unwrap()
+                    .prepare("SELECT id FROM provider_failure_holds WHERE state='active'")
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                for (index, hold_id) in holds.into_iter().enumerate() {
+                    let version = store
+                        .lock()
+                        .unwrap()
+                        .query_row("SELECT version FROM tasks WHERE id='t'", [], |row| {
+                            row.get(0)
+                        })
+                        .unwrap();
+                    let released = app
+                        .execute_human_command(&HumanCommand::ReleaseProviderFailureHold {
+                            operation_id: format!("release-history-{index}"),
+                            task_id: "t".into(),
+                            attempt_id: "a".into(),
+                            session_id: "s".into(),
+                            hold_id,
+                            expected_task_version: version,
+                        })
+                        .unwrap();
+                    assert_eq!(released.state, "released");
+                }
+            } else {
+                store
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE provider_failure_holds SET expires_at='2000-01-01'",
+                        [],
+                    )
+                    .unwrap();
+            }
             let before_work = count("SELECT (SELECT COUNT(*) FROM sessions)+(SELECT COUNT(*) FROM launch_permits)+(SELECT COUNT(*) FROM guidance_messages)+(SELECT SUM(resume_count) FROM sessions)");
             app.coordinator_tick().unwrap();
             fenced();

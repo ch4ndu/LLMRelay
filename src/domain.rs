@@ -2716,7 +2716,14 @@ pub struct FailedSessionStopBinding {
     pub transcript_epoch: String,
     pub process_identity: ProcessIdentity,
     pub accepted_hook_event_id: Option<String>,
-    pub failure_hook_event_id: String,
+    pub failure_source: ProviderFailureSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ProviderFailureSource {
+    FailureHook { failure_hook_event_id: String },
+    CodexHistory { history_observation_id: String },
 }
 
 /// Notification types of the admitted Claude Code release that announce a
@@ -2815,8 +2822,8 @@ pub enum CurrentInputUnavailableReason {
     GenerationReplaced,
 }
 
-/// Claude `StopFailure` error values of the admitted Claude Code release. Any
-/// other value is `Unknown`; its text stays in `provider_error`.
+/// Supported hook and structured-history failure classes. Claude hook values
+/// outside its admitted mapping stay `Unknown`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeTurnFailureKind {
@@ -2827,6 +2834,7 @@ pub enum NativeTurnFailureKind {
     BillingError,
     RateLimit,
     Overloaded,
+    UsageLimitExceeded,
     InvalidRequest,
     ModelNotFound,
     ServerError,
@@ -2863,6 +2871,7 @@ impl NativeTurnFailureKind {
             Self::BillingError => "billing_error",
             Self::RateLimit => "rate_limit",
             Self::Overloaded => "overloaded",
+            Self::UsageLimitExceeded => "usage_limit_exceeded",
             Self::InvalidRequest => "invalid_request",
             Self::ModelNotFound => "model_not_found",
             Self::ServerError => "server_error",
@@ -2880,6 +2889,7 @@ impl NativeTurnFailureKind {
             | Self::AccountOnHold
             | Self::VerificationRequired
             | Self::BillingError
+            | Self::UsageLimitExceeded
             | Self::InvalidRequest
             | Self::ModelNotFound
             | Self::ServerError
@@ -2899,6 +2909,7 @@ pub enum ProviderFailureAttribution {
     ArrivalOrder,
     /// The invocation started but no turn was accepted yet.
     StartupInvocation,
+    AcceptedTurnHistory,
 }
 
 impl ProviderFailureAttribution {
@@ -2907,6 +2918,7 @@ impl ProviderFailureAttribution {
             Self::PromptIdMatched => "prompt_id_matched",
             Self::ArrivalOrder => "arrival_order",
             Self::StartupInvocation => "startup_invocation",
+            Self::AcceptedTurnHistory => "accepted_turn_history",
         }
     }
 }
@@ -2922,9 +2934,12 @@ pub struct ProviderFailureHoldDto {
     pub role_generation_id: String,
     pub transcript_epoch: String,
     pub accepted_hook_event_id: Option<String>,
-    pub failure_hook_event_id: String,
+    #[serde(flatten)]
+    pub failure_source: ProviderFailureSource,
     pub kind: NativeTurnFailureKind,
     pub attribution: ProviderFailureAttribution,
+    pub cause: String,
+    pub remedy: String,
     pub created_at: String,
     /// LLMRelay's own cooldown end, never a provider reset time; `None` needs a release.
     pub expires_at: Option<String>,

@@ -18,7 +18,7 @@ Provider boundary: embedded compatibility candidates are Codex 0.157.1 and Claud
 | Delayed or duplicate signals | Runner-specific event checks | Current invocation identity and accepted state determine visibility; repeated notifications retain a stable event identity. | Without provider turn identifiers, hook arrival order is weaker evidence. No stronger causal claim is made. |
 | Reconnect / initial snapshot | Reference parity not established | In-app notices list current waits; initial/reset state does not replay historical browser alerts. | Browser delivery does not change provider or workflow state. |
 | Claude turn failure | Structured StopFailure normalization and durable role/lane hold | A trusted current StopFailure exposes the failure kind and restricts affected automatic work. Rate-limit/overload uses an app cooldown; other kinds require Release provider hold. Holds remain visible on exited sessions. | No fabricated role result, readiness promotion, review call, paid retry, model fallback or provider-reset claim. |
-| Codex capacity / process-open error | Runner-specific output handling | Exact current admitted Codex history with a structured capacity completion opens the affected agent output. Other recorded launch/process errors retain their existing output route. | Attention only; no fabricated failure hook, readiness, hold, retry or fallback. Missing or ambiguous history is unclassified. |
+| Codex capacity / usage error | Structured rollout completion | Exact current admitted history for overload, rate limiting or usage/plan-access failure records a durable source-bound hold and can offer the existing verified stop. | No fabricated failure hook or idle readiness. No automatic retry/fallback. Unknown, ambiguous or already-exited-before-capture history is unclassified. |
 | Submitted implementation / open process | Native output and result channel | Authenticated role report is awaiting processing or verification; the session may remain open. | A candidate report and hook completion are separate from human acceptance. |
 | Resume recovery | Runner/session machinery | Exact accepted resumed-turn evidence may supersede its own earlier blocker and release its matching hold atomically. | Independent controls, current blockers, original reports and rejection history remain intact. |
 | Completion / cleanup | Runner completion and process handling | Report consumption, workflow verification, process exit and human acceptance retain separate owners. | No completion inferred from silence, an open process or a notification. |
@@ -214,3 +214,21 @@ inherited history and sub-agent records do not. All displayed totals are partial
 usage never supplies a permission decision, readiness or failure-reset deadline.
 Claude telemetry, account quota windows and costs require separate qualification
 and scope.
+
+
+## October 14 recovery integration evidence
+
+The recovery reader remains pinned to Codex 0.162.1. Its three structured error
+tags are confirmed in the retained rust-v0.160.0 protocol source: server overload,
+rate limiting and usage-limit exhaustion. The last tag includes quota exhaustion
+and usage not included by the plan. The source/runtime version gap is explicit.
+The older 0.157.1 controlled native faults above cover overload and rate limiting,
+not a live 0.162.1 usage-exhaustion event. Earlier attention-only descriptions are
+historical; the new integration links the immutable observation to a durable hold.
+Synthetic parser, persistence, migration, supervisor and UI regressions verify
+app behavior but do not close that native characterization gap.
+
+Existing supported Claude failure-hook classes remain available. An unsupported
+Claude usage-limit tag remains Unknown; quota counters alone cannot establish a
+rejecting request or reset time. No paid quota exhaustion or new native failure
+experiment was performed for this change.

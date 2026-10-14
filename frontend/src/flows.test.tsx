@@ -2,7 +2,7 @@
 import { Window } from "happy-dom";
 import type { ReactNode } from "react";
 import type { Root } from "react-dom/client";
-import { ROLES } from "./types";
+import { roleLabel, ROLES } from "./types";
 import type {
   AppState,
   AttentionActionKind,
@@ -13068,6 +13068,7 @@ Deno.test("Session Access keeps the open process apart from reports, accepted tu
 });
 
 Deno.test("Failed session stop and native notice dismissal keep exact requests and honest refreshed state", async () => {
+  localStorage.clear();
   const requests: Record<string, unknown>[] = [];
   let refreshes = 0;
   let output = "";
@@ -13109,7 +13110,10 @@ Deno.test("Failed session stop and native notice dismissal keep exact requests a
         observed_started_at: "2026-10-01T00:00:00Z",
       },
       accepted_hook_event_id: "accepted",
-      failure_hook_event_id: "failure",
+      failure_source: {
+        source: "failure_hook",
+        failure_hook_event_id: "failure",
+      },
     },
   };
   const prompted: Session = {
@@ -13177,7 +13181,10 @@ Deno.test("Failed session stop and native notice dismissal keep exact requests a
     }));
   try {
     mount(render(stopped, prompted));
-    click("Stop failed session and pause task");
+    act(() => {
+      findButton("Stop failed session and pause task").click();
+      findButton("Stop failed session and pause task").click();
+    });
     await settle();
     const pending = [...article(stopped.id).querySelectorAll("button")].find((
       button,
@@ -13205,7 +13212,9 @@ Deno.test("Failed session stop and native notice dismissal keep exact requests a
       failed_session_stop: null,
       failure_stop_pause: { control_id: "pause", state: "requested" },
     };
-    rerender(render(stopping, prompted));
+    unmount();
+    mount(render(stopping, prompted));
+    check(requests.length === 1, "reconnect replayed a stop without a click");
     respond = () => receipt("stop_recovery_required");
     click("Check previous stop request");
     await settle();
@@ -13287,6 +13296,31 @@ Deno.test("Failed session stop and native notice dismissal keep exact requests a
         requests[3].operation_id !== dismissId,
       "a later same-turn notice reused the old dismissal frontier",
     );
+    const historyStopped: Session = {
+      ...stopped,
+      provider: "codex",
+      native_turn: { ...stopped.native_turn!, failure: null },
+      failed_session_stop: {
+        ...stopped.failed_session_stop!,
+        failure_source: {
+          source: "codex_history",
+          history_observation_id: "audit-failure",
+        },
+      },
+    };
+    rerender(render(historyStopped, later));
+    respond = () => receipt("stop_requested");
+    click("Stop failed session and pause task");
+    await settle();
+    const { operation_id: historyStopId, kind: historyKind, ...historyBinding } =
+      requests[4];
+    check(
+      historyKind === "stop_failed_session" && historyStopId !== stopId &&
+        JSON.stringify(historyBinding) ===
+          JSON.stringify(historyStopped.failed_session_stop) &&
+        !("failure_hook_event_id" in historyBinding),
+      "a history-origin stop lost its tagged source or manufactured a failure hook",
+    );
     check(
       requests.every((request) =>
         ["stop_failed_session", "dismiss_native_prompt"].includes(
@@ -13298,16 +13332,18 @@ Deno.test("Failed session stop and native notice dismissal keep exact requests a
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
+    localStorage.clear();
   }
 });
 
 Deno.test("A provider failure hold shows on exited and running sessions and Release provider hold posts its exact binding", async () => {
+  localStorage.clear();
   const requests: Record<string, unknown>[] = [];
   let refreshes = 0;
   let respond: () => Response | Promise<Response> = () =>
     new Response(JSON.stringify({
       result: {
-        operation_id: "release",
+        operation_id: requests.at(-1)?.operation_id,
         entity_kind: "provider_failure_hold",
         entity_id: "hold-billing",
         version: 8,
@@ -13341,8 +13377,8 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
   const hold = (
     id: string,
     sessionId: string,
-    overrides: Partial<ProviderFailureHold> = {},
-  ): ProviderFailureHold => ({
+    overrides: Partial<Extract<ProviderFailureHold, { source: "failure_hook" }>> = {},
+  ): Extract<ProviderFailureHold, { source: "failure_hook" }> => ({
     id,
     task_id: "AJ-1",
     task_version: 7,
@@ -13351,8 +13387,11 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
     role_generation_id: "g1",
     transcript_epoch: "epoch-1",
     accepted_hook_event_id: null,
+    source: "failure_hook",
     failure_hook_event_id: `hook-${id}`,
     kind: "billing_error",
+    cause: "the account's usage limit was reached",
+    remedy: "Check the provider account's usage and billing.",
     attribution: "startup_invocation",
     created_at: "2026-10-01T15:00:00Z",
     expires_at: null,
@@ -13362,6 +13401,7 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
     ...managerSession,
     id: "s-exited",
     status: "exited",
+    process_group_quiescent: true,
     provider_failure_holds: [hold("hold-billing", "s-exited")],
   };
   const cooling: Session = {
@@ -13373,11 +13413,36 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
       hold("hold-rate", "s-cooling", {
         role_generation_id: "g2",
         kind: "rate_limit",
+        cause: "the provider's rate limit was reached",
+        remedy: "Check the provider's rate-limit status before choosing the next action.",
         attribution: "prompt_id_matched",
         accepted_hook_event_id: "hook-accept",
         expires_at: "2026-10-01T15:01:00Z",
       }),
     ],
+  };
+  const usage: Session = {
+    ...managerSession,
+    id: "s-usage",
+    provider: "codex",
+    provider_failure_holds: [{
+      id: "hold-usage",
+      task_id: "AJ-1",
+      task_version: 7,
+      attempt_id: "a1",
+      session_id: "s-usage",
+      role_generation_id: "g1",
+      transcript_epoch: "epoch-1",
+      accepted_hook_event_id: "hook-usage-accept",
+      source: "codex_history",
+      history_observation_id: "audit-usage",
+      kind: "usage_limit_exceeded",
+      cause: "the usage allowance or plan access does not permit this request",
+      remedy: "Check the provider account's usage allowance and plan access.",
+      attribution: "accepted_turn_history",
+      created_at: "2026-10-01T15:00:00Z",
+      expires_at: null,
+    }],
   };
   const render = (sessions: Session[]) => (
     <SessionTree
@@ -13399,16 +13464,16 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
       .map((element) => element.textContent ?? "").join(" ");
   const releaseButton = (sessionId: string) =>
     [...notice(sessionId)!.querySelectorAll("button")].find((button) =>
-      button.textContent?.includes("provider hold")
+      button.textContent?.includes("provider hold") || button.textContent === "Check previous release request"
     ) as HTMLButtonElement;
   try {
-    mount(render([exited, cooling]));
+    mount(render([exited, cooling, usage]));
     check(
       primary("s-exited").includes(
         "Manager is on hold after a provider error",
       ) &&
         primary("s-exited").includes(
-          "The provider reported a failure: a billing problem",
+          "The provider reported a failure: the account's usage limit was reached",
         ) &&
         primary("s-exited").includes("This needs your action") &&
         primary("s-exited").includes("will not start, resume or send input") &&
@@ -13420,7 +13485,7 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
     );
     check(
       primary("s-cooling").includes(
-        "The provider reported a failure: a rate limit was reached",
+        "The provider reported a failure: the provider's rate limit was reached",
       ) &&
         primary("s-cooling").includes("short cooldown of its own") &&
         primary("s-cooling").includes("not the provider's reset time") &&
@@ -13430,6 +13495,14 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
         primary("s-cooling")
       }`,
     );
+    check(
+      primary("s-usage").includes("usage allowance or plan access") &&
+        primary("s-usage").includes("This needs your action") &&
+        !primary("s-usage").includes("cooldown") &&
+        !primary("s-usage").includes("reset") &&
+        !primary("s-usage").includes("ended"),
+      `usage classification promised a reset or completion, or lost plan access: ${primary("s-usage")}`,
+    );
     const details = notice("s-exited")!.querySelector("details")!;
     check(
       !details.open &&
@@ -13437,12 +13510,71 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
         details.textContent.includes("no app cooldown; needs your action") &&
         !details.textContent.includes("only by release") &&
         details.textContent.includes("hold-billing") &&
+        details.textContent.includes("failure hook hook-hold-billing") &&
         !primary("s-exited").includes("hold-billing") &&
         !primary("s-exited").includes("startup_invocation"),
       "hold identity or attribution was primary copy, details claimed release is the only end, or expanded by default",
     );
+    const usageDetails = notice("s-usage")!.querySelector("details")!;
+    check(
+      !usageDetails.open &&
+        usageDetails.textContent?.includes("history observation audit-usage") &&
+        usageDetails.textContent.includes("accepted_turn_history attribution") &&
+        !usageDetails.textContent.includes("failure hook") &&
+        !primary("s-usage").includes("audit-usage") && requests.length === 0,
+      "history identity was presented as a hook, promoted to primary copy, or caused a request",
+    );
+    check(releaseButton("s-cooling").disabled && releaseButton("s-usage").disabled,
+      "an open invocation offered a new release without exit confirmation");
+    act(() => releaseButton("s-cooling").click());
+    check(requests.length === 0, "a disabled release issued a command");
 
-    act(() => releaseButton("s-exited").click());
+    for (const failure of [
+      {
+        kind: "overloaded" as const,
+        cause: "the model was overloaded",
+        remedy: "Check the provider's service status or choose another verified model when replacement is available.",
+        expires_at: "2026-10-01T15:01:00Z",
+      },
+      {
+        kind: "authentication_failed" as const,
+        cause: "the provider could not authenticate the session",
+        remedy: "Sign this computer in to the provider again.",
+        expires_at: null,
+      },
+      {
+        kind: "account_on_hold" as const,
+        cause: "the provider account needs attention",
+        remedy: "Resolve the account or verification issue with the provider.",
+        expires_at: null,
+      },
+      {
+        kind: "unknown" as const,
+        cause: "the provider did not say why",
+        remedy: "Open agent output to see the error and choose the next step.",
+        expires_at: null,
+      },
+    ]) {
+      const failed: Session = {
+        ...cooling,
+        id: "s-cause",
+        provider_failure_holds: [hold("hold-cause", "s-cause", { ...failure, role_generation_id: cooling.role_generation_id })],
+      };
+      rerender(render([exited, cooling, usage, failed]));
+      check(primary(failed.id).includes(failure.cause) &&
+        primary(failed.id).includes(failure.remedy) &&
+        primary(failed.id).includes("Invocation still open") &&
+        primary(failed.id).includes("checkpoints are retained") &&
+        releaseButton(failed.id).disabled,
+        `${failure.kind} lost its projected correction or offered release on an open invocation`);
+      act(() => releaseButton(failed.id).click());
+      check(requests.length === 0, `${failure.kind} dispatched from a disabled recovery action`);
+    }
+    rerender(render([exited, cooling, usage]));
+    act(() => {
+      releaseButton("s-exited").click();
+      releaseButton("s-exited").click();
+    });
     await settle();
     check(
       requests.length === 1 &&
@@ -13462,6 +13594,11 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
         primary("s-exited")
       }`,
     );
+    rerender(render([exited, { ...cooling, status: "interrupt_requested" }, usage]));
+    check(releaseButton("s-cooling").disabled && requests.length === 1,
+      "stopping was treated as confirmed stopped or refresh chained a release");
+    const settledCooling: Session = { ...cooling, status: "exited", process_group_quiescent: true };
+    rerender(render([exited, settledCooling, usage]));
 
     respond = () =>
       new Response(JSON.stringify({ error: "task version is stale" }), {
@@ -13508,10 +13645,16 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
         ),
       "an uncertain release did not ask for a refresh before retrying",
     );
+    unmount();
+    mount(render([exited, {
+      ...settledCooling,
+      provider_failure_holds: settledCooling.provider_failure_holds?.map((hold) => ({ ...hold, task_version: 8 })),
+    }, usage]));
+    check(requests.length === 4, "reconnect replayed a release automatically");
     respond = () =>
       new Response(JSON.stringify({
         result: {
-          operation_id: "release",
+          operation_id: requests.at(-1)?.operation_id,
           entity_kind: "provider_failure_hold",
           entity_id: "hold-rate",
           version: 7,
@@ -13524,6 +13667,7 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
     const operations = requests.map((request) => request.operation_id);
     check(
       requests.length === 5 && operations[4] === operations[3] &&
+        requests[4].expected_task_version === 7 &&
         operations[3] !== operations[2] && operations[2] !== operations[1] &&
         primary("s-cooling").includes(
           "cooldown had already ended, so nothing changed",
@@ -13543,9 +13687,34 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
       !!notice("s-exited") && !notice("s-cooling"),
       "the session list did not follow the authoritative hold state",
     );
+    const late: Session = {
+      ...exited, id: "s-late", provider_failure_holds: [],
+    };
+    for (const exitSuccess of [0, false] as const) {
+      rerender(render([{ ...late, exit_success: exitSuccess }]));
+      const lateSession = document.querySelector('[data-attention-target="session:s-late"]')!;
+      check(lateSession.textContent?.includes("No attributable provider failure is recorded") &&
+        lateSession.textContent.includes("only after exit cannot be classified") &&
+        !notice(late.id) && !lateSession.querySelector(".session-failure-stop") &&
+        [...lateSession.querySelectorAll("button")].some((button) => button.textContent === "View recorded output") &&
+        requests.length === 5,
+        `Failed exit ${exitSuccess} lost its explanation, classified a post-exit observation or granted stop authority`);
+    }
+    const otherExits: Session[] = [
+      { ...late, exit_success: null }, late,
+      { ...late, exit_success: 1 }, { ...late, exit_success: true },
+    ];
+    for (const otherExit of otherExits) {
+      rerender(render([otherExit]));
+      const lateSession = document.querySelector('[data-attention-target="session:s-late"]')!;
+      check(!lateSession.textContent?.includes("No attributable provider failure is recorded") &&
+        !notice(late.id) && !lateSession.querySelector(".session-failure-stop") && requests.length === 5,
+        `Exit success ${otherExit.exit_success} was treated as a failed exit or granted recovery authority`);
+    }
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
+    localStorage.clear();
   }
 });
 
@@ -13714,7 +13883,7 @@ Deno.test("A provider hold's attention item opens its exited session, whose Rele
       commands.push(JSON.parse(String(init?.body)));
       return new Response(JSON.stringify({
         result: {
-          operation_id: "release",
+          operation_id: commands.at(-1)?.operation_id,
           entity_kind: "provider_failure_hold",
           entity_id: "hold-billing",
           version: 8,
@@ -13734,6 +13903,7 @@ Deno.test("A provider hold's attention item opens its exited session, whose Rele
       ...managerSession,
       id: "s-exited",
       status: "exited",
+      process_group_quiescent: true,
       provider_failure_holds: [{
         id: "hold-billing",
         task_id: "AJ-1",
@@ -13743,8 +13913,11 @@ Deno.test("A provider hold's attention item opens its exited session, whose Rele
         role_generation_id: "g1",
         transcript_epoch: "epoch-1",
         accepted_hook_event_id: null,
+        source: "failure_hook",
         failure_hook_event_id: "hook-billing",
         kind: "billing_error",
+        cause: "the account's usage limit was reached",
+        remedy: "Check the provider account's usage and billing.",
         attribution: "startup_invocation",
         created_at: "2026-10-01T15:00:00Z",
         expires_at: null,
@@ -13823,6 +13996,270 @@ Deno.test("A provider hold's attention item opens its exited session, whose Rele
     unmount();
     liveEnvironment.transport = priorEnvironment.transport;
     liveEnvironment.scheduler = priorEnvironment.scheduler;
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Provider recovery model choices reach the exact role and manager controls without relaxing replacement restrictions", async () => {
+  localStorage.clear();
+  const commands: Record<string, unknown>[] = [];
+  const openedSetup: string[] = [];
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.body) commands.push(JSON.parse(String(init.body)));
+    return new Response("[]");
+  }) as typeof fetch;
+  const held: ProviderFailureHold = {
+    id: "hold-choice", task_id: task.id, task_version: task.version,
+    attempt_id: "a1", session_id: managerSession.id, role_generation_id: "g1",
+    transcript_epoch: "epoch-choice", accepted_hook_event_id: "accepted-choice",
+    source: "codex_history", history_observation_id: "audit-choice",
+    kind: "usage_limit_exceeded", attribution: "accepted_turn_history",
+    cause: "the usage allowance or plan access does not permit this request",
+    remedy: "Check the provider account's usage allowance and plan access.",
+    created_at: "2026-10-01T15:00:00Z", expires_at: null,
+  };
+  try {
+    for (const role of ROLES) {
+      const source: Session = {
+        ...managerSession, role, status: "exited", process_group_quiescent: true,
+        generation_status: "exited", has_newer_generation: false,
+        provider_failure_holds: [held],
+      };
+      const configured: Task = {
+        ...task,
+        role_settings: [{
+          id: "effective-choice", role, revision: 1,
+          config: { provider: source.provider, model: source.launch.model, effort: "high" },
+          effective_generation_id: source.role_generation_id,
+        }, {
+          id: "requested-choice", role, revision: 2,
+          config: { provider: "codex", model: "requested-model", effort: "high" },
+        }],
+      };
+      mount(<TaskDetail task={configured}
+        state={{ ...liveBase, tasks: [configured], active_sessions: [source] }}
+        onClose={noop} onChanged={noop} onOpenSetup={(id) => openedSetup.push(id)} />);
+      click("Activity");
+      const notice = document.querySelector(".session-provider-hold")!;
+      const choose = [...notice.querySelectorAll("button")]
+        .find((button) => button.textContent?.startsWith("Choose model or provider"));
+      if (role === "explorer") {
+        check(!choose && notice.textContent?.includes("checkpoint model/provider switch is not available"),
+          "Explorer promised a checkpoint switch");
+        click("Open task controls");
+        check(document.activeElement?.getAttribute("data-attention-target") === `workflow_controls:${task.id}`,
+          "Explorer's recovery direction did not open the existing controls");
+      } else {
+        check(!!choose, `${role} has no model-choice navigation`);
+        act(() => choose!.click());
+        await settle();
+        const target = `role_settings:${task.id}:${role}`;
+        const row = document.querySelector<HTMLElement>(`[data-attention-target="${target}"]`)!;
+        check(document.activeElement === row && row.textContent?.includes("checkpoints are retained"),
+          `${role} model choice did not focus its exact settings`);
+        check(![...row.querySelectorAll("button")].some((button) => button.textContent === "Request checkpoint switch"),
+          `${role} bypassed verified preparation and checkpoint restrictions`);
+        const edit = [...row.querySelectorAll("button")].find((button) => button.textContent === "Edit")!;
+        act(() => edit.click());
+        const exactModel = findField(`${roleLabel(role)} exact model`);
+        check(row.contains(exactModel) && !exactModel.disabled && exactModel.value === "requested-model",
+          `${role} model choice reached the wrong model editor`);
+        if (role === "manager") {
+          click("Open manager change controls");
+          check(document.activeElement?.getAttribute("data-attention-target") === `manager_change:${task.id}` &&
+            !!findButton("Change manager at safe boundary"),
+            "Manager navigation did not reach its existing manager-change controls");
+        } else {
+          check(row.textContent?.includes("matching verified checkpoint"),
+            `${role} did not explain the existing checkpoint requirement`);
+        }
+      }
+      check(commands.length === 0, `${role} navigation sent a recovery command`);
+    }
+    const setup: Session = {
+      ...managerSession, setup_operation_id: "setup-choice", provider_failure_holds: [held],
+    };
+    mount(<TaskDetail task={task}
+      state={{ ...liveBase, active_sessions: [setup] }}
+      onClose={noop} onChanged={noop} onOpenSetup={(id) => openedSetup.push(id)} />);
+    click("Activity");
+    const setupNotice = document.querySelector(".session-provider-hold")!;
+    check(setupNotice.textContent?.includes("switch is not available for this setup invocation") &&
+      ![...setupNotice.querySelectorAll("button")].some((button) => button.textContent?.startsWith("Choose model")),
+      "Setup promised an unsupported role replacement");
+    act(() => [...setupNotice.querySelectorAll("button")]
+      .find((button) => button.textContent === "Open project setup")!.click());
+    check(openedSetup.join() === task.project_id && commands.length === 0,
+      "Setup recovery did not open its existing project setup screen without mutation");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Provider recovery waits for settled current eligibility before a separate continuation and preserves queued resume state", async () => {
+  localStorage.clear();
+  const requests: Record<string, unknown>[] = [];
+  let refreshes = 0;
+  let receiptState = "requested";
+  let resumedStatus = "unknown";
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const request = JSON.parse(String(init?.body));
+    requests.push(request);
+    const result = request.kind === "restart_resume"
+      ? { operation_id: request.operation_id, mode: "selected", state: receiptState,
+        selected_ids: [managerSession.id], queued_ids: [managerSession.id], omitted_ids: [], omitted_count: 0,
+        outcomes: [{ session_id: managerSession.id, state: "queued_capacity" }] }
+      : request.kind === "role_resume" || request.kind === "runtime_probe_resume"
+      ? { session_id: managerSession.id, task_id: task.id, attempt_id: "a1",
+        role_generation_id: managerSession.role_generation_id, launch: managerSession.launch,
+        process: { pid: 42, process_group_id: 42, native_start_marker: "start",
+          observed_started_at: "2026-10-01T15:00:00Z" }, status: resumedStatus }
+      : { operation_id: request.operation_id, entity_kind: "task", entity_id: task.id,
+        version: task.version + 1, state: receiptState, detail: {} };
+    return new Response(JSON.stringify({ result }));
+  }) as typeof fetch;
+  const policy: DecisionExplanation = {
+    decision_schema: 1, reason_code: "workflow.task_attention_required", disposition: "held",
+    subject: { task_id: task.id, attempt_id: "a1" }, observed_revision: { task_version: task.version },
+    prerequisites: [], ownership: { owner: "human", state: "paused", binding: {} },
+    control_policy: { allowed_controls: ["continue", "run_next", "pause_now", "cancel"] },
+  };
+  const pending: Session = {
+    ...managerSession, status: "interrupt_requested",
+    failure_stop_pause: { control_id: "failed-pause", state: "requested" },
+  };
+  const settled: Session = {
+    ...pending, status: "exited", process_group_quiescent: true,
+    generation_status: "exited", has_newer_generation: false,
+    failure_stop_pause: { control_id: "failed-pause", state: "finished" },
+    provider_failure_holds: [],
+  };
+  const exact: ContinuationAction = {
+    kind: "exact_resume", enabled: true, owner: "human", operation: "role_resume",
+    reason: "The current stopped session is eligible for exact resume.",
+    binding: { task_id: task.id, attempt_id: "a1", session_id: settled.id },
+  };
+  const render = (session: Session, decision?: DecisionExplanation, actions: ContinuationAction[] = []) => (
+    <WorkflowControls task={task} project={initialized} sessions={[session]} decision={decision}
+      actions={actions} onChanged={() => { refreshes += 1; }} />
+  );
+  try {
+    mount(render(pending, policy, [exact]));
+    check(findButton("Continue").disabled && findButton("Run next").disabled &&
+      findButton("Resume the stopped session").disabled &&
+      !findButton("Pause now").disabled && !findButton("Cancel").disabled,
+      "A pending stop enabled continuation or hid the normal Pause/Cancel controls");
+    act(() => findButton("Continue").click());
+    const held: Session = {
+      ...settled,
+      provider_failure_holds: [{
+        id: "hold-settled", task_id: task.id, task_version: task.version,
+        attempt_id: "a1", session_id: settled.id, role_generation_id: settled.role_generation_id,
+        transcript_epoch: "epoch-settled", accepted_hook_event_id: "accepted-settled",
+        source: "codex_history", history_observation_id: "audit-settled",
+        kind: "usage_limit_exceeded", attribution: "accepted_turn_history",
+        cause: "the usage allowance or plan access does not permit this request",
+        remedy: "Check the provider account's usage allowance and plan access.",
+        created_at: "2026-10-01T15:00:00Z", expires_at: null,
+      }],
+    };
+    rerender(render(held, policy, [exact]));
+    check(findButton("Continue").disabled && findButton("Run next").disabled &&
+      findButton("Resume the stopped session").disabled && !findButton("Cancel").disabled && requests.length === 0,
+      "A settled invocation bypassed its active provider hold or disabled Cancel");
+    rerender(render(settled));
+    check(findButton("Continue").disabled && findButton("Run next").disabled &&
+      document.body.textContent?.includes("continuation eligibility is unavailable") && requests.length === 0,
+      "A settled stop inferred continuation eligibility or refreshed into a mutation");
+    rerender(render(settled, { ...policy, control_policy: { allowed_controls: ["pause_now", "cancel"] } }));
+    check(findButton("Continue").disabled && findButton("Run next").disabled,
+      "A backend-blocked continuation became available after release");
+    rerender(render(settled, policy));
+    check(!findButton("Continue").disabled && !findButton("Run next").disabled && requests.length === 0,
+      "Current eligible continuation was unavailable or dispatched automatically");
+    const continueButton = findButton("Continue");
+    act(() => { continueButton.click(); continueButton.click(); });
+    await settle();
+    check(requests.length === 1 && requests[0].kind === "control" &&
+      requests[0].action === "continue" && requests[0].task_id === task.id &&
+      requests[0].expected_version === task.version && refreshes === 1 &&
+      document.body.textContent?.includes("does not prove the agent resumed"),
+      "Separate Continue duplicated, lost the current version, or treated its receipt as resumed");
+    rerender(render(settled, policy, [{ ...exact, enabled: false, reason: "Current resume is blocked." }]));
+    check(findButton("Resume the stopped session").disabled && requests.length === 1,
+      "A disabled exact resume was offered or refresh retried Continue");
+    const verificationResume: ContinuationAction = {
+      ...exact, operation: "runtime_probe_resume",
+      binding: { ...exact.binding, runtime_admission_id: "runtime-resume", role: settled.role },
+    };
+    for (const successful of [
+      { action: exact, status: "running_resumed", button: "Resume the stopped session" },
+      { action: verificationResume, status: "running_resumed_unverified", button: "Resume the verification" },
+    ]) {
+      resumedStatus = successful.status;
+      rerender(render(settled, policy, [successful.action]));
+      const before = requests.length;
+      const resume = findButton(successful.button);
+      act(() => { resume.click(); resume.click(); });
+      await settle();
+      const sent = requests[before];
+      const text = document.body.textContent ?? "";
+      check(requests.length === before + 1 && sent.kind === successful.action.operation &&
+        typeof sent.operation_id === "string" && sent.operation_id !== requests[before - 1].operation_id &&
+        (sent.kind === "role_resume"
+          ? sent.session_id === settled.id && sent.prompt === ""
+          : sent.admission_id === "runtime-resume" && sent.role === settled.role),
+        `${successful.status} duplicated its resume or lost the exact operation binding`);
+      check(text.includes("process resumed") || text.includes("confirmed the resumed process"),
+        `${successful.status} was not reported as a resumed process`);
+      check(text.includes("does not confirm acceptance of its new turn") &&
+        (sent.kind === "runtime_probe_resume"
+          ? text.includes("verification remains pending") && text.includes("does not confirm acceptance of its new turn or completed verification")
+          : text.includes("completion of its work")) &&
+        !text.includes("Running or resumed state is not yet confirmed"),
+        `${successful.status} claimed turn acceptance/completed work, lost pending verification or remained unconfirmed`);
+      rerender(render(settled, policy, [{ ...successful.action, enabled: false, reason: "Resume was recorded; await current activity." }]));
+      check(requests.length === before + 1 && findButton(successful.button).disabled,
+        `${successful.status} replayed its request on refresh or ignored current eligibility`);
+    }
+    resumedStatus = "unknown";
+    rerender(render(settled, policy, [exact]));
+    const beforeUnknown = requests.length;
+    act(() => findButton("Resume the stopped session").click());
+    await settle();
+    const unknownText = document.body.textContent ?? "";
+    check(requests.length === beforeUnknown + 1 &&
+      unknownText.includes("Running or resumed state is not yet confirmed") &&
+      !unknownText.includes("confirmed the resumed process") &&
+      !unknownText.includes("verification process resumed"),
+      "An unknown resume receipt claimed a resumed process");
+    receiptState = "queued";
+    const restartResume: ContinuationAction = { ...exact, operation: "restart_resume" };
+    rerender(render(settled, policy, [restartResume]));
+    const beforeQueued = requests.length;
+    const resume = findButton("Resume after restart");
+    act(() => { resume.click(); resume.click(); });
+    await settle();
+    const queuedText = document.body.textContent ?? "";
+    check(requests.length === beforeQueued + 1 && requests[beforeQueued].kind === "restart_resume" &&
+      JSON.stringify(requests[beforeQueued].session_ids) === JSON.stringify([settled.id]) &&
+      requests[beforeQueued].operation_id !== requests[beforeQueued - 1].operation_id &&
+      queuedText.includes("not been confirmed running") &&
+      !queuedText.includes("confirmed the resumed process") && !queuedText.includes("verification process resumed"),
+      "Exact resume lost its session, duplicated, or reported queued admission as running");
+    unmount();
+    mount(render(settled, policy, [{ ...restartResume, enabled: false, reason: "Resume is queued." }]));
+    check(requests.length === beforeQueued + 1 && findButton("Resume after restart").disabled,
+      "Reconnect retried a queued resume or ignored current disabled eligibility");
+    rerender(render(settled, policy, [{ ...restartResume, enabled: false, reason: "Resume is blocked by its current admission." }]));
+    check(findButton("Resume after restart").disabled && requests.length === beforeQueued + 1 &&
+      document.body.textContent?.includes("Resume is blocked by its current admission"),
+      "A blocked resume lost its reason or issued another operation");
+  } finally {
+    unmount();
     globalThis.fetch = nativeFetch;
     localStorage.clear();
   }

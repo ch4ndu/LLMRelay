@@ -24,6 +24,8 @@ import {
   type CurrentInputUnavailableReason,
   type PermissionRequest,
   type Role,
+  ROLES,
+  type Session,
   roleLabel,
   type Task,
   type TaskAction,
@@ -784,6 +786,17 @@ export function TaskDetail(
     if (onTabChange) onTabChange(next);
     else setLocalTab(next);
   };
+  const [recoveryFocus, setRecoveryFocus] = useState<{ tab: TaskTab; target: string }>();
+  const openRecoveryControls = (managerChange = false) => {
+    chooseTab("overview");
+    setRecoveryFocus({ tab: "overview", target: `${managerChange ? "manager_change" : "workflow_controls"}:${task.id}` });
+  };
+  const openRecoveryRole = (session: Session) => {
+    const role = ROLES.find((value) => value === session.role);
+    if (!role || session.setup_operation_id || role === "explorer") return;
+    chooseTab("roles");
+    setRecoveryFocus({ tab: "roles", target: `role_settings:${task.id}:${role}` });
+  };
   const [dependency, setDependency] = useState("");
   const [integrationRef, setIntegrationRef] = useState("");
   const [answer, setAnswer] = useState("");
@@ -804,6 +817,13 @@ export function TaskDetail(
   const dialog = useRef<HTMLElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
   const trapTab = useDialogFocus(dialog, closeButton, onClose);
+  useEffect(() => {
+    if (!recoveryFocus || tab !== recoveryFocus.tab) return;
+    const target = [...(dialog.current?.querySelectorAll<HTMLElement>("[data-attention-target]") ?? [])]
+      .find((element) => element.dataset.attentionTarget === recoveryFocus.target);
+    target?.focus();
+    target?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [recoveryFocus, tab]);
   const operationStorageKey = `llmrelay.task.operations.${task.id}`;
   const commandIdentities = useRef(
     new Map<string, { body: string; id: string }>(
@@ -1819,6 +1839,8 @@ export function TaskDetail(
           taskTitle={() => undefined}
           setupProjectId={() => task.project_id}
           onOpenSetup={onOpenSetup}
+          onOpenRoleSettings={openRecoveryRole}
+          onOpenControls={(_session, managerChange) => openRecoveryControls(managerChange)}
         />
       </section>
       <section className="panel">
@@ -1951,6 +1973,7 @@ export function TaskDetail(
         )}
         tasks={state.tasks}
         onChanged={onChanged}
+        onOpenManagerControls={() => openRecoveryControls(true)}
       />
       {!singleAgent && (
         <details className="panel">

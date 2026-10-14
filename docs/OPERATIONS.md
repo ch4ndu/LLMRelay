@@ -824,23 +824,45 @@ Session Access keeps **Session open**, native accepted-turn evidence and report 
 
 The sidebar **Appearance** selector offers System, Light and Dark. An explicit choice overrides the operating-system preference and is stored for this browser origin. System follows the operating-system preference; unavailable or invalid preference storage falls back to System.
 
-A **Codex reported model capacity** notice opens the affected agent output.
-For an attached, admitted Codex 0.157.1 session, the existing observation cycle
-reads only the history path named by its current accepted turn. It requires
-matching session and turn identities and the structured `server_overloaded`
-completion value. The notice records an observation only: it does not change
-readiness, create or release a provider hold, retry input or switch models.
-Later matching activity, a new accepted turn or invocation, session exit or
-replacement, or an obsolete attempt removes the current notice. Its historical
-audit remains; repeated cycles do not insert another observation for that binding.
+### Provider capacity and usage recovery
 
-The reader rejects symlinks and nonregular files without waiting for a FIFO
-writer. It reads at most 256 KiB for metadata and 1 MiB of complete tail records,
-with a 256 KiB record limit. Missing, changing, malformed or unsupported history,
-or a turn start outside that tail, yields no specific capacity notice. Ordinary
-agent output remains available. These limits avoid inferring a failure from
-terminal text or unrelated history; the [signal matrix](PERMISSION_SIGNAL_MATRIX.md)
-separates native characterization from managed integration evidence.
+Task Activity explains the affected role, provider and model, retained checkout
+changes, reports and checkpoints, and the corrective action for each provider
+hold. Account, sign-in and billing errors require correcting that cause; usage
+failures can mean exhausted allowance or missing plan access. Neither implies a
+known reset time. IDs and source bindings remain in Technical details.
+
+For a live failed invocation, choose **Stop failed session and pause task** when
+the service offers its exact binding. Wait for confirmed exit and process-group
+quiescence. The dashboard then permits a separate **Release provider hold**
+request. Release sends no input. Use **Continue**, **Run next**, or an eligible
+existing resume action separately; queued or blocked receipts are not running
+claims. Pending or uncertain stop/release requests retain their original identity
+and payload across reconnects; refresh does not retry them automatically.
+Normal Pause and Cancel controls remain subject to their existing prerequisites.
+
+**Choose model or provider** opens the affected role settings. Manager replacement
+uses the existing manager-change controls; implementer/reviewer replacement still
+requires the appropriate verified checkpoint. Explorer and setup actors do not
+gain a new checkpoint switch. Follow their displayed existing controls instead.
+
+For admitted live Codex 0.162.1 sessions, the bounded history reader recognizes
+exact structured `task_complete` values `server_overloaded`,
+`rate_limit_exceeded` and `usage_limit_exceeded`. It records an immutable audit
+observation and a linked durable hold atomically, without fabricating a failure
+hook or promoting readiness. The first two use the existing 60-second app
+cooldown; usage requires explicit resolution. An old observation cannot recreate
+a released hold. Hook and history sources remain distinct.
+
+The reader retains exact accepted-turn, invocation, native identity and current
+activity checks. It rejects symlinks/nonregular files and reads only bounded
+metadata and complete tail records. Unknown, malformed, stale or incomplete
+history stays unclassified. A process that exits before capture is not classified
+by this live reader; inspect its output and use existing stopped-session recovery.
+No terminal-text inference, automatic upstream retry or silent model fallback is
+added. The [signal matrix](PERMISSION_SIGNAL_MATRIX.md) records the older source
+and native-observation versions separately from the current runtime pin; usage
+recognition is source-confirmed, not a live quota-exhaustion qualification.
 
 ### Durable attention observations
 

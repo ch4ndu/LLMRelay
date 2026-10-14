@@ -312,6 +312,8 @@ export function WorkflowControls(
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [routeNotice, setRouteNotice] = useState("");
+  const [requestNotice, setRequestNotice] = useState("");
+  const mutationInFlight = useRef(false);
   const checkoutCommands = useWorkflowCommands(
     `llmrelay.checkout.operations.${task.id}`, onChanged,
   );
@@ -357,6 +359,7 @@ export function WorkflowControls(
       JSON.stringify([...commandIdentities.current]),
     );
   const send = async (kind: string, body: Record<string, unknown> = {}) => {
+    if (mutationInFlight.current) return;
     const intent = {
       kind,
       task_id: task.id,
@@ -370,6 +373,7 @@ export function WorkflowControls(
     const { id, request } = stable;
     commandIdentities.current.set(key, { body: JSON.stringify(request), id });
     persistOperationIdentities();
+    mutationInFlight.current = true;
     setBusy(key);
     setError("");
     try {
@@ -377,6 +381,9 @@ export function WorkflowControls(
         ...request,
         operation_id: id,
       } as never);
+      setRequestNotice(kind === "control"
+        ? `${String(body.action).replaceAll("_", " ")} requested. The service has recorded the request; refresh to check whether it is queued, blocked or applied. This receipt does not prove the agent resumed.`
+        : "Request recorded. Refresh to check the service's current state.");
       commandIdentities.current.delete(key);
       persistOperationIdentities();
       onChanged();
@@ -394,6 +401,7 @@ export function WorkflowControls(
       );
       onChanged();
     } finally {
+      mutationInFlight.current = false;
       setBusy("");
     }
   };
@@ -403,6 +411,7 @@ export function WorkflowControls(
     kind: string,
     body: Record<string, unknown>,
   ) => {
+    if (mutationInFlight.current) return;
     const request = { kind, ...body };
     const key = `operation:${operationIntent(request)}`;
     const stable = reuseOperationIdentity(
@@ -415,10 +424,30 @@ export function WorkflowControls(
       id,
     });
     persistOperationIdentities();
+    mutationInFlight.current = true;
     setBusy(key);
     setError("");
     try {
-      await operation({ ...stableRequest, operation_id: id } as never);
+      const result = await operation({ ...stableRequest, operation_id: id } as never);
+      const outcomes: unknown[] = Array.isArray(result.outcomes) ? result.outcomes : [];
+      const resumeBlocked = result.state === "blocked" || result.state === "held" || outcomes.some((outcome) =>
+        outcome !== null && typeof outcome === "object" && "state" in outcome &&
+        (outcome.state === "blocked" || outcome.state === "held"));
+      const isResume = ["role_resume", "runtime_probe_resume", "restart_resume"].includes(kind);
+      const resumedRoleProcess = kind === "role_resume" && result.status === "running_resumed";
+      const resumedVerificationProcess = kind === "runtime_probe_resume" && result.status === "running_resumed_unverified";
+      const resumedRestartProcess = kind === "restart_resume" && result.state === "resumed";
+      setRequestNotice(!isResume
+        ? "Request recorded. Refresh to check the service's current state."
+        : result.state === "queued" || result.state === "admitting"
+        ? "Resume is queued or awaiting admission; it has not been confirmed running. Refresh to follow its state."
+        : resumeBlocked
+        ? "Resume is blocked. Check the current recovery actions before choosing another step."
+        : resumedVerificationProcess
+        ? "The verification process resumed, and verification remains pending. This receipt does not confirm acceptance of its new turn or completed verification. Refresh to follow acceptance and verification."
+        : resumedRoleProcess || resumedRestartProcess
+        ? "The service confirmed the resumed process. This receipt does not confirm acceptance of its new turn or completion of its work. Refresh to follow current activity."
+        : "Request recorded. Running or resumed state is not yet confirmed; refresh to check it.");
       commandIdentities.current.delete(key);
       persistOperationIdentities();
       onChanged();
@@ -436,12 +465,19 @@ export function WorkflowControls(
       );
       onChanged();
     } finally {
+      mutationInFlight.current = false;
       setBusy("");
     }
   };
   const terminal = task.archived ||
     ["done", "cancelled"].includes(task.lifecycle);
   const attemptId = task.active_attempt?.id;
+  const providerHeld = sessions.some((session) => session.provider_failure_holds?.some((hold) =>
+    hold.task_id === task.id && hold.attempt_id === attemptId));
+  const failureStopPending = sessions.some((session) => session.task_id === task.id && session.attempt_id === attemptId &&
+    session.failure_stop_pause && session.failure_stop_pause.state !== "finished");
+  const failureEligibilityUnknown = !decision && sessions.some((session) =>
+    session.task_id === task.id && session.attempt_id === attemptId && !!session.failure_stop_pause);
   const managerControl = controls.find((value) =>
     value.attempt_id === attemptId &&
     ["manager_stop", "manager_change"].includes(value.kind) &&
@@ -560,7 +596,9 @@ export function WorkflowControls(
       ].includes(action.kind)
     );
   const allows = (controlName: string) =>
-    decision
+    (providerHeld || failureStopPending || failureEligibilityUnknown) && ["continue", "run_next", "retry"].includes(controlName)
+      ? false
+      : decision
       ? decision.control_policy.allowed_controls.includes(controlName)
       : !projectedControlsBlocked;
   const taskControls: Array<[string, string]> = [
@@ -625,7 +663,7 @@ export function WorkflowControls(
         return (
           <button
             className="primary compact"
-            disabled={!action.enabled || !sessionId ||
+            disabled={!action.enabled || providerHeld || failureStopPending || !sessionId ||
               (!restartResume && action.operation === "runtime_probe_resume" &&
                 (!runtimeAdmissionId || !role)) ||
               !!busy}
@@ -792,9 +830,17 @@ export function WorkflowControls(
       data-attention-target={attemptId ? `attempt:${attemptId}` : undefined}
       tabIndex={-1}
     >
-      <header>
+      <header data-attention-target={`workflow_controls:${task.id}`} tabIndex={-1}>
         <h3>Controls</h3>
       </header>
+      {(providerHeld || failureStopPending || failureEligibilityUnknown) && <p role="status">
+        {failureEligibilityUnknown && !providerHeld && !failureStopPending
+          ? "The failed session's stop is recorded, but current continuation eligibility is unavailable. Refresh to check the task controls; no continuation is sent automatically."
+          : failureStopPending
+          ? "The failed invocation's stop is still pending or unconfirmed. Continue, Run next and Retry remain unavailable."
+          : "A provider hold still applies. Inspect the affected session in Activity, confirm its stop, fix the stated cause and release the hold separately before choosing an eligible continuation."}
+        {" "}Existing checkout changes, accepted reports and checkpoints are retained. Pause and Cancel follow the task's current control policy.
+      </p>}
       <section aria-label="Task workspace">
         <h4>Workspace: {mainCheckout ? "Main checkout" : "Isolated worktree"}</h4>
         {mainCheckout && (
@@ -1034,7 +1080,7 @@ export function WorkflowControls(
         </p>
       )}
       {!terminal && task.lifecycle !== "backlog" && !singleAgent && (
-        <div className="inline-form">
+        <div className="inline-form" data-attention-target={`manager_change:${task.id}`} tabIndex={-1}>
           <strong>Manager</strong>
           <small>
             {effectiveManager
@@ -1184,10 +1230,15 @@ export function WorkflowControls(
         </section>
       )}
       {routeNotice && <p className="hint" role="status">{routeNotice}</p>}
+      {requestNotice && <p role="status">{requestNotice}</p>}
       {error && <ErrorNotice error={error} />}
       <small className="hint">
         {terminal
           ? "Completed and cancelled tasks cannot be resumed or changed."
+          : failureEligibilityUnknown && !providerHeld && !failureStopPending
+          ? "After confirmed settlement and release, current service eligibility is still required before choosing a continuation. Refresh to check it."
+          : providerHeld || failureStopPending
+          ? "Continuation remains unavailable until the service confirms settlement and the provider hold is cleared. Releasing a hold sends no input; Pause and Cancel retain their existing policy."
           : decision?.reason_code === "workflow.review_budget_exhausted"
           ? "The saved candidate still needs code review, and this attempt has reached its review limit. Leave it held to inspect the work, or choose Cancel to stop the task and keep its history."
           : decision?.reason_code === "workflow.review_session_exited"

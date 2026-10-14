@@ -5095,7 +5095,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
     let codex_capacity = crate::store::current_codex_capacity(&connection)?;
     let capacity_sessions = codex_capacity
         .iter()
-        .map(|binding| &binding.session_id)
+        .map(|(binding, _)| &binding.session_id)
         .collect::<Vec<_>>();
     let active_sessions = json_rows(
         &connection,
@@ -6807,10 +6807,28 @@ pub(crate) fn failed_session_stop_binding(
     if crate::store::failure_stop_fence(connection, &attempt_id)?.is_some() {
         return Ok(None);
     }
-    let Some(turn) = native_turn(connection, session_id)? else {
-        return Ok(None);
-    };
-    let Some(failure) = turn.failure else {
+    let (accepted_hook_event_id, failure_source) = if let Some(NativeTurnDto {
+        accepted_hook_event_id,
+        failure: Some(failure),
+        ..
+    }) = native_turn(connection, session_id)?
+    {
+        (
+            accepted_hook_event_id,
+            crate::domain::ProviderFailureSource::FailureHook {
+                failure_hook_event_id: failure.hook_event_id,
+            },
+        )
+    } else if let Some((binding, id, _)) =
+        crate::store::current_codex_capacity_for_session(connection, session_id)?
+    {
+        (
+            Some(binding.accepted_hook_id),
+            crate::domain::ProviderFailureSource::CodexHistory {
+                history_observation_id: id,
+            },
+        )
+    } else {
         return Ok(None);
     };
     Ok(Some(FailedSessionStopBinding {
@@ -6821,8 +6839,8 @@ pub(crate) fn failed_session_stop_binding(
         role_generation_id,
         transcript_epoch,
         process_identity: serde_json::from_str(&process)?,
-        accepted_hook_event_id: turn.accepted_hook_event_id,
-        failure_hook_event_id: failure.hook_event_id,
+        accepted_hook_event_id,
+        failure_source,
     }))
 }
 
@@ -7092,6 +7110,7 @@ fn provider_failure_holds(
                       'transcript_epoch',hold.transcript_epoch,
                       'accepted_hook_event_id',hold.accepted_hook_event_id,
                       'failure_hook_event_id',hold.failure_hook_event_id,
+                      'source',hold.source,'history_observation_id',hold.history_observation_id,
                       'kind',hold.failure_kind,'attribution',hold.attribution,
                       'created_at',hold.created_at,'expires_at',hold.expires_at)
              FROM provider_failure_holds hold JOIN attempts a ON a.id=hold.attempt_id
@@ -7105,7 +7124,13 @@ fn provider_failure_holds(
     )?;
     holds
         .into_iter()
-        .map(|hold| serde_json::from_value(hold).context("parse provider failure hold"))
+        .map(|mut hold| {
+            let (cause, remedy) =
+                native_turn_failure_explanation(json_text(&hold, "kind").unwrap_or("unknown"));
+            hold["cause"] = serde_json::json!(cause);
+            hold["remedy"] = serde_json::json!(remedy);
+            serde_json::from_value(hold).context("parse provider failure hold")
+        })
         .collect()
 }
 
@@ -7115,12 +7140,12 @@ pub(crate) fn provider_failure_hold_message(
     kind: NativeTurnFailureKind,
     cooldown: bool,
 ) -> String {
-    let (cause, _) = native_turn_failure_explanation(kind.as_str());
+    let (cause, remedy) = native_turn_failure_explanation(kind.as_str());
     let role = role.label();
     if cooldown {
-        format!("The provider reported a failure for {role} ({cause}). LLMRelay paused automatic work for this role for a short cooldown of its own, which is not the provider's reset time. Work that is already allowed may continue after it; to end it sooner, choose Release provider hold on the agent's session.")
+        format!("The provider reported a failure for {role} ({cause}). LLMRelay paused automatic work for this role for a short cooldown of its own, which is not the provider's reset time. {remedy} Work that is already allowed may continue after the cooldown. To end the hold sooner, first confirm the invocation has stopped, then choose Release provider hold on the agent's session; releasing it sends no input.")
     } else {
-        format!("The provider reported a failure for {role} ({cause}). This needs your action: LLMRelay will not start, resume or send input to this role while the hold stands. Fix the cause, then choose Release provider hold on the agent's session.")
+        format!("The provider reported a failure for {role} ({cause}). This needs your action: LLMRelay will not start, resume or send input to this role while the hold stands. {remedy} After the invocation is confirmed stopped, choose Release provider hold on the agent's session; releasing it sends no input. Then open task controls to check whether Continue or Run next is available under the existing checks.")
     }
 }
 
@@ -8997,7 +9022,7 @@ struct AttentionSources<'a> {
     /// Set while the coordinator keeps failing the same step.
     coordinator_deferral: Option<crate::coordinator::TickDeferral>,
     observations: &'a [crate::store::OpenObservation],
-    codex_capacity: &'a [crate::store::CodexCapacityBinding],
+    codex_capacity: &'a [(crate::store::CodexCapacityBinding, NativeTurnFailureKind)],
 }
 
 impl AttentionSources<'_> {
@@ -10016,13 +10041,23 @@ impl AttentionSources<'_> {
     }
 
     fn codex_capacity_items(&self) -> impl Iterator<Item = AttentionItem> + '_ {
-        self.codex_capacity.iter().filter_map(|binding| {
+        self.codex_capacity.iter().filter_map(|(binding, kind)| {
             let task = self.task_with_active_attempt(&binding.attempt_id)?;
+            let (title, reason) = match kind {
+                NativeTurnFailureKind::Overloaded => (
+                    "Codex reported model capacity",
+                    "Codex reported that the selected model is at capacity; open agent output to inspect it and choose the next action.".to_owned(),
+                ),
+                _ => {
+                    let (cause, remedy) = native_turn_failure_explanation(kind.as_str());
+                    ("Codex reported a provider error", format!("Codex reported {cause}. {remedy} Open agent output to choose the next action."))
+                }
+            };
             Some(AttentionItem {
                 id: format!("codex_capacity:{}", binding.accepted_hook_id),
                 category: AttentionCategory::Blocked,
-                title: "Codex reported model capacity".into(),
-                reason: "Codex reported that the selected model is at capacity; open agent output to inspect it and choose the next action.".into(),
+                title: title.into(),
+                reason,
                 task_title: Some(task.title.clone()),
                 role: self.session_role(&binding.session_id),
                 action: AttentionActionKind::OpenAgentOutput.into(),
@@ -10071,6 +10106,18 @@ impl AttentionSources<'_> {
                     .map_or_else(String::new, |until| {
                         format!(" · app cooldown until {until}")
                     });
+                let source = match &hold.failure_source {
+                    crate::domain::ProviderFailureSource::FailureHook {
+                        failure_hook_event_id,
+                    } => {
+                        format!("failure hook {failure_hook_event_id}")
+                    }
+                    crate::domain::ProviderFailureSource::CodexHistory {
+                        history_observation_id,
+                    } => {
+                        format!("history observation {history_observation_id}")
+                    }
+                };
                 items.push(AttentionItem {
                     id: format!("provider_failure_hold:{}", hold.id),
                     category: AttentionCategory::Blocked,
@@ -10093,11 +10140,10 @@ impl AttentionSources<'_> {
                     }),
                     held_tasks: Vec::new(),
                     details: Some(format!(
-                        "{} · {} attribution{cooldown} · hold {} · failure hook {}",
+                        "{} · {} attribution{cooldown} · hold {} · {source}",
                         hold.kind.as_str(),
                         hold.attribution.as_str(),
-                        hold.id,
-                        hold.failure_hook_event_id
+                        hold.id
                     )),
                 });
             }
@@ -10508,37 +10554,41 @@ fn active_attempt_id(task: &TaskDto) -> Option<&str> {
 }
 
 fn native_turn_failure_explanation(kind: &str) -> (&'static str, &'static str) {
-    const CONTINUE_LATER: &str = "Continue the agent from its output once the provider recovers.";
+    const CHECK_SERVICE: &str = "Check the provider's service status or choose another verified model when replacement is available.";
     match kind {
         "rate_limit" => (
             "the provider's rate limit was reached",
-            "When the limit resets, continue the agent from its output.",
+            "Check the provider's rate-limit status before choosing the next action.",
         ),
-        "overloaded" => ("the model was overloaded", CONTINUE_LATER),
-        "server_error" => ("the provider's service returned an error", CONTINUE_LATER),
+        "overloaded" => ("the model was overloaded", CHECK_SERVICE),
+        "usage_limit_exceeded" => (
+            "the usage allowance or plan access does not permit this request",
+            "Check the provider account's usage allowance and plan access.",
+        ),
+        "server_error" => ("the provider's service returned an error", CHECK_SERVICE),
         "billing_error" => (
             "the account's usage limit was reached",
-            "Check the provider account's usage or billing, then continue the agent from its output.",
+            "Check the provider account's usage and billing.",
         ),
         "authentication_failed" | "oauth_org_not_allowed" | "cloud_credential_error" => (
             "the provider could not authenticate the session",
-            "Sign this computer in to the provider again, then continue the agent from its output.",
+            "Sign this computer in to the provider again.",
         ),
         "account_on_hold" | "verification_required" => (
             "the provider account needs attention",
-            "Resolve the account with the provider, then continue the agent from its output.",
+            "Resolve the account or verification issue with the provider.",
         ),
         "invalid_request" => (
             "the provider rejected the request",
-            "Open agent output to see what the provider rejected before continuing.",
+            "Open agent output to inspect what the provider rejected.",
         ),
         "model_not_found" => (
             "the selected model is unavailable",
-            "Choose an available model for this role before continuing.",
+            "Choose an available verified model for this role when replacement is available.",
         ),
         "max_output_tokens" => (
             "the response reached its output limit",
-            "Ask the agent to continue from its output.",
+            "Inspect the saved output before choosing the next action.",
         ),
         _ => (
             "the provider did not say why",

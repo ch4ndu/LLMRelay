@@ -4,7 +4,7 @@
 
 Selected by the user on October 13, 2026 as essential. Start after the current
 isolated provider-validation task, ahead of further refactoring and feature work.
-This is a queued task, not a claim of implemented or verified recovery.
+Implementation, independent code review and fresh final verification completed on 2026-10-14. Verification passed: 203 library tests (2 ignored), 262 contract tests, 3 runtime tests and 109 frontend tests, plus typecheck/build and formatting checks. Native signal coverage remains bounded as recorded in PERMISSION_SIGNAL_MATRIX.md.
 
 The committed-source audit found uneven provider coverage: Codex's structured
 capacity observation is informational and does not provide a complete retry or

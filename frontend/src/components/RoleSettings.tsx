@@ -600,6 +600,7 @@ export function RoleSettings(
     execution,
     tasks = [],
     onChanged,
+    onOpenManagerControls,
   }: {
     task: Task;
     project?: Project;
@@ -615,6 +616,7 @@ export function RoleSettings(
     /** Every task, so an admission's probe task can be found. */
     tasks?: Task[];
     onChanged: () => void;
+    onOpenManagerControls?: () => void;
   },
 ) {
   const terminal = task.archived ||
@@ -1136,7 +1138,8 @@ export function RoleSettings(
           const session = sessions.find((value) =>
             value.role_generation_id === effective?.effective_generation_id
           );
-          const exactResume = session && actions.find((action) =>
+          const exactResume = session && !session.provider_failure_holds?.length &&
+            (!session.failure_stop_pause || session.failure_stop_pause.state === "finished") && actions.find((action) =>
             action.kind === "exact_resume" && action.enabled &&
             action.binding.session_id === session.id
           );
@@ -1270,6 +1273,16 @@ export function RoleSettings(
             >
               <div>
                 <strong>{roleLabel(role)}</strong>
+                {!!session?.provider_failure_holds?.length && <p>
+                  Existing checkout changes, accepted reports and checkpoints are retained.
+                  {role === "explorer"
+                    ? " Explorer has no supported checkpoint replacement for this failure. Use Pause, Cancel or the task's recovery controls."
+                    : role === "manager"
+                    ? " Save and verify the requested model/provider here, then use the manager change controls; a role checkpoint switch is not the manager's recovery path."
+                    : " Save and verify the requested model/provider here. Replacement still requires the matching verified checkpoint and the existing switch eligibility below; a hold does not prove the agent is idle."}
+                </p>}
+                {role === "manager" && !terminal && onOpenManagerControls &&
+                  <button onClick={onOpenManagerControls}>Open manager change controls</button>}
                 <small>
                   {running
                     ? "Running now"

@@ -638,7 +638,7 @@ export interface Task {
 }
 export type NativeTurnFailureKind =
   | "authentication_failed" | "oauth_org_not_allowed" | "account_on_hold"
-  | "verification_required" | "billing_error" | "rate_limit" | "overloaded"
+  | "verification_required" | "billing_error" | "rate_limit" | "overloaded" | "usage_limit_exceeded"
   | "invalid_request" | "model_not_found" | "server_error" | "max_output_tokens"
   | "cloud_credential_error" | "unknown";
 export interface NativeTurnFailure {
@@ -684,13 +684,17 @@ export interface FailedSessionStopBinding {
     observed_started_at: string;
   };
   accepted_hook_event_id: string | null;
-  failure_hook_event_id: string;
+  failure_source: ProviderFailureSource;
 }
+export type ProviderFailureSource =
+  | { source: "failure_hook"; failure_hook_event_id: string; history_observation_id?: never }
+  | { source: "codex_history"; history_observation_id: string; failure_hook_event_id?: never };
 export type ProviderFailureAttribution =
   | "prompt_id_matched"
   | "arrival_order"
-  | "startup_invocation";
-export interface ProviderFailureHold {
+  | "startup_invocation"
+  | "accepted_turn_history";
+export type ProviderFailureHold = ProviderFailureSource & {
   id: string;
   task_id: string;
   task_version: number;
@@ -699,13 +703,14 @@ export interface ProviderFailureHold {
   role_generation_id: string;
   transcript_epoch: string;
   accepted_hook_event_id: string | null;
-  failure_hook_event_id: string;
   kind: NativeTurnFailureKind;
   attribution: ProviderFailureAttribution;
+  cause: string;
+  remedy: string;
   created_at: string;
   /** End of LLMRelay's own cooldown, never the provider's reset time. */
   expires_at: string | null;
-}
+};
 export type ProviderFailureHoldRelease =
   | "released"
   | "already_released"
@@ -746,7 +751,7 @@ export interface Session {
   launch_state?: string;
   launch_error?: string | null;
   exit_code?: number | null;
-  exit_success?: boolean | null;
+  exit_success?: boolean | 0 | 1 | null;
   exit_status?: string | null;
   exit_reason?: string | null;
   process_group_quiescent?: boolean | number | null;

@@ -32490,6 +32490,13 @@ fn native_turn_failure_is_bound_to_the_newest_accepted_turn() {
         .iter()
         .all(|item| item.id != item_id));
 
+    hook(
+        "UserPromptSubmit",
+        json!({"prompt":"unsupported Claude signal"}),
+    );
+    hook("StopFailure", json!({"error":"usage_limit_exceeded"}));
+    assert_eq!(native_turn()["failure"]["kind"], "unknown");
+
     // A known kind names its cause and the person's next step, and still retries nothing.
     hook("UserPromptSubmit", json!({"prompt":"after sign-in"}));
     let signed_out = hook("StopFailure", json!({"error":"authentication_failed"}));
@@ -32505,7 +32512,7 @@ fn native_turn_failure_is_bound_to_the_newest_accepted_turn() {
         .unwrap();
     assert_eq!(
         item.reason,
-        "The provider ended the agent's turn (the provider could not authenticate the session). The session is still open. LLMRelay does not retry or switch models in response to this notice. Sign this computer in to the provider again, then continue the agent from its output."
+        "The provider ended the agent's turn (the provider could not authenticate the session). The session is still open. LLMRelay does not retry or switch models in response to this notice. Sign this computer in to the provider again."
     );
 }
 
@@ -32881,9 +32888,27 @@ fn provider_failure_hold_binds_its_attributed_turn_and_ends_only_by_its_own_rule
     assert_eq!(fail(json!({"error":"authentication_failed"})), None);
     hook("SessionStart", json!({}));
     let startup = fail(json!({"error":"authentication_failed"})).unwrap();
+    fixture.assert_scalar::<String>(
+        "SELECT source||':'||(history_observation_id IS NULL) FROM provider_failure_holds",
+        "failure_hook:1".into(),
+    );
     assert_eq!(
         binding(&startup),
         "none|authentication_failed|startup_invocation|none|active"
+    );
+    let projected = workflow::state(&fixture.store)
+        .unwrap()
+        .active_sessions
+        .into_iter()
+        .find(|session| session["id"] == "session")
+        .unwrap();
+    assert_eq!(
+        projected["provider_failure_holds"][0]["cause"],
+        "the provider could not authenticate the session"
+    );
+    assert_eq!(
+        projected["provider_failure_holds"][0]["remedy"],
+        "Sign this computer in to the provider again."
     );
     assert_eq!(
         fail(json!({"error":"authentication_failed"})).as_deref(),
@@ -33018,6 +33043,18 @@ fn provider_failure_hold_binds_its_attributed_turn_and_ends_only_by_its_own_rule
         assert_eq!(projected.as_array().map(Vec::len), Some(1), "{status}");
         assert_eq!(projected[0]["id"], billing.as_str());
         assert_eq!(projected[0]["kind"], "billing_error");
+        assert_eq!(
+            projected[0]["cause"],
+            "the account's usage limit was reached"
+        );
+        assert_eq!(
+            projected[0]["remedy"],
+            "Check the provider account's usage and billing."
+        );
+        assert!(!projected[0]["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("continue"));
         assert_eq!(projected[0]["attribution"], "arrival_order");
         assert!(projected[0]["expires_at"].is_null());
         assert_eq!(
@@ -33059,6 +33096,40 @@ fn provider_failure_hold_binds_its_attributed_turn_and_ends_only_by_its_own_rule
             .unwrap()["provider_failure_holds"][0]["id"],
         billing.as_str()
     );
+    for (kind, cause, remedy) in [
+        (
+            "account_on_hold",
+            "the provider account needs attention",
+            "Resolve the account or verification issue with the provider.",
+        ),
+        (
+            "usage_limit_exceeded",
+            "the usage allowance or plan access does not permit this request",
+            "Check the provider account's usage allowance and plan access.",
+        ),
+        (
+            "unknown",
+            "the provider did not say why",
+            "Open agent output to see the error and choose the next step.",
+        ),
+    ] {
+        fixture.execute(
+            "UPDATE provider_failure_holds SET failure_kind=?1 WHERE id=?2",
+            params![kind, billing],
+        );
+        let projected = workflow::state(&fixture.store)
+            .unwrap()
+            .active_sessions
+            .into_iter()
+            .find(|session| session["id"] == "session")
+            .unwrap();
+        assert_eq!(projected["provider_failure_holds"][0]["cause"], cause);
+        assert_eq!(projected["provider_failure_holds"][0]["remedy"], remedy);
+        assert!(projected["provider_failure_holds"][0]["expires_at"].is_null());
+        assert!(
+            !remedy.contains("reset") && !remedy.contains("continue") && !remedy.contains("resume")
+        );
+    }
 }
 
 #[test]
@@ -42380,7 +42451,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 40_i64);
+    fixture.assert_scalar("PRAGMA user_version", 41_i64);
     fixture.assert_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%'",
         i64::try_from(triggers.len()).unwrap(),
@@ -42415,7 +42486,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 40_i64);
+    fixture.assert_scalar("PRAGMA user_version", 41_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -50360,14 +50431,14 @@ fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordina
 #[test]
 fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
-    fixture.assert_scalar("PRAGMA user_version", 40_i64);
+    fixture.assert_scalar("PRAGMA user_version", 41_i64);
     let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
     fixture.execute_batch(&format!(
         "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; PRAGMA user_version=30;"
     ));
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 40_i64);
+    fixture.assert_scalar("PRAGMA user_version", 41_i64);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
@@ -51283,7 +51354,7 @@ fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
     fixture.assert_scalar("PRAGMA user_version", 31_i64);
 
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 40_i64);
+    fixture.assert_scalar("PRAGMA user_version", 41_i64);
     assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(

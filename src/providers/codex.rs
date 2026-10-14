@@ -1113,6 +1113,31 @@ fn require_local_executor_home(codex_home: &Path) -> Result<()> {
 const CAPACITY_RECORD_BYTES: usize = 256 * 1024;
 const CAPACITY_TAIL_BYTES: u64 = 1024 * 1024;
 
+pub(crate) struct CapacityHistoryFailure {
+    pub(crate) identity: CapacityFileIdentity,
+    pub(crate) kind: CapacityFailureKind,
+}
+
+// Protocol source is 0.160.0; runtime stays pinned to 0.162.1. Usage coverage is source-only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CapacityFailureKind {
+    ServerOverloaded,
+    RateLimitExceeded,
+    UsageLimitExceeded,
+}
+
+impl CapacityFailureKind {
+    pub(crate) fn failure_kind(self) -> crate::domain::NativeTurnFailureKind {
+        use crate::domain::NativeTurnFailureKind;
+        match self {
+            Self::ServerOverloaded => NativeTurnFailureKind::Overloaded,
+            Self::RateLimitExceeded => NativeTurnFailureKind::RateLimit,
+            Self::UsageLimitExceeded => NativeTurnFailureKind::UsageLimitExceeded,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CapacityFileIdentity {
     device: u64,
@@ -1230,7 +1255,7 @@ pub(crate) fn read_capacity_history(
     native_id: &str,
     turn_id: &str,
     cwd: &Path,
-) -> Option<CapacityFileIdentity> {
+) -> Option<CapacityHistoryFailure> {
     let (directory, name) = capacity_history_parent(root, path)?;
     let mut file = capacity_openat(&directory, &name, 0)?;
     let identity = CapacityFileIdentity::from_metadata(&file.metadata().ok()?)?;
@@ -1276,14 +1301,14 @@ pub(crate) fn read_capacity_history(
     } else {
         tail.as_slice()
     };
-    capacity_turn_complete(tail, turn_id)?;
+    let kind = capacity_turn_complete(tail, turn_id)?;
     capacity_history_unchanged(root, path, &file, &identity)?;
-    Some(identity)
+    Some(CapacityHistoryFailure { identity, kind })
 }
 
-fn capacity_turn_complete(tail: &[u8], turn_id: &str) -> Option<()> {
+fn capacity_turn_complete(tail: &[u8], turn_id: &str) -> Option<CapacityFailureKind> {
     let mut started = false;
-    let mut completed = false;
+    let mut completed = None;
     for line in tail.strip_suffix(b"\n")?.split(|byte| *byte == b'\n') {
         if line.len() > CAPACITY_RECORD_BYTES {
             return None;
@@ -1305,18 +1330,15 @@ fn capacity_turn_complete(tail: &[u8], turn_id: &str) -> Option<()> {
         }
         match kind {
             "task_started" if !started => started = true,
-            "task_complete"
-                if started
-                    && !completed
-                    && event.pointer("/error/codex_error_info")?.as_str()?
-                        == "server_overloaded" =>
-            {
-                completed = true;
+            "task_complete" if started && completed.is_none() => {
+                let tag = event.pointer("/error/codex_error_info")?.as_str()?;
+                completed =
+                    Some(serde_json::from_value(serde_json::Value::String(tag.to_owned())).ok()?);
             }
             _ => return None,
         }
     }
-    completed.then_some(())
+    completed
 }
 
 pub(crate) const USAGE_CONTRACT_REVISION: &str = "codex-0.162.1-response-usage-v1";
@@ -1681,8 +1703,8 @@ mod executor_environment_tests {
     }
 
     #[test]
-    fn codex_capacity_reader_requires_exact_identity_and_structured_overload() {
-        let (root, path, records) = capacity_fixture();
+    fn codex_capacity_reader_requires_exact_identity_and_supported_structured_errors() {
+        let (root, path, mut records) = capacity_fixture();
         let read = || {
             read_capacity_history(
                 &root.join("sessions"),
@@ -1692,8 +1714,21 @@ mod executor_environment_tests {
                 &root,
             )
         };
-        write_capacity_records(&path, &records);
-        assert!(read().is_some());
+        for (tag, kind) in [
+            ("server_overloaded", CapacityFailureKind::ServerOverloaded),
+            (
+                "rate_limit_exceeded",
+                CapacityFailureKind::RateLimitExceeded,
+            ),
+            (
+                "usage_limit_exceeded",
+                CapacityFailureKind::UsageLimitExceeded,
+            ),
+        ] {
+            records[2]["payload"]["error"]["codex_error_info"] = serde_json::json!(tag);
+            write_capacity_records(&path, &records);
+            assert_eq!(read().unwrap().kind, kind);
+        }
         for (index, pointer, value) in [
             (0, "/payload/id", serde_json::json!("another-root")),
             (
@@ -1714,7 +1749,18 @@ mod executor_environment_tests {
             (
                 2,
                 "/payload/error/codex_error_info",
-                serde_json::json!("rate_limit_exceeded"),
+                serde_json::json!("quota_exceeded"),
+            ),
+            (2, "/payload/type", serde_json::json!("turn_complete")),
+            (
+                2,
+                "/payload/error/codex_error_info",
+                serde_json::json!("unknown"),
+            ),
+            (
+                2,
+                "/payload/error/codex_error_info",
+                serde_json::json!({"server_overloaded":null}),
             ),
             (
                 2,
