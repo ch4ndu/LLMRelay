@@ -32442,6 +32442,20 @@ fn native_turn_failure_is_bound_to_the_newest_accepted_turn() {
     assert_eq!(turn["failure"]["hook_event_id"], failed["hook_event_id"]);
     assert_eq!(turn["failure"]["kind"], "rate_limit");
     assert_eq!(turn["failure"]["details"], "429 Too Many Requests");
+    let failure_item_id = format!(
+        "native_turn_failure:{}",
+        failed["hook_event_id"].as_str().unwrap()
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    let item = state
+        .attention
+        .iter()
+        .find(|item| item.id == failure_item_id)
+        .unwrap();
+    assert_eq!(
+        item.reason,
+        "The provider ended the agent's turn (a rate or usage limit was reached). The session is still open. LLMRelay does not retry or switch models in response to this notice. Check the provider account's limits and usage allowance. This signal does not identify the specific limit or its reset time."
+    );
 
     let next = hook("UserPromptSubmit", json!({"prompt":"continue"}));
     let turn = native_turn();
@@ -32968,6 +32982,31 @@ fn provider_failure_hold_binds_its_attributed_turn_and_ends_only_by_its_own_rule
     assert!(
         limited_binding.starts_with(&format!("{turn_id}|rate_limit|prompt_id_matched|")),
         "{limited_binding}"
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    let projected = &state
+        .active_sessions
+        .iter()
+        .find(|session| session["id"] == "session")
+        .unwrap()["provider_failure_holds"][0];
+    assert_eq!(projected["id"], limited.as_str());
+    assert_eq!(projected["cause"], "a rate or usage limit was reached");
+    assert_eq!(
+        projected["remedy"],
+        "Check the provider account's limits and usage allowance. This signal does not identify the specific limit or its reset time."
+    );
+    let item = state
+        .attention
+        .iter()
+        .find(|item| item.id == format!("provider_failure_hold:{limited}"))
+        .unwrap();
+    assert!(
+        item.reason.starts_with(
+            "The provider reported a failure for Implementer (a rate or usage limit was reached)."
+        ) && item.reason.contains("not the provider's reset time")
+            && item.reason.contains(projected["remedy"].as_str().unwrap()),
+        "{}",
+        item.reason
     );
     fixture.assert_scalar::<i64>(
         &format!(

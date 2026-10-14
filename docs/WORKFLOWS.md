@@ -187,7 +187,9 @@ bindings fail before writing; Codex retains its existing raw-paste behavior.
 When an agent asks a question or reports that it is blocked, the task waits for you. **Answer question** appears only when the service has matched the question to the manager session that asked it, and your reply goes to exactly that session; a wait that is not a question has no reply form. If the same agent then sends a newer, usable report, for example a finished plan, LLMRelay releases the wait by itself exactly once and continues from that report; you do not also need to choose **Continue**. The wait stays in place while a permission request, keyboard control, an unconfirmed guidance delivery, a recovery, a pending control, or another unread blocked report still needs you. Only an agent's newest report can hold its task: older questions it has already moved past are retired once and recorded, so **Retry** or **Continue** never brings an answered question back, and a report made while the task waited stays available afterwards instead of being treated as stale.
 
 A supported, attributable provider failure places a durable hold on automatic work for the affected
-role and lane. Rate-limit and overload failures use a 60-second app cooldown;
+role and lane. Claude may report subscription allowance rejection as `rate_limit`;
+that hook does not identify the quota or reset time. Rate-limit and overload
+failures use a 60-second app cooldown, not a provider reset or availability promise;
 other failure kinds require you to fix the cause and choose **Release provider
 hold** on the agent's session. The hold remains visible after the session exits.
 It does not turn into a generic coordinator-failure recovery item, and unrelated

@@ -12370,8 +12370,8 @@ Deno.test("A permission wait stays visible beside an independent hold and opens 
         accepted_at: "2026-09-23T00:00:00Z",
         failure: {
           hook_event_id: "hook-failure",
-          kind: "overloaded",
-          provider_error: "Selected model is at capacity.",
+          kind: "rate_limit",
+          provider_error: "rate_limit",
           details: null,
           observed_at: "2026-09-23T00:01:00Z",
         },
@@ -12386,12 +12386,13 @@ Deno.test("A permission wait stays visible beside an independent hold and opens 
     check(
       document.querySelectorAll(".wait-notices li").length === 3 &&
         document.querySelector(".wait-notices")?.textContent?.includes(
-          "latest turn stopped",
+          "latest turn stopped: a rate or usage limit was reached",
         ) &&
         document.querySelector(".wait-notices")?.textContent?.includes(
           "LLMRelay cannot answer it",
         ) &&
-        sessionArticle()?.querySelector(".session-turn-failure") &&
+        sessionArticle()?.querySelector(".session-turn-failure strong")
+            ?.textContent === "Its latest turn stopped: a rate or usage limit was reached" &&
         !sessionArticle()?.querySelector(".session-native-prompt") &&
         document.querySelector(
           '[data-attention-target="session:s-other"] .session-native-prompt',
@@ -13407,14 +13408,15 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
   const cooling: Session = {
     ...managerSession,
     id: "s-cooling",
+    provider: "claude",
     role: "implementer",
     role_generation_id: "g2",
     provider_failure_holds: [
       hold("hold-rate", "s-cooling", {
         role_generation_id: "g2",
         kind: "rate_limit",
-        cause: "the provider's rate limit was reached",
-        remedy: "Check the provider's rate-limit status before choosing the next action.",
+        cause: "a rate or usage limit was reached",
+        remedy: "Check the provider account's limits and usage allowance. This signal does not identify the specific limit or its reset time.",
         attribution: "prompt_id_matched",
         accepted_hook_event_id: "hook-accept",
         expires_at: "2026-10-01T15:01:00Z",
@@ -13485,8 +13487,12 @@ Deno.test("A provider failure hold shows on exited and running sessions and Rele
     );
     check(
       primary("s-cooling").includes(
-        "The provider reported a failure: the provider's rate limit was reached",
+        "The provider reported a failure: a rate or usage limit was reached",
       ) &&
+        primary("s-cooling").includes("Claude") &&
+        primary("s-cooling").includes(
+          "Check the provider account's limits and usage allowance. This signal does not identify the specific limit or its reset time.",
+        ) &&
         primary("s-cooling").includes("short cooldown of its own") &&
         primary("s-cooling").includes("not the provider's reset time") &&
         !primary("s-cooling").includes("will not start") &&

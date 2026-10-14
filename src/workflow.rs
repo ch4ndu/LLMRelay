@@ -10557,8 +10557,8 @@ fn native_turn_failure_explanation(kind: &str) -> (&'static str, &'static str) {
     const CHECK_SERVICE: &str = "Check the provider's service status or choose another verified model when replacement is available.";
     match kind {
         "rate_limit" => (
-            "the provider's rate limit was reached",
-            "Check the provider's rate-limit status before choosing the next action.",
+            "a rate or usage limit was reached",
+            "Check the provider account's limits and usage allowance. This signal does not identify the specific limit or its reset time.",
         ),
         "overloaded" => ("the model was overloaded", CHECK_SERVICE),
         "usage_limit_exceeded" => (

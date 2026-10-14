@@ -17,7 +17,7 @@ Provider boundary: embedded compatibility candidates are Codex 0.157.1 and Claud
 | Compound command, heredoc, redirect or interpreter | Reference automatic response policy differs | Existing structured permission families retain their exact argument, path, cwd and invocation fences. | Unsupported families require one-time review or the native route. No blanket Python/shell permission. |
 | Delayed or duplicate signals | Runner-specific event checks | Current invocation identity and accepted state determine visibility; repeated notifications retain a stable event identity. | Without provider turn identifiers, hook arrival order is weaker evidence. No stronger causal claim is made. |
 | Reconnect / initial snapshot | Reference parity not established | In-app notices list current waits; initial/reset state does not replay historical browser alerts. | Browser delivery does not change provider or workflow state. |
-| Claude turn failure | Structured StopFailure normalization and durable role/lane hold | A trusted current StopFailure exposes the failure kind and restricts affected automatic work. Rate-limit/overload uses an app cooldown; other kinds require Release provider hold. Holds remain visible on exited sessions. | No fabricated role result, readiness promotion, review call, paid retry, model fallback or provider-reset claim. |
+| Claude turn failure | Structured StopFailure normalization and durable role/lane hold | A trusted current StopFailure exposes the failure kind and restricts affected automatic work. Claude subscription allowance rejection can also arrive as rate_limit, without identifying quota or reset. Rate-limit/overload uses an app cooldown; other kinds require Release provider hold. Holds remain visible on exited sessions. | No fabricated role result, readiness promotion, review call, paid retry, model fallback or provider-reset claim. |
 | Codex capacity / usage error | Structured rollout completion | Exact current admitted history for overload, rate limiting or usage/plan-access failure records a durable source-bound hold and can offer the existing verified stop. | No fabricated failure hook or idle readiness. No automatic retry/fallback. Unknown, ambiguous or already-exited-before-capture history is unclassified. |
 | Submitted implementation / open process | Native output and result channel | Authenticated role report is awaiting processing or verification; the session may remain open. | A candidate report and hook completion are separate from human acceptance. |
 | Resume recovery | Runner/session machinery | Exact accepted resumed-turn evidence may supersede its own earlier blocker and release its matching hold atomically. | Independent controls, current blockers, original reports and rejection history remain intact. |
@@ -232,3 +232,24 @@ Existing supported Claude failure-hook classes remain available. An unsupported
 Claude usage-limit tag remains Unknown; quota counters alone cannot establish a
 rejecting request or reset time. No paid quota exhaustion or new native failure
 experiment was performed for this change.
+
+## Claude allowance recovery evidence — 2026-10-14
+
+Claude `StopFailure` rate-limit recovery also covers a reachable subscription
+allowance rejection path; it cannot distinguish that cause from other limits.
+The existing Claude failure row above applies only to delivered, attributable
+hooks. Missing-hook failures remain unclassified.
+
+Static inspection of installed Claude 2.1.289 (229,616,464 bytes; SHA-256
+`03d66745e3bb69ec727d66023696f3820bc0a00a8a5ba725eb6706d0c67cbe69`)
+traced HTTP 429 subscription rejection to `error:"rate_limit"` and the terminal
+`StopFailure` emitter. Internal quota information is omitted from the hook;
+`error_details` is an optional string, not a quota discriminator. Hook emission
+is conditional and not awaited by that terminal path. This proves reachable
+code, not live rejection or delivery. SDK limit-event schemas and cached
+status-line utilization do not establish an attributed signal for this PTY
+integration. No new receiver, text parser or reset estimate is inferred.
+
+Shared recovery text and projected hold/attention regression assertions cover
+the rate-or-usage ambiguity. Existing authenticated unknown hooks retain generic
+recovery, and existing cooldown, stop, release and dispatch guards are unchanged.

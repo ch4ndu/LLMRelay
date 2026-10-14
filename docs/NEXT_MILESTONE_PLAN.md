@@ -1,12 +1,18 @@
 # LLMRelay roadmap and next task
 
-## Next stabilization task — provider error recovery
+## Provider error recovery checkpoint
 
 Selected by the user on October 13, 2026 as essential. Start after the current
 isolated provider-validation task, ahead of further refactoring and feature work.
 Implementation, independent code review and fresh final verification completed on 2026-10-14. Verification passed: 203 library tests (2 ignored), 262 contract tests, 3 runtime tests and 109 frontend tests, plus typecheck/build and formatting checks. Native signal coverage remains bounded as recorded in PERMISSION_SIGNAL_MATRIX.md.
 
-The committed-source audit found uneven provider coverage: Codex's structured
+Claude follow-up: allowance rejection can reach the existing `rate_limit` hook,
+without exposing a specific quota or reset. Shared recovery wording and focused
+projection/UI coverage passed focused verification, independent code review and
+fresh final verification on 2026-10-14.
+Missing-hook detection and live allowance-delivery qualification remain open.
+
+The pre-implementation audit found uneven provider coverage: Codex's structured
 capacity observation is informational and does not provide a complete retry or
 resume flow; its usage-exhaustion recovery is incomplete. Supported failure-hook
 handling already supplies durable role/lane holds, a 60-second app cooldown for

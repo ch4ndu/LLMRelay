@@ -846,6 +846,22 @@ uses the existing manager-change controls; implementer/reviewer replacement stil
 requires the appropriate verified checkpoint. Explorer and setup actors do not
 gain a new checkpoint switch. Follow their displayed existing controls instead.
 
+Claude can report subscription allowance rejection through the same `rate_limit`
+failure hook used for other limits. The recovery guidance therefore says a rate
+or usage limit was reached: the hook does not identify the specific quota or its
+reset time. Check the provider account before continuing. To wait safely, use
+**Stop failed session and pause task** when offered; after confirmed settlement,
+use the separate release and eligible continuation controls described above.
+The app cooldown is not proof that Claude is available again. Changing model or
+provider still requires the existing replacement checks.
+
+This covers authenticated, attributable hooks, including generic recovery for
+unknown error kinds. A missing hook cannot establish a quota failure. Inspect
+agent output and use the task's existing pause, cancel or stopped-session
+recovery controls; no terminal-text quota inference is performed. The exact
+Claude 2.1.289 evidence is static emission-path analysis, not a live allowance
+exhaustion or guaranteed hook-delivery qualification.
+
 For admitted live Codex 0.162.1 sessions, the bounded history reader recognizes
 exact structured `task_complete` values `server_overloaded`,
 `rate_limit_exceeded` and `usage_limit_exceeded`. It records an immutable audit

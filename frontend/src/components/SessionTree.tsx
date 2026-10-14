@@ -293,7 +293,7 @@ export const nativeTurnFailureLabel: Record<NativeTurnFailureKind, string> = {
   account_on_hold: "the account is on hold",
   verification_required: "the account needs verification",
   billing_error: "a billing problem",
-  rate_limit: "a rate limit was reached",
+  rate_limit: "a rate or usage limit was reached",
   overloaded: "the model is overloaded or at capacity",
   usage_limit_exceeded: "the usage allowance or plan access does not permit this request",
   invalid_request: "the provider rejected the request",
