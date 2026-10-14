@@ -638,3 +638,14 @@ independent so qualifying one does not imply the other. Conservative native
 state remains in place until each passes admission and acceptance. No further probe
 of unchanged payloads, speculative parser, polling daemon or execution-transport
 replacement is selected.
+
+## Revision-bound task content and reports
+
+Task content loading now lives in `useTaskContent.ts`, and report rendering lives
+in `TaskReports.tsx`. The moved bodies and remaining `TaskDetail.tsx` body match
+the prior source apart from imports and exports. Revision matching, stale-result
+protection, exact current-input selection, reply eligibility and report actions
+are preserved. Independent code review, six focused tests, frontend typecheck/build
+and all 118 frontend tests passed. Fresh final verification approved the checkpoint. This
+source-only checkpoint does not refresh the local package; the final roadmap
+verification step owns that refresh and the remaining browser checks.
