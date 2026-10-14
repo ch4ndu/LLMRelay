@@ -649,3 +649,15 @@ are preserved. Independent code review, six focused tests, frontend typecheck/bu
 and all 118 frontend tests passed. Fresh final verification approved the checkpoint. This
 source-only checkpoint does not refresh the local package; the final roadmap
 verification step owns that refresh and the remaining browser checks.
+
+## Coordinator failure-containment refactoring
+
+Failure attribution, durable failure holds and settlement, and tick deferral
+records now live in the private `coordinator/failure_containment.rs` module.
+Direct reexports preserve existing caller paths and error type identity. Moved
+bodies and transaction ownership are unchanged; phase and control execution
+remain in the coordinator. Independent code review, formatting, compilation,
+three focused unit tests and eight recovery contracts passed. The full Rust
+suite passed 468 tests with two live-provider qualification tests intentionally
+ignored. Fresh final verification approved the checkpoint. The final roadmap step still
+owns package refresh and remaining browser checks.
