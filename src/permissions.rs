@@ -379,10 +379,8 @@ impl ParsedRequest {
 }
 
 /// The running invocation a native permission request belongs to, resolved
-/// from that invocation's own credential. Only a workspace-writing actor can
-/// receive a human grant: the TRIP Implementer, or a Single agent bound to the
-/// compiled workspace-writer policy. Every other actor's request is recorded
-/// and denied, and no actor can decide its own request.
+/// from that invocation's own credential. Writers may request action grants;
+/// read-only Claude roles may request their exact report or paged-context command once.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermissionActor {
     pub project_id: String,
@@ -486,7 +484,20 @@ pub fn begin_actor_request(
         reason,
         invocation_nonce,
     } = ParsedRequest::from_payload(payload)?;
-    let (request_context, context_error) = if context.writer {
+    let role_protocol_action = if !context.writer && raw_bytes.len() <= MAX_INPUT_BYTES {
+        let connection = store.lock()?;
+        role_protocol_action(
+            &connection,
+            &context.session_id,
+            context.provider,
+            &context.actor,
+            &tool_name,
+            &raw_input,
+        )?
+    } else {
+        false
+    };
+    let (request_context, context_error) = if context.writer || role_protocol_action {
         match request_context(store, context, payload) {
             Ok(value) => (Some(value), None),
             Err(error) => (None, Some(format!("{error:#}"))),
@@ -515,7 +526,16 @@ pub fn begin_actor_request(
     } else {
         None
     };
-    let (family, family_error, mut command_display) =
+    let (family, family_error, mut command_display) = if role_protocol_action {
+        (
+            None,
+            Some(
+                "Role reports and paged context support Approve once only, without a reusable command family"
+                    .to_owned(),
+            ),
+            command_text(context.provider, &tool_name, &raw_input),
+        )
+    } else {
         match (request_context.as_ref(), review_error.as_ref()) {
             (Some(request_context), None) => {
                 match classify_family(
@@ -548,7 +568,8 @@ pub fn begin_actor_request(
             )),
                 command_text(context.provider, &tool_name, &raw_input),
             ),
-        };
+        }
+    };
     if command_display
         .as_ref()
         .is_some_and(|value| value.len() > MAX_INPUT_BYTES)
@@ -558,18 +579,21 @@ pub fn begin_actor_request(
     let now = Utc::now();
     let deadline = now + Duration::seconds(APPLICATION_DECISION_SECONDS);
     let request_id = uuid::Uuid::new_v4().to_string();
-    let actionable = context.writer && request_context.is_some() && review_error.is_none();
+    let actionable = (context.writer || role_protocol_action)
+        && request_context.is_some()
+        && review_error.is_none();
     let initial_state = if actionable {
         "pending"
     } else {
         "policy_denied"
     };
     let initial_reason = if !context.writer
+        && !role_protocol_action
         && context.actor == crate::domain::ExecutionActor::SINGLE_AGENT_KEY
     {
         Some("This Single agent is not bound to the workspace-writer policy, so it cannot receive a human-granted action permission".to_owned())
-    } else if !context.writer {
-        Some("Only the Implementer role may receive a human-granted action permission".to_owned())
+    } else if !context.writer && !role_protocol_action {
+        Some("Read-only roles may receive Approve once only for their exact Claude role report or paged context command".to_owned())
     } else if let Some(error) = context_error {
         Some(format!(
             "{error}; no grant was authorized. Use the faithful native terminal prompt"
@@ -1156,6 +1180,9 @@ pub fn consume_actor_response(
         registered_root: String,
         project_identity: String,
         configuration_revision: i64,
+        tool_name: String,
+        input_json: String,
+        input_digest: String,
     }
     let row: Option<ReadyRequest> = transaction
         .query_row(
@@ -1163,7 +1190,7 @@ pub fn consume_actor_response(
                     pr.attempt_id,pr.session_id,pr.role_generation_id,pr.role,pr.native_session_id,pr.cwd,pr.policy_fingerprint,
                     pr.matching_rule_id,pr.family_json,s.status,COALESCE(s.native_session_id,''),COALESCE(s.capability_key,''),
                     pr.delivery_state,s.provider,rg.status,rg.role,rg.provider,w.path,w.state,w.repository_identity,p.repository_path,
-                    p.repository_identity,a.configuration_revision
+                    p.repository_identity,a.configuration_revision,pr.tool_name,pr.input_json,pr.input_digest
              FROM permission_requests pr JOIN sessions s ON s.id=pr.session_id
              JOIN role_generations rg ON rg.id=pr.role_generation_id
              JOIN attempts a ON a.id=pr.attempt_id JOIN tasks t ON t.id=pr.task_id
@@ -1203,6 +1230,9 @@ pub fn consume_actor_response(
                     registered_root: row.get(27)?,
                     project_identity: row.get(28)?,
                     configuration_revision: row.get(29)?,
+                    tool_name: row.get(30)?,
+                    input_json: row.get(31)?,
+                    input_digest: row.get(32)?,
                 })
             },
         )
@@ -1224,11 +1254,33 @@ pub fn consume_actor_response(
         )));
     }
     let mut state = row.state.clone();
+    let role_protocol_action = if !credential_context.writer
+        && row.input_json.len() <= MAX_INPUT_BYTES
+        && hex::encode(Sha256::digest(row.input_json.as_bytes())) == row.input_digest
+    {
+        match serde_json::from_str(&row.input_json) {
+            Ok(input) => role_protocol_action(
+                &transaction,
+                &row.session,
+                credential_context.provider,
+                &row.role,
+                &row.tool_name,
+                &input,
+            )?,
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
     let mut invalid = row.delivery_state == "deny_required"
         || !credential_current
         || row.boot != service_boot_id
         || row.connection != connection_nonce
-        || !credential_context.writer
+        || !(credential_context.writer || role_protocol_action)
+        || (role_protocol_action
+            && (state == "approved_rule"
+                || row.family_json.is_some()
+                || row.matching_rule.is_some()))
         || row.role != credential_context.actor
         || row.generation_role != credential_context.actor
         || row.provider != row.session_provider
@@ -1644,6 +1696,7 @@ pub fn apply_human_decision(
         deadline,
         tool_name,
         input_json,
+        input_digest,
     ): (
         String,
         String,
@@ -1660,14 +1713,15 @@ pub fn apply_human_decision(
         String,
         String,
         String,
+        String,
     ) = transaction
         .query_row(
-            "SELECT pr.provider,pr.project_id,pr.attempt_id,pr.role,pr.session_id,pr.role_generation_id,pr.native_session_id,p.repository_path,p.repository_identity,pr.cwd,pr.policy_fingerprint,pr.family_json,pr.deadline_at,pr.tool_name,pr.input_json
+            "SELECT pr.provider,pr.project_id,pr.attempt_id,pr.role,pr.session_id,pr.role_generation_id,pr.native_session_id,p.repository_path,p.repository_identity,pr.cwd,pr.policy_fingerprint,pr.family_json,pr.deadline_at,pr.tool_name,pr.input_json,pr.input_digest
              FROM permission_requests pr JOIN projects p ON p.id=pr.project_id
              JOIN sessions s ON s.id=pr.session_id JOIN role_generations rg ON rg.id=pr.role_generation_id
              JOIN attempts a ON a.id=pr.attempt_id JOIN workspaces w ON w.attempt_id=a.id
              WHERE pr.id=?1 AND pr.revision=?2 AND pr.state='pending'
-               AND pr.role IN ('implementer','single_agent') AND rg.role=pr.role
+               AND rg.role=pr.role
                AND rg.id=s.role_generation_id AND rg.status NOT IN ('replaced','revoked')
                AND s.status='running' AND s.native_session_id=pr.native_session_id
                AND s.capability_key=pr.policy_fingerprint AND w.state='ready'
@@ -1690,6 +1744,7 @@ pub fn apply_human_decision(
                     row.get(12)?,
                     row.get(13)?,
                     row.get(14)?,
+                    row.get(15)?,
                 ))
             },
         )
@@ -1699,6 +1754,28 @@ pub fn apply_human_decision(
         })?;
     if deadline <= now {
         bail!("permission request deadline elapsed")
+    }
+    let writer = matches!(role.as_str(), "implementer" | "single_agent");
+    if !writer {
+        let provider_kind: Provider = provider.parse().map_err(|error: String| anyhow!(error))?;
+        let exact_input: serde_json::Value = serde_json::from_str(&input_json)
+            .context("permission request no longer contains its exact structured action")?;
+        if input_json.len() > MAX_INPUT_BYTES
+            || hex::encode(Sha256::digest(input_json.as_bytes())) != input_digest
+            || !role_protocol_action(
+                transaction,
+                &session,
+                provider_kind,
+                &role,
+                &tool_name,
+                &exact_input,
+            )?
+        {
+            bail!("permission request is not the exact read-only role report or paged context command authorized for one-time review")
+        }
+        if decision == PermissionDecision::AlwaysApprove {
+            bail!("this request has no safely reusable command family; role reports and paged context support Approve once only")
+        }
     }
     if decision != PermissionDecision::Deny {
         let provider_kind: Provider = provider.parse().map_err(|error: String| anyhow!(error))?;
@@ -2443,6 +2520,88 @@ pub(crate) fn command_text(
     }
 }
 
+fn role_protocol_action(
+    connection: &Connection,
+    session_id: &str,
+    provider: Provider,
+    actor: &str,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> Result<bool> {
+    if provider != Provider::Claude || tool_name != "Bash" {
+        return Ok(false);
+    }
+    let launch: Option<String> = connection
+        .query_row(
+            "SELECT launch_config_json FROM sessions WHERE id=?1",
+            params![session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(launch) =
+        launch.and_then(|value| serde_json::from_str::<crate::domain::LaunchConfig>(&value).ok())
+    else {
+        return Ok(false);
+    };
+    if launch.provider != provider
+        || launch.role == RoleKind::Implementer
+        || launch.role.to_string() != actor
+    {
+        return Ok(false);
+    }
+    let Ok(workspace) = launch.cwd.canonicalize() else {
+        return Ok(false);
+    };
+    if validate_call_cwd(input, &workspace).is_err() {
+        return Ok(false);
+    }
+    let Some(allowed) = launch.security_policy["allowed_operations"].as_array() else {
+        return Ok(false);
+    };
+    let executables = allowed
+        .iter()
+        .filter_map(|rule| rule.as_str())
+        .filter_map(|rule| rule.strip_prefix("Bash(")?.strip_suffix(" role report:*)"))
+        .collect::<Vec<_>>();
+    let [executable] = executables.as_slice() else {
+        return Ok(false);
+    };
+    if !Path::new(executable).is_absolute()
+        || !launch
+            .argv
+            .iter()
+            .any(|argument| argument == &format!("Bash({executable} role report:*)"))
+    {
+        return Ok(false);
+    }
+    if is_direct_role_command(provider, tool_name, input, Path::new(executable), "report") {
+        return Ok(true);
+    }
+    for (operation, suffix) in [
+        ("context_index", "role context --index)"),
+        ("context_page", "role context --page:*)"),
+    ] {
+        let grant = format!("Bash({executable} {suffix}");
+        if allowed
+            .iter()
+            .filter(|rule| rule.as_str() == Some(grant.as_str()))
+            .count()
+            == 1
+            && launch
+                .argv
+                .iter()
+                .filter(|argument| **argument == grant)
+                .count()
+                == 1
+            && is_direct_role_command(provider, tool_name, input, Path::new(executable), operation)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn is_direct_role_command(
     provider: Provider,
     tool_name: &str,
@@ -2461,16 +2620,78 @@ pub(crate) fn is_direct_role_command(
     }
     match operation {
         "context" => argv.len() == 3 && argv[1..] == ["role", "context"],
+        "context_index" => argv.len() == 4 && argv[1..] == ["role", "context", "--index"],
+        "context_page" => {
+            argv.len() == 5
+                && argv[1..4] == ["role", "context", "--page"]
+                && crate::task_cli::RoleContextCursor::parse(&argv[4]).is_ok()
+        }
         "report" => {
             (argv.len() == 5
                 && argv[1..4] == ["role", "report", "--json"]
                 && !argv[4].trim().is_empty())
                 || (argv.len() >= 4
                     && argv[1..3] == ["role", "report"]
-                    && crate::domain::parse_runtime_role_report_args(&argv[3..]).is_ok())
+                    && (crate::domain::parse_runtime_role_report_args(&argv[3..]).is_ok()
+                        || crate::domain::parse_functional_role_report_args(&argv[3..]).is_ok()))
         }
         _ => false,
     }
+}
+
+pub(crate) fn direct_functional_report(
+    provider: Provider,
+    tool_name: &str,
+    input: &serde_json::Value,
+    role_executable: &Path,
+) -> Option<crate::domain::RoleResultReport> {
+    let (argv, _) = command_argv(provider, tool_name, input).ok()?;
+    if argv.len() < 4 || Path::new(&argv[0]) != role_executable || argv[1..3] != ["role", "report"]
+    {
+        return None;
+    }
+    crate::domain::parse_functional_role_report_args(&argv[3..]).ok()
+}
+
+pub(crate) fn is_filtered_role_context_command(script: &str, role_executable: &Path) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut pipe = None;
+    for (index, character) in script.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, character) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => {}
+            (_, '\\') => escaped = true,
+            (None, '\'' | '"') => quote = Some(character),
+            (None, '|') => {
+                if pipe.replace(index).is_some() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(pipe) = pipe else {
+        return false;
+    };
+    let (Ok(context), Ok(filter)) = (
+        simple_argv(&script[..pipe]),
+        simple_argv(&script[pipe + 1..]),
+    ) else {
+        return false;
+    };
+    context.len() == 3
+        && Path::new(&context[0]) == role_executable
+        && context[1..] == ["role", "context"]
+        && filter.len() == 3
+        && matches!(filter[0].as_str(), "grep" | "/usr/bin/grep")
+        && matches!(filter[1].as_str(), "-o" | "--only-matching")
+        && !filter[2].is_empty()
+        && !filter[2].starts_with('-')
 }
 
 fn validate_call_cwd(input: &serde_json::Value, expected: &Path) -> Result<()> {
@@ -2849,9 +3070,98 @@ fn ensure_no_symlink_components(root: &Path, relative: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_argv, is_direct_role_command, simple_argv};
+    use super::{
+        command_argv, is_direct_role_command, is_filtered_role_context_command, simple_argv,
+    };
     use crate::domain::{parse_runtime_role_report_args, Provider};
     use std::path::Path;
+
+    #[test]
+    fn paged_context_commands_require_exact_direct_argv_and_canonical_cursor() {
+        let executable = Path::new("/opt/llmrelay");
+        let cursor = format!("v1:task:0:{}:{}", "ab".repeat(16), "cd".repeat(16));
+        for (operation, command) in [
+            (
+                "context_index",
+                "/opt/llmrelay role context --index".to_owned(),
+            ),
+            (
+                "context_page",
+                format!("/opt/llmrelay role context --page {cursor}"),
+            ),
+        ] {
+            assert!(is_direct_role_command(
+                Provider::Claude,
+                "Bash",
+                &serde_json::json!({"command":command}),
+                executable,
+                operation
+            ));
+            for invalid in [
+                format!("/bin/sh -c '{command}'"),
+                format!("{command} | cat"),
+                format!("{command} > output"),
+                format!("{command}; true"),
+                command.replace("/opt/llmrelay", "/other/llmrelay"),
+            ] {
+                assert!(!is_direct_role_command(
+                    Provider::Claude,
+                    "Bash",
+                    &serde_json::json!({"command":invalid}),
+                    executable,
+                    operation
+                ));
+            }
+        }
+        for invalid in [
+            cursor.replace(":task:", ":secrets:"),
+            cursor.replace(":0:", ":01:"),
+            format!("{cursor}x"),
+        ] {
+            assert!(!is_direct_role_command(
+                Provider::Claude,
+                "Bash",
+                &serde_json::json!({"command":format!("/opt/llmrelay role context --page {invalid}")}),
+                executable,
+                "context_page"
+            ));
+        }
+    }
+
+    #[test]
+    fn functional_context_filters_do_not_become_permission_exemptions() {
+        let executable = Path::new("/opt/llmrelay");
+        for pattern in [
+            r#"'"setup_contract":{[^}]*}'"#,
+            r#"'"binding_hash":"[^"]*"'"#,
+        ] {
+            let command = format!("/opt/llmrelay role context | /usr/bin/grep -o {pattern}");
+            assert!(is_filtered_role_context_command(&command, executable));
+            assert!(!is_direct_role_command(
+                Provider::Claude,
+                "Bash",
+                &serde_json::json!({"command":command}),
+                executable,
+                "context",
+            ));
+        }
+        for command in [
+            "/opt/llmrelay role context | grep -o pattern file",
+            "/opt/llmrelay role context | grep -r pattern",
+            "/opt/llmrelay role context | grep -f patterns",
+            "/opt/llmrelay role context | grep -e one -e two",
+            "/opt/llmrelay role context | grep -o pattern > output",
+            "/opt/llmrelay role context | grep -o \"$(cat file)\"",
+            "/opt/llmrelay role context | grep -o pattern | cat",
+            "/opt/llmrelay role context | cat file",
+            "/different/llmrelay role context | grep -o pattern",
+        ] {
+            assert!(
+                !is_filtered_role_context_command(command, executable),
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn permission_family_lexer_keeps_all_arguments_without_shell_widening() {
@@ -2909,6 +3219,26 @@ mod tests {
             decoded["metadata"]["validation_observation"]["actual_outcomes"][0]["command"],
             exact_command
         );
+
+        let long_report = serde_json::json!({"operation_id":"long-plan-report","outcome":"plan_ready",
+            "summary":"bounded app lexer coverage","evidence":[],"metadata":{"plan":"Literal plan text. ".repeat(800)}}).to_string();
+        let long_command = format!(
+            "{} role report --json '{}'",
+            executable.display(),
+            long_report
+        );
+        assert!(long_command.len() > 12 * 1024 && long_command.len() < 64 * 1024);
+        let long_input = serde_json::json!({"command":long_command});
+        let (long_argv, _) = command_argv(Provider::Claude, "Bash", &long_input).unwrap();
+        assert_eq!(long_argv.len(), 5);
+        assert_eq!(long_argv[4], long_report);
+        assert!(is_direct_role_command(
+            Provider::Claude,
+            "Bash",
+            &long_input,
+            executable,
+            "report"
+        ));
 
         let raw_outer_unicode_escape = tool_input_json.replace(r"\\u0027", r"\u0027");
         let malformed_input: serde_json::Value =
@@ -3022,6 +3352,44 @@ mod tests {
                 "report"
             ));
         }
+        let functional_command = format!("{} role report --functional-v2 --operation-id=functional --status=passed --binding-hash={} --challenge=read-nonce --session-mode=retained",executable.display(),"ab".repeat(32));
+        let functional_input = serde_json::json!({"command":functional_command});
+        assert!(is_direct_role_command(
+            Provider::Claude,
+            "Bash",
+            &functional_input,
+            executable,
+            "report"
+        ));
+        for invalid in [
+            format!(
+                "{} ; /usr/bin/true",
+                functional_input["command"].as_str().unwrap()
+            ),
+            format!(
+                "{} --actual=direct_write,true,1,denied,os,native_session",
+                functional_input["command"].as_str().unwrap()
+            ),
+            format!(
+                "/usr/bin/env {}",
+                functional_input["command"].as_str().unwrap()
+            ),
+        ] {
+            assert!(!is_direct_role_command(
+                Provider::Claude,
+                "Bash",
+                &serde_json::json!({"command":invalid}),
+                executable,
+                "report"
+            ));
+        }
+        assert!(!is_direct_role_command(
+            Provider::Claude,
+            "Bash",
+            &functional_input,
+            Path::new("/different/llmrelay"),
+            "report"
+        ));
         let missing_context = [
             "--runtime-v1".to_owned(),
             "--operation-id=runtime-missing".to_owned(),

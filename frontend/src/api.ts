@@ -1,5 +1,6 @@
 import type {
   AppState,
+  CapabilityRecordFunctionalProofOperation,
   CmuxKeyboardControlAction,
   CmuxKeyboardControlOutcome,
   CmuxViewOutcome,
@@ -1054,14 +1055,17 @@ export const command = (body: Command) =>
     body.operation_id,
   );
 export const operation = async <T = Record<string, unknown>>(
-  body: Operation,
-) => {
+  body: Operation | CapabilityRecordFunctionalProofOperation,
+): Promise<T> => {
+  const identity = body.kind === "capability_record_functional_proof"
+    ? field(field(body, "proof"), "operation_id")
+    : field(body, "operation_id");
   const response = await preserveMutationIdentity(
     json<{ result: T }>("/api/operation", {
       method: "POST",
       body: JSON.stringify(body),
     }, transportTimeouts.mutation),
-    typeof body.operation_id === "string" ? body.operation_id : undefined,
+    typeof identity === "string" ? identity : undefined,
   );
   return response.result;
 };

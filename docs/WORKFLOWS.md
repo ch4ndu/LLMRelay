@@ -2,6 +2,35 @@
 
 [Back to README](../README.md)
 
+## Choose a workflow
+
+| Workflow | What you do | What the app adds |
+| --- | --- | --- |
+| Single agent | Describe a task, select one agent, review its result. | A working copy, saved progress, optional checks and a final acceptance step. |
+| TRIP | Describe a task, approve its plan and implementation, then review the final result. | A Manager and separate planning, implementation and review roles. |
+
+For a first small task, start with [Single agent](#single-agent-workflow).
+For the full planning and review process, use [TRIP](#required-trip-workflow).
+A project can offer both. Neither workflow requires you to use both providers.
+Custom workflow editing, Build and review, and Research presets are not yet available.
+Recipes and schedules currently use TRIP.
+
+**Ready** means queued. **Your review** means the app is waiting for your decision.
+**Done** means you accepted the result; it does not mean the changes were merged
+or released. See the [README walkthrough](../README.md#create-a-useful-first-task)
+for a first task. The sections below include detailed behavior for troubleshooting.
+
+## Provider-independent TRIP roles
+
+Manager, Explorer, Plan Reviewer, Implementer, Code Reviewer and Final Verifier
+may all select Codex, all select Claude, or use a mixed configuration. Each role
+keeps its own session and review authority; using one provider does not merge
+roles or remove the fresh Final Verifier, selected checks or final acceptance.
+No fallback to a different provider is implied by failure or unavailable capacity.
+The exact selected profiles require current qualification and explicit activation.
+See [functional qualification](PROJECT_SETUP.md#capability-checks-and-setup-recovery)
+and its [security boundary](SECURITY.md#functional-qualification-and-local-authority).
+
 ## Required TRIP workflow
 
 **Needs your attention** groups what is waiting for you: approvals, decisions,
@@ -69,6 +98,8 @@ The first turn of a retained setup discovery or profile probe completes at a str
 
 Ordinary reviewers receive evidence tied to their current review request: the frozen manifest, structured plan and approval receipts, lane yields, integration records, and applicable verification evidence. Missing or stale evidence remains explicitly unavailable. Reviewers inspect workspace content read-only against the manifest; a recorded hash alone is not proof of the file contents. Selected checks that await code approval remain pending. The standalone formatting restrictions for submitting a role report do not prohibit separately authorized ordinary review inspection, and do not expand setup or runtime-probe authority.
 
+The exact approved structured plan determines ownership mode. A default single writer has no explicit lane-yield or integration receipt; those records are not applicable. Configured lanes require matching records, and missing or mismatched records remain unavailable. Candidate-writer evidence ties the review request and snapshot to a completed service freeze, its consumed candidate report, and the source generation and session. The completed freeze is a historical record. The reported exit quiescence and writer conflicts are a current evaluation of service records, not a new historical validation receipt or a live process probe. Missing correlation or false or absent recorded quiescence remains unavailable. Manager conformance prose is a submitted assertion accepted under service checks, not native-quiescence evidence.
+
 ## Single agent workflow
 
 Besides TRIP, LLMRelay bundles a **Single agent** workflow: one admitted agent
@@ -112,10 +143,12 @@ currently offers. If a decision's outcome is unknown, the panel says so; trying
 again unchanged reuses the same request, and a changed request after a refresh
 is sent only after you choose it again.
 
-The Single agent writer modes for Codex and Claude have not been qualified on
-real provider installations yet, so LLMRelay refuses their probe runs and shows
-the reason; no Single agent profile can be activated until that qualification
-exists.
+Single agent is available for the supported Codex and Claude writer versions.
+The [native verification record](provider-qualification-20261011.md) documents
+provider checks and ordinary task execution, including a controlled Claude
+restart and dashboard acceptance. Your own profile must still pass its admission
+check before activation; a result from another installation does not activate it.
+Follow [Single agent setup](PROJECT_SETUP.md#single-agent-setup).
 
 ## Stop or change the task manager
 
@@ -158,6 +191,31 @@ The existing attachment connection holds a short, renewed input lease for you on
 A current manager code-review transition proposal suppresses further frozen-candidate reminders while its native turn finishes. This checks the exact manager generation, source phase, task version, plan, and candidate; it does not authorize transition before verified idle or process quiescence. Stale proposals do not suppress the reminder.
 
 Manager guidance is submitted once. It remains queued while a viewer owns input or while native work is active, and is delivered automatically after matching native submit/stop evidence and known helper descendants have exited. Claude must explicitly report empty background-task and scheduled-wakeup registries; missing or nonempty registries keep guidance queued, including after denied commands. Outstanding permission requests also prevent automatic delivery. For an exact pending service-owned Manager obligation, an otherwise current native turn whose latest real Stop has incomplete tool-hook bookkeeping may receive one service-initiated SIGINT stop request, distinct from verified native idle; the service still requires current generation, credential, invocation, candidate, permission, input, guidance, control, recovery, and whole-process-quiescence fences before it can retain-resume or transition. The atomic claim and the signal path are one-shot: another interrupt entry point does not send another signal, and drain reports the request separately as already pending. Completed checks/final-Explorer evidence and a completed final handoff are also held until the exact current Manager is either at a verified idle boundary or has exited with positively recorded whole-process quiescence; evidence recorded during a live busy turn is not consumed early. The stop has no timeout-based escalation and grants no blanket permission. If the process does not exit within the durable graceful-stop deadline, it enters explicit recovery with revoked role credentials and exact process controls; the service never fabricates idle, delivery, acknowledgement, or completion. Retained resume preserves the saved native invocation and its identity. The host-restart path adds a fixed interruption notice to its separately recorded delivered text so the agent verifies in-flight effects before repeating a command; ordinary resume does not add that notice. The Manager loads current obligations and queued notices from role context. Guidance uses a framed terminal paste and a separate Enter under the same input lease. Only matching native submission evidence advances it to submitted; only the role acknowledgement advances it to acknowledged. The dashboard shows queued, written, submitted, and acknowledged states separately.
+
+Ordinary authenticated role context exposes the newest activated Explorer decision
+for the exact attempt and current candidate as `current_explorer_evidence`, with
+its reporting generation and a `pending` or `quiescent` state. The full recorded
+summary and up to 256 KiB of evidence text accompany that decision. An explicit
+`evidence_truncated` flag and `evidence_total_count` identify omitted items, which
+remain available to the human in the dashboard. Roles must disclose the omission,
+avoid claiming complete consumption, and request the missing evidence through
+supported human guidance. Dashboard inspection belongs to the human; roles must
+not access the human-control channel. The bounded historical decision list retains
+metadata without outcome text; older or different-candidate findings do not
+satisfy the current obligation.
+
+During planning, after the reporting Explorer generation has exited and every
+one of its sessions has positively recorded process-group quiescence, LLMRelay
+queues one findings notice per decision and current effective running Manager
+generation through the existing guidance path. A submitted current plan takes
+precedence, and an absent or exited Manager keeps its existing dispatch or resume
+path. The notice does not bypass input ownership, native readiness, permissions,
+holds or recovery. Availability, notice delivery and acknowledgement do not prove
+consumption or approval: the Manager must read the available findings, disclose
+any omitted evidence and request human guidance, and cite the relevant findings
+and their consequences in a new structured `plan_ready` report without claiming
+complete consumption of evidence it has not received. Plan review,
+human approval and implementation authorization remain separate gates.
 
 Projects can opt in to **Remind agents to submit reports** in project settings. The default is off. An eligible planning manager, activated Explorer, plan/code reviewer or default-lane implementer may receive a reminder after a trusted, safely ended native turn if its required structured report is still missing. Final verification, setup/probe sessions, other manager phases and non-default implementation lanes are excluded. A blocked or other admitted current report satisfies the obligation; a guidance acknowledgement does not replace a report.
 

@@ -3863,6 +3863,171 @@ pub struct CapabilityProofInput {
     pub runtime_scope: Option<serde_json::Value>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualificationContract {
+    Legacy,
+    FunctionalV2,
+}
+
+impl QualificationContract {
+    pub fn from_record(record: &serde_json::Value) -> Result<Self, String> {
+        match record.get("qualification_contract") {
+            None => Ok(Self::Legacy),
+            Some(value) if value.as_str() == Some("functional-v2") => Ok(Self::FunctionalV2),
+            Some(_) => Err("unknown qualification contract".into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FunctionalQualificationContract {
+    #[serde(rename = "functional-v2")]
+    V2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionalSessionMode {
+    Fresh,
+    Retained,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FunctionalObservation {
+    Passed {
+        binding_hash: String,
+        challenge: String,
+        session_mode: FunctionalSessionMode,
+    },
+    Failed {
+        failure_category: String,
+    },
+    MissingContext,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FunctionalMainEvidence {
+    pub observation_request_hash: String,
+    pub native_command: String,
+    pub native_session_id: String,
+    pub role_generation_id: String,
+    pub observation: FunctionalObservation,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FunctionalCapabilityProofInput {
+    pub qualification_contract: FunctionalQualificationContract,
+    pub operation_id: String,
+    pub session_id: String,
+    pub evidence_reference: String,
+    #[serde(default)]
+    pub main: Option<FunctionalMainEvidence>,
+}
+
+pub fn parse_functional_role_report_args(args: &[String]) -> Result<RoleResultReport, String> {
+    if args.len() > 12 || args.iter().map(String::len).sum::<usize>() > MAX_RUNTIME_REPORT_BYTES {
+        return Err("functional-v2 command exceeds its bounded argument limits".into());
+    }
+    let mut marker = false;
+    let mut fields = std::collections::BTreeMap::new();
+    for argument in args {
+        if argument == "--functional-v2" {
+            if std::mem::replace(&mut marker, true) {
+                return Err("functional-v2 marker is duplicated".into());
+            }
+            continue;
+        }
+        let (name, value) = argument
+            .strip_prefix("--")
+            .and_then(|value| value.split_once('='))
+            .ok_or("functional-v2 fields require --name=value syntax")?;
+        if ![
+            "operation-id",
+            "status",
+            "binding-hash",
+            "challenge",
+            "session-mode",
+            "failure-category",
+        ]
+        .contains(&name)
+            || value.is_empty()
+            || value.len() > MAX_RUNTIME_ATOM_BYTES
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-:/".contains(&byte))
+        {
+            return Err("functional-v2 contains an unknown field or invalid bounded atom".into());
+        }
+        if fields.insert(name, value).is_some() {
+            return Err("functional-v2 contains a duplicate field".into());
+        }
+    }
+    if !marker {
+        return Err("functional-v2 marker is required".into());
+    }
+    let operation_id = fields
+        .remove("operation-id")
+        .ok_or("functional-v2 requires --operation-id")?;
+    let status = fields
+        .remove("status")
+        .ok_or("functional-v2 requires --status")?;
+    let observation = match status {
+        "passed" => {
+            let binding_hash = fields
+                .remove("binding-hash")
+                .ok_or("functional-v2 requires --binding-hash")?;
+            if binding_hash.len() != 64
+                || !binding_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err("functional-v2 binding hash must be SHA-256 hexadecimal".into());
+            }
+            FunctionalObservation::Passed {
+                binding_hash: binding_hash.into(),
+                challenge: fields
+                    .remove("challenge")
+                    .ok_or("functional-v2 requires --challenge")?
+                    .into(),
+                session_mode: match fields.remove("session-mode") {
+                    Some("fresh") => FunctionalSessionMode::Fresh,
+                    Some("retained") => FunctionalSessionMode::Retained,
+                    _ => {
+                        return Err("functional-v2 requires fresh or retained --session-mode".into())
+                    }
+                },
+            }
+        }
+        "failed" => {
+            let category = fields
+                .remove("failure-category")
+                .ok_or("functional-v2 requires --failure-category")?;
+            if !RUNTIME_FAILURES.contains(&category) {
+                return Err("functional-v2 failure category is unsupported".into());
+            }
+            FunctionalObservation::Failed {
+                failure_category: category.into(),
+            }
+        }
+        "missing_context" => FunctionalObservation::MissingContext,
+        _ => return Err("functional-v2 status is unsupported".into()),
+    };
+    if !fields.is_empty() {
+        return Err("functional-v2 status contains forbidden fields".into());
+    }
+    Ok(RoleResultReport {
+        operation_id: operation_id.into(),
+        outcome: "capability_observed".into(),
+        summary: "functional-v2 observation".into(),
+        evidence: Vec::new(),
+        metadata: serde_json::json!({
+            "runtime_report_format":"functional-v2",
+            "validation_observation":{"cell":"trip_runtime_probe", "functional":observation}
+        }),
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RolePeerProvenance {
     pub peer_pid: u32,
@@ -3876,6 +4041,40 @@ pub struct RolePeerProvenance {
 #[cfg(test)]
 mod runtime_report_tests {
     use super::parse_runtime_role_report_args;
+
+    #[test]
+    fn functional_report_is_typed_and_cannot_reinterpret_legacy_outcomes() {
+        let args = vec![
+            "--functional-v2".into(),
+            "--operation-id=functional-report".into(),
+            "--status=passed".into(),
+            format!("--binding-hash={}", "ab".repeat(32)),
+            "--challenge=read-nonce".into(),
+            "--session-mode=retained".into(),
+        ];
+        let report = super::parse_functional_role_report_args(&args).unwrap();
+        assert_eq!(report.metadata["runtime_report_format"], "functional-v2");
+        assert_eq!(
+            report.metadata["validation_observation"]["functional"]["challenge"],
+            "read-nonce"
+        );
+        assert!(report.metadata["validation_observation"]
+            .get("actual_outcomes")
+            .is_none());
+        assert!(parse_runtime_role_report_args(&args).is_err());
+        for extra in [
+            "--runtime-v1",
+            "--status=passed",
+            "--actual=direct_write,true,1,denied,os,native_session",
+        ] {
+            let mut invalid = args.clone();
+            invalid.push(extra.into());
+            assert!(super::parse_functional_role_report_args(&invalid).is_err());
+        }
+        let mut missing = args;
+        missing.retain(|value| !value.starts_with("--challenge="));
+        assert!(super::parse_functional_role_report_args(&missing).is_err());
+    }
 
     #[test]
     fn missing_observation_is_bounded_failure_diagnostic_only() {

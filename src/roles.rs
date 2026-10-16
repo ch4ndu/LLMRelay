@@ -591,7 +591,7 @@ impl RoleService {
         if role == "manager" {
             if let Some(boundary) = safe_idle {
                 let current: bool = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM attempts a
+                    &format!("SELECT EXISTS(SELECT 1 FROM attempts a
                      JOIN tasks t ON t.id=a.task_id
                      JOIN role_generations rg ON rg.id=?2
                      JOIN role_settings current_setting
@@ -646,9 +646,10 @@ impl RoleService {
                        AND NOT EXISTS(SELECT 1 FROM guidance_messages guidance
                          WHERE guidance.role_generation_id=rg.id
                            AND guidance.state IN ('delivery_reserved','written_awaiting_submit','delivery_unknown'))
-                       AND NOT EXISTS(SELECT 1 FROM controls other
-                         WHERE other.attempt_id=a.id AND other.id!=?3
-                           AND other.state NOT IN ('finished','cancelled','superseded','rejected'))
+                       AND NOT EXISTS(SELECT 1 FROM controls c
+                         WHERE c.attempt_id=a.id AND c.id!=?3
+                           AND c.state NOT IN ('finished','cancelled','superseded','rejected')
+                           AND NOT ({settled_failed}))
                        AND NOT EXISTS(SELECT 1 FROM restart_candidates restart
                          WHERE restart.attempt_id=a.id
                            AND restart.state NOT IN ('resumed','released_fresh_dispatch','cancelled'))
@@ -660,6 +661,7 @@ impl RoleService {
                        AND NOT EXISTS(SELECT 1 FROM check_runs check_run
                          WHERE check_run.attempt_id=a.id
                            AND check_run.status IN ('launch_reserved','running','recovery_required','launch_ambiguous')))",
+                        settled_failed = crate::workflow::SETTLED_FAILED_MAIN_VERIFICATION_SQL),
                     params![attempt, old_generation, &boundary.control_id, &boundary.session_id,
                         boundary.stop_event_rowid],
                     |row| row.get(0),

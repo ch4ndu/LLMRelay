@@ -491,7 +491,7 @@ export function TaskForm(
       : unactivatedOverride
       ? `${
         roleLabel(unactivatedOverride)
-      } differs from the project default. Save this as a draft, validate its exact ordinary capability, and explicitly activate the task-only profile before making it Ready.`
+      } differs from the project default. Save this as a draft, run functional qualification for its exact settings, and explicitly activate the task-only profile before making it Ready.`
       : "");
   const missingProject = draft.project_id && !projectIsAvailable;
   const workflowCreate = (criteria: string[]): WorkflowCreateRequest => ({
@@ -1007,7 +1007,7 @@ export function TaskForm(
             : singleAgent
             ? validationReason ||
               "Single agent tasks are saved as drafts. Make one Ready from the task once its agent profile is admitted."
-            : readyReason || "Ready uses the activated project defaults or exact task-only profiles explicitly activated with current ordinary capability evidence."}
+            : readyReason || "Ready uses the activated project defaults or task-only profiles activated with current functional qualification. All six roles may use the same provider; each exact profile is checked separately."}
         </p>
         <footer>
           <button type="button" disabled={saving} onClick={onClose}>

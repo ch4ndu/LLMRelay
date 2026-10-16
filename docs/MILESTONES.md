@@ -1,5 +1,27 @@
 # LLMRelay milestones
 
+## Active qualification update — October 15, 2026
+
+Provider-independent functional-v2 qualification is implemented through backend
+admission, Main resume/publication, web transport and dashboard projections.
+The integrated verification suite passes: 118 frontend tests and 490 Rust tests,
+with two live-provider tests intentionally ignored. The all-Codex task
+AJ-B0B87291 and all-Claude task AJ-E58677BC are accepted and done. The Claude
+Main journey required stopping its completed read-only Manager before acceptance;
+this is evidence of completion through supported recovery, not seamless automation.
+The ordinary Claude continuity task AJ-7F5AE750 is also accepted and done.
+Its Implementer paused after an edit, exited quiescent, survived dashboard reload
+and resumed the same app/native session before submitting its candidate. Both
+service checks and independent code and fresh final reviews passed. The completed
+Manager lacked a recorded Stop event before final review and needed a supported
+stop. A later authenticated Stop advanced its handoff before process exit;
+acceptance still required all sessions stopped. This exercise does not establish
+unattended completion. Fresh engineering final
+verification approved the candidate. The refreshed local package passed its
+release build and archive-integrity check. Nothing was published. After this bounded task, continue the authorized engineering/refactor
+pipeline before optional distribution work. Earlier dated evidence below remains
+historical and does not qualify the new contract.
+
 Decision recorded: September 18, 2026.
 
 Initial-v1 boundary updated September 23, 2026: the user explicitly excludes

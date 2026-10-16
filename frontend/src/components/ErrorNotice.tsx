@@ -6,6 +6,16 @@ export type ErrorGuidance = { summary: string; nextStep: string };
 export function explainError(error: string): ErrorGuidance {
   const text = error.toLowerCase();
   if (
+    /functional qualification|main functional|functional.*(report|proof|challenge|artifact|context|invocation|evidence)/
+      .test(text)
+  ) {
+    return {
+      summary: "The selected agent profile did not pass functional verification.",
+      nextStep:
+        "Review that role's exact provider, model, effort, and recorded output in Project setup or the task's Roles tab. Once the session has stopped, prepare and approve a new verification, or save and verify different supported settings from the same provider. Earlier results stay in history.",
+    };
+  }
+  if (
     text.startsWith("ordinary runtime probe reported observation_unavailable") ||
     (text.startsWith("ordinary runtime probe reported an observed failure") &&
       text.includes("failure category: observation_unavailable"))

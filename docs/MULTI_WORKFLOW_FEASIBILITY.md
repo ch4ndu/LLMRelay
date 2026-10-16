@@ -2,11 +2,25 @@
 
 **Date:** October 6, 2026
 
-**Status:** Future product direction, with the replacement MW-01 design recorded in the [shared workflow architecture plan](MULTI_WORKFLOW_PLAN.md). The ordered MW-01 through MW-04 chain starts from checkpoint `8c6f1e7`; repository publication is not its prerequisite. This documentation does not implement Single agent. The current TRIP product contract remains in effect until the separately authorized implementation and qualification gates are satisfied.
+**Current status (October 15, 2026):** The first part of this proposal is now
+implemented: LLMRelay supports **TRIP and Single agent** in the same app.
+Single agent can run without a TRIP installation. Codex and Claude writer
+verification and ordinary task evidence are documented in the
+[native verification record](provider-qualification-20261011.md); individual
+profiles still need their own admission checks.
 
-The [requirement ledger](MULTI_WORKFLOW_REQUIREMENTS.md) binds all five MW-01 acceptance criteria to decisions, owners and future tests. The [TRIP compatibility baseline](TRIP_COMPATIBILITY_BASELINE.md) separates source observations, activated profile identities, historical runtime evidence and native behavior still requiring qualification. MW-02 owns policy/profile/run contracts and additive migration; MW-03 owns lifecycle and dashboard behavior; MW-04 owns bounded native/dashboard qualification. Each follow-up requires its own reviewed scope and authorization. Build and review, Research, workflow editing, plugins and recipe generalization remain deferred.
+Start with the [README](../README.md) for what you can do today, or
+[project setup](PROJECT_SETUP.md#single-agent-setup) to run a Single-agent task.
+Build and review, Research, custom workflow editing, plugins and generalized
+recipes remain deferred.
 
-LLMRelay can offer several workflows in one distributed application. TRIP would become one option alongside simpler ways to run development work. The existing session runtime provides a substantial foundation, but workflow selection requires changes to execution authority, profile activation, admission, recovery, and result handling.
+## Original feasibility proposal
+
+The sections below preserve the October 6 proposal and its rationale. Their
+future-tense wording is historical. The [architecture plan](MULTI_WORKFLOW_PLAN.md)
+records the design, while [Workflows](WORKFLOWS.md) describes current behavior.
+The requirement ledger and compatibility baseline retain the original planning
+and evidence boundaries; they are not a current onboarding checklist.
 
 ## Product direction
 

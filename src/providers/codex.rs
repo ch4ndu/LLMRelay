@@ -12,7 +12,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 pub const IMPLEMENTER_NATIVE_POLICY_STATUS: &str = "unknown_unattested";
-pub const IMPLEMENTER_NATIVE_POLICY_REASON: &str = "Codex Implementer requires exact current native validation, including a delivered PermissionRequest decision; native approvals may be reused without an inbox request and app revocation affects only app-owned rules";
+pub const IMPLEMENTER_NATIVE_POLICY_REASON: &str = "Codex Implementer requires exact current functional qualification with an owned workspace write and retained native continuity; real native approvals remain subject to authenticated human decisions and app revocation affects only app-owned rules";
 pub const DENIED_READ_FLOOR_VERSION: &str = "codex-denied-read-floor-v3";
 pub const DENIED_READ_FLOOR_PROFILE: &str = "agenticjira_role";
 pub const LEGACY_DENIED_READ_FLOOR_GAP: &str = "historical Codex configuration does not match the current canonical control-socket denied-read and restricted-proxy contract; fresh exact-version native validation is required";
@@ -210,6 +210,7 @@ pub(crate) fn prepare_with_bundles(
         denied_read_floor["additional_denied_roots"] = serde_json::json!(read_denials);
     }
     let mut security_policy = serde_json::json!({
+        "qualification_contract":"functional-v2",
         "permission_profile": {
             "name": DENIED_READ_FLOOR_PROFILE,
             "extends": permission_base,

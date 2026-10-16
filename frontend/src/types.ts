@@ -202,6 +202,7 @@ export interface TripSetupRecovery {
 }
 export interface RuntimeProbeState {
   role: Role;
+  qualification_contract?: unknown;
   settings_revision?: number | null;
   profile: RoleConfig & Record<string, unknown>;
   profile_hash: string;
@@ -227,6 +228,7 @@ export interface RuntimeProbeState {
 }
 export interface RuntimeAdmissionState {
   id: string;
+  qualification_contract?: unknown;
   project_id?: string;
   task_id?: string | null;
   scope_hash: string;
@@ -1433,6 +1435,42 @@ export interface CapabilityEvidence {
   checked_at?: string;
   compatibility?: CompatibilityExplanation | null;
 }
+export type FunctionalObservation =
+  | {
+    status: "passed";
+    binding_hash: string;
+    challenge: string;
+    session_mode: "fresh" | "retained";
+  }
+  | {
+    status: "failed";
+    failure_category:
+      | "os_denial"
+      | "provider_denial"
+      | "shell_construction"
+      | "model_refusal"
+      | "observation_unavailable"
+      | "unexpected_result"
+      | "authentication_missing";
+  }
+  | { status: "missing_context" };
+export interface FunctionalCapabilityProofInput {
+  qualification_contract: "functional-v2";
+  operation_id: string;
+  session_id: string;
+  evidence_reference: string;
+  main?: {
+    observation_request_hash: string;
+    native_command: string;
+    native_session_id: string;
+    role_generation_id: string;
+    observation: FunctionalObservation;
+  } | null;
+}
+export interface CapabilityRecordFunctionalProofOperation {
+  kind: "capability_record_functional_proof";
+  proof: FunctionalCapabilityProofInput;
+}
 export type CompatibilityStatus =
   | "matched"
   | "unknown_version"
@@ -1465,6 +1503,7 @@ export interface RolePreparation {
   requested_revision: number;
   config: RoleConfig;
   capability_key?: string;
+  qualification_contract?: unknown;
   generic_capability_supported?: boolean;
   exact_runtime_authority?: boolean;
   exact_runtime_reason?: string;
@@ -2100,3 +2139,9 @@ export const roleLabel = (role: ExecutionActor | null) =>
     ? "Single agent"
     : role.split("_").map((part) => part[0].toUpperCase() + part.slice(1))
       .join(" ");
+
+export function qualificationContractLabel(contract: unknown): string {
+  if (contract === undefined) return "Legacy denial diagnostic";
+  if (contract === "functional-v2") return "Functional qualification";
+  return "Unknown qualification contract";
+}

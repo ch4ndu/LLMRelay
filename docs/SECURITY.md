@@ -4,6 +4,62 @@
 
 This guide describes the implemented native CLI permission boundaries. Setup and ordinary runtime proof remain separate; see [project setup](PROJECT_SETUP.md).
 
+## What you are allowing
+
+LLMRelay supervises coding tools that run on your own machine. To do that, it
+needs access to the selected repository, separate working copies for tasks,
+its saved task records, and the agent processes it starts. This lets it show
+progress, save results and stop or resume work. It is not just a chat window.
+
+| Decision | What it allows |
+| --- | --- |
+| Trust a folder in Codex or Claude | Lets that provider use the folder under its own trust rules. Review any hook prompts too. |
+| Approve a command | Allows the displayed action within its stated scope. A reusable rule covers matching actions. |
+| Approve a TRIP plan | Accepts the proposed approach. Implementation authorization is a separate step. |
+| Allow work in the Main checkout | Lets the selected writer work in your actual checkout, subject to protected paths. |
+| Accept a result | Records that the delivered work meets your task. It does not merge or publish it. |
+
+Use only repositories and commands you are comfortable giving a coding agent.
+The app does not require blanket administrator access. Approval for one project
+is not permission for unrelated folders or the app's private controls. Provider
+account or organization restrictions still apply.
+
+Setup checks confirm that a particular configuration can perform its required
+work and report back. They are not a guarantee that every possible forbidden
+action is blocked. The dashboard is local; Codex and Claude still send requests
+to their providers under your account's terms.
+
+The rest of this guide is technical reference for exact restrictions, supported
+versions and recovery decisions.
+
+## Functional qualification and local authority
+
+New Codex and Claude preparations use the explicit `functional-v2` contract.
+Qualification establishes permitted challenge access, authenticated reporting,
+retained-session continuity where required, and service-checked writer artifacts.
+It does **not** attest OS confinement. Configured sandbox, read-only, protected-root,
+credential and human-control restrictions remain enforced by their existing
+provider/app paths; a passing functional check is not evidence that every forbidden
+operation was attempted and denied. No artificial denied operation is required.
+
+LLMRelay needs local access to its state, the selected repository, its worktrees,
+provider executables, and managed child processes to supervise the CLI workflow,
+record results and reconcile stop/resume. Main checkout consent permits the
+selected writer to work in that checkout subject to protected paths. It does not
+grant access to the human-control socket, unrelated repositories, credentials or
+app state. Provider trust/permission prompts and native organization policy remain
+separate controls. This contract adds no requirement for root/admin access,
+global sandbox bypass, or blanket control-socket permission. Revoking an app grant
+does not undo previous writes or revoke unrelated native CLI trust settings.
+
+Legacy denial evidence keeps its original contract and history. New proof keys
+include the qualification contract; legacy or unknown proofs cannot authorize a
+new functional profile. Frozen legacy sessions retain their original checks;
+changing contract requires fresh admission rather than silent rebinding. Main
+qualification additionally binds the checkout, protected-root partition and
+repository ownership. Cleanup of owned challenge files does not invalidate an
+otherwise unchanged ordinary resume binding.
+
 ## Recovery and decision authority
 
 Each service data directory uses its own browser-session cookie name, derived
@@ -50,7 +106,7 @@ when it is located beneath a temporary directory. This prevents a temporary
 host location from making sibling repositories or service data writable.
 Earlier implementer proofs without this restriction require fresh verification.
 
-## Claude terminal confinement
+## Claude terminal permissions
 
 The embedded compatibility bundle accepts exact Claude Code `2.1.289 (Claude
 Code)` for all six roles. Other versions require a reviewed compatibility
@@ -58,14 +114,29 @@ update. Matching the bundle makes a profile eligible for verification; it does
 not mark the profile Supported or reuse evidence from another executable,
 model, effort, role, or policy. Run the selected profile's setup and runtime
 verification before assigning it work. Claude's `default` permission mode is
-displayed as Manual; Implementers retain human permission ownership, while
-the other roles use `dontAsk`.
+displayed as Manual for managed role sessions. Implementers retain human
+permission ownership. For a read-only Claude role, the Approval inbox permits
+**Approve once** only for one direct `role report`, `role context --index`, or
+`role context --page <cursor>` invocation of that session's configured LLMRelay
+executable. The two context forms read only the caller's own authenticated
+ordinary role projection. They have exact index and direct page-prefix native
+grants, with strict cursor and command parsing at the app boundary. There is no
+reusable rule, bare-context approval exception, wrapper, or shell-filter grant.
+This app-side classifier does not establish why a native allow rule
+matched or prompted. Observation print sessions retain `dontAsk` with tools denied.
 
 Managed Claude sessions require the native sandbox, fail closed when it is
 unavailable, disable unsandboxed command bypass, and allow only the canonical
-LLMRelay `role.sock` Unix socket. The launch retains the role's filesystem,
-network, tool and hook restrictions. Removing cmux environment variables alone
-would not establish this boundary.
+LLMRelay `role.sock` Unix socket. Read-only launches sandbox-deny writes to the
+workspace and protected roots, retain native mutation-tool and protected-read
+denials, and grant only their existing role commands. When the hook bridge runs,
+it denies other permission requests from these roles. If the hook
+executable cannot run, Claude may show a native human permission prompt in the
+keyboard-controlled terminal; the app cannot decide that prompt. Workspace and
+protected-root write denials remain the configured backstop. Writes elsewhere,
+outbound network access and process creation are not attested by this policy.
+It is not full OS confinement. Removing cmux environment variables alone would
+not establish these protections.
 
 The policy change invalidates earlier Claude capability evidence. Historical
 proofs remain available, but affected profiles require fresh exact runtime
@@ -98,11 +169,11 @@ The Approval inbox identifies the project, task, role, native session, requested
 
 A reusable command-family rule identifies one stable, verified absolute or project-relative executable and covers all current and future arguments. Changed filenames, counts, flags, targets, and configuration values therefore do not require tiny new grants when the same executable family remains faithful. The preview shows the executable family, all-arguments coverage, provider and role, complete validated configuration binding, and either the registered Project boundary or exact Session worktree/native identity. The same generic matcher remains in place for every provider; there are no command-specific families. Compounds, redirects, substitutions, shell or interpreter wrappers, different executables, unsafe paths, and ambiguous input cannot inherit a reusable rule. A completely represented action outside the matcher may still receive exact one-time human review. Bare PATH names and shell builtins whose executable identity cannot be verified remain exact-once, deny, or faithful native-fallback decisions; denial never triggers automatic rewriting or rerouting. Saved rules remain bound to the complete validated configuration disclosed in the preview.
 
-Inspect saved rules in **Reusable permission rules** and choose **Revoke** to stop their future matching decisions. Revocation cannot undo an already dispatched command and does not revoke native Codex approvals. Requests are bound to the current role generation, native session, and live hook connection; stale or restarted requests cannot replay an allow. Only Implementers can receive provider action requests; managers and reviewers retain their read-only policy. For Codex, every role uses a strict named profile that denies the exact canonical sibling `control.sock` and sets `network.enabled=true` only so Codex retains an enforcing limited proxy. The complete proxy override has no allowed domains, allows only the exact canonical `role.sock`, and explicitly disables local binding, upstream proxies, SOCKS5 and SOCKS5 UDP, credential brokerage, non-loopback proxy exposure, and arbitrary Unix sockets. `features.exec_permission_approvals` and `features.request_permissions_tool` are pinned off, so the under-development additive-permission path is not admitted. An approval or inherited native allow can skip an inbox interaction, but it cannot discard the local-command sandbox; arbitrary approved writes outside the Implementer worktree are not supported.
+Inspect saved rules in **Reusable permission rules** and choose **Revoke** to stop their future matching decisions. Revocation cannot undo an already dispatched command and does not revoke native Codex approvals. Requests are bound to the current role generation, native session, and live hook connection; stale or restarted requests cannot replay an allow. Workspace writers can receive action grants; read-only Claude roles can receive only the exact one-time report permission described above. Their workflow authority remains read-only, with the hook-unavailable native-prompt residual and sandbox limits stated above. For Codex, every role uses a strict named profile that denies the exact canonical sibling `control.sock` and sets `network.enabled=true` only so Codex retains an enforcing limited proxy. The complete proxy override has no allowed domains, allows only the exact canonical `role.sock`, and explicitly disables local binding, upstream proxies, SOCKS5 and SOCKS5 UDP, credential brokerage, non-loopback proxy exposure, and arbitrary Unix sockets. `features.exec_permission_approvals` and `features.request_permissions_tool` are pinned off, so the under-development additive-permission path is not admitted. An approval or inherited native allow can skip an inbox interaction, but it cannot discard the local-command sandbox; arbitrary approved writes outside the Implementer worktree are not supported.
 
-Codex Implementer is currently **eligible and validation-required**, not fixed Unsupported. LLMRelay pins `--strict-config`, `--ask-for-approval on-request`, `approvals_reviewer="user"`, the denied-read floor, the complete restricted-proxy configuration with an empty domain allowlist and one identity-bound role socket, and both additive-permission features false. Native approvals are honored; only new requests Codex actually emits can reach the inbox. A current `Supported` proof additionally requires an actual completed decision whose response was delivered for the exact session and generation, alongside the existing worktree-write, protected-path-denial, native-history, quiescence, provenance, and typed-checkpoint contracts. Pending, reserved, unknown, stale, or other-generation requests do not count. The app neither claims that every action produces an inbox request nor introduces an API-key fallback.
+Codex Implementer is currently **eligible and validation-required**, not fixed Unsupported. LLMRelay pins `--strict-config`, `--ask-for-approval on-request`, `approvals_reviewer="user"`, the denied-read floor, the complete restricted-proxy configuration with an empty domain allowlist and one identity-bound role socket, and both additive-permission features false. Native approvals are honored; only new requests Codex actually emits can reach the inbox. Under the legacy diagnostic contract, a `Supported` proof additionally requires an actual completed decision whose response was delivered for the exact session and generation, alongside the existing worktree-write, protected-path-denial, native-history, quiescence, provenance, and typed-checkpoint contracts. Those legacy observations do not qualify functional-v2. New functional proof requires the permitted write, authenticated report, native continuity and correlated evidence described above; it does not require an artificial denial or a permission request that the provider never emits. For actual permission delivery, pending, reserved, unknown, stale, or other-generation requests do not count. The app neither claims that every action produces an inbox request nor introduces an API-key fallback.
 
-The Codex 0.160.0 adapter has a deliberately narrow local compatibility envelope. It structurally parses bounded `/etc/codex/config.toml`, `~/.codex/config.toml`, and every working-directory ancestor `.codex/config.toml`; it rejects malformed, unreadable, wrong-typed, profile-selected, managed, conditional project-MCP, shared-app-server, parent-`CODEX_HOME`, and unsupported credential-store forms. A boolean `features.memories` preference may remain enabled in local configuration; LLMRelay retains `--disable memories` on each fresh and resumed child launch and validates that flag in its launch identity. Non-boolean values still fail validation, and the other excluded features, including `external_agent_memory_import`, must remain disabled. The adapter does not rewrite the global preference or delete memory files; this feature-level restriction is not a claim that native Codex performs zero memory-related writes. Every discovered unconditional local MCP name is disabled inside one serialized inline-table value passed with the plain `mcp_servers` override key. Server names remain table keys inside that value, so Codex’s dotted-path argument parser cannot reinterpret periods or quotes in their names. The adapter requires file-backed `auth_mode=chatgpt` credentials with a known personal Free/Plus/Pro ID-token classification and a usable access-token expiry outside the native five-minute refresh window plus a ten-minute margin. It rejects API-key-in-file, keyring/external-provider, missing, malformed, expired, managed, workspace, and unknown forms. It reads this bounded metadata only in memory and does not copy, refresh, log, persist, or pass tokens or account identifiers.
+The Codex 0.162.1 adapter has a deliberately narrow local compatibility envelope. It structurally parses bounded `/etc/codex/config.toml`, `~/.codex/config.toml`, and every working-directory ancestor `.codex/config.toml`; it rejects malformed, unreadable, wrong-typed, profile-selected, managed, conditional project-MCP, shared-app-server, parent-`CODEX_HOME`, and unsupported credential-store forms. A boolean `features.memories` preference may remain enabled in local configuration; LLMRelay retains `--disable memories` on each fresh and resumed child launch and validates that flag in its launch identity. Non-boolean values still fail validation, and the other excluded features, including `external_agent_memory_import`, must remain disabled. The adapter does not rewrite the global preference or delete memory files; this feature-level restriction is not a claim that native Codex performs zero memory-related writes. Every discovered unconditional local MCP name is disabled inside one serialized inline-table value passed with the plain `mcp_servers` override key. Server names remain table keys inside that value, so Codex’s dotted-path argument parser cannot reinterpret periods or quotes in their names. The adapter requires file-backed `auth_mode=chatgpt` credentials with a known personal Free/Plus/Pro ID-token classification and a usable access-token expiry outside the native five-minute refresh window plus a ten-minute margin. It rejects API-key-in-file, keyring/external-provider, missing, malformed, expired, managed, workspace, and unknown forms. It reads this bounded metadata only in memory and does not copy, refresh, log, persist, or pass tokens or account identifiers.
 
 This is `personal_ineligible_observed_prelaunch`, not universal cloud attestation. `~/.codex/cloud-config-bundle-cache.json` must be absent at preparation, proof publication before receipt replay, and both resume paths; LLMRelay never deletes or parses it. Local configured MCP servers are disabled at those gates, but native credential refresh or external account/configuration changes after preflight can introduce cloud policy before the next gate, and a native cache write failure can leave no cache even after cloud policy was returned. This residual is disclosed rather than hidden behind a broad `external_tools: disabled` claim. Native organization controls are not bypassed or reimplemented.
 
@@ -201,9 +272,10 @@ baseline. Acceptance checks the current reviewed candidate; it is not Git
 integration authority.
 
 Main proof binds the exact actor, provider identity, scope, native session and
-observation request. Read-only roles remain read-only. Their approved probe
-commands and protected-root partition are frozen; absent roots are distinguished
-from observed denials, and appearance or disappearance invalidates that scope.
+observation request. Read-only roles retain their workflow authority and the
+provider-specific protections and residuals described above. Their approved probe
+commands and protected-root partition are frozen; absent roots remain distinct
+from present protected paths, and appearance or disappearance invalidates that scope.
 Narration, an unchanged file, a provider refusal or a missing path cannot prove
 an OS permission denial. Consent and synthetic tests do not qualify native
 behavior. A finished matching read-only policy may follow authorized rework

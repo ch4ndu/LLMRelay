@@ -3,11 +3,12 @@ use crate::domain::{
     AttachmentBinding, CapabilityIdentity, CapabilityProofInput, CmuxAttachmentControlDirective,
     CmuxAttachmentControlDisposition, CmuxAttachmentMode, CmuxAttachmentRoute,
     CmuxKeyboardControlAction, CmuxKeyboardControlOutcome, CmuxSessionSurface, CmuxTaskWorkspace,
-    CmuxViewOutcome, HistoryPaneView, HistoryPaneViewState, HookEnvelope, LaunchConfig,
-    NativeTurnFailureKind, ObservedProcessIdentity, Provider, ProviderCheckDto, ProviderCheckPlan,
-    ProviderCheckPreviewDto, ProviderInstallationDto, ProviderProofDto, ProviderValidationBatchDto,
-    ProviderValidationPreviewDto, ProviderValidationSelection, ProviderValidationStartRequest,
-    ProviderValidationStateDto, RestartCandidateResult, RoleContext, RoleKind, RolePeerProvenance,
+    CmuxViewOutcome, FunctionalCapabilityProofInput, HistoryPaneView, HistoryPaneViewState,
+    HookEnvelope, LaunchConfig, NativeTurnFailureKind, ObservedProcessIdentity, Provider,
+    ProviderCheckDto, ProviderCheckPlan, ProviderCheckPreviewDto, ProviderInstallationDto,
+    ProviderProofDto, ProviderValidationBatchDto, ProviderValidationPreviewDto,
+    ProviderValidationSelection, ProviderValidationStartRequest, ProviderValidationStateDto,
+    QualificationContract, RestartCandidateResult, RoleContext, RoleKind, RolePeerProvenance,
     RoleResultReport, SessionOwner, ValidationLaunchRequest,
 };
 use crate::providers::codex::CapacityFileIdentity;
@@ -20,6 +21,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1326,6 +1328,49 @@ struct CheckoutTurn<'a> {
     generation: &'a str,
 }
 
+fn require_main_verification_hold_binding(
+    connection: &Connection,
+    task_id: &str,
+    attempt_id: &str,
+    actor: &str,
+) -> Result<bool> {
+    let (control, payload, attention, version, requested_version): (String, String, String, i64, Option<i64>) = connection.query_row(
+        "SELECT c.id,c.payload_json,t.attention,t.version,c.expected_version FROM controls c JOIN tasks t ON t.id=?1
+         WHERE c.attempt_id=?2 AND c.kind='main_checkout_verify' AND c.state='native_requested'
+           AND json_extract(c.payload_json,'$.actor')=?3",
+        params![task_id, attempt_id, actor],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    )?;
+    let payload: serde_json::Value = serde_json::from_str(&payload)?;
+    if payload["admitted_under_hold"] != true {
+        if attention == "resume_failed" {
+            bail!("Main verification has no admission for the current resume failure")
+        }
+        return Ok(false);
+    }
+    if attention != "resume_failed"
+        || requested_version != Some(version)
+        || payload["task_version"].as_i64() != Some(version)
+        || payload["attempt_id"] != attempt_id
+        || payload["task_id"] != task_id
+        || payload["qualification_contract"] != "functional-v2"
+    {
+        bail!("The task changed after its held Main verification was authorized")
+    }
+    let binding = crate::workflow::main_verification_resume_rejection(
+        connection,
+        task_id,
+        attempt_id,
+        actor,
+        &payload["actor_settings"],
+        Some(&control),
+    )?;
+    if payload["resume_rejection"] != binding {
+        bail!("Main verification no longer matches its admitted Manager resume rejection")
+    }
+    Ok(true)
+}
+
 fn require_checkout_reservation(
     connection: &Connection,
     task_id: &str,
@@ -1452,12 +1497,13 @@ fn require_checkout_reservation(
     if pending {
         bail!("This Main verification still owns the attempt; finish its exact evidence or cancel it before ordinary execution")
     }
-    let proven: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM capabilities WHERE mode='main_checkout' AND role=?1
+    let proven: Option<String> = connection.query_row("SELECT proof_json FROM capabilities WHERE mode='main_checkout' AND role=?1
         AND config_hash=?2 AND status='supported' AND json_extract(proof_json,'$.authorization.scope_hash')=?3
-        AND json_extract(proof_json,'$.scope_hash')=?4)",params![actor,key,policy["checkout_authorization"]["scope_hash"].as_str(),json_hash(scope)?], |row|row.get(0))?;
-    if !proven {
+        AND json_extract(proof_json,'$.scope_hash')=?4",params![actor,key,policy["checkout_authorization"]["scope_hash"].as_str(),json_hash(scope)?], |row|row.get(0)).optional()?;
+    let Some(proof) = proven else {
         bail!("Verify this actor's exact Main checkout policy before starting it; worktree proof cannot authorize this checkout")
-    }
+    };
+    require_capability_proof_contract_in(connection, key, &serde_json::from_str(&proof)?)?;
     if resumed {
         let began=connection.execute("UPDATE controls SET payload_json=json_set(payload_json,'$.coding_started',json('true'))
             WHERE attempt_id=?1 AND kind='main_checkout_verify' AND state='finished'
@@ -1507,7 +1553,7 @@ pub(crate) fn main_readonly_control_payload_in(
                  AND json_extract(proof.proof_json,'$.retained_observations.observation_request_hash')
                    =json_extract(c.payload_json,'$.observation_request_hash')
                  AND json_extract(proof.proof_json,'$.retained_observations.readonly_command_policy')
-                   =json_extract(c.payload_json,'$.readonly_command_policy')
+                   IS json_extract(c.payload_json,'$.readonly_command_policy')
              )))
          ORDER BY (c.attempt_id=?1) DESC,c.rowid DESC LIMIT 1",
         params![attempt, role.to_string()], |row| row.get(0),
@@ -1528,11 +1574,51 @@ fn require_main_readonly_command_binding(
         return Ok(());
     };
     if launch.role == RoleKind::Implementer {
+        if QualificationContract::from_record(&launch.security_policy)
+            .map_err(anyhow::Error::msg)?
+            == QualificationContract::FunctionalV2
+        {
+            let payload = main_readonly_control_payload_in(connection, attempt, launch.role)?
+                .context("Main functional writer has no frozen request authority")?;
+            let request = &payload["observation_request"];
+            crate::providers::require_qualification_contract(&launch.security_policy, request)?;
+            request["owned_writer"]["path"]
+                .as_str()
+                .context("Main writer has no owned artifact requirement")?;
+            crate::providers::validate_main_functional_request(scope, request)?;
+            if payload["scope"] != *scope
+                || payload["observation_request_hash"].as_str()
+                    != Some(json_hash(request)?.as_str())
+            {
+                bail!("Main writer functional request differs from its frozen scope")
+            }
+        }
         return Ok(());
     }
     let payload = main_readonly_control_payload_in(connection, attempt, launch.role)?
         .context("Main read-only reservation has no frozen command authority")?;
     let request = &payload["observation_request"];
+    crate::providers::require_qualification_contract(&launch.security_policy, request)?;
+    if QualificationContract::from_record(request).map_err(anyhow::Error::msg)?
+        == QualificationContract::FunctionalV2
+    {
+        crate::providers::validate_main_functional_request(scope, request)?;
+        let expected = crate::providers::main_readonly_command_policy(
+            scope,
+            request,
+            &serde_json::Value::Null,
+        )?;
+        if payload["scope"] != *scope
+            || payload["scope_hash"].as_str() != Some(json_hash(scope)?.as_str())
+            || payload["observation_request_hash"].as_str() != Some(json_hash(request)?.as_str())
+            || payload["readonly_command_policy"] != serde_json::to_value(&expected)?
+            || launch.security_policy["main_readonly_command_policy"]
+                != payload["readonly_command_policy"]
+        {
+            bail!("Main functional read-only authority differs from its exact frozen request")
+        }
+        return Ok(());
+    }
     let database = request["targets"]
         .as_array()
         .and_then(|targets| {
@@ -1560,6 +1646,186 @@ fn require_main_readonly_command_binding(
         bail!("The exact frozen Main read-only command authority changed before reservation")
     }
     Ok(())
+}
+
+fn functional_main_binding_in(
+    connection: &Connection,
+    payload: &serde_json::Value,
+    session: &str,
+    generation: &str,
+) -> Result<serde_json::Value> {
+    let binding: String = connection.query_row(
+        "SELECT json_object('qualification_contract','functional-v2','session_id',s.id,
+           'role_generation_id',g.id,'native_session_id',s.native_session_id,'capability_key',s.capability_key,
+           'capability_identity',json(s.capability_identity_json),'role',g.role,
+           'first_transcript_epoch',COALESCE((SELECT prior_transcript_epoch FROM resume_invocations
+             WHERE session_id=s.id AND resume_ordinal=1),s.transcript_epoch),
+           'initial_hook_boundary',s.initial_hook_event_boundary_rowid)
+         FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE s.id=?1 AND g.id=?2",
+        params![session,generation], |row| row.get(0),
+    )?;
+    let mut binding: serde_json::Value = serde_json::from_str(&binding)?;
+    if binding["native_session_id"]
+        .as_str()
+        .is_none_or(str::is_empty)
+    {
+        bail!("Main functional qualification has no observed native invocation")
+    }
+    binding["scope"] = payload["scope"].clone();
+    binding["actor_settings"] = payload["actor_settings"].clone();
+    binding["observation_request_hash"] = payload["observation_request_hash"].clone();
+    Ok(binding)
+}
+
+pub(crate) fn functional_main_context_in(
+    connection: &Connection,
+    context: &RoleContext,
+) -> Result<Option<serde_json::Value>> {
+    let payload: Option<String> = connection.query_row(
+        "SELECT c.payload_json FROM controls c JOIN sessions s ON s.id=json_extract(c.payload_json,'$.session_id')
+         WHERE c.attempt_id=?1 AND c.kind='main_checkout_verify' AND c.state='native_running'
+           AND s.id=?2 AND s.role_generation_id=?3
+           AND json_extract(c.payload_json,'$.observation_request.qualification_contract')='functional-v2'",
+        params![context.attempt_id,context.session_id,context.role_generation_id], |row| row.get(0),
+    ).optional()?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let resumed: bool = connection.query_row(
+        "SELECT resume_count>0 FROM sessions WHERE id=?1",
+        params![context.session_id],
+        |row| row.get(0),
+    )?;
+    if resumed {
+        bail!("Main functional recall must report without rereading role context")
+    }
+    let payload: serde_json::Value = serde_json::from_str(&payload)?;
+    let binding = functional_main_binding_in(
+        connection,
+        &payload,
+        &context.session_id,
+        &context.role_generation_id,
+    )?;
+    Ok(Some(
+        serde_json::json!({"qualification_contract":"functional-v2","binding_hash":json_hash(&binding)?,
+        "binding":binding,"observation_request":payload["observation_request"]}),
+    ))
+}
+
+pub(crate) fn validate_functional_main_report_in(
+    connection: &Connection,
+    session: &str,
+    generation: &str,
+    report: &RoleResultReport,
+) -> Result<serde_json::Value> {
+    let (payload, launch, resumes, prior_exit): (String, String, i64, Option<String>) = connection
+        .query_row(
+            "SELECT c.payload_json,s.launch_config_json,s.resume_count,r.prior_exit_json
+         FROM controls c JOIN sessions s ON s.id=json_extract(c.payload_json,'$.session_id')
+         JOIN role_generations g ON g.id=s.role_generation_id
+         LEFT JOIN resume_invocations r ON r.session_id=s.id AND r.resume_ordinal=s.resume_count
+           AND r.transcript_epoch=s.transcript_epoch AND r.state IN ('running','exited')
+         WHERE s.id=?1 AND g.id=?2 AND c.attempt_id=g.attempt_id AND c.kind='main_checkout_verify'
+           AND (c.state IN ('native_running','awaiting_native_evidence')
+             OR (c.state='native_stopping' AND s.status='exited' AND g.status='exited'
+               AND json_extract(s.exit_json,'$.process_group_quiescent')=1))
+           AND json_extract(c.payload_json,'$.role_generation_id')=g.id
+           AND json_extract(c.payload_json,'$.transcript_epoch')=s.transcript_epoch",
+            params![session, generation],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    let payload: serde_json::Value = serde_json::from_str(&payload)?;
+    let launch: LaunchConfig = serde_json::from_str(&launch)?;
+    let request = &payload["observation_request"];
+    crate::providers::require_qualification_contract(&launch.security_policy, request)?;
+    if report.metadata["runtime_report_format"] != "functional-v2"
+        || QualificationContract::from_record(request).map_err(anyhow::Error::msg)?
+            != QualificationContract::FunctionalV2
+        || payload["scope"] != launch.security_policy["checkout_scope"]
+        || payload["scope_hash"].as_str() != Some(json_hash(&payload["scope"])?.as_str())
+        || payload["observation_request_hash"].as_str() != Some(json_hash(request)?.as_str())
+    {
+        bail!("Main functional report does not match its current scope and contract")
+    }
+    crate::providers::validate_main_functional_request(&payload["scope"], request)?;
+    let observation: crate::domain::FunctionalObservation =
+        serde_json::from_value(report.metadata["validation_observation"]["functional"].clone())?;
+    if report.metadata
+        != serde_json::json!({"runtime_report_format":"functional-v2",
+        "validation_observation":{"cell":"trip_runtime_probe","functional":&observation}})
+        || serde_json::to_vec(&report.metadata)?.len() > 16 * 1024
+    {
+        bail!("Main functional report requires bounded canonical typed observations")
+    }
+    if !matches!(
+        observation,
+        crate::domain::FunctionalObservation::Passed { .. }
+    ) {
+        return Ok(serde_json::json!({"observation":observation,"qualified":false}));
+    }
+    let read = Path::new(
+        request["permitted_read"]["path"]
+            .as_str()
+            .context("Main functional request has no permitted read")?,
+    );
+    let writer = request["owned_writer"]["path"].as_str().map(Path::new);
+    if writer.is_some() != (launch.role == RoleKind::Implementer)
+        || *request
+            != crate::providers::main_checkout_functional_observation_request(
+                &payload["scope"],
+                read,
+                writer,
+            )?
+    {
+        bail!("Main functional request must prescribe exactly its permitted read and role-owned writer requirement")
+    }
+    let crate::domain::FunctionalObservation::Passed {
+        binding_hash,
+        challenge,
+        session_mode,
+    } = observation
+    else {
+        bail!("Main functional proof requires a passed authenticated observation")
+    };
+    let binding = functional_main_binding_in(connection, &payload, session, generation)?;
+    let fresh = launch.role == RoleKind::FinalReviewer;
+    if binding_hash != json_hash(&binding)?
+        || fs::read(read)? != challenge.as_bytes()
+        || (fresh && (resumes != 0 || session_mode != crate::domain::FunctionalSessionMode::Fresh))
+        || (!fresh
+            && (resumes != 1
+                || session_mode != crate::domain::FunctionalSessionMode::Retained
+                || payload["first_turn_complete"] != true
+                || prior_exit
+                    .as_deref()
+                    .map(serde_json::from_str::<serde_json::Value>)
+                    .transpose()?
+                    .is_none_or(|exit| exit["process_group_quiescent"] != true)))
+    {
+        bail!("Main functional evidence differs from its exact native challenge or fresh/retained invocation")
+    }
+    if let Some(writer) = writer {
+        if !fs::symlink_metadata(writer)?.is_file() || fs::read(writer)? != challenge.as_bytes() {
+            bail!("Main functional writer artifact is missing or has different content")
+        }
+    }
+    crate::trip::validate_functional_native_commands(
+        connection,
+        session,
+        generation,
+        &[crate::providers::RuntimeProbeCommand {
+            operation: "fixture_read".into(),
+            command: request["command"]
+                .as_str()
+                .context("missing Main functional command")?
+                .into(),
+        }],
+        report,
+    )?;
+    Ok(
+        serde_json::json!({"binding":binding,"binding_hash":binding_hash,"observation_request_hash":payload["observation_request_hash"],
+        "read_sha256":request["permitted_read"]["content_hash"],"owned_writer":request["owned_writer"],"report_operation_id":report.operation_id}),
+    )
 }
 
 fn record_main_checkout_proof_in(
@@ -2209,6 +2475,7 @@ pub(crate) struct PreparedResumeIdentity {
     model: String,
     effort: String,
     compatibility_hash: Option<String>,
+    qualification_contract: QualificationContract,
 }
 
 impl PreparedResumeIdentity {
@@ -2222,11 +2489,13 @@ impl PreparedResumeIdentity {
             model: identity.model,
             effort: identity.effort,
             compatibility_hash: identity.compatibility.map(|binding| binding.effective_hash),
+            qualification_contract: QualificationContract::from_record(&identity.security_policy)
+                .map_err(anyhow::Error::msg)?,
         })
     }
 
     fn audit_value(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "provider": self.provider.as_str(),
             "executable_version": self.executable_version.as_str(),
             "role": self.role.as_str(),
@@ -2234,7 +2503,11 @@ impl PreparedResumeIdentity {
             "effort": self.effort.as_str(),
             "mode": "interactive_pty",
             "compatibility_hash": self.compatibility_hash,
-        })
+        });
+        if self.qualification_contract == QualificationContract::FunctionalV2 {
+            value["qualification_contract"] = "functional-v2".into();
+        }
+        value
     }
 }
 
@@ -2859,7 +3132,7 @@ fn validate_role_report_contract(
 ) -> Result<()> {
     let capability_observation = report.outcome == "capability_observed";
     if let Some(format) = report.metadata.get("runtime_report_format") {
-        if format.as_str() != Some("runtime-v1") {
+        if !matches!(format.as_str(), Some("runtime-v1" | "functional-v2")) {
             bail!("unknown runtime report format")
         }
         if validation_cell != Some("trip_runtime_probe") || !capability_observation {
@@ -3262,13 +3535,30 @@ impl Store {
             params![context.session_id, context.role_generation_id, context.attempt_id],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
         )?;
-        validate_role_report_contract(
-            context.role,
-            isolated_validation,
-            workflow_validation,
-            validation_cell.as_deref(),
-            report,
+        let functional_main: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM controls c JOIN sessions s ON s.id=json_extract(c.payload_json,'$.session_id')
+             WHERE c.attempt_id=?1 AND s.id=?2 AND s.role_generation_id=?3 AND c.kind='main_checkout_verify'
+               AND (c.state IN ('native_running','awaiting_native_evidence')
+                 OR (c.state='finished' AND EXISTS(SELECT 1 FROM role_results prior
+                   WHERE prior.session_id=s.id AND prior.operation_id=?4
+                     AND json_extract(prior.metadata_json,'$.runtime_report_format')='functional-v2'))
+                 OR EXISTS(SELECT 1 FROM operation_receipts receipt WHERE receipt.operation_id=?4
+                   AND receipt.actor_key=s.role_generation_id AND receipt.operation_kind='role_report'
+                   AND json_extract(receipt.result_json,'$.session_id')=s.id
+                   AND json_extract(receipt.result_json,'$.accepted')=0))
+               AND json_extract(c.payload_json,'$.observation_request.qualification_contract')='functional-v2'
+               AND json_extract(s.launch_config_json,'$.security_policy.qualification_contract')='functional-v2')",
+            params![context.attempt_id,context.session_id,context.role_generation_id,report.operation_id], |row| row.get(0),
         )?;
+        if !functional_main {
+            validate_role_report_contract(
+                context.role,
+                isolated_validation,
+                workflow_validation,
+                validation_cell.as_deref(),
+                report,
+            )?;
+        }
         let stored_receipt: Option<(String, String)> = transaction
             .query_row(
                 "SELECT request_hash, result_json FROM operation_receipts
@@ -3277,7 +3567,8 @@ impl Store {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
-        if context.role.is_reviewer() && report.outcome != "capability_observed" {
+        if context.role.is_reviewer() && !functional_main && report.outcome != "capability_observed"
+        {
             let expected_kind = match context.role {
                 RoleKind::PlanReviewer => "plan",
                 RoleKind::CodeReviewer => "code",
@@ -3327,6 +3618,14 @@ impl Store {
             {
                 return Err(rejection.into());
             }
+            if functional_main && result["accepted"] == false {
+                bail!(
+                    "{}",
+                    result["reason"]
+                        .as_str()
+                        .unwrap_or("role report was rejected")
+                )
+            }
             return Ok(result);
         }
         let current_authority: bool = transaction.query_row(
@@ -3350,6 +3649,20 @@ impl Store {
         if !current_authority {
             bail!("role result authority was revoked, replaced, or stopped before persistence")
         }
+        if report.metadata["runtime_report_format"] == "functional-v2" {
+            let exact_context: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+                 JOIN role_credentials rc ON rc.role_generation_id=g.id
+                 WHERE s.id=?1 AND g.id=?2 AND g.attempt_id=?3 AND s.transcript_epoch=?4
+                   AND rc.id=?5 AND rc.revoked_at IS NULL AND s.provider=?6 AND g.role=?7
+                   AND s.status='running' AND g.status='running')",
+                params![context.session_id,context.role_generation_id,context.attempt_id,context.transcript_epoch,
+                    context.credential_id,context.provider.to_string(),context.role.to_string()],|row|row.get(0),
+            )?;
+            if !exact_context {
+                bail!("functional report context does not match its current credential and invocation")
+            }
+        }
         if context.role == RoleKind::Manager
             && !isolated_validation
             && !workflow_validation
@@ -3360,6 +3673,49 @@ impl Store {
                 bail!("Manager source repair handoffs require the needs_input outcome")
             }
             crate::repair_handoff::validate(&transaction, &context.attempt_id, &report.metadata)?;
+        }
+        if functional_main {
+            let validation = (|| -> Result<()> {
+                if report.outcome != "capability_observed"
+                    || report.metadata["runtime_report_format"] != "functional-v2"
+                    || !meaningful_validation_observation(
+                        &report.metadata,
+                        Some("trip_runtime_probe"),
+                    )?
+                {
+                    bail!("Main functional qualification requires the typed functional-v2 observation")
+                }
+                validate_functional_main_report_in(
+                    &transaction,
+                    &context.session_id,
+                    &context.role_generation_id,
+                    report,
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = validation {
+                let code = error
+                    .downcast_ref::<crate::trip::RuntimeReportRejection>()
+                    .map(|rejection| rejection.code())
+                    .unwrap_or("main_functional_report_invalid");
+                let result = serde_json::json!({"accepted":false,"authoritative_completion":false,
+                    "session_id":context.session_id,"role_generation_id":context.role_generation_id,
+                    "transcript_epoch":context.transcript_epoch,"credential_id":context.credential_id,
+                    "rejection_code":code,"reason":error.to_string().chars().take(4096).collect::<String>()});
+                transaction.execute(
+                    "INSERT INTO audit_events(id,operation_id,actor_kind,actor_id,event_code,entity_kind,entity_id,detail_json,created_at)
+                     VALUES(?1,?2,'role',?3,'main.verification.report.rejected','session',?4,?5,?6)",
+                    params![uuid::Uuid::new_v4().to_string(),report.operation_id,context.role_generation_id,
+                        context.session_id,result.to_string(),now],
+                )?;
+                transaction.execute(
+                    "INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at)
+                     VALUES(?1,?2,'role_report',?3,?4,?5)",
+                    params![report.operation_id,context.role_generation_id,request_hash,result.to_string(),now],
+                )?;
+                transaction.commit()?;
+                return Err(error);
+            }
         }
         if let Err(error) = crate::trip::record_setup_probe_report(&transaction, context, report) {
             if let Some(rejection) = error.downcast_ref::<crate::trip::RuntimeReportRejection>() {
@@ -5382,6 +5738,20 @@ impl Store {
              JOIN tasks t ON t.id=a.task_id WHERE s.id=?1",
             params![session_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
         )?;
+        let held_main_verification = prior_attention == "resume_failed"
+            && transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM controls c JOIN role_generations g ON g.id=?2
+             WHERE c.attempt_id=?4 AND c.kind='main_checkout_verify'
+               AND c.state IN ('native_running','native_stopping','recovery_required')
+               AND json_extract(c.payload_json,'$.admitted_under_hold')=1
+               AND json_extract(c.payload_json,'$.qualification_contract')='functional-v2'
+               AND json_extract(c.payload_json,'$.actor')=g.role AND g.role='manager'
+               AND json_extract(c.payload_json,'$.session_id')=?1
+               AND json_extract(c.payload_json,'$.role_generation_id')=g.id
+               AND json_extract(c.payload_json,'$.transcript_epoch')=?3)",
+                params![session_id, generation, epoch, attempt],
+                |row| row.get::<_, bool>(0),
+            )?;
         transaction.execute(
             "UPDATE sessions SET status='recovery_required',launch_state='delivery_unknown',launch_error=?1,readiness_state='unknown',updated_at=?2 WHERE id=?3",
             params![reason,now,session_id],
@@ -5396,7 +5766,9 @@ impl Store {
             "UPDATE attempts SET status='needs_recovery',updated_at=?1 WHERE id=?2",
             params![now, attempt],
         )?;
-        transaction.execute("UPDATE tasks SET version=version+CASE WHEN attention='needs_recovery' THEN 0 ELSE 1 END,attention='needs_recovery',updated_at=?1 WHERE id=(SELECT task_id FROM attempts WHERE id=?2)",params![now,attempt])?;
+        transaction.execute("UPDATE tasks SET version=version+CASE WHEN attention='needs_recovery' THEN 0 ELSE 1 END,
+            attention=CASE WHEN ?3 THEN attention ELSE 'needs_recovery' END,updated_at=?1
+            WHERE id=(SELECT task_id FROM attempts WHERE id=?2)",params![now,attempt,held_main_verification])?;
         transaction.execute(
             "UPDATE claims SET state='unknown',updated_at=?1 WHERE attempt_id=?2",
             params![now, attempt],
@@ -6123,6 +6495,12 @@ impl Store {
         }
         let request_hash = json_hash(proof)?;
         let config = self.session_json(&proof.session_id)?["launch_config"].clone();
+        if QualificationContract::from_record(&config["security_policy"])
+            .map_err(anyhow::Error::msg)?
+            != QualificationContract::Legacy
+        {
+            bail!("legacy diagnostic proof cannot qualify a functional-v2 launch")
+        }
         let main_scope = config
             .get("checkout_scope")
             .or_else(|| config.pointer("/security_policy/checkout_scope"));
@@ -6423,6 +6801,10 @@ impl Store {
             )
             .optional()?
             .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+            .filter(|existing| {
+                crate::providers::require_qualification_contract(&identity.security_policy, existing).is_ok()
+                    && require_capability_proof_contract_in(&transaction, &config_hash, existing).is_ok()
+            })
         {
             runtime_scopes.extend(
                 existing
@@ -6464,12 +6846,277 @@ impl Store {
         Ok(result)
     }
 
+    pub fn record_functional_main_checkout_proof(
+        &self,
+        proof: &FunctionalCapabilityProofInput,
+    ) -> Result<serde_json::Value> {
+        let evidence = proof
+            .main
+            .as_ref()
+            .context("Main functional publication requires the typed Main evidence variant")?;
+        if !matches!(
+            evidence.observation,
+            crate::domain::FunctionalObservation::Passed { .. }
+        ) {
+            bail!("Main functional publication requires a passed observation")
+        }
+        if proof.operation_id.trim().is_empty() || proof.evidence_reference.trim().is_empty() {
+            bail!("Main functional proof requires an operation ID and evidence reference")
+        }
+        let request_hash = json_hash(proof)?;
+        if let Some(result) = self.operation_receipt(
+            &proof.operation_id,
+            "human_control",
+            "functional_main_proof",
+            &request_hash,
+        )? {
+            return Ok(result);
+        }
+        let launch: LaunchConfig =
+            serde_json::from_value(self.session_json(&proof.session_id)?["launch_config"].clone())?;
+        let scope = launch
+            .security_policy
+            .get("checkout_scope")
+            .context("Main functional proof has no checkout scope")?;
+        self.check_checkout_preparation(Some(scope))?;
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (control,payload,generation,native,key,identity,exit): (String,String,String,String,String,String,String) = tx.query_row(
+            "SELECT c.id,c.payload_json,g.id,s.native_session_id,s.capability_key,s.capability_identity_json,s.exit_json
+             FROM controls c JOIN sessions s ON s.id=json_extract(c.payload_json,'$.session_id')
+             JOIN role_generations g ON g.id=s.role_generation_id JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id
+             WHERE s.id=?1 AND c.attempt_id=g.attempt_id AND c.kind='main_checkout_verify' AND c.state='awaiting_native_evidence'
+               AND s.status='exited' AND g.status='exited' AND s.hook_trust_state='observed_unverified'
+               AND a.status IN ('running','held','needs_input') AND t.lifecycle='in_progress' AND t.archived_at IS NULL
+               AND NOT EXISTS(SELECT 1 FROM controls stop WHERE stop.attempt_id=a.id
+                 AND stop.kind IN ('cancel','pause_now','pause_after_role','manager_stop','manager_change') AND stop.state IN ('requested','draining'))
+               AND NOT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=a.id AND state='attention_required')",
+            params![proof.session_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+        ).optional()?.context("Main functional publication requires its exact completed, quiescent authorized turn")?;
+        let mut payload: serde_json::Value = serde_json::from_str(&payload)?;
+        let identity: CapabilityIdentity = serde_json::from_str(&identity)?;
+        crate::providers::require_qualification_contract(
+            &launch.security_policy,
+            &serde_json::to_value(proof)?,
+        )?;
+        crate::providers::require_qualification_contract(
+            &identity.security_policy,
+            &serde_json::to_value(proof)?,
+        )?;
+        crate::providers::require_current_capability_identity_with_bundles(
+            &identity,
+            &launch.cwd,
+            &self.compatibility_bundles,
+        )?;
+        let completed = payload["completed_at"]
+            .as_str()
+            .context("Main functional verification has no completion time")?;
+        if payload["deadline_at"]
+            .as_str()
+            .is_none_or(|deadline| completed > deadline)
+            || serde_json::from_str::<serde_json::Value>(&exit)?["process_group_quiescent"] != true
+            || crate::providers::capability_identity_key(&identity)? != key
+            || crate::providers::capability_key(&launch)? != key
+            || payload["scope"] != *scope
+            || payload["capability_key"].as_str() != Some(key.as_str())
+            || evidence.role_generation_id != generation
+            || evidence.native_session_id != native
+            || evidence.observation_request_hash != json_hash(&payload["observation_request"])?
+            || payload["observation_request_hash"].as_str()
+                != Some(evidence.observation_request_hash.as_str())
+            || payload["observation_request"]["command"].as_str()
+                != Some(evidence.native_command.as_str())
+            || payload["first_turn_complete"] != true
+            || (launch.role != RoleKind::FinalReviewer && payload["retained_turn_complete"] != true)
+        {
+            bail!("Main functional proof differs from its exact current request, native identity or completion")
+        }
+        let mut report_statement = tx.prepare("SELECT json_object('operation_id',operation_id,'outcome',outcome,'summary',summary,
+            'evidence',json(evidence_json),'metadata',json(metadata_json)) FROM role_results WHERE session_id=?1 AND role_generation_id=?2 ORDER BY rowid LIMIT 2")?;
+        let reports = report_statement
+            .query_map(params![proof.session_id, generation], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(report_statement);
+        if reports.len() != 1 {
+            bail!("Main functional proof requires exactly one authenticated report")
+        }
+        let report: RoleResultReport = serde_json::from_str(&reports[0])?;
+        if serde_json::to_value(&evidence.observation)?
+            != report.metadata["validation_observation"]["functional"]
+        {
+            bail!("Main functional proof differs from the authenticated report")
+        }
+        let observations =
+            validate_functional_main_report_in(&tx, &proof.session_id, &generation, &report)?;
+        let task = scope["authorization"]["task_id"]
+            .as_str()
+            .context("Main functional proof has no task authorization")?;
+        crate::workflow::validate_workspace_checkout(
+            &tx,
+            task,
+            &serde_json::json!({"workspace_mode":"main_checkout",
+            "workspace_ownership":"borrowed_checkout","writing_lane":"default","checkout_authorization":scope["authorization"]}),
+        )?;
+        if scope["repository_inventory_hash"].as_str()
+            != Some(json_hash(&repository_inventory_in(&tx)?)?.as_str())
+        {
+            bail!("Main protection inventory changed before functional publication")
+        }
+        let ordinary_input: String = tx.query_row(
+            "SELECT invocation_input_json FROM sessions WHERE id=?1",
+            params![proof.session_id],
+            |row| row.get(0),
+        )?;
+        let mut input: serde_json::Value = serde_json::from_str(&ordinary_input)?;
+        payload["diagnostic_input"] = input.clone();
+        let prompt = format!("{}\nFunctional qualification is complete. Continue the task using authenticated role context and existing human approvals.",crate::workflow_resources::role_prompt(launch.role));
+        input["prompt_hash"] = json_hash(&prompt)?.into();
+        input["prompt"] = prompt.into();
+        payload["ordinary_input_hash"] = json_hash(&input)?.into();
+        let result = serde_json::json!({"qualification_contract":"functional-v2","mode":"main_checkout","status":"supported",
+            "actor":launch.role,"authorization":scope["authorization"],"scope_hash":json_hash(scope)?,"scope":scope,
+            "config_hash":key,"capability_identity":identity,"compatibility":identity.compatibility,"session_id":proof.session_id,"native_session_id":native,
+            "evidence_reference":proof.evidence_reference,"functional_observations":observations,
+            "retained_observations":payload,"configured_protections":launch.security_policy,"os_confinement_attested":false});
+        let now = Utc::now().to_rfc3339();
+        tx.execute("INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,hook_hash,proof_json)
+            VALUES(?1,?2,?3,?4,'main_checkout',?5,'supported',?6,'[]',?7,?8,?9)
+            ON CONFLICT(provider,executable_version,role,mode,config_hash) DO UPDATE SET status='supported',evidence_reference=excluded.evidence_reference,
+              checked_at=excluded.checked_at,hook_hash=excluded.hook_hash,proof_json=excluded.proof_json,gaps_json='[]'",
+            params![uuid::Uuid::new_v4().to_string(),launch.provider.to_string(),launch.executable_version,launch.role.to_string(),key,proof.evidence_reference,now,identity.hook_revision,result.to_string()])?;
+        tx.execute("UPDATE controls SET state='finished',payload_json=?1,updated_at=?2 WHERE id=?3 AND state='awaiting_native_evidence'",params![payload.to_string(),now,control])?;
+        tx.execute("UPDATE sessions SET invocation_input_json=?1,hook_trust_state='verified_live',native_identity_verified_at=?2,updated_at=?2 WHERE id=?3",params![input.to_string(),now,proof.session_id])?;
+        tx.execute("INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at) VALUES(?1,'human_control','functional_main_proof',?2,?3,?4)",params![proof.operation_id,request_hash,result.to_string(),now])?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn record_functional_capability_proof_with_guard<F>(
+        &self,
+        proof: &FunctionalCapabilityProofInput,
+        runtime_scope: &serde_json::Value,
+        guard: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: FnOnce(&Transaction<'_>) -> Result<()>,
+    {
+        if proof.operation_id.trim().is_empty()
+            || proof.evidence_reference.trim().is_empty()
+            || proof.main.is_some()
+        {
+            bail!("functional runtime publication requires its own service-owned proof input")
+        }
+        let request_hash =
+            json_hash(&serde_json::json!({"proof":proof,"runtime_scope":runtime_scope}))?;
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((hash,result)) = tx.query_row(
+            "SELECT request_hash,result_json FROM operation_receipts WHERE operation_id=?1 AND actor_key='human_control' AND operation_kind='functional_capability_proof'",
+            params![proof.operation_id], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)),
+        ).optional()? {
+            if hash != request_hash { bail!("functional proof operation was reused with different input") }
+            return Ok(serde_json::from_str(&result)?);
+        }
+        guard(&tx)?;
+        let (generation,launch,identity,key,workspace,exit,native): (String,String,String,String,String,String,String) = tx.query_row(
+            "SELECT g.id,s.launch_config_json,p.capability_identity_json,p.capability_key,p.workspace_path,s.exit_json,s.native_session_id
+             FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+             JOIN trip_runtime_probes p ON p.session_id=s.id AND p.attempt_id=g.attempt_id AND p.role=g.role
+             WHERE s.id=?1 AND s.status='exited' AND g.status='exited' AND p.state='evidence_recorded'
+               AND s.validation_cell='trip_runtime_probe' AND s.hook_trust_state='observed_unverified'",
+            params![proof.session_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+        ).optional()?.context("functional publication requires recorded evidence and an exited native session")?;
+        let launch: LaunchConfig = serde_json::from_str(&launch)?;
+        let identity: CapabilityIdentity = serde_json::from_str(&identity)?;
+        crate::providers::require_qualification_contract(
+            &launch.security_policy,
+            &serde_json::to_value(proof)?,
+        )?;
+        crate::providers::require_qualification_contract(
+            &identity.security_policy,
+            &serde_json::to_value(proof)?,
+        )?;
+        if crate::providers::capability_identity_key(&identity)? != key
+            || identity.provider != launch.provider
+            || identity.role != launch.role
+            || identity.model != launch.model
+            || identity.effort != launch.effort
+            || serde_json::from_str::<serde_json::Value>(&exit)?["process_group_quiescent"] != true
+        {
+            bail!("functional publication lost its exact profile identity or process quiescence")
+        }
+        crate::providers::require_current_capability_identity_with_bundles(
+            &identity,
+            Path::new(&workspace),
+            &self.compatibility_bundles,
+        )?;
+        let mut report_statement = tx.prepare(
+            "SELECT json_object('operation_id',operation_id,'outcome',outcome,'summary',summary,
+               'evidence',json(evidence_json),'metadata',json(metadata_json))
+             FROM role_results WHERE session_id=?1 AND role_generation_id=?2 ORDER BY rowid LIMIT 2",
+        )?;
+        let reports = report_statement
+            .query_map(params![proof.session_id, generation], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(report_statement);
+        if reports.len() != 1 {
+            bail!("functional proof requires exactly one authenticated report")
+        }
+        let report: RoleResultReport = serde_json::from_str(&reports[0])?;
+        let observations = crate::trip::validate_functional_runtime_evidence(
+            &tx,
+            &proof.session_id,
+            &generation,
+            &report,
+        )?;
+        let mut scopes = Vec::new();
+        if let Some(existing) = tx.query_row(
+            "SELECT proof_json FROM capabilities WHERE provider=?1 AND executable_version=?2 AND role=?3 AND mode='interactive_pty' AND config_hash=?4 AND status='supported'",
+            params![launch.provider.to_string(),launch.executable_version,launch.role.to_string(),key], |row| row.get::<_,String>(0),
+        ).optional()? {
+            let existing: serde_json::Value = serde_json::from_str(&existing)?;
+            if crate::providers::require_qualification_contract(&identity.security_policy, &existing).is_ok()
+                && require_capability_proof_contract_in(&tx,&key,&existing).is_ok()
+            {
+                scopes.extend(existing["runtime_scopes"].as_array().cloned().unwrap_or_default());
+            }
+        }
+        if !scopes.contains(runtime_scope) {
+            scopes.push(runtime_scope.clone());
+        }
+        let id = tx.query_row(
+            "SELECT id FROM capabilities WHERE provider=?1 AND executable_version=?2 AND role=?3 AND mode='interactive_pty' AND config_hash=?4",
+            params![launch.provider.to_string(),launch.executable_version,launch.role.to_string(),key], |row| row.get::<_,String>(0),
+        ).optional()?.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let result = serde_json::json!({"qualification_contract":"functional-v2","status":"supported",
+            "capability_id":id,"provider":launch.provider,"version":launch.executable_version,"role":launch.role,
+            "model":identity.model,"effort":identity.effort,"config_hash":key,"capability_identity":identity,
+            "session_id":proof.session_id,"native_session_id":native,"evidence_reference":proof.evidence_reference,
+            "functional_observations":observations,"runtime_scope":runtime_scope,"runtime_scopes":scopes,
+            "configured_protections":launch.security_policy,"os_confinement_attested":false});
+        let now = Utc::now().to_rfc3339();
+        tx.execute("INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,hook_hash,proof_json)
+             VALUES(?1,?2,?3,?4,'interactive_pty',?5,'supported',?6,'[]',?7,?8,?9)
+             ON CONFLICT(provider,executable_version,role,mode,config_hash) DO UPDATE SET status='supported',evidence_reference=excluded.evidence_reference,
+               gaps_json='[]',checked_at=excluded.checked_at,hook_hash=excluded.hook_hash,proof_json=excluded.proof_json",
+            params![id,launch.provider.to_string(),launch.executable_version,launch.role.to_string(),key,proof.evidence_reference,now,identity.hook_revision,result.to_string()])?;
+        tx.execute("UPDATE sessions SET native_identity_verified_at=?1,hook_trust_state='verified_live',updated_at=?1 WHERE id=?2", params![now,proof.session_id])?;
+        tx.execute("INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at) VALUES(?1,'human_control','functional_capability_proof',?2,?3,?4)",
+            params![proof.operation_id,request_hash,result.to_string(),now])?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     pub fn role_launch_context(
         &self,
         attempt_id: &str,
         role: RoleKind,
     ) -> Result<RoleLaunchContext> {
-        self.role_launch_context_inner(attempt_id, role, "default", false, None)
+        self.role_launch_context_inner(attempt_id, role, "default", false, None, false)
     }
 
     pub fn lane_role_launch_context(
@@ -6478,7 +7125,7 @@ impl Store {
         role: RoleKind,
         lane_key: &str,
     ) -> Result<RoleLaunchContext> {
-        self.role_launch_context_inner(attempt_id, role, lane_key, false, None)
+        self.role_launch_context_inner(attempt_id, role, lane_key, false, None, false)
     }
 
     pub fn validation_role_launch_context(
@@ -6486,7 +7133,7 @@ impl Store {
         attempt_id: &str,
         role: RoleKind,
     ) -> Result<RoleLaunchContext> {
-        self.role_launch_context_inner(attempt_id, role, "default", true, None)
+        self.role_launch_context_inner(attempt_id, role, "default", true, None, false)
     }
 
     pub fn trip_setup_role_launch_context(
@@ -6495,7 +7142,23 @@ impl Store {
         role: RoleKind,
         runtime_probe: bool,
     ) -> Result<RoleLaunchContext> {
-        self.role_launch_context_inner(attempt_id, role, "default", true, Some(runtime_probe))
+        self.role_launch_context_inner(
+            attempt_id,
+            role,
+            "default",
+            true,
+            Some(runtime_probe),
+            false,
+        )
+    }
+
+    pub(crate) fn preflight_main_verification(
+        &self,
+        attempt_id: &str,
+        role: RoleKind,
+    ) -> Result<()> {
+        self.role_launch_context_inner(attempt_id, role, "default", false, None, true)?;
+        Ok(())
     }
 
     fn role_launch_context_inner(
@@ -6505,6 +7168,7 @@ impl Store {
         lane_key: &str,
         validation_dispatch: bool,
         setup_runtime_probe: Option<bool>,
+        dry_run: bool,
     ) -> Result<RoleLaunchContext> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -6587,7 +7251,10 @@ impl Store {
             && attempt_status == "held"
             && lifecycle == "validation"
             && attention == "paused";
-        if attempt_status != "running" && !held_validation {
+        let pending_verification = dry_run
+            && main_verification
+            && matches!(attempt_status.as_str(), "held" | "needs_input");
+        if attempt_status != "running" && !held_validation && !pending_verification {
             bail!("attempt is not dispatchable")
         }
         let allowed = validation_dispatch
@@ -6674,7 +7341,14 @@ impl Store {
             bail!("role capacity is reserved until the prior task context is quiescent")
         }
         let resolved_config = serde_json::from_str::<crate::domain::RoleOverride>(&config_json)?;
+        let mut admitted_under_hold = false;
         if main_verification {
+            admitted_under_hold = require_main_verification_hold_binding(
+                &transaction,
+                &task_id,
+                attempt_id,
+                &role.to_string(),
+            )?;
             let settings: String=transaction.query_row("SELECT json_extract(payload_json,'$.actor_settings') FROM controls WHERE attempt_id=?1
                 AND kind='main_checkout_verify' AND state='native_requested' AND json_extract(payload_json,'$.actor')=?2",params![attempt_id,role.to_string()], |row|row.get(0))?;
             let settings: serde_json::Value = serde_json::from_str(&settings)?;
@@ -6711,13 +7385,15 @@ impl Store {
         if !role_capacity_available(&transaction, &provider, role, None, None)? {
             return Err(RoleLaunchCapacityError.into());
         }
-        let held:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1 AND (t.attention IN ('pause_requested','needs_recovery','restart_parked','resume_failed') OR EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=a.id AND c.kind IN ('pause_now','pause_after_role','cancel') AND c.state='requested') OR (?2='manager' AND EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=a.id AND c.kind='setup_manager_change' AND c.state='held')) OR EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=a.id AND c.kind IN ('manager_stop','manager_change') AND c.state NOT IN ('finished','cancelled','superseded','rejected')) OR EXISTS(SELECT 1 FROM restart_candidates rc WHERE rc.attempt_id=a.id AND rc.state NOT IN ('resumed','released_fresh_dispatch','cancelled'))))",params![attempt_id,role.to_string()],|row|row.get(0))?;
+        let held:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1 AND (t.attention IN ('pause_requested','needs_recovery','restart_parked') OR (t.attention='resume_failed' AND NOT ?3) OR EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=a.id AND c.kind IN ('pause_now','pause_after_role','cancel') AND c.state='requested') OR (?2='manager' AND EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=a.id AND c.kind='setup_manager_change' AND c.state='held')) OR EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=a.id AND c.kind IN ('manager_stop','manager_change') AND c.state NOT IN ('finished','cancelled','superseded','rejected')) OR EXISTS(SELECT 1 FROM restart_candidates rc WHERE rc.attempt_id=a.id AND rc.state NOT IN ('resumed','released_fresh_dispatch','cancelled'))))",params![attempt_id,role.to_string(),admitted_under_hold],|row|row.get(0))?;
         if held {
             bail!("attempt is held by a pending control or recovery decision")
         }
         let permit_id = uuid::Uuid::new_v4().to_string();
-        transaction.execute("INSERT INTO launch_permits(id,attempt_id,role,settings_revision,state,created_at,validation_dispatch,setup_permit_id,lane_id) VALUES(?1,?2,?3,?4,'issued',?5,?6,?7,?8)",params![permit_id,attempt_id,role.to_string(),revision,Utc::now().to_rfc3339(),validation_dispatch,setup_permit_id,lane_id])?;
-        transaction.commit()?;
+        if !dry_run {
+            transaction.execute("INSERT INTO launch_permits(id,attempt_id,role,settings_revision,state,created_at,validation_dispatch,setup_permit_id,lane_id) VALUES(?1,?2,?3,?4,'issued',?5,?6,?7,?8)",params![permit_id,attempt_id,role.to_string(),revision,Utc::now().to_rfc3339(),validation_dispatch,setup_permit_id,lane_id])?;
+            transaction.commit()?;
+        }
         Ok(RoleLaunchContext {
             task_id,
             workspace: workspace.into(),
@@ -7143,6 +7819,19 @@ impl Store {
         )?;
         let main = config.security_policy.get("checkout_scope").is_some();
         require_main_readonly_command_binding(&transaction, &attempt_id, config)?;
+        let pending_main_verification: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1 AND kind='main_checkout_verify'
+             AND state='native_requested' AND json_extract(payload_json,'$.actor')=?2)",
+            params![attempt_id, config.role.to_string()], |row| row.get(0),
+        )?;
+        if main && pending_main_verification {
+            require_main_verification_hold_binding(
+                &transaction,
+                &context.task_id,
+                &attempt_id,
+                &config.role.to_string(),
+            )?;
+        }
         let main_verification = require_checkout_reservation(
             &transaction,
             &context.task_id,
@@ -7419,6 +8108,16 @@ impl Store {
         transaction.execute("INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at,lane_id) VALUES(?1,?2,?3,?4,?5,?6,'launch_reserved',?7,?8,?8,?9)",params![context.role_generation_id,attempt_id,config.role.to_string(),config.provider.to_string(),generation,context.settings_revision,uuid::Uuid::new_v4().to_string(),now,context.lane_id])?;
         transaction.execute("INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at) VALUES(?1,?2,?3,?4,?5)",params![context.credential_id,context.role_generation_id,auth::hash_secret(&context.token),serde_json::to_string(&role_permissions(config.role))?,now])?;
         transaction.execute("INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,hook_trust_state,created_at,updated_at,workflow_version,workflow_hash,prompt_hash,capability_key,capability_identity_json,setup_permit_id,lane_id,validation_cell) VALUES(?1,?2,?3,'launch_reserved',?4,?5,?6,'pending_observation',?7,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![context.session_id,context.role_generation_id,config.provider.to_string(),serde_json::to_string(config)?,config.executable_version,context.transcript_epoch,now,crate::workflow_resources::WORKFLOW_VERSION,crate::workflow_resources::workflow_hash(),crate::workflow_resources::prompt_hash(config.role),capability_key,capability_identity_json,setup_permit_id,context.lane_id,setup_validation_cell])?;
+        if setup_validation_cell.as_deref() == Some("trip_runtime_probe") {
+            // The first context can arrive before dispatch returns from native launch.
+            let bound = transaction.execute(
+                "UPDATE trip_runtime_probes SET session_id=?1 WHERE attempt_id=?2 AND role=?3 AND state='authorized'
+                   AND (session_id IS NULL OR session_id=?1)",params![context.session_id,attempt_id,config.role.to_string()],
+            )?;
+            if bound != 1 {
+                bail!("runtime qualification lost its exact pre-spawn invitation binding")
+            }
+        }
         if typed_setup_phase_authority {
             crate::trip::require_setup_session_confinement(
                 &transaction,
@@ -9975,7 +10674,15 @@ impl Store {
         let codex_implementer = request.provider == crate::domain::Provider::Codex
             && request.role == RoleKind::Implementer;
         let capability_status = "unverified";
-        let capability_gaps = if codex_implementer {
+        let capability_gaps = if QualificationContract::from_record(&launch.security_policy)
+            .map_err(anyhow::Error::msg)?
+            == QualificationContract::FunctionalV2
+        {
+            serde_json::json!([
+                "permitted fixture read and authenticated report not yet observed",
+                "required fresh or retained native session functionality not yet observed"
+            ])
+        } else if codex_implementer {
             serde_json::json!([
                 "live implementer confinement not yet exercised",
                 "native resume not yet exercised",
@@ -11779,7 +12486,14 @@ impl Store {
             params![session_id], |row| Ok((row.get(0)?,row.get(1)?))
         )?;
         crate::trip::require_attempt_ready(&tx, &admission_attempt, setup_permit.as_deref())?;
-        let(generation,status,recovery_count):(String,String,i64)=tx.query_row("SELECT s.role_generation_id,s.status,(SELECT COUNT(*) FROM recovery_records r WHERE r.session_id=s.id AND r.state='resolved_quiescent') FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id WHERE s.id=?1 AND s.native_session_id IS NOT NULL AND s.native_session_id!='' AND s.capability_identity_json IS NOT NULL AND EXISTS(SELECT 1 FROM capabilities current_capability WHERE current_capability.rowid=(SELECT latest_capability.rowid FROM capabilities latest_capability WHERE latest_capability.provider=s.provider AND latest_capability.executable_version=s.executable_version AND latest_capability.role=rg.role AND latest_capability.mode='interactive_pty' ORDER BY latest_capability.checked_at DESC,latest_capability.rowid DESC LIMIT 1) AND current_capability.config_hash=s.capability_key AND current_capability.status='supported' AND current_capability.proof_json!='{}')",params![session_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?.ok_or_else(||anyhow!("session lacks a same-generation native candidate with current Supported frozen capability evidence"))?;
+        let frozen_launch: String = tx.query_row(
+            "SELECT launch_config_json FROM sessions WHERE id=?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        let frozen_launch: LaunchConfig = serde_json::from_str(&frozen_launch)?;
+        require_supported_capability_in(&tx, &frozen_launch, &self.compatibility_bundles)?;
+        let(generation,status,recovery_count):(String,String,i64)=tx.query_row("SELECT s.role_generation_id,s.status,(SELECT COUNT(*) FROM recovery_records r WHERE r.session_id=s.id AND r.state='resolved_quiescent') FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id WHERE s.id=?1 AND s.native_session_id IS NOT NULL AND s.native_session_id!='' AND s.capability_identity_json IS NOT NULL AND EXISTS(SELECT 1 FROM capabilities current_capability WHERE current_capability.rowid=(SELECT latest_capability.rowid FROM capabilities latest_capability WHERE latest_capability.provider=s.provider AND latest_capability.executable_version=s.executable_version AND latest_capability.role=rg.role AND latest_capability.mode=CASE WHEN json_type(s.launch_config_json,'$.security_policy.checkout_scope')='object' THEN 'main_checkout' ELSE 'interactive_pty' END ORDER BY latest_capability.checked_at DESC,latest_capability.rowid DESC LIMIT 1) AND current_capability.config_hash=s.capability_key AND current_capability.status='supported' AND current_capability.proof_json!='{}')",params![session_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?.ok_or_else(||anyhow!("session lacks a same-generation native candidate with current Supported frozen capability evidence"))?;
         if status != "exited" {
             bail!("role resume requires a quiescent exited session")
         }
@@ -18968,6 +19682,14 @@ fn reserve_typed_setup_fresh_route(
     if !authorized {
         bail!("fresh typed setup dispatch no longer matches the exact rejected-session authority")
     }
+    let proof: String = transaction.query_row(
+        "SELECT proof_json FROM capabilities WHERE provider=?1 AND executable_version=?2 AND role=?3
+           AND mode='interactive_pty' AND config_hash=?4 AND status='supported'",
+        params![config.provider.to_string(),config.executable_version,config.role.to_string(),capability_key], |row| row.get(0),
+    )?;
+    let proof: serde_json::Value = serde_json::from_str(&proof)?;
+    crate::providers::require_qualification_contract(&config.security_policy, &proof)?;
+    require_capability_proof_contract_in(transaction, capability_key, &proof)?;
     transaction.execute(
         "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
          VALUES(?1,?2,'human','session.resume.fresh_route.reserved','session',?3,?4,?5)",
@@ -19021,6 +19743,16 @@ fn validate_frozen_capability(
     })?;
     if frozen != current_key {
         bail!("executable, hook, security policy, arguments, environment, model, or effort changed; exact resume requires a fresh accounted session")
+    }
+    let proof: Option<String> = connection.query_row(
+        "SELECT proof_json FROM capabilities WHERE config_hash=?1 AND provider=?2 AND executable_version=?3 AND role=?4
+           AND mode IN ('interactive_pty','main_checkout') AND status='supported' ORDER BY checked_at DESC,rowid DESC LIMIT 1",
+        params![frozen,frozen_identity.provider.to_string(),frozen_identity.executable_version,frozen_identity.role.to_string()],|row|row.get(0),
+    ).optional()?;
+    if let Some(proof) = proof {
+        let proof: serde_json::Value = serde_json::from_str(&proof)?;
+        crate::providers::require_qualification_contract(&frozen_identity.security_policy, &proof)?;
+        require_capability_proof_contract_in(connection, &frozen, &proof)?;
     }
     Ok(())
 }
@@ -19606,6 +20338,110 @@ pub(crate) fn session_capacity_available(
     Ok(global < 4 && provider_active < 2 && (!manager || provider_managers < 1))
 }
 
+pub(crate) fn require_capability_record_contract_in(
+    connection: &Connection,
+    id: &str,
+    key: &str,
+) -> Result<()> {
+    let proof: String = connection.query_row(
+        "SELECT proof_json FROM capabilities WHERE id=?1 AND config_hash=?2 AND status='supported'",
+        params![id, key],
+        |row| row.get(0),
+    )?;
+    require_capability_proof_contract_in(connection, key, &serde_json::from_str(&proof)?)
+}
+
+pub(crate) fn session_capability_is_current_in(
+    connection: &Connection,
+    session: &str,
+) -> Result<bool> {
+    let row: Option<(String, String, String)> = connection
+        .query_row(
+            "SELECT s.capability_key,s.capability_identity_json,s.launch_config_json
+         FROM sessions s WHERE s.id=?1 AND s.capability_key IS NOT NULL
+           AND s.capability_identity_json IS NOT NULL",
+            params![session],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((key, identity, launch)) = row else {
+        return Ok(false);
+    };
+    let validation = || -> Result<()> {
+        let identity: CapabilityIdentity = serde_json::from_str(&identity)?;
+        let launch: LaunchConfig = serde_json::from_str(&launch)?;
+        let mode = if launch.security_policy.get("checkout_scope").is_some() {
+            "main_checkout"
+        } else {
+            "interactive_pty"
+        };
+        let proof: String = connection.query_row(
+            "SELECT c.proof_json FROM capabilities c WHERE c.rowid=(
+               SELECT latest.rowid FROM capabilities latest WHERE latest.provider=?1
+                 AND latest.executable_version=?2 AND latest.role=?3 AND latest.mode=?4
+               ORDER BY latest.checked_at DESC,latest.rowid DESC LIMIT 1)
+               AND c.config_hash=?5 AND c.status='supported' AND c.proof_json!='{}'",
+            params![
+                launch.provider.to_string(),
+                launch.executable_version,
+                launch.role.to_string(),
+                mode,
+                key
+            ],
+            |row| row.get(0),
+        )?;
+        let proof: serde_json::Value = serde_json::from_str(&proof)?;
+        if crate::providers::capability_identity_key(&identity)? != key
+            || crate::providers::capability_identity_key(&crate::providers::capability_identity(
+                &launch,
+            )?)? != key
+        {
+            bail!("session capability differs from its frozen launch identity")
+        }
+        crate::providers::require_qualification_contract(&launch.security_policy, &proof)?;
+        require_capability_proof_contract_in(connection, &key, &proof)
+    };
+    Ok(validation().is_ok())
+}
+
+fn require_capability_proof_contract_in(
+    connection: &Connection,
+    key: &str,
+    proof: &serde_json::Value,
+) -> Result<()> {
+    let contract = QualificationContract::from_record(proof).map_err(anyhow::Error::msg)?;
+    if (contract == QualificationContract::FunctionalV2 || proof.get("config_hash").is_some())
+        && proof["config_hash"].as_str() != Some(key)
+    {
+        bail!("capability proof differs from its exact stored key")
+    }
+    let session = proof["session_id"]
+        .as_str()
+        .context("capability proof has no frozen source session")?;
+    let identity: String = connection
+        .query_row(
+            "SELECT COALESCE((SELECT p.capability_identity_json FROM trip_runtime_probes p
+           WHERE p.session_id=s.id AND p.capability_key=?2),s.capability_identity_json)
+         FROM sessions s WHERE s.id=?1",
+            params![session, key],
+            |row| row.get(0),
+        )
+        .optional()?
+        .context("capability proof source session is missing")?;
+    let identity: serde_json::Value = serde_json::from_str(&identity)?;
+    let expected = if proof["mode"] == "main_checkout" && proof["actor"] == "single_agent" {
+        let _: crate::providers::SingleAgentNativeIdentity =
+            serde_json::from_value(identity.clone())?;
+        crate::providers::main_checkout_capability_key("single_agent", &proof["scope"], &identity)?
+    } else {
+        crate::providers::capability_identity_key(&serde_json::from_value(identity.clone())?)?
+    };
+    if expected != key {
+        bail!("capability proof key differs from its frozen source identity")
+    }
+    crate::providers::require_qualification_contract(&identity["security_policy"], proof)
+}
+
 pub(crate) fn require_supported_capability_in(
     connection: &rusqlite::Connection,
     config: &LaunchConfig,
@@ -19620,16 +20456,19 @@ pub(crate) fn require_supported_capability_in(
     )?;
     let key = crate::providers::capability_key(config)?;
     if let Some(scope) = config.security_policy.get("checkout_scope") {
-        let exact: bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM capabilities WHERE role=?1 AND mode='main_checkout'
-            AND config_hash=?2 AND status='supported' AND json_extract(proof_json,'$.scope_hash')=?3)",params![config.role.to_string(),key,json_hash(scope)?], |row|row.get(0))?;
-        if !exact {
+        let exact: Option<String>=connection.query_row("SELECT proof_json FROM capabilities WHERE role=?1 AND mode='main_checkout'
+            AND config_hash=?2 AND status='supported' AND json_extract(proof_json,'$.scope_hash')=?3",params![config.role.to_string(),key,json_hash(scope)?], |row|row.get(0)).optional()?;
+        let Some(proof) = exact else {
             bail!("Verify the exact Main checkout actor, native policy and protected roots; worktree capability cannot authorize this launch")
-        }
+        };
+        let proof: serde_json::Value = serde_json::from_str(&proof)?;
+        crate::providers::require_qualification_contract(&config.security_policy, &proof)?;
+        require_capability_proof_contract_in(connection, &key, &proof)?;
         return Ok(());
     }
-    let exact: bool = connection.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM capabilities current_capability
+    let exact: Option<String> = connection
+        .query_row(
+            "SELECT current_capability.proof_json FROM capabilities current_capability
             WHERE current_capability.rowid=(
                 SELECT latest_capability.rowid FROM capabilities latest_capability
                 WHERE latest_capability.provider=?1 AND latest_capability.executable_version=?2
@@ -19637,17 +20476,20 @@ pub(crate) fn require_supported_capability_in(
                 ORDER BY latest_capability.checked_at DESC,latest_capability.rowid DESC LIMIT 1)
               AND current_capability.config_hash=?4
               AND current_capability.status='supported'
-              AND current_capability.proof_json!='{}'
-        )",
-        params![
-            config.provider.to_string(),
-            config.executable_version,
-            config.role.to_string(),
-            key
-        ],
-        |row| row.get(0),
-    )?;
-    if exact {
+              AND current_capability.proof_json!='{}'",
+            params![
+                config.provider.to_string(),
+                config.executable_version,
+                config.role.to_string(),
+                key
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(proof) = exact {
+        let proof: serde_json::Value = serde_json::from_str(&proof)?;
+        crate::providers::require_qualification_contract(&config.security_policy, &proof)?;
+        require_capability_proof_contract_in(connection, &key, &proof)?;
         return Ok(());
     }
     bail!("provider capability is not proven for this exact effective version, role, tool/network policy, and hook bytes")
@@ -21273,7 +22115,32 @@ mod interruption_tests {
             &std::env::current_exe().unwrap(),
         )
         .unwrap();
-        let proof = serde_json::json!({"authorization":frozen["checkout_authorization"],"scope_hash":json_hash(&scope).unwrap()});
+        let native = crate::providers::SingleAgentNativeIdentity {
+            provider: Provider::Codex,
+            executable: crate::domain::ExecutableFingerprint {
+                canonical_path: "/synthetic/codex".into(),
+                device: 1,
+                inode: 2,
+                bytes: 3,
+                modified_seconds: 4,
+                modified_nanos: 5,
+            },
+            executable_version: "fixture".into(),
+            account_identity: None,
+            config_identity: serde_json::json!({"model":"fixture","effort":"high"}),
+            security_policy: serde_json::json!({"qualification_contract":"functional-v2",
+                "checkout_scope":scope,"execution_actor":"single_agent","synthetic_fixture":true}),
+            hook_revision: "synthetic".into(),
+            policy_binding_hash: policy.content_hash(),
+        };
+        let native = serde_json::to_value(native).unwrap();
+        let main_key =
+            crate::providers::main_checkout_capability_key("single_agent", &scope, &native)
+                .unwrap();
+        let proof = serde_json::json!({"authorization":frozen["checkout_authorization"],
+            "scope_hash":json_hash(&scope).unwrap(),"scope":scope,"mode":"main_checkout",
+            "actor":"single_agent","config_hash":main_key,"session_id":"main-proof-source",
+            "qualification_contract":native["security_policy"]["qualification_contract"],"synthetic_fixture":true});
         {
             let connection = store.lock().unwrap();
             let turn = CheckoutTurn {
@@ -21288,14 +22155,28 @@ mod interruption_tests {
                 "single_agent",
                 &checkout,
                 Some(&scope),
-                "main-key",
+                &main_key,
                 Some("prompt"),
                 turn,
                 false
             )
             .is_err());
+            connection.execute_batch(
+                "INSERT INTO tasks(id,project_id,title,lifecycle,attention,created_at,updated_at)
+                   VALUES('proof-task','p','Synthetic qualification','validation','paused','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+                   VALUES('proof-attempt','proof-task','proof-context','agent_execution','base',1,'held','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+                   VALUES('proof-generation','proof-attempt','single_agent','codex',1,1,'exited','proof-authority','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');"
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,capability_key,capability_identity_json,exit_json,created_at,updated_at)
+                   VALUES('main-proof-source','proof-generation','codex','exited',?1,'fixture','proof-epoch',?2,?3,
+                     '{\"process_group_quiescent\":true}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                params![serde_json::json!({"native_identity":native,"synthetic_fixture":true}).to_string(),main_key,native.to_string()],
+            ).unwrap();
             connection.execute("INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
-                VALUES('main-proof','codex','fixture','single_agent','main_checkout','main-key','supported','synthetic-boundary-proof','[]','2026-01-01T00:00:00Z',?1)",params![proof.to_string()]).unwrap();
+                VALUES('main-proof','codex','fixture','single_agent','main_checkout',?1,'supported','synthetic-boundary-proof','[]','2026-01-01T00:00:00Z',?2)",params![main_key,proof.to_string()]).unwrap();
             assert!(!require_checkout_reservation(
                 &connection,
                 "t",
@@ -21303,7 +22184,7 @@ mod interruption_tests {
                 "single_agent",
                 &checkout,
                 Some(&scope),
-                "main-key",
+                &main_key,
                 Some("prompt"),
                 turn,
                 false
@@ -21316,7 +22197,7 @@ mod interruption_tests {
                 "implementer",
                 &checkout,
                 Some(&scope),
-                "main-key",
+                &main_key,
                 Some("prompt"),
                 turn,
                 false
@@ -21356,7 +22237,7 @@ mod interruption_tests {
                 "single_agent",
                 &checkout,
                 Some(&scope),
-                "main-key",
+                &main_key,
                 Some("prompt"),
                 CheckoutTurn {
                     session: "session",
@@ -21372,8 +22253,11 @@ mod interruption_tests {
             );
             assert_eq!(
                 connection
-                    .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
-                        .get::<_, i64>(0))
+                    .query_row(
+                        "SELECT COUNT(*) FROM sessions WHERE id!='main-proof-source'",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
                     .unwrap(),
                 0
             );
@@ -21403,8 +22287,11 @@ mod interruption_tests {
         assert_eq!(connection.query_row("SELECT COUNT(*) FROM workflow_run_bindings WHERE source_snapshot_id IS NOT NULL", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         assert_eq!(
             connection
-                .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
-                    .get::<_, i64>(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE id!='main-proof-source'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
                 .unwrap(),
             0
         );

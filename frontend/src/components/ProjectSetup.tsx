@@ -20,6 +20,7 @@ import {
 } from "../cmuxRouting";
 import { ModelSelector } from "./ModelSelector";
 import { CompatibilityDetails } from "./RoleSettings";
+import { qualificationContractLabel } from "../types";
 import type {
   CmuxKeyboardControlAction,
   CmuxSessionSurface,
@@ -48,6 +49,21 @@ const delegatedRoles: Array<Exclude<Role, "manager">> = [
   "final_verifier",
 ];
 const efforts = ["low", "medium", "high", "xhigh", "max", "ultra"];
+function runtimeQualificationLabel(admission: RuntimeAdmissionState): string {
+  if (admission.probes.length > 0) {
+    if (admission.probes.every((probe) =>
+      probe.qualification_contract === "functional-v2"
+    )) {
+      return "Functional qualification group";
+    }
+    if (admission.probes.every((probe) =>
+      probe.qualification_contract === undefined
+    )) {
+      return "Legacy denial diagnostic group";
+    }
+  }
+  return "Mixed or unknown qualification group";
+}
 const builtInAdapters: Record<string, TripAdapter> = {
   llmrelay_codex: {
     kind: "native-agent",
@@ -547,9 +563,6 @@ export function ProjectSetup({
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [cmuxSocketPath, setCmuxSocketPath] = useState("");
-  const cmuxSocketInstruction =
-    "Enter the live cmux socket path before preparing Claude verification.";
   const [editingRevision, setEditingRevision] = useState(
     persistedSetupDraft?.editingRevision || false,
   );
@@ -989,20 +1002,6 @@ export function ProjectSetup({
       configuration: setup.proposal,
     });
   const prepareRuntime = async (role?: Role) => {
-    const requestedRoles: Role[] = role
-      ? [role]
-      : ["manager", ...delegatedRoles];
-    const projectRoles = isRecord(project.settings.roles)
-      ? project.settings.roles
-      : {};
-    const includesClaude = requestedRoles.some((requestedRole) => {
-      const config = projectRoles[requestedRole];
-      return isRecord(config) && config.provider === "claude";
-    });
-    if (includesClaude && !cmuxSocketPath.trim()) {
-      setError(cmuxSocketInstruction);
-      return;
-    }
     const result = await runTrip(
       role ? `prepare-runtime:${role}` : "prepare-runtime",
       {
@@ -1010,9 +1009,6 @@ export function ProjectSetup({
         project_id: project.id,
         expected_version: project.version,
         ...(role ? { role } : {}),
-        ...(cmuxSocketPath.trim()
-          ? { cmux_socket_path: cmuxSocketPath.trim() }
-          : {}),
       },
     );
     if (typeof result?.entity_id === "string" && result.entity_id.trim()) {
@@ -2766,10 +2762,19 @@ export function ProjectSetup({
         <fieldset className="setup-step">
           <legend>Runtime capability readiness</legend>
           <p>
-            Installation is complete. Ordinary task dispatch remains separate
-            until every selected profile has current executable, policy, hook,
-            role, model, effort, confinement, and native-session proof. Setup
-            receipts are never promoted into this authority.
+            Installation is complete. Each exact selected role, model, and
+            effort needs functional qualification before ordinary task work.
+            All six roles may use Codex, Claude, or a mix. Setup receipts remain
+            installation history and cannot grant runtime authority.
+          </p>
+          <p className="hint">
+            New verification checks a permitted challenge read, an authenticated
+            report, and same-session recall for retained roles. Implementer also
+            writes an owned artifact; Final Verifier starts fresh. These checks
+            do not attest OS confinement. Sandbox, read-only role, and credential
+            restrictions remain configured; human approval controls still apply.
+            Main checkout actors also need verification for that checkout after
+            authorization in the task's Overview.
           </p>
           {setupVerifications.filter(({ selection }) =>
             qualificationResumeUnavailable(selection.compatibility)
@@ -2779,22 +2784,13 @@ export function ProjectSetup({
               <CompatibilityDetails compatibility={selection.compatibility} />
             </div>
           ))}
-          <label>
-            Live cmux Unix socket for Claude requalification
-            <input
-              value={cmuxSocketPath}
-              onChange={(event) => setCmuxSocketPath(event.target.value)}
-              placeholder="/absolute/path/to/cmux.sock"
-            />
-          </label>
           <p className="hint">
-            Required when this admission includes Claude. Enter the socket path
-            of the cmux you are running now before preparing it. The frozen
-            probe is a zero-I/O connection attempt only: it never sends a cmux
-            control request or changes cmux, and preserves its native exit and
-            stderr. A missing or refused path is not evidence of sandbox denial.
+            Legacy denial diagnostics keep their original interpretation in
+            saved history. They are not converted into functional qualification.
+            Saved verification groups below may describe earlier settings;
+            current task readiness is checked against its exact selected profile.
           </p>
-          {!runtimeAdmission && (
+          {(!runtimeAdmission || runtimeAdmission.state === "ready") && (
             <button
               className="primary"
               disabled={!!busy || freshUnavailableRoles.size > 0}
@@ -2815,6 +2811,7 @@ export function ProjectSetup({
                   >
                     {runtimeAdmissions.map((item) => (
                       <option key={item.id} value={item.id}>
+                        {runtimeQualificationLabel(item)} ·{" "}
                         {item.probes.map((probe) =>
                           roleName(probe.role)
                         ).join(", ")} · {item.state.replaceAll("_", " ")} ·{" "}
@@ -2850,9 +2847,7 @@ export function ProjectSetup({
           {notice.replaceAll("_", " ")}
         </p>
       )}
-      {error && (error === cmuxSocketInstruction
-        ? <p className="error" role="alert">{error}</p>
-        : <ErrorNotice error={error} />)}
+      {error && <ErrorNotice error={error} />}
     </section>
   );
 }
@@ -3530,6 +3525,9 @@ function RuntimeAdmission(
   return (
     <div className="runtime-admission">
       <p>
+        <strong>{runtimeQualificationLabel(admission)}</strong>
+        <br />
+        Recorded group state:{" "}
         <strong>{admission.state.replaceAll("_", " ")}</strong>{" "}
         · fresh calls before launch:{" "}
         <strong>{admission.fresh_call_count}</strong>
@@ -3578,6 +3576,9 @@ function RuntimeAdmission(
           return (
             <div key={probe.role}>
               <strong>{roleName(probe.role)}</strong>
+              <small>
+                {qualificationContractLabel(probe.qualification_contract)}
+              </small>
               <small>
                 {probe.profile.provider} · {probe.profile.model} · {probe
                   .profile.effort} · {probe.state.replaceAll("_", " ")}

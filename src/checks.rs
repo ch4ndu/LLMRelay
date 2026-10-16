@@ -1316,9 +1316,9 @@ impl CheckService {
     }
 
     fn verify_candidate(&self, snapshot: &str, workspace: &str, hash: &str) -> Result<()> {
-        let (manifest, repository) = {
+        let (manifest, repository, attempt) = {
             let connection = self.store.lock()?;
-            connection.query_row("SELECT s.manifest_json,p.repository_path FROM snapshots s JOIN attempts a ON a.id=s.attempt_id JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id WHERE s.id=?1 AND s.manifest_hash=?2",params![snapshot,hash],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?
+            connection.query_row("SELECT s.manifest_json,p.repository_path,s.attempt_id FROM snapshots s JOIN attempts a ON a.id=s.attempt_id JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id WHERE s.id=?1 AND s.manifest_hash=?2",params![snapshot,hash],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?
         };
         let expected: SnapshotManifest = serde_json::from_str(&manifest)?;
         let mut repository = crate::workspace::inspect(Path::new(&repository))?;
@@ -1328,9 +1328,10 @@ impl CheckService {
             expected.original_base.clone()
         };
         let temp = self.root.join(format!("verify-{}", uuid::Uuid::new_v4()));
-        let (observed, observed_hash) =
-            crate::snapshot::capture(&repository, Path::new(workspace), &temp)?;
+        let (mut observed, _) = crate::snapshot::capture(&repository, Path::new(workspace), &temp)?;
+        let binding = crate::review::bind_checkout_delta(&self.store, &attempt, &mut observed);
         std::fs::remove_dir_all(&temp)?;
+        let observed_hash = binding?;
         if observed_hash != hash || serde_json::to_vec(&observed)? != serde_json::to_vec(&expected)?
         {
             bail!("workspace bytes drifted from exact frozen candidate")

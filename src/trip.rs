@@ -1,7 +1,9 @@
 use crate::config::{atomic_write, InstancePaths};
 use crate::domain::{
-    CapabilityIdentity, CapabilityProofInput, LaunchConfig, OperationResult, Provider, RoleContext,
-    RoleKind, RoleOverride, RoleResultReport, TripHumanAction,
+    CapabilityIdentity, CapabilityProofInput, FunctionalCapabilityProofInput,
+    FunctionalObservation, FunctionalQualificationContract, FunctionalSessionMode, LaunchConfig,
+    OperationResult, Provider, QualificationContract, RoleContext, RoleKind, RoleOverride,
+    RoleResultReport, TripHumanAction,
 };
 use crate::store::{json_hash, Store};
 use anyhow::{anyhow, bail, Context, Result};
@@ -820,6 +822,12 @@ fn scoped_capability_binding(
         return Ok(None);
     };
     let proof = serde_json::from_str::<serde_json::Value>(&proof_text)?;
+    if crate::providers::require_qualification_contract(&config.security_policy, &proof).is_err() {
+        return Ok(None);
+    }
+    if crate::store::require_capability_record_contract_in(connection, &id, &key).is_err() {
+        return Ok(None);
+    }
     let mut scopes = proof
         .get("runtime_scopes")
         .and_then(serde_json::Value::as_array)
@@ -896,6 +904,7 @@ pub(crate) fn require_recorded_task_profile_authority(
         |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))
     ).optional()?;
     let (activation,capability,key,proof)=binding.ok_or_else(||anyhow!("role {role} setting revision {revision} is pending explicit task-profile activation with exact current capability evidence"))?;
+    crate::store::require_capability_record_contract_in(connection, &capability, &key)?;
     descriptor.activation_id = Some(activation);
     descriptor.capability_id = capability;
     descriptor.capability_key = key;
@@ -1274,6 +1283,15 @@ pub(crate) fn read_only_profile_boundary(
     else {
         return Ok(verify_again());
     };
+    if crate::store::require_capability_record_contract_in(
+        connection,
+        &capability_id,
+        &capability_key,
+    )
+    .is_err()
+    {
+        return Ok(verify_again());
+    }
     let Ok((mut authority, _)) =
         task_profile_descriptor(connection, &task_id, &role_name, revision)
     else {
@@ -3936,6 +3954,7 @@ fn current_runtime_probe_plan(
     role: RoleKind,
     requested_revision: Option<i64>,
     fixture_root: &str,
+    frozen_policy: Option<&serde_json::Value>,
 ) -> Result<RuntimeProbePlan> {
     let (mut plan, target_cwd) = if let Some(task) = task_id {
         let revision = requested_revision.ok_or_else(|| {
@@ -3976,8 +3995,8 @@ fn current_runtime_probe_plan(
     } else {
         project_runtime_profile(connection, project_id, role)?
     };
-    let prepare = |cwd: &Path| {
-        crate::providers::prepare_role_launch_with_bundles(
+    let prepare = |cwd: &Path| -> Result<crate::providers::PreparedLaunch> {
+        let mut launch = crate::providers::prepare_role_launch_with_bundles(
             plan.config.provider,
             role,
             &plan.config.model,
@@ -3992,7 +4011,11 @@ fn current_runtime_probe_plan(
             &runtime.hooks,
             &runtime.executable,
             &runtime.compatibility_bundles,
-        )
+        )?;
+        if let Some(policy) = frozen_policy {
+            crate::providers::retain_qualification_contract(&mut launch.config, policy)?;
+        }
+        Ok(launch)
     };
     let target = prepare(Path::new(&target_cwd))?;
     let fixture = prepare(Path::new(fixture_root))?;
@@ -4112,6 +4135,7 @@ fn prepare_runtime_admission(
                 role,
                 requested_revision,
                 &fixture_root,
+                None,
             )?);
         }
         (
@@ -4125,7 +4149,14 @@ fn prepare_runtime_admission(
     };
     let cmux_socket_path = plans
         .iter()
-        .any(|plan| plan.config.provider == Provider::Claude)
+        .any(|plan| {
+            plan.config.provider == Provider::Claude
+                && serde_json::from_str::<CapabilityIdentity>(&plan.capability_identity_json)
+                    .is_ok_and(|identity| {
+                        QualificationContract::from_record(&identity.security_policy)
+                            == Ok(QualificationContract::Legacy)
+                    })
+        })
         .then(|| validate_runtime_cmux_socket_path(cmux_socket_path))
         .transpose()?;
     let admission = uuid::Uuid::new_v4().to_string();
@@ -4285,7 +4316,24 @@ fn authorize_runtime_admission(
             refresh_runtime_admission_state(&connection, admission_id, &now)?;
             return Err(anyhow!(reason));
         }
-        let ordinary_launch = crate::providers::prepare_role_launch_with_bundles(
+        let (nonce, identity): (String, String) = store.lock()?.query_row(
+            "SELECT nonce,capability_identity_json FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2",
+            params![admission_id, role_text], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let identity: CapabilityIdentity = serde_json::from_str(&identity)?;
+        if QualificationContract::from_record(&identity.security_policy)
+            .map_err(anyhow::Error::msg)?
+            == QualificationContract::FunctionalV2
+        {
+            use std::io::Write;
+            let mut challenge = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(workspace.join("functional-challenge.txt"))
+                .context("create the exact functional challenge")?;
+            challenge.write_all(nonce.as_bytes())?;
+        }
+        let mut ordinary_launch = crate::providers::prepare_role_launch_with_bundles(
             config.provider,
             role,
             &config.model,
@@ -4301,6 +4349,10 @@ fn authorize_runtime_admission(
             &runtime.executable,
             &runtime.compatibility_bundles,
         )?;
+        crate::providers::retain_qualification_contract(
+            &mut ordinary_launch.config,
+            &identity.security_policy,
+        )?;
         runtime.require_current_policy(&ordinary_launch.config)?;
         let key = crate::providers::capability_key(&ordinary_launch.config)?;
         let expected: String = store.lock()?.query_row(
@@ -4313,7 +4365,7 @@ fn authorize_runtime_admission(
         }
         let diagnostic_key =
             if let Some(policy) = runtime_probe_launch_policy(store, &attempt, role, None)? {
-                let diagnostic_launch =
+                let mut diagnostic_launch =
                     crate::providers::prepare_runtime_probe_role_launch_with_bundles(
                         config.provider,
                         role,
@@ -4331,6 +4383,10 @@ fn authorize_runtime_admission(
                         &policy,
                         &runtime.compatibility_bundles,
                     )?;
+                crate::providers::retain_qualification_contract(
+                    &mut diagnostic_launch.config,
+                    &identity.security_policy,
+                )?;
                 runtime.require_current_policy(&diagnostic_launch.config)?;
                 Some(crate::providers::capability_key(&diagnostic_launch.config)?)
             } else {
@@ -4450,6 +4506,7 @@ fn validate_current_runtime_admission_scope(
                 )));
             }
         }
+        let frozen_identity: CapabilityIdentity = serde_json::from_str(&identity)?;
         let plan = current_runtime_probe_plan(
             connection,
             runtime,
@@ -4458,6 +4515,7 @@ fn validate_current_runtime_admission_scope(
             role.parse().map_err(|error: String| anyhow!(error))?,
             revision,
             &fixture_root,
+            Some(&frozen_identity.security_policy),
         )?;
         for (name, unchanged) in [
             ("profile", plan.profile_hash == profile),
@@ -4689,6 +4747,18 @@ fn publish_runtime_proof(
     admission_id: &str,
     role: RoleKind,
 ) -> Result<OperationResult> {
+    let contract = {
+        let connection = store.lock()?;
+        let identity: String = connection.query_row(
+            "SELECT capability_identity_json FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2",
+            params![admission_id,role.to_string()], |row| row.get(0),
+        )?;
+        let identity: CapabilityIdentity = serde_json::from_str(&identity)?;
+        QualificationContract::from_record(&identity.security_policy).map_err(anyhow::Error::msg)?
+    };
+    if contract == QualificationContract::FunctionalV2 {
+        return publish_functional_runtime_proof(store, runtime, operation_id, admission_id, role);
+    }
     let publication_scope = {
         let connection = store.lock()?;
         match validate_current_runtime_admission_scope(&connection, runtime, admission_id) {
@@ -4949,6 +5019,82 @@ fn publish_runtime_proof(
             "proof_published"
         },
         serde_json::json!({"admission_id":admission_id,"role":role,"capability_id":capability_id,"capability_key":capability_key,"remaining":remaining,"proof":published,"setup_receipt_promoted":false}),
+    ))
+}
+
+fn publish_functional_runtime_proof(
+    store: &Store,
+    runtime: &CapabilityRuntime,
+    operation_id: &str,
+    admission_id: &str,
+    role: RoleKind,
+) -> Result<OperationResult> {
+    let scope = {
+        let connection = store.lock()?;
+        match validate_current_runtime_admission_scope(&connection, runtime, admission_id)? {
+            RuntimeScopeValidation::Current(scope) => scope,
+            RuntimeScopeValidation::Drift(reason) => {
+                drop(connection);
+                mark_runtime_publication_stale(store, admission_id, role)?;
+                bail!("{reason}")
+            }
+        }
+    };
+    let session: String = store.lock()?.query_row(
+        "SELECT session_id FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2 AND state='evidence_recorded'",
+        params![admission_id,role.to_string()], |row| row.get(0),
+    )?;
+    let proof = FunctionalCapabilityProofInput {
+        qualification_contract: FunctionalQualificationContract::V2,
+        operation_id: format!("{operation_id}:functional-proof"),
+        session_id: session.clone(),
+        evidence_reference: format!("runtime-admission:{admission_id}:{role}:{session}"),
+        main: None,
+    };
+    let published =
+        store.record_functional_capability_proof_with_guard(&proof, &scope, |connection| {
+            match validate_current_runtime_admission_scope(connection, runtime, admission_id)? {
+                RuntimeScopeValidation::Current(current) if current == scope => Ok(()),
+                RuntimeScopeValidation::Current(_) | RuntimeScopeValidation::Drift(_) => {
+                    bail!("runtime admission scope mismatch during publication")
+                }
+            }
+        });
+    let published = match published {
+        Ok(value) => value,
+        Err(error) => {
+            if matches!(
+                error.downcast_ref::<RuntimeReportRejection>(),
+                Some(RuntimeReportRejection::CommandMismatch)
+            ) {
+                mark_runtime_command_mismatch(store, admission_id, role)?;
+            } else if error
+                .to_string()
+                .contains("runtime admission scope mismatch during publication")
+            {
+                mark_runtime_publication_stale(store, admission_id, role)?;
+            }
+            return Err(error);
+        }
+    };
+    let capability = published["capability_id"]
+        .as_str()
+        .context("functional publication omitted capability ID")?;
+    let now = Utc::now().to_rfc3339();
+    let connection = store.lock()?;
+    connection.execute("UPDATE trip_runtime_probes SET state='published',capability_id=?1,published_at=?2,updated_at=?2 WHERE admission_id=?3 AND role=?4 AND state='evidence_recorded'",params![capability,now,admission_id,role.to_string()])?;
+    let state = refresh_runtime_admission_state(&connection, admission_id, &now)?;
+    Ok(operation_result(
+        operation_id,
+        "runtime_admission",
+        admission_id,
+        None,
+        if state == "ready" {
+            "ready"
+        } else {
+            "proof_published"
+        },
+        serde_json::json!({"admission_id":admission_id,"role":role,"capability_id":capability,"proof":published,"setup_receipt_promoted":false}),
     ))
 }
 
@@ -7545,6 +7691,77 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+pub(crate) fn runtime_probe_security_policy(
+    connection: &Connection,
+    attempt: &str,
+    role: RoleKind,
+) -> Result<serde_json::Value> {
+    let identity: String = connection.query_row(
+        "SELECT capability_identity_json FROM trip_runtime_probes WHERE attempt_id=?1 AND role=?2",
+        params![attempt, role.to_string()],
+        |row| row.get(0),
+    )?;
+    let identity: CapabilityIdentity = serde_json::from_str(&identity)?;
+    QualificationContract::from_record(&identity.security_policy).map_err(anyhow::Error::msg)?;
+    Ok(identity.security_policy)
+}
+
+fn runtime_probe_contract(
+    connection: &Connection,
+    attempt: &str,
+    role: RoleKind,
+) -> Result<QualificationContract> {
+    QualificationContract::from_record(&runtime_probe_security_policy(connection, attempt, role)?)
+        .map_err(anyhow::Error::msg)
+}
+
+fn functional_probe_commands(
+    role: RoleKind,
+    workspace: &str,
+) -> Vec<crate::providers::RuntimeProbeCommand> {
+    let challenge = shell_quote(
+        &Path::new(workspace)
+            .join("functional-challenge.txt")
+            .to_string_lossy(),
+    );
+    let mut commands = vec![crate::providers::RuntimeProbeCommand {
+        operation: "fixture_read".into(),
+        command: format!("/bin/cat -- {challenge}"),
+    }];
+    if role == RoleKind::Implementer {
+        commands.push(crate::providers::RuntimeProbeCommand {
+            operation: "workspace_write".into(),
+            command: format!(
+                "/bin/cp -- {challenge} {}",
+                shell_quote(
+                    &Path::new(workspace)
+                        .join("functional-write.txt")
+                        .to_string_lossy()
+                )
+            ),
+        });
+    }
+    commands
+}
+
+fn functional_probe_command_policy(
+    role: RoleKind,
+    workspace: &str,
+    fixture: &str,
+    service: &str,
+    control: &str,
+) -> crate::providers::RuntimeProbeCommandPolicy {
+    crate::providers::RuntimeProbeCommandPolicy {
+        commands: functional_probe_commands(role, workspace),
+        read_denials: vec![PathBuf::from(control)],
+        write_denials: if role == RoleKind::Implementer {
+            vec![PathBuf::from(fixture), PathBuf::from(service)]
+        } else {
+            vec![PathBuf::from(workspace)]
+        },
+    }
+}
+
 fn runtime_probe_commands(
     provider: Provider,
     role: RoleKind,
@@ -7746,6 +7963,16 @@ pub(crate) fn runtime_probe_launch_policy(
     if frozen_config.provider != Provider::Claude {
         return Ok(None);
     }
+    if runtime_probe_contract(&connection, attempt_id, role)? == QualificationContract::FunctionalV2
+    {
+        return Ok(Some(functional_probe_command_policy(
+            role,
+            &workspace,
+            &fixture,
+            &service_sentinel,
+            &control_socket,
+        )));
+    }
     Ok(Some(runtime_probe_command_policy(
         frozen_config.provider,
         role,
@@ -7774,6 +8001,10 @@ pub(crate) fn require_runtime_probe_launch_policy_in_connection(
     role: RoleKind,
     launch: &LaunchConfig,
 ) -> Result<()> {
+    crate::providers::require_qualification_contract(
+        &runtime_probe_security_policy(connection, attempt_id, role)?,
+        &launch.security_policy,
+    )?;
     let expected = runtime_probe_launch_policy_from_connection(connection, attempt_id, role, None)?;
     match expected {
         Some(policy) => {
@@ -7907,6 +8138,16 @@ fn runtime_probe_launch_policy_from_connection(
     let frozen_config: RoleOverride = serde_json::from_str(&launch_json)?;
     if frozen_config.provider != Provider::Claude {
         return Ok(None);
+    }
+    if runtime_probe_contract(connection, attempt_id, role)? == QualificationContract::FunctionalV2
+    {
+        return Ok(Some(functional_probe_command_policy(
+            role,
+            &workspace,
+            &fixture,
+            &service_sentinel,
+            &control_socket,
+        )));
     }
     Ok(Some(runtime_probe_command_policy(
         frozen_config.provider,
@@ -8877,6 +9118,352 @@ mod cmux_socket_stderr_tests {
     }
 }
 
+fn functional_runtime_binding(
+    connection: &Connection,
+    session: &str,
+    generation: &str,
+) -> Result<serde_json::Value> {
+    let binding: String = connection.query_row(
+        "SELECT json_object('qualification_contract','functional-v2',
+           'session_id',s.id,'role_generation_id',g.id,'native_session_id',s.native_session_id,
+           'first_transcript_epoch',COALESCE((SELECT prior_transcript_epoch FROM resume_invocations
+             WHERE session_id=s.id AND resume_ordinal=1),s.transcript_epoch),
+           'initial_hook_boundary',s.initial_hook_event_boundary_rowid,
+           'session_capability_key',s.capability_key,'capability_key',p.capability_key,
+           'profile_hash',p.profile_hash,'project_config_revision_id',p.project_config_revision_id,
+           'project_configuration_hash',p.project_configuration_hash,'adapter_hash',p.adapter_hash,
+           'workspace',p.workspace_path,'fixture_repository_identity',p.fixture_repository_identity,
+           'admission_id',p.admission_id,'role',g.role)
+         FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+         JOIN trip_runtime_probes p ON p.session_id=s.id AND p.attempt_id=g.attempt_id AND p.role=g.role
+         WHERE s.id=?1 AND g.id=?2 AND s.validation_cell='trip_runtime_probe'",
+        params![session, generation], |row| row.get(0),
+    )?;
+    let mut binding: serde_json::Value = serde_json::from_str(&binding)?;
+    if binding["native_session_id"]
+        .as_str()
+        .is_none_or(str::is_empty)
+        || binding["first_transcript_epoch"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    {
+        bail!("functional qualification has no bound native invocation")
+    }
+    let workspace = binding["workspace"]
+        .as_str()
+        .context("functional qualification has no workspace")?;
+    binding["canonical_workspace"] = fs::canonicalize(workspace)?
+        .to_string_lossy()
+        .as_ref()
+        .into();
+    Ok(binding)
+}
+
+fn read_functional_artifact(path: &Path, expected: &str) -> Result<String> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect functional artifact {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() != expected.len() as u64 {
+        bail!("functional artifact is not the exact regular nonce file")
+    }
+    let bytes = fs::read(path)?;
+    if bytes != expected.as_bytes() {
+        bail!("functional artifact content differs from the current challenge")
+    }
+    Ok(sha256(&bytes))
+}
+
+pub(crate) fn validate_functional_native_commands(
+    connection: &Connection,
+    session: &str,
+    generation: &str,
+    commands: &[crate::providers::RuntimeProbeCommand],
+    report: &RoleResultReport,
+) -> Result<()> {
+    let (launch, native, initial_boundary, resume_boundary): (String,String,i64,Option<i64>) = connection.query_row(
+        "SELECT s.launch_config_json,s.native_session_id,s.initial_hook_event_boundary_rowid,
+           r.hook_event_boundary_rowid FROM sessions s LEFT JOIN resume_invocations r
+           ON r.session_id=s.id AND r.resume_ordinal=s.resume_count AND r.transcript_epoch=s.transcript_epoch
+           AND r.state IN ('running','exited') WHERE s.id=?1 AND s.role_generation_id=?2",
+        params![session,generation], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    )?;
+    let launch: LaunchConfig = serde_json::from_str(&launch)?;
+    let fresh = launch.role == RoleKind::FinalReviewer;
+    let (native_count,prompts,resume_ready): (i64,i64,bool) = connection.query_row(
+        "SELECT (SELECT COUNT(DISTINCT native_session_id) FROM hook_events WHERE session_id=s.id
+             AND provenance_state='managed_process_group_untrusted_payload'),
+           (SELECT COUNT(*) FROM hook_events WHERE session_id=s.id AND event_name='UserPromptSubmit'
+             AND native_session_id=s.native_session_id AND provenance_state='managed_process_group_untrusted_payload'),
+           EXISTS(SELECT 1 FROM resume_invocations r WHERE r.session_id=s.id AND r.resume_ordinal=1
+             AND r.transcript_epoch=s.transcript_epoch AND r.process_identity_json=s.process_identity_json
+             AND r.prior_transcript_epoch IS NOT NULL AND json_extract(r.prior_exit_json,'$.process_group_quiescent')=1
+             AND r.state IN ('running','exited')) FROM sessions s WHERE s.id=?1",
+        params![session], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    )?;
+    let expected_prompts = if fresh { 1 } else { 2 };
+    if native_count != 1 || prompts != expected_prompts || (!fresh && !resume_ready) {
+        bail!("functional qualification lacks exact same-native-session invocation and quiescent resume evidence")
+    }
+    let hooks = bound_runtime_first_invocation_hooks(connection, session, generation, launch.role)?
+        .context("functional qualification lacks correlated native first-invocation hooks")?;
+    if !hooks.commands.first().is_some_and(|hook| hook.role_context) {
+        return Err(RuntimeReportRejection::CommandMismatch.into());
+    }
+    let executable = std::env::current_exe()?;
+    let mut witness_count = 0;
+    let mut report_seen = false;
+    for hook in &hooks.commands {
+        if report_seen {
+            return Err(RuntimeReportRejection::CommandMismatch.into());
+        }
+        if hook.role_context
+            || hook.command.as_deref().is_some_and(|command| {
+                crate::permissions::is_filtered_role_context_command(command, &executable)
+            })
+        {
+            continue;
+        }
+        if commands
+            .get(witness_count)
+            .is_some_and(|expected| hook.command.as_deref() == Some(expected.command.as_str()))
+        {
+            witness_count += 1;
+        } else if fresh && hook.role_report && witness_count == commands.len() {
+            report_seen = true;
+        } else {
+            return Err(RuntimeReportRejection::CommandMismatch.into());
+        }
+    }
+    if witness_count != commands.len() || report_seen != fresh {
+        return Err(RuntimeReportRejection::CommandMismatch.into());
+    }
+    let report_boundary = if fresh {
+        initial_boundary
+    } else {
+        resume_boundary.context("missing functional resume boundary")?
+    };
+    let mut statement = connection.prepare(
+        "SELECT payload_json FROM hook_events WHERE session_id=?1 AND role_generation_id=?2
+           AND provider=?3 AND native_session_id=?4 AND event_name='PreToolUse' AND rowid>?5
+           AND provenance_state='managed_process_group_untrusted_payload'
+           AND peer_pid>0 AND peer_process_group_id>0 AND TRIM(peer_start_marker)!='' ORDER BY rowid",
+    )?;
+    let payloads = statement
+        .query_map(
+            params![
+                session,
+                generation,
+                launch.provider.to_string(),
+                Some(native.as_str()),
+                report_boundary
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if (fresh && payloads.len() != hooks.commands.len()) || (!fresh && payloads.len() != 1) {
+        return Err(RuntimeReportRejection::CommandMismatch.into());
+    }
+    let payload: serde_json::Value = serde_json::from_str(
+        payloads
+            .last()
+            .context("functional qualification has no native report command")?,
+    )?;
+    let observed = crate::permissions::direct_functional_report(
+        launch.provider,
+        payload["tool_name"].as_str().unwrap_or_default(),
+        &payload["tool_input"],
+        &executable,
+    )
+    .context("functional qualification lacks its exact direct typed native report")?;
+    if serde_json::to_value(&observed)? != serde_json::to_value(report)? {
+        return Err(RuntimeReportRejection::CommandMismatch.into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_functional_runtime_evidence(
+    connection: &Connection,
+    session: &str,
+    generation: &str,
+    report: &RoleResultReport,
+) -> Result<serde_json::Value> {
+    let binding = functional_runtime_binding(connection, session, generation)?;
+    let (nonce, workspace, launch, epoch, resumes, resume_id, resume_boundary): (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<i64>,
+    ) = connection.query_row(
+        "SELECT p.nonce,p.workspace_path,s.launch_config_json,s.transcript_epoch,s.resume_count,
+           r.id,r.hook_event_boundary_rowid
+         FROM sessions s JOIN trip_runtime_probes p ON p.session_id=s.id
+         LEFT JOIN resume_invocations r ON r.session_id=s.id AND r.resume_ordinal=s.resume_count
+           AND r.transcript_epoch=s.transcript_epoch AND r.state IN ('running','exited')
+         WHERE s.id=?1 AND s.role_generation_id=?2",
+        params![session, generation],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        },
+    )?;
+    let launch: LaunchConfig = serde_json::from_str(&launch)?;
+    if QualificationContract::from_record(&launch.security_policy).map_err(anyhow::Error::msg)?
+        != QualificationContract::FunctionalV2
+        || runtime_probe_contract(
+            connection,
+            &connection.query_row::<String, _, _>(
+                "SELECT attempt_id FROM role_generations WHERE id=?1",
+                params![generation],
+                |row| row.get(0),
+            )?,
+            launch.role,
+        )? != QualificationContract::FunctionalV2
+        || report.metadata["runtime_report_format"] != "functional-v2"
+        || report.metadata["validation_observation"]["cell"] != "trip_runtime_probe"
+    {
+        bail!("functional report cannot qualify a different evidence contract")
+    }
+    let observation: FunctionalObservation =
+        serde_json::from_value(report.metadata["validation_observation"]["functional"].clone())?;
+    let FunctionalObservation::Passed {
+        binding_hash,
+        challenge,
+        session_mode,
+    } = observation
+    else {
+        bail!("functional proof requires a passed typed report")
+    };
+    let fresh = launch.role == RoleKind::FinalReviewer;
+    if binding_hash != json_hash(&binding)?
+        || challenge != nonce
+        || (fresh
+            && (session_mode != FunctionalSessionMode::Fresh
+                || resumes != 0
+                || resume_id.is_some()))
+        || (!fresh
+            && (session_mode != FunctionalSessionMode::Retained
+                || resumes != 1
+                || resume_id.is_none()
+                || resume_boundary.is_none()))
+    {
+        bail!("functional report differs from its exact challenge, profile, session or invocation")
+    }
+    require_runtime_probe_session_policy(connection, session, launch.role, None)?;
+    validate_functional_native_commands(
+        connection,
+        session,
+        generation,
+        &functional_probe_commands(launch.role, &workspace),
+        report,
+    )?;
+    let read_sha256 = read_functional_artifact(
+        &Path::new(&workspace).join("functional-challenge.txt"),
+        &nonce,
+    )?;
+    let writer_sha256 = if launch.role == RoleKind::Implementer {
+        Some(read_functional_artifact(
+            &Path::new(&workspace).join("functional-write.txt"),
+            &nonce,
+        )?)
+    } else {
+        None
+    };
+    Ok(
+        serde_json::json!({"binding":binding,"binding_hash":binding_hash,"read_sha256":read_sha256,
+        "writer_sha256":writer_sha256,"reporting_transcript_epoch":epoch,"resume_invocation_id":resume_id,
+        "report_operation_id":report.operation_id,"session_mode":session_mode}),
+    )
+}
+
+fn record_functional_runtime_report(
+    connection: &Connection,
+    context: &RoleContext,
+    report: &RoleResultReport,
+    permit_id: &str,
+    setup_id: &str,
+    role: &str,
+) -> Result<()> {
+    if report.metadata["runtime_report_format"] != "functional-v2" {
+        bail!("functional qualification requires the dedicated functional-v2 report")
+    }
+    let observation: FunctionalObservation =
+        serde_json::from_value(report.metadata["validation_observation"]["functional"].clone())?;
+    let expected_metadata = serde_json::json!({"runtime_report_format":"functional-v2",
+        "validation_observation":{"cell":"trip_runtime_probe","functional":&observation}});
+    if report.metadata != expected_metadata
+        || serde_json::to_vec(&report.metadata)?.len() > 16 * 1024
+        || contains_sensitive_evidence(&report.metadata)
+    {
+        bail!("functional qualification requires bounded canonical typed observations")
+    }
+    let resumes: i64 = connection.query_row(
+        "SELECT resume_count FROM sessions WHERE id=?1",
+        params![context.session_id],
+        |row| row.get(0),
+    )?;
+    let expected_resumes = if context.role == RoleKind::FinalReviewer {
+        0
+    } else {
+        1
+    };
+    if resumes != expected_resumes {
+        bail!("functional report is outside its authorized fresh or retained reporting invocation")
+    }
+    let admission: String = connection.query_row(
+        "SELECT p.admission_id FROM trip_runtime_probes p JOIN trip_runtime_admissions a ON a.id=p.admission_id
+         WHERE p.session_id=?1 AND p.attempt_id=?2 AND p.role=?3 AND p.state IN ('authorized','running','awaiting_resume')
+           AND a.state IN ('authorized','running','awaiting_publication')", params![context.session_id,context.attempt_id,role], |row| row.get(0),
+    )?;
+    let (state, reason) = match observation {
+        FunctionalObservation::Passed { .. } => {
+            validate_functional_runtime_evidence(
+                connection,
+                &context.session_id,
+                &context.role_generation_id,
+                report,
+            )?;
+            ("evidence_recorded", None)
+        }
+        FunctionalObservation::MissingContext => {
+            let resumed: bool = connection.query_row(
+                "SELECT resume_count=1 FROM sessions WHERE id=?1",
+                params![context.session_id],
+                |row| row.get(0),
+            )?;
+            if context.role == RoleKind::FinalReviewer || !resumed {
+                bail!("missing_context requires a retained functional recall invocation")
+            }
+            (
+                "failed",
+                Some(
+                    "retained native conversation did not recall the functional challenge"
+                        .to_owned(),
+                ),
+            )
+        }
+        FunctionalObservation::Failed { failure_category } => (
+            "failed",
+            Some(format!(
+                "functional qualification reported {failure_category}"
+            )),
+        ),
+    };
+    let now = Utc::now().to_rfc3339();
+    connection.execute("UPDATE trip_runtime_probes SET state=?1,failure_reason=?2,updated_at=?3 WHERE admission_id=?4 AND role=?5", params![state,reason,now,admission,role])?;
+    connection.execute("UPDATE trip_setup_permits SET state='consumed',consumed_at=?1 WHERE id=?2 AND setup_operation_id=?3 AND purpose='runtime_probe' AND state='issued'",params![now,permit_id,setup_id])?;
+    refresh_runtime_admission_state(connection, &admission, &now)?;
+    Ok(())
+}
+
 fn record_runtime_probe_report(
     connection: &Connection,
     context: &RoleContext,
@@ -8887,6 +9474,17 @@ fn record_runtime_probe_report(
     nonce: Option<&str>,
     workspace: &str,
 ) -> Result<()> {
+    let role_kind: RoleKind = role.parse().map_err(|error: String| anyhow!(error))?;
+    if runtime_probe_contract(connection, &context.attempt_id, role_kind)?
+        == QualificationContract::FunctionalV2
+    {
+        return record_functional_runtime_report(
+            connection, context, report, permit_id, setup_id, role,
+        );
+    }
+    if report.metadata["runtime_report_format"] == "functional-v2" {
+        bail!("legacy diagnostic qualification cannot accept functional-v2 evidence")
+    }
     let nonce = nonce.ok_or_else(|| anyhow!("ordinary runtime permit is missing its nonce"))?;
     let evidence = report
         .metadata
@@ -9534,7 +10132,7 @@ pub fn setup_context(
     let Some((setup_id, purpose, action, nonce, role, profile_hash, inventory, proposal_json)) =
         row
     else {
-        return Ok(None);
+        return crate::store::functional_main_context_in(connection, context);
     };
     if purpose == "runtime_probe" {
         let resumed: bool = connection.query_row(
@@ -9597,6 +10195,33 @@ pub fn setup_context(
     };
     if purpose == "runtime_probe" {
         let role_kind: RoleKind = role.parse().map_err(|error: String| anyhow!(error))?;
+        if runtime_probe_contract(connection, &context.attempt_id, role_kind)?
+            == QualificationContract::FunctionalV2
+        {
+            let binding = functional_runtime_binding(
+                connection,
+                &context.session_id,
+                &context.role_generation_id,
+            )?;
+            contract
+                .as_object_mut()
+                .context("functional setup contract is not an object")?
+                .remove("nonce");
+            contract
+                .as_object_mut()
+                .context("functional setup contract is not an object")?
+                .remove("workspace_probe_relative_path");
+            contract["qualification_contract"] = "functional-v2".into();
+            contract["binding_hash"] = json_hash(&binding)?.into();
+            contract["binding"] = binding;
+            let profile: String = connection.query_row(
+                "SELECT profile_json FROM trip_runtime_probes WHERE session_id=?1 AND role=?2",
+                params![context.session_id, role],
+                |row| row.get(0),
+            )?;
+            contract["profile"] = serde_json::from_str(&profile)?;
+            return Ok(Some(contract));
+        }
         if let Some(model) = bound_runtime_first_invocation_hooks(
             connection,
             &context.session_id,
@@ -9677,6 +10302,27 @@ const RUNTIME_OUTCOME_REPORT_SCHEMA: &str = "Only a native invocation with exact
 
 const RUNTIME_TYPED_REPORT_SCHEMA: &str = "For this runtime probe only, these instructions override the appended generic JSON report channel: use one direct `<exact-executable> role report --runtime-v1` command, never --json, --file, stdin, a pipe, redirect, heredoc, command substitution, helper, wrapper, prefix, suffix, or second report. Every supplied value is a decoded unquoted atom using only ASCII letters, digits, dot, underscore, hyphen, colon, or slash; use equals only between each flag and value and commas only inside --actual. --cmux-stderr-hex is the one exception: it is the exact native diagnostic stderr encoded as hexadecimal, or the atom empty only for zero stderr. If provider display strips only one terminal LF or CRLF from the exact cmux diagnostic line, encode that otherwise exact line without the stripped ending. Always supply --operation-id=<new-safe-id> and --status=<passed|failed|missing_context>. Passed requires --nonce=<remembered-nonce>, --model-evidence=<observed-atom>, --session-mode=<fresh|retained>, --target-data-accessed=<true|false>, --fallback-observed=<true|false>, --authentication-observed=<true|false>, and all --actual fields; do not default any required observation. When the first invocation's role context exposes setup_contract.provider_model_observation, retain its exact model_evidence atom and use that as the observed --model-evidence on the reporting turn. This records what the native CLI SessionStart payload reported, not attestation of the remote backend model. The service checks this observation against the same first invocation; requested profile settings alone are not model evidence. Do not reread context on retained resume. Passed may additionally include --sandbox-identity=<observed-atom> only as an optional untrusted supplementary agent description directly exposed by the active provider/runtime. Failed requires --failure-category=<category> and all --actual fields. For observation_unavailable, also identify the missing required non-command observation with --missing-observation=<field>, choosing model_evidence, session_mode_observed, target_data_accessed, fallback_observed, or authentication_observed. An unavailable optional sandbox description is not a failure; omit that optional flag. Never infer a passed observation from requested settings. Older failed reports without the diagnostic field remain failed and explicitly lack an identified cause. When cmux_socket_connect was attempted, either status requires --cmux-stderr-hex=<exact-native-stderr-hex>. Missing_context accepts no other fields. The CLI inserts the fixed runtime cell metadata and canonical transport metadata; neither is an agent observation. Do not supply commands in --actual.";
 
+pub(crate) const FUNCTIONAL_REPORT_SCHEMA: &str = "Use one direct `<exact-executable> role report --functional-v2 --operation-id=<new-safe-id> --status=passed --binding-hash=<setup_contract.binding_hash> --challenge=<exact-read-content> --session-mode=<fresh|retained>`. Values must be bounded decoded ASCII atoms (letters, digits, dot, underscore, hyphen, colon or slash). Retain the binding hash and exact challenge in this native conversation. If an observation failed, use --status=failed --failure-category=<os_denial|provider_denial|shell_construction|model_refusal|observation_unavailable|unexpected_result|authentication_missing> with only the operation ID and those two fields. If retained recall is unavailable, use --status=missing_context with only a new operation ID. Never guess, reconstruct a challenge, use JSON, stdin, a wrapper, pipe, redirection or a second report. Stop after the report whether accepted or rejected. The report grants no completion or publication authority.";
+
+pub(crate) fn functional_main_launch_prompt(
+    role: RoleKind,
+    request: &serde_json::Value,
+) -> Result<String> {
+    let command = request["command"]
+        .as_str()
+        .context("Main functional request has no command")?;
+    let phase = if role == RoleKind::FinalReviewer {
+        "FRESH FINAL: submit the report in this invocation with session-mode=fresh; never resume."
+    } else {
+        "RETAINED FIRST INVOCATION: retain the binding hash and challenge in native conversation history, finish without reporting, and wait for the service to resume this exact session."
+    };
+    Ok(format!("{phase} Perform only the authorized Main functional-v2 qualification. Your first action is the authenticated role context command; retain setup_contract.binding_hash. Role context is compact and authenticated. If its output appears truncated or spooled, rerun the direct role context command or a permitted single-pipe context-to-grep filter using only -o or --only-matching and one pattern with no file operands. Never open provider-managed output files or use native file-search tools, including Grep. These context rereads are permitted only on this first invocation; retained recall must use memory without any context access. Then execute this exact permitted command once: `{command}`. Read the challenge from actual tool output. Implementer must leave the owned writer artifact for service verification. Do not implement the task, access protected roots, delegate, retry, or request diagnostic escalation. Real native permission decisions remain controlled by the authenticated human. {FUNCTIONAL_REPORT_SCHEMA} These functional observations do not attest OS confinement. {phase}"))
+}
+
+pub(crate) fn functional_main_resume_prompt() -> String {
+    format!("RETAINED MAIN FUNCTIONAL RECALL: your first and only action is the direct functional-v2 report using solely the binding hash and challenge retained in this native conversation, with session-mode=retained. Do not call role context, read files or history, or repeat a probe. This rule overrides appended generic context and JSON-report instructions. {FUNCTIONAL_REPORT_SCHEMA} Submit exactly one report and stop.")
+}
+
 pub fn setup_launch_prompt(store: &Store, attempt_id: &str, role: RoleKind) -> Result<String> {
     let connection = store.lock()?;
     let (purpose, action, nonce): (String, String, Option<String>) = connection
@@ -9695,6 +10341,21 @@ pub fn setup_launch_prompt(store: &Store, attempt_id: &str, role: RoleKind) -> R
             params![attempt_id,role.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))
         )?;
         let provider: Provider = provider.parse().map_err(|error: String| anyhow!(error))?;
+        if runtime_probe_contract(&connection, attempt_id, role)?
+            == QualificationContract::FunctionalV2
+        {
+            let commands = functional_probe_commands(role, &workspace)
+                .iter()
+                .map(|entry| format!("{}=`{}`", entry.operation, entry.command))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let phase = if role == RoleKind::FinalReviewer {
+                "FRESH FINAL: execute the commands and submit the report now with session-mode=fresh. This session must never resume."
+            } else {
+                "RETAINED FIRST INVOCATION: execute the commands, retain the binding hash and challenge in native history, and exit without reporting. Only the service's same-session resume may report with session-mode=retained."
+            };
+            return Ok(format!("{phase} Perform only this functional-v2 qualification in the app-owned disposable fixture. Your first action is the authenticated role context command; retain setup_contract.binding_hash. Role context is compact and authenticated. If its output appears truncated or spooled, rerun the direct role context command or a permitted single-pipe context-to-grep filter using only -o or --only-matching and one pattern with no file operands. Never open provider-managed output files or use native file-search tools, including Grep. These context rereads are permitted only on this first invocation; retained recall must use memory without any context access. Then execute exactly once in order: {commands}. Read the challenge from the actual tool output. Implementer must leave its exact owned functional-write.txt artifact for service verification after quiescence. Do not read the user's target, access protected paths, delegate, retry, or request diagnostic escalation. Real native permission decisions remain controlled by the authenticated human. {FUNCTIONAL_REPORT_SCHEMA} These functional observations do not attest OS confinement. {phase}"));
+        }
         let commands = runtime_probe_commands(
             provider,
             role,
@@ -9775,6 +10436,12 @@ pub fn runtime_probe_resume_prompt(
     )?;
     if !valid {
         bail!("runtime recall instruction requires the exact authorized retained probe session")
+    }
+    if runtime_probe_contract(&connection, &connection.query_row::<String,_,_>(
+        "SELECT attempt_id FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2 AND session_id=?3",
+        params![admission_id,role.to_string(),session_id], |row| row.get(0))?, role)? == QualificationContract::FunctionalV2
+    {
+        return Ok(format!("RETAINED FUNCTIONAL RECALL: your first and only action is the direct functional-v2 report, using solely the challenge and binding hash retained in this native conversation. Do not call role context, read any file or history, or repeat any command. This rule overrides appended generic context and JSON-report instructions. {FUNCTIONAL_REPORT_SCHEMA} Submit exactly one report and stop."));
     }
     Ok(format!("PHASE: RETAINED NATIVE RESUME REPORT. Your first and only action is the one authenticated report; execute no command or probe before it. This is the service-owned recall turn for the exact retained ordinary runtime probe. Report based solely on the nonce, instructions, and actual outcomes you remember from this native conversation. Before reporting, do not call role context, read any file, inspect external or application history/context, or repeat any command or probe. This runtime retained first-action/no-context rule overrides every later or subsequently appended generic instruction, including any instruction to use `role context`; do not call `role context` even if a later instruction directs you to do so. The runtime typed-report rule likewise overrides every later or subsequently appended generic JSON reporting instruction. If exact recall is unavailable, use --status=missing_context with only a new --operation-id, then stop; never guess or reconstruct the nonce. If recall is available, use --session-mode=retained and --status=passed only when every required observation actually passed, otherwise use --status=failed with a concrete --failure-category and the remembered actual outcomes. {RUNTIME_TYPED_REPORT_SCHEMA} {RUNTIME_OUTCOME_REPORT_SCHEMA} Submit exactly one report; whether it is accepted or rejected, stop without changing its operation ID or contents and without submitting a successor report. The report remains non-authoritative and requires separate authenticated human publication. END PHASE: RETAINED NATIVE RESUME REPORT permits the report as the first and only action, then stop."))
 }
@@ -11440,11 +12107,30 @@ fn runtime_admission_rows(
                         WHEN r.surface_state IN ('opening','open','unknown')
                          AND r.attachment_state IN ('pending','live') THEN 0
                         ELSE 1
-                     END,r.created_at DESC,r.binding_revision DESC LIMIT 1)
+                     END,r.created_at DESC,r.binding_revision DESC LIMIT 1),
+                    p.capability_identity_json
              FROM trip_runtime_probes p LEFT JOIN sessions s ON s.id=p.session_id
              WHERE p.admission_id=?1 ORDER BY p.role"
         )?;
-        let probes=probes.query_map(params![id],|row|Ok(serde_json::json!({"role":row.get::<_,String>(0)?,"settings_revision":row.get::<_,Option<i64>>(1)?,"profile":serde_json::from_str::<serde_json::Value>(&row.get::<_,String>(2)?).unwrap_or_default(),"profile_hash":row.get::<_,String>(3)?,"project_config_revision_id":row.get::<_,String>(4)?,"project_configuration_hash":row.get::<_,String>(5)?,"adapter":row.get::<_,String>(6)?,"adapter_hash":row.get::<_,String>(7)?,"capability_key":row.get::<_,String>(8)?,"nonce":row.get::<_,String>(9)?,"state":row.get::<_,String>(10)?,"session_id":row.get::<_,Option<String>>(11)?,"capability_id":row.get::<_,Option<String>>(12)?,"failure_reason":row.get::<_,Option<String>>(13)?,"published_at":row.get::<_,Option<String>>(14)?,"attempt_id":row.get::<_,Option<String>>(15)?,"workspace_path":row.get::<_,Option<String>>(16)?,"session_status":row.get::<_,Option<String>>(17)?,"readiness":row.get::<_,Option<String>>(18)?,"hook_trust":row.get::<_,Option<String>>(19)?,"has_native_session":row.get::<_,Option<bool>>(20)?.unwrap_or(false),"failure_category":row.get::<_,Option<String>>(21)?,"cmux_surface":row.get::<_,Option<String>>(22)?.and_then(|value|serde_json::from_str::<serde_json::Value>(&value).ok())})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let probes = probes
+            .query_map(params![id], |row| {
+                Ok((
+                serde_json::json!({"role":row.get::<_,String>(0)?,"settings_revision":row.get::<_,Option<i64>>(1)?,"profile":serde_json::from_str::<serde_json::Value>(&row.get::<_,String>(2)?).unwrap_or_default(),"profile_hash":row.get::<_,String>(3)?,"project_config_revision_id":row.get::<_,String>(4)?,"project_configuration_hash":row.get::<_,String>(5)?,"adapter":row.get::<_,String>(6)?,"adapter_hash":row.get::<_,String>(7)?,"capability_key":row.get::<_,String>(8)?,"nonce":row.get::<_,String>(9)?,"state":row.get::<_,String>(10)?,"session_id":row.get::<_,Option<String>>(11)?,"capability_id":row.get::<_,Option<String>>(12)?,"failure_reason":row.get::<_,Option<String>>(13)?,"published_at":row.get::<_,Option<String>>(14)?,"attempt_id":row.get::<_,Option<String>>(15)?,"workspace_path":row.get::<_,Option<String>>(16)?,"session_status":row.get::<_,Option<String>>(17)?,"readiness":row.get::<_,Option<String>>(18)?,"hook_trust":row.get::<_,Option<String>>(19)?,"has_native_session":row.get::<_,Option<bool>>(20)?.unwrap_or(false),"failure_category":row.get::<_,Option<String>>(21)?,"cmux_surface":row.get::<_,Option<String>>(22)?.and_then(|value|serde_json::from_str::<serde_json::Value>(&value).ok())}),
+                    row.get::<_, String>(23)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let probes = probes
+            .into_iter()
+            .map(|(mut probe, identity)| -> Result<_> {
+                let identity: serde_json::Value = serde_json::from_str(&identity)?;
+                if let Some(contract) = identity.pointer("/security_policy/qualification_contract")
+                {
+                    probe["qualification_contract"] = contract.clone();
+                }
+                Ok(probe)
+            })
+            .collect::<Result<Vec<_>>>()?;
         result.push(serde_json::json!({"id":id,"project_id":project_id,"task_id":task_id,"scope_hash":scope_hash,"state":state,"fresh_call_count":fresh_call_count,"authorized_at":authorized_at,"failure_reason":failure_reason,"probes":probes,"created_at":created_at,"updated_at":updated_at}));
     }
     Ok(result)
@@ -14965,9 +15651,17 @@ mod read_only_profile_boundary_tests {
                VALUES('t','p','Task','Description','["criterion"]','in_progress',?1,?1)"#,
             params![NOW],
         ).unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks(id,project_id,title,lifecycle,attention,created_at,updated_at)
+             VALUES('proof-task','p','Synthetic qualification','validation','paused',?1,?1)",
+                params![NOW],
+            )
+            .unwrap();
         connection.execute(
             "INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,scope_hash,configuration_hash,workflow_version,workflow_hash,upstream_source_hash,overlay_hash,legacy_migration_required,created_at,updated_at,candidate_hash)
-             VALUES('a','t','context','code_review','base',1,'running','scope','configuration','v','h','u','o',0,?1,?1,'candidate')",
+             VALUES('a','t','context','code_review','base',1,'running','scope','configuration','v','h','u','o',0,?1,?1,'candidate'),
+                   ('proof-attempt','proof-task','proof-context','code_review','base',1,'held','scope','configuration','v','h','u','o',0,?1,?1,NULL)",
             params![NOW],
         ).unwrap();
         connection.execute(
@@ -14979,20 +15673,69 @@ mod read_only_profile_boundary_tests {
                 "INSERT INTO role_settings(id,task_id,role,revision,config_json,created_at) VALUES(?1,'t','code_reviewer',?2,?3,?4)",
                 params![format!("setting-{revision}"), revision, role_json(effort), NOW],
             ).unwrap();
+            let identity = CapabilityIdentity {
+                provider: Provider::Codex,
+                executable: crate::domain::ExecutableFingerprint {
+                    canonical_path: "/synthetic/codex".into(),
+                    device: 1,
+                    inode: 2,
+                    bytes: 3,
+                    modified_seconds: 4,
+                    modified_nanos: 5,
+                },
+                executable_version: "1.0".into(),
+                role: RoleKind::CodeReviewer,
+                model: "gpt-5.6-sol".into(),
+                effort: effort.into(),
+                permission_policy: "read-only".into(),
+                security_policy: serde_json::json!({"qualification_contract":"functional-v2","synthetic_fixture":true}),
+                effective_argv: vec![],
+                environment_contract: vec![],
+                hook_revision: "synthetic".into(),
+                capability_status: None,
+                compatibility: None,
+            };
+            let key = crate::providers::capability_identity_key(&identity).unwrap();
+            let authority = task_profile_descriptor(&connection, "t", "code_reviewer", revision)
+                .unwrap()
+                .0;
+            let scope = serde_json::json!({"project_id":"p","task_id":(authority.source=="task_override").then_some("t"),
+                "role":"code_reviewer","settings_revision":(authority.source=="task_override").then_some(revision),
+                "source":authority.source,"profile_hash":authority.profile_hash,
+                "project_config_revision_id":authority.project_config_revision_id,
+                "project_configuration_hash":authority.project_configuration_hash,
+                "adapter":authority.adapter_name,"adapter_hash":authority.adapter_hash,
+                "capability_key":key,"capability_identity":identity});
+            let proof = serde_json::json!({"qualification_contract":identity.security_policy["qualification_contract"],
+                "config_hash":key,"session_id":format!("proof-session-{revision}"),"runtime_scope":scope,"synthetic_fixture":true});
+            let proof_hash = json_hash(&scope).unwrap();
+            let launch = serde_json::json!({"provider":identity.provider,"role":identity.role,
+                "executable":identity.executable.canonical_path,"executable_version":identity.executable_version,
+                "model":identity.model,"effort":identity.effort,"cwd":"/tmp/project","argv":[],"environment_keys":[],
+                "permission_policy":identity.permission_policy,"security_policy":identity.security_policy,
+                "hook_revision":identity.hook_revision,"capability_status":"supported"});
+            connection.execute(
+                "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+                 VALUES(?1,'proof-attempt','code_reviewer','codex',?2,?2,'exited',?1,?3,?3)",
+                params![format!("proof-generation-{revision}"), revision, NOW],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,capability_key,capability_identity_json,exit_json,created_at,updated_at)
+                 VALUES(?1,?2,'codex','exited',?3,'1.0',?4,?5,?6,'{\"process_group_quiescent\":true}',?7,?7)",
+                params![format!("proof-session-{revision}"),format!("proof-generation-{revision}"),launch.to_string(),
+                    format!("proof-epoch-{revision}"),key,serde_json::to_string(&identity).unwrap(),NOW],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,checked_at,proof_json)
+                 VALUES(?1,'codex','1.0','code_reviewer','read_only',?2,'supported',?3,?4)",
+                params![format!("capability-{revision}"), key, NOW, proof.to_string()],
+            ).unwrap();
+            if revision == 1 {
+                connection.execute("INSERT INTO trip_attempt_profiles(attempt_id,role,settings_revision,activation_id,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at) VALUES('a','code_reviewer',1,NULL,?1,?2,?3,'config','configuration',?4,?5,?6,?7,?8,?9)",params![authority.source,authority.profile_json.to_string(),authority.profile_hash,authority.adapter_name,authority.adapter_hash,format!("capability-{revision}"),key,proof_hash,NOW]).unwrap();
+            } else {
+                connection.execute("INSERT INTO trip_task_profile_activations(id,task_id,role,settings_id,settings_revision,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,activated_at) VALUES('activation-2','t','code_reviewer','setting-2',2,?1,?2,'config','configuration',?3,?4,?5,?6,?7,?8)",params![authority.profile_json.to_string(),authority.profile_hash,authority.adapter_name,authority.adapter_hash,format!("capability-{revision}"),key,proof_hash,NOW]).unwrap();
+            }
         }
-        connection.execute(
-            "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,checked_at,proof_json)
-             VALUES('capability','codex','1.0','code_reviewer','read_only','key','supported',?1,'{\"proof\":1}')",
-            params![NOW],
-        ).unwrap();
-        let bound = task_profile_descriptor(&connection, "t", "code_reviewer", 1)
-            .unwrap()
-            .0;
-        connection.execute("INSERT INTO trip_attempt_profiles(attempt_id,role,settings_revision,activation_id,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at) VALUES('a','code_reviewer',1,NULL,?1,?2,?3,'config','configuration',?4,?5,'capability','key','proof',?6)",params![bound.source,bound.profile_json.to_string(),bound.profile_hash,bound.adapter_name,bound.adapter_hash,NOW]).unwrap();
-        let next = task_profile_descriptor(&connection, "t", "code_reviewer", 2)
-            .unwrap()
-            .0;
-        connection.execute("INSERT INTO trip_task_profile_activations(id,task_id,role,settings_id,settings_revision,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,activated_at) VALUES('activation-2','t','code_reviewer','setting-2',2,?1,?2,'config','configuration',?3,?4,'capability','key','proof-2',?5)",params![next.profile_json.to_string(),next.profile_hash,next.adapter_name,next.adapter_hash,NOW]).unwrap();
         drop(connection);
         (store, root)
     }

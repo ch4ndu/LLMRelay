@@ -1,18 +1,27 @@
 # Shared workflow architecture: TRIP plus Single agent
 
-**Status:** MW-01 design record, retained as written below. The Single agent
-workflow has since been implemented in source in one consolidated delivery
-rather than the MW-02 to MW-04 sequence: workflow selection and project
-default, execution configurations, profiles and admissions, the run,
-structured result, selected checks, acceptance, linked rework, resume and the
-dashboard controls, together with app-wide provider checks. Gate A and B
-evidence is limited to the automated Rust and dashboard tests. Gate C has not
-started: the Single agent writer modes remain unqualified, so no Single agent
-profile can be activated on a real installation, and browser validation is
-pending. Gate D follows the usual review and acceptance. Current behavior is
-described in [Tasks, agents, and verification](WORKFLOWS.md#single-agent-workflow).
-Where this record names future tasks, file paths or migration names, the
-implementation's own source is authoritative.
+**Current status (October 15, 2026):** The TRIP plus Single agent implementation
+is delivered. Users can choose a workflow, set a project default, configure one
+Single-agent profile, run a task, review its result, request changes and resume
+eligible work. Single agent does not require installing TRIP.
+
+Automated tests and native Codex/Claude writer verification are recorded in the
+[verification record](provider-qualification-20261011.md). It includes ordinary
+task execution and a controlled Claude restart followed by dashboard acceptance.
+Each real profile still needs its own current admission check. These records do
+not establish every browser, crash or reboot scenario, or fully unattended work.
+
+For everyday instructions, start with the [README](../README.md) and
+[Single agent setup](PROJECT_SETUP.md#single-agent-setup). Additional Build and
+review or Research presets, custom workflow editing and recipe generalization
+remain future work.
+
+## Original design record
+
+The rest of this document preserves the MW-01 design and its original task
+boundaries. Implementation was delivered as a consolidated change rather than
+the proposed MW-02 through MW-04 sequence. Future-tense statements and approval
+limits below describe that historical task, not today's feature availability.
 
 **Task:** AJ-4FCAAAE2, replacement MW-01.
 

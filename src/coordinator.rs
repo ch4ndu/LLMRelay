@@ -663,6 +663,7 @@ impl AttemptAdvance {
 enum PlanningSelection {
     FreezePlan,
     QuiesceCompletedManager { session_id: String },
+    NotifyManagerOfExplorerEvidence { decision_id: String },
     WaitForManagerPlan,
     DispatchManager,
     ProviderHeld(ProviderFailureHeld),
@@ -1496,6 +1497,14 @@ fn superseding_unapproved_plan(
     connection: &Connection,
     attempt_id: &str,
 ) -> Result<Option<crate::store::EligibleManagerPlan>> {
+    superseding_plan_eligibility(connection, attempt_id, true)
+}
+
+fn superseding_plan_eligibility(
+    connection: &Connection,
+    attempt_id: &str,
+    require_running: bool,
+) -> Result<Option<crate::store::EligibleManagerPlan>> {
     let Some(candidate) = crate::store::eligible_manager_plan(connection, attempt_id, false)?
     else {
         return Ok(None);
@@ -1505,7 +1514,7 @@ fn superseding_unapproved_plan(
          JOIN review_budgets b ON b.attempt_id=a.id AND b.review_kind='plan'
          JOIN role_results rr ON rr.id=?2
          JOIN trip_structured_plans p ON p.attempt_id=a.id AND p.plan_hash=?3
-         WHERE a.id=?1 AND a.phase='awaiting_plan_approval' AND a.status='running'
+         WHERE a.id=?1 AND a.phase='awaiting_plan_approval' AND (?4=0 OR a.status='running')
            AND a.plan_approved_at IS NULL AND a.candidate_hash IS NULL
            AND a.accepted_snapshot_id IS NULL
            AND json_extract(rr.metadata_json,'$.supersedes_plan_hash')=a.plan_hash
@@ -1514,7 +1523,8 @@ fn superseding_unapproved_plan(
         params![
             attempt_id,
             candidate.result_id,
-            hex::encode(Sha256::digest(candidate.plan.as_bytes()))
+            hex::encode(Sha256::digest(candidate.plan.as_bytes())),
+            require_running
         ],
         |row| row.get(0),
     )?;
@@ -1563,6 +1573,34 @@ fn supersede_unapproved_plan(
     )
 }
 
+fn quiescent_planning_explorer_decision_on(
+    connection: &Connection,
+    attempt: &Attempt,
+) -> Result<Option<String>> {
+    let current: Option<(String, String, bool, bool)> = connection.query_row(
+        "SELECT d.id,d.stage,d.outcome_json IS NOT NULL,
+           EXISTS(SELECT 1 FROM role_generations g WHERE g.id=d.role_generation_id
+             AND g.attempt_id=d.attempt_id AND g.role='explorer' AND g.status='exited')
+           AND EXISTS(SELECT 1 FROM sessions s WHERE s.role_generation_id=d.role_generation_id)
+           AND NOT EXISTS(SELECT 1 FROM sessions s WHERE s.role_generation_id=d.role_generation_id
+             AND (s.status!='exited' OR COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)!=1))
+         FROM trip_explorer_decisions d WHERE d.attempt_id=?1 AND d.activated=1
+           AND d.candidate_hash IS ?2 ORDER BY d.created_at DESC,d.id DESC LIMIT 1",
+        params![attempt.id, attempt.candidate_hash],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).optional()?;
+    Ok(current.and_then(|(id, stage, reported, quiescent)| {
+        (stage == "planning" && reported && quiescent).then_some(id)
+    }))
+}
+
+fn planning_explorer_evidence_notice(attempt: &Attempt, decision_id: &str) -> String {
+    format!(
+        "Planning Explorer report {decision_id} for attempt {} (candidate {}) is available in authenticated role context at current_explorer_evidence. Read the recorded findings and cite the relevant findings and their consequences in a new structured plan_ready report. If evidence_truncated is true, disclose that evidence was omitted, do not claim complete consumption, and request the missing evidence through supported human guidance. Dashboard inspection is for the human; roles must not access the human-control channel. Delivery of this notice is not consumption, approval, implementation authorization, or permission to expand scope.",
+        attempt.id, attempt.candidate_hash.as_deref().unwrap_or("none")
+    )
+}
+
 fn classify_planning(connection: &Connection, attempt: &Attempt) -> Result<PlanningSelection> {
     if attempt.plan_hash.is_none() {
         if crate::store::eligible_manager_plan(connection, &attempt.id, true)?.is_some() {
@@ -1580,6 +1618,13 @@ fn classify_planning(connection: &Connection, attempt: &Attempt) -> Result<Plann
             }
         }
         return if active_role_on(connection, &attempt.id, "manager")? {
+            if let Some(decision_id) = quiescent_planning_explorer_decision_on(connection, attempt)?
+            {
+                let notice = planning_explorer_evidence_notice(attempt, &decision_id);
+                if manager_notice_pending_on(connection, attempt, &notice, true)? {
+                    return Ok(PlanningSelection::NotifyManagerOfExplorerEvidence { decision_id });
+                }
+            }
             Ok(PlanningSelection::WaitForManagerPlan)
         } else {
             unless_provider_held(
@@ -1614,6 +1659,11 @@ fn evaluate_planning(
                 "workflow.manager_plan_result_available",
             )
         }
+        PlanningSelection::NotifyManagerOfExplorerEvidence { .. } => ready_attempt_decision(
+            attempt,
+            prerequisites,
+            "workflow.planning_explorer_evidence_available",
+        ),
         PlanningSelection::WaitForManagerPlan => blocked_attempt_decision(
             attempt,
             "workflow.current_manager_plan_pending",
@@ -2013,7 +2063,7 @@ fn evaluate_activated_explorer(
     )?;
     decision.advance = AttemptAdvance::DispatchExplorer {
         prompt: format!(
-            "You are already the assigned Explorer. Perform this bounded read-only evidence task directly, without delegation, edits, builds, tests, or workflow invocation. Read your current role context and obey its authority and reporting schema. Decision: {id}. Stage: {stage}. Census: {census}. Limits and question: {limits}. Return findings_ready with metadata.explorer_decision_id set to {id}. Evidence is not approval or permission to expand scope."
+            "You are already the assigned Explorer. Perform this bounded read-only evidence task directly, without delegation, edits, builds, tests, or workflow invocation. Read your current role context and obey its authority and reporting schema. Decision: {id}. Stage: {stage}. Census: {census}. Limits and question: {limits}. Return evidence_ready with metadata.explorer_decision_id set to {id}. Evidence is not approval or permission to expand scope."
         ),
     };
     Ok(Some(decision))
@@ -3330,6 +3380,36 @@ fn advance_planning(
                 "session_id":session_id,
                 "completion":"current_plan_ready"
             }))
+        }
+        PlanningSelection::NotifyManagerOfExplorerEvidence { decision_id } => {
+            let mut connection = app.store.lock()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = active_attempts_from_connection(&transaction)?
+                .into_iter()
+                .find(|current| current.id == attempt.id);
+            let queued = if let Some(current) = current {
+                let decision = evaluate_attempt(&transaction, &current)?;
+                if matches!(decision.advance, AttemptAdvance::Planning(
+                    PlanningSelection::NotifyManagerOfExplorerEvidence { decision_id: ref id }
+                ) if id == &decision_id)
+                {
+                    let notice = planning_explorer_evidence_notice(&current, &decision_id);
+                    queue_manager_notice_on(&transaction, &current, &notice, true)?
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            transaction.commit()?;
+            if queued {
+                return Ok(
+                    serde_json::json!({"action":"manager_explorer_evidence_notified",
+                    "attempt_id":attempt.id,"explorer_decision_id":decision_id}),
+                );
+            }
+            Ok(waiting(attempt, "current_manager_plan"))
         }
         PlanningSelection::WaitForManagerPlan => Ok(waiting(attempt, "current_manager_plan")),
         PlanningSelection::DispatchManager => {
@@ -5661,12 +5741,16 @@ fn manager_change_boundary(
     let unblocked: bool = {
         let connection = app.store.lock()?;
         connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
              WHERE a.id=?1 AND a.status='running' AND t.attention='none'
                AND t.archived_at IS NULL
-               AND NOT EXISTS(SELECT 1 FROM controls other
-                 WHERE other.attempt_id=a.id AND other.id!=?2
-                   AND other.state NOT IN ('finished','cancelled','superseded','rejected')))",
+               AND NOT EXISTS(SELECT 1 FROM controls c
+                 WHERE c.attempt_id=a.id AND c.id!=?2
+                   AND c.state NOT IN ('finished','cancelled','superseded','rejected')
+                   AND NOT ({settled_failed})))",
+                settled_failed = crate::workflow::SETTLED_FAILED_MAIN_VERIFICATION_SQL
+            ),
             params![attempt, control_id],
             |row| row.get(0),
         )?
@@ -5691,7 +5775,7 @@ fn manager_change_boundary(
         let connection = app.store.lock()?;
         connection
             .query_row(
-                "SELECT s.id,stop.rowid FROM sessions s
+                &format!("SELECT s.id,stop.rowid FROM sessions s
                  JOIN role_generations rg ON rg.id=s.role_generation_id
                  JOIN role_credentials credential ON credential.role_generation_id=rg.id
                    AND credential.revoked_at IS NULL
@@ -5718,9 +5802,10 @@ fn manager_change_boundary(
                    AND NOT EXISTS(SELECT 1 FROM guidance_messages guidance
                      WHERE guidance.role_generation_id=rg.id
                        AND guidance.state IN ('delivery_reserved','written_awaiting_submit','delivery_unknown'))
-                   AND NOT EXISTS(SELECT 1 FROM controls other
-                     WHERE other.attempt_id=?2 AND other.id!=?3
-                       AND other.state NOT IN ('finished','cancelled','superseded','rejected'))
+                   AND NOT EXISTS(SELECT 1 FROM controls c
+                     WHERE c.attempt_id=?2 AND c.id!=?3
+                       AND c.state NOT IN ('finished','cancelled','superseded','rejected')
+                       AND NOT ({settled_failed}))
                    AND NOT EXISTS(SELECT 1 FROM restart_candidates restart
                      WHERE restart.attempt_id=?2
                        AND restart.state NOT IN ('resumed','released_fresh_dispatch','cancelled'))
@@ -5733,6 +5818,7 @@ fn manager_change_boundary(
                      WHERE check_run.attempt_id=?2
                        AND check_run.status IN ('launch_reserved','running','recovery_required','launch_ambiguous'))
                  ORDER BY s.created_at DESC,s.rowid DESC LIMIT 1",
+                    settled_failed = crate::workflow::SETTLED_FAILED_MAIN_VERIFICATION_SQL),
                 params![old_generation, attempt, control_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -7063,22 +7149,12 @@ fn consume_completed_handoff(
     let now = Utc::now().to_rfc3339();
     let mut connection = app.store.lock()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let eligible: bool = transaction.query_row(
-        "SELECT a.phase='manager_handoff' AND a.status='running' AND a.candidate_hash=?2
+    let (eligible, result_id): (bool, Option<String>) = transaction.query_row(
+        "SELECT eligible AND result_id IS NOT NULL,result_id FROM (
+         SELECT a.phase='manager_handoff' AND a.status='running' AND a.candidate_hash=?2
            AND a.accepted_snapshot_id=?3 AND snapshot.kind='accepted'
            AND snapshot.complete=1 AND snapshot.manifest_hash=a.candidate_hash
            AND t.attention='none' AND t.archived_at IS NULL
-           AND EXISTS(SELECT 1 FROM role_results result
-             JOIN role_generations manager ON manager.id=result.role_generation_id
-             JOIN role_settings rs ON rs.effective_generation_id=manager.id AND rs.role='manager'
-             JOIN review_requests review
-               ON review.id=json_extract(result.metadata_json,'$.final_review_request_id')
-             WHERE manager.attempt_id=a.id AND manager.role='manager'
-               AND result.outcome='handoff_ready' AND result.consumed_at IS NULL
-               AND json_extract(result.metadata_json,'$.candidate_hash')=a.candidate_hash
-               AND review.attempt_id=a.id AND review.review_kind='final'
-               AND review.candidate_hash=a.candidate_hash AND review.verdict='approved'
-               AND review.delivery_state='finished')
            AND EXISTS(SELECT 1 FROM trip_conformance_receipts conformance
              WHERE conformance.attempt_id=a.id
                AND conformance.revision=a.manager_conformance_revision
@@ -7102,14 +7178,26 @@ fn consume_completed_handoff(
                          WHERE credential.role_generation_id=manager.id
                            AND credential.revoked_at IS NULL))
                  OR (manager.status='exited' AND session.status='exited'
-                       AND COALESCE(json_extract(session.exit_json,'$.process_group_quiescent'),0)=1)))
+                       AND COALESCE(json_extract(session.exit_json,'$.process_group_quiescent'),0)=1))) AS eligible,
+           (SELECT result.id FROM role_results result
+             JOIN role_generations manager ON manager.id=result.role_generation_id
+             JOIN role_settings rs ON rs.effective_generation_id=manager.id AND rs.role='manager'
+             JOIN review_requests review
+               ON review.id=json_extract(result.metadata_json,'$.final_review_request_id')
+             WHERE manager.attempt_id=a.id AND manager.role='manager'
+               AND result.outcome='handoff_ready' AND result.consumed_at IS NULL
+               AND json_extract(result.metadata_json,'$.candidate_hash')=a.candidate_hash
+               AND review.attempt_id=a.id AND review.review_kind='final'
+               AND review.candidate_hash=a.candidate_hash AND review.verdict='approved'
+               AND review.delivery_state='finished'
+             ORDER BY result.created_at DESC,result.rowid DESC LIMIT 1) AS result_id
          FROM attempts a JOIN tasks t ON t.id=a.task_id
          JOIN snapshots snapshot ON snapshot.id=a.accepted_snapshot_id
-         WHERE a.id=?1",
+         WHERE a.id=?1)",
         params![attempt.id, candidate, snapshot_id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if !eligible {
+    let Some(result_id) = result_id.filter(|_| eligible) else {
         transaction.execute(
             "UPDATE attempts SET accepted_snapshot_id=NULL,updated_at=?1
              WHERE id=?2 AND phase='manager_handoff' AND accepted_snapshot_id=?3",
@@ -7123,7 +7211,7 @@ fn consume_completed_handoff(
         )?;
         transaction.commit()?;
         return Ok(false);
-    }
+    };
     if transaction.execute(
         "UPDATE attempts SET phase='awaiting_human_review',updated_at=?1
          WHERE id=?2 AND phase='manager_handoff' AND candidate_hash=?3
@@ -7142,6 +7230,13 @@ fn consume_completed_handoff(
     {
         return Ok(false);
     }
+    if transaction.execute(
+        "UPDATE role_results SET consumed_at=?1 WHERE id=?2 AND consumed_at IS NULL",
+        params![now, result_id],
+    )? != 1
+    {
+        return Ok(false);
+    }
     transaction.execute(
         "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
          VALUES(?1,?2,'service','attempt.phase.changed','attempt',?3,?4,?5)",
@@ -7149,7 +7244,7 @@ fn consume_completed_handoff(
             uuid::Uuid::new_v4().to_string(),
             uuid::Uuid::new_v4().to_string(),
             attempt.id,
-            serde_json::json!({"phase":"awaiting_human_review"}).to_string(),
+            serde_json::json!({"phase":"awaiting_human_review","role_result_id":result_id}).to_string(),
             now
         ],
     )?;
@@ -7205,10 +7300,9 @@ fn dispatch_or_resume_retained_role(
     prompt: &str,
     role: RoleKind,
 ) -> Result<(crate::domain::ValidationLaunchResult, bool)> {
-    let (resumable, current_role) =
-        {
-            let connection = app.store.lock()?;
-            let resumable = connection.query_row(
+    let (resumable, current_role) = {
+        let connection = app.store.lock()?;
+        let resumable = connection.query_row(
             "SELECT s.id FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
              JOIN attempts a ON a.id=rg.attempt_id JOIN role_settings rs ON rs.task_id=a.task_id
                AND rs.role=?2 AND rs.effective_generation_id=rg.id
@@ -7221,7 +7315,8 @@ fn dispatch_or_resume_retained_role(
                    WHERE latest_capability.provider=s.provider
                      AND latest_capability.executable_version=s.executable_version
                      AND latest_capability.role=rg.role
-                     AND latest_capability.mode='interactive_pty'
+                     AND latest_capability.mode=CASE WHEN json_type(s.launch_config_json,'$.security_policy.checkout_scope')='object'
+                       THEN 'main_checkout' ELSE 'interactive_pty' END
                    ORDER BY latest_capability.checked_at DESC,
                             latest_capability.rowid DESC LIMIT 1)
                    AND current_capability.config_hash=s.capability_key
@@ -7234,7 +7329,7 @@ fn dispatch_or_resume_retained_role(
             params![attempt, role.to_string()],
             |row| row.get::<_, String>(0),
         ).optional()?;
-            let current_role = connection.query_row(
+        let current_role = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM role_generations rg JOIN attempts a ON a.id=rg.attempt_id
              JOIN role_settings rs ON rs.task_id=a.task_id AND rs.role=?2
                AND rs.effective_generation_id=rg.id
@@ -7242,8 +7337,16 @@ fn dispatch_or_resume_retained_role(
             params![attempt, role.to_string()],
             |row| row.get(0),
         )?;
-            (resumable, current_role)
+        let resumable = match resumable {
+            Some(session)
+                if crate::store::session_capability_is_current_in(&connection, &session)? =>
+            {
+                Some(session)
+            }
+            _ => None,
         };
+        (resumable, current_role)
+    };
     if let Some(session) = resumable {
         return Ok((app.resume_role_session(&session, "")?, true));
     }
@@ -7352,10 +7455,19 @@ fn queue_manager_notice(
     one_shot: bool,
 ) -> Result<bool> {
     let connection = app.store.lock()?;
+    queue_manager_notice_on(&connection, attempt, body, one_shot)
+}
+
+fn queue_manager_notice_on(
+    connection: &Connection,
+    attempt: &Attempt,
+    body: &str,
+    one_shot: bool,
+) -> Result<bool> {
     // The proposal is submitted during the native turn. Re-prompting here can
     // consume its next idle boundary before the coordinator applies it.
     if body == CANDIDATE_FROZEN_NOTICE
-        && current_manager_transition(&connection, attempt, "code_review", false)?.is_some()
+        && current_manager_transition(connection, attempt, "code_review", false)?.is_some()
     {
         return Ok(false);
     }
@@ -7942,6 +8054,182 @@ fn running_attempt_store(
         )
         .unwrap();
     (root, database, store)
+}
+
+#[test]
+fn planning_explorer_notice_revalidates_selected_obligation_before_enqueue() {
+    use crate::domain::{Provider, RoleContext, RoleResultReport};
+
+    for invalidation in ["unchanged", "plan_ready", "newer_decision"] {
+        let (root, _, store) = running_attempt_store(&format!("planning-notice-{invalidation}"));
+        let paths = crate::config::InstancePaths::resolve(Some(root.clone())).unwrap();
+        paths.create().unwrap();
+        let app = Application::new(paths, store.clone(), std::env::current_exe().unwrap()).unwrap();
+        let config = serde_json::json!({"testing":{"coverage":"minimal"}});
+        {
+            let connection = store.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO trip_config_revisions(id,project_id,revision,state,config_json,
+                   adapters_json,preflight_json,verification_json,source_hash,overlay_hash,
+                   configuration_hash,created_at,activated_at)
+                 VALUES('config','p',1,'activated',?1,'{}','[]','{}',?2,?3,?4,
+                   '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                    params![
+                        config.to_string(),
+                        crate::trip::source_hash(),
+                        crate::trip::overlay_hash(),
+                        crate::store::json_hash(&config).unwrap()
+                    ],
+                )
+                .unwrap();
+            connection.execute(
+                "INSERT INTO trip_project_state(project_id,readiness,reason,detected_installation,
+                   active_config_revision_id,workflow_id,package_version,upstream_source_hash,
+                   overlay_hash,updated_at)
+                 VALUES('p','ready','synthetic unit fixture','compatible','config',?1,?2,?3,?4,
+                   '2026-01-01T00:00:00Z')",
+                params![
+                    crate::trip::WORKFLOW_ID,
+                    crate::trip::PACKAGE_VERSION,
+                    crate::trip::source_hash(),
+                    crate::trip::overlay_hash()
+                ],
+            ).unwrap();
+            connection.execute(
+                "UPDATE attempts SET workflow_version=?1,workflow_hash=?2,legacy_migration_required=0
+                 WHERE id='a'",
+                params![crate::trip::WORKFLOW_ID, crate::workflow_resources::workflow_hash()],
+            ).unwrap();
+            connection.execute_batch(
+                "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,
+                   status,authority_generation,created_at,updated_at) VALUES
+                   ('manager','a','manager','codex',1,1,'running','authority','now','now'),
+                   ('explorer','a','explorer','codex',1,1,'exited','authority','now','now');
+                 INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,
+                   executable_version,transcript_epoch,exit_json,created_at,updated_at) VALUES
+                   ('manager-session','manager','codex','running','{}','fixture','epoch',NULL,'now','now'),
+                   ('explorer-session','explorer','codex','exited','{}','fixture','explorer-epoch',
+                    '{\"process_group_quiescent\":true}','now','now');
+                 INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+                   VALUES('manager-settings','t','manager',1,'{}','manager','now');
+                 INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at)
+                   VALUES('manager-credential','manager','manager-hash','[\"report_result\"]','now');
+                 INSERT INTO trip_explorer_decisions(id,attempt_id,stage,census_json,trigger,activated,
+                   limits_json,candidate_hash,role_generation_id,outcome_json,created_at)
+                   VALUES('decision','a','planning','{}','multi_module',1,
+                     '{\"max_words\":100,\"question\":\"Inspect the existing entrypoint\"}',NULL,
+                     'explorer','{\"outcome\":\"evidence_ready\",\"summary\":\"Preserve the entrypoint\",\"evidence\":[]}',
+                     '2026-01-01T00:00:00Z');",
+            ).unwrap();
+        }
+        let (attempt, selection) = {
+            let connection = store.lock().unwrap();
+            let attempt = active_attempts_from_connection(&connection)
+                .unwrap()
+                .remove(0);
+            let decision = evaluate_attempt(&connection, &attempt).unwrap();
+            let AttemptAdvance::Planning(selection) = decision.advance else {
+                panic!("expected an eligible planning obligation")
+            };
+            assert!(matches!(
+                &selection,
+                PlanningSelection::NotifyManagerOfExplorerEvidence { decision_id }
+                    if decision_id == "decision"
+            ));
+            (attempt, selection)
+        };
+        match invalidation {
+            "plan_ready" => {
+                let manager = RoleContext {
+                    project_id: "p".into(),
+                    task_id: "t".into(),
+                    attempt_id: "a".into(),
+                    role_generation_id: "manager".into(),
+                    session_id: "manager-session".into(),
+                    credential_id: "manager-credential".into(),
+                    transcript_epoch: "epoch".into(),
+                    role: RoleKind::Manager,
+                    provider: Provider::Codex,
+                    configuration_revision: 1,
+                    lane_id: "default".into(),
+                    permissions: vec!["report_result".into()],
+                };
+                let report = RoleResultReport {
+                    operation_id: "plan-after-notice-selection".into(),
+                    outcome: "plan_ready".into(),
+                    summary: "The plan preserves the existing entrypoint".into(),
+                    evidence: vec![],
+                    metadata: serde_json::json!({
+                        "plan":"Preserve the entrypoint and its authorization boundary",
+                        "structured_plan":{
+                            "outcomes_scope":{"fixture":"planning handoff"},"classification":"bounded",
+                            "ownership":{"paths":["src/coordinator.rs"]},"acceptance_criteria":[],
+                            "test_policy":{"coverage":"minimal"},"verification_matrix":[],
+                            "documentation":{"change":"none"},"restrictions":["fixture only"],
+                            "explorer_disposition":{"decision_id":"decision","activated":true},
+                            "unresolved_decisions":[],"config_revision_id":"config",
+                            "conformance":{"workflow_id":crate::trip::WORKFLOW_ID,
+                                "upstream_source_hash":crate::trip::source_hash(),
+                                "overlay_hash":crate::trip::overlay_hash()}
+                        }
+                    }),
+                };
+                assert_eq!(
+                    store.save_role_result(&manager, &report).unwrap()["accepted"],
+                    true
+                );
+                let connection = store.lock().unwrap();
+                assert!(crate::store::eligible_manager_plan(&connection, "a", false)
+                    .unwrap()
+                    .is_some());
+            }
+            "newer_decision" => {
+                store.lock().unwrap().execute(
+                    "INSERT INTO trip_explorer_decisions(id,attempt_id,stage,census_json,trigger,
+                       activated,limits_json,candidate_hash,role_generation_id,outcome_json,created_at)
+                     SELECT 'newer-decision',attempt_id,stage,census_json,trigger,activated,limits_json,
+                       candidate_hash,role_generation_id,outcome_json,'2026-01-01T00:00:01Z'
+                     FROM trip_explorer_decisions WHERE id='decision'",
+                    [],
+                ).unwrap();
+            }
+            "unchanged" => {}
+            _ => unreachable!(),
+        }
+        let outcome = advance_planning(&app, &attempt, selection).unwrap();
+        let connection = store.lock().unwrap();
+        let notice_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM guidance_messages WHERE attempt_id='a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if invalidation == "unchanged" {
+            assert_eq!(outcome["action"], "manager_explorer_evidence_notified");
+            assert_eq!(notice_count, 1);
+            let (generation, body): (String, String) = connection
+                .query_row(
+                    "SELECT role_generation_id,body FROM guidance_messages WHERE attempt_id='a'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(generation, "manager");
+            assert!(body.contains("report decision for attempt a (candidate none)"));
+        } else {
+            assert_eq!(outcome["action"], "waiting", "{invalidation}: {outcome}");
+            assert_eq!(notice_count, 0, "{invalidation}");
+        }
+        if invalidation == "plan_ready" {
+            assert!(crate::store::eligible_manager_plan(&connection, "a", false)
+                .unwrap()
+                .is_some());
+        }
+        drop(connection);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[test]
@@ -8730,11 +9018,8 @@ fn eligible_blocked_result(
     Ok(rows.into_iter().find(|(id, _, _)| !superseded.contains(id)))
 }
 
-/// The report the attempt's current phase would consume next from this exact
-/// generation: the current manager's eligible plan while planning, or the
-/// current implementer's eligible candidate while implementing. Uses the same
-/// eligibility the phase logic uses, so a wrong-phase, stale, rejected or
-/// replaced-authority report never counts. Returns the result and its rowid.
+// Reconciliation ignores only the running-state gate; phase transitions still
+// require it, and progress must belong to this exact current generation.
 fn eligible_progress_result(
     connection: &Connection,
     attempt_id: &str,
@@ -8751,6 +9036,11 @@ fn eligible_progress_result(
     let result_id = match (role, phase.as_deref()) {
         ("manager", Some("planning")) => {
             crate::store::eligible_manager_plan(connection, attempt_id, false)?
+                .filter(|plan| plan.generation_id == generation_id)
+                .map(|plan| plan.result_id)
+        }
+        ("manager", Some("awaiting_plan_approval")) => {
+            superseding_plan_eligibility(connection, attempt_id, false)?
                 .filter(|plan| plan.generation_id == generation_id)
                 .map(|plan| plan.result_id)
         }

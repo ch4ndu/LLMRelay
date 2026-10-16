@@ -427,7 +427,7 @@ pub(crate) fn restart_session_facts(
            AND rg.role!='single_agent'
          ORDER BY s.created_at,s.id",
     )?;
-    let rows = statement
+    let mut rows = statement
         .query_map(params![session_id], |row| {
             let session_id = row.get::<_, String>(0)?;
             let candidate_state = row.get::<_, Option<String>>(33)?;
@@ -496,6 +496,10 @@ pub(crate) fn restart_session_facts(
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    for facts in &mut rows {
+        facts.current_capability =
+            crate::store::session_capability_is_current_in(connection, &facts.session_id)?;
+    }
     Ok(rows)
 }
 

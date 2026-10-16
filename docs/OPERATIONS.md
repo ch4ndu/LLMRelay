@@ -4,6 +4,30 @@
 
 Examples below use `llmrelay` on PATH. If you have not added it to PATH, substitute the full path to your packaged `bin/llmrelay`. Building a development executable is covered in [Building LLMRelay](BUILDING.md).
 
+## Start here when something needs attention
+
+| What you see | What to do first |
+| --- | --- |
+| The dashboard will not sign in | Use the one-use login link printed by the running app. A clean URL alone does not sign in another browser. |
+| A task is Ready but has not started | Check whether the project queue is paused, another task is using the repository, or the app shows a missing prerequisite. |
+| An agent asks for folder trust or terminal input | Open its output and take keyboard control. Read and answer the prompt, then release control with **Ctrl-]**. |
+| A task needs a decision | Open **Needs your attention** and follow the action for that task. |
+| A request timed out or its result is unknown | Refresh and inspect the current result before submitting it again. |
+| Work is waiting after restart | Open the task and use **Resume after restart** or the recovery action offered. |
+| An agent appears finished but the task is still active | Read the task's reason. Terminal text alone does not confirm completion. Use an explicit stop or recovery control only when appropriate to the displayed state. |
+
+Closing the browser or output view does not stop work. Use task controls for
+pause/cancel, and `llmrelay stop --drain` for a planned service shutdown. Wait for
+confirmation that processes have stopped before treating shutdown as complete.
+
+A **session** is one agent conversation. **Recorded output** is its saved text.
+When a technical detail says **quiescent**, it means the relevant processes have
+been confirmed stopped. Missing history or an uncertain process state can prevent
+resume; the app should explain the next available action.
+
+The sections below retain detailed recovery rules for troubleshooting. For a
+first task, use the [README walkthrough](../README.md#create-a-useful-first-task).
+
 ## Startup and browser authentication
 
 The dashboard waits for committed state changes instead of refreshing every two
@@ -991,6 +1015,65 @@ complete account usage. Claude usage, quota/reset windows and costs are outside
 this increment. Usage display never starts work, changes models, approves tools,
 promotes readiness or releases a provider hold.
 
+## Claude report permissions and policy migration
+
+Managed Claude read-only roles use the supported `default` permission mode. If a
+direct `role report` command reaches the Approval inbox, inspect the exact command
+and choose **Approve once** or **Deny**. Always approve is unavailable. The same
+one-time fallback applies to direct ordinary `role context --index` and
+`role context --page <cursor>` commands; bare context, shell filters and wrappers
+gain no approval exception. A report command must still
+run natively and pass service report validation; permission delivery
+alone neither submits nor accepts a plan. Long literal JSON is supported by the
+app parser, without a claim about Claude's native allow-rule matcher.
+
+Ordinary roles read every index page and every listed section page through the
+authenticated role channel before reporting. Successful index and content output
+is compact JSON of at most 4096 bytes including its newline. Index `complete`
+becomes true only on the last manifest page; follow `next` until it is null.
+Concatenating a section's `utf8_json_chunk` strings recovers its exact JSON,
+including existing evidence truncation markers. A provider preview is not the
+complete context. Do not open provider-spooled output or use native file search
+or shell filters to recover it. Stale cursors require restarting from `--index`
+and reading the new revision. A resume rotates the cursor's invocation scope.
+Qualification keeps its prescribed bare context and retained-recall rules;
+index and page operations are refused there, and Single agent has no paged role
+context operation.
+
+The new native context grants change Claude role capability identity separately
+from the earlier permission-mode migration. Requalify affected profiles and Main
+actors under this policy before new admission; frozen sessions keep their old
+identity. This change does not retroactively combine those qualification rounds.
+
+The mode, reviewer hooks and workspace/protected-root write denials change the
+Claude read-only capability identity. Historical evidence and sessions retain
+their frozen identity. Requalify affected selected profiles, reverify Main actors
+where applicable, and use the versioned **Change Manager** action with current
+proof, including when the selected settings revision is unchanged. Preserve the
+existing plan, review budgets and history; replacement does not approve a plan.
+
+A failed Main checkout verification does not block **Stop Manager**, either
+**Change Manager** form, or **Continue Manager** when ownership is positively
+settled: its exact session and actor generation show a quiescent exit or proven
+launch nondelivery, or the service recorded `not_started` with no reserved launch
+or live owner.
+The failed record stays unchanged. Active verification, missing or mismatched
+ownership, unresolved resumes, recovery, restart, or keyboard control still
+block these actions. Older sessionless failures without that disposition
+remain holds; absence of a session alone does not prove that nothing started.
+
+Check old-generation guidance and permission waits before replacement. Safe-idle
+replacement requires attention `none` and no unresolved native permission; the
+interrupt form requests a stop when that boundary is unavailable, without
+clearing unrelated attention or recovery holds. There is no general human cancel
+operation for ordinary queued guidance. Reminder cancellation handles generated
+reminders only, and abandonment handles the specifically bound unconfirmed
+delivery states. Neither is a substitute for disposing of ordinary queued text.
+If it cannot be delivered legitimately to the original generation, stop migration
+for a bounded recovery decision rather than editing records or claiming delivery.
+This change performs no live migration and does not attest network, process or
+outside-protected-root write confinement; see [Security](SECURITY.md#claude-terminal-permissions).
+
 ## Main checkout verification recovery
 
 Task Overview shows the authorized checkout and **Verify Main checkout access**.
@@ -1009,11 +1092,66 @@ replaced by requesting verification again in the same attempt: cancel the run,
 wait for ownership to settle, and verify fresh authorized lineage. Correcting a
 launch prerequisite does not clear the retained-writer binding.
 
+Functional Main verification offers publication only after its final turn exits
+with verified quiescence and one accepted passed report revalidates against that
+exact session and invocation. The first retained turn needs no report. A missing
+or rejected final report fails verification and records its cause; rejected
+submissions retain an operation receipt and session audit. Correct the cause and
+explicitly request fresh verification. Cleanup preserves changed or unsafe
+artifacts, and the service starts no automatic retry.
+
+When a TRIP Manager's exact retained session cannot resume, Main verification can
+qualify the same selected profile while the task keeps its resume-failure hold.
+The request must match one unresolved rejection in the latest attempt, with the
+original session proven quiescent and no independent hold. A failed verification
+does not require that original session to remain the effective generation before
+you explicitly request another verification. Changed settings or scope need their
+own current authority; verification never clears the hold itself.
+
+After the final retained turn settles and matching proof is published, Resume
+session continues that qualified conversation with ordinary task input. The task
+still keeps its resume-failure hold until you choose Continue. Continue may also
+precede Resume session once proof publication finishes. Running, unfinished,
+failed or cancelled verification cannot authorize Continue, and an independent
+hold must be resolved separately. Final verifier sessions remain fresh.
+
+For this qualified Main recovery, Continue completes the hold release in the
+versioned human request without advancing the phase or queuing another control
+step. Its durable receipt links the exact resolved rejection and completed
+verification. Later recovery in the same attempt keeps that resolved history;
+other unresolved rejections still block admission and release.
+
+Admission is checked before creating functional challenge files. A failure before
+reservation is recorded once without creating a session, proof or retry and
+preserves the hold. Cleanup removes only verified owned bytes; changed or uncertain artifacts
+stay available for inspection. If reservation or spawn evidence makes delivery
+uncertain, the service retains the exact verification and session for explicit
+recovery and preserves the existing resume-failure hold instead of treating the
+launch as not started.
+
 When verification awaits native evidence, inspect its exact session output and
-review the recorded observations before using `capability record-proof` with the
-matching evidence. The dashboard does not infer proof from consent or completion.
+review the recorded observations before publishing matching evidence through the
+contract-specific proof operation. Functional-v2 uses the typed functional proof
+path; inspect current `capability record-proof --help` for its file input. Legacy
+denial payloads cannot substitute for functional observations. The dashboard does not infer proof from consent or completion.
 Timeout/cancellation requests a stop and retains uncertainty until exit is
 established; neither authorizes a replacement. Do not overwrite files or reset
 the checkout to recover verification. Corrected scope or profile settings need
 current admission and matching proof. Unchanged ordinary resume and authorized
 rework reuse valid bindings without copying an ancestor's active session authority.
+
+## Qualification contract changes
+
+A new functional-v2 profile needs new matching evidence and task-profile
+activation; an older ready group does not qualify it. Saved groups retain their
+frozen contract and are labeled independently of status. For a failed check,
+inspect the affected role output, correct its prerequisites, then explicitly
+prepare and authorize a new verification. Staying with the same provider is
+supported; changing provider is a user choice. Refreshing does not retry paid work.
+
+For an uncertain proof-publication response, refresh and inspect the recorded
+operation before retrying. The functional publication identity is the nested
+`proof.operation_id`; reuse that identity and payload for reconciliation. Do not
+create a replacement request merely because the response was lost. Permission,
+provider-capacity, quota and restart holds still require their existing recovery
+checks; functional qualification does not release them.

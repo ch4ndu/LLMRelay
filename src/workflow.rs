@@ -18,6 +18,54 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
+// Callers bind c to the control; internal aliases must not capture a caller's session.
+pub(crate) const SETTLED_FAILED_MAIN_VERIFICATION_SQL: &str = "CASE
+    WHEN c.kind='main_checkout_verify' AND c.state='failed' AND json_valid(c.payload_json)
+    THEN COALESCE(json_type(c.payload_json)='object'
+      AND json_extract(c.payload_json,'$.actor') IN
+        ('manager','explorer','plan_reviewer','implementer','code_reviewer','final_verifier')
+      AND (
+        EXISTS(SELECT 1 FROM sessions settled_session
+          JOIN role_generations settled_generation ON settled_generation.id=settled_session.role_generation_id
+          WHERE json_type(c.payload_json,'$.session_id')='text'
+            AND json_type(c.payload_json,'$.role_generation_id')='text'
+            AND settled_session.id=json_extract(c.payload_json,'$.session_id')
+            AND settled_generation.id=json_extract(c.payload_json,'$.role_generation_id')
+            AND settled_generation.attempt_id=c.attempt_id
+            AND settled_generation.role=json_extract(c.payload_json,'$.actor')
+            AND (json_type(c.payload_json,'$.transcript_epoch') IS NULL
+              OR (json_type(c.payload_json,'$.transcript_epoch')='text'
+                AND settled_session.transcript_epoch=json_extract(c.payload_json,'$.transcript_epoch')))
+            AND ((settled_session.status='exited' AND CASE WHEN json_valid(settled_session.exit_json)
+                    THEN json_extract(settled_session.exit_json,'$.process_group_quiescent')=1 ELSE 0 END)
+              OR (settled_session.status='launch_failed' AND settled_session.launch_state='failed'
+                AND settled_session.process_identity_json IS NULL))
+            AND settled_generation.status IN ('exited','launch_failed','replaced')
+            AND NOT EXISTS(SELECT 1 FROM resume_invocations settled_resume
+              WHERE settled_resume.session_id=settled_session.id AND settled_resume.state NOT IN ('exited','proven_nondelivery'))
+            AND NOT EXISTS(SELECT 1 FROM recovery_records settled_recovery
+              WHERE settled_recovery.session_id=settled_session.id AND settled_recovery.state!='resolved_quiescent')
+            AND NOT EXISTS(SELECT 1 FROM restart_candidates settled_restart
+              WHERE settled_restart.session_id=settled_session.id
+                AND settled_restart.state NOT IN ('resumed','released_fresh_dispatch','cancelled'))
+            AND NOT EXISTS(SELECT 1 FROM input_leases settled_lease
+              WHERE settled_lease.session_id=settled_session.id AND settled_lease.revoked_at IS NULL
+                AND julianday(settled_lease.expires_at)>julianday('now')))
+        OR (json_extract(c.payload_json,'$.launch_disposition')='not_started'
+          AND COALESCE(json_type(c.payload_json,'$.turns_reserved'),'null') IN ('null','integer')
+          AND COALESCE(json_extract(c.payload_json,'$.turns_reserved'),0)=0
+          AND json_extract(c.payload_json,'$.session_id') IS NULL
+          AND COALESCE(json_type(c.payload_json,'$.launch_reservation'),'object')='object'
+          AND json_extract(c.payload_json,'$.launch_reservation.session_id') IS NULL
+          AND NOT EXISTS(SELECT 1 FROM launch_permits settled_permit
+            WHERE settled_permit.attempt_id=c.attempt_id AND settled_permit.role=json_extract(c.payload_json,'$.actor')
+              AND settled_permit.state='issued' AND settled_permit.created_at>=c.created_at)
+          AND NOT EXISTS(SELECT 1 FROM role_generations settled_owner
+            WHERE settled_owner.attempt_id=c.attempt_id AND settled_owner.role=json_extract(c.payload_json,'$.actor')
+              AND settled_owner.status IN ('launch_reserved','running','stopping') AND settled_owner.created_at>=c.created_at))
+      ),0)
+    ELSE 0 END";
+
 // A reserved route keeps its captured authority but has already moved reviewer and Explorer ownership.
 const FRESH_ROUTE_AUTHORITY: &str = "SELECT EXISTS(
                             SELECT 1 FROM audit_events event
@@ -70,6 +118,8 @@ const FRESH_ROUTE_AUTHORITY: &str = "SELECT EXISTS(
                                   AND current_capability.status='supported'
                                   AND current_capability.proof_json!='{}'
                                   AND current_capability.config_hash=json_extract(event.detail_json,'$.observed_capability_key')
+                                  AND COALESCE(json_extract(current_capability.proof_json,'$.qualification_contract'),'legacy')
+                                    =COALESCE(json_extract(event.detail_json,'$.observed_identity.qualification_contract'),'legacy')
                                   AND (json_extract(event.detail_json,'$.category') IN ('frozen_runtime_identity_changed','native_history_unavailable')
                                     OR (json_type(current_capability.proof_json,'$.compatibility')='object'
                                       AND json_extract(current_capability.proof_json,'$.compatibility.effective_hash')=
@@ -151,7 +201,7 @@ pub(crate) fn fresh_route_authorized(
     task_id: &str,
     reserved_operation_id: Option<&str>,
 ) -> Result<bool> {
-    let allowed = connection.query_row(
+    let allowed: bool = connection.query_row(
         FRESH_ROUTE_AUTHORITY,
         params![
             rejection_event_id,
@@ -165,7 +215,20 @@ pub(crate) fn fresh_route_authorized(
         ],
         |row| row.get(0),
     )?;
-    Ok(allowed)
+    if !allowed {
+        return Ok(false);
+    }
+    let (capability, key): (String, String) = connection.query_row(
+        "SELECT c.id,c.config_hash FROM audit_events event JOIN capabilities c
+           ON c.config_hash=json_extract(event.detail_json,'$.observed_capability_key')
+           AND c.provider=json_extract(event.detail_json,'$.observed_identity.provider')
+           AND c.executable_version=json_extract(event.detail_json,'$.observed_identity.executable_version')
+           AND c.role=json_extract(event.detail_json,'$.observed_identity.role')
+           AND c.mode=json_extract(event.detail_json,'$.observed_identity.mode')
+         WHERE event.id=?1 AND c.status='supported' ORDER BY c.checked_at DESC,c.rowid DESC LIMIT 1",
+        params![rejection_event_id], |row| Ok((row.get(0)?,row.get(1)?)),
+    )?;
+    Ok(crate::store::require_capability_record_contract_in(connection, &capability, &key).is_ok())
 }
 
 pub(crate) fn ordinary_control_allowed(
@@ -411,6 +474,15 @@ pub(crate) fn ordinary_control_policy(
         }
     }
     if let Some(attempt_id) = attempt_id {
+        if attention == "resume_failed"
+            && lifecycle == "in_progress"
+            && task_family(connection, task_id)? == crate::domain::WorkflowFamily::Trip
+            && task_workspace_mode(connection, task_id)?
+                == crate::domain::WorkspaceMode::MainCheckout
+            && resume_failure_has_current_replacement_authority(connection, task_id, attempt_id)?
+        {
+            controls.push("continue".to_owned());
+        }
         if crate::store::failure_stop_fence(connection, attempt_id)? == Some(false) {
             controls.retain(|control| !matches!(control.as_str(), "continue" | "run_next"));
         }
@@ -805,13 +877,200 @@ fn fresh_resume_rejection_binding(
     ))
 }
 
+// Immutable release receipts keep later session epochs from reopening a resolved rejection.
+const RESOLVED_MAIN_REJECTIONS: &str = "
+    SELECT rejection.id FROM audit_events resolution
+    JOIN audit_events rejection ON rejection.id=json_extract(resolution.detail_json,'$.resume_rejection.rejection_event_id')
+    JOIN controls release_control ON release_control.id=json_extract(resolution.detail_json,'$.release_control_id')
+    JOIN controls verification ON verification.id=json_extract(resolution.detail_json,'$.verification.control_id')
+    JOIN operation_receipts command ON command.operation_id=resolution.operation_id
+      AND command.actor_key='human_control' AND command.operation_kind='human_command'
+    JOIN audit_events applied ON applied.operation_id=command.operation_id
+      AND applied.actor_kind='human' AND applied.event_code='human.command.applied'
+      AND applied.detail_json=command.result_json
+    JOIN operation_receipts publication ON publication.operation_id=json_extract(resolution.detail_json,'$.verification.proof_operation_id')
+      AND publication.actor_key='human_control' AND publication.operation_kind='functional_main_proof'
+    WHERE resolution.event_code='session.resume.main_verification_released'
+      AND resolution.actor_kind='service' AND resolution.entity_kind='session'
+      AND json_extract(resolution.detail_json,'$.task_id')=?1 AND json_extract(resolution.detail_json,'$.attempt_id')=?2
+      AND rejection.event_code='session.resume.rejected' AND rejection.actor_kind='service' AND rejection.entity_kind='session'
+      AND resolution.entity_id=rejection.entity_id
+      AND json_extract(resolution.detail_json,'$.resume_rejection.session_id')=rejection.entity_id
+      AND json_extract(resolution.detail_json,'$.resume_rejection.role_generation_id')=json_extract(rejection.detail_json,'$.role_generation_id')
+      AND json_extract(resolution.detail_json,'$.resume_rejection.transcript_epoch')=json_extract(rejection.detail_json,'$.transcript_epoch')
+      AND json_extract(resolution.detail_json,'$.resume_rejection.resume_count')=json_extract(rejection.detail_json,'$.resume_count')
+      AND json_extract(resolution.detail_json,'$.task_id')=applied.entity_id AND applied.entity_kind='task'
+      AND json_extract(resolution.detail_json,'$.attempt_id')=json_extract(rejection.detail_json,'$.attempt_id')
+      AND release_control.kind='continue' AND release_control.state='finished' AND release_control.requested_operation_id=resolution.operation_id
+      AND json_extract(resolution.detail_json,'$.release_operation_id')=resolution.operation_id
+      AND release_control.role_generation_id=json_extract(resolution.detail_json,'$.current.role_generation_id')
+      AND release_control.payload_json=resolution.detail_json AND release_control.attempt_id=json_extract(resolution.detail_json,'$.attempt_id')
+      AND release_control.expected_version=resolution.old_version AND resolution.new_version=resolution.old_version+1
+      AND json_extract(resolution.detail_json,'$.expected_task_version')=resolution.old_version
+      AND json_extract(resolution.detail_json,'$.task_version')=resolution.new_version AND applied.new_version=resolution.new_version
+      AND json_extract(command.result_json,'$.operation_id')=resolution.operation_id
+      AND json_extract(command.result_json,'$.entity_kind')='task'
+      AND json_extract(command.result_json,'$.entity_id')=applied.entity_id
+      AND json_extract(command.result_json,'$.state')='main_resume_failure_released'
+      AND json_extract(command.result_json,'$.version')=resolution.new_version
+      AND json_extract(command.result_json,'$.detail')=resolution.detail_json
+      AND verification.kind='main_checkout_verify' AND verification.state='finished' AND verification.attempt_id=release_control.attempt_id
+      AND json_extract(verification.payload_json,'$.actor')='manager'
+      AND json_extract(verification.payload_json,'$.qualification_contract')='functional-v2'
+      AND json_extract(verification.payload_json,'$.admitted_under_hold')=1
+      AND json_extract(verification.payload_json,'$.resume_rejection')=json_extract(resolution.detail_json,'$.resume_rejection')
+      AND json_extract(verification.payload_json,'$.session_id')=json_extract(resolution.detail_json,'$.verification.session_id')
+      AND json_extract(verification.payload_json,'$.role_generation_id')=json_extract(resolution.detail_json,'$.verification.role_generation_id')
+      AND json_extract(verification.payload_json,'$.transcript_epoch')=json_extract(resolution.detail_json,'$.verification.transcript_epoch')
+      AND json_extract(verification.payload_json,'$.capability_key')=json_extract(resolution.detail_json,'$.verification.capability_key')
+      AND json_extract(verification.payload_json,'$.scope_hash')=json_extract(resolution.detail_json,'$.verification.scope_hash')
+      AND json_extract(verification.payload_json,'$.actor_settings.settings_revision')=json_extract(resolution.detail_json,'$.settings_revision')
+      AND json_extract(resolution.detail_json,'$.current.session_id')=json_extract(verification.payload_json,'$.session_id')
+      AND json_extract(resolution.detail_json,'$.current.role_generation_id')=json_extract(verification.payload_json,'$.role_generation_id')
+      AND json_extract(resolution.detail_json,'$.current.capability_key')=json_extract(verification.payload_json,'$.capability_key')
+      AND json_extract(publication.result_json,'$.qualification_contract')='functional-v2'
+      AND json_extract(publication.result_json,'$.status')='supported' AND json_extract(publication.result_json,'$.actor')='manager'
+      AND json_extract(publication.result_json,'$.session_id')=json_extract(verification.payload_json,'$.session_id')
+      AND json_extract(publication.result_json,'$.native_session_id')=json_extract(resolution.detail_json,'$.current.native_session_id')
+      AND json_extract(publication.result_json,'$.config_hash')=json_extract(verification.payload_json,'$.capability_key')
+      AND json_extract(publication.result_json,'$.scope_hash')=json_extract(verification.payload_json,'$.scope_hash')
+      AND json_extract(publication.result_json,'$.authorization.task_id')=applied.entity_id
+      AND json_extract(publication.result_json,'$.retained_observations.resume_rejection')=json_extract(resolution.detail_json,'$.resume_rejection')";
+
+fn resume_failure_has_independent_hold(
+    connection: &Connection,
+    attempt_id: &str,
+    verification_id: Option<&str>,
+) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=?1
+             AND (?2 IS NULL OR c.id!=?2) AND c.kind!='transition_proposal'
+             AND c.state NOT IN ('finished','cancelled','superseded','rejected','failed','abandoned'))
+           OR EXISTS(SELECT 1 FROM restart_candidates WHERE attempt_id=?1
+             AND state NOT IN ('resumed','released_fresh_dispatch','cancelled'))
+           OR EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=?1 AND state='attention_required')
+           OR EXISTS(SELECT 1 FROM rework_intents WHERE new_attempt_id=?1
+             AND state NOT IN ('completed','cancelled','failed'))
+           OR EXISTS(SELECT 1 FROM switch_intents WHERE attempt_id=?1
+             AND state NOT IN ('completed','cancelled','superseded'))",
+        params![attempt_id, verification_id],
+        |row| row.get(0),
+    )?)
+}
+
+pub(crate) fn main_verification_resume_rejection(
+    connection: &Connection,
+    task_id: &str,
+    attempt_id: &str,
+    actor: &str,
+    actor_settings: &serde_json::Value,
+    verification_id: Option<&str>,
+) -> Result<serde_json::Value> {
+    if actor != "manager" {
+        bail!(
+            "Main verification under this hold is available only for the rejected Manager profile"
+        )
+    }
+    if resume_failure_has_independent_hold(connection, attempt_id, verification_id)? {
+        bail!(
+            "Main verification cannot start while another hold is active; resolve that hold first"
+        )
+    }
+    let mut statement = connection.prepare(&format!(
+        "WITH resolved_main_rejections AS ({RESOLVED_MAIN_REJECTIONS})
+         SELECT event.id,event.detail_json FROM audit_events event
+         JOIN sessions s ON s.id=event.entity_id
+         JOIN role_generations g ON g.id=s.role_generation_id
+         JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id
+         WHERE event.event_code='session.resume.rejected' AND event.actor_kind='service' AND event.entity_kind='session'
+           AND a.task_id=?1 AND a.id=?2 AND t.attention='resume_failed'
+           AND a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=?1
+                     ORDER BY latest.created_at DESC LIMIT 1)
+           AND s.transcript_epoch=json_extract(event.detail_json,'$.transcript_epoch')
+           AND s.resume_count=json_extract(event.detail_json,'$.resume_count')
+           AND NOT EXISTS(SELECT 1 FROM resolved_main_rejections resolved WHERE resolved.id=event.id)
+           AND NOT EXISTS(SELECT 1 FROM audit_events route
+             WHERE route.event_code='session.resume.fresh_route.reserved'
+               AND json_extract(route.detail_json,'$.rejection_event_id')=event.id)
+           AND NOT EXISTS(SELECT 1 FROM audit_events reconciled,
+             json_each(reconciled.detail_json,'$.rejection_event_ids') rejection
+             WHERE reconciled.event_code='session.resume.turn_reconciled' AND rejection.value=event.id)",
+    ))?;
+    let events = statement
+        .query_map(params![task_id, attempt_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let [(event_id, detail)] = events.as_slice() else {
+        bail!("Main verification requires one exact unconsumed Manager resume rejection")
+    };
+    let detail: serde_json::Value = serde_json::from_str(detail)?;
+    let (_, _, _, owner, operation, _) =
+        permanent_resume_rejection_route(detail["category"].as_str().unwrap_or_default());
+    if owner != "human"
+        || operation != "replace_stale_authority"
+        || detail["same_profile_authority"] != true
+    {
+        bail!("This resume rejection does not authorize Main verification of the same Manager profile")
+    }
+    let current_settings: String = connection.query_row(
+        "SELECT json_set(config_json,'$.settings_revision',revision) FROM role_settings
+         WHERE task_id=?1 AND role='manager' ORDER BY revision DESC LIMIT 1",
+        params![task_id],
+        |row| row.get(0),
+    )?;
+    if serde_json::from_str::<serde_json::Value>(&current_settings)? != *actor_settings {
+        bail!("The selected Manager verification settings changed")
+    }
+    let valid: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+         JOIN attempts a ON a.id=g.attempt_id JOIN role_settings setting
+           ON setting.task_id=a.task_id AND setting.role=g.role AND setting.revision=g.config_revision
+         WHERE s.id=?1 AND g.id=?2 AND a.id=?3 AND g.role='manager' AND g.lane_id='default'
+           AND s.status='exited' AND g.status='exited'
+           AND json_extract(s.exit_json,'$.process_group_quiescent')=1
+           AND s.transcript_epoch=?4 AND s.resume_count=?5
+           AND g.config_revision=?6 AND a.phase=?7 AND a.candidate_hash IS ?8 AND a.plan_hash IS ?9
+           AND setting.revision=(SELECT MAX(revision) FROM role_settings WHERE task_id=a.task_id AND role='manager')
+           AND EXISTS(SELECT 1 FROM audit_events event WHERE event.id=?10 AND event.entity_id=s.id)
+           AND NOT EXISTS(SELECT 1 FROM guidance_messages WHERE role_generation_id=g.id
+             AND state IN ('queued','delivery_reserved','written_awaiting_submit','delivery_unknown'))
+           AND NOT EXISTS(SELECT 1 FROM permission_requests WHERE role_generation_id=g.id AND state='pending')
+           AND NOT EXISTS(SELECT 1 FROM input_leases WHERE session_id=s.id AND revoked_at IS NULL AND expires_at>?11)
+           AND NOT EXISTS(SELECT 1 FROM sessions active JOIN role_generations owner ON owner.id=active.role_generation_id
+             WHERE owner.attempt_id=a.id AND (active.status NOT IN ('exited','launch_failed')
+               OR (active.status='exited' AND COALESCE(json_extract(active.exit_json,'$.process_group_quiescent'),0)!=1))))",
+        params![detail["session_id"].as_str(), detail["role_generation_id"].as_str(), attempt_id,
+            detail["transcript_epoch"].as_str(), detail["resume_count"].as_i64(), detail["config_revision"].as_i64(),
+            detail["attempt_phase"].as_str(), detail["candidate_hash"].as_str(), detail["plan_hash"].as_str(),
+            event_id, Utc::now().to_rfc3339()],
+        |row| row.get(0),
+    )?;
+    if !valid
+        || detail["attempt_id"] != attempt_id
+        || detail["role"] != actor
+        || detail["lane_id"] != "default"
+    {
+        bail!("The Manager resume rejection no longer matches its exact quiescent session, settings, or task scope")
+    }
+    Ok(
+        serde_json::json!({"rejection_event_id":event_id,"session_id":detail["session_id"],
+        "role_generation_id":detail["role_generation_id"],"transcript_epoch":detail["transcript_epoch"],
+        "resume_count":detail["resume_count"]}),
+    )
+}
+
 fn resume_failure_has_current_replacement_authority(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     task_id: &str,
     attempt_id: &str,
 ) -> Result<bool> {
-    Ok(transaction.query_row(
-        "SELECT EXISTS(
+    if resume_failure_has_independent_hold(connection, attempt_id, None)? {
+        return Ok(false);
+    }
+    Ok(connection.query_row(&format!(
+        "WITH resolved_main_rejections AS ({RESOLVED_MAIN_REJECTIONS})
+         SELECT EXISTS(
             SELECT 1 FROM audit_events event
             JOIN sessions rejected_session ON rejected_session.id=event.entity_id
             JOIN role_generations rejected_generation
@@ -823,6 +1082,22 @@ fn resume_failure_has_current_replacement_authority(
              AND replacement.lane_id=rejected_generation.lane_id
              AND replacement.generation>rejected_generation.generation
              AND replacement.status IN ('launch_reserved','running','exited','stopping')
+             AND NOT EXISTS(SELECT 1 FROM controls verification JOIN sessions qualified
+               ON qualified.role_generation_id=replacement.id
+               WHERE verification.attempt_id=replacement.attempt_id AND verification.kind='main_checkout_verify'
+                 AND (json_extract(verification.payload_json,'$.session_id')=qualified.id
+                   OR json_extract(verification.payload_json,'$.launch_reservation.session_id')=qualified.id)
+                 AND (verification.state!='finished'
+                   OR json_extract(verification.payload_json,'$.session_id') IS NOT qualified.id
+                   OR json_extract(verification.payload_json,'$.role_generation_id') IS NOT replacement.id
+                   OR json_extract(verification.payload_json,'$.capability_key') IS NOT qualified.capability_key
+                   OR json_extract(verification.payload_json,'$.actor') IS NOT replacement.role
+                   OR (json_extract(verification.payload_json,'$.admitted_under_hold')=1
+                     AND (json_extract(verification.payload_json,'$.resume_rejection.rejection_event_id') IS NOT event.id
+                       OR json_extract(verification.payload_json,'$.resume_rejection.session_id') IS NOT rejected_session.id
+                       OR json_extract(verification.payload_json,'$.resume_rejection.role_generation_id') IS NOT rejected_generation.id
+                       OR json_extract(verification.payload_json,'$.resume_rejection.transcript_epoch') IS NOT rejected_session.transcript_epoch
+                       OR json_extract(verification.payload_json,'$.resume_rejection.resume_count') IS NOT rejected_session.resume_count))))
              AND (
                 EXISTS(SELECT 1 FROM role_settings setting
                         WHERE setting.task_id=?1 AND setting.role=replacement.role
@@ -844,10 +1119,29 @@ fn resume_failure_has_current_replacement_authority(
                AND json_extract(event.detail_json,'$.session_id')=rejected_session.id
                AND json_extract(event.detail_json,'$.transcript_epoch')=rejected_session.transcript_epoch
                AND json_extract(event.detail_json,'$.category') IS NOT NULL
+               AND rejected_session.resume_count=json_extract(event.detail_json,'$.resume_count')
+               AND NOT EXISTS(SELECT 1 FROM resolved_main_rejections resolved WHERE resolved.id=event.id)
+               AND NOT EXISTS(SELECT 1 FROM audit_events route
+                 WHERE route.event_code='session.resume.fresh_route.reserved'
+                   AND json_extract(route.detail_json,'$.rejection_event_id')=event.id)
+               AND NOT EXISTS(SELECT 1 FROM audit_events reconciled,
+                 json_each(reconciled.detail_json,'$.rejection_event_ids') rejection
+                 WHERE reconciled.event_code='session.resume.turn_reconciled' AND rejection.value=event.id)
+               AND NOT EXISTS(SELECT 1 FROM audit_events other JOIN sessions s ON s.id=other.entity_id
+                 JOIN role_generations g ON g.id=s.role_generation_id
+                 WHERE other.event_code='session.resume.rejected' AND g.attempt_id=?2 AND other.id!=event.id
+                   AND json_extract(other.detail_json,'$.transcript_epoch')=s.transcript_epoch
+                   AND json_extract(other.detail_json,'$.resume_count')=s.resume_count
+                   AND NOT EXISTS(SELECT 1 FROM resolved_main_rejections resolved WHERE resolved.id=other.id)
+                   AND NOT EXISTS(SELECT 1 FROM audit_events route WHERE route.event_code='session.resume.fresh_route.reserved'
+                     AND json_extract(route.detail_json,'$.rejection_event_id')=other.id)
+                   AND NOT EXISTS(SELECT 1 FROM audit_events reconciled,
+                     json_each(reconciled.detail_json,'$.rejection_event_ids') rejection
+                     WHERE reconciled.event_code='session.resume.turn_reconciled' AND rejection.value=other.id))
                AND NOT EXISTS(SELECT 1 FROM recovery_records recovery
                               WHERE recovery.attempt_id=rejected_attempt.id
                                 AND recovery.state='attention_required')
-        )",
+        )"),
         params![task_id, attempt_id],
         |row| row.get(0),
     )?)
@@ -2456,6 +2750,7 @@ pub fn execute_with_runtime(
                 if action == "continue" && pending_continue(&transaction, &attempt, None)? {
                     bail!("a Continue control is already pending for this attempt")
                 }
+                let mut main_resume_release = None;
                 if action == "continue" && attention == "resume_failed" {
                     if payload.get("resume_rejection").is_some() {
                         let (
@@ -2555,6 +2850,102 @@ pub fn execute_with_runtime(
                         &attempt,
                     )? {
                         bail!("continue cannot clear a resume failure without the current exact rejected-session fresh-route authority")
+                    } else if task_family(&transaction, task_id)?
+                        == crate::domain::WorkflowFamily::Trip
+                        && task_workspace_mode(&transaction, task_id)?
+                            == crate::domain::WorkspaceMode::MainCheckout
+                    {
+                        let mut statement = transaction.prepare(&format!(
+                            "WITH resolved_main_rejections AS ({RESOLVED_MAIN_REJECTIONS})
+                             SELECT c.id,c.payload_json,json_object('session_id',s.id,'role_generation_id',g.id,
+                                'native_session_id',s.native_session_id,'capability_key',s.capability_key,
+                                'transcript_epoch',s.transcript_epoch,'resume_count',s.resume_count,'settings_revision',g.config_revision)
+                             FROM role_settings setting JOIN role_generations g ON g.id=setting.effective_generation_id
+                             JOIN sessions s ON s.role_generation_id=g.id JOIN controls c ON c.attempt_id=g.attempt_id
+                             JOIN audit_events rejection ON rejection.id=json_extract(c.payload_json,'$.resume_rejection.rejection_event_id')
+                             JOIN sessions rejected_session ON rejected_session.id=rejection.entity_id
+                             JOIN role_generations rejected_generation ON rejected_generation.id=rejected_session.role_generation_id
+                             WHERE setting.task_id=?1 AND setting.role='manager' AND g.attempt_id=?2
+                               AND g.role='manager' AND g.lane_id='default'
+                               AND setting.revision=g.config_revision AND c.kind='main_checkout_verify'
+                               AND rejection.event_code='session.resume.rejected' AND rejection.actor_kind='service' AND rejection.entity_kind='session'
+                               AND rejected_generation.attempt_id=g.attempt_id AND rejected_generation.role=g.role
+                               AND rejected_generation.lane_id=g.lane_id AND rejected_generation.generation<g.generation
+                               AND json_extract(c.payload_json,'$.resume_rejection.session_id')=rejected_session.id
+                               AND json_extract(c.payload_json,'$.resume_rejection.role_generation_id')=rejected_generation.id
+                               AND json_extract(c.payload_json,'$.resume_rejection.transcript_epoch')=rejected_session.transcript_epoch
+                               AND json_extract(c.payload_json,'$.resume_rejection.resume_count')=rejected_session.resume_count
+                               AND NOT EXISTS(SELECT 1 FROM resolved_main_rejections resolved WHERE resolved.id=rejection.id)
+                               AND (json_type(c.payload_json,'$.qualification_contract') IS NOT NULL
+                                 OR json_extract(c.payload_json,'$.admitted_under_hold')=1)
+                               AND (json_extract(c.payload_json,'$.session_id')=s.id
+                                 OR json_extract(c.payload_json,'$.launch_reservation.session_id')=s.id)
+                             LIMIT 2",
+                        ))?;
+                        let qualifications = statement
+                            .query_map(params![task_id, attempt], |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                ))
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        drop(statement);
+                        if qualifications.len() > 1 {
+                            bail!("Continue requires one exact completed Main verification")
+                        }
+                        if let Some((verification_id, verification_json, current_json)) =
+                            qualifications.first()
+                        {
+                            let verification: serde_json::Value =
+                                serde_json::from_str(verification_json)?;
+                            let current: serde_json::Value = serde_json::from_str(current_json)?;
+                            if verification["qualification_contract"] != "functional-v2"
+                                || verification["admitted_under_hold"] != true
+                                || verification["actor"] != "manager"
+                                || verification["actor_settings"]["settings_revision"]
+                                    != current["settings_revision"]
+                            {
+                                bail!(
+                                    "Continue requires the exact held Main qualification authority"
+                                )
+                            }
+                            let publication: Option<(String,String)> = transaction.query_row(
+                                "SELECT proof.id,publication.operation_id FROM capabilities proof
+                                 JOIN operation_receipts publication ON publication.actor_key='human_control'
+                                   AND publication.operation_kind='functional_main_proof' AND publication.result_json=proof.proof_json
+                                 JOIN controls c ON c.id=?1 AND c.state='finished'
+                                 JOIN sessions s ON s.id=json_extract(c.payload_json,'$.session_id')
+                                 WHERE proof.mode='main_checkout' AND proof.status='supported' AND proof.role='manager'
+                                   AND proof.provider=s.provider AND proof.executable_version=s.executable_version
+                                   AND proof.config_hash=s.capability_key AND proof.config_hash=json_extract(c.payload_json,'$.capability_key')
+                                   AND json_extract(proof.proof_json,'$.qualification_contract')='functional-v2'
+                                   AND json_extract(proof.proof_json,'$.session_id')=s.id
+                                   AND json_extract(proof.proof_json,'$.native_session_id')=s.native_session_id
+                                   AND json_extract(proof.proof_json,'$.authorization.task_id')=?2
+                                   AND json_extract(proof.proof_json,'$.scope_hash')=json_extract(c.payload_json,'$.scope_hash')
+                                   AND json_extract(proof.proof_json,'$.retained_observations.resume_rejection')
+                                     =json_extract(c.payload_json,'$.resume_rejection')",
+                                params![verification_id,task_id], |row| Ok((row.get(0)?,row.get(1)?)),
+                            ).optional()?;
+                            let (capability_id, proof_operation_id) = publication.context("Continue requires the published proof for its exact held Main verification")?;
+                            crate::store::require_capability_record_contract_in(
+                                &transaction,
+                                &capability_id,
+                                verification["capability_key"]
+                                    .as_str()
+                                    .context("Main qualification has no capability key")?,
+                            )?;
+                            main_resume_release = Some(serde_json::json!({
+                                "task_id":task_id,"attempt_id":attempt,"settings_revision":current["settings_revision"],
+                                "resume_rejection":verification["resume_rejection"],"current":current,
+                                "verification":{"control_id":verification_id,"session_id":verification["session_id"],
+                                    "role_generation_id":verification["role_generation_id"],"transcript_epoch":verification["transcript_epoch"],
+                                    "capability_key":verification["capability_key"],"scope_hash":verification["scope_hash"],"proof_operation_id":proof_operation_id},
+                                "expected_task_version":expected_version,"task_version":expected_version+1
+                            }));
+                        }
                     }
                 }
                 let (attempt_status, attempt_phase): (String, String) = transaction.query_row(
@@ -2670,9 +3061,10 @@ pub fn execute_with_runtime(
                         |row| row.get(0),
                     ).optional()?.ok_or_else(|| anyhow!("Stop manager requires the current manager to have an owned live or reserved session"))?;
                     let other_hold: bool = transaction.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
-                         AND state NOT IN ('finished','cancelled','superseded','rejected')
-                         AND NOT (kind IN ('manager_stop','manager_change') AND state='failed'))",
+                        &format!("SELECT EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=?1
+                         AND c.state NOT IN ('finished','cancelled','superseded','rejected')
+                         AND NOT ({SETTLED_FAILED_MAIN_VERIFICATION_SQL})
+                         AND NOT (c.kind IN ('manager_stop','manager_change') AND c.state='failed'))"),
                         params![attempt],
                         |row| row.get(0),
                     )?;
@@ -2748,10 +3140,13 @@ pub fn execute_with_runtime(
                         bail!("change manager waits for the stopped manager's verified process-group exit")
                     }
                     let conflicting_hold: bool = transaction.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1
-                         AND state NOT IN ('finished','cancelled','superseded','rejected')
-                         AND NOT ((kind='manager_stop' AND state='held')
-                           OR (kind IN ('manager_stop','manager_change') AND state='failed')))",
+                        &format!(
+                            "SELECT EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=?1
+                         AND c.state NOT IN ('finished','cancelled','superseded','rejected')
+                         AND NOT ({SETTLED_FAILED_MAIN_VERIFICATION_SQL})
+                         AND NOT ((c.kind='manager_stop' AND c.state='held')
+                           OR (c.kind IN ('manager_stop','manager_change') AND c.state='failed')))"
+                        ),
                         params![attempt],
                         |row| row.get(0),
                     )?;
@@ -2822,8 +3217,9 @@ pub fn execute_with_runtime(
                         |row| row.get(0),
                     ).optional()?.ok_or_else(|| anyhow!("continue manager requires this task's durable manager stop hold"))?;
                     let other_hold: bool = transaction.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1 AND id!=?2
-                         AND state NOT IN ('finished','cancelled','superseded','rejected'))",
+                        &format!("SELECT EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=?1 AND c.id!=?2
+                         AND c.state NOT IN ('finished','cancelled','superseded','rejected')
+                         AND NOT ({SETTLED_FAILED_MAIN_VERIFICATION_SQL}))"),
                         params![attempt, stop_id],
                         |row| row.get(0),
                     )?;
@@ -2842,6 +3238,36 @@ pub fn execute_with_runtime(
                         Some(expected_version + 1),
                         "manager_stop_released",
                     )
+                } else if let Some(mut release) = main_resume_release {
+                    let control_id = uuid::Uuid::new_v4().to_string();
+                    release["release_control_id"] = control_id.clone().into();
+                    release["release_operation_id"] = operation_id.into();
+                    release["attempt_phase"] = attempt_phase.into();
+                    release["attempt_status"] = attempt_status.into();
+                    let release_json = serde_json::to_string(&release)?;
+                    transaction.execute("INSERT INTO controls(id,attempt_id,role_generation_id,kind,state,expected_version,payload_json,created_at,updated_at,requested_operation_id)
+                        VALUES(?1,?2,?3,'continue','finished',?4,?5,?6,?6,?7)",
+                        params![control_id,attempt,release["current"]["role_generation_id"].as_str(),expected_version,release_json,now,operation_id])?;
+                    if transaction.execute(
+                        "UPDATE tasks SET attention='none',version=version+1,updated_at=?1
+                        WHERE id=?2 AND version=?3 AND attention='resume_failed'",
+                        params![now, task_id, expected_version],
+                    )? != 1
+                    {
+                        bail!("task changed while releasing its qualified Main resume failure")
+                    }
+                    transaction.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,old_version,new_version,detail_json,created_at)
+                        VALUES(?1,?2,'service','session.resume.main_verification_released','session',?3,?4,?5,?6,?7)",
+                        params![uuid::Uuid::new_v4().to_string(),operation_id,release["resume_rejection"]["session_id"].as_str(),expected_version,expected_version+1,release_json,now])?;
+                    let mut completed = result(
+                        operation_id,
+                        "task",
+                        task_id.clone(),
+                        Some(expected_version + 1),
+                        "main_resume_failure_released",
+                    );
+                    completed.detail = release;
+                    completed
                 } else {
                     transaction.execute("INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at,requested_operation_id) VALUES(?1,?2,?3,'requested',?4,?5,?6,?6,?7)",
                     params![uuid::Uuid::new_v4().to_string(), attempt, action, expected_version, serde_json::to_string(payload)?, now,operation_id])?;
@@ -4112,41 +4538,27 @@ pub fn role_preparations(
                 let capability_key = match crate::providers::capability_key(&prepared.config) {
                     Ok(key) => key,
                     Err(error) => {
-                        preparations.push(serde_json::json!({
+                        let mut preparation = serde_json::json!({
                             "task_id":task_id,
                             "role":role,
                             "requested_revision":revision,
                             "config":config,
                             "status":"unsupported",
                             "reason":format!("Current preparation identity failed: {error:#}"),
-                        }));
+                        });
+                        if let Some(contract) = prepared.config.security_policy.get("qualification_contract")
+                        {
+                            preparation["qualification_contract"] = contract.clone();
+                        }
+                        preparations.push(preparation);
                         continue;
                     }
                 };
                 let supported = {
                     let connection = store.lock()?;
-                    connection.query_row(
-                        "SELECT EXISTS(
-                            SELECT 1 FROM capabilities current_capability
-                            WHERE current_capability.rowid=(
-                                SELECT latest_capability.rowid FROM capabilities latest_capability
-                                WHERE latest_capability.provider=?1
-                                  AND latest_capability.executable_version=?2
-                                  AND latest_capability.role=?3
-                                  AND latest_capability.mode='interactive_pty'
-                                ORDER BY latest_capability.checked_at DESC,
-                                         latest_capability.rowid DESC LIMIT 1)
-                              AND current_capability.config_hash=?4
-                              AND current_capability.status='supported'
-                              AND current_capability.proof_json!='{}')",
-                        params![
-                            provider.to_string(),
-                            prepared.config.executable_version,
-                            role.to_string(),
-                            capability_key,
-                        ],
-                        |row| row.get::<_, bool>(0),
-                    )?
+                    crate::store::require_supported_capability_in(
+                        &connection, &prepared.config, &store.compatibility_bundles,
+                    ).is_ok()
                 };
                 let authority = {
                     let connection = store.lock()?;
@@ -4167,15 +4579,22 @@ pub fn role_preparations(
                         .map(|value| value.descriptor.source.as_str())
                         .unwrap_or("task_override");
                     connection.query_row(
-                        "SELECT json_object('id',a.id,'scope_hash',a.scope_hash,'state',a.state,'fresh_call_count',a.fresh_call_count,'failure_reason',a.failure_reason,'failure_category',(SELECT json_extract(rr.metadata_json,'$.validation_observation.failure_category') FROM role_results rr WHERE rr.session_id=p.session_id AND rr.outcome='capability_observed' ORDER BY rr.created_at DESC LIMIT 1),'probe_state',p.state,'session_id',p.session_id,'session_status',s.status,'readiness',s.readiness_state,'hook_trust',s.hook_trust_state,'has_native_session',s.native_session_id IS NOT NULL)
+                        "SELECT json_object('id',a.id,'scope_hash',a.scope_hash,'state',a.state,'fresh_call_count',a.fresh_call_count,'failure_reason',a.failure_reason,'failure_category',(SELECT json_extract(rr.metadata_json,'$.validation_observation.failure_category') FROM role_results rr WHERE rr.session_id=p.session_id AND rr.outcome='capability_observed' ORDER BY rr.created_at DESC LIMIT 1),'probe_state',p.state,'session_id',p.session_id,'session_status',s.status,'readiness',s.readiness_state,'hook_trust',s.hook_trust_state,'has_native_session',s.native_session_id IS NOT NULL),p.capability_identity_json
                          FROM trip_runtime_probes p JOIN trip_runtime_admissions a ON a.id=p.admission_id
                          LEFT JOIN sessions s ON s.id=p.session_id
                          WHERE a.project_id=(SELECT project_id FROM tasks WHERE id=?1)
                            AND ((?4='task_override' AND a.task_id=?1) OR (?4='project_default' AND a.task_id IS NULL))
                            AND p.role=?2 AND p.capability_key=?3 ORDER BY a.created_at DESC LIMIT 1",
                         params![task_id,role.to_string(),capability_key,source],
-                        |row|row.get::<_,String>(0),
-                    ).optional()?.and_then(|value|serde_json::from_str::<serde_json::Value>(&value).ok())
+                        |row|Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?)),
+                    ).optional()?.map(|(value, identity)| -> Result<_> {
+                        let mut admission: serde_json::Value = serde_json::from_str(&value)?;
+                        let identity: serde_json::Value = serde_json::from_str(&identity)?;
+                        if let Some(contract) = identity.pointer("/security_policy/qualification_contract") {
+                            admission["qualification_contract"] = contract.clone();
+                        }
+                        Ok(admission)
+                    }).transpose()?
                 };
                 let generic_supported = supported;
                 let exact_runtime_authority = authority
@@ -4191,7 +4610,7 @@ pub fn role_preparations(
                             .ok()
                             .and_then(|value| value.exact_runtime_reason.clone())
                     });
-                preparations.push(serde_json::json!({
+                let mut preparation = serde_json::json!({
                     "task_id":task_id,
                     "role":role,
                     "requested_revision":revision,
@@ -4217,7 +4636,12 @@ pub fn role_preparations(
                     } else {
                         "Exact current prepared capability requires validation"
                     },
-                }));
+                });
+                if let Some(contract) = prepared.config.security_policy.get("qualification_contract")
+                {
+                    preparation["qualification_contract"] = contract.clone();
+                }
+                preparations.push(preparation);
             }
             Err(error) => preparations.push(serde_json::json!({
                 "task_id":task_id,
@@ -5025,7 +5449,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         "status": "unverified",
         "reason": crate::providers::codex::IMPLEMENTER_NATIVE_POLICY_REASON,
     })];
-    let mut capabilities = json_rows_no_param(&connection, "SELECT json_object('rowid',rowid,'provider',provider,'version',executable_version,'role',role,'mode',mode,'config_hash',config_hash,'hook_hash',hook_hash,'status',status,'proof',json(proof_json),'gaps',json(gaps_json),'checked_at',checked_at) FROM capabilities ORDER BY provider,role")?;
+    let mut capabilities = json_rows_no_param(&connection, "SELECT json_object('id',id,'rowid',rowid,'provider',provider,'version',executable_version,'role',role,'mode',mode,'config_hash',config_hash,'hook_hash',hook_hash,'status',status,'proof',json(proof_json),'gaps',json(gaps_json),'checked_at',checked_at) FROM capabilities ORDER BY provider,role")?;
     for capability in &mut capabilities {
         let Some(provider) = capability
             .get("provider")
@@ -5046,8 +5470,20 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         let current = store.compatibility_bundles.resolve(provider, version, role);
+        let source_compatibility = if capability["mode"] == "main_checkout" {
+            capability.pointer("/proof/session_id").and_then(serde_json::Value::as_str)
+                .map(|session| connection.query_row(
+                    "SELECT json_extract(capability_identity_json,'$.compatibility') FROM sessions WHERE id=?1",
+                    params![session], |row| row.get::<_, Option<String>>(0),
+                ).optional()).transpose()?.flatten().flatten()
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+        } else {
+            None
+        };
         let recorded = capability
             .pointer("/proof/compatibility")
+            .or_else(|| capability.pointer("/proof/capability_identity/compatibility"))
+            .or(source_compatibility.as_ref())
             .and_then(|value| {
                 serde_json::from_value::<crate::provider_compatibility::AuthorityBinding>(
                     value.clone(),
@@ -5088,6 +5524,23 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
                 }
             } else {
                 capability["gaps"] = serde_json::json!([gap]);
+            }
+        }
+        if capability["status"] == "supported"
+            && matches!(
+                capability["mode"].as_str(),
+                Some("interactive_pty" | "main_checkout")
+            )
+            && crate::store::require_capability_record_contract_in(
+                &connection,
+                capability["id"].as_str().unwrap_or_default(),
+                capability["config_hash"].as_str().unwrap_or_default(),
+            )
+            .is_err()
+        {
+            capability["status"] = "unverified".into();
+            if let Some(gaps) = capability["gaps"].as_array_mut() {
+                gaps.push("qualification_contract_mismatch".into());
             }
         }
         capability["compatibility"] = serde_json::to_value(explanation)?;
@@ -5143,11 +5596,11 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             'capability_key',s.capability_key,
             'current_capability_key',(SELECT c.config_hash FROM capabilities c
               WHERE c.provider=s.provider AND c.executable_version=s.executable_version
-                AND c.role=rg.role AND c.mode='interactive_pty'
+                AND c.role=rg.role AND c.mode=CASE WHEN json_type(s.launch_config_json,'$.security_policy.checkout_scope')='object' THEN 'main_checkout' ELSE 'interactive_pty' END
               ORDER BY c.checked_at DESC,c.rowid DESC LIMIT 1),
             'current_capability_rowid',(SELECT c.rowid FROM capabilities c
               WHERE c.provider=s.provider AND c.executable_version=s.executable_version
-                AND c.role=rg.role AND c.mode='interactive_pty'
+                AND c.role=rg.role AND c.mode=CASE WHEN json_type(s.launch_config_json,'$.security_policy.checkout_scope')='object' THEN 'main_checkout' ELSE 'interactive_pty' END
               ORDER BY c.checked_at DESC,c.rowid DESC LIMIT 1),
             'capability_current',EXISTS(SELECT 1 FROM capabilities current_capability
               WHERE current_capability.rowid=(
@@ -5155,7 +5608,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
                 WHERE latest_capability.provider=s.provider
                   AND latest_capability.executable_version=s.executable_version
                   AND latest_capability.role=rg.role
-                  AND latest_capability.mode='interactive_pty'
+                  AND latest_capability.mode=CASE WHEN json_type(s.launch_config_json,'$.security_policy.checkout_scope')='object' THEN 'main_checkout' ELSE 'interactive_pty' END
                 ORDER BY latest_capability.checked_at DESC,latest_capability.rowid DESC LIMIT 1)
                 AND current_capability.config_hash=s.capability_key
                 AND current_capability.status='supported'
@@ -5215,7 +5668,13 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
                 && capability.get("config_hash") == session.get("capability_key")
                 && capability.get("status").and_then(serde_json::Value::as_str) == Some("supported")
         });
-        session["capability_current"] = serde_json::json!(current.is_some());
+        let eligible = session
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(|id| crate::store::session_capability_is_current_in(&connection, id))
+            .transpose()?
+            .unwrap_or(false);
+        session["capability_current"] = serde_json::json!(eligible && current.is_some());
         if let Some(session_id) = session
             .get("id")
             .and_then(serde_json::Value::as_str)
@@ -5268,8 +5727,11 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
                 serde_json::to_value(provider_failure_holds(&connection, &session_id)?)?;
         }
     }
-    let controls = json_rows_no_param(&connection, "SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,'kind',kind,'state',state,'payload',json(payload_json),'updated_at',updated_at)
-        FROM controls WHERE state NOT IN ('finished','cancelled') OR (kind='main_checkout_verify' AND state='cancelled'
+    let mut controls = json_rows_no_param(&connection, "SELECT json_object('id',id,'attempt_id',attempt_id,'role_generation_id',role_generation_id,'kind',kind,'state',state,'payload',json(payload_json),'updated_at',updated_at)
+        FROM controls WHERE state NOT IN ('finished','cancelled')
+          OR (kind='main_checkout_verify' AND state='finished' AND json_extract(payload_json,'$.actor') IN ('manager','explorer','plan_reviewer','implementer','code_reviewer','final_verifier')
+            AND COALESCE(json_extract(payload_json,'$.coding_started'),0)=0)
+          OR (kind='main_checkout_verify' AND state='cancelled'
           AND NOT EXISTS(SELECT 1 FROM controls newer WHERE newer.kind='main_checkout_verify'
             AND newer.attempt_id IS controls.attempt_id
             AND json_extract(newer.payload_json,'$.task_id') IS json_extract(controls.payload_json,'$.task_id')
@@ -5526,6 +5988,10 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             },
         });
     }
+    for task in &mut tasks {
+        task.workspace_mode = task_workspace_mode(&connection, &task.id)?;
+        task.workflow = task_workflow_projection(&connection, &task.id)?;
+    }
     let mut continuation_actions = continuation_actions(
         &projects,
         &tasks,
@@ -5541,6 +6007,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         &trip_lanes,
         &decisions,
     );
+    controls.retain(|control| control["state"] != "finished");
     continuation_actions.extend(migration_actions);
     for setup in &mut trip_setups {
         let setup_receipts = setup
@@ -5643,10 +6110,6 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         }
     }
     let observations = crate::store::open_attention_observations(&connection)?;
-    for task in &mut tasks {
-        task.workspace_mode = task_workspace_mode(&connection, &task.id)?;
-        task.workflow = task_workflow_projection(&connection, &task.id)?;
-    }
     let workflow_execution = workflow_execution_projection(
         &connection,
         &store.compatibility_bundles,
@@ -8079,17 +8542,39 @@ fn continuation_actions(
             {
                 continue;
             }
-            // An ordinary role session that reported its result in its latest
-            // invocation was stopped after completing that turn, and a
-            // superseded generation no longer owns the role. Both are history;
-            // the coordinator owns any later dispatch.
-            let historical_role_session = ordinary_task.is_some()
-                && (!session_generation_current
-                    || session
-                        .get("reported_in_latest_invocation")
-                        .is_some_and(|value| {
-                            value.as_bool() == Some(true) || value.as_i64() == Some(1)
-                        }));
+            let trip_task = ordinary_task
+                .and_then(|task| task.workflow.as_ref())
+                .is_some_and(|workflow| workflow.family == crate::domain::WorkflowFamily::Trip);
+            let unfinished_main_verification = trip_task
+                && controls.iter().any(|control| {
+                    control["kind"] == "main_checkout_verify"
+                        && control["state"] != "finished"
+                        && control["attempt_id"] == session["attempt_id"]
+                        && control["payload"]["session_id"] == session["id"]
+                });
+            let completed_main_verification = trip_task
+                && controls.iter().any(|control| {
+                    let payload = &control["payload"];
+                    control["kind"] == "main_checkout_verify"
+                        && control["state"] == "finished"
+                        && control["attempt_id"] == session["attempt_id"]
+                        && payload["actor"] == session["role"]
+                        && payload["session_id"] == session["id"]
+                        && payload["role_generation_id"] == session["role_generation_id"]
+                        && payload["transcript_epoch"] == session["transcript_epoch"]
+                        && payload["capability_key"]
+                            .as_str()
+                            .is_some_and(|key| session["capability_key"].as_str() == Some(key))
+                        && payload["coding_started"] != true
+                });
+            let historical_role_session =
+                ordinary_task.is_some()
+                    && (!session_generation_current
+                        || unfinished_main_verification
+                        || (!completed_main_verification
+                            && session.get("reported_in_latest_invocation").is_some_and(
+                                |value| value.as_bool() == Some(true) || value.as_i64() == Some(1),
+                            )));
             let matching_rejection = history.iter().find(|event| {
                 event.get("event_code").and_then(serde_json::Value::as_str)
                     == Some("session.resume.rejected")
@@ -8629,7 +9114,9 @@ fn continuation_actions(
                         ContinuationActionKind::AuthorizationRequired
                     },
                     resumable,
-                    if resumable {
+                    if resumable && completed_main_verification {
+                        "Main verification is complete. Resume this qualified conversation to continue the task; Continue releases any separate resume-failure hold."
+                    } else if resumable {
                         "The session stopped before reporting its result. You can resume the same session where it left off."
                     } else if !quiescent {
                         "The session stopped before reporting its result. It can be resumed once LLMRelay confirms it has fully exited."
@@ -10921,14 +11408,38 @@ pub(crate) fn require_workspace_execution_supported(
         if recorded_checkout_authorization(connection, task_id)?.as_ref() != Some(&scope) {
             bail!("The Main checkout scope changed. Stop or cancel the current run, then authorize the displayed checkout with Make Ready.")
         }
-        let verified: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM capabilities WHERE mode='main_checkout' AND status='supported'
-             AND json_extract(proof_json,'$.authorization.scope_hash')=?1)
-             OR EXISTS(SELECT 1 FROM controls WHERE kind='main_checkout_verify' AND state IN ('native_requested','native_running')
+        let pending: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM controls WHERE kind='main_checkout_verify' AND state IN ('native_requested','native_running')
                AND json_extract(payload_json,'$.authorization.scope_hash')=?1)",
             params![scope.scope_hash], |row| row.get(0),
         )?;
-        if !verified && pending_checkout_verification(connection, task_id)?.is_none() {
+        let functional = task_family(connection, task_id)? == crate::domain::WorkflowFamily::Trip;
+        let mut statement = connection.prepare(
+            "SELECT id,config_hash,proof_json FROM capabilities WHERE mode='main_checkout' AND status='supported'
+               AND json_extract(proof_json,'$.authorization.scope_hash')=?1",
+        )?;
+        let proofs = statement
+            .query_map(params![scope.scope_hash], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let verified = proofs.iter().any(|(id, key, proof)| {
+            let contract = serde_json::from_str::<serde_json::Value>(proof)
+                .ok()
+                .and_then(|proof| crate::domain::QualificationContract::from_record(&proof).ok());
+            contract
+                == Some(if functional {
+                    crate::domain::QualificationContract::FunctionalV2
+                } else {
+                    crate::domain::QualificationContract::Legacy
+                })
+                && crate::store::require_capability_record_contract_in(connection, id, key).is_ok()
+        });
+        if !verified && !pending && pending_checkout_verification(connection, task_id)?.is_none() {
             bail!("Verify this Main checkout's native permissions before starting it. Existing worktree proof cannot authorize Main checkout execution.")
         }
     }
@@ -13321,16 +13832,19 @@ pub fn execute_workflow_command(
                 transaction.query_row("SELECT json_set(config_json,'$.settings_revision',revision) FROM role_settings WHERE task_id=?1 AND role=?2 ORDER BY revision DESC LIMIT 1",params![task_id,actor], |row|row.get(0))?
             };
             let pending: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM controls WHERE kind='main_checkout_verify' AND state IN ('native_requested','native_running','native_stopping','awaiting_native_evidence')
+                "SELECT EXISTS(SELECT 1 FROM controls WHERE kind='main_checkout_verify' AND state IN ('native_requested','native_running','native_stopping','awaiting_native_evidence','recovery_required')
                  AND json_extract(payload_json,'$.task_id')=?1)", params![task_id], |row| row.get(0),
             )?;
             if pending || pending_checkout_verification(&transaction, task_id)?.is_some() {
                 bail!("This checkout already has a verification in progress; reconcile or cancel that exact verification before starting another")
             }
-            let detail = serde_json::json!({"task_id":task_id,"actor":actor,"authorization":authorization,
+            let mut detail = serde_json::json!({"task_id":task_id,"actor":actor,"authorization":authorization,
                 "actor_settings":serde_json::from_str::<serde_json::Value>(&actor_settings)?,
                 "phase":"first","deadline_at":(Utc::now()+chrono::Duration::seconds(300)).to_rfc3339(),
                 "max_turns":if actor=="final_verifier" {1} else {2},"nonce":uuid::Uuid::new_v4().simple().to_string(),"probe_id":uuid::Uuid::new_v4().simple().to_string()});
+            if actor != "single_agent" {
+                detail["qualification_contract"] = "functional-v2".into();
+            }
             let mut queued = result(
                 operation_id,
                 "task",
@@ -13343,6 +13857,32 @@ pub fn execute_workflow_command(
                 WHERE a.task_id=?1 AND a.status IN ('running','held','needs_input') AND w.state='ready'
                 ORDER BY a.created_at DESC LIMIT 1",params![task_id], |row|row.get(0)).optional()?;
             if let Some(attempt) = existing {
+                let attention: String = transaction.query_row(
+                    "SELECT attention FROM tasks WHERE id=?1",
+                    params![task_id],
+                    |row| row.get(0),
+                )?;
+                if attention == "resume_failed" {
+                    let status: String = transaction.query_row(
+                        "SELECT status FROM attempts WHERE id=?1",
+                        params![attempt],
+                        |row| row.get(0),
+                    )?;
+                    if !matches!(status.as_str(), "needs_input" | "running") {
+                        bail!("The rejected Manager attempt is not waiting for a recovery decision")
+                    }
+                    queued.detail["resume_rejection"] = main_verification_resume_rejection(
+                        &transaction,
+                        task_id,
+                        &attempt,
+                        &actor,
+                        &queued.detail["actor_settings"],
+                        None,
+                    )?;
+                    queued.detail["admitted_under_hold"] = true.into();
+                    queued.detail["task_version"] = (*expected_version).into();
+                    queued.detail["attempt_id"] = attempt.clone().into();
+                }
                 if actor == "single_agent" {
                     let retained: bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM role_generations WHERE attempt_id=?1 AND role='single_agent')",params![attempt], |row|row.get(0))?;
                     if retained {

@@ -349,7 +349,11 @@ pub fn install_hook_assets(paths: &InstancePaths, executable: &Path) -> Result<H
         reviewer_hooks.insert(
             event.to_owned(),
             json!([{
-                "hooks": [{"type": "command", "command": event_hook_command.clone(), "timeout": 2}]
+                "hooks": [{"type": "command", "command": event_hook_command.clone(), "timeout": if event == "PermissionRequest" {
+                    crate::permissions::PROVIDER_PERMISSION_TIMEOUT_SECONDS
+                } else {
+                    2
+                }}]
             }]),
         );
         implementer_hooks.insert(
@@ -369,7 +373,7 @@ pub fn install_hook_assets(paths: &InstancePaths, executable: &Path) -> Result<H
     }
     let settings = json!({
         "env": {"DISABLE_AUTOUPDATER":"1","DISABLE_UPDATES":"1"},
-        "permissions": {"defaultMode":"dontAsk","allow":[],"deny":["Edit","Write","NotebookEdit","WebFetch","WebSearch","Task","Agent"]},
+        "permissions": {"defaultMode":"default","allow":[],"deny":["Edit","Write","NotebookEdit","WebFetch","WebSearch","Task","Agent"]},
         "hooks": reviewer_hooks
     });
     let settings_bytes = serde_json::to_vec_pretty(&settings)?;
@@ -979,6 +983,115 @@ pub(crate) fn bind_checkout_launch(
     Ok(())
 }
 
+pub fn main_checkout_functional_observation_request(
+    scope: &serde_json::Value,
+    challenge_path: &Path,
+    writer_path: Option<&Path>,
+) -> Result<serde_json::Value> {
+    let metadata = std::fs::symlink_metadata(challenge_path)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 512 {
+        bail!("Main functional challenge must be a bounded regular nonce file")
+    }
+    let read_sha256 = hex::encode(Sha256::digest(std::fs::read(challenge_path)?));
+    if let Some(writer) = writer_path {
+        match std::fs::symlink_metadata(writer) {
+            Ok(metadata) if !metadata.is_file() => {
+                bail!("Main functional writer artifact must be a regular file")
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+    }
+    functional_main_request(scope, challenge_path, writer_path, &read_sha256)
+}
+
+pub(crate) fn validate_main_functional_request(
+    scope: &serde_json::Value,
+    request: &serde_json::Value,
+) -> Result<()> {
+    let read = request["permitted_read"]["path"]
+        .as_str()
+        .context("Main functional request has no permitted read")?;
+    let digest = request["permitted_read"]["content_hash"]
+        .as_str()
+        .context("Main functional request has no challenge digest")?;
+    if *request
+        != functional_main_request(
+            scope,
+            Path::new(read),
+            request["owned_writer"]["path"].as_str().map(Path::new),
+            digest,
+        )?
+    {
+        bail!("Main functional request differs from its exact permitted command and protections")
+    }
+    Ok(())
+}
+
+fn functional_main_request(
+    scope: &serde_json::Value,
+    challenge_path: &Path,
+    writer_path: Option<&Path>,
+    read_sha256: &str,
+) -> Result<serde_json::Value> {
+    require_main_protection_partition(scope)?;
+    if read_sha256.len() != 64 || !read_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("Main functional request requires an exact challenge digest")
+    }
+    let root = Path::new(
+        scope["root"]
+            .as_str()
+            .context("Main functional scope has no checkout")?,
+    );
+    if root.canonicalize()? != root {
+        bail!("Main functional scope must use the exact canonical checkout")
+    }
+    let owned = |path: &Path| -> bool {
+        path.parent() == Some(root)
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with(".llmrelay-main-")
+                        && name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte))
+                })
+            && scope["protected_roots"].as_array().is_some_and(|roots| {
+                roots.iter().all(|protected| {
+                    protected
+                        .as_str()
+                        .is_some_and(|protected| !path.starts_with(protected))
+                })
+            })
+    };
+    if !owned(challenge_path) {
+        bail!("Main functional read requires an exact owned checkout challenge")
+    }
+    let mut command = format!(
+        "/bin/cat -- {}",
+        shell_quote(&challenge_path.to_string_lossy())
+    );
+    let writer = if let Some(path) = writer_path {
+        if !owned(path) || path == challenge_path {
+            bail!("Main functional writer requires a distinct exact owned checkout file")
+        }
+        command.push_str(&format!(
+            " && /bin/cp -- {} {}",
+            shell_quote(&challenge_path.to_string_lossy()),
+            shell_quote(&path.to_string_lossy())
+        ));
+        json!({"path":path,"content_hash":read_sha256})
+    } else {
+        serde_json::Value::Null
+    };
+    Ok(
+        json!({"qualification_contract":"functional-v2","command":command,
+        "permitted_read":{"path":challenge_path,"content_hash":read_sha256},"owned_writer":writer,
+        "protected_read_targets":scope["protected_read_targets"],"policy_denied_unobserved":scope["policy_denied_unobserved"]}),
+    )
+}
+
 pub(crate) fn main_checkout_observation_request(
     scope: &serde_json::Value,
     database: &Path,
@@ -1055,6 +1168,34 @@ pub(crate) fn main_readonly_command_policy(
     request: &serde_json::Value,
     paths: &serde_json::Value,
 ) -> Result<RuntimeProbeCommandPolicy> {
+    if crate::domain::QualificationContract::from_record(request).map_err(anyhow::Error::msg)?
+        == crate::domain::QualificationContract::FunctionalV2
+    {
+        if request["owned_writer"] != serde_json::Value::Null {
+            bail!("Main read-only qualification cannot prescribe a writer artifact")
+        }
+        validate_main_functional_request(scope, request)?;
+        let read_denials: Vec<PathBuf> = serde_json::from_value(scope["protected_roots"].clone())?;
+        let mut write_denials = read_denials.clone();
+        write_denials.push(PathBuf::from(
+            scope["root"]
+                .as_str()
+                .context("Main scope has no checkout")?,
+        ));
+        write_denials.sort();
+        write_denials.dedup();
+        return Ok(RuntimeProbeCommandPolicy {
+            commands: vec![RuntimeProbeCommand {
+                operation: "fixture_read".into(),
+                command: request["command"]
+                    .as_str()
+                    .context("Main functional request has no command")?
+                    .into(),
+            }],
+            read_denials,
+            write_denials,
+        });
+    }
     let paths: Vec<String> = serde_json::from_value(paths.clone())?;
     let root = Path::new(
         scope["root"]
@@ -1399,6 +1540,8 @@ pub fn require_current_capability_identity_with_bundles(
     cwd: &Path,
     bundles: &crate::provider_compatibility::BundleSet,
 ) -> Result<()> {
+    crate::domain::QualificationContract::from_record(&identity.security_policy)
+        .map_err(anyhow::Error::msg)?;
     let current = bundles.resolve(
         identity.provider,
         &identity.executable_version,
@@ -1432,7 +1575,43 @@ pub fn require_current_capability_identity_with_bundles(
 }
 
 pub fn capability_identity_key(identity: &CapabilityIdentity) -> Result<String> {
+    crate::domain::QualificationContract::from_record(&identity.security_policy)
+        .map_err(anyhow::Error::msg)?;
     crate::store::json_hash(identity)
+}
+
+pub fn require_qualification_contract(
+    security_policy: &serde_json::Value,
+    proof: &serde_json::Value,
+) -> Result<()> {
+    let expected = crate::domain::QualificationContract::from_record(security_policy)
+        .map_err(anyhow::Error::msg)?;
+    let observed =
+        crate::domain::QualificationContract::from_record(proof).map_err(anyhow::Error::msg)?;
+    if expected != observed {
+        bail!("qualification proof contract differs from the frozen launch contract")
+    }
+    Ok(())
+}
+
+pub(crate) fn retain_qualification_contract(
+    config: &mut LaunchConfig,
+    frozen_policy: &serde_json::Value,
+) -> Result<()> {
+    crate::domain::QualificationContract::from_record(frozen_policy).map_err(anyhow::Error::msg)?;
+    let policy = config
+        .security_policy
+        .as_object_mut()
+        .context("prepared launch has no security policy")?;
+    match frozen_policy.get("qualification_contract") {
+        Some(contract) => {
+            policy.insert("qualification_contract".into(), contract.clone());
+        }
+        None => {
+            policy.remove("qualification_contract");
+        }
+    }
+    Ok(())
 }
 
 fn normalized_provider_argv(config: &LaunchConfig) -> Vec<String> {
@@ -1747,7 +1926,7 @@ pub fn toml_string(value: &str) -> Result<String> {
 
 pub fn role_channel_instructions(role: RoleKind, executable: &Path, socket: &Path) -> String {
     let executable = shell_quote(executable.to_string_lossy().as_ref());
-    let common=format!("Use `{executable} role context` to read the bounded task-scoped plan, review/check evidence, feedback, budgets, and command contract. The exact executable for this role channel is `{executable}`; terminal prose is not a result. The role channel is scoped at `{}`. {ROLE_RESULT_REPORT_CONTRACT}",socket.display());
+    let common=format!("Use `{executable} role context` to read the bounded task-scoped plan, review/check evidence, feedback, budgets, and command contract during qualification only when prescribed; retained qualification recall instructions take precedence and forbid rereading. For ordinary task work, use `{executable} role context --index`, then `{executable} role context --page <cursor>` with each exact returned cursor. Read every index page, then every page of every listed section, before reporting. Each page is complete only as indicated by its index or next cursor; a native preview, truncated display, or first page is not complete context. Reassemble each section's utf8_json_chunk strings in order to recover its exact JSON; retain and disclose any original evidence truncation markers. If a cursor is stale, restart at --index and read the new revision. Never open provider-spooled output, use native file search for this context, apply shell filters, or access the human-control channel; read context only through these authenticated direct commands. The exact executable for this role channel is `{executable}`; terminal prose is not a result. The role channel is scoped at `{}`. {ROLE_RESULT_REPORT_CONTRACT}",socket.display());
     if role == RoleKind::Manager {
         format!("{common} Manager-only commands are `role propose-transition --operation-id <UUID> --phase <PHASE> --evidence <TEXT>` and `role acknowledge-guidance --guidance <ID>`. Read context again after guidance, role completion, or a review.")
     } else {
@@ -1804,6 +1983,24 @@ mod tests {
         let helper = PathBuf::from("/fixture/llmrelay");
         let socket = "/fixture/role.sock";
         let instructions = role_channel_instructions(RoleKind::Manager, &helper, Path::new(socket));
+        for role in [
+            RoleKind::Manager,
+            RoleKind::Explorer,
+            RoleKind::PlanReviewer,
+            RoleKind::Implementer,
+            RoleKind::CodeReviewer,
+            RoleKind::FinalReviewer,
+        ] {
+            let guidance = role_channel_instructions(role, &helper, Path::new(socket));
+            assert!(guidance.contains(
+                "Read every index page, then every page of every listed section, before reporting."
+            ));
+            assert!(guidance.contains(
+                "retained qualification recall instructions take precedence and forbid rereading"
+            ));
+            assert!(guidance.contains("Never open provider-spooled output"));
+            assert!(guidance.contains("or first page is not complete context"));
+        }
         let first = format!("  Main verification first\r\n\n\n{instructions}\nretain nonce  ");
         let recall = "Main verification recall. Use conversation memory only.";
         for provider in [Provider::Codex, Provider::Claude] {
@@ -1838,6 +2035,22 @@ mod tests {
                 environment: vec![("AGENTICJIRA_ROLE_SOCKET".into(), socket.into())],
                 supervision_executable: helper.clone(),
             };
+            launch.config.security_policy =
+                json!({"qualification_contract":"functional-v2","deny":["/protected"]});
+            let functional = launch.config.security_policy.clone();
+            retain_qualification_contract(&mut launch.config, &json!({})).unwrap();
+            assert_eq!(
+                launch.config.security_policy,
+                json!({"deny":["/protected"]})
+            );
+            retain_qualification_contract(&mut launch.config, &functional).unwrap();
+            assert_eq!(launch.config.security_policy, functional);
+            assert!(retain_qualification_contract(
+                &mut launch.config,
+                &json!({"qualification_contract":"unknown"})
+            )
+            .is_err());
+            assert_eq!(launch.config.security_policy, functional);
             let first_hash = launch.request_prompt_hash(&first).unwrap();
             assert_eq!(first_hash, crate::store::json_hash(&first).unwrap());
             assert_ne!(first_hash, crate::store::json_hash(&launch.config).unwrap());

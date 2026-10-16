@@ -25,6 +25,10 @@ pub struct RoleRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RoleOperation {
     Context,
+    ContextIndex,
+    ContextPage {
+        cursor: String,
+    },
     Report {
         report: RoleResultReport,
     },
@@ -63,6 +67,92 @@ pub enum RoleOperation {
     SubmitConformance {
         input: serde_json::Value,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RoleContextSection {
+    Index,
+    Identity,
+    Task,
+    Attempt,
+    TaskProfiles,
+    ProjectPolicy,
+    VerificationCatalog,
+    SelectedChecks,
+    ExplorerDecisions,
+    ApprovedPlan,
+    ActiveReview,
+    CompletedFinalReview,
+    ReviewFeedback,
+    ReviewBudgets,
+    CheckResults,
+    Guidance,
+    GuidanceContract,
+    SetupContract,
+    Commands,
+    CurrentExplorerEvidence,
+    OrdinaryReviewEvidence,
+    HumanApprovalContext,
+    FinalRepairRecheck,
+    ManagerFeedback,
+    ManagerFeedbackBlocker,
+    RepairHandoffTemplate,
+    StructuredPlan,
+    ImplementationCapsule,
+}
+
+impl RoleContextSection {
+    pub(crate) fn parse(name: &str) -> Result<Self> {
+        serde_json::from_value(serde_json::Value::String(name.to_owned()))
+            .context("unknown role context section")
+    }
+}
+
+pub(crate) struct RoleContextCursor {
+    pub section: RoleContextSection,
+    pub page: usize,
+    pub revision: String,
+    pub scope: String,
+}
+
+impl RoleContextCursor {
+    pub(crate) fn parse(cursor: &str) -> Result<Self> {
+        if cursor.len() > 128
+            || !cursor
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-'))
+        {
+            bail!("role context cursor exceeds 128 bytes or contains invalid characters")
+        }
+        let fields = cursor.split(':').collect::<Vec<_>>();
+        let ["v1", section, page, revision, scope] = fields.as_slice() else {
+            bail!("role context cursor has an unsupported version or shape")
+        };
+        let section = RoleContextSection::parse(section)?;
+        if page.is_empty()
+            || page.len() > 6
+            || !page.bytes().all(|byte| byte.is_ascii_digit())
+            || (page.len() > 1 && page.starts_with('0'))
+        {
+            bail!("role context page must be a canonical decimal with at most six digits")
+        }
+        for digest in [revision, scope] {
+            if digest.len() != 32
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                bail!("role context cursor digests must each contain 32 lowercase hex digits")
+            }
+        }
+        Ok(Self {
+            section,
+            page: page.parse()?,
+            revision: (*revision).to_owned(),
+            scope: (*scope).to_owned(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -167,6 +257,8 @@ async fn handle(
     let request: RoleRequest = serde_json::from_str(&line)?;
     let operation_kind = match &request.operation {
         RoleOperation::Context => "context",
+        RoleOperation::ContextIndex => "context_index",
+        RoleOperation::ContextPage { .. } => "context_page",
         RoleOperation::Report { .. } => "report",
         RoleOperation::Hook { .. } => "hook",
         RoleOperation::PermissionRequest { .. } => "permission_request",
@@ -358,6 +450,10 @@ async fn dispatch(
     )?;
     match request.operation {
         RoleOperation::Context => app.role_context_payload(&context),
+        RoleOperation::ContextIndex => app.role_context_delivery_payload(&context, None),
+        RoleOperation::ContextPage { cursor } => {
+            app.role_context_delivery_payload(&context, Some(&cursor))
+        }
         RoleOperation::Report { report } => app.store.save_role_result(&context, &report),
         RoleOperation::Hook { envelope } => {
             app.store.save_hook_event(&context, &envelope, &provenance)
@@ -492,6 +588,43 @@ mod tests {
     use super::*;
     use crate::config::InstancePaths;
     use crate::store::Store;
+
+    #[test]
+    fn context_cursor_grammar_and_wire_operations_are_strict() {
+        let cursor = format!(
+            "v1:current_explorer_evidence:999999:{}:{}",
+            "ab".repeat(16),
+            "cd".repeat(16)
+        );
+        assert!(cursor.len() <= 128);
+        let parsed = RoleContextCursor::parse(&cursor).unwrap();
+        assert_eq!(parsed.section, RoleContextSection::CurrentExplorerEvidence);
+        assert_eq!(parsed.page, 999999);
+        for invalid in [
+            cursor.replace("v1:", "v2:"),
+            cursor.replace("current_explorer_evidence", "secrets"),
+            cursor.replace(":999999:", ":1000000:"),
+            cursor.replace(":999999:", ":01:"),
+            cursor.replace("ab", "AB"),
+            format!("{cursor}:extra"),
+            format!("{cursor}{}", "a".repeat(128 - cursor.len())),
+            format!("{cursor}{}", "a".repeat(129 - cursor.len())),
+        ] {
+            assert!(RoleContextCursor::parse(&invalid).is_err(), "{invalid}");
+        }
+        assert_eq!(
+            serde_json::to_value(RoleOperation::Context).unwrap(),
+            serde_json::json!({"kind":"context"})
+        );
+        assert_eq!(
+            serde_json::to_value(RoleOperation::ContextIndex).unwrap(),
+            serde_json::json!({"kind":"context_index"})
+        );
+        let page: RoleOperation =
+            serde_json::from_value(serde_json::json!({"kind":"context_page","cursor":cursor}))
+                .unwrap();
+        assert!(matches!(page, RoleOperation::ContextPage { .. }));
+    }
 
     fn test_application() -> (std::path::PathBuf, Application) {
         let root = std::env::temp_dir().join(format!(

@@ -68,6 +68,140 @@ enum BrowserLaunchDispatch {
 
 const MAX_RESTART_SELECTION: usize = 200;
 const MAX_RESTART_BATCH: usize = 4;
+
+pub(crate) const ROLE_CONTEXT_OUTPUT_BYTES: usize = 4096;
+const ROLE_CONTEXT_MAX_PAGES: usize = 1_000_000;
+
+fn role_context_cursor(section: &str, page: usize, revision: &str, scope: &str) -> String {
+    format!("v1:{section}:{page}:{}:{scope}", &revision[..32])
+}
+
+fn role_context_envelope(
+    section: &str,
+    revision: &str,
+    scope: &str,
+    page: usize,
+    pages: usize,
+    content: serde_json::Value,
+) -> serde_json::Value {
+    let next = (page + 1 < pages).then(|| role_context_cursor(section, page + 1, revision, scope));
+    let mut envelope = serde_json::json!({"v":1,"section":section,"revision":revision,
+        "scope":scope,"page":page,"pages":pages,"next":next});
+    if section == "index" {
+        envelope["entries"] = content;
+        envelope["complete"] = (page + 1 == pages).into();
+    } else {
+        envelope["encoding"] = "utf8_json_chunk".into();
+        envelope["chunk"] = content;
+    }
+    envelope
+}
+
+fn role_context_output_fits(value: &serde_json::Value) -> Result<bool> {
+    Ok(serde_json::to_vec(value)?.len() + 1 <= ROLE_CONTEXT_OUTPUT_BYTES)
+}
+
+fn role_context_content_ranges(
+    section: &str,
+    content: &str,
+    revision: &str,
+    scope: &str,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    // Reserve the longest page numbers and next cursor before choosing any chunks.
+    let overhead = serde_json::to_vec(&role_context_envelope(
+        section,
+        revision,
+        scope,
+        ROLE_CONTEXT_MAX_PAGES - 2,
+        ROLE_CONTEXT_MAX_PAGES,
+        serde_json::json!(""),
+    ))?
+    .len()
+        + 1;
+    let capacity = ROLE_CONTEXT_OUTPUT_BYTES
+        .checked_sub(overhead)
+        .filter(|capacity| *capacity >= 6)
+        .context("role context page metadata exceeds the output bound")?;
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    for (offset, character) in content.char_indices() {
+        let bytes = match character {
+            '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+            '\u{0}'..='\u{1f}' => 6,
+            _ => character.len_utf8(),
+        };
+        if used + bytes > capacity {
+            ranges.push(start..offset);
+            start = offset;
+            used = 0;
+        }
+        used += bytes;
+    }
+    ranges.push(start..content.len());
+    if ranges.len() > ROLE_CONTEXT_MAX_PAGES {
+        bail!("role context section exceeds the supported page count")
+    }
+    Ok(ranges)
+}
+
+fn role_context_index_ranges(
+    entries: &[serde_json::Value],
+    revision: &str,
+    scope: &str,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    let mut pages = 1;
+    // Total-page digit growth can change how many whole entries fit.
+    for _ in 0..7 {
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        for end in 1..=entries.len() {
+            let page = ranges.len();
+            let sizing_pages = if end == entries.len() {
+                page + 1
+            } else {
+                pages.max(page + 2)
+            };
+            let candidate = role_context_envelope(
+                "index",
+                revision,
+                scope,
+                page,
+                sizing_pages,
+                serde_json::json!(&entries[start..end]),
+            );
+            if !role_context_output_fits(&candidate)? {
+                if end - 1 == start {
+                    bail!("a role context index entry exceeds the output bound")
+                }
+                ranges.push(start..end - 1);
+                start = end - 1;
+                let sizing_pages = if end == entries.len() {
+                    ranges.len() + 1
+                } else {
+                    pages.max(ranges.len() + 2)
+                };
+                let candidate = role_context_envelope(
+                    "index",
+                    revision,
+                    scope,
+                    ranges.len(),
+                    sizing_pages,
+                    serde_json::json!(&entries[start..end]),
+                );
+                if !role_context_output_fits(&candidate)? {
+                    bail!("a role context index entry exceeds the output bound")
+                }
+            }
+        }
+        ranges.push(start..entries.len());
+        if ranges.len() == pages {
+            return Ok(ranges);
+        }
+        pages = ranges.len();
+    }
+    bail!("role context index page count did not stabilize")
+}
 const MAX_RESTART_REPLACEMENT_FAILURES: u8 = 3;
 const MAX_BLOCKING_OPERATIONS: usize = 16;
 const HOST_RESTART_RESUME_NOTICE: &str = "LLMRelay restarted while this session was running and interrupted its previous turn. Before repeating any command, edit or report that may already have been in flight, check its actual effect; do not assume it did or did not happen. The task instructions below are unchanged.";
@@ -1854,6 +1988,137 @@ impl Application {
         Ok(result)
     }
 
+    fn require_ordinary_context_delivery(&self, context: &RoleContext) -> Result<()> {
+        if self.store.restore_hold()?.is_some() {
+            bail!("role authority is disabled by the database restore hold")
+        }
+        let connection = self.store.lock()?;
+        let current: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM role_credentials credential
+             JOIN role_generations generation ON generation.id=credential.role_generation_id
+             JOIN sessions session ON session.role_generation_id=generation.id
+             JOIN attempts attempt ON attempt.id=generation.attempt_id
+             JOIN tasks task ON task.id=attempt.task_id
+             WHERE credential.id=?1 AND credential.revoked_at IS NULL
+               AND generation.status NOT IN ('replaced','revoked')
+               AND session.id=?2 AND generation.id=?3 AND attempt.id=?4 AND task.id=?5
+               AND task.project_id=?6 AND session.transcript_epoch=?7 AND generation.role=?8
+               AND generation.provider=?9 AND EXISTS(SELECT 1 FROM json_each(credential.permissions_json)
+                 WHERE value='read_context'))",
+            rusqlite::params![context.credential_id, context.session_id, context.role_generation_id,
+                context.attempt_id, context.task_id, context.project_id, context.transcript_epoch,
+                context.role.to_string(), context.provider.to_string()],
+            |row| row.get(0),
+        )?;
+        if !current {
+            bail!("role context delivery credential or invocation is no longer current")
+        }
+        if crate::trip::setup_context(&connection, context)?.is_some() {
+            bail!("paged role context is unavailable during qualification; use the prescribed direct context command")
+        }
+        let qualification: bool = connection.query_row(
+            "SELECT session.validation_cell IS NOT NULL OR attempt.status='capability_validation'
+               OR EXISTS(SELECT 1 FROM controls verification
+                 WHERE verification.attempt_id=attempt.id AND verification.kind='main_checkout_verify'
+                   AND verification.state IN ('native_running','native_stopping','awaiting_native_evidence')
+                   AND (json_extract(verification.payload_json,'$.session_id')=session.id
+                     OR json_extract(verification.payload_json,'$.launch_reservation.session_id')=session.id))
+             FROM sessions session JOIN role_generations generation ON generation.id=session.role_generation_id
+             JOIN attempts attempt ON attempt.id=generation.attempt_id WHERE session.id=?1",
+            rusqlite::params![context.session_id], |row| row.get(0),
+        )?;
+        if qualification {
+            bail!("paged role context is unavailable during qualification; use the prescribed direct context command")
+        }
+        Ok(())
+    }
+
+    pub fn role_context_delivery_payload(
+        &self,
+        context: &RoleContext,
+        cursor: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        use crate::task_cli::{RoleContextCursor, RoleContextSection};
+        let cursor = cursor.map(RoleContextCursor::parse).transpose()?;
+        self.require_ordinary_context_delivery(context)?;
+        let projection = self.role_context_payload(context)?;
+        let revision = json_hash(&projection)?;
+        let scope = json_hash(&serde_json::json!([
+            context.task_id,
+            context.attempt_id,
+            context.session_id,
+            context.role_generation_id,
+            context.transcript_epoch,
+            context.credential_id
+        ]))?;
+        let scope = &scope[..32];
+        if let Some(cursor) = &cursor {
+            if cursor.scope != scope || cursor.revision != revision[..32] {
+                bail!("role context cursor is stale or belongs to another invocation; restart with role context --index")
+            }
+        }
+        let sections = projection
+            .as_object()
+            .context("role context projection must be an object")?;
+        for name in sections.keys() {
+            if RoleContextSection::parse(name)? == RoleContextSection::Index {
+                bail!("role context projection contains the reserved index section")
+            }
+        }
+        let page = cursor.as_ref().map_or(0, |cursor| cursor.page);
+        let section = cursor
+            .as_ref()
+            .map_or(RoleContextSection::Index, |cursor| cursor.section);
+        let result = if section == RoleContextSection::Index {
+            let mut entries = Vec::new();
+            for (name, value) in sections {
+                let content = serde_json::to_string(value)?;
+                let ranges = role_context_content_ranges(name, &content, &revision, scope)?;
+                entries.push(
+                    serde_json::json!({"name":name,"bytes":content.len(),"pages":ranges.len(),
+                    "digest":&hex::encode(sha2::Sha256::digest(content.as_bytes()))[..32],
+                    "first":role_context_cursor(name, 0, &revision, scope)}),
+                );
+            }
+            entries.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+            let ranges = role_context_index_ranges(&entries, &revision, scope)?;
+            let range = ranges
+                .get(page)
+                .context("role context index page is out of range")?;
+            role_context_envelope(
+                "index",
+                &revision,
+                scope,
+                page,
+                ranges.len(),
+                serde_json::json!(&entries[range.clone()]),
+            )
+        } else {
+            let name: String = serde_json::from_value(serde_json::to_value(section)?)?;
+            let value = sections
+                .get(&name)
+                .context("role context section is not present in this projection")?;
+            let content = serde_json::to_string(value)?;
+            let ranges = role_context_content_ranges(&name, &content, &revision, scope)?;
+            let range = ranges
+                .get(page)
+                .context("role context section page is out of range")?;
+            role_context_envelope(
+                &name,
+                &revision,
+                scope,
+                page,
+                ranges.len(),
+                serde_json::json!(&content[range.clone()]),
+            )
+        };
+        if !role_context_output_fits(&result)? {
+            bail!("role context page exceeds the 4096-byte output bound")
+        }
+        self.require_ordinary_context_delivery(context)?;
+        Ok(result)
+    }
+
     pub fn role_context_payload(
         &self,
         context: &crate::domain::RoleContext,
@@ -1864,6 +2129,34 @@ impl Application {
         // catalog data is assembled. The resumed turn must rely only on retained
         // native-conversation recall.
         let setup_contract = crate::trip::setup_context(&connection, context)?;
+        if setup_contract
+            .as_ref()
+            .is_some_and(|contract| contract["qualification_contract"] == "functional-v2")
+        {
+            let executable = providers::shell_quote(self.executable.to_string_lossy().as_ref());
+            let (mode, phase) = if context.role == crate::domain::RoleKind::FinalReviewer {
+                (
+                    "fresh",
+                    "Report only after the prescribed witnesses in this fresh invocation.",
+                )
+            } else {
+                ("retained", "Do not report on this first invocation; retain the binding and challenge for the service-owned recall turn.")
+            };
+            let value = serde_json::json!({
+                "context_scope":"functional_qualification",
+                "identity":context,
+                "setup_contract":setup_contract,
+                "commands":{
+                    "context":format!("{executable} role context"),
+                    "report":format!("{executable} role report --functional-v2 --operation-id=<new-safe-id> --status=passed --binding-hash=<setup_contract.binding_hash> --challenge=<exact-read-content> --session-mode={mode}"),
+                    "reporting_contract":format!("{phase} {}", crate::trip::FUNCTIONAL_REPORT_SCHEMA.replace("<exact-executable>", &executable)),
+                },
+            });
+            if serde_json::to_vec(&value)?.len() > 1024 * 1024 {
+                bail!("task-scoped role context exceeds the 1 MiB response bound")
+            }
+            return Ok(value);
+        }
         let isolated_validation: bool = connection.query_row(
             "SELECT a.status='capability_validation' FROM attempts a
              JOIN tasks t ON t.id=a.task_id
@@ -2133,6 +2426,64 @@ impl Application {
             } else {
                 (None, None, None, Vec::new())
             };
+        let current_explorer_evidence = if ordinary_task {
+            let current: Option<(
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                bool,
+            )> = connection.query_row(
+                "SELECT d.id,d.stage,d.candidate_hash,d.role_generation_id,d.outcome_json,
+                   EXISTS(SELECT 1 FROM role_generations g WHERE g.id=d.role_generation_id
+                     AND g.attempt_id=a.id AND g.role='explorer' AND g.status='exited')
+                   AND EXISTS(SELECT 1 FROM sessions s WHERE s.role_generation_id=d.role_generation_id)
+                   AND NOT EXISTS(SELECT 1 FROM sessions s WHERE s.role_generation_id=d.role_generation_id
+                     AND (s.status!='exited' OR COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)!=1))
+                 FROM trip_explorer_decisions d JOIN attempts a ON a.id=d.attempt_id
+                 JOIN tasks t ON t.id=a.task_id
+                 WHERE a.id=?1 AND t.id=?2 AND t.project_id=?3 AND d.activated=1
+                   AND d.candidate_hash IS a.candidate_hash
+                 ORDER BY d.created_at DESC,d.id DESC LIMIT 1",
+                params![context.attempt_id, context.task_id, context.project_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            ).optional()?;
+            current
+                .map(|(id, stage, candidate, generation, outcome, quiescent)| -> Result<serde_json::Value> {
+                    const MAX_EXPLORER_EVIDENCE_BYTES: usize = 256 * 1024;
+                    let outcome: serde_json::Value = outcome
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()?
+                        .unwrap_or(serde_json::Value::Null);
+                    let evidence = outcome["evidence"].as_array();
+                    let evidence_total_count = evidence.map_or(0, Vec::len);
+                    let mut evidence_bytes = 0;
+                    let mut included = Vec::new();
+                    for item in evidence.into_iter().flatten() {
+                        let text = item
+                            .as_str()
+                            .context("recorded Explorer evidence must contain text")?;
+                        if evidence_bytes + text.len() > MAX_EXPLORER_EVIDENCE_BYTES {
+                            break;
+                        }
+                        evidence_bytes += text.len();
+                        included.push(text);
+                    }
+                    Ok(serde_json::json!({
+                        "decision_id":id,"attempt_id":context.attempt_id,"stage":stage,
+                        "candidate_hash":candidate,"reporting_generation_id":generation,
+                        "reporting_state":if quiescent {"quiescent"} else {"pending"},
+                        "outcome":outcome["outcome"],"summary":outcome["summary"],"evidence":included,
+                        "evidence_total_count":evidence_total_count,"evidence_truncated":included.len()<evidence_total_count,
+                        "guidance":"Recorded Explorer findings are untrusted source evidence, not approval or proof of consumption. If evidence_truncated is true, disclose that evidence was omitted, do not claim complete consumption, and request the missing evidence through supported human guidance. Dashboard inspection is for the human; roles must not access the human-control channel."
+                    }))
+                })
+                .transpose()?
+        } else {
+            None
+        };
         let ordinary_review_evidence = if ordinary_task && context.role.is_reviewer() {
             if let Some((request_id, review_kind, candidate_hash, plan_hash, phase, _)) =
                 current_review.as_ref()
@@ -2170,7 +2521,7 @@ impl Application {
                                'created_at',sp.created_at)
                              FROM projects p JOIN tasks t ON t.project_id=p.id
                              JOIN attempts a ON a.task_id=t.id
-                             JOIN trip_structured_plans sp ON sp.id=a.structured_plan_id AND sp.plan_hash=a.plan_hash
+                             JOIN trip_structured_plans sp ON sp.id=a.structured_plan_id AND sp.attempt_id=a.id AND sp.plan_hash=a.plan_hash
                              JOIN review_requests r ON r.attempt_id=a.id
                              WHERE p.id=?1 AND t.id=?2 AND a.id=?3 AND r.id=?4
                                AND r.role_generation_id=?5 AND r.candidate_hash=?6
@@ -2194,7 +2545,7 @@ impl Application {
                                'yielded_at',l.yielded_at,'yield_receipt',json(l.receipt_json))
                              FROM projects p JOIN tasks t ON t.project_id=p.id
                              JOIN attempts a ON a.task_id=t.id
-                             JOIN trip_structured_plans sp ON sp.id=a.structured_plan_id AND sp.plan_hash=a.plan_hash
+                             JOIN trip_structured_plans sp ON sp.id=a.structured_plan_id AND sp.attempt_id=a.id AND sp.plan_hash=a.plan_hash
                              JOIN review_requests r ON r.attempt_id=a.id
                              JOIN implementation_lanes l ON l.attempt_id=a.id
                              LEFT JOIN lane_generations lg ON lg.lane_id=l.id
@@ -2226,7 +2577,7 @@ impl Application {
                                'created_at',i.created_at,'dispatched_at',i.dispatched_at)
                              FROM projects p JOIN tasks t ON t.project_id=p.id
                              JOIN attempts a ON a.task_id=t.id
-                             JOIN trip_structured_plans sp ON sp.id=a.structured_plan_id AND sp.plan_hash=a.plan_hash
+                             JOIN trip_structured_plans sp ON sp.id=a.structured_plan_id AND sp.attempt_id=a.id AND sp.plan_hash=a.plan_hash
                              JOIN review_requests r ON r.attempt_id=a.id
                              JOIN trip_integration_requests i ON i.attempt_id=a.id
                              WHERE p.id=?1 AND t.id=?2 AND a.id=?3 AND r.id=?4
@@ -2253,7 +2604,7 @@ impl Application {
                         |row|row.get(0)
                     ).optional()?;
                     let manager_conformance: Option<String> = connection.query_row(
-                        "SELECT json_object('availability','recorded','id',c.id,'revision',c.revision,
+                        "SELECT json_object('availability','recorded','evidence_kind','manager_submitted_assertions','id',c.id,'revision',c.revision,
                            'candidate_hash',c.candidate_hash,'config_hash',c.config_hash,
                            'active_config_revision_id',s.active_config_revision_id,
                            'active_configuration_hash',r.configuration_hash,
@@ -2349,15 +2700,203 @@ impl Application {
                     } else {
                         "pending"
                     };
+                    let candidate_snapshot: serde_json::Value = serde_json::from_str(&candidate)?;
+                    let structured_plan = structured_plan
+                        .map(|value| serde_json::from_str::<serde_json::Value>(&value))
+                        .transpose()?;
+                    let ownership = structured_plan
+                        .as_ref()
+                        .filter(|plan| {
+                            plan["plan_review_receipt"]["availability"] == "recorded"
+                                && plan["human_plan_approval_receipt"]["availability"] == "recorded"
+                                && plan["implementation_authorization_receipt"]["availability"]
+                                    == "recorded"
+                        })
+                        .and_then(|plan| {
+                            plan.pointer("/plan/ownership").filter(|value| {
+                                value
+                                    .as_object()
+                                    .is_some_and(|ownership| !ownership.is_empty())
+                            })
+                        });
+                    let ownership_mode = match ownership {
+                        Some(ownership) if ownership.get("lanes").is_some() => "configured_lanes",
+                        Some(_) => "default_single_writer",
+                        None => "unavailable",
+                    };
+                    let lanes = lanes
+                        .into_iter()
+                        .map(|value| serde_json::from_str::<serde_json::Value>(&value))
+                        .collect::<serde_json::Result<Vec<_>>>()?;
+                    let empty_paths = serde_json::json!([]);
+                    let configured_lanes_match = ownership
+                        .and_then(|value| value["lanes"].as_array())
+                        .is_some_and(|reviewed| {
+                            reviewed.len() >= 2
+                                && reviewed.len() == lanes.len()
+                                && reviewed
+                                    .iter()
+                                    .filter_map(|lane| lane["lane_key"].as_str())
+                                    .collect::<HashSet<_>>()
+                                    .len()
+                                    == reviewed.len()
+                                && reviewed.iter().all(|reviewed| {
+                                    lanes.iter().any(|recorded| {
+                                        ["lane_key", "owned_paths", "shared_paths", "dependencies"]
+                                            .iter()
+                                            .all(|field| {
+                                                reviewed.get(*field).is_some()
+                                                    && reviewed.get(*field) == recorded.get(*field)
+                                            })
+                                            && reviewed
+                                                .get("protected_paths")
+                                                .unwrap_or(&empty_paths)
+                                                == &recorded["protected_paths"]
+                                    })
+                                })
+                        });
+                    let lane_availability = match ownership_mode {
+                        "default_single_writer" if lanes.is_empty() => "not_applicable",
+                        "configured_lanes" if configured_lanes_match => "available",
+                        _ => "unavailable",
+                    };
+                    let mut integration = integration
+                        .map(|value| serde_json::from_str::<serde_json::Value>(&value))
+                        .transpose()?
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    integration["availability"] = if ownership_mode == "default_single_writer"
+                        && lanes.is_empty()
+                        && integration.get("id").is_none()
+                    {
+                        "not_applicable"
+                    } else if configured_lanes_match && integration.get("id").is_some() {
+                        "available"
+                    } else {
+                        "unavailable"
+                    }
+                    .into();
+                    let candidate_writer_evidence = if review_kind == "plan" {
+                        serde_json::json!({"availability":"not_applicable","reason":"plan review has no implementation candidate writer"})
+                    } else {
+                        let writer_session_conflict: bool = connection.query_row(
+                            crate::review::ACTIVE_WRITER_SQL,
+                            params![context.attempt_id],
+                            |row| row.get(0),
+                        )?;
+                        let writer_generation_conflict: bool = connection.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM role_generations WHERE attempt_id=?1
+                               AND role='implementer' AND status IN ('launch_reserved','running','stopping'))",
+                            params![context.attempt_id], |row| row.get(0),
+                        )?;
+                        // Freeze reservations are serialized per attempt. Bind the last completed
+                        // publication at review creation before validating its source; never fall back.
+                        // UTC suffix normalization retains full timestamp precision in that fence.
+                        let mut statement = connection.prepare(
+                            "SELECT json_object('role_generation_id',writer.id,'settings_revision',writer.config_revision,
+                               'settings_id',writer_settings.id,
+                               'session_id',session.id,'native_session_id',session.native_session_id,
+                               'transcript_epoch',session.transcript_epoch,'result_id',result.id,
+                               'generation_status',writer.status,'session_status',session.status,
+                               'recorded_quiescence',json_object(
+                                 'process_group_quiescent',json(CASE json_extract(session.exit_json,'$.process_group_quiescent')
+                                   WHEN 1 THEN 'true' WHEN 0 THEN 'false' ELSE 'null' END),
+                                 'exit_source',json_extract(session.exit_json,'$.source'),
+                                 'observed_at',json_extract(session.exit_json,'$.observed_at'),
+                                 'session_record_updated_at',session.updated_at),
+                               'freeze_observation',json_object('freeze_intent_id',freeze.id,'state',freeze.state,
+                                 'completed_at',freeze.updated_at,'snapshot_id',snapshot.id,
+                                 'source_role_generation_id',freeze.source_role_generation_id,
+                                 'review_created_at',review.created_at))
+                             FROM review_requests review JOIN attempts a ON a.id=review.attempt_id
+                             JOIN tasks t ON t.id=a.task_id
+                             JOIN trip_structured_plans plan ON plan.id=a.structured_plan_id
+                               AND plan.attempt_id=a.id AND plan.plan_hash=a.plan_hash
+                               AND plan.reviewed_at IS NOT NULL AND plan.approved_at IS NOT NULL
+                               AND plan.implementation_authorized_at IS NOT NULL
+                             JOIN snapshots snapshot ON snapshot.attempt_id=a.id
+                               AND snapshot.manifest_hash=review.candidate_hash
+                             JOIN freeze_intents freeze ON freeze.rowid=(
+                               SELECT publication.rowid FROM freeze_intents publication
+                               WHERE publication.attempt_id=a.id AND publication.kind='candidate'
+                                 AND publication.state='complete'
+                                 AND rtrim(replace(publication.updated_at,'+00:00',''),'Z')
+                                   <=rtrim(replace(review.created_at,'+00:00',''),'Z')
+                               ORDER BY publication.rowid DESC LIMIT 1)
+                               AND freeze.result_snapshot_id=snapshot.id
+                             JOIN role_generations writer ON writer.id=freeze.source_role_generation_id
+                               AND writer.attempt_id=a.id AND writer.role='implementer' AND writer.lane_id='default'
+                             JOIN role_settings writer_settings ON writer_settings.task_id=t.id
+                               AND writer_settings.role='implementer' AND writer_settings.revision=writer.config_revision
+                             JOIN role_results result ON result.role_generation_id=writer.id
+                               AND result.outcome='candidate_ready' AND result.consumed_at=freeze.updated_at
+                               AND rtrim(replace(result.created_at,'+00:00',''),'Z')
+                                 <=rtrim(replace(freeze.created_at,'+00:00',''),'Z')
+                               AND rtrim(replace(freeze.created_at,'+00:00',''),'Z')
+                                 <=rtrim(replace(freeze.updated_at,'+00:00',''),'Z')
+                             JOIN sessions session ON session.id=result.session_id AND session.role_generation_id=writer.id
+                             WHERE t.project_id=?1 AND t.id=?2 AND a.id=?3 AND review.id=?4
+                               AND review.role_generation_id=?5 AND review.session_id=?6
+                               AND review.candidate_hash=?7 AND review.candidate_hash=a.candidate_hash
+                               AND snapshot.id=?8 AND snapshot.kind='candidate' AND snapshot.complete=1
+                               AND review.review_kind=?9 AND review.delivery_state IN ('launching','delivered','ambiguous')
+                               AND (json_type(result.metadata_json,'$.lane_yield.plan_hash') IS NULL
+                                 OR json_extract(result.metadata_json,'$.lane_yield.plan_hash')=a.plan_hash)
+                             LIMIT 2",
+                        )?;
+                        let writers = statement
+                            .query_map(
+                                params![
+                                    context.project_id,
+                                    context.task_id,
+                                    context.attempt_id,
+                                    request_id,
+                                    context.role_generation_id,
+                                    context.session_id,
+                                    candidate_hash,
+                                    candidate_snapshot["snapshot_id"].as_str(),
+                                    review_kind
+                                ],
+                                |row| row.get::<_, String>(0),
+                            )?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        let writer = if writers.len() == 1 {
+                            Some(serde_json::from_str::<serde_json::Value>(&writers[0])?)
+                        } else {
+                            None
+                        };
+                        let source_quiescent = writer.as_ref().is_some_and(|writer| {
+                            writer["generation_status"] == "exited"
+                                && writer["session_status"] == "exited"
+                                && writer["recorded_quiescence"]["process_group_quiescent"] == true
+                        });
+                        serde_json::json!({
+                            "availability":if source_quiescent && !writer_session_conflict && !writer_generation_conflict {"available"}else{"unavailable"},
+                            "reason":if writer.is_none() {Some("exact review, snapshot, freeze, source generation and consumed-report session correlation is missing or ambiguous")}
+                                else if !source_quiescent {Some("the exact source writer lacks a recorded quiescent exit for both session and generation")}
+                                else if writer_session_conflict || writer_generation_conflict {Some("current service records contain an active or unresolved writer")}
+                                else {None},
+                            "review_request_id":request_id,"attempt_id":context.attempt_id,
+                            "candidate_hash":candidate_hash,"snapshot_id":candidate_snapshot["snapshot_id"],
+                            "snapshot_creation_provenance":{"created_at":candidate_snapshot["created_at"],
+                                "source_role_generation_id":candidate_snapshot["source_role_generation_id"],
+                                "source_settings_revision":candidate_snapshot["source_settings_revision"]},
+                            "source_writer":writer,
+                            "current_evaluation":{"source":"service_records","persisted_receipt":false,
+                                "recorded_source_quiescent":source_quiescent,
+                                "writer_session_conflict":writer_session_conflict,"writer_generation_conflict":writer_generation_conflict},
+                            "guidance":"Snapshot creation provenance is immutable history and may name an earlier writer when identical bytes reuse a snapshot. The applicable publication is the last completed candidate freeze at this review request's creation, correlated through its consumed candidate report and freeze source generation to the exact writer settings and session. Later publications do not rebind an existing review, and invalid applicable evidence never falls back to an earlier freeze. Quiescence and writer conflicts are evaluated now from service records, not a new historical validation receipt or a live process probe. Missing, ambiguous, or mismatched bindings and false or absent recorded quiescence remain unavailable. Manager conformance prose is a separate submitted assertion, not native quiescence evidence."
+                        })
+                    };
                     Some(serde_json::json!({
                         "availability":"available","review_request_id":request_id,"review_kind":review_kind,
-                        "candidate_hash":candidate_hash,"candidate_snapshot":serde_json::from_str::<serde_json::Value>(&candidate)?,
-                        "structured_plan":structured_plan.map(|value|serde_json::from_str::<serde_json::Value>(&value)).transpose()?
+                        "candidate_hash":candidate_hash,"candidate_snapshot":candidate_snapshot,
+                        "structured_plan":structured_plan
                             .unwrap_or_else(||serde_json::json!({"availability":"unavailable","reason":"exact current structured plan receipt is missing or stale"})),
-                        "lanes":{"availability":if lanes.is_empty(){"not_recorded"}else{"available"},
-                            "records":lanes.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?},
-                        "integration":integration.map(|value|serde_json::from_str::<serde_json::Value>(&value)).transpose()?
-                            .unwrap_or_else(||serde_json::json!({"availability":"not_recorded"})),
+                        "ownership_mode":ownership_mode,
+                        "lanes":{"availability":lane_availability,"records":lanes,
+                            "guidance":"Explicit lane yields and integration receipts are not applicable to approved default single-writer ownership. Configured lane records must exactly match the approved ownership; missing or mismatched records remain unavailable."},
+                        "integration":integration,
+                        "candidate_writer_evidence":candidate_writer_evidence,
                         "approved_code_review_receipt":approved_code_review.map(|value|serde_json::from_str::<serde_json::Value>(&value)).transpose()?
                             .unwrap_or_else(||serde_json::json!({"availability":"unavailable","reason":"exact current-candidate finished approved code-review receipt is missing or stale"})),
                         "manager_conformance_receipt":manager_conformance.map(|value|serde_json::from_str::<serde_json::Value>(&value)).transpose()?
@@ -2497,6 +3036,9 @@ impl Application {
             "server_guard":"The service still requires the exact current manager generation and correlated submitted state."
         }));
         let mut value = serde_json::json!({"identity":context,"task":serde_json::from_str::<serde_json::Value>(&task)?,"attempt":serde_json::from_str::<serde_json::Value>(&attempt)?,"task_profiles":task_profiles.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"project_policy":project_policy,"verification_catalog":verification_catalog,"selected_checks":selected_checks,"explorer_decisions":explorer_decisions,"approved_plan":plan,"active_review":current_review.map(|value|serde_json::from_str::<serde_json::Value>(&value.5)).transpose()?,"completed_final_review":completed_final_review.map(|value|serde_json::from_str::<serde_json::Value>(&value)).transpose()?,"review_feedback":feedback.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"review_budgets":budgets.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"check_results":checks.into_iter().map(|value|serde_json::from_str::<serde_json::Value>(&value)).collect::<serde_json::Result<Vec<_>>>()?,"guidance":guidance,"guidance_contract":guidance_contract,"setup_contract":setup_contract,"commands":commands});
+        if let Some(evidence) = current_explorer_evidence {
+            value["current_explorer_evidence"] = evidence;
+        }
         if let Some(evidence) = ordinary_review_evidence {
             value["ordinary_review_evidence"] = evidence;
         }
@@ -2814,7 +3356,7 @@ impl Application {
         if runtime_policy.is_some() && !read_denials.is_empty() {
             bail!("runtime probe resume cannot inherit setup target read denials")
         }
-        let launch = if let Some(policy) = runtime_policy.as_ref() {
+        let mut launch = if let Some(policy) = runtime_policy.as_ref() {
             providers::prepare_runtime_probe_role_launch_with_bundles(
                 prior.provider,
                 prior.role,
@@ -2851,6 +3393,7 @@ impl Application {
                 &self.store.compatibility_bundles,
             )?
         };
+        providers::retain_qualification_contract(&mut launch.config, &prior.security_policy)?;
         let prompt_hash = launch.request_prompt_hash(&resume_prompt)?;
         let attempted = PreparedResumeIdentity::from_launch(&launch.config)?;
         let runtime = crate::trip::CapabilityRuntime::from_store(
@@ -3315,7 +3858,7 @@ impl Application {
                 crate::trip::setup_target_read_denials(&self.store, &receipt.attempt_id)?;
             // Prepare the exact profile to measure its current identity. No
             // reservation, provider spawn, or review allowance is spent here.
-            let prepared = providers::prepare_role_launch_with_read_denials_and_bundles(
+            let mut prepared = providers::prepare_role_launch_with_read_denials_and_bundles(
                 prior.provider,
                 prior.role,
                 &prior.model,
@@ -3332,6 +3875,7 @@ impl Application {
                 &read_denials,
                 &self.store.compatibility_bundles,
             )?;
+            providers::retain_qualification_contract(&mut prepared.config, &prior.security_policy)?;
             self.store.record_unanswered_review_rejection(
                 receipt,
                 &PreparedResumeIdentity::from_launch(&prepared.config)?,
@@ -3535,6 +4079,7 @@ impl Application {
             &read_denials,
             &self.store.compatibility_bundles,
         )?;
+        providers::retain_qualification_contract(&mut launch.config, &prior.security_policy)?;
         if let Some(scope) = &checkout_scope {
             let policy = self.main_readonly_policy(
                 record["attempt_id"]
@@ -3819,7 +4364,16 @@ impl Application {
             Ok(result) => {
                 let now = Utc::now().to_rfc3339();
                 let connection = self.store.lock()?;
-                connection.execute("UPDATE trip_runtime_probes SET state='running',session_id=?1,updated_at=?2 WHERE admission_id=?3 AND role=?4",rusqlite::params![result.session_id,now,admission_id,role.to_string()])?;
+                let changed = connection.execute(
+                    "UPDATE trip_runtime_probes SET state=CASE WHEN state='authorized' THEN 'running' ELSE state END,
+                       updated_at=CASE WHEN state='authorized' THEN ?2 ELSE updated_at END
+                     WHERE admission_id=?3 AND role=?4 AND session_id=?1 AND attempt_id=?5
+                       AND state IN ('authorized','running','awaiting_resume','evidence_recorded','published','failed','stale')",
+                    rusqlite::params![result.session_id,now,admission_id,role.to_string(),attempt],
+                )?;
+                if changed != 1 {
+                    bail!("runtime probe launch lost its exact reserved session binding")
+                }
                 crate::trip::refresh_runtime_admission_state(&connection, admission_id, &now)?;
                 connection.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'human','runtime_probe.launch','runtime_admission',?3,?4,?5)",rusqlite::params![uuid::Uuid::new_v4().to_string(),operation_id,admission_id,serde_json::json!({"role":role,"session_id":result.session_id,"attempt_id":attempt}).to_string(),now])?;
                 Ok(result)
@@ -3886,7 +4440,16 @@ impl Application {
         };
         let now = Utc::now().to_rfc3339();
         let connection = self.store.lock()?;
-        connection.execute("UPDATE trip_runtime_probes SET state='running',updated_at=?1 WHERE admission_id=?2 AND role=?3",rusqlite::params![now,admission_id,role.to_string()])?;
+        let changed = connection.execute(
+            "UPDATE trip_runtime_probes SET state=CASE WHEN state='awaiting_resume' THEN 'running' ELSE state END,
+               updated_at=CASE WHEN state IN ('running','awaiting_resume') THEN ?1 ELSE updated_at END
+             WHERE admission_id=?2 AND role=?3 AND session_id=?4
+               AND state IN ('running','awaiting_resume','evidence_recorded','published','failed','stale')",
+            rusqlite::params![now,admission_id,role.to_string(),session],
+        )?;
+        if changed != 1 {
+            bail!("runtime probe resume lost its exact retained session binding")
+        }
         crate::trip::refresh_runtime_admission_state(&connection, admission_id, &now)?;
         Ok(BrowserLaunchDispatch::Launched(result))
     }
@@ -4251,6 +4814,23 @@ impl Application {
             Ok(launch) => launch,
             Err(error) => return Err(release_permit(error, "provider launch preparation failed")),
         };
+        let runtime_probe: bool = self.store.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM launch_permits launch
+               JOIN trip_setup_permits setup ON setup.id=launch.setup_permit_id
+               WHERE launch.id=?1 AND launch.attempt_id=?2 AND launch.role=?3 AND setup.purpose='runtime_probe')",
+            rusqlite::params![context.permit_id, attempt_id, role.to_string()], |row| row.get(0),
+        )?;
+        if runtime_probe {
+            let policy = crate::trip::runtime_probe_security_policy(&*self.store.lock()?, attempt_id, role)?;
+            providers::retain_qualification_contract(&mut launch.config, &policy)?;
+        } else if let Some(payload) = self.store.lock()?.query_row(
+            "SELECT payload_json FROM controls WHERE attempt_id=?1 AND kind='main_checkout_verify'
+               AND state='native_requested' AND json_extract(payload_json,'$.actor')=?2",
+            rusqlite::params![attempt_id, role.to_string()], |row| row.get::<_, String>(0),
+        ).optional()? {
+            let payload: serde_json::Value = serde_json::from_str(&payload)?;
+            providers::retain_qualification_contract(&mut launch.config, &payload)?;
+        }
         if let Some(scope) = &checkout_scope {
             let policy = self
                 .main_readonly_policy(attempt_id, role, scope)
@@ -5937,7 +6517,22 @@ impl Application {
             crate::store::main_readonly_control_payload_in(&*self.store.lock()?, attempt, role)?
                 .context("Verify this Main read-only role before preparing its native commands")?;
         providers::require_main_protection_partition(&payload["scope"])?;
-        let request = providers::main_checkout_observation_request(scope, &self.paths.database)?;
+        let request = match crate::domain::QualificationContract::from_record(
+            &payload["observation_request"],
+        )
+        .map_err(anyhow::Error::msg)?
+        {
+            crate::domain::QualificationContract::Legacy => {
+                providers::main_checkout_observation_request(scope, &self.paths.database)?
+            }
+            crate::domain::QualificationContract::FunctionalV2 => {
+                providers::validate_main_functional_request(
+                    scope,
+                    &payload["observation_request"],
+                )?;
+                payload["observation_request"].clone()
+            }
+        };
         let policy = providers::main_readonly_command_policy(
             scope,
             &request,
@@ -5952,6 +6547,190 @@ impl Application {
             bail!("The frozen Main read-only commands or protections changed; verify the current scope again")
         }
         Ok(Some(policy))
+    }
+
+    pub(crate) fn record_functional_main_checkout_proof(
+        &self,
+        proof: &crate::domain::FunctionalCapabilityProofInput,
+    ) -> Result<serde_json::Value> {
+        let mut result = self.store.record_functional_main_checkout_proof(proof)?;
+        let payload = &result["retained_observations"];
+        let control: String = self.store.lock()?.query_row(
+            "SELECT id FROM controls WHERE kind='main_checkout_verify' AND state='finished'
+               AND json_extract(payload_json,'$.session_id')=?1 AND json_extract(payload_json,'$.probe_id')=?2",
+            rusqlite::params![proof.session_id,payload["probe_id"].as_str()], |row| row.get(0),
+        )?;
+        if let Some(error) = self.cleanup_terminal_main_artifacts(&control, payload)? {
+            result["artifact_cleanup_error"] = error.into();
+        }
+        Ok(result)
+    }
+
+    fn cleanup_terminal_main_artifacts(
+        &self,
+        control: &str,
+        payload: &serde_json::Value,
+    ) -> Result<Option<String>> {
+        let error = cleanup_functional_main_artifacts(payload)
+            .err()
+            .map(|error| format!("{error:#}"));
+        if let Some(error) = &error {
+            let changed = self.store.lock()?.execute(
+                "UPDATE controls SET payload_json=json_set(payload_json,'$.artifact_cleanup_error',?1),updated_at=?2
+                 WHERE id=?3 AND kind='main_checkout_verify' AND state IN ('cancelled','failed','finished')
+                   AND json_extract(payload_json,'$.probe_id')=?4",
+                rusqlite::params![error,Utc::now().to_rfc3339(),control,payload["probe_id"].as_str()],
+            )?;
+            if changed != 1 {
+                bail!("Main artifact cleanup lost its terminal control ownership")
+            }
+        }
+        Ok(error)
+    }
+
+    fn settle_main_verification_launch_failure(
+        &self,
+        control: &str,
+        attempt: &str,
+        task: &str,
+        prepared: &serde_json::Value,
+        error: &anyhow::Error,
+    ) -> Result<serde_json::Value> {
+        use rusqlite::{params, OptionalExtension};
+        let nonce = prepared["nonce"]
+            .as_str()
+            .context("Main preparation lost its nonce binding")?;
+        let reason: String = format!("{error:#}")
+            .replace(nonce, "[redacted]")
+            .chars()
+            .take(4096)
+            .collect();
+        let mut connection = self.store.lock()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (json, state): (String, String) = tx.query_row(
+            "SELECT payload_json,state FROM controls WHERE id=?1 AND attempt_id=?2 AND kind='main_checkout_verify'
+             AND state IN ('native_requested','native_running','native_stopping','cancelled','failed')",
+            params![control, attempt], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut payload: serde_json::Value = serde_json::from_str(&json)?;
+        if payload["probe_id"] != prepared["probe_id"] {
+            bail!("Main verification lost its exact preparation ownership")
+        }
+        if prepared["functional_challenge_created"] == true {
+            payload["functional_challenge_created"] = true.into();
+            payload["scope"] = prepared["scope"].clone();
+            if prepared.get("observation_request").is_some() {
+                payload["observation_request"] = prepared["observation_request"].clone();
+            }
+        }
+        if payload.get("launch_reservation").is_none() {
+            if let Some(reservation) = prepared.get("launch_reservation") {
+                payload["launch_reservation"] = reservation.clone();
+            }
+        }
+        let reservation = &payload["launch_reservation"];
+        let session = payload["session_id"]
+            .as_str()
+            .or(reservation["session_id"].as_str());
+        let generation = payload["role_generation_id"]
+            .as_str()
+            .or(reservation["role_generation_id"].as_str());
+        let epoch = payload["transcript_epoch"]
+            .as_str()
+            .or(reservation["transcript_epoch"].as_str());
+        let owned: Option<(String, String, bool)> = tx
+            .query_row(
+                "SELECT s.id,s.launch_state,s.status='launch_failed' AND s.launch_state='failed'
+               AND s.process_identity_json IS NULL
+             FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+             WHERE s.id=?1 AND g.id=?2 AND s.transcript_epoch=?3 AND g.attempt_id=?4 AND g.role=?5",
+                params![
+                    session,
+                    generation,
+                    epoch,
+                    attempt,
+                    payload["actor"].as_str()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let any_reserved_owner: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 OR role_generation_id=?2 OR transcript_epoch=?3)
+             OR EXISTS(SELECT 1 FROM role_generations WHERE id=?2)",
+            params![session, generation, epoch], |row| row.get(0),
+        )?;
+        // A reservation or spawn marker is ownership evidence, never proof of nondelivery.
+        let not_started = payload["turns_reserved"].as_u64().unwrap_or(0) == 0
+            && !any_reserved_owner
+            && payload.get("session_id").is_none();
+        let nondelivery = owned.as_ref().is_some_and(|(_, _, failed)| *failed);
+        let terminal = not_started || nondelivery;
+        let recovery_session = owned
+            .as_ref()
+            .filter(|(_, state, _)| state != "delivery_unknown")
+            .map(|(id, _, _)| id.clone());
+        let owner = owned.as_ref().map(|(id, _, _)| {
+            serde_json::json!({"session_id":id,
+            "role_generation_id":generation,"transcript_epoch":epoch})
+        });
+        if let Some(owner) = owner {
+            for field in ["session_id", "role_generation_id", "transcript_epoch"] {
+                payload[field] = owner[field].clone();
+            }
+        }
+        payload["failure_reason"] = reason.clone().into();
+        payload["launch_disposition"] = if not_started {
+            "not_started"
+        } else if nondelivery {
+            "proven_nondelivery"
+        } else {
+            "recovery_required"
+        }
+        .into();
+        tx.execute(
+            "UPDATE controls SET state=?1,payload_json=?2,updated_at=?3 WHERE id=?4",
+            params![
+                if !terminal {
+                    "recovery_required"
+                } else if state == "cancelled" {
+                    "cancelled"
+                } else {
+                    "failed"
+                },
+                payload.to_string(),
+                Utc::now().to_rfc3339(),
+                control
+            ],
+        )?;
+        tx.execute(
+            "UPDATE attempts SET status='needs_input' WHERE id=?1 AND status IN ('running','held','needs_input')",
+            params![attempt],
+        )?;
+        tx.execute(
+            "UPDATE tasks SET attention='needs_input' WHERE id=?1 AND lifecycle='in_progress'
+             AND attention IN ('none','paused','needs_input')",
+            params![task],
+        )?;
+        tx.commit()?;
+        drop(connection);
+        if terminal {
+            if let Some(permit) = payload["launch_reservation"]["permit_id"].as_str() {
+                self.store.release_unconsumed_launch_permits(
+                    Some(permit),
+                    "Main verification preparation failed",
+                )?;
+            }
+            let _ = self.cleanup_terminal_main_artifacts(control, &payload)?;
+        } else if let Some(session) = recovery_session {
+            self.store
+                .mark_session_delivery_ambiguous(&session, &reason)?;
+        }
+        Ok(
+            serde_json::json!({"action":if terminal {"main_verification_failed"} else {"main_verification_recovery_required"},
+            "control_id":control,"retry_started":false,"success_proof":false,"not_started":not_started,
+            "reason":reason,"message":if terminal {"Main verification could not start. Review this failure before requesting a new verification."}
+                else {"Main verification may have started. Reconcile its exact session before requesting another verification."}}),
+        )
     }
 
     fn settle_main_checkout_verification(&self) -> Result<Option<serde_json::Value>> {
@@ -5969,6 +6748,9 @@ impl Application {
             return Ok(None);
         };
         let mut payload: serde_json::Value = serde_json::from_str(&json)?;
+        let functional = crate::domain::QualificationContract::from_record(&payload)
+            .map_err(anyhow::Error::msg)?
+            == crate::domain::QualificationContract::FunctionalV2;
         let task = payload["task_id"]
             .as_str()
             .ok_or_else(|| anyhow!("Verification has no task"))?
@@ -6007,87 +6789,187 @@ impl Application {
             return Ok(None);
         }
         if turns == 0 && !expired && !cancelled {
-            let root = self
-                .checkout_scope(&attempt)?
-                .ok_or_else(|| anyhow!("Verification lost Main scope"))?;
-            let path = std::path::Path::new(root["root"].as_str().unwrap())
-                .join(format!(".llmrelay-main-{probe}-first"));
-            match std::fs::symlink_metadata(&path) {
-                Ok(_) => bail!(
-                    "Verification output {} already exists; cancel without overwriting it",
-                    path.display()
-                ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("Cannot inspect verification output {}", path.display())
-                    })
+            let started = (|| -> Result<serde_json::Value> {
+                if functional {
+                    if payload["functional_challenge_created"] == true
+                        || payload.get("launch_reservation").is_some()
+                    {
+                        bail!("Main verification already attempted preparation; inspect this verification before starting a new one")
+                    }
+                    self.store.preflight_main_verification(
+                        &attempt,
+                        actor.parse().map_err(|error: String| anyhow!(error))?,
+                    )?;
                 }
-            }
-            let request =
-                providers::main_checkout_observation_request(&root, &self.paths.database)?;
-            payload["observation_request_hash"] = json_hash(&request)?.into();
-            payload["observation_request"] = request.clone();
-            payload["scope"] = root.clone();
-            payload["scope_hash"] = json_hash(&root)?.into();
-            let writable = actor == "single_agent" || actor == "implementer";
-            let readonly_probes = if writable {
-                String::new()
-            } else {
-                let compound = format!(".llmrelay-main-{probe}-compound");
-                let redirect = format!(".llmrelay-main-{probe}-redirect");
-                for name in [&compound, &redirect] {
-                    let artifact = std::path::Path::new(root["root"].as_str().unwrap()).join(name);
-                    match std::fs::symlink_metadata(&artifact) {
+                let root = self
+                    .checkout_scope(&attempt)?
+                    .ok_or_else(|| anyhow!("Verification lost Main scope"))?;
+                if functional {
+                    payload["scope"] = root.clone();
+                    payload["scope_hash"] = json_hash(&root)?.into();
+                }
+                let path = std::path::Path::new(root["root"].as_str().unwrap())
+                    .join(format!(".llmrelay-main-{probe}-first"));
+                if !functional || actor == "implementer" {
+                    match std::fs::symlink_metadata(&path) {
+                        Ok(_) => bail!(
+                            "Verification output {} already exists; cancel without overwriting it",
+                            path.display()
+                        ),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("Cannot inspect verification output {}", path.display())
+                            })
+                        }
+                    }
+                }
+                let request = if functional {
+                    if actor == "single_agent" {
+                        bail!("Single agent Main verification has no functional role contract")
+                    }
+                    use std::io::Write;
+                    let challenge = std::path::Path::new(root["root"].as_str().unwrap())
+                        .join(format!(".llmrelay-main-{probe}-challenge"));
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&challenge)
+                        .context(
+                            "Create the exact owned Main challenge without replacing a file",
+                        )?;
+                    payload["functional_challenge_created"] = true.into();
+                    if self.store.lock()?.execute(
+                    "UPDATE controls SET payload_json=?1 WHERE id=?2 AND state='native_requested'",
+                    params![payload.to_string(), control],
+                )? != 1 {
+                    bail!("Main challenge preparation lost its current control ownership")
+                }
+                    file.write_all(nonce.as_bytes())?;
+                    providers::main_checkout_functional_observation_request(
+                        &root,
+                        &challenge,
+                        (actor == "implementer").then_some(path.as_path()),
+                    )?
+                } else {
+                    providers::main_checkout_observation_request(&root, &self.paths.database)?
+                };
+                payload["observation_request_hash"] = json_hash(&request)?.into();
+                payload["observation_request"] = request.clone();
+                if !functional {
+                    payload["scope"] = root.clone();
+                    payload["scope_hash"] = json_hash(&root)?.into();
+                }
+                let writable = actor == "single_agent" || actor == "implementer";
+                let readonly_probes = if functional {
+                    if !writable {
+                        payload["readonly_command_policy"] =
+                            serde_json::to_value(providers::main_readonly_command_policy(
+                                &root,
+                                &request,
+                                &serde_json::Value::Null,
+                            )?)?;
+                    }
+                    String::new()
+                } else if writable {
+                    String::new()
+                } else {
+                    let compound = format!(".llmrelay-main-{probe}-compound");
+                    let redirect = format!(".llmrelay-main-{probe}-redirect");
+                    for name in [&compound, &redirect] {
+                        let artifact =
+                            std::path::Path::new(root["root"].as_str().unwrap()).join(name);
+                        match std::fs::symlink_metadata(&artifact) {
                         Ok(_) => bail!("Read-only verification output {} already exists; cancel without overwriting it",artifact.display()),
                         Err(error) if error.kind()==std::io::ErrorKind::NotFound => {},
                         Err(error) => return Err(error).with_context(||format!("Cannot inspect read-only verification output {}",artifact.display())),
                     }
-                }
-                payload["readonly_probe_paths"] = serde_json::json!([
-                    format!(".llmrelay-main-{probe}-first"),
-                    compound,
-                    redirect
-                ]);
-                let policy = providers::main_readonly_command_policy(
-                    &root,
-                    &request,
-                    &payload["readonly_probe_paths"],
-                )?;
-                payload["readonly_command_policy"] = serde_json::to_value(&policy)?;
-                format!("Remain read-only: writing tools are disabled. Run only these four exact commands once each and preserve their native tool results:\n{}\nThe three write probes use fixed harmless bytes, not the conversation nonce. If a probe leaves an artifact, report its exact path without deleting or resetting it.",
+                    }
+                    payload["readonly_probe_paths"] = serde_json::json!([
+                        format!(".llmrelay-main-{probe}-first"),
+                        compound,
+                        redirect
+                    ]);
+                    let policy = providers::main_readonly_command_policy(
+                        &root,
+                        &request,
+                        &payload["readonly_probe_paths"],
+                    )?;
+                    payload["readonly_command_policy"] = serde_json::to_value(&policy)?;
+                    format!("Remain read-only: writing tools are disabled. Run only these four exact commands once each and preserve their native tool results:\n{}\nThe three write probes use fixed harmless bytes, not the conversation nonce. If a probe leaves an artifact, report its exact path without deleting or resetting it.",
                     policy.commands.iter().map(|entry|entry.command.as_str()).collect::<Vec<_>>().join("\n"))
+                };
+                let command = request["command"].as_str().unwrap();
+                let prompt = if functional {
+                    crate::trip::functional_main_launch_prompt(
+                        actor.parse().map_err(|error: String| anyhow!(error))?,
+                        &request,
+                    )?
+                } else {
+                    let action = if writable {
+                        format!("Retain the nonce in this native conversation. Use the native file tool to write exactly {nonce} followed by a single LF newline, with no other bytes, to .llmrelay-main-{probe}-first. Run this exact harmless boundary command once:\n{command}")
+                    } else {
+                        format!(
+                            "Remember {nonce} only in this native conversation. {readonly_probes}"
+                        )
+                    };
+                    format!("LLMRelay Main verification first. This is only the authorized permission check; do not implement the task or submit a completion report. {action}\nThe boundary command only opens and closes paths without reading, creating, truncating or writing bytes, and connects then closes without an application protocol request. Preserve actual native commands and tool results. Do not print contents, enumerate directories, read credentials, send app-control requests, install runtimes, bypass a refusal or retry. Missing paths/runtime, tool refusal, connection failure, narration and unchanged files do not prove OS denial; report them as unavailable. Finish this turn and wait.")
+                };
+                payload["prompt_hash"] = json_hash(&prompt)?.into();
+                let connection = self.store.lock()?;
+                if connection.execute(
+                    "UPDATE controls SET payload_json=?1 WHERE id=?2 AND state='native_requested'",
+                    params![payload.to_string(), control],
+                )? != 1
+                {
+                    bail!("Main verification preparation lost its current control ownership")
+                }
+                connection.execute("UPDATE attempts SET status='running' WHERE id=?1 AND status IN ('held','needs_input')",params![attempt])?;
+                connection.execute("UPDATE tasks SET attention='none' WHERE id=?1 AND attention IN ('paused','needs_input')",params![task])?;
+                drop(connection);
+                let launch = if actor == "single_agent" {
+                    self.launch_single_agent_turn(&attempt, None, Some(&prompt), None, true)?
+                } else {
+                    let role = actor.parse().map_err(|error: String| anyhow!(error))?;
+                    let launched = if functional {
+                        let context = self.store.role_launch_context(&attempt, role)?;
+                        payload["launch_reservation"] = serde_json::json!({"session_id":context.session_id,
+                        "role_generation_id":context.role_generation_id,"transcript_epoch":context.transcript_epoch,
+                        "permit_id":context.permit_id});
+                        if self.store.lock()?.execute(
+                        "UPDATE controls SET payload_json=?1 WHERE id=?2 AND state='native_requested'",
+                        params![payload.to_string(), control],
+                    )? != 1 {
+                        bail!("Main launch preparation lost its current control ownership")
+                    }
+                        self.dispatch_context(
+                            &attempt, role, &prompt, None, context, None, None, None,
+                        )?
+                    } else {
+                        self.dispatch_role(&attempt, role, &prompt, None)?
+                    };
+                    serde_json::to_value(launched)?
+                };
+                self.hold_main_verification(&control, &attempt, &task)?;
+                Ok(
+                    serde_json::json!({"action":"main_verification_started","control_id":control,"launch":launch}),
+                )
+            })();
+            return match started {
+                Ok(result) => Ok(Some(result)),
+                Err(error) if functional => self
+                    .settle_main_verification_launch_failure(
+                        &control, &attempt, &task, &payload, &error,
+                    )
+                    .map(Some),
+                Err(error) => Err(error),
             };
-            let command = request["command"].as_str().unwrap();
-            let action = if writable {
-                format!("Retain the nonce in this native conversation. Use the native file tool to write exactly {nonce} followed by a single LF newline, with no other bytes, to .llmrelay-main-{probe}-first. Run this exact harmless boundary command once:\n{command}")
-            } else {
-                format!("Remember {nonce} only in this native conversation. {readonly_probes}")
-            };
-            let prompt=format!("LLMRelay Main verification first. This is only the authorized permission check; do not implement the task or submit a completion report. {action}\nThe boundary command only opens and closes paths without reading, creating, truncating or writing bytes, and connects then closes without an application protocol request. Preserve actual native commands and tool results. Do not print contents, enumerate directories, read credentials, send app-control requests, install runtimes, bypass a refusal or retry. Missing paths/runtime, tool refusal, connection failure, narration and unchanged files do not prove OS denial; report them as unavailable. Finish this turn and wait.");
-            payload["prompt_hash"] = json_hash(&prompt)?.into();
-            let connection = self.store.lock()?;
-            connection.execute(
-                "UPDATE controls SET payload_json=?1 WHERE id=?2 AND state='native_requested'",
-                params![payload.to_string(), control],
-            )?;
-            connection.execute("UPDATE attempts SET status='running' WHERE id=?1 AND status IN ('held','needs_input')",params![attempt])?;
-            connection.execute("UPDATE tasks SET attention='none' WHERE id=?1 AND attention IN ('paused','needs_input')",params![task])?;
-            drop(connection);
-            let launch = if actor == "single_agent" {
-                self.launch_single_agent_turn(&attempt, None, Some(&prompt), None, true)?
-            } else {
-                let role = actor.parse().map_err(|error: String| anyhow!(error))?;
-                let launched = self.dispatch_role(&attempt, role, &prompt, None)?;
-                serde_json::to_value(launched)?
-            };
-            self.hold_main_verification(&control, &attempt, &task)?;
-            return Ok(Some(
-                serde_json::json!({"action":"main_verification_started","control_id":control,"launch":launch}),
-            ));
         }
         if turns == 0 {
             self.store.lock()?.execute("UPDATE controls SET state='cancelled',updated_at=?1 WHERE id=?2 AND state='native_requested'",params![Utc::now().to_rfc3339(),control])?;
+            if functional {
+                let _ = self.cleanup_terminal_main_artifacts(&control, &payload)?;
+            }
             return Ok(Some(
                 serde_json::json!({"action":"main_verification_not_started","expired":expired,"control_id":control}),
             ));
@@ -6116,6 +6998,9 @@ impl Application {
                     "UPDATE controls SET state='failed',updated_at=?1 WHERE id=?2",
                     params![Utc::now().to_rfc3339(), control],
                 )?;
+                if functional {
+                    let _ = self.cleanup_terminal_main_artifacts(&control, &payload)?;
+                }
                 return Ok(Some(
                     serde_json::json!({"action":"main_verification_failed","session_id":session,"proven_nondelivery":true,"retry_started":false}),
                 ));
@@ -6132,10 +7017,14 @@ impl Application {
             )?;
             tx.execute("UPDATE attempts SET status='needs_input' WHERE id=?1 AND status IN ('running','held')",params![attempt])?;
             tx.execute(
-                "UPDATE tasks SET attention='needs_input' WHERE id=?1 AND lifecycle='in_progress'",
+                "UPDATE tasks SET attention='needs_input' WHERE id=?1 AND lifecycle='in_progress' AND attention!='resume_failed'",
                 params![task],
             )?;
             tx.commit()?;
+            drop(connection);
+            if functional {
+                let _ = self.cleanup_terminal_main_artifacts(&control, &payload)?;
+            }
             return Ok(Some(
                 serde_json::json!({"action":"main_verification_failed","session_id":session,"retry_started":false,"reason":record["launch_error"]}),
             ));
@@ -6188,6 +7077,9 @@ impl Application {
                 "UPDATE controls SET state='cancelled',updated_at=?1 WHERE id=?2",
                 params![Utc::now().to_rfc3339(), control],
             )?;
+            if functional {
+                let _ = self.cleanup_terminal_main_artifacts(&control, &payload)?;
+            }
             return Ok(Some(
                 serde_json::json!({"action":"main_verification_stopped","expired":expired,"session_id":session,"success_proof":false}),
             ));
@@ -6200,6 +7092,90 @@ impl Application {
             params![session], |row|row.get(0))?;
         if !completed_turn {
             bail!("Main verification stopped without an authenticated complete turn; no retained call or success proof was started")
+        }
+        if functional {
+            let validation = (|| -> Result<()> {
+                let connection = self.store.lock()?;
+                let generation = payload["role_generation_id"]
+                    .as_str()
+                    .context("Main verification lost its generation")?;
+                let failed: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM role_results WHERE session_id=?1 AND role_generation_id=?2
+                       AND json_extract(metadata_json,'$.runtime_report_format')='functional-v2'
+                       AND json_extract(metadata_json,'$.validation_observation.functional.status') IN ('failed','missing_context'))",
+                    params![session,generation], |row| row.get(0),
+                )?;
+                if failed {
+                    bail!("Main functional report recorded failed or missing context")
+                }
+                match (turns, payload["max_turns"].as_u64()) {
+                    (1, Some(2)) => return Ok(()),
+                    (1, Some(1)) | (2, Some(2)) => {}
+                    _ => bail!("Main functional verification has an invalid turn reservation"),
+                }
+                let mut statement = connection.prepare(
+                    "SELECT json_object('operation_id',operation_id,'outcome',outcome,'summary',summary,
+                       'evidence',json(evidence_json),'metadata',json(metadata_json)) FROM role_results
+                     WHERE session_id=?1 AND role_generation_id=?2 ORDER BY rowid LIMIT 2",
+                )?;
+                let reports = statement
+                    .query_map(params![session, generation], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if reports.len() != 1 {
+                    let rejection: Option<String> = connection.query_row(
+                        "SELECT json_extract(result_json,'$.reason') FROM operation_receipts
+                         WHERE actor_key=?1 AND operation_kind='role_report'
+                           AND json_extract(result_json,'$.accepted')=0
+                           AND json_extract(result_json,'$.session_id')=?2
+                           AND json_extract(result_json,'$.transcript_epoch')=?3 ORDER BY rowid DESC LIMIT 1",
+                        params![generation,session,payload["transcript_epoch"].as_str()], |row| row.get(0),
+                    ).optional()?;
+                    bail!(
+                        "{}",
+                        rejection.as_deref().unwrap_or("Main functional verification requires exactly one accepted current report")
+                    )
+                }
+                let report: crate::domain::RoleResultReport = serde_json::from_str(&reports[0])?;
+                if report.outcome != "capability_observed"
+                    || report.metadata["runtime_report_format"] != "functional-v2"
+                    || report.metadata["validation_observation"]["functional"]["status"] != "passed"
+                {
+                    bail!("Main functional verification requires a passed current functional-v2 report")
+                }
+                crate::store::validate_functional_main_report_in(
+                    &connection,
+                    &session,
+                    generation,
+                    &report,
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = validation {
+                let reason = format!("{error:#}");
+                payload["failure_reason"] = reason.clone().into();
+                let mut connection = self.store.lock()?;
+                let tx = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                tx.execute(
+                    "UPDATE controls SET state='failed',payload_json=?1,updated_at=?2 WHERE id=?3",
+                    params![payload.to_string(), Utc::now().to_rfc3339(), control],
+                )?;
+                tx.execute(
+                    "UPDATE attempts SET status='needs_input' WHERE id=?1",
+                    params![attempt],
+                )?;
+                tx.execute(
+                    "UPDATE tasks SET attention='needs_input' WHERE id=?1 AND attention!='resume_failed'",
+                    params![task],
+                )?;
+                tx.commit()?;
+                drop(connection);
+                let _ = self.cleanup_terminal_main_artifacts(&control, &payload)?;
+                return Ok(Some(
+                    serde_json::json!({"action":"main_verification_failed","session_id":session,"retry_started":false,"success_proof":false,
+                        "reason":reason,"message":"Prepare fresh Main verification after correcting the evidence; no retry or publication was started."}),
+                ));
+            }
         }
         let root = self
             .checkout_scope(&attempt)?
@@ -6214,7 +7190,27 @@ impl Application {
             if turns == 1 { "first" } else { "recall" }
         );
         let path = std::path::Path::new(root["root"].as_str().unwrap()).join(&filename);
-        let observed = if writable {
+        let observed = if functional {
+            let request = &payload["observation_request"];
+            let read = std::path::Path::new(
+                request["permitted_read"]["path"]
+                    .as_str()
+                    .context("Main functional verification lost its challenge")?,
+            );
+            let writer = request["owned_writer"]["path"]
+                .as_str()
+                .map(std::path::Path::new);
+            *request
+                == providers::main_checkout_functional_observation_request(&root, read, writer)?
+                && std::fs::read(read)? == nonce.as_bytes()
+                && match writer {
+                    Some(path) => {
+                        std::fs::symlink_metadata(path)?.is_file()
+                            && std::fs::read(path)? == nonce.as_bytes()
+                    }
+                    None => !writable,
+                }
+        } else if writable {
             remove_owned_verification_output(&path, &nonce)?
         } else {
             for name in payload["readonly_probe_paths"]
@@ -6248,7 +7244,7 @@ impl Application {
         if first && payload["max_turns"].as_u64() == Some(2) {
             let recall_path = std::path::Path::new(root["root"].as_str().unwrap())
                 .join(format!(".llmrelay-main-{probe}-recall"));
-            if writable && std::fs::symlink_metadata(recall_path).is_ok() {
+            if !functional && writable && std::fs::symlink_metadata(recall_path).is_ok() {
                 bail!("The retained verification output already exists; no replacement or overwrite was authorized")
             }
             let recall = if writable {
@@ -6256,7 +7252,11 @@ impl Application {
             } else {
                 "Remain read-only. State the remembered nonce in your final answer for independent native UI review. Do not run tools or attempt any file write.".into()
             };
-            let prompt=format!("LLMRelay Main verification recall. Continue only this diagnostic in the same native conversation. {recall} Do not read prior files, transcripts or fixture records. Finish and wait; do not implement, submit a result, bypass a denial or retry.");
+            let prompt = if functional {
+                crate::trip::functional_main_resume_prompt()
+            } else {
+                format!("LLMRelay Main verification recall. Continue only this diagnostic in the same native conversation. {recall} Do not read prior files, transcripts or fixture records. Finish and wait; do not implement, submit a result, bypass a denial or retry.")
+            };
             payload["prompt_hash"] = json_hash(&prompt)?.into();
             payload["phase"] = "recall".into();
             self.store.lock()?.execute(
@@ -6270,7 +7270,7 @@ impl Application {
                     params![attempt],
                 )?;
                 connection.execute(
-                    "UPDATE tasks SET attention='needs_input' WHERE id=?1",
+                    "UPDATE tasks SET attention='needs_input' WHERE id=?1 AND attention!='resume_failed'",
                     params![task],
                 )?;
                 drop(connection);
@@ -6312,13 +7312,13 @@ impl Application {
             params![attempt],
         )?;
         transaction.execute(
-            "UPDATE tasks SET attention='needs_input' WHERE id=?1",
+            "UPDATE tasks SET attention='needs_input' WHERE id=?1 AND attention!='resume_failed'",
             params![task],
         )?;
         transaction.commit()?;
         Ok(Some(
             serde_json::json!({"action":"main_verification_requires_native_evidence","session_id":session,
-            "message":"Inspect exact native protected-root denial evidence and record it with capability record-proof. File/recall observations alone do not qualify Main permissions."}),
+            "message":if functional {"Publish the exact typed functional Main evidence with capability record-proof; functional evidence does not attest OS confinement."} else {"Inspect exact native protected-root denial evidence and record it with capability record-proof. File/recall observations alone do not qualify Main permissions."}}),
         ))
     }
 
@@ -6511,9 +7511,67 @@ impl Application {
 const PROVIDER_CHECK_PREFIX: &str = "LLMRELAY-CHECK-";
 
 fn remove_owned_verification_output(path: &std::path::Path, nonce: &str) -> Result<bool> {
+    remove_owned_verification_bytes(path, format!("{nonce}\n").as_bytes())
+}
+
+fn cleanup_functional_main_artifacts(payload: &serde_json::Value) -> Result<()> {
+    if payload["functional_challenge_created"] != true {
+        return Ok(());
+    }
+    let root = std::path::Path::new(
+        payload["scope"]["root"]
+            .as_str()
+            .context("Owned Main cleanup lost its root")?,
+    );
+    let probe = payload["probe_id"]
+        .as_str()
+        .context("Owned Main cleanup lost its identity")?;
+    let nonce = payload["nonce"]
+        .as_str()
+        .context("Owned Main cleanup lost its nonce")?;
+    if [probe, nonce]
+        .iter()
+        .any(|value| value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        bail!("Owned Main cleanup has an invalid identity")
+    }
+    let request = &payload["observation_request"];
+    providers::validate_main_functional_request(&payload["scope"], request)?;
+    let challenge = root.join(format!(".llmrelay-main-{probe}-challenge"));
+    let writer = root.join(format!(".llmrelay-main-{probe}-first"));
+    if request["permitted_read"]["path"].as_str() != challenge.to_str()
+        || (request["owned_writer"] != serde_json::Value::Null
+            && request["owned_writer"]["path"].as_str() != writer.to_str())
+    {
+        bail!("Owned Main cleanup paths differ from the reserved artifacts")
+    }
+    for path in [&challenge, &writer] {
+        if path == &writer && request["owned_writer"] == serde_json::Value::Null {
+            continue;
+        }
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect owned Main artifact {}", path.display()))
+            }
+            Ok(_) => {}
+        }
+        if !remove_owned_verification_bytes(path, nonce.as_bytes())
+            .with_context(|| format!("remove owned Main artifact {}", path.display()))?
+        {
+            bail!(
+                "Main artifact {} no longer has the exact owned bytes; preserve it for review",
+                path.display()
+            )
+        }
+    }
+    Ok(())
+}
+
+fn remove_owned_verification_bytes(path: &std::path::Path, expected: &[u8]) -> Result<bool> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let expected = format!("{nonce}\n");
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -6529,7 +7587,7 @@ fn remove_owned_verification_output(path: &std::path::Path, nonce: &str) -> Resu
     let mut bytes = Vec::new();
     file.by_ref().take(129).read_to_end(&mut bytes)?;
     let current = std::fs::symlink_metadata(path)?;
-    if bytes != expected.as_bytes()
+    if bytes != expected
         || current.ino() != metadata.ino()
         || current.dev() != metadata.dev()
         || current.nlink() != 1
@@ -6877,6 +7935,29 @@ mod provider_validation_tests {
             }
             assert_eq!(std::fs::read(&target).unwrap(), expected.as_bytes());
         }
+        let canonical = root.canonicalize().unwrap();
+        let probe = "fedcba9876543210fedcba9876543210";
+        let challenge = canonical.join(format!(".llmrelay-main-{probe}-challenge"));
+        let writer = canonical.join(format!(".llmrelay-main-{probe}-first"));
+        std::fs::write(&challenge, nonce).unwrap();
+        std::fs::write(&writer, nonce).unwrap();
+        let protected = target.canonicalize().unwrap();
+        let scope = serde_json::json!({"root":canonical,"protected_roots":[protected],"protected_read_targets":[protected],"policy_denied_unobserved":[]});
+        let request = providers::main_checkout_functional_observation_request(
+            &scope,
+            &challenge,
+            Some(&writer),
+        )
+        .unwrap();
+        let payload = serde_json::json!({"functional_challenge_created":true,"scope":scope,"probe_id":probe,"nonce":nonce,"observation_request":request});
+        std::fs::write(&writer, b"changed by owner").unwrap();
+        assert!(cleanup_functional_main_artifacts(&payload).is_err());
+        assert!(!challenge.exists());
+        assert_eq!(std::fs::read(&writer).unwrap(), b"changed by owner");
+        std::fs::write(&writer, nonce).unwrap();
+        cleanup_functional_main_artifacts(&payload).unwrap();
+        assert!(!writer.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), expected.as_bytes());
         std::fs::remove_dir_all(root).unwrap();
     }
     use crate::domain::Provider;
@@ -7274,6 +8355,71 @@ mod provider_validation_tests {
 #[cfg(test)]
 mod compatibility_error_tests {
     use super::*;
+
+    #[test]
+    fn context_index_pages_preserve_whole_entries_and_bound_complete_envelopes() {
+        let revision = "ab".repeat(32);
+        let scope = "cd".repeat(16);
+        let entries = (0..27).map(|index| serde_json::json!({
+            "name":format!("section_{index:02}"),"bytes":999999,"pages":999999,
+            "digest":"ef".repeat(16),"first":role_context_cursor("current_explorer_evidence",999999,&revision,&scope)
+        })).collect::<Vec<_>>();
+        let ranges = role_context_index_ranges(&entries, &revision, &scope).unwrap();
+        assert!(ranges.len() > 1);
+        let mut reconstructed = Vec::new();
+        for (page, range) in ranges.iter().enumerate() {
+            let envelope = role_context_envelope(
+                "index",
+                &revision,
+                &scope,
+                page,
+                ranges.len(),
+                serde_json::json!(&entries[range.clone()]),
+            );
+            assert!(role_context_output_fits(&envelope).unwrap());
+            assert_eq!(envelope["complete"], page + 1 == ranges.len());
+            assert_eq!(envelope["next"].is_null(), page + 1 == ranges.len());
+            reconstructed.extend(envelope["entries"].as_array().unwrap().iter().cloned());
+        }
+        assert_eq!(reconstructed, entries);
+        let oversized = vec![serde_json::json!({"name":"x".repeat(4096)})];
+        assert!(role_context_index_ranges(&oversized, &revision, &scope)
+            .unwrap_err()
+            .to_string()
+            .contains("entry exceeds"));
+
+        let content =
+            serde_json::to_string(&serde_json::json!({"text":"é中😀\"\\\n\u{0}".repeat(6000)}))
+                .unwrap();
+        let ranges = role_context_content_ranges("task", &content, &revision, &scope).unwrap();
+        assert!(ranges.len() > 1);
+        let largest_counters = role_context_envelope(
+            "task",
+            &revision,
+            &scope,
+            ROLE_CONTEXT_MAX_PAGES - 2,
+            ROLE_CONTEXT_MAX_PAGES,
+            serde_json::json!(&content[ranges[0].clone()]),
+        );
+        assert!(role_context_output_fits(&largest_counters).unwrap());
+        crate::task_cli::RoleContextCursor::parse(largest_counters["next"].as_str().unwrap())
+            .unwrap();
+        let mut reconstructed = String::new();
+        for (page, range) in ranges.iter().enumerate() {
+            let envelope = role_context_envelope(
+                "task",
+                &revision,
+                &scope,
+                page,
+                ranges.len(),
+                serde_json::json!(&content[range.clone()]),
+            );
+            let cli_output = format!("{}\n", serde_json::to_string(&envelope).unwrap());
+            assert!(cli_output.len() <= ROLE_CONTEXT_OUTPUT_BYTES);
+            reconstructed.push_str(envelope["chunk"].as_str().unwrap());
+        }
+        assert_eq!(reconstructed.as_bytes(), content.as_bytes());
+    }
 
     #[test]
     fn changed_resume_request_does_not_poison_retained_session() {

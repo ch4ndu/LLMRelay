@@ -8,6 +8,7 @@ import type {
   AttentionActionKind,
   AttentionItem,
   AttentionTarget,
+  CapabilityRecordFunctionalProofOperation,
   CmuxSessionSurface,
   CmuxViewOutcome,
   ContinuationAction,
@@ -18,6 +19,7 @@ import type {
   ProjectExecution,
   ProviderFailureHold,
   ProviderValidationBatch,
+  RuntimeAdmissionState,
   Session,
   SingleAgentCheck,
   SingleAgentRun,
@@ -78,6 +80,7 @@ const {
   ApiError,
   ProtocolError,
   command,
+  operation,
   getState,
   getTaskContent,
   waitForState,
@@ -2072,10 +2075,11 @@ Deno.test("M7 fresh qualification stays reachable while stale exact resume is he
     click("Prepare a new verification");
     await settle();
     check(
-      requests.length === beforeClaudeCorrection &&
-        document.querySelector(".error[role=alert]:not(.error-notice)")
-          ?.textContent?.includes("Enter the live cmux socket path"),
-      "current Claude correction used old Codex setup history and sent a blank socket",
+      requests.length === beforeClaudeCorrection + 1 &&
+        requests.at(-1)?.action === "prepare_runtime_admission" &&
+        requests.at(-1)?.role === "explorer" &&
+        !("cmux_socket_path" in (requests.at(-1) || {})),
+      "Claude correction inherited the legacy denial diagnostic's cmux prerequisite",
     );
     unmount();
 
@@ -2191,25 +2195,75 @@ Deno.test("M7 fresh qualification stays reachable while stale exact resume is he
         onViewSession={cmuxFixture}
       />,
     );
-    const beforeSocket = requests.length;
+    const beforeClaudeGroup = requests.length;
     click("Prepare exact runtime verification");
     await settle();
     check(
-      requests.length === beforeSocket &&
-        document.querySelector(".error[role=alert]:not(.error-notice)")
-          ?.textContent?.includes("Enter the live cmux socket path"),
-      "current Claude manager with old Codex setup history sent a preparation or hid the inline instruction",
+      requests.length === beforeClaudeGroup + 1 &&
+        requests.at(-1)?.action === "prepare_runtime_admission" &&
+        !("cmux_socket_path" in (requests.at(-1) || {})) &&
+        document.body.textContent?.includes("do not attest OS confinement") &&
+        !document.body.textContent.includes("Live cmux Unix socket"),
+      "Claude functional preparation retained a denial-probe prerequisite or claimed confinement",
     );
-    field(
-      "Live cmux Unix socket for Claude requalification",
-      "/tmp/live-cmux.sock",
+    unmount();
+
+    mount(
+      <ProjectSetup
+        project={claudeManagerProject}
+        setup={{
+          ...setup,
+          runtime_admissions: [{
+            ...setup.runtime_admissions[0],
+            state: "ready",
+            probes: setup.runtime_admissions[0].probes.map((probe) => ({
+              ...probe, state: "published",
+            })),
+          }],
+        }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
     );
+    const beforeHistoricalGroup = requests.length;
     click("Prepare exact runtime verification");
     await settle();
-    check(
-      requests.at(-1)?.cmux_socket_path === "/tmp/live-cmux.sock",
-      "current Claude group did not send the entered socket",
+    check(requests.length === beforeHistoricalGroup + 1 &&
+      requests.at(-1)?.action === "prepare_runtime_admission" &&
+      !("cmux_socket_path" in (requests.at(-1) || {})) &&
+      document.body.textContent?.includes("Legacy denial diagnostics keep their original interpretation"),
+      "published history hid preparation of the current functional profiles");
+    check(document.querySelector(".runtime-admission")?.textContent?.includes("Legacy denial diagnostic group") &&
+      !document.querySelector(".runtime-admission")?.textContent?.includes("Functional qualification"),
+      "ready legacy history was relabeled as functional qualification");
+    const publishedGroup = {
+      ...setup.runtime_admissions[0],
+      state: "ready",
+      probes: setup.runtime_admissions[0].probes.map((probe) => ({
+        ...probe, state: "published", qualification_contract: "functional-v2",
+      })),
+    };
+    const showGroup = (group: RuntimeAdmissionState) => rerender(
+      <ProjectSetup
+        project={claudeManagerProject}
+        setup={{ ...setup, runtime_admissions: [group] }}
+        onChanged={noop}
+        onViewSession={cmuxFixture}
+      />,
     );
+    showGroup(publishedGroup);
+    check(document.querySelector(".runtime-admission")?.textContent?.includes("Functional qualification group"),
+      "frozen functional probes lost their group classification");
+    showGroup({ ...publishedGroup, probes: [publishedGroup.probes[0], { ...probe("plan_reviewer"), state: "published" }] });
+    check(document.querySelector(".runtime-admission")?.textContent?.includes("Mixed or unknown qualification group") &&
+      !document.querySelector(".runtime-admission")?.textContent?.includes("Functional qualification group") &&
+      document.querySelector(".runtime-admission")?.textContent?.includes("Legacy denial diagnostic"),
+      "mixed contracts were presented as one functional group");
+    showGroup({ ...publishedGroup, probes: [{ ...publishedGroup.probes[0], qualification_contract: null }] });
+    check(document.querySelector(".runtime-admission")?.textContent?.includes("Unknown qualification contract") &&
+      !document.querySelector(".runtime-admission")?.textContent?.includes("Functional qualification group") &&
+      !document.querySelector(".runtime-admission")?.textContent?.includes("Legacy denial diagnostic"),
+      "an explicit unknown discriminator inherited functional or legacy interpretation");
     unmount();
 
     const retainedProbe = {
@@ -3824,6 +3878,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
   const requests: Record<string, unknown>[] = [];
   const historyPages: Record<string, TranscriptPage[]> = {};
   const currentPreparationKey = "current-complete-preparation-key";
+  let preparationContract: unknown = "functional-v2";
   let failedRuntimeView = false;
   let runtimeProvider: "codex" | "claude" = "codex";
   const codexCatalogRequests: Array<{
@@ -3879,6 +3934,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
               effort: "high",
             },
             capability_key: currentPreparationKey,
+            qualification_contract: preparationContract,
             generic_capability_supported: true,
             exact_runtime_authority: false,
             task_profile_source: "task_override",
@@ -3922,6 +3978,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
             effort: "high",
           },
           capability_key: currentPreparationKey,
+          qualification_contract: preparationContract,
           generic_capability_supported: true,
           exact_runtime_authority: proofReady,
           task_profile_source: preparationSource,
@@ -4348,22 +4405,14 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
     click("Prepare a new verification");
     await settle();
     check(
-      requests.length === beforeClaude &&
-        document.querySelector(".error[role=alert]:not(.error-notice)")
-          ?.textContent?.includes("Enter the live cmux socket path"),
-      "task Claude preparation sent an empty socket instead of an inline instruction",
+      requests.length === beforeClaude + 1,
+      "task Claude functional verification did not prepare exactly one new admission",
     );
-    field(
-      "Live cmux Unix socket for Claude requalification",
-      "/tmp/task-cmux.sock",
-    );
-    click("Prepare a new verification");
-    await settle();
     if (
       requests.at(-1)?.action !== "prepare_runtime_admission" ||
       requests.at(-1)?.task_id !== "AJ-1" ||
       requests.at(-1)?.role !== "implementer" ||
-      requests.at(-1)?.cmux_socket_path !== "/tmp/task-cmux.sock" ||
+      "cmux_socket_path" in (requests.at(-1) || {}) ||
       requests.some((request) => request.kind === "runtime_probe_launch")
     ) {
       throw new Error(
@@ -5105,7 +5154,8 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       !document.body.textContent?.includes("Verification required") ||
       !document.body.textContent?.includes(
         "current preparation key has not yet appeared",
-      )
+      ) ||
+      !document.body.textContent?.includes("Earlier legacy diagnostic evidence remains in history")
     ) {
       throw new Error(
         "stale Supported evidence with identical labels hid the exact current preparation gate",
@@ -5119,7 +5169,7 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       "stale proof hid the current verification action",
     );
     unmount();
-    mount(
+    const supportedRoles = (
       <RoleSettings
         task={configured}
         sessions={[session]}
@@ -5136,6 +5186,8 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
           status: "supported",
           config_hash: currentPreparationKey,
           proof: {
+            qualification_contract: "functional-v2",
+            os_confinement_attested: false,
             model: "gpt-5.6-sol",
             effort: "high",
             local_mcp_coverage_revision: "codex-local-mcp-coverage-v1-0.155.1",
@@ -5145,8 +5197,9 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
           gaps: [],
         }]}
         onChanged={() => {}}
-      />,
+      />
     );
+    mount(supportedRoles);
     await settle();
     if (
       document.body.textContent?.includes("exact native validation required")
@@ -5160,6 +5213,8 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       ?.querySelector(".compatibility-details")?.textContent;
     check(
       proofCopy?.includes("These exact agent settings passed verification.") &&
+        proofCopy.includes("Functional qualification passed") &&
+        proofCopy.includes("does not attest OS confinement") &&
         !proofCopy.includes("Next step:"),
       "exact current proof still advised requalification",
     );
@@ -5172,6 +5227,21 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
       requests.at(-1)?.expected_version !== 7
     ) throw new Error("task-profile activation authority drifted");
     unmount();
+    for (const contract of [undefined, "functional-v99"]) {
+      preparationContract = contract;
+      const beforeContractCheck = requests.length;
+      mount(supportedRoles);
+      await settle();
+      check(!document.body.textContent?.includes("These exact agent settings passed verification.") &&
+        ![...document.querySelectorAll("button")].some((button) => button.textContent === "Activate task profile") &&
+        document.body.textContent?.includes(contract === undefined
+          ? "Prepared contract: Legacy denial diagnostic"
+          : "Prepared contract: Unknown qualification contract") &&
+        requests.length === beforeContractCheck,
+        "a legacy or unknown preparation borrowed current functional proof authority");
+      unmount();
+    }
+    preparationContract = "functional-v2";
 
     let selectProvider: (provider: "codex" | "claude") => void = () => {};
     const CatalogRace = () => {
@@ -7434,6 +7504,48 @@ Deno.test("T21 ambiguous mutation transport failures preserve durable operation 
       );
     }
 
+    const functionalRequest: CapabilityRecordFunctionalProofOperation = {
+      kind: "capability_record_functional_proof",
+      proof: {
+        qualification_contract: "functional-v2",
+        operation_id: "functional-main-publication",
+        session_id: "main-session",
+        evidence_reference: "reviewed-native-evidence",
+        main: {
+          observation_request_hash: "request-hash",
+          native_command: "/bin/cat -- '/owned/challenge'",
+          native_session_id: "native-session",
+          role_generation_id: "generation",
+          observation: {
+            status: "passed", binding_hash: "binding", challenge: "nonce",
+            session_mode: "retained",
+          },
+        },
+      },
+    };
+    const functionalBodies: string[] = [];
+    globalThis.fetch = (async (_input, init) => {
+      functionalBodies.push(String(init?.body));
+      throw new TypeError("connection ended after functional publication dispatch");
+    }) as typeof fetch;
+    let functionalFailure: unknown;
+    try {
+      await operation(functionalRequest);
+    } catch (cause) {
+      functionalFailure = cause;
+    }
+    check(functionalFailure instanceof ApiError && functionalFailure.ambiguous &&
+      functionalFailure.operationId === functionalRequest.proof.operation_id,
+      "functional publication lost its authoritative nested mutation identity");
+    globalThis.fetch = (async (_input, init) => {
+      functionalBodies.push(String(init?.body));
+      return new Response(JSON.stringify({ result: { status: "supported" } }));
+    }) as typeof fetch;
+    await operation(functionalRequest);
+    check(functionalBodies.length === 2 && functionalBodies.every((body) =>
+      body === JSON.stringify(functionalRequest)),
+      "functional publication reconciliation changed its proof or request identity");
+
     let genericRecoveryRefreshes = 0;
     mount(
       <RecoveryPanel
@@ -9258,6 +9370,11 @@ Deno.test("User errors explain recovery while retaining collapsed diagnostics", 
   const { ErrorNotice } = await import("./components/ErrorNotice");
   const cases = [
     [
+      "functional qualification reported model_refusal",
+      "selected agent profile did not pass functional verification",
+      "different supported settings from the same provider",
+    ],
+    [
       "setup discovery manager must exit before profile probes are frozen",
       "agent session has not closed yet",
       "saved setup information does not need correcting",
@@ -10133,17 +10250,22 @@ Deno.test("Recovery names the affected role and errors explain the setup baselin
   }
 });
 
-Deno.test("Role settings edit fields keep visible labels", async () => {
+Deno.test("Role settings edit fields keep visible labels and save all six roles with either provider", async () => {
   const configured: Task = {
     ...task,
-    role_settings: [{
-      id: "rs-manager",
-      role: "manager",
+    role_settings: ROLES.map((role): Task["role_settings"][number] => ({
+      id: `rs-${role}`,
+      role,
       revision: 1,
       config: { provider: "codex", model: "gpt-5.6-sol", effort: "high" },
-    }],
+    })),
   };
-  globalThis.fetch = (async () => new Response("[]")) as typeof fetch;
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input, init) => {
+    if (!init?.body) return new Response("[]");
+    requests.push(JSON.parse(String(init.body)));
+    return new Response(JSON.stringify({ result: { state: "requested" } }));
+  }) as typeof fetch;
   try {
     mount(
       <RoleSettings
@@ -10169,6 +10291,29 @@ Deno.test("Role settings edit fields keep visible labels", async () => {
       !document.querySelector(".role-edit-fields"),
       "Cancel did not leave editing",
     );
+    for (const provider of ["codex", "claude"] as const) {
+      for (const role of ROLES) {
+        const row = [...document.querySelectorAll(".role-settings article")]
+          .find((item) => item.querySelector("strong")?.textContent === roleLabel(role));
+        const edit = [...(row?.querySelectorAll("button") ?? [])]
+          .find((button) => button.textContent === "Edit");
+        if (!edit) throw new Error(`${role} has no individual provider selector`);
+        act(() => edit.click());
+        change(findSelect("Provider"), provider);
+        field(`${roleLabel(role)} exact model`, `${provider}-fixture-model`);
+        click("Save request");
+        await settle();
+        const request = requests.at(-1);
+        check(request?.kind === "set_role_settings" && request.role === role &&
+          request.task_id === configured.id && request.expected_version === configured.version &&
+          JSON.stringify(request.config) === JSON.stringify({
+            provider, model: `${provider}-fixture-model`, effort: "high",
+          }), `${role} did not save the exact ${provider} profile`);
+      }
+    }
+    check(requests.length === ROLES.length * 2 &&
+      !requests.some((request) => request.kind === "runtime_probe_launch"),
+      "saving six role choices started work or duplicated a save");
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -12008,7 +12153,7 @@ Deno.test("Setup installation review explains the files and steps plainly and ke
             ?.querySelectorAll("p.success").length === 6 &&
         !document.querySelector('.trip-setup > p[role="status"]') &&
         document.body.textContent?.includes(
-          "Setup receipts are never promoted into this authority",
+          "Setup receipts remain installation history and cannot grant runtime authority.",
         ),
       "activation turned successful installation records into a review warning or runtime permission",
     );
@@ -16726,12 +16871,24 @@ Deno.test("Role readiness refreshes when runtime evidence changes without changi
         config,
       }],
     };
-    const admission = (state: string) => ({
+    const admission = (state: string): RuntimeAdmissionState => ({
       id: "current-runtime",
       scope_hash: "scope",
       state,
       fresh_call_count: 1,
-      probes: [],
+      probes: [{
+        role: "manager",
+        profile: config,
+        profile_hash: "profile",
+        project_config_revision_id: "configuration",
+        project_configuration_hash: "configuration-hash",
+        adapter: "codex",
+        adapter_hash: "adapter-hash",
+        capability_key: "readiness-key",
+        nonce: "fixture-only",
+        state,
+        has_native_session: false,
+      }],
     });
     const compatibility = {
       status: "matched" as const,
@@ -16763,7 +16920,12 @@ Deno.test("Role readiness refreshes when runtime evidence changes without changi
         status: "unverified",
         reason: "Verification pending",
         compatibility,
-        runtime_admission: runtime,
+        capability_key: "readiness-key",
+        qualification_contract: "functional-v2",
+        runtime_admission: {
+          ...runtime,
+          qualification_contract: runtime.probes[0].qualification_contract,
+        },
       }]));
     }) as typeof fetch;
     const card = () => (
@@ -16816,6 +16978,8 @@ Deno.test("Role readiness refreshes when runtime evidence changes without changi
         document.body.textContent?.includes(
           "Previous probe needs correction",
         ) &&
+          document.body.textContent.includes("Prepared contract: Functional qualification") &&
+          document.body.textContent.includes("Recorded verification: Legacy denial diagnostic") &&
           reads === 1,
         "initial failure was not visible",
       );
@@ -16835,6 +16999,16 @@ Deno.test("Role readiness refreshes when runtime evidence changes without changi
         reads === 2,
         "unchanged snapshot objects repeatedly requested preparations",
       );
+      runtime = {
+        ...runtime,
+        probes: runtime.probes.map((probe) => ({ ...probe, qualification_contract: null })),
+      };
+      update("4");
+      await settle();
+      check(reads === 3 &&
+        document.body.textContent?.includes("Recorded verification: Unknown qualification contract") &&
+        document.body.textContent.includes("Prepared contract: Functional qualification"),
+        `${surface}: a contract-only change retained an inferred legacy label`);
     } finally {
       unmount();
       globalThis.fetch = nativeFetch;
@@ -18199,10 +18373,15 @@ Deno.test("Main checkout consent binds current scope and verification routes bot
         "verification used a new endpoint, omitted the exact version or confused actor authority");
       rerender(view({ ...ready, active_attempt: task.active_attempt }, [{
         id: "main-control", attempt_id: "a1", kind: "main_checkout_verify",
-        state: "awaiting_native_evidence", payload: { task_id: ready.id }, updated_at: "2026-10-14T00:00:00Z",
+        state: "awaiting_native_evidence", payload: { task_id: ready.id,
+          ...(family === "trip" ? { qualification_contract: "functional-v2" } : {}) },
+        updated_at: "2026-10-14T00:00:00Z",
       }]));
       check(findButton("Verify Main checkout access").disabled &&
-        document.body.textContent?.includes("Waiting for reviewed native permission evidence"),
+        document.body.textContent?.includes(family === "trip"
+          ? "Waiting for publication of correlated functional evidence"
+          : "Waiting for reviewed native permission evidence") &&
+        (family !== "trip" || document.body.textContent.includes("does not attest OS confinement")),
         "waiting evidence offered a duplicate verification or fabricated proof");
       if (family === "trip") {
         rerender(view(ready, [{ id: "main-control", attempt_id: "a1", kind: "main_checkout_verify",

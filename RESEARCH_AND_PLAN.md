@@ -1,5 +1,22 @@
 # LLMRelay — independent architecture and product plan
 
+## Start with the current user guide
+
+This file preserves architecture decisions and dated implementation history.
+Descriptions of “current” versions, unfinished tests and TRIP-only setup in older
+sections refer to their original checkpoints.
+
+Today, LLMRelay supports **TRIP and Single agent**. Single agent does not need
+TRIP installation. Both Codex and Claude have writer verification records, and
+TRIP tasks have reached acceptance using either provider alone. This does not
+mean every recovery scenario is verified or that workflows always finish
+without intervention.
+
+For instructions, read the [README](README.md). For current completion status
+and limits, read the [roadmap](docs/NEXT_MILESTONE_PLAN.md). Detailed historical
+provider evidence is in the [verification record](docs/provider-qualification-20261011.md).
+
+
 ## Required TRIP Explorer host — approved September 15, 2026
 
 LLMRelay is an extension of the standalone TRIP Explorer workflow, including

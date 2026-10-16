@@ -1,103 +1,169 @@
 # LLMRelay
 
-LLMRelay is a local dashboard for running development tasks through the TRIP Explorer workflow. It manages projects, native agent sessions, role settings, review gates, permissions, and recovery on your machine.
+LLMRelay is a local app for giving development tasks to coding agents and following their work in a browser. You describe the change, choose how the work should be done, answer questions or permission requests, and review the result before accepting it.
 
-It runs your installed Codex and Claude Code CLIs using their normal accounts. You use the dashboard in a browser and cmux for live terminal views; manual attachment from another terminal is also available. No provider API integration, Jinn, or cloud service is required.
+It uses the Codex or Claude Code command-line tools already installed on your Mac, with your existing accounts. You can use **only Codex, only Claude, or a mixture**; you do not need both providers. Model calls use your account's allowance. The dashboard runs locally, but the selected coding tool still communicates with its provider.
+
+## Choose how you want to work
+
+A **workflow** is the sequence of steps a task follows.
+
+| Workflow | What happens | When to choose it |
+| --- | --- | --- |
+| **Single agent** | One agent works on the task, submits a result, and runs any checks you selected. You review and accept it or request changes. | A small fix, a focused change, or your first task. No TRIP installation is needed. |
+| **TRIP** | Separate agent sessions plan, implement and review the change. You approve the plan and implementation, then review the final result. | A larger change where you want a structured plan and independent reviews. |
+
+Both workflows are implemented. Single-agent execution has native verification records for Codex and Claude. Complete TRIP tasks have also reached acceptance using only Codex and only Claude. Your own project profiles still need their setup checks before they can run.
+
+Custom workflow editing and separate **Build and review** or **Research** presets are not available yet. Recipes and schedules currently use TRIP.
 
 ## Start LLMRelay
 
-You need macOS, Git, and an installed, authenticated CLI for each provider you select. Rust and Deno are needed only when [building from source](docs/BUILDING.md).
+You need macOS, Git, and an installed, signed-in Codex or Claude Code CLI. A CLI is a program you run in a terminal. Rust and Deno are needed only if you [build LLMRelay from source](docs/BUILDING.md).
 
-Extract the local package and run its executable from a terminal inside cmux:
+Extract the local package, then run:
 
 ```sh
 /path/to/llmrelay-0.1.0-macos/bin/llmrelay serve --port 0
 ```
 
-For the package built in this checkout:
+Replace `/path/to` with the folder where you extracted the package. If you built it in this checkout, use:
 
 ```sh
 .local/dist/llmrelay-0.1.0-macos/bin/llmrelay serve --port 0
 ```
 
-Keep that terminal open. Automatic dashboard-to-cmux routing requires the service to verify that it was started inside cmux; another terminal can still host the dashboard and use manual attachment. LLMRelay selects an available local port, opens your default browser, and authenticates the dashboard automatically. The browser then shows a clean URL; you do not need to add a session ID. Adding the executable to `PATH` is optional. LLMRelay does not register a background login service.
+Keep the terminal open. The app chooses a free local port and opens your browser with a signed-in dashboard. It does not install a background login service.
 
-Use `serve --no-open` if you prefer to open the browser yourself. Use the one-use login link printed in Terminal; opening the clean URL in a different, unauthenticated browser is not enough. See [browser authentication and troubleshooting](docs/OPERATIONS.md#startup-and-browser-authentication).
+For live agent output that opens directly from the dashboard, start the app inside **cmux**, the terminal application used for those views. Another terminal can host the app too, with [manual terminal attachment](docs/OPERATIONS.md#attach-from-a-terminal).
 
-## Add and set up a project
+If the browser does not open, use the one-use login link printed in the terminal. Opening the dashboard's clean URL in another browser does not sign that browser in. You can also start with `serve --no-open` and use the printed link yourself.
 
-1. Choose **Add project** and enter a display name and the absolute path to an existing Git repository.
-2. Open its project setup. Inspect the existing workflow and choose the manager that will discover the project's guidance and suggested settings.
-3. Launch discovery and use **View output** to watch the manager in cmux. If the CLI asks for folder or hook trust, choose **Take keyboard control**, answer its prompt, then press **Ctrl-]** to detach and release control.
-4. Review the suggested project settings, verification commands, and agent profiles. Discovery must finish and record its result before the setup proposal can be saved.
-5. Explicitly authorize the required profile checks, review the exact installation changes, then approve and apply the installation.
-6. Complete and publish the separate ordinary runtime capability checks before running tasks. Installing TRIP alone does not make a profile ready to execute work.
+## Set up your first project
 
-Existing workflow files are inspected before changes are proposed. Files that will be replaced are backed up; custom instructions are **not automatically merged** into the new workflow. Profile checks use your CLI accounts' allowance and require their own authorization.
+A **project** is an existing local Git repository. Keep the LLMRelay executable and its data directory outside the repository you are setting up.
 
-Keep the LLMRelay executable and its data directory outside the repository you are initializing. Follow the [project setup guide](docs/PROJECT_SETUP.md) for setup stages, profile validation, existing customizations, and recovery.
+1. Choose **Add project**. Enter a name and the repository's full folder path.
+2. In **Projects**, choose **Default workflow for new tasks**. Choose **Single agent** for the shorter setup, or **TRIP** for the planning and review process. Save the choice.
+3. Follow the matching setup below. Adding a repository alone does not start an agent.
 
-## Create and run a task
+### Single agent setup
 
-Choose **New task**, select the project, and enter a title, description, priority, and acceptance criteria. Use **Save draft** to retain the work in Backlog, or **Create Ready task** when its prerequisites are satisfied. New projects start with their queue paused; enable pickup when you want eligible work to begin. Tasks use the TRIP workflow below unless you choose the bundled **Single agent** workflow; see [Single agent](docs/WORKFLOWS.md#single-agent-workflow).
+1. Open **Single agent profiles and configuration** in the project's settings.
+2. Save an **Execution configuration**: instructions the agent should follow and any test commands you want available.
+3. Add an **Agent profile**: your provider, exact model name, reasoning effort and instructions. A profile is a saved set of agent settings.
+4. Choose **Prepare admission**, then **Probe this profile…**. Review the prompt before choosing **Queue the probe run**. This runs a small trial task and uses your provider allowance.
+5. After the trial records its evidence, choose **Activate admission**. This makes that checked profile available for its matching configuration.
 
-The workflow includes:
+If a button is unavailable, read the reason beside it. A model name entered in a form is not enough to prove that your account and installed tool can use it. See [Single agent setup](docs/PROJECT_SETUP.md#single-agent-setup) for changes to profiles and configurations.
+
+### TRIP setup
+
+1. Open project setup and launch the discovery manager. It reads the project's guidance and suggests settings.
+2. Review the suggested instructions, test commands and profiles for the six roles.
+3. Authorize the profile checks. Review the proposed file changes before approving and applying the TRIP installation.
+4. Complete the separate runtime checks and publish their valid results to make the checked roles available. Here, **publish** means activate verification evidence inside LLMRelay; it does not upload your code.
+
+Setup preserves replaced files, but does not automatically merge custom instructions. Checks use provider allowance. See the [TRIP setup steps](docs/PROJECT_SETUP.md#trip-setup) for the full sequence.
+
+If the provider asks you to trust a folder or its hooks, use **Take keyboard control** to read and answer the prompt. Hooks are small commands that tell LLMRelay when an agent starts, stops or needs attention. Press **Ctrl-]** to detach and release keyboard control when finished.
+
+## Create a useful first task
+
+Choose **New task**, select the project and workflow, and write the desired change. Include **acceptance criteria**: specific things you will check before calling the task finished.
+
+For example:
+
+> Title: Make empty search results easier to understand
+>
+> Change: Show a helpful message when a search has no matches.
+>
+> Acceptance criteria: The message says “No results found”; it includes the search text; existing matching results still display normally.
+
+Choose **Save draft** if you are still deciding, or **Create Ready task** once setup is complete. **Ready means queued**, not finished. New project queues start paused; enable pickup when you want eligible tasks to begin.
+
+Single agent follows this path:
 
 ```text
-Planning → Independent plan review → Your approval and implementation authorization
-→ Implementation → Code review → Verification → Fresh final review
+Agent work → Result → Selected checks, if any → Your review → Done
+```
+
+TRIP follows this path:
+
+```text
+Planning → Plan review → Your plan and implementation approvals
+→ Implementation → Code review → Checks → Fresh final review
 → Manager handoff → Your acceptance → Done
 ```
 
-The manager owns the task. The delegated roles are Explorer, plan reviewer, implementer, code reviewer, and final verifier; Explorer runs only when the workflow requires it. You can select role profiles before starting and request changes during a task. Changes take effect through validated revisions and safe switching boundaries, rather than interrupting an agent mid-command.
+TRIP's Manager coordinates the task. Explorer investigates when needed, Implementer changes the code, and the review roles assess the plan and result. All of these roles can use the same provider while keeping separate sessions and responsibilities.
 
-Different repositories can run concurrently within capacity limits. A single repository has one active coding task; parallel implementers within it require a reviewed plan with explicit, non-overlapping ownership. See [tasks, agents, and verification](docs/WORKFLOWS.md).
+Different repositories can run work at the same time within configured limits. One repository has one active coding task. TRIP can use parallel implementers inside that task only when its reviewed plan assigns separate areas of work.
 
-## Follow output and approve actions
+## Follow the work and review the result
 
-**Workspace** shows what is waiting for you first: **Needs your attention** and **Approvals**, each with a count, stay reachable from the top bar on every page. Below them, tasks are split into **Active** and **Completed**, followed by the agents running now. Opening a task shows its details in a dialog (full screen on narrow windows) with its workflow's progress and **Overview**, **Changes**, **Checks**, **Roles** and **Activity** tabs; **Roles** holds the workflow choice and every agent setting. Press Escape or choose the close button to return to where you were. Plans, reports and feedback are shown as formatted Markdown; raw HTML is never rendered and only web, mail and relative links are clickable. **Ready** always means queued and eligible to start, never ready for your review.
+Open **Workspace**. **Needs your attention** and **Approvals** show questions, permission requests and decisions that need you.
 
-Use **Workspace** or a task's **Activity** tab to follow sessions and open their output in cmux. For each service boot, LLMRelay owns one cmux workspace for a task and one active, mode-neutral terminal for each current role session. **View output** creates or focuses that exact terminal in view-only mode; it never changes a keyboard lease. **Take control** lets you answer an agent prompt: it sends a revision-bound acquire request to the same authenticated terminal. **Release control** (or **Ctrl-]**) lets automation continue without stopping the agent, and closing the output view never stops work. An ended session exposes recorded output only: **View recorded output** pages through everything saved for one invocation in the browser, with search and download covering all of it, and can open it in a separate read-only cmux pane. If a terminal result is unknown, explicitly discard its non-live reservation before another View. If validated loss is found while its exact attachment is live, the loss first enters a retirement interval: the client receives `Retire`, clears its in-memory lease, and records the binding ended (or the exact bounded lease expiry is observed) before a later explicit View can reserve a fresh view-only terminal. None of these cmux actions restarts a provider, resumes a workflow, or resumes a native conversation. See [terminal attachment](docs/OPERATIONS.md#attach-from-a-terminal) for reconnect and manual attachment.
+| Place or action | Use it to |
+| --- | --- |
+| **Overview** | Read the task and its progress. |
+| **Changes** | Inspect the proposed code changes and integration status. |
+| **Checks** | Review test commands, authorize them and inspect results. |
+| **Roles** | See agent settings and the task's workflow choice. |
+| **Activity** | Follow sessions and open agent output. |
+| **View output** | Watch a live agent without taking keyboard control. |
+| **Take control** / **Release control** | Answer a terminal prompt, then let automation continue. |
+| **View recorded output** | Read, search or download saved output from an ended session. |
 
-**Approvals** offers **Approve once**, **Always approve matching actions**, and **Deny** for supported requests. Reusable rules show their scope before you approve them. Rules do not bypass workflow gates or grant unrestricted machine access.
+Closing an output view does not stop the agent. Releasing keyboard control does not restart or resume a task.
 
-Codex also honors existing native approvals, so an already-permitted action may not produce a new inbox request. Dashboard revocation applies only to LLMRelay-owned rules. Folder trust, command permission, plan approval, installation approval, and final acceptance are separate decisions. Read [permissions and provider compatibility](docs/SECURITY.md) for the exact boundaries.
+For Single agent, use **Resume agent** when offered to send an answer and continue its conversation. **Request changes** starts a linked new run with your feedback and preserves the previous result.
 
-## Stop, restart, and resume
+Read the changes and check the acceptance criteria before choosing **Accept result**. A successful test or an agent saying “done” does not accept the task for you. Acceptance records your decision; it does **not** commit, merge, push or release the code. Integration into your repository is a separate step.
 
-Closing the browser leaves the service running. For a planned shutdown, run the same executable from another terminal:
+See [tasks and workflow details](docs/WORKFLOWS.md) for switching an unstarted task's workflow, reviews and rework.
+
+## Why the app needs permissions
+
+LLMRelay runs real development tools on your machine. It needs access to the chosen repository, working copies, its own saved state and the agent processes it manages. Agents need permission to edit the intended files and run the commands you allow. A **worktree** is a separate working copy of your Git repository used for a task.
+
+Review what an approval covers. Allowing a test command, trusting a folder, approving a plan and accepting a result are different decisions. Some permissions are handled by the provider's terminal prompt; supported requests appear in **Approvals**. Reusable approvals apply to the matching scope shown on screen.
+
+The app does not require blanket administrator access or permission to every repository. Its setup checks confirm supported behavior; they do not prove that every possible unsafe action is blocked. See the [plain-language permission guide](docs/SECURITY.md#what-you-are-allowing) and the technical details below it.
+
+## Pause, restart and recover
+
+Closing the browser leaves the app running. Use the task's **Pause now** or **Cancel** control when you want to stop its work, and wait for the app to confirm that its processes have stopped.
+
+For a planned app shutdown, run the same executable from another terminal:
 
 ```sh
 /path/to/llmrelay-0.1.0-macos/bin/llmrelay stop --drain
 ```
 
-After a restart or crash, run `serve` again against the **same data directory**. Open **Workspace → Waiting after restart → Open task**, then use the task's **Resume after restart** or recovery action. Only a current, unfinished task whose exact session is still eligible offers a resume; completed and cancelled tasks never do. Automatic resumption is off by default; it can be enabled with **Resume eligible work automatically** under **Restart and recovery tools**.
+Start it again with `serve`, using the **same data directory**. In **Workspace → Waiting after restart → Open task**, follow **Resume after restart** or the recovery action shown. Resume is available only when the app can safely continue the saved session. Automatic resume is off by default.
 
-Eligible sessions resume their saved native conversation. Uncertain process ownership requires recovery first, and missing history or changed provider configuration can block exact resume. Pending approvals remain pending. An interrupted final verifier stays incomplete and cannot be resumed as a fresh review. See [restart and recovery](docs/OPERATIONS.md#restart-and-restore) and the [recovery action guide](docs/OPERATIONS.md#recovery-actions-and-bounded-waits) for fresh-session, stop-deadline, and browser-timeout decisions.
+If an action's result is unknown, refresh and check what happened before repeating it. Some completed Claude Manager turns have needed an explicit stop before the workflow could continue. Fully unattended completion is not guaranteed; the [current limitation](docs/NEXT_MILESTONE_PLAN.md#claude-manager-idle-boundary-follow-up) remains tracked.
 
-## Data, logs, and troubleshooting
+Controlled restart has been tested. That does not establish recovery from every crash, machine reboot or sleep interruption. See [recovery instructions](docs/OPERATIONS.md#restart-and-restore) when work cannot continue.
 
-The default macOS data directory is `~/Library/Application Support/AgenticJira`. The historical directory name is retained so existing installations keep their data. To use another instance, pass an absolute `--data-dir` path and reuse it for every command targeting that instance.
+## Find settings, logs and more help
 
-For opt-in verified backups while the foreground service runs, start with `--backup-every-hours 24`. The schedule is off by default, begins anew after restart, and uses existing backup retention. Restore remains offline. See [scheduled backups](docs/OPERATIONS.md#scheduled-backups-while-the-service-runs).
+The default data directory is `~/Library/Application Support/AgenticJira`. The older name is retained to preserve existing installations. If you choose a different absolute path with `--data-dir`, use it consistently for every command for that instance.
 
-Startup prints the selected data and log paths. Use the dashboard's **Diagnostics** page or the executable's `logs` and `diagnostics export` commands when investigating a failure. A diagnostic export omits credentials, raw transcripts, repository source, and native provider history. See [operations and diagnostics](docs/OPERATIONS.md).
+Use **Diagnostics** to investigate problems. Diagnostic exports omit credentials, raw agent transcripts, repository source and native provider history. Optional [scheduled backups](docs/OPERATIONS.md#scheduled-backups-while-the-service-runs) can be enabled with `--backup-every-hours 24`; restoring a backup requires the service to be stopped.
 
-## Support and documentation
+The **Providers** page checks local installation and sign-in information. It does not start a model session or authorize coding in a project. Supported versions and account restrictions are in the [provider compatibility guide](docs/SECURITY.md). Unsupported configurations show a reason instead of silently switching providers.
 
-LLMRelay currently hosts standalone TRIP Explorer **v0.12.0**. Provider support is validated locally for the exact executable, role, model, effort, and policy; proofs are not transferable between installations. The current Codex adapter has a narrow compatibility envelope, including Codex CLI **0.160.0** and supported personal ChatGPT credentials. You can leave global Codex memories enabled: LLMRelay disables the memory feature only for its own fresh and resumed agent processes, without rewriting your preference or deleting memory files. Unsupported configurations are reported rather than silently modified. Review the [provider restrictions](docs/SECURITY.md) before onboarding.
-
-**Providers**, outside any project, inspects local installation, version, sign-in and catalog facts. It starts no model session and grants no project coding permission. Coding access is authorized and verified separately within a project task; see [app-wide provider checks](docs/SECURITY.md#app-wide-provider-checks).
-
-The [TRIP plus Single agent architecture plan](docs/MULTI_WORKFLOW_PLAN.md) records the design. The Single agent workflow is implemented and covered by automated tests, and the [qualification record](docs/provider-qualification-20261011.md) documents native evidence for the exact tested Codex and Claude writer installations. Each app profile still requires current installation, admission and capability checks. Claude Main verification remains unavailable after native refusal, and a complete TRIP task through Main checkout remains unverified; see [current Main checkout evidence](docs/provider-qualification-20261011.md#task-scoped-main-checkout-verification-2026-10-14).
-
-- [Building, verification, and local packaging](docs/BUILDING.md)
-- [Project setup and capability checks](docs/PROJECT_SETUP.md)
-- [Tasks, roles, and verification](docs/WORKFLOWS.md)
-- [Permissions and provider compatibility](docs/SECURITY.md)
-- [Sessions, recovery, and diagnostics](docs/OPERATIONS.md)
-- [Milestones: service validation, background service, and menu-bar companion](docs/MILESTONES.md)
-- [Research, implementation history, and verification boundaries](RESEARCH_AND_PLAN.md)
-- [Third-party notices](THIRD_PARTY_NOTICES.md)
-
-Automated checks and prior disposable native validation do not establish visual verification in your browser. Verification boundaries and historical evidence are retained in the research plan; a successful build alone does not establish every runtime behavior.
+| Guide | What you will find |
+| --- | --- |
+| [Project setup](docs/PROJECT_SETUP.md) | Set up Single agent or TRIP and prepare profiles. |
+| [Tasks and workflows](docs/WORKFLOWS.md) | Understand task stages, reviews, checks and acceptance. |
+| [Permissions](docs/SECURITY.md) | Understand access, approvals and supported provider versions. |
+| [Operations](docs/OPERATIONS.md) | Start, stop, attach terminals, back up and recover. |
+| [Building](docs/BUILDING.md) | Build, test and package the app from source. |
+| [Current progress and limits](docs/NEXT_MILESTONE_PLAN.md) | See what is completed and what still needs work. |
+| [Architecture plan](docs/MULTI_WORKFLOW_PLAN.md) | Read the original TRIP plus Single agent design. |
+| [Native verification record](docs/provider-qualification-20261011.md) | Inspect detailed provider test evidence and its limits. |
+| [Milestones](docs/MILESTONES.md) | Explore longer-term plans, including distribution work. |
+| [Third-party notices](THIRD_PARTY_NOTICES.md) | Review bundled software notices. |

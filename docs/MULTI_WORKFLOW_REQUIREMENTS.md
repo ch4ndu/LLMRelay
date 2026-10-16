@@ -7,11 +7,17 @@
 **Execution configuration:** `b4147f19-6849-4fb6-a3aa-ec9c1176ab1e`; moderate testing coverage.
 **Candidate scope:** five Markdown files; no runtime implementation.
 
-**Current status:** this MW-01 ledger is kept as recorded. Rows 1 and 3 are
-now implemented in source with automated tests; row 2's TRIP preservation is
-covered by the same tests, with the existing TRIP compatibility manifests left
-unchanged. Native qualification of the Single agent writer modes (Gate C) and
-browser validation have not been performed. See the [plan status](MULTI_WORKFLOW_PLAN.md).
+**Current status (October 15, 2026):** The TRIP plus Single agent implementation
+is delivered, with automated coverage and native writer verification for Codex
+and Claude. The [native verification record](provider-qualification-20261011.md)
+includes ordinary task execution and a controlled Claude restart followed by
+dashboard acceptance. Each profile still requires its own admission. These
+results do not claim exhaustive browser or crash/reboot coverage.
+
+**Historical record:** The rows, task permissions and future test assignments
+below preserve the original MW-01 design task. They are not current feature
+availability or a setup checklist. See the [current plan status](MULTI_WORKFLOW_PLAN.md)
+and [user guide](../README.md) for today's behavior.
 
 This ledger records the user's exact five acceptance rows in order. “Documented” means present in this MW-01 candidate. It does not mean MW-02 through MW-04 behavior shipped, checks passed, the candidate was accepted or changes were integrated. The [plan](MULTI_WORKFLOW_PLAN.md) resolves the design; the [baseline](TRIP_COMPATIBILITY_BASELINE.md) identifies evidence and limitations.
 

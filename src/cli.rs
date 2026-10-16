@@ -673,8 +673,14 @@ struct RoleArgs {
 
 #[derive(Debug, Subcommand)]
 enum RoleCommand {
-    Context,
-    #[command(after_long_help = crate::domain::ROLE_RESULT_REPORT_CONTRACT)]
+    Context {
+        #[arg(long, conflicts_with = "page")]
+        index: bool,
+        #[arg(long, conflicts_with = "index")]
+        page: Option<String>,
+    },
+    #[command(after_long_help = crate::domain::ROLE_RESULT_REPORT_CONTRACT,
+        group(clap::ArgGroup::new("typed_report").args(["runtime_v1", "functional_v2"])))]
     Report {
         #[arg(long, conflicts_with = "file")]
         json: Option<String>,
@@ -682,31 +688,112 @@ enum RoleCommand {
         file: Option<PathBuf>,
         #[arg(long, conflicts_with_all = ["json", "file"])]
         runtime_v1: bool,
-        #[arg(long, require_equals = true, requires = "runtime_v1")]
+        #[arg(long, conflicts_with_all = ["json", "file", "runtime_v1"])]
+        functional_v2: bool,
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "functional_v2",
+            conflicts_with_all = ["runtime_v1", "json", "file"]
+        )]
+        binding_hash: Option<String>,
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "functional_v2",
+            conflicts_with_all = ["runtime_v1", "json", "file"]
+        )]
+        challenge: Option<String>,
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "typed_report",
+            conflicts_with_all = ["json", "file"]
+        )]
         operation_id: Option<String>,
-        #[arg(long, require_equals = true, requires = "runtime_v1")]
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "typed_report",
+            conflicts_with_all = ["json", "file"]
+        )]
         status: Option<String>,
-        #[arg(long, require_equals = true, requires = "runtime_v1")]
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "runtime_v1",
+            conflicts_with_all = ["functional_v2", "json", "file"]
+        )]
         nonce: Option<String>,
-        #[arg(long, require_equals = true, requires = "runtime_v1")]
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "runtime_v1",
+            conflicts_with_all = ["functional_v2", "json", "file"]
+        )]
         model_evidence: Option<String>,
-        #[arg(long, require_equals = true, requires = "runtime_v1")]
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "runtime_v1",
+            conflicts_with_all = ["functional_v2", "json", "file"]
+        )]
         sandbox_identity: Option<String>,
-        #[arg(long, require_equals = true, requires = "runtime_v1")]
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "typed_report",
+            conflicts_with_all = ["json", "file"]
+        )]
         session_mode: Option<String>,
-        #[arg(long, require_equals = true, requires = "runtime_v1")]
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "runtime_v1",
+            conflicts_with_all = ["functional_v2", "json", "file"]
+        )]
         target_data_accessed: Option<String>,
-        #[arg(long, require_equals = true, requires = "runtime_v1")]
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "runtime_v1",
+            conflicts_with_all = ["functional_v2", "json", "file"]
+        )]
         fallback_observed: Option<String>,
-        #[arg(long, require_equals = true, requires = "runtime_v1")]
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "runtime_v1",
+            conflicts_with_all = ["functional_v2", "json", "file"]
+        )]
         authentication_observed: Option<String>,
-        #[arg(long, require_equals = true, requires = "runtime_v1")]
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "typed_report",
+            conflicts_with_all = ["json", "file"]
+        )]
         failure_category: Option<String>,
-        #[arg(long, require_equals = true, requires = "runtime_v1")]
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "runtime_v1",
+            conflicts_with_all = ["functional_v2", "json", "file"]
+        )]
         missing_observation: Option<String>,
-        #[arg(long, require_equals = true, requires = "runtime_v1")]
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "runtime_v1",
+            conflicts_with_all = ["functional_v2", "json", "file"]
+        )]
         cmux_stderr_hex: Option<String>,
-        #[arg(long, require_equals = true, requires = "runtime_v1")]
+        #[arg(
+            long,
+            require_equals = true,
+            requires = "runtime_v1",
+            conflicts_with_all = ["functional_v2", "json", "file"]
+        )]
         actual: Vec<String>,
     },
     ProposeTransition {
@@ -1349,11 +1436,24 @@ async fn run_capability(args: CapabilityArgs) -> Result<()> {
                 .with_context(|| format!("read {}", prompt_file.display()))?,
         },
         CapabilityCommand::RecordProof { file } => {
-            let proof: CapabilityProofInput = serde_json::from_slice(
+            let record: serde_json::Value = serde_json::from_slice(
                 &std::fs::read(&file).with_context(|| format!("read {}", file.display()))?,
             )
             .context("capability proof file must be valid JSON")?;
-            ControlRequest::CapabilityRecordProof { proof }
+            match crate::domain::QualificationContract::from_record(&record)
+                .map_err(anyhow::Error::msg)?
+            {
+                crate::domain::QualificationContract::Legacy => {
+                    let proof: CapabilityProofInput = serde_json::from_value(record)
+                        .context("legacy capability proof file must match its diagnostic schema")?;
+                    ControlRequest::CapabilityRecordProof { proof }
+                }
+                crate::domain::QualificationContract::FunctionalV2 => {
+                    let proof = serde_json::from_value(record)
+                        .context("functional capability proof file must match its typed schema")?;
+                    ControlRequest::CapabilityRecordFunctionalProof { proof }
+                }
+            }
         }
     };
     print_control(&paths, request).await
@@ -2178,11 +2278,21 @@ async fn run_role(args: RoleArgs) -> Result<()> {
     let credential =
         std::env::var("AGENTICJIRA_ROLE_TOKEN").context("AGENTICJIRA_ROLE_TOKEN is not set")?;
     let operation = match args.command {
-        RoleCommand::Context => RoleOperation::Context,
+        RoleCommand::Context { index: true, .. } => RoleOperation::ContextIndex,
+        RoleCommand::Context {
+            page: Some(cursor), ..
+        } => {
+            crate::task_cli::RoleContextCursor::parse(&cursor)?;
+            RoleOperation::ContextPage { cursor }
+        }
+        RoleCommand::Context { .. } => RoleOperation::Context,
         RoleCommand::Report {
             json,
             file,
             runtime_v1,
+            functional_v2,
+            binding_hash,
+            challenge,
             operation_id,
             status,
             nonce,
@@ -2197,9 +2307,16 @@ async fn run_role(args: RoleArgs) -> Result<()> {
             cmux_stderr_hex,
             actual,
         } => {
-            if runtime_v1 {
-                let mut arguments = vec!["--runtime-v1".to_owned()];
+            if runtime_v1 || functional_v2 {
+                let mut arguments = vec![if functional_v2 {
+                    "--functional-v2"
+                } else {
+                    "--runtime-v1"
+                }
+                .to_owned()];
                 for (name, value) in [
+                    ("binding-hash", binding_hash),
+                    ("challenge", challenge),
                     ("operation-id", operation_id),
                     ("status", status),
                     ("nonce", nonce),
@@ -2218,8 +2335,12 @@ async fn run_role(args: RoleArgs) -> Result<()> {
                     }
                 }
                 arguments.extend(actual.into_iter().map(|value| format!("--actual={value}")));
-                let report = crate::domain::parse_runtime_role_report_args(&arguments)
-                    .map_err(anyhow::Error::msg)?;
+                let report = if functional_v2 {
+                    crate::domain::parse_functional_role_report_args(&arguments)
+                } else {
+                    crate::domain::parse_runtime_role_report_args(&arguments)
+                }
+                .map_err(anyhow::Error::msg)?;
                 RoleOperation::Report { report }
             } else {
                 let mut input = match (json, file) {
@@ -2271,6 +2392,10 @@ async fn run_role(args: RoleArgs) -> Result<()> {
             input: role_json_input(json, file)?,
         },
     };
+    let paged_context = matches!(
+        &operation,
+        RoleOperation::ContextIndex | RoleOperation::ContextPage { .. }
+    );
     let response = task_cli::request(
         &socket,
         &RoleRequest {
@@ -2279,7 +2404,11 @@ async fn run_role(args: RoleArgs) -> Result<()> {
         },
     )
     .await?;
-    println!("{}", serde_json::to_string(&response.result)?);
+    let output = serde_json::to_string(&response.result)?;
+    if paged_context && output.len() + 1 > crate::operations::ROLE_CONTEXT_OUTPUT_BYTES {
+        bail!("role context page exceeds the 4096-byte output bound")
+    }
+    println!("{output}");
     Ok(())
 }
 
@@ -2453,6 +2582,102 @@ mod attach_input_tests {
         Command, PersistentCmuxInputAuthority,
     };
     use clap::Parser;
+
+    #[test]
+    fn role_context_cli_preserves_bare_and_separates_index_and_page() {
+        for arguments in [
+            vec!["llmrelay", "role", "context"],
+            vec!["llmrelay", "role", "context", "--index"],
+            vec!["llmrelay", "role", "context", "--page", "cursor"],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_ok());
+        }
+        assert_eq!(
+            Cli::try_parse_from(["llmrelay", "role", "context", "--index", "--page", "cursor"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert!(Cli::try_parse_from(["llmrelay", "role", "context", "--section", "task"]).is_err());
+    }
+
+    #[test]
+    fn functional_reports_require_their_own_marker_and_exclude_legacy_fields() {
+        let mut args = vec![
+            "llmrelay".to_owned(),
+            "role".into(),
+            "report".into(),
+            "--functional-v2".into(),
+            "--operation-id=functional-cli".into(),
+            "--status=passed".into(),
+            format!("--binding-hash={}", "ab".repeat(32)),
+            "--challenge=read-nonce".into(),
+            "--session-mode=retained".into(),
+        ];
+        assert!(Cli::try_parse_from(&args).is_ok());
+        args.push("--runtime-v1".into());
+        assert!(Cli::try_parse_from(&args).is_err());
+        args.pop();
+        for legacy_field in [
+            "--actual=direct_write,true,1,denied,os,native_session",
+            "--nonce=legacy-nonce",
+            "--missing-observation=model_evidence",
+        ] {
+            let mut wrong_mode = args.clone();
+            wrong_mode.push(legacy_field.into());
+            assert_eq!(
+                Cli::try_parse_from(&wrong_mode).unwrap_err().kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{legacy_field} was accepted with --functional-v2"
+            );
+        }
+
+        let runtime_args = vec![
+            "llmrelay".to_owned(),
+            "role".into(),
+            "report".into(),
+            "--runtime-v1".into(),
+            "--operation-id=runtime-cli".into(),
+            "--status=failed".into(),
+            "--failure-category=observation_unavailable".into(),
+            "--actual=direct_write,true,1,denied,os,native_session".into(),
+        ];
+        assert!(Cli::try_parse_from(&runtime_args).is_ok());
+        for functional_field in [
+            format!("--binding-hash={}", "ab".repeat(32)),
+            "--challenge=read-nonce".into(),
+        ] {
+            let mut wrong_mode = runtime_args.clone();
+            wrong_mode.push(functional_field.clone());
+            assert_eq!(
+                Cli::try_parse_from(&wrong_mode).unwrap_err().kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{functional_field} was accepted with --runtime-v1"
+            );
+        }
+
+        assert!(Cli::try_parse_from(["llmrelay", "role", "report"]).is_ok());
+        for source in ["--json={}", "--file=report.json"] {
+            assert!(Cli::try_parse_from(["llmrelay", "role", "report", source]).is_ok());
+        }
+        for (source, typed_field) in [
+            (
+                "--json={}",
+                "--actual=direct_write,true,1,denied,os,native_session",
+            ),
+            ("--file=report.json", "--challenge=read-nonce"),
+            ("--json={}", "--operation-id=typed-cli"),
+            ("--file=report.json", "--session-mode=retained"),
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(["llmrelay", "role", "report", source, typed_field])
+                    .unwrap_err()
+                    .kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{typed_field} was accepted with {source}"
+            );
+        }
+    }
 
     #[test]
     fn runtime_report_accepts_the_missing_observation_flag_only_in_runtime_mode() {

@@ -98,6 +98,31 @@ pub struct ReviewService {
     snapshots_root: PathBuf,
 }
 
+pub(crate) fn bind_checkout_delta(
+    store: &Store,
+    attempt: &str,
+    manifest: &mut SnapshotManifest,
+) -> Result<String> {
+    let connection = store.lock()?;
+    let (task,policy): (String,String)=connection.query_row("SELECT a.task_id,w.policy_json FROM attempts a JOIN workspaces w ON w.attempt_id=a.id WHERE a.id=?1",
+        params![attempt], |row|Ok((row.get(0)?,row.get(1)?)))?;
+    let policy: serde_json::Value = serde_json::from_str(&policy)?;
+    crate::workflow::validate_workspace_checkout(&connection, &task, &policy)?;
+    if crate::workspace::policy_mode(&policy)? == crate::domain::WorkspaceMode::MainCheckout {
+        crate::workspace::require_checkout_environment()?;
+        let baseline = policy["baseline_snapshot_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Main result has no original checkout baseline"))?;
+        let json: String=connection.query_row("SELECT s.manifest_json FROM snapshots s JOIN attempts original ON original.id=s.attempt_id
+            JOIN attempts current ON current.task_id=original.task_id WHERE s.id=?1 AND s.kind='baseline' AND s.complete=1 AND current.id=?2",
+            params![baseline,attempt], |row|row.get(0))?;
+        manifest.task_changed_paths =
+            crate::snapshot::task_changed_paths(&serde_json::from_str(&json)?, manifest)?;
+        manifest.baseline_snapshot_id = Some(baseline.to_owned());
+    }
+    crate::store::json_hash(manifest)
+}
+
 impl ReviewService {
     pub fn new(store: Store, artifacts: PathBuf) -> Self {
         Self {
@@ -111,24 +136,7 @@ impl ReviewService {
         attempt: &str,
         manifest: &mut SnapshotManifest,
     ) -> Result<String> {
-        let connection = self.store.lock()?;
-        let (task,policy): (String,String)=connection.query_row("SELECT a.task_id,w.policy_json FROM attempts a JOIN workspaces w ON w.attempt_id=a.id WHERE a.id=?1",
-            params![attempt], |row|Ok((row.get(0)?,row.get(1)?)))?;
-        let policy: serde_json::Value = serde_json::from_str(&policy)?;
-        crate::workflow::validate_workspace_checkout(&connection, &task, &policy)?;
-        if crate::workspace::policy_mode(&policy)? == crate::domain::WorkspaceMode::MainCheckout {
-            crate::workspace::require_checkout_environment()?;
-            let baseline = policy["baseline_snapshot_id"]
-                .as_str()
-                .ok_or_else(|| anyhow!("Main result has no original checkout baseline"))?;
-            let json: String=connection.query_row("SELECT s.manifest_json FROM snapshots s JOIN attempts original ON original.id=s.attempt_id
-                JOIN attempts current ON current.task_id=original.task_id WHERE s.id=?1 AND s.kind='baseline' AND s.complete=1 AND current.id=?2",
-                params![baseline,attempt], |row|row.get(0))?;
-            manifest.task_changed_paths =
-                crate::snapshot::task_changed_paths(&serde_json::from_str(&json)?, manifest)?;
-            manifest.baseline_snapshot_id = Some(baseline.to_owned());
-        }
-        crate::store::json_hash(manifest)
+        bind_checkout_delta(&self.store, attempt, manifest)
     }
 
     pub(crate) fn capture_workspace_baseline(
@@ -1816,7 +1824,8 @@ pub(crate) fn final_repair_code_review_binding(
         params![capability],
         |row| row.get(0),
     )?;
-    if !current_capability {
+    if !current_capability || !crate::store::session_capability_is_current_in(connection, &session)?
+    {
         return held("the retained code reviewer's capability evidence is no longer current");
     }
     Ok(RecheckBinding::Retained)

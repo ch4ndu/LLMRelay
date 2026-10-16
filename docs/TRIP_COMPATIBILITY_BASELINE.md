@@ -1,5 +1,11 @@
 # TRIP compatibility baseline at 8c6f1e7
 
+> Historical comparison from October 7, 2026. References below to future
+> Single-agent qualification describe that checkpoint. Later Codex and Claude
+> writer verification is recorded in the [native verification record](provider-qualification-20261011.md).
+> Use the [README](../README.md) for current features and setup.
+
+
 **Status:** MW-01 redacted comparison baseline; source and authenticated context evidence only.
 **Recorded:** October 7, 2026.
 **Checkpoint:** `8c6f1e72cb3282db4dd4e381ef8fd83b6b37ea9e`.

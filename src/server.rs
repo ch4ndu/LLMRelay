@@ -5,8 +5,8 @@ use crate::database::{
     BackupOptions, BackupPublication, InstanceLock, OnlineBackupControl, PublishedBackup,
 };
 use crate::domain::{
-    AppStateDto, CapabilityProofInput, CmuxKeyboardControlAction, HumanCommand,
-    ProviderValidationSelection, RoleKind, WorkflowCommand,
+    AppStateDto, CapabilityProofInput, CmuxKeyboardControlAction, FunctionalCapabilityProofInput,
+    HumanCommand, ProviderValidationSelection, RoleKind, WorkflowCommand,
 };
 use crate::operations::Application;
 use crate::protocol::{self, ClientKind};
@@ -193,6 +193,24 @@ struct ModelCatalogQuery {
     provider: String,
 }
 
+fn deserialize_legacy_capability_proof<'de, D>(
+    deserializer: D,
+) -> Result<CapabilityProofInput, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if crate::domain::QualificationContract::from_record(&value)
+        .map_err(serde::de::Error::custom)?
+        != crate::domain::QualificationContract::Legacy
+    {
+        return Err(serde::de::Error::custom(
+            "functional proof requires its explicit web operation",
+        ));
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(deny_unknown_fields)]
@@ -300,7 +318,11 @@ enum WebOperation {
         session_id: String,
     },
     CapabilityRecordProof {
+        #[serde(deserialize_with = "deserialize_legacy_capability_proof")]
         proof: CapabilityProofInput,
+    },
+    CapabilityRecordFunctionalProof {
+        proof: FunctionalCapabilityProofInput,
     },
     HistoryPage {
         session_id: String,
@@ -385,7 +407,8 @@ impl WebOperation {
             | Self::CmuxSetKeyboardControl { .. }
             | Self::CmuxDiscardUnknown { .. }
             | Self::Interrupt { .. }
-            | Self::CapabilityRecordProof { .. } => None,
+            | Self::CapabilityRecordProof { .. }
+            | Self::CapabilityRecordFunctionalProof { .. } => None,
         }
     }
 }
@@ -1661,6 +1684,9 @@ async fn api_operation(
             WebOperation::CapabilityRecordProof { proof } => {
                 state.app.store.record_capability_proof(&proof)
             }
+            WebOperation::CapabilityRecordFunctionalProof { proof } => {
+                state.app.record_functional_main_checkout_proof(&proof)
+            }
             WebOperation::HistoryPage {
                 session_id,
                 transcript_epoch,
@@ -1950,6 +1976,61 @@ mod web_operation_tests {
     use crate::store::Store;
     use axum::http::HeaderValue;
     use rusqlite::params;
+
+    #[test]
+    fn functional_main_proof_web_transport_keeps_the_contract_explicit() {
+        let request = serde_json::json!({
+            "kind": "capability_record_functional_proof",
+            "proof": {
+                "qualification_contract": "functional-v2",
+                "operation_id": "publish",
+                "session_id": "session",
+                "evidence_reference": "native-reference",
+                "main": {
+                    "observation_request_hash": "request",
+                    "native_command": "/bin/cat -- '/owned/challenge'",
+                    "native_session_id": "native",
+                    "role_generation_id": "generation",
+                    "observation": {
+                        "status": "passed",
+                        "binding_hash": "binding",
+                        "challenge": "nonce",
+                        "session_mode": "retained"
+                    }
+                }
+            }
+        });
+        let parsed: WebOperation = serde_json::from_value(request.clone()).unwrap();
+        let WebOperation::CapabilityRecordFunctionalProof { proof } = parsed else {
+            panic!("functional proof must retain its dedicated web operation");
+        };
+        assert_eq!(proof.operation_id, "publish");
+        assert_eq!(serde_json::to_value(proof).unwrap(), request["proof"]);
+
+        let mut wrong = request.clone();
+        wrong["kind"] = "capability_record_proof".into();
+        assert!(serde_json::from_value::<WebOperation>(wrong).is_err());
+        let mut unknown = request;
+        unknown["proof"]["qualification_contract"] = "functional-v3".into();
+        assert!(serde_json::from_value::<WebOperation>(unknown).is_err());
+
+        let mut legacy = serde_json::json!({"kind":"capability_record_proof","proof":{
+            "operation_id":"legacy","session_id":"session","evidence_reference":"native-reference",
+            "direct_write_denied":true,"compound_denied":true,"redirect_denied":true,
+            "sentinel_relative_path":"sentinel","native_resume_session_id":"native","history_nonce":"nonce"}});
+        let parsed: WebOperation = serde_json::from_value(legacy.clone()).unwrap();
+        let WebOperation::CapabilityRecordProof { proof } = parsed else {
+            panic!("legacy proof must retain its original web operation");
+        };
+        assert_eq!(proof.operation_id, "legacy");
+        legacy["proof"]["qualification_contract"] = "functional-v2".into();
+        assert!(serde_json::from_value::<WebOperation>(legacy.clone()).is_err());
+        let mut wrong = legacy.clone();
+        wrong["kind"] = "capability_record_functional_proof".into();
+        assert!(serde_json::from_value::<WebOperation>(wrong).is_err());
+        legacy["proof"]["qualification_contract"] = "functional-v3".into();
+        assert!(serde_json::from_value::<WebOperation>(legacy).is_err());
+    }
 
     #[test]
     fn scheduled_backup_admission_is_single_flight_and_restart_waits_a_future_interval() {

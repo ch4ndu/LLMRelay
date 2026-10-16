@@ -517,6 +517,7 @@ export function WorkflowControls(
   const latestVerification = pendingVerification ?? currentMainControls.at(-1);
   const latestVerificationRole = ROLES.find((role) => role === latestVerification?.payload.actor);
   const awaitingNativeEvidence = pendingVerification?.state === "awaiting_native_evidence";
+  const functionalVerification = latestVerification?.payload.qualification_contract === "functional-v2";
   const unsettledSession = !!attemptId && sessions.some((session) =>
     session.task_id === task.id && session.attempt_id === attemptId &&
     session.status !== "launch_failed" &&
@@ -919,15 +920,31 @@ export function WorkflowControls(
             ? `${verificationConfig.provider} · ${verificationConfig.model} · ${verificationConfig.effort}`
             : "The task's exact selected profile details are unavailable. Refresh this task and inspect Roles if they remain unavailable."}</p>
           <p className="hint">
-            This uses the selected provider and its installed version in this authorized checkout,
-            with harmless access probes and a retained-session recall where required.
+            {singleAgent
+              ? "This uses the selected provider and its installed version for the existing native permission diagnostic in this authorized checkout."
+              : "New TRIP verification checks a permitted challenge read and authenticated report in this authorized checkout. Implementer also leaves an owned writer artifact. Retained roles recall the challenge in the same session; Final Verifier starts fresh."}
+            {" "}
             It may consume provider quota across multiple requests. Each verification has a
             five-minute deadline; uncertain stops wait for verified exit. LLMRelay does not
             automatically retry, change models or approve hooks.
           </p>
+          {!singleAgent && <p className="hint">
+            Functional qualification does not attest OS confinement. The
+            sandbox, protected roots, read-only roles, and human approval
+            controls remain configured. Isolated worktree qualification
+            cannot authorize this Main checkout.
+          </p>}
           {pendingVerification && <p role="status">{pendingVerification.state === "awaiting_native_evidence"
-            ? "Waiting for reviewed native permission evidence. A completed conversation alone is not proof. The service operator must review actual native observations; refused or missing observations cannot count as proof. Stop this verification if the required observations are unavailable."
+            ? functionalVerification
+              ? "Waiting for publication of correlated functional evidence. The service operator must publish this actor's recorded result. The service validates the permitted read, authenticated report, and required recall or writer artifact, then cleans up its owned artifacts. Conversation completion alone does not qualify this checkout."
+              : pendingVerification.payload.qualification_contract === undefined
+              ? "Waiting for reviewed native permission evidence. A completed conversation alone is not proof. The service operator must review actual native observations; refused or missing observations cannot count as proof. Stop this verification if the required observations are unavailable. This legacy diagnostic retains its original denial interpretation."
+              : "The service could not identify this verification format. Refresh and inspect Technical details before continuing; no qualification is established."
             : "Verification is in progress. Review the task's sessions and refresh its recorded state; cancellation uses the ordinary task controls."}</p>}
+          {latestVerification?.state === "finished" && functionalVerification && <p role="status">
+            Functional evidence was published for {latestVerificationRole ? roleLabel(latestVerificationRole) : "this actor"}.
+            {" "}Ordinary work still requires the same current profile, checkout scope, and human authorizations.
+          </p>}
           {latestVerification?.state === "cancelled" && <p role="status">
             Stopped without proof. {latestVerificationRole ? roleLabel(latestVerificationRole) : "This"}
             {" "}verification did not establish Main checkout access.
@@ -945,7 +962,7 @@ export function WorkflowControls(
           {verificationNotice && <p role="status">{verificationNotice}</p>}
           {checkoutCommands.uncertain.has("verification") && <UncertainRequestNotice changed={checkoutCommands.reviewed.has("verification")} />}
           {!!mainControls.length && <TechnicalDetails>
-            <p>Reviewed evidence is published through the existing capability record-proof command; this dashboard does not manufacture an attestation.</p>
+            <p>Publication uses the existing capability record-proof command. Functional records use functional-v2; records without that discriminator retain their legacy denial interpretation. The dashboard does not create proof observations.</p>
             <pre>{JSON.stringify(mainControls, null, 2)}</pre>
           </TechnicalDetails>}
         </section>
@@ -954,7 +971,9 @@ export function WorkflowControls(
       {task.lifecycle === "ready" && (
         <p className="hint">
           {mainCheckout
-            ? "Prepare task captures the checkout baseline without replacing your files. Verify Main checkout access for the selected actors; ordinary work requires current native proof."
+            ? singleAgent
+              ? "Prepare task captures the checkout baseline without replacing your files. Single agent work requires its current native permission proof."
+              : "Prepare task captures the checkout baseline without replacing your files. Verify Main checkout access for each selected actor; ordinary work requires current functional evidence and the existing workflow approvals."
             : <>Prepare task creates its workspace and pauses before starting an
           agent. Then choose Continue to start this task. Other queued tasks
           stay paused if project pickup is paused.</>}

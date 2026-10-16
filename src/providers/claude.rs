@@ -213,12 +213,23 @@ pub(crate) fn prepare_with_bundles(
     let effective_read_denials = runtime_probe_policy
         .map(|policy| policy.read_denials.as_slice())
         .unwrap_or(read_denials);
-    let write_denials = runtime_probe_policy.map(|policy| policy.write_denials.as_slice());
+    let write_denials = if readonly {
+        let mut roots = vec![cwd.to_path_buf()];
+        roots.extend_from_slice(effective_read_denials);
+        if let Some(policy) = runtime_probe_policy {
+            roots.extend_from_slice(&policy.write_denials);
+        }
+        roots.sort();
+        roots.dedup();
+        Some(roots)
+    } else {
+        runtime_probe_policy.map(|policy| policy.write_denials.clone())
+    };
     let settings_argument = native_sandbox_settings_argument(
         settings,
         &canonical_role_socket,
         effective_read_denials,
-        write_denials,
+        write_denials.as_deref(),
         None,
     )?;
     let relative = cwd.strip_prefix("/").unwrap_or(cwd);
@@ -227,6 +238,8 @@ pub(crate) fn prepare_with_bundles(
         format!("Grep(//{}/**)", relative.display()),
         format!("Glob(//{}/**)", relative.display()),
         context_command,
+        format!("Bash({} role context --index)", executable_path.display()),
+        format!("Bash({} role context --page:*)", executable_path.display()),
         report_prefix,
     ];
     if role == RoleKind::Manager {
@@ -270,11 +283,7 @@ pub(crate) fn prepare_with_bundles(
         effort.to_owned(),
         "--restricted".to_owned(),
         "--permission-mode".to_owned(),
-        if role == RoleKind::Implementer {
-            "default".to_owned()
-        } else {
-            "dontAsk".to_owned()
-        },
+        "default".to_owned(),
         "--tools".to_owned(),
         tools.to_owned(),
         "--allowedTools".to_owned(),
@@ -345,8 +354,14 @@ pub(crate) fn prepare_with_bundles(
         )
         })
         .unwrap_or_default();
-    let permission_policy = format!("claude --restricted + {}; tools {tools}, exact role-specific AgenticJira commands, denied {denied}; native settings require the sandbox, fail closed if unavailable, refuse unsandboxed commands, and allow only the canonical authenticated role socket{runtime_policy_description}; managed child and settings pin DISABLE_AUTOUPDATER=1 and DISABLE_UPDATES=1; base settings {}; Implementer PermissionRequest decisions are human-only through AgenticJira; no permission bypass",if readonly{"dontAsk"}else{"default"},settings.display());
-    let mut security_policy = serde_json::json!({"restricted":true,"permission_mode":if readonly{"dontAsk"}else{"default"},"permission_request_timeout_seconds":if readonly{None}else{Some(crate::permissions::PROVIDER_PERMISSION_TIMEOUT_SECONDS)},"tools":tools,"allowed_operations":allowed,"denied":denied,"mcp":"strict_empty","chrome":false,"slash_commands":false,"prompt_suggestions":false,"settings_kind":if readonly{"reviewer"}else{"implementer"},"hooks":"native_explicit_trust","update_environment":{"DISABLE_AUTOUPDATER":"1","DISABLE_UPDATES":"1"},"update_scope":"managed_claude_child_only"});
+    let permission_owner = if readonly {
+        "Read-only PermissionRequest grants are human-only, once, for the exact role report command through AgenticJira"
+    } else {
+        "Implementer PermissionRequest decisions are human-only through AgenticJira"
+    };
+    let permission_policy = format!("claude --restricted + default; tools {tools}, exact role-specific AgenticJira commands, denied {denied}; native settings require the sandbox, fail closed if unavailable, refuse unsandboxed commands, and allow only the canonical authenticated role socket{runtime_policy_description}; managed child and settings pin DISABLE_AUTOUPDATER=1 and DISABLE_UPDATES=1; base settings {}; {permission_owner}; no permission bypass",settings.display());
+    let mut security_policy = serde_json::json!({"restricted":true,"permission_mode":"default","permission_request_timeout_seconds":crate::permissions::PROVIDER_PERMISSION_TIMEOUT_SECONDS,"tools":tools,"allowed_operations":allowed,"denied":denied,"mcp":"strict_empty","chrome":false,"slash_commands":false,"prompt_suggestions":false,"settings_kind":if readonly{"reviewer"}else{"implementer"},"hooks":"native_explicit_trust","update_environment":{"DISABLE_AUTOUPDATER":"1","DISABLE_UPDATES":"1"},"update_scope":"managed_claude_child_only"});
+    security_policy["qualification_contract"] = "functional-v2".into();
     security_policy["native_sandbox"] = serde_json::json!({
         "policy_revision": NATIVE_SANDBOX_POLICY_REVISION,
         "enabled": true,
@@ -691,13 +706,16 @@ fn validate_main_readonly_policy(
     ));
     writes.sort();
     writes.dedup();
+    let functional = policy.commands.len() == 1 && policy.commands[0].operation == "fixture_read";
+    let expected_command_count = if functional { 1 } else { 4 };
     if policy.read_denials != roots
         || policy.write_denials != writes
-        || policy
-            .commands
-            .iter()
-            .map(|entry| entry.operation.as_str())
-            .ne(["boundary", "direct", "compound", "redirect"])
+        || (!functional
+            && policy
+                .commands
+                .iter()
+                .map(|entry| entry.operation.as_str())
+                .ne(["boundary", "direct", "compound", "redirect"]))
         || policy.commands.iter().any(|entry| {
             entry.command.is_empty()
                 || entry.command.len() > 16 * 1024
@@ -712,9 +730,9 @@ fn validate_main_readonly_policy(
             .map(|entry| &entry.command)
             .collect::<std::collections::BTreeSet<_>>()
             .len()
-            != 4
+            != expected_command_count
     {
-        bail!("Main read-only policy requires four exact representable commands and its complete checkout protections")
+        bail!("Main read-only policy requires its exact qualification commands and complete checkout protections")
     }
     Ok(())
 }
@@ -739,7 +757,12 @@ pub(crate) fn bind_main_readonly_policy(
             .get(settings_index)
             .context("Claude Main settings value is missing")?,
     )?;
-    settings["sandbox"]["filesystem"]["denyWrite"] = serde_json::to_value(&policy.write_denials)?;
+    let mut write_denials: Vec<PathBuf> =
+        serde_json::from_value(settings["sandbox"]["filesystem"]["denyWrite"].clone())?;
+    write_denials.extend_from_slice(&policy.write_denials);
+    write_denials.sort();
+    write_denials.dedup();
+    settings["sandbox"]["filesystem"]["denyWrite"] = serde_json::to_value(&write_denials)?;
     launch.arguments[settings_index] = serde_json::to_string(&settings)?;
     let commands = policy
         .commands
@@ -757,7 +780,7 @@ pub(crate) fn bind_main_readonly_policy(
         .context("Claude Main launch omitted exact allowed operations")?
         .extend(commands.into_iter().map(serde_json::Value::String));
     launch.config.security_policy["native_sandbox"]["filesystem_deny_write"] =
-        serde_json::to_value(&policy.write_denials)?;
+        serde_json::to_value(&write_denials)?;
     launch.config.argv = launch.arguments.clone();
     Ok(())
 }
@@ -812,6 +835,83 @@ pub fn require_native_sandbox(
     if !expected_denials.is_subset(&denied) {
         bail!("Claude effective inline settings omit an exact canonical target denyRead path")
     }
+    if identity.security_policy["permission_mode"] != "default"
+        || identity.security_policy["permission_request_timeout_seconds"]
+            != crate::permissions::PROVIDER_PERMISSION_TIMEOUT_SECONDS
+        || identity
+            .effective_argv
+            .iter()
+            .filter(|argument| *argument == "--permission-mode")
+            .count()
+            != 1
+        || !identity
+            .effective_argv
+            .windows(2)
+            .any(|pair| pair[0] == "--permission-mode" && pair[1] == "default")
+        || !identity
+            .effective_argv
+            .iter()
+            .any(|argument| argument == "--restricted")
+        || identity.effective_argv.iter().any(|argument| {
+            argument.starts_with("--dangerously-skip-permissions")
+                || argument.starts_with("--allow-dangerously-skip-permissions")
+        })
+    {
+        bail!("Claude launch requires restricted default permission mode and human decision timeout without bypass")
+    }
+    let allowed_operations: Vec<String> =
+        serde_json::from_value(identity.security_policy["allowed_operations"].clone())?;
+    let helpers = allowed_operations
+        .iter()
+        .filter_map(|rule| rule.strip_prefix("Bash(")?.strip_suffix(" role report:*)"))
+        .collect::<Vec<_>>();
+    let [helper] = helpers.as_slice() else {
+        bail!("Claude role launch must identify exactly one authenticated report helper")
+    };
+    for rule in [
+        format!("Bash({helper} role context --index)"),
+        format!("Bash({helper} role context --page:*)"),
+    ] {
+        if allowed_operations
+            .iter()
+            .filter(|value| **value == rule)
+            .count()
+            != 1
+            || identity
+                .effective_argv
+                .iter()
+                .filter(|value| **value == rule)
+                .count()
+                != 1
+        {
+            bail!("Claude role launch lacks its exact paged context grants")
+        }
+    }
+    if identity.role != RoleKind::Implementer {
+        let writes: Vec<PathBuf> =
+            serde_json::from_value(value["sandbox"]["filesystem"]["denyWrite"].clone())
+                .context("Claude read-only settings omit filesystem denyWrite paths")?;
+        let actual = writes
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut required = denied.clone();
+        let workspace =
+            if identity.security_policy["checkout_scope"]["workspace_mode"] == "main_checkout" {
+                identity.security_policy["checkout_scope"]["root"]
+                    .as_str()
+                    .context("Claude Main read-only policy omitted checkout root")?
+            } else {
+                "<attempt-worktree>"
+            };
+        required.insert(PathBuf::from(workspace));
+        if !required.is_subset(&actual)
+            || identity.security_policy["native_sandbox"]["filesystem_deny_write"]
+                != serde_json::to_value(&writes)?
+        {
+            bail!("Claude read-only settings must deny writes to the workspace and every protected read root")
+        }
+    }
     if let Some(policy) = identity.security_policy.get("runtime_probe_command_policy") {
         let policy: RuntimeProbeCommandPolicy = serde_json::from_value(policy.clone())
             .context("Claude runtime probe command policy is malformed")?;
@@ -859,7 +959,7 @@ pub fn require_native_sandbox(
         let policy: RuntimeProbeCommandPolicy = serde_json::from_value(policy.clone())?;
         validate_main_readonly_policy(&policy, &identity.security_policy["checkout_scope"])?;
         if identity.role == RoleKind::Implementer
-            || identity.security_policy["permission_mode"] != "dontAsk"
+            || identity.security_policy["permission_mode"] != "default"
             || identity
                 .security_policy
                 .get("runtime_probe_command_policy")
@@ -891,7 +991,7 @@ pub fn require_native_sandbox(
             || !identity
                 .effective_argv
                 .windows(2)
-                .any(|pair| pair[0] == "--permission-mode" && pair[1] == "dontAsk")
+                .any(|pair| pair[0] == "--permission-mode" && pair[1] == "default")
             || identity.effective_argv.iter().any(|arg| {
                 arg.starts_with("--dangerously-skip-permissions")
                     || arg.starts_with("--allow-dangerously-skip-permissions")
@@ -922,6 +1022,8 @@ pub fn require_native_sandbox(
             format!("Grep(//{root}/**)"),
             format!("Glob(//{root}/**)"),
             format!("Bash({helper} role context)"),
+            format!("Bash({helper} role context --index)"),
+            format!("Bash({helper} role context --page:*)"),
             format!("Bash({helper} role report:*)"),
         ];
         if identity.role == RoleKind::Manager {
@@ -994,11 +1096,6 @@ pub fn require_native_sandbox(
         "SubagentStop",
         "SessionEnd",
     ];
-    let expected_mode = if identity.role == RoleKind::Implementer {
-        "default"
-    } else {
-        "dontAsk"
-    };
     let denied_tools = value
         .pointer("/permissions/deny")
         .and_then(|item| item.as_array())
@@ -1035,7 +1132,24 @@ pub fn require_native_sandbox(
         || value
             .pointer("/permissions/defaultMode")
             .and_then(|item| item.as_str())
-            != Some(expected_mode)
+            != Some("default")
+        || hooks
+            .get("PermissionRequest")
+            .and_then(|entries| entries.as_array())
+            .is_none_or(|entries| {
+                entries.is_empty()
+                    || entries.iter().any(|entry| {
+                        entry["hooks"].as_array().is_none_or(|commands| {
+                            commands.is_empty()
+                                || commands.iter().any(|command| {
+                                    command["timeout"].as_u64()
+                                        != Some(
+                                            crate::permissions::PROVIDER_PERMISSION_TIMEOUT_SECONDS,
+                                        )
+                                })
+                        })
+                    })
+            })
         || required_hooks.iter().any(|event| {
             hooks
                 .get(*event)
@@ -1225,7 +1339,7 @@ mod tests {
             None,
             &assets,
             &std::env::current_exe().unwrap(),
-            &[],
+            &[root.join("protected")],
             None,
             &bundles,
         )
@@ -1237,7 +1351,7 @@ mod tests {
         assert!(prepared
             .arguments
             .windows(2)
-            .any(|pair| pair == ["--permission-mode", "dontAsk"]));
+            .any(|pair| pair == ["--permission-mode", "default"]));
         assert!(prepared
             .environment
             .iter()
@@ -1279,6 +1393,118 @@ mod tests {
             &identity, &root, &bundles,
         )
         .unwrap();
+
+        let settings_index = identity
+            .effective_argv
+            .iter()
+            .position(|argument| argument == "--settings")
+            .unwrap()
+            + 1;
+        let settings: serde_json::Value =
+            serde_json::from_str(&identity.effective_argv[settings_index]).unwrap();
+        assert_eq!(settings["permissions"]["defaultMode"], "default");
+        assert_eq!(
+            settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
+            crate::permissions::PROVIDER_PERMISSION_TIMEOUT_SECONDS
+        );
+        let writes = settings["sandbox"]["filesystem"]["denyWrite"]
+            .as_array()
+            .unwrap();
+        assert!(writes.contains(&serde_json::json!("<attempt-worktree>")));
+        assert!(writes.contains(&serde_json::json!("<attempt-worktree>/protected")));
+        assert_eq!(identity.security_policy["tools"], "Read,Grep,Glob,Bash");
+        assert!(!identity.security_policy["allowed_operations"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("Bash(*)")));
+
+        let mut before_paging = identity.clone();
+        let is_paging_grant = |value: &str| {
+            value.contains(" role context --index)") || value.contains(" role context --page:*)")
+        };
+        before_paging
+            .effective_argv
+            .retain(|value| !is_paging_grant(value));
+        before_paging.security_policy["allowed_operations"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|value| !is_paging_grant(value.as_str().unwrap()));
+        assert_ne!(
+            crate::providers::capability_identity_key(&before_paging).unwrap(),
+            crate::providers::capability_identity_key(&identity).unwrap()
+        );
+        assert!(require_current_native_policy(&before_paging)
+            .unwrap_err()
+            .to_string()
+            .contains("exact paged context grants"));
+
+        let mut old = identity.clone();
+        old.security_policy["permission_mode"] = "dontAsk".into();
+        let mode = old
+            .effective_argv
+            .iter()
+            .position(|argument| argument == "--permission-mode")
+            .unwrap()
+            + 1;
+        old.effective_argv[mode] = "dontAsk".into();
+        let mut old_settings = settings.clone();
+        old_settings["permissions"]["defaultMode"] = "dontAsk".into();
+        old.effective_argv[settings_index] = old_settings.to_string();
+        assert_ne!(
+            crate::providers::capability_identity_key(&old).unwrap(),
+            crate::providers::capability_identity_key(&identity).unwrap()
+        );
+        assert!(require_current_native_policy(&old)
+            .unwrap_err()
+            .to_string()
+            .contains("restricted default permission mode"));
+        let mut bypass = identity.clone();
+        bypass
+            .effective_argv
+            .push("--dangerously-skip-permissions".into());
+        assert!(require_current_native_policy(&bypass).is_err());
+        let mut missing_writes = identity.clone();
+        let mut changed_settings = settings.clone();
+        changed_settings["sandbox"]["filesystem"]["denyWrite"] = serde_json::json!([]);
+        missing_writes.security_policy["native_sandbox"]["filesystem_deny_write"] =
+            serde_json::json!([]);
+        missing_writes.effective_argv[settings_index] = changed_settings.to_string();
+        assert!(require_current_native_policy(&missing_writes)
+            .unwrap_err()
+            .to_string()
+            .contains("must deny writes to the workspace"));
+
+        let writer = prepare_with_bundles(
+            RoleKind::Implementer,
+            "claude-opus-4-1",
+            "high",
+            &root,
+            "writer policy",
+            &paths.role_socket,
+            "writer-token",
+            "writer-generation",
+            "writer-session",
+            None,
+            &assets,
+            &executable,
+            &[],
+            None,
+            &bundles,
+        )
+        .unwrap();
+        let writer_identity = crate::providers::capability_identity(&writer.config).unwrap();
+        require_current_native_policy(&writer_identity).unwrap();
+        assert_eq!(
+            writer_identity.security_policy["permission_mode"],
+            "default"
+        );
+        assert_eq!(
+            writer_identity.security_policy["tools"],
+            "Read,Grep,Glob,Edit,Write,Bash"
+        );
+        assert!(writer_identity.security_policy["native_sandbox"]
+            .get("filesystem_deny_write")
+            .is_none());
 
         let mut corrupted = identity.clone();
         let settings = corrupted

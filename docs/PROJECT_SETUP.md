@@ -4,7 +4,23 @@
 
 In the dashboard, choose **Add project**, enter a project name and the absolute path to an existing local Git repository, and submit the form. Field labels and validation explain missing values before submission; the service then validates the physical repository identity and current revision. A relink is accepted only for another path to the same physical repository and only while no attempt is active. **Validate and relink** also accepts the current path: use it after committing changes so new tasks start from the folder's current commit.
 
-Continue through project setup before running tasks. The five stages organize the existing approvals:
+## Choose your setup path
+
+LLMRelay supports two workflows. **Single agent** uses one coding agent and your
+review. **TRIP** adds planning and separate review roles. You can use Codex or
+Claude; you do not need subscriptions to both.
+
+- For **Single agent**, go to [Single agent setup](#single-agent-setup). You do
+  not need TRIP installation, discovery or six role profiles.
+- For **TRIP**, follow the stages below. A project can support both workflows.
+
+A profile is a saved provider, model and set of instructions. A setup check runs
+a small trial to confirm that the selected profile works in the required way.
+Checks can use your provider allowance. Saving settings alone does not run them.
+
+## TRIP setup
+
+The following five stages apply to TRIP:
 
 | Stage | What to do |
 | --- | --- |
@@ -196,22 +212,50 @@ After installation, ordinary runtime checks establish evidence for the policy us
 
 When more than one runtime verification group exists, use **Runtime verification group** to return to earlier authorized checks. A correction for one role does not hide the remaining roles in an earlier group or authorize another launch.
 
-For Claude requalification, the runtime-check form asks for the currently live
-cmux Unix-socket path. Run `cmux identify` from your cmux terminal and use its
-`socket_path` value. The path is frozen in the authorized probe scope; changing
-it requires a new preparation and authorization. The connection probe sends no
-cmux control request. A missing endpoint or an inconclusive result leaves the
-profile unverified. See [Claude terminal confinement](SECURITY.md#claude-terminal-confinement).
+New ordinary runtime preparations use `functional-v2` for both Codex and Claude.
+Select one provider for all six roles in Role Settings, or keep a mixed
+configuration. Each exact role/model/effort selection must qualify separately;
+there is no automatic switch to another provider. A live cmux diagnostic socket
+is not required for these new checks. Earlier groups retain their frozen
+contract and appear as legacy diagnostics or mixed/unknown history.
 
-Ready admission requires current ordinary proof for all six effective roles. If evidence is missing or stale, creating or updating a Ready task preserves the requested work as a pending backlog task. Runtime reports must include structured observations for every prescribed command; publication checks those observations and rechecks the approved scope against current settings and configuration. A stale report remains historical evidence and cannot grant current authority.
+Ready admission requires current ordinary proof for all six effective roles. If evidence is missing or stale, creating or updating a Ready task preserves the requested work as a pending backlog task. Legacy diagnostic reports include structured observations for every prescribed command. Functional-v2 uses typed challenge and continuity reports with command evidence correlated by the service. Publication validates the evidence for the frozen contract and rechecks the approved scope against current settings and configuration. A stale report remains historical evidence and cannot grant current authority.
 
 Ordinary task context exposes the activated project policy, exact configured check catalog and IDs, current check selection, and the accepted input shapes for the role's workflow commands. These descriptions do not authorize checks or supply agent results. Guidance identifies whether the current native invocation has actually received a correlated submission and may acknowledge it; queued or merely written guidance cannot be acknowledged. Project guidance paths are listed, but their file contents are not embedded; agents must report unavailable guidance rather than invent its contents. Setup-only reads are advertised only during setup discovery.
 
-Ordinary runtime probes submit observations with the runtime-only `role report --runtime-v1` argument form, avoiding nested JSON and shell quoting. The native agent supplies its observed command outcomes, model evidence, and session observations; the CLI sends them through the existing authenticated role socket. Operation IDs bind those observations to the prescribed commands without treating server-owned command text as an agent observation. This form grants no additional execution permission and is rejected outside a runtime probe. General workflow reports keep their existing JSON interface, and previously recorded runtime reports remain readable and subject to the same publication checks.
+New ordinary runtime probes use the dedicated `role report --functional-v2`
+contract. All roles read a permitted challenge and use authenticated role context
+and reporting. Retained roles demonstrate continuity in the same native session;
+the Final Verifier uses a fresh session. Implementers also write an owned artifact
+whose contents the service checks. The prescribed invocation, command, session,
+profile and scope must correlate before publication. Missing evidence or provider
+refusal remains a failed or unavailable check; narration alone is insufficient.
+
+During Main or Isolated functional qualification, authenticated role context is
+limited to the exact identity, qualification binding/request and reporting
+commands. It omits unrelated task history and catalogs and never supplies the
+challenge contents. If the provider truncates or spools that output, repeat the
+permitted context read or filter during the first invocation. Never open a
+provider-managed output file or use native file search to recover it. Retained
+recall still refuses context access and must rely on conversation memory.
+
+The first functional invocation must begin with the direct `role context`
+command. It may repeat that read or pipe its output to `grep -o` or
+`grep --only-matching` with one pattern and no file operands, redirects,
+substitutions or additional pipes. This evidence rule adds no permission
+exemption. Each prescribed challenge or write command must still occur exactly
+once. The fresh Final report is the last command; retained recall permits only
+its one typed report, with no context or challenge reread.
+
+Legacy `--runtime-v1` reports retain their original denial-observation semantics.
+They cannot be submitted as functional proof or converted by changing a label.
+Neither reporting form grants execution permission. New functional qualification
+does not require forbidden reads/writes, a control-socket connection, or an
+artificial permission denial, and does not attest OS confinement.
 
 Role Settings shows support for the exact project or task scope. Evidence for the same model in another scope does not make the selected role usable. Correcting an inherited project-default role prepares project-scoped evidence; a task override keeps its exact task and settings revision. Explicit task-profile activation remains separate from proof publication. Publishing fresh evidence after invalidation restores only the newly verified scope.
 
-Ordinary runtime verification identifies configured controls using the service-recorded frozen launch-policy identity, checked against the reporting session and again against current policy before publication. This identifies configuration; it is not OS enforcement attestation. Exact native probe outcomes remain separate observations. An agent-supplied sandbox description is optional supplementary information and cannot replace the policy identity or probe checks; supplied malformed descriptions are rejected. Setup preflight uses its separate, unchanged reporting contract.
+Ordinary runtime verification identifies configured controls using the service-recorded frozen launch-policy identity, checked against the reporting session and again against current policy before publication. This identifies configuration; it is not OS enforcement attestation. Legacy native denial outcomes remain separate historical observations; new functional results establish permitted operations and session continuity. An agent-supplied sandbox description is optional supplementary information and cannot replace the policy identity or probe checks; supplied malformed descriptions are rejected. Setup preflight uses its separate, unchanged reporting contract.
 
 Retained runtime probes resume with a service-generated recall instruction that does not repeat the original nonce. Their first action must report remembered observations before reading files, role context, or external history. This rule takes precedence over generic provider context instructions, and the service refuses runtime context disclosure for the current resumed invocation. An observed failure or `missing_context` leaves admission unsupported; neither can publish proof. Final-verifier probes use a fresh invocation and cannot resume.
 
@@ -227,10 +271,10 @@ settings. The agent may retain its `provider_session_start:<model>` evidence ato
 and report it after resume; acceptance checks it against that first invocation.
 This records an untrusted provider payload, not remote backend model attestation.
 It grants no proof by itself and does not relax the nonce, native command,
-confinement, frozen policy or separate publication gates. Retained context reads
+configured protection identity, frozen policy or separate publication gates. Retained context reads
 remain prohibited, and earlier failed reports remain failed.
 
-An `observation_unavailable` failure must identify the missing required fact with
+For legacy runtime-v1 diagnostics, an `observation_unavailable` failure must identify the missing required fact with
 `--missing-observation`: `model_evidence`, `session_mode_observed`,
 `target_data_accessed`, `fallback_observed`, or `authentication_observed`.
 The stored failure names that fact so the user can investigate before spending

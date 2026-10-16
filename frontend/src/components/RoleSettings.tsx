@@ -20,6 +20,7 @@ import {
   type Provider,
   type Role,
   type RoleConfig,
+  qualificationContractLabel,
   roleLabel,
   type RolePreparation,
   type RuntimeAdmissionState,
@@ -48,9 +49,11 @@ const compatibilityActions: Record<CompatibilityExplanation["action"], string> =
 export function CompatibilityDetails({
   compatibility,
   verification,
+  proof,
 }: {
   compatibility?: CompatibilityExplanation | null;
   verification?: "current_profile" | "saved_record";
+  proof?: Record<string, unknown>;
 }) {
   if (!compatibility) return null;
   const candidate = compatibility.status === "matched";
@@ -77,6 +80,12 @@ export function CompatibilityDetails({
           ? "Version recognition alone does not mean this profile is ready to run. Check its verification status."
           : "LLMRelay's agent support information could not be validated."}
       </p>
+      {verified && proof?.qualification_contract === "functional-v2" && (
+        <p>
+          Functional qualification passed. Configured protections are recorded
+          separately; this evidence does not attest OS confinement.
+        </p>
+      )}
       {!verified && <p className="hint">Next step: {compatibilityActions[compatibility.action]}</p>}
       <details>
         <summary>Technical details</summary>
@@ -631,8 +640,6 @@ export function RoleSettings(
   const [editing, setEditing] = useState<Role>();
   const [config, setConfig] = useState<RoleConfig>();
   const [error, setError] = useState("");
-  const [cmuxSocketPath, setCmuxSocketPath] = useState("");
-  const cmuxSocketInstruction = "Enter the live cmux socket path before preparing Claude verification.";
   const operationStorageKey = `llmrelay.role.operations.${task.id}`;
   const browserOperationIdentities = useRef(
     new Map<string, { body: string; id: string }>(
@@ -775,6 +782,7 @@ export function RoleSettings(
       item.status,
       item.checked_at,
       item.compatibility,
+      item.proof?.qualification_contract,
     ]),
     admissions: runtimeAdmissions.filter((item) =>
       !item.task_id || item.task_id === task.id
@@ -787,6 +795,7 @@ export function RoleSettings(
         item.updated_at,
         item.probes.map((probe) => [
           probe.role,
+          { qualification_contract: probe.qualification_contract },
           probe.state,
           probe.session_id,
           probe.session_status,
@@ -977,10 +986,6 @@ export function RoleSettings(
       item.task_id === task.id && item.role === role &&
       item.requested_revision === revision
     );
-    if (preparation?.config.provider === "claude" && !cmuxSocketPath.trim()) {
-      setError(cmuxSocketInstruction);
-      return;
-    }
     const projectScoped = preparation?.task_profile_source ===
       "project_default";
     try {
@@ -991,9 +996,6 @@ export function RoleSettings(
         ...(projectScoped ? {} : { task_id: task.id }),
         role,
         ...(projectScoped ? {} : { settings_revision: revision }),
-        ...(cmuxSocketPath.trim()
-          ? { cmux_socket_path: cmuxSocketPath.trim() }
-          : {}),
         expected_version: projectScoped ? project.version : task.version,
       });
       setError("");
@@ -1092,6 +1094,16 @@ export function RoleSettings(
         <h3>Agent roles</h3>
         <span>The manager plus five delegated roles</span>
       </header>
+      <p className="hint">
+        All six roles can use Codex, Claude, or a mix. Each exact model and
+        effort must pass functional qualification before activation. Roles use
+        separate sessions, and Final Verifier always starts fresh.
+        Functional qualification does not attest OS confinement. Sandbox and
+        read-only restrictions remain configured; human approval controls still
+        apply.
+        Main checkout access is verified separately in Overview for the selected
+        checkout.
+      </p>
       {canUseDefaults && (
         <div className="project-role-defaults">
           <p className="hint">
@@ -1161,12 +1173,15 @@ export function RoleSettings(
             item.config.effort === value.effort
           );
           const currentProof = preparation?.status === "supported" &&
+              preparation.qualification_contract === "functional-v2" &&
               preparation.capability_key
             ? capabilities.find((capability) =>
               capability.provider === value?.provider &&
               capability.role === role &&
               capability.mode === "interactive_pty" &&
               capability.status === "supported" &&
+              capability.proof?.qualification_contract ===
+                preparation.qualification_contract &&
               capability.config_hash === preparation.capability_key
             )
             : undefined;
@@ -1426,7 +1441,35 @@ export function RoleSettings(
               <CompatibilityDetails
                 compatibility={compatibility}
                 verification={currentProof ? "current_profile" : undefined}
+                proof={currentProof?.proof}
               />
+              {preparation && (
+                <small>
+                  Prepared contract: {preparation.capability_key ||
+                      preparation.qualification_contract !== undefined
+                    ? qualificationContractLabel(
+                      preparation.qualification_contract,
+                    )
+                    : "Unavailable; the current launch could not be prepared"}
+                </small>
+              )}
+              {runtimeAdmission && (
+                <small>
+                  Recorded verification: {qualificationContractLabel(
+                    runtimeAdmission.qualification_contract,
+                  )}
+                </small>
+              )}
+              {!currentProof && value && capabilities.some((item) =>
+                item.provider === value.provider && item.role === role &&
+                item.proof !== undefined &&
+                item.proof.qualification_contract === undefined
+              ) && (
+                <small>
+                  Earlier legacy diagnostic evidence remains in history. It
+                  does not qualify these selected settings for a new run.
+                </small>
+              )}
               {requested && preparation?.task_profile_source && (
                 <small>
                   Settings from{" "}
@@ -1439,26 +1482,14 @@ export function RoleSettings(
                 preparation.compatibility?.status === "matched" &&
                 !currentProof && (
                 <div className="inline-form runtime-proof-control">
-                  {value?.provider === "claude" && (
-                    <>
-                      <label>
-                        Live cmux Unix socket for Claude requalification
-                        <input
-                          value={cmuxSocketPath}
-                          onChange={(event) =>
-                            setCmuxSocketPath(event.target.value)}
-                          placeholder="/absolute/path/to/cmux.sock"
-                        />
-                      </label>
-                      <small>
-                        Enter the socket path of the cmux you are running now
-                        before preparing the verification. The check does not
-                        control cmux; if the socket is missing or refused the
-                        verification fails instead of being treated as a
-                        sandbox limit.
-                      </small>
-                    </>
-                  )}
+                  <small>
+                    Verify a permitted challenge read and authenticated report.
+                    Retained roles recall it in the same conversation;
+                    Implementer also leaves an owned writer artifact. Final
+                    Verifier uses a fresh session. A permission prompt is not
+                    required for qualification; any real prompt still uses the
+                    normal human approval controls.
+                  </small>
                   {stopping && (
                     <small>
                       The {roleLabel(role).toLowerCase()} has exited, but
@@ -1625,9 +1656,7 @@ export function RoleSettings(
           );
         })}
       </div>
-      {error && (error === cmuxSocketInstruction
-        ? <p className="error" role="alert">{error}</p>
-        : <ErrorNotice error={error} />)}
+      {error && <ErrorNotice error={error} />}
       <p className="hint">
         A change to a running role stays requested until the role reaches a
         safe checkpoint. Resume continues the same agent conversation with the

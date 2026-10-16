@@ -1851,6 +1851,37 @@ fn seed_supported_capabilities_for_config(fixture: &Fixture, config: &RoleOverri
     );
 }
 
+fn seed_capability_source(
+    connection: &Connection,
+    fixture_project: &str,
+    launch: &LaunchConfig,
+    proof: &mut serde_json::Value,
+) {
+    let key = providers::capability_key(launch).unwrap();
+    let identity = providers::capability_identity(launch).unwrap();
+    let source = format!("synthetic-capability-{key}");
+    let task = format!("synthetic-capability-task-{fixture_project}");
+    connection.execute("INSERT OR IGNORE INTO tasks(id,project_id,title,lifecycle,archived_at,created_at,updated_at)
+        VALUES(?1,?2,'Synthetic capability source','validation','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z')",
+        params![task,fixture_project]).unwrap();
+    connection.execute("INSERT OR IGNORE INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+        VALUES(?1,?2,'synthetic-source','validation','synthetic',1,'completed','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z')",
+        params![source,task]).unwrap();
+    connection.execute("INSERT OR IGNORE INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+        VALUES(?1,?1,?2,?3,1,1,'exited','synthetic-source','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z')",
+        params![source,launch.role.to_string(),launch.provider.to_string()]).unwrap();
+    connection.execute("INSERT OR IGNORE INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,
+        transcript_epoch,capability_key,capability_identity_json,exit_json,created_at,updated_at)
+        VALUES(?1,?1,?2,'exited',?3,?4,?1,?5,?6,'{\"process_group_quiescent\":true}','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z')",
+        params![source,launch.provider.to_string(),serde_json::to_string(launch).unwrap(),launch.executable_version,key,serde_json::to_string(&identity).unwrap()]).unwrap();
+    proof["session_id"] = source.into();
+    proof["config_hash"] = key.into();
+    proof["native_proof"] = false.into();
+    if let Some(contract) = launch.security_policy.get("qualification_contract") {
+        proof["qualification_contract"] = contract.clone();
+    }
+}
+
 fn seed_supported_capabilities_for_config_with_runtime(
     fixture: &Fixture,
     config: &RoleOverride,
@@ -2047,7 +2078,7 @@ fn seed_supported_capabilities_for_config_with_runtime(
             if !scopes.contains(&scope) {
                 scopes.push(scope.clone());
             }
-            let proof = serde_json::json!({
+            let mut proof = serde_json::json!({
                 "fixture": true,
                 "runtime_scope": scope,
                 "runtime_scopes": scopes,
@@ -2055,6 +2086,7 @@ fn seed_supported_capabilities_for_config_with_runtime(
                 "model": current.model,
                 "effort": current.effort,
             });
+            seed_capability_source(&connection, &fixture_project_id, &launch.config, &mut proof);
             connection.execute(
                 "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
                  VALUES(?1,?2,?3,?4,'interactive_pty',?5,'supported','fixture','[]','2026-01-01T00:00:00Z',?6)
@@ -2225,7 +2257,7 @@ fn seed_supported_capabilities_for_config_with_runtime(
         if !scopes.contains(&scope) {
             scopes.push(scope.clone());
         }
-        let proof = serde_json::json!({
+        let mut proof = serde_json::json!({
             "fixture": true,
             "runtime_scope": scope,
             "runtime_scopes": scopes,
@@ -2233,6 +2265,7 @@ fn seed_supported_capabilities_for_config_with_runtime(
             "model": requested.model,
             "effort": requested.effort,
         });
+        seed_capability_source(&connection, &fixture_project_id, &launch.config, &mut proof);
         connection.execute("INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json) VALUES(?1,?2,?3,?4,'interactive_pty',?5,'supported','fixture','[]','2026-01-01T00:00:00Z',?6) ON CONFLICT(provider,executable_version,role,mode,config_hash) DO UPDATE SET status='supported',evidence_reference='fixture',gaps_json='[]',checked_at='2026-01-01T00:00:00Z',proof_json=excluded.proof_json",params![uuid::Uuid::new_v4().to_string(),launch.config.provider.to_string(),launch.config.executable_version,role_name,key,proof.to_string()]).unwrap();
     }
 }
@@ -2437,7 +2470,7 @@ fn start_synthetic_runtime_probe(
         .trip_setup_role_launch_context(&attempt, role, true)
         .unwrap();
     let prompt = agenticjira::trip::setup_launch_prompt(&fixture.store, &attempt, role).unwrap();
-    let launch = if context.config.provider == Provider::Claude {
+    let mut launch = if context.config.provider == Provider::Claude {
         let runtime = capability_runtime(fixture);
         let policy = runtime_probe_policy_for_test(fixture, admission, role, &context.workspace);
         providers::prepare_runtime_probe_role_launch_with_bundles(
@@ -2465,6 +2498,20 @@ fn start_synthetic_runtime_probe(
     } else {
         confined_launch(fixture, &attempt, &context, role, &prompt)
     };
+    let frozen: String = fixture.connection().query_row(
+        "SELECT capability_identity_json FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2",
+        params![admission, role_name], |row| row.get(0),
+    ).unwrap();
+    if serde_json::from_str::<serde_json::Value>(&frozen).unwrap()["security_policy"]
+        .get("qualification_contract")
+        .is_none()
+    {
+        launch
+            .security_policy
+            .as_object_mut()
+            .unwrap()
+            .remove("qualification_contract");
+    }
     fixture.reserve_role(&context, &launch);
     fixture
         .store
@@ -2501,7 +2548,16 @@ fn start_synthetic_runtime_probe(
         )
         .unwrap();
     let fake_native_id = format!("synthetic-runtime-native-{admission}-{role_name}");
-    let mut fake_outcomes = if role == RoleKind::Implementer {
+    let functional = prompt.contains("functional-v2");
+    let mut fake_outcomes = if functional {
+        let quote = |path: PathBuf| providers::shell_quote(&path.to_string_lossy());
+        let read = quote(context.workspace.join("functional-challenge.txt"));
+        let mut commands = vec![serde_json::json!({"command":format!("/bin/cat -- {read}")})];
+        if role == RoleKind::Implementer {
+            commands.push(serde_json::json!({"command":format!("/bin/cp -- {read} {}",quote(context.workspace.join("functional-write.txt")))}));
+        }
+        serde_json::Value::Array(commands)
+    } else if role == RoleKind::Implementer {
         implementer_runtime_outcomes(
             context.config.provider,
             context.workspace.to_string_lossy().as_ref(),
@@ -2577,6 +2633,15 @@ fn start_synthetic_runtime_probe(
     };
     insert_fake_hook("SessionStart", 0, None);
     insert_fake_hook("UserPromptSubmit", 0, None);
+    if functional {
+        insert_fake_hook(
+            "PreToolUse",
+            1000,
+            Some(
+                serde_json::json!({"command":format!("{} role context",std::env::current_exe().unwrap().display())}),
+            ),
+        );
+    }
     for (ordinal, outcome) in fake_outcomes.as_array().unwrap().iter().enumerate() {
         insert_fake_hook(
             "PreToolUse",
@@ -2584,7 +2649,7 @@ fn start_synthetic_runtime_probe(
             Some(serde_json::json!({"command":outcome["command"]})),
         );
     }
-    if role == RoleKind::Implementer && context.config.provider == Provider::Codex {
+    if !functional && role == RoleKind::Implementer && context.config.provider == Provider::Codex {
         let command = fake_outcomes
             .as_array()
             .unwrap()
@@ -2613,9 +2678,9 @@ fn start_synthetic_runtime_probe(
         fixture.execute(
             "INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,
                launch_config_json,capability_key,capability_identity_json,state,
-               hook_event_boundary_rowid,created_at,updated_at)
+               hook_event_boundary_rowid,prior_transcript_epoch,prior_exit_json,process_identity_json,created_at,updated_at)
              SELECT ?1,id,1,transcript_epoch,launch_config_json,capability_key,
-               capability_identity_json,'running',?2,'2026-01-01T00:00:00Z',
+               capability_identity_json,'running',?2,transcript_epoch,json_object('process_group_quiescent',json('true')),process_identity_json,'2026-01-01T00:00:00Z',
                '2026-01-01T00:00:00Z' FROM sessions WHERE id=?3",
             params![
                 uuid::Uuid::new_v4().to_string(),
@@ -2803,6 +2868,90 @@ fn authorized_runtime_fixture(name: &str) -> (Fixture, InstancePaths, String, St
     authorized_runtime_fixture_with_bundles(name, false)
 }
 
+fn authorized_legacy_runtime_fixture(name: &str) -> (Fixture, InstancePaths, String, String) {
+    authorized_legacy_runtime_fixture_with_bundles(name, false)
+}
+
+fn authorized_legacy_runtime_fixture_with_bundles(
+    name: &str,
+    synthetic_claude: bool,
+) -> (Fixture, InstancePaths, String, String) {
+    let (fixture, paths, project, admission) =
+        authorized_runtime_fixture_with_bundles(name, synthetic_claude);
+    freeze_legacy_runtime_admission(&fixture, &admission);
+    (fixture, paths, project, admission)
+}
+
+fn freeze_legacy_runtime_admission(fixture: &Fixture, admission: &str) {
+    let connection = fixture.connection();
+    let mut profiles = Vec::new();
+    for role in [
+        RoleKind::Manager,
+        RoleKind::Explorer,
+        RoleKind::PlanReviewer,
+        RoleKind::Implementer,
+        RoleKind::CodeReviewer,
+        RoleKind::FinalReviewer,
+    ] {
+        let row: Option<String> = connection.query_row(
+            "SELECT json_object('role',role,'settings_revision',settings_revision,'source',CASE WHEN settings_revision IS NULL THEN 'project_default' ELSE 'task_override' END,
+               'profile_hash',profile_hash,'project_config_revision_id',project_config_revision_id,'project_configuration_hash',project_configuration_hash,
+               'adapter',adapter_name,'adapter_hash',adapter_hash,'capability_key',capability_key,'capability_identity',capability_identity_json,
+               'cmux_socket_path_hash',NULL) FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2",
+            params![admission, role.to_string()], |row| row.get(0),
+        ).optional().unwrap();
+        let Some(row) = row else {
+            continue;
+        };
+        let mut profile: serde_json::Value = serde_json::from_str(&row).unwrap();
+        let mut identity: agenticjira::domain::CapabilityIdentity =
+            serde_json::from_str(profile["capability_identity"].as_str().unwrap()).unwrap();
+        identity
+            .security_policy
+            .as_object_mut()
+            .unwrap()
+            .remove("qualification_contract");
+        if identity.provider == Provider::Claude {
+            let socket = fixture
+                .root
+                .join("human-confirmed-cmux.sock")
+                .to_string_lossy()
+                .into_owned();
+            connection.execute("UPDATE trip_runtime_probes SET cmux_socket_path=?1 WHERE admission_id=?2 AND role=?3",
+                params![socket,admission,role.to_string()]).unwrap();
+            profile["cmux_socket_path_hash"] = sha256(socket.as_bytes()).into();
+        }
+        let key = providers::capability_identity_key(&identity).unwrap();
+        let identity = serde_json::to_string(&identity).unwrap();
+        connection.execute("UPDATE trip_runtime_probes SET capability_key=?1,capability_identity_json=?2 WHERE admission_id=?3 AND role=?4",
+            params![key,identity,admission,role.to_string()]).unwrap();
+        profile["capability_key"] = key.into();
+        profile["capability_identity"] = identity.into();
+        profiles.push(profile);
+    }
+    let scope: String = connection.query_row(
+        "SELECT json_object('project_id',a.project_id,'task_id',a.task_id,
+           'entity_version',CASE WHEN a.task_id IS NULL THEN project.version ELSE task.version END,
+           'setup_operation_id',setup.id,'fixture_project_id',fixture.id,
+           'fixture_repository_identity',fixture.repository_identity,'fixture_root',fixture.repository_path)
+         FROM trip_runtime_admissions a JOIN projects project ON project.id=a.project_id
+         LEFT JOIN tasks task ON task.id=a.task_id JOIN trip_runtime_probes probe ON probe.admission_id=a.id
+         JOIN trip_setup_operations setup ON setup.fixture_project_id=probe.fixture_project_id AND setup.state='activated'
+         JOIN projects fixture ON fixture.id=setup.fixture_project_id WHERE a.id=?1 LIMIT 1",
+        params![admission], |row| row.get(0),
+    ).unwrap();
+    let mut scope: serde_json::Value = serde_json::from_str(&scope).unwrap();
+    scope["fixture_root_hash"] = sha256(scope["fixture_root"].as_str().unwrap().as_bytes()).into();
+    scope.as_object_mut().unwrap().remove("fixture_root");
+    scope["profiles"] = profiles.into();
+    connection
+        .execute(
+            "UPDATE trip_runtime_admissions SET scope_hash=?1 WHERE id=?2",
+            params![agenticjira::store::json_hash(&scope).unwrap(), admission],
+        )
+        .unwrap();
+}
+
 fn authorized_runtime_fixture_with_bundles(
     name: &str,
     synthetic_claude: bool,
@@ -2859,6 +3008,21 @@ fn authorized_claude_explorer_runtime_fixture(
     name: &str,
 ) -> (Fixture, InstancePaths, String, String) {
     authorized_claude_runtime_fixture(name, RoleKind::Explorer)
+}
+
+fn authorized_legacy_claude_explorer_runtime_fixture(
+    name: &str,
+) -> (Fixture, InstancePaths, String, String) {
+    authorized_legacy_claude_runtime_fixture(name, RoleKind::Explorer)
+}
+
+fn authorized_legacy_claude_runtime_fixture(
+    name: &str,
+    role: RoleKind,
+) -> (Fixture, InstancePaths, String, String) {
+    let (fixture, paths, project, admission) = authorized_claude_runtime_fixture(name, role);
+    freeze_legacy_runtime_admission(&fixture, &admission);
+    (fixture, paths, project, admission)
 }
 
 fn authorized_claude_runtime_fixture(
@@ -2930,6 +3094,42 @@ fn runtime_probe_policy_for_test(
     role: RoleKind,
     workspace: &std::path::Path,
 ) -> providers::RuntimeProbeCommandPolicy {
+    let identity: String = fixture.connection().query_row("SELECT capability_identity_json FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2",params![admission,role.to_string()],|row|row.get(0)).unwrap();
+    if serde_json::from_str::<serde_json::Value>(&identity).unwrap()["security_policy"]
+        ["qualification_contract"]
+        == "functional-v2"
+    {
+        let (fixture_root,service,control): (String,String,String) = fixture.connection().query_row(
+            "SELECT fixture_root,service_sentinel_path,control_socket_path FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2",
+            params![admission,role.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        let read =
+            providers::shell_quote(&workspace.join("functional-challenge.txt").to_string_lossy());
+        let mut commands = vec![providers::RuntimeProbeCommand {
+            operation: "fixture_read".into(),
+            command: format!("/bin/cat -- {read}"),
+        }];
+        if role == RoleKind::Implementer {
+            commands.push(providers::RuntimeProbeCommand {
+                operation: "workspace_write".into(),
+                command: format!(
+                    "/bin/cp -- {read} {}",
+                    providers::shell_quote(
+                        &workspace.join("functional-write.txt").to_string_lossy()
+                    )
+                ),
+            });
+        }
+        return providers::RuntimeProbeCommandPolicy {
+            commands,
+            read_denials: vec![control.into()],
+            write_denials: if role == RoleKind::Implementer {
+                vec![fixture_root.into(), service.into()]
+            } else {
+                vec![workspace.to_path_buf()]
+            },
+        };
+    }
     let (nonce, fixture_root, service_sentinel, control, cmux_socket): (
         String,
         String,
@@ -3042,6 +3242,14 @@ fn mark_synthetic_runtime_resume(
     process: &str,
     exact_invocation_identity: bool,
 ) {
+    let (prior_epoch, prior_exit): (String, Option<String>) = fixture
+        .connection()
+        .query_row(
+            "SELECT transcript_epoch,exit_json FROM sessions WHERE id=?1",
+            params![context.session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
     fixture.execute(
         "UPDATE sessions SET status='running',launch_state='started',resume_count=1,
            transcript_epoch=?1,process_identity_json=?2,exit_json=NULL WHERE id=?3",
@@ -3064,18 +3272,604 @@ fn mark_synthetic_runtime_resume(
     fixture.execute(
         "INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,
            process_identity_json,launch_config_json,capability_key,capability_identity_json,
-           state,hook_event_boundary_rowid,created_at,updated_at)
+           state,hook_event_boundary_rowid,prior_transcript_epoch,prior_exit_json,created_at,updated_at)
          SELECT ?1,id,1,?2,?3,launch_config_json,capability_key,capability_identity_json,
-           'running',(SELECT MAX(rowid) FROM hook_events WHERE session_id=?4),
+           'running',(SELECT MAX(rowid) FROM hook_events WHERE session_id=?4),?5,?6,
            '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'
          FROM sessions WHERE id=?4",
         params![
             uuid::Uuid::new_v4().to_string(),
             invocation_epoch,
             invocation_process,
-            context.session_id
+            context.session_id,
+            prior_epoch,
+            prior_exit
         ],
     );
+}
+
+fn synthetic_functional_runtime_report(
+    fixture: &Fixture,
+    admission: &str,
+    role: RoleKind,
+    first_invocation_commands: &[String],
+    context_application: Option<&Application>,
+) -> (RoleLaunchContext, RoleResultReport) {
+    let (context, _, challenge, _, prompt) =
+        start_synthetic_runtime_probe(fixture, admission, role, false);
+    assert!(prompt.contains("--functional-v2"));
+    assert!(!prompt.contains("permission_delivery"));
+    assert!(!prompt.contains("unix-connect-probe"));
+    let authenticated = fixture.store.role_context(&context.token).unwrap();
+    let mut contract = agenticjira::trip::setup_context(&fixture.connection(), &authenticated)
+        .unwrap()
+        .unwrap();
+    if let Some(application) = context_application {
+        const FUNCTIONAL_CONTEXT_BYTE_LIMIT: usize = 64 * 1024;
+        for cursor in [
+            None,
+            Some("v1:task:0:abababababababababababababababab:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"),
+        ] {
+            assert!(application
+                .role_context_delivery_payload(&authenticated, cursor)
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable during qualification"));
+        }
+        let payload = application.role_context_payload(&authenticated).unwrap();
+        let serialized = serde_json::to_string_pretty(&payload).unwrap();
+        assert!(serialized.len() <= FUNCTIONAL_CONTEXT_BYTE_LIMIT);
+        assert!(!serialized.contains(&challenge));
+        assert_eq!(payload.as_object().unwrap().len(), 4);
+        assert_eq!(payload["context_scope"], "functional_qualification");
+        assert_eq!(
+            payload["identity"],
+            serde_json::to_value(&authenticated).unwrap()
+        );
+        assert_eq!(payload["setup_contract"], contract);
+        let executable =
+            providers::shell_quote(&std::env::current_exe().unwrap().to_string_lossy());
+        assert_eq!(
+            payload["commands"]["context"],
+            format!("{executable} role context")
+        );
+        let report_command = payload["commands"]["report"].as_str().unwrap();
+        assert!(report_command.starts_with(&format!("{executable} role report --functional-v2 ")));
+        assert!(
+            report_command.ends_with(if role == RoleKind::FinalReviewer {
+                "--session-mode=fresh"
+            } else {
+                "--session-mode=retained"
+            })
+        );
+        assert!(!report_command.contains("--json"));
+        assert!(payload["commands"]["reporting_contract"]
+            .as_str()
+            .unwrap()
+            .contains("--functional-v2"));
+        assert!(prompt
+            .contains("Never open provider-managed output files or use native file-search tools"));
+        assert!(prompt.contains("rerun the direct role context command or a permitted single-pipe"));
+        contract = payload["setup_contract"].clone();
+    }
+    assert!(contract.get("nonce").is_none());
+    let binding = contract["binding_hash"].as_str().unwrap().to_owned();
+    for command in first_invocation_commands {
+        fixture.execute("INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,payload_json,
+            peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+            SELECT ?1,session_id,role_generation_id,provider,event_name,native_session_id,
+              json_set(payload_json,'$.tool_input.command',?2),peer_pid,peer_process_group_id,
+              peer_start_marker,provenance_state,received_at FROM hook_events
+            WHERE session_id=?3 AND event_name='PreToolUse' ORDER BY rowid DESC LIMIT 1",
+            params![uuid::Uuid::new_v4().to_string(),command,context.session_id]);
+    }
+    if role != RoleKind::FinalReviewer {
+        fixture.finish_role(&context);
+        let resume_epoch = uuid::Uuid::new_v4().to_string();
+        mark_synthetic_runtime_resume(fixture, &context, &resume_epoch, "{}", true);
+        let native: String = fixture
+            .connection()
+            .query_row(
+                "SELECT native_session_id FROM sessions WHERE id=?1",
+                params![context.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        fixture.execute("INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,payload_json,
+            peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+            VALUES(?1,?2,?3,?4,'UserPromptSubmit',?5,'{}',1,1,'synthetic-functional','managed_process_group_untrusted_payload','2026-01-01T00:00:00Z')",
+            params![uuid::Uuid::new_v4().to_string(),context.session_id,context.role_generation_id,context.config.provider.to_string(),native]);
+    }
+    let arguments = vec![
+        "--functional-v2".into(),
+        format!("--operation-id=functional-{}", context.session_id),
+        "--status=passed".into(),
+        format!("--binding-hash={binding}"),
+        format!("--challenge={challenge}"),
+        format!(
+            "--session-mode={}",
+            if role == RoleKind::FinalReviewer {
+                "fresh"
+            } else {
+                "retained"
+            }
+        ),
+    ];
+    let report = agenticjira::domain::parse_functional_role_report_args(&arguments).unwrap();
+    let command = format!(
+        "{} role report {}",
+        providers::shell_quote(&std::env::current_exe().unwrap().to_string_lossy()),
+        arguments.join(" ")
+    );
+    let native: String = fixture
+        .connection()
+        .query_row(
+            "SELECT native_session_id FROM sessions WHERE id=?1",
+            params![context.session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload = serde_json::json!({"synthetic_fixture":true,"native_proof":false,"hook_event_name":"PreToolUse","session_id":native,
+        "tool_name":if context.config.provider==Provider::Claude{"Bash"}else{"shell"},"tool_input":{"command":command}});
+    fixture.execute("INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,payload_json,
+        peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+        VALUES(?1,?2,?3,?4,'PreToolUse',?5,?6,1,1,'synthetic-functional','managed_process_group_untrusted_payload','2026-01-01T00:00:00Z')",
+        params![uuid::Uuid::new_v4().to_string(),context.session_id,context.role_generation_id,context.config.provider.to_string(),native,payload.to_string()]);
+    (context, report)
+}
+
+#[test]
+fn trip_runtime_functional_all_roles_publish_without_artificial_permission_requests() {
+    let (fixture, paths, _, admission) = authorized_runtime_fixture("functional-all-roles");
+    for role in [
+        RoleKind::Manager,
+        RoleKind::Explorer,
+        RoleKind::PlanReviewer,
+        RoleKind::Implementer,
+        RoleKind::CodeReviewer,
+        RoleKind::FinalReviewer,
+    ] {
+        let (context, report) =
+            synthetic_functional_runtime_report(&fixture, &admission, role, &[], None);
+        if role == RoleKind::Implementer {
+            std::fs::copy(
+                context.workspace.join("functional-challenge.txt"),
+                context.workspace.join("functional-write.txt"),
+            )
+            .unwrap();
+        }
+        fixture
+            .store
+            .save_role_result(
+                &fixture.store.role_context(&context.token).unwrap(),
+                &report,
+            )
+            .unwrap();
+        fixture.finish_role(&context);
+        fixture.execute(
+            "UPDATE resume_invocations SET state='exited' WHERE session_id=?1",
+            params![context.session_id],
+        );
+        let published = execute_trip(
+            &fixture,
+            &paths,
+            &format!("publish-functional-{role}"),
+            &TripHumanAction::PublishRuntimeProof {
+                admission_id: admission.clone(),
+                role,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            published.detail["proof"]["qualification_contract"],
+            "functional-v2"
+        );
+        assert_eq!(published.detail["proof"]["os_confinement_attested"], false);
+        assert_eq!(
+            published.detail["proof"]["functional_observations"]["writer_sha256"].is_string(),
+            role == RoleKind::Implementer
+        );
+        assert!(published.detail["proof"]
+            .get("native_denial_evidence")
+            .is_none());
+    }
+    assert_eq!(
+        fixture.scalar::<i64>("SELECT COUNT(*) FROM permission_requests"),
+        0
+    );
+    assert_eq!(
+        fixture.scalar::<String>(
+            "SELECT state FROM trip_runtime_admissions ORDER BY rowid DESC LIMIT 1"
+        ),
+        "ready"
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    let projected = state
+        .trip_setups
+        .iter()
+        .flat_map(|setup| setup["runtime_admissions"].as_array().unwrap())
+        .find(|entry| entry["id"] == admission)
+        .unwrap();
+    let probes = projected["probes"].as_array().unwrap();
+    assert_eq!(probes.len(), 6);
+    assert!(probes
+        .iter()
+        .all(|probe| probe["qualification_contract"] == "functional-v2"));
+}
+
+#[test]
+fn trip_runtime_functional_requires_writer_artifact_and_correlated_native_provenance() {
+    let (fixture, _, _, admission) = authorized_runtime_fixture("functional-missing-evidence");
+    let (context, report) =
+        synthetic_functional_runtime_report(&fixture, &admission, RoleKind::Implementer, &[], None);
+    let authenticated = fixture.store.role_context(&context.token).unwrap();
+    let mut wrong_binding = report.clone();
+    wrong_binding.metadata["validation_observation"]["functional"]["binding_hash"] =
+        "00".repeat(32).into();
+    assert!(fixture
+        .store
+        .save_role_result(&authenticated, &wrong_binding)
+        .unwrap_err()
+        .to_string()
+        .contains("exact challenge, profile, session or invocation"));
+    assert!(fixture
+        .store
+        .save_role_result(&authenticated, &report)
+        .unwrap_err()
+        .to_string()
+        .contains("functional artifact"));
+    assert_eq!(
+        fixture.scalar::<i64>("SELECT COUNT(*) FROM role_results"),
+        0
+    );
+    std::fs::copy(
+        context.workspace.join("functional-challenge.txt"),
+        context.workspace.join("functional-write.txt"),
+    )
+    .unwrap();
+    let process: String = fixture
+        .connection()
+        .query_row(
+            "SELECT process_identity_json FROM resume_invocations WHERE session_id=?1",
+            params![context.session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    fixture.execute(
+        "UPDATE resume_invocations SET process_identity_json=?1 WHERE session_id=?2",
+        params![r#"{"stale":true}"#, context.session_id],
+    );
+    assert!(fixture
+        .store
+        .save_role_result(&authenticated, &report)
+        .unwrap_err()
+        .to_string()
+        .contains("same-native-session invocation and quiescent resume evidence"));
+    fixture.execute(
+        "UPDATE resume_invocations SET process_identity_json=?1 WHERE session_id=?2",
+        params![process, context.session_id],
+    );
+    fixture.execute("UPDATE hook_events SET provenance_state='untrusted' WHERE session_id=?1 AND event_name='PreToolUse'
+        AND json_extract(payload_json,'$.tool_input.command') LIKE '%role context'",params![context.session_id]);
+    assert!(fixture
+        .store
+        .save_role_result(&authenticated, &report)
+        .is_err());
+    assert_eq!(
+        fixture.scalar::<i64>("SELECT COUNT(*) FROM role_results"),
+        0
+    );
+    assert_eq!(
+        fixture.scalar::<i64>("SELECT COUNT(*) FROM trip_runtime_probes WHERE state='published'"),
+        0
+    );
+
+    let context_command = format!(
+        "{} role context",
+        providers::shell_quote(&std::env::current_exe().unwrap().to_string_lossy())
+    );
+    for role in [RoleKind::Implementer, RoleKind::FinalReviewer] {
+        let (fixture, paths, _, admission) = authorized_runtime_fixture("functional-context-reads");
+        let attempt: String = fixture
+            .connection()
+            .query_row(
+                "SELECT attempt_id FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2",
+                params![admission, role.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let history = "unrelated qualification history ".repeat(4096);
+        fixture.execute("INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,prompt_hash,handoff_hash,
+            delivery_state,verdict,feedback,created_at,updated_at)
+            VALUES('unrelated-functional-history',?1,'code','historical-candidate','historical-prompt','historical-handoff',
+              'finished','request_changes',?2,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            params![attempt,history]);
+        let application = Application::new_with_synthetic_dispatch_for_tests(
+            paths,
+            fixture.store.clone(),
+            std::env::current_exe().unwrap(),
+            test_hooks(&fixture),
+        )
+        .unwrap();
+        let extra = vec![
+            context_command.clone(),
+            format!(r#"{context_command} | /usr/bin/grep -o '"setup_contract":{{[^}}]*}}'"#),
+            format!(r#"{context_command} | /usr/bin/grep -o '"binding_hash":"[^"]*"'"#),
+        ];
+        let (context, report) = synthetic_functional_runtime_report(
+            &fixture,
+            &admission,
+            role,
+            &extra,
+            Some(&application),
+        );
+        if role != RoleKind::FinalReviewer {
+            let recalled = fixture.store.role_context(&context.token).unwrap();
+            assert!(application
+                .role_context_payload(&recalled)
+                .unwrap_err()
+                .to_string()
+                .contains("resumed runtime probe context is unavailable"));
+            assert!(application
+                .role_context_delivery_payload(&recalled, None)
+                .unwrap_err()
+                .to_string()
+                .contains("resumed runtime probe context is unavailable"));
+        }
+        if role == RoleKind::Implementer {
+            std::fs::copy(
+                context.workspace.join("functional-challenge.txt"),
+                context.workspace.join("functional-write.txt"),
+            )
+            .unwrap();
+        }
+        fixture
+            .store
+            .save_role_result(
+                &fixture.store.role_context(&context.token).unwrap(),
+                &report,
+            )
+            .unwrap();
+        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM role_results", 1);
+        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM permission_requests", 0);
+    }
+    for case in [
+        "duplicate_read",
+        "duplicate_write",
+        "unknown",
+        "redirect",
+        "retained_reread",
+        "native_grep",
+    ] {
+        let (fixture, _, _, admission) = if case == "native_grep" {
+            authorized_claude_explorer_runtime_fixture(case)
+        } else {
+            authorized_runtime_fixture(case)
+        };
+        let role = if case == "native_grep" {
+            RoleKind::Explorer
+        } else {
+            RoleKind::Implementer
+        };
+        let workspace: String = fixture
+            .connection()
+            .query_row(
+                "SELECT workspace_path FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2",
+                params![admission, role.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let challenge = providers::shell_quote(
+            &std::path::Path::new(&workspace)
+                .join("functional-challenge.txt")
+                .to_string_lossy(),
+        );
+        let extra = match case {
+            "duplicate_read" => vec![format!("/bin/cat -- {challenge}")],
+            "duplicate_write" => vec![format!(
+                "/bin/cp -- {challenge} {}",
+                providers::shell_quote(
+                    &std::path::Path::new(&workspace)
+                        .join("functional-write.txt")
+                        .to_string_lossy()
+                )
+            )],
+            "unknown" => vec!["/usr/bin/true".into()],
+            "redirect" => vec![format!("{context_command} | grep -o pattern > output")],
+            "retained_reread" => Vec::new(),
+            "native_grep" => vec!["synthetic-native-grep".into()],
+            _ => unreachable!(),
+        };
+        let (context, report) =
+            synthetic_functional_runtime_report(&fixture, &admission, role, &extra, None);
+        if role == RoleKind::Implementer {
+            std::fs::copy(
+                context.workspace.join("functional-challenge.txt"),
+                context.workspace.join("functional-write.txt"),
+            )
+            .unwrap();
+        }
+        if case == "native_grep" {
+            let input = serde_json::json!({"pattern":"setup_contract","path":fixture.root.join("provider-spooled-output")});
+            fixture.execute("UPDATE hook_events SET payload_json=json_set(payload_json,'$.tool_name','Grep','$.tool_input',json(?1))
+                WHERE session_id=?2 AND event_name='PreToolUse'
+                  AND json_extract(payload_json,'$.tool_input.command')='synthetic-native-grep'",
+                params![input.to_string(),context.session_id]);
+            fixture.assert_scalar::<i64>(
+                &format!(
+                    "SELECT COUNT(*) FROM hook_events WHERE session_id='{}'
+                AND event_name='PreToolUse' AND json_extract(payload_json,'$.tool_name')='Grep'",
+                    context.session_id
+                ),
+                1,
+            );
+            fixture.assert_scalar::<i64>(
+                &format!(
+                    "SELECT COUNT(*) FROM hook_events WHERE session_id='{}'
+                AND event_name='PostToolUse' AND json_extract(payload_json,'$.tool_name')='Grep'",
+                    context.session_id
+                ),
+                0,
+            );
+        }
+        if case == "retained_reread" {
+            fixture.execute("INSERT INTO hook_events(id,session_id,role_generation_id,provider,event_name,native_session_id,payload_json,
+                peer_pid,peer_process_group_id,peer_start_marker,provenance_state,received_at)
+                SELECT ?1,session_id,role_generation_id,provider,event_name,native_session_id,
+                  json_set(payload_json,'$.tool_input.command',?2),peer_pid,peer_process_group_id,
+                  peer_start_marker,provenance_state,received_at FROM hook_events
+                WHERE session_id=?3 AND event_name='PreToolUse' ORDER BY rowid DESC LIMIT 1",
+                params![uuid::Uuid::new_v4().to_string(),context_command,context.session_id]);
+        }
+        let error = fixture
+            .store
+            .save_role_result(
+                &fixture.store.role_context(&context.token).unwrap(),
+                &report,
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exact authenticated native hook commands and count"),
+            "{case}: {error:#}"
+        );
+        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM role_results", 0);
+        fixture.assert_scalar::<i64>(
+            "SELECT COUNT(*) FROM trip_runtime_probes WHERE state='published'",
+            0,
+        );
+    }
+}
+
+#[test]
+fn trip_runtime_functional_claude_readonly_uses_the_benign_exact_command_policy() {
+    let (fixture, paths, _, admission) =
+        authorized_claude_explorer_runtime_fixture("functional-claude-readonly");
+    let (context, report) =
+        synthetic_functional_runtime_report(&fixture, &admission, RoleKind::Explorer, &[], None);
+    fixture
+        .store
+        .save_role_result(
+            &fixture.store.role_context(&context.token).unwrap(),
+            &report,
+        )
+        .unwrap();
+    fixture.finish_role(&context);
+    fixture.execute(
+        "UPDATE resume_invocations SET state='exited' WHERE session_id=?1",
+        params![context.session_id],
+    );
+    let published = execute_trip(
+        &fixture,
+        &paths,
+        "publish-functional-claude",
+        &TripHumanAction::PublishRuntimeProof {
+            admission_id: admission,
+            role: RoleKind::Explorer,
+        },
+    )
+    .unwrap();
+    assert_eq!(published.detail["proof"]["provider"], "claude");
+    assert_eq!(
+        published.detail["proof"]["qualification_contract"],
+        "functional-v2"
+    );
+    assert_eq!(
+        fixture.scalar::<i64>("SELECT COUNT(*) FROM permission_requests"),
+        0
+    );
+}
+
+#[test]
+fn trip_runtime_functional_rejects_legacy_proof_even_under_the_new_key() {
+    let (fixture, _, _, admission) = authorized_runtime_fixture("functional-forged-legacy");
+    let (context, ..) =
+        start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Explorer, false);
+    let launch: LaunchConfig = serde_json::from_value(
+        fixture.store.session_json(&context.session_id).unwrap()["launch_config"].clone(),
+    )
+    .unwrap();
+    let key = providers::capability_key(&launch).unwrap();
+    let legacy=serde_json::json!({"status":"supported","session_id":context.session_id,"runtime_scope":{"legacy":true}}).to_string();
+    fixture.execute("INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,proof_json,gaps_json,checked_at)
+        VALUES('forged-legacy',?1,?2,'explorer','interactive_pty',?3,'supported',?4,'[]','2099-01-01T00:00:00Z')
+        ON CONFLICT(provider,executable_version,role,mode,config_hash) DO UPDATE SET status='supported',proof_json=excluded.proof_json,checked_at=excluded.checked_at",
+        params![launch.provider.to_string(),launch.executable_version,key,legacy]);
+    assert!(fixture
+        .store
+        .require_supported_capability(&launch)
+        .unwrap_err()
+        .to_string()
+        .contains("contract"));
+    assert_eq!(fixture.connection().query_row::<String,_,_>("SELECT proof_json FROM capabilities WHERE config_hash=?1 AND mode='interactive_pty'",params![key],|row|row.get(0)).unwrap(),legacy);
+    let mut unknown = launch;
+    unknown.security_policy["qualification_contract"] = "functional-v99".into();
+    assert!(fixture
+        .store
+        .require_supported_capability(&unknown)
+        .is_err());
+    fixture.execute(
+        "UPDATE trip_runtime_probes SET capability_identity_json=json_set(capability_identity_json,'$.security_policy.qualification_contract','functional-v99') WHERE admission_id=?1 AND role='explorer'",
+        params![admission],
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    let projected = state
+        .trip_setups
+        .iter()
+        .flat_map(|setup| setup["runtime_admissions"].as_array().unwrap())
+        .find(|entry| entry["id"] == admission)
+        .unwrap();
+    let explorer = projected["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|probe| probe["role"] == "explorer")
+        .unwrap();
+    assert_eq!(explorer["qualification_contract"], "functional-v99");
+}
+
+#[test]
+fn main_checkout_functional_request_prescribes_only_the_owned_read_and_writer() {
+    let fixture = Fixture::new("main-functional-request");
+    let root = fixture.root.canonicalize().unwrap();
+    let protected = root.join("protected-surrogate");
+    std::fs::write(&protected, b"protected").unwrap();
+    let challenge = root.join(".llmrelay-main-challenge");
+    std::fs::write(&challenge, b"functional-nonce").unwrap();
+    let writer = root.join(".llmrelay-main-writer");
+    let scope = serde_json::json!({"root":root,"protected_roots":[protected],"protected_read_targets":[protected],"policy_denied_unobserved":[]});
+    let read =
+        providers::main_checkout_functional_observation_request(&scope, &challenge, None).unwrap();
+    assert_eq!(read["qualification_contract"], "functional-v2");
+    assert_eq!(
+        read["permitted_read"]["path"],
+        challenge.to_string_lossy().as_ref()
+    );
+    assert!(read.get("targets").is_none());
+    assert!(read["owned_writer"].is_null());
+    let write =
+        providers::main_checkout_functional_observation_request(&scope, &challenge, Some(&writer))
+            .unwrap();
+    assert_eq!(
+        write["owned_writer"]["path"],
+        writer.to_string_lossy().as_ref()
+    );
+    assert!(write["command"].as_str().unwrap().contains("/bin/cp --"));
+    assert!(
+        providers::main_checkout_functional_observation_request(&scope, &protected, None).is_err()
+    );
+    assert!(providers::main_checkout_functional_observation_request(
+        &scope,
+        &challenge,
+        Some(&protected)
+    )
+    .is_err());
+    assert!(providers::require_qualification_contract(
+        &serde_json::json!({"qualification_contract":"functional-v2"}),
+        &serde_json::json!({"targets":[]})
+    )
+    .is_err());
 }
 
 fn assert_runtime_report_schema(prompt: &str) {
@@ -3305,6 +4099,37 @@ fn insert_synthetic_runtime_report_hook(
 }
 
 fn record_synthetic_runtime_pass(fixture: &Fixture, admission: &str, role: RoleKind) {
+    let identity: String = fixture.connection().query_row(
+        "SELECT capability_identity_json FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2",
+        params![admission, role.to_string()], |row| row.get(0),
+    ).unwrap();
+    if serde_json::from_str::<serde_json::Value>(&identity).unwrap()["security_policy"]
+        ["qualification_contract"]
+        == "functional-v2"
+    {
+        let (context, report) =
+            synthetic_functional_runtime_report(fixture, admission, role, &[], None);
+        if role == RoleKind::Implementer {
+            let nonce: String = fixture
+                .connection()
+                .query_row(
+                    "SELECT nonce FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2",
+                    params![admission, role.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            std::fs::write(context.workspace.join("functional-write.txt"), nonce).unwrap();
+        }
+        fixture
+            .store
+            .save_role_result(
+                &fixture.store.role_context(&context.token).unwrap(),
+                &report,
+            )
+            .unwrap();
+        fixture.finish_role(&context);
+        return;
+    }
     let (context, _, nonce, control, _) =
         start_synthetic_runtime_probe(fixture, admission, role, role != RoleKind::FinalReviewer);
     if role == RoleKind::Implementer {
@@ -4253,9 +5078,16 @@ fn authorize_ordinary_implementation(fixture: &Fixture, plan: &DispatchPlan) {
 
 #[test]
 fn activated_explorer_dispatches_before_writer_and_waits_for_quiescence() {
-    for stage in ["planning", "rescue"] {
-        let fixture = Fixture::new(&format!("activated-explorer-{stage}"));
-        let (_, _, plan) = new_task(&fixture, "explorer-project", "explorer-task");
+    for (stage, existing_manager, submitted_plan) in [
+        ("planning", false, false),
+        ("rescue", false, false),
+        ("planning", true, false),
+        ("planning", true, true),
+    ] {
+        let fixture = Fixture::new(&format!(
+            "activated-explorer-{stage}-{existing_manager}-{submitted_plan}"
+        ));
+        let (project, task, plan) = new_task(&fixture, "explorer-project", "explorer-task");
         if stage == "rescue" {
             authorize_ordinary_implementation(&fixture, &plan);
         }
@@ -4296,14 +5128,76 @@ fn activated_explorer_dispatches_before_writer_and_waits_for_quiescence() {
             app.coordinator_tick().unwrap()["decision"]["reason_code"],
             "workflow.activated_explorer_evidence"
         );
-        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM sessions", 1);
+        fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'", plan.attempt_id), 1);
         fixture.assert_scalar::<i64>(
-            "SELECT COUNT(*) FROM role_generations WHERE role='implementer'",
+            &format!("SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}' AND role='implementer'", plan.attempt_id),
             0,
         );
+        let manager = existing_manager.then(|| {
+            seed_session(
+                &fixture,
+                &plan.attempt_id,
+                "manager",
+                "planning-manager-generation",
+                "planning-manager-session",
+                "running",
+            );
+            fixture.execute(
+                "UPDATE role_settings SET effective_generation_id='planning-manager-generation'
+                 WHERE task_id=?1 AND role='manager'",
+                params![task],
+            );
+            fixture.execute(
+                "INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at)
+                 VALUES('planning-manager-credential','planning-manager-generation','planning-manager-hash',
+                   '[\"report_result\"]','2026-01-01T00:00:00Z')",
+                [],
+            );
+            RoleContext {
+                project_id: project.clone(),
+                task_id: task.clone(),
+                attempt_id: plan.attempt_id.clone(),
+                role_generation_id: "planning-manager-generation".into(),
+                session_id: "planning-manager-session".into(),
+                credential_id: "planning-manager-credential".into(),
+                transcript_epoch: "e".into(),
+                role: RoleKind::Manager,
+                provider: Provider::Codex,
+                configuration_revision: 1,
+                lane_id: "default".into(),
+                permissions: vec!["report_result".into(), "request_next_role".into()],
+            }
+        });
+        let explorer_generation = fixture.store.session_json(session).unwrap()
+            ["role_generation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let token = uuid::Uuid::new_v4().to_string();
         fixture.execute(
-            "UPDATE trip_explorer_decisions SET outcome_json='{}' WHERE id='activated-decision'",
-            [],
+            "UPDATE role_credentials SET token_hash=?1 WHERE role_generation_id=?2 AND revoked_at IS NULL",
+            params![auth::hash_secret(&token), explorer_generation],
+        );
+        let explorer_context = fixture.store.role_context(&token).unwrap();
+        fixture
+            .store
+            .save_role_result(
+                &explorer_context,
+                &RoleResultReport {
+                    operation_id: "planning-explorer-report".into(),
+                    outcome: "evidence_ready".into(),
+                    summary: "The existing entrypoint supports the requested bounded change".into(),
+                    evidence: vec!["Preserve its current authorization boundary in the plan".into()],
+                    metadata: serde_json::json!({"explorer_decision_id":"activated-decision"}),
+                },
+            )
+            .unwrap();
+        fixture.assert_scalar::<i64>(
+            &format!(
+                "SELECT COUNT(*) FROM guidance_messages WHERE attempt_id='{}'",
+                plan.attempt_id
+            ),
+            0,
         );
         assert_eq!(
             app.coordinator_tick().unwrap()["action"],
@@ -4313,8 +5207,162 @@ fn activated_explorer_dispatches_before_writer_and_waits_for_quiescence() {
             app.coordinator_tick().unwrap()["decision"]["reason_code"],
             "workflow.activated_explorer_evidence"
         );
-        fixture.execute("UPDATE sessions SET status='exited',launch_state='finished',exit_json='{\"process_group_quiescent\":true}' WHERE id=?1",params![session]);
+        fixture.assert_scalar::<i64>(
+            &format!(
+                "SELECT COUNT(*) FROM guidance_messages WHERE attempt_id='{}'",
+                plan.attempt_id
+            ),
+            0,
+        );
+        fixture.execute("UPDATE sessions SET status='exited',launch_state='finished',exit_json=NULL WHERE id=?1",params![session]);
         fixture.execute("UPDATE role_generations SET status='exited' WHERE id=(SELECT role_generation_id FROM sessions WHERE id=?1)",params![session]);
+        if existing_manager {
+            assert_eq!(
+                app.coordinator_tick().unwrap()["decision"]["reason_code"],
+                "workflow.current_manager_plan_pending"
+            );
+            fixture.assert_scalar::<i64>(
+                &format!(
+                    "SELECT COUNT(*) FROM guidance_messages WHERE attempt_id='{}'",
+                    plan.attempt_id
+                ),
+                0,
+            );
+        }
+        fixture.execute(
+            "UPDATE sessions SET exit_json='{\"process_group_quiescent\":true}' WHERE id=?1",
+            params![session],
+        );
+        if let Some(manager) = manager {
+            if submitted_plan {
+                let (criteria, config_revision, coverage): (String, String, String) = fixture
+                    .connection()
+                    .query_row(
+                        "SELECT t.acceptance_criteria_json,s.active_config_revision_id,
+                           json_extract(r.config_json,'$.testing.coverage')
+                         FROM tasks t JOIN trip_project_state s ON s.project_id=t.project_id
+                         JOIN trip_config_revisions r ON r.id=s.active_config_revision_id
+                         WHERE t.id=?1",
+                        params![manager.task_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                let structured = serde_json::json!({
+                    "outcomes_scope":{"fixture":"Explorer-informed planning"},
+                    "classification":"bounded", "ownership":{"paths":["tests/contracts.rs"]},
+                    "acceptance_criteria":serde_json::from_str::<serde_json::Value>(&criteria).unwrap(),
+                    "test_policy":{"coverage":coverage}, "verification_matrix":[],
+                    "documentation":{"change":"none"}, "restrictions":["fixture only"],
+                    "explorer_disposition":{"decision_id":"activated-decision", "activated":true},
+                    "unresolved_decisions":[], "config_revision_id":config_revision,
+                    "conformance":{"workflow_id":agenticjira::trip::WORKFLOW_ID,
+                        "upstream_source_hash":agenticjira::trip::source_hash(),
+                        "overlay_hash":agenticjira::trip::overlay_hash()}
+                });
+                fixture.store.save_role_result(&manager, &RoleResultReport {
+                    operation_id:"explorer-informed-plan".into(),
+                    outcome:"plan_ready".into(),
+                    summary:"Keep the existing entrypoint and its authorization boundary".into(),
+                    evidence:vec!["Planning Explorer findings constrain the change to that entrypoint".into()],
+                    metadata:serde_json::json!({"plan":"Preserve the existing entrypoint authorization boundary", "structured_plan":structured}),
+                }).unwrap();
+                assert_eq!(
+                    workflow::state(&fixture.store)
+                        .unwrap()
+                        .decisions
+                        .iter()
+                        .find(|decision| decision.subject.attempt_id.as_deref()
+                            == Some(plan.attempt_id.as_str()))
+                        .unwrap()
+                        .reason_code,
+                    "workflow.manager_plan_result_available"
+                );
+                fixture.execute("UPDATE sessions SET readiness_state='idle_candidate' WHERE id='planning-manager-session'", []);
+                assert_eq!(app.coordinator_tick().unwrap()["action"], "plan_frozen");
+                fixture.assert_scalar::<i64>(
+                    &format!(
+                        "SELECT COUNT(*) FROM guidance_messages WHERE attempt_id='{}'",
+                        plan.attempt_id
+                    ),
+                    0,
+                );
+            } else {
+                fixture.execute("UPDATE sessions SET readiness_state='idle_candidate' WHERE id='planning-manager-session'", []);
+                assert_eq!(
+                    workflow::state(&fixture.store)
+                        .unwrap()
+                        .decisions
+                        .iter()
+                        .find(|decision| decision.subject.attempt_id.as_deref()
+                            == Some(plan.attempt_id.as_str()))
+                        .unwrap()
+                        .reason_code,
+                    "workflow.planning_explorer_evidence_available"
+                );
+                fixture.assert_scalar::<i64>(
+                    &format!(
+                        "SELECT COUNT(*) FROM guidance_messages WHERE attempt_id='{}'",
+                        plan.attempt_id
+                    ),
+                    0,
+                );
+                let notified = app.coordinator_tick().unwrap();
+                assert_eq!(
+                    notified["action"], "manager_explorer_evidence_notified",
+                    "{notified}"
+                );
+                assert_eq!(notified["explorer_decision_id"], "activated-decision");
+                let (generation, body): (String, String) = fixture
+                    .connection()
+                    .query_row(
+                        "SELECT role_generation_id,body FROM guidance_messages WHERE attempt_id=?1",
+                        params![plan.attempt_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(generation, manager.role_generation_id);
+                assert!(body.contains("activated-decision"));
+                assert!(body.contains(&plan.attempt_id));
+                assert!(body.contains("candidate none"));
+                assert!(body.contains("current_explorer_evidence"));
+                assert!(body.contains("disclose that evidence was omitted"));
+                assert!(body.contains("do not claim complete consumption"));
+                assert!(
+                    body.contains("request the missing evidence through supported human guidance")
+                );
+                assert!(body.contains("Dashboard inspection is for the human"));
+                assert!(body.contains("roles must not access the human-control channel"));
+                assert!(body.contains("Delivery of this notice is not consumption"));
+                assert_eq!(
+                    workflow::state(&fixture.store)
+                        .unwrap()
+                        .decisions
+                        .iter()
+                        .find(|decision| decision.subject.attempt_id.as_deref()
+                            == Some(plan.attempt_id.as_str()))
+                        .unwrap()
+                        .reason_code,
+                    "workflow.current_manager_plan_pending"
+                );
+                fixture.execute("UPDATE sessions SET readiness_state='unknown' WHERE id='planning-manager-session'", []);
+                assert_eq!(
+                    app.coordinator_tick().unwrap()["decision"]["reason_code"],
+                    "workflow.current_manager_plan_pending"
+                );
+                fixture.assert_scalar::<i64>(
+                    &format!(
+                        "SELECT COUNT(*) FROM guidance_messages WHERE attempt_id='{}'",
+                        plan.attempt_id
+                    ),
+                    1,
+                );
+                fixture.assert_scalar::<i64>(
+                    &format!("SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}' AND role='manager'", plan.attempt_id),
+                    1,
+                );
+            }
+            continue;
+        }
         assert_eq!(
             app.coordinator_tick().unwrap()["action"],
             "manager_dispatched"
@@ -4333,7 +5381,7 @@ fn activated_explorer_dispatches_before_writer_and_waits_for_quiescence() {
                 "workflow.activated_explorer_evidence"
             );
             fixture.assert_scalar::<i64>(
-                "SELECT COUNT(*) FROM role_generations WHERE role='explorer'",
+                &format!("SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}' AND role='explorer'", plan.attempt_id),
                 1,
             );
         }
@@ -5156,7 +6204,7 @@ fn m5_scheduler_explanations_preserve_precedence_and_do_not_duplicate_authority(
     );
     assert_eq!(
         filtered.scalar::<i64>(
-            "SELECT (SELECT COUNT(*) FROM attempts)+(SELECT COUNT(*) FROM claims)+(SELECT COUNT(*) FROM workspaces)"
+            &format!("WITH candidates(id) AS (VALUES ('{paused_task}'),('{parent}'),('{child}')) SELECT (SELECT COUNT(*) FROM attempts a JOIN candidates t ON t.id=a.task_id)+(SELECT COUNT(*) FROM claims c JOIN candidates t ON t.id=c.task_id)+(SELECT COUNT(*) FROM workspaces w JOIN attempts a ON a.id=w.attempt_id JOIN candidates t ON t.id=a.task_id)")
         ),
         0
     );
@@ -5194,7 +6242,7 @@ fn m5_scheduler_explanations_preserve_precedence_and_do_not_duplicate_authority(
     );
     assert_eq!(
         profile.scalar::<i64>(
-            "SELECT (SELECT COUNT(*) FROM attempts)+(SELECT COUNT(*) FROM claims)+(SELECT COUNT(*) FROM workspaces)"
+            &format!("WITH candidates(id) AS (VALUES ('{profile_task}')) SELECT (SELECT COUNT(*) FROM attempts a JOIN candidates t ON t.id=a.task_id)+(SELECT COUNT(*) FROM claims c JOIN candidates t ON t.id=c.task_id)+(SELECT COUNT(*) FROM workspaces w JOIN attempts a ON a.id=w.attempt_id JOIN candidates t ON t.id=a.task_id)")
         ),
         0
     );
@@ -5220,7 +6268,7 @@ fn m5_scheduler_explanations_preserve_precedence_and_do_not_duplicate_authority(
     assert!(repository_scheduler.claim_next().unwrap().is_none());
     assert_eq!(
         repository.scalar::<i64>(
-            "SELECT (SELECT COUNT(*) FROM attempts)+(SELECT COUNT(*) FROM claims)+(SELECT COUNT(*) FROM workspaces)"
+            &format!("WITH candidates(id) AS (VALUES ('{first}'),('{second}')) SELECT (SELECT COUNT(*) FROM attempts a JOIN candidates t ON t.id=a.task_id)+(SELECT COUNT(*) FROM claims c JOIN candidates t ON t.id=c.task_id)+(SELECT COUNT(*) FROM workspaces w JOIN attempts a ON a.id=w.attempt_id JOIN candidates t ON t.id=a.task_id)")
         ),
         3
     );
@@ -5310,7 +6358,7 @@ fn m5_scheduler_capacity_audits_every_encountered_hold_without_duplicate_work() 
     );
     assert_eq!(
         fixture.scalar::<i64>(
-            "SELECT (SELECT COUNT(*) FROM attempts)+(SELECT COUNT(*) FROM claims)+(SELECT COUNT(*) FROM workspaces)"
+            &format!("WITH candidates(id) AS (VALUES ('{task_a}'),('{task_b}'),('{task_c}'),('{task_d}')) SELECT (SELECT COUNT(*) FROM attempts a JOIN candidates t ON t.id=a.task_id)+(SELECT COUNT(*) FROM claims c JOIN candidates t ON t.id=c.task_id)+(SELECT COUNT(*) FROM workspaces w JOIN attempts a ON a.id=w.attempt_id JOIN candidates t ON t.id=a.task_id)")
         ),
         6
     );
@@ -5350,7 +6398,7 @@ fn m5_scheduler_claim_stops_before_a_later_invalid_role_setting() {
     );
     assert_eq!(
         fixture.scalar::<i64>(
-            "SELECT (SELECT COUNT(*) FROM attempts)+(SELECT COUNT(*) FROM claims)+(SELECT COUNT(*) FROM workspaces)"
+            &format!("WITH candidates(id) AS (VALUES ('{first}'),('{later}')) SELECT (SELECT COUNT(*) FROM attempts a JOIN candidates t ON t.id=a.task_id)+(SELECT COUNT(*) FROM claims c JOIN candidates t ON t.id=c.task_id)+(SELECT COUNT(*) FROM workspaces w JOIN attempts a ON a.id=w.attempt_id JOIN candidates t ON t.id=a.task_id)")
         ),
         3
     );
@@ -5443,7 +6491,7 @@ fn seed_permanent_fresh_rejection_authority(
     generation: &str,
     session: &str,
 ) {
-    use agenticjira::provider_compatibility::{AuthorityBinding, BundleSet};
+    use agenticjira::provider_compatibility::BundleSet;
 
     seed_attempt(fixture, phase);
     if let Some(candidate_hash) = candidate_hash {
@@ -5463,53 +6511,36 @@ fn seed_permanent_fresh_rejection_authority(
         params![format!("{generation}-setting"), role, generation],
     );
     let role_kind = role.parse::<RoleKind>().unwrap();
-    let current_binding: AuthorityBinding = (&BundleSet::embedded()
+    let current_binding = BundleSet::embedded()
         .resolve(
             Provider::Codex,
             agenticjira::provider_compatibility::CODEX_EXACT_VERSION,
             role_kind,
         )
-        .unwrap())
-        .into();
-    for (id, key, checked_at) in [
-        (
-            "frozen-capability",
-            "frozen-capability-key",
-            "2026-01-01T00:00:00Z",
-        ),
-        (
-            "observed-capability",
-            "observed-capability-key",
-            "2026-01-02T00:00:00Z",
-        ),
-    ] {
-        let (version, proof) = if id == "observed-capability" {
-            (
-                agenticjira::provider_compatibility::CODEX_EXACT_VERSION,
-                serde_json::json!({
-                    "fixture": true,
-                    "compatibility": current_binding,
-                    "model": "fixture-model",
-                    "effort": "fixture-effort",
-                }),
-            )
-        } else {
-            ("fixture", serde_json::json!({"fixture": true}))
-        };
-        fixture.execute(
-            "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
-             VALUES(?1,'codex',?2,?3,'interactive_pty',?4,'supported','fixture','[]',?5,?6)",
-            params![id, version, role, key, checked_at, proof.to_string()],
-        );
-    }
+        .unwrap();
+    let mut frozen = launch(role_kind, "fixture-model", fixture.root.clone());
+    frozen.effort = "fixture-effort".into();
+    seed_supported_restart_identity(fixture, session, "frozen-capability", &frozen);
+    let frozen_key =
+        providers::capability_identity_key(&providers::capability_identity(&frozen).unwrap())
+            .unwrap();
+    let mut observed = frozen.clone();
+    observed.executable_version = agenticjira::provider_compatibility::CODEX_EXACT_VERSION.into();
+    observed.compatibility = Some(current_binding);
+    let observed_identity = providers::capability_identity(&observed).unwrap();
+    let observed_key = providers::capability_identity_key(&observed_identity).unwrap();
+    let mut proof = serde_json::json!({"fixture":true,"compatibility":observed_identity.compatibility,
+        "model":observed.model,"effort":observed.effort});
+    seed_capability_source(&fixture.connection(), "p", &observed, &mut proof);
     fixture.execute(
-        "UPDATE sessions SET capability_key='frozen-capability-key' WHERE id=?1",
-        params![session],
+        "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
+         VALUES('observed-capability','codex',?1,?2,'interactive_pty',?3,'supported','fixture','[]','2026-01-02T00:00:00Z',?4)",
+        params![observed.executable_version, role, observed_key, proof.to_string()],
     );
     fixture.execute(
         "INSERT INTO trip_attempt_profiles(attempt_id,role,settings_revision,activation_id,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at)
-         VALUES('a',?1,1,NULL,'fixture','{}','fixture-profile','synthetic-seeded-config','configuration','fixture','fixture','frozen-capability','frozen-capability-key','fixture-proof','2026-01-01T00:00:00Z')",
-        params![role],
+         VALUES('a',?1,1,NULL,'fixture','{}','fixture-profile','synthetic-seeded-config','configuration','fixture','fixture','frozen-capability',?2,'fixture-proof','2026-01-01T00:00:00Z')",
+        params![role, frozen_key],
     );
 }
 
@@ -5521,6 +6552,17 @@ fn seed_permanent_resume_rejection(
     same_profile_authority: bool,
 ) -> String {
     let connection = fixture.connection();
+    let (frozen_key, observed_key): (Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT s.capability_key,c.config_hash FROM sessions s
+         JOIN role_generations rg ON rg.id=s.role_generation_id
+         LEFT JOIN capabilities c ON c.id='observed-capability'
+           AND c.provider=s.provider AND c.role=rg.role
+         WHERE s.id=?1 AND rg.id=?2 AND rg.role=?3",
+            params![session, generation, role],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
     let (transcript_epoch, resume_count): (String, i64) = connection
         .query_row(
             "SELECT transcript_epoch,resume_count FROM sessions WHERE id=?1",
@@ -5528,11 +6570,11 @@ fn seed_permanent_resume_rejection(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    let (phase, candidate_hash, plan_hash): (String, Option<String>, Option<String>) = connection
+    let (attempt, task, phase, candidate_hash, plan_hash): (String, String, String, Option<String>, Option<String>) = connection
         .query_row(
-            "SELECT phase,candidate_hash,plan_hash FROM attempts WHERE id='a'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            "SELECT a.id,a.task_id,a.phase,a.candidate_hash,a.plan_hash FROM attempts a JOIN role_generations g ON g.attempt_id=a.id WHERE g.id=?1",
+            params![generation],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .unwrap();
     let review_request_id: Option<String> = connection
@@ -5558,8 +6600,8 @@ fn seed_permanent_resume_rejection(
                     "role_generation_id":generation,
                     "transcript_epoch":transcript_epoch,
                     "resume_count":resume_count,
-                    "frozen_capability_key":"frozen-capability-key",
-                    "observed_capability_key":"observed-capability-key",
+                    "frozen_capability_key":frozen_key,
+                    "observed_capability_key":observed_key,
                     "observed_identity":{
                         "provider":"codex",
                         "executable_version":agenticjira::provider_compatibility::CODEX_EXACT_VERSION,
@@ -5568,7 +6610,7 @@ fn seed_permanent_resume_rejection(
                         "effort":"fixture-effort",
                         "mode":"interactive_pty",
                     },
-                    "attempt_id":"a",
+                    "attempt_id":attempt,
                     "role":role,
                     "lane_id":"default",
                     "config_revision":1,
@@ -5586,12 +6628,15 @@ fn seed_permanent_resume_rejection(
         )
         .unwrap();
     connection
-        .execute("UPDATE attempts SET status='needs_input' WHERE id='a'", [])
+        .execute(
+            "UPDATE attempts SET status='needs_input' WHERE id=?1",
+            params![attempt],
+        )
         .unwrap();
     connection
         .execute(
-            "UPDATE tasks SET attention='resume_failed',version=version+1 WHERE id='t'",
-            [],
+            "UPDATE tasks SET attention='resume_failed',version=version+1 WHERE id=?1",
+            params![task],
         )
         .unwrap();
     event_id
@@ -7038,6 +8083,7 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
         "authorize-ordinary-runtime",
         &runtime_admission,
     );
+    freeze_legacy_runtime_admission(&fixture, &admission_id);
     let (context, attempt, nonce, control_socket, original) =
         start_synthetic_runtime_probe(&fixture, &admission_id, RoleKind::Explorer, true);
     let payload = agenticjira::trip::runtime_probe_resume_prompt(
@@ -7288,6 +8334,7 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
             &resume_admission,
         );
         let resume_admission_id = resume_admission.entity_id;
+        freeze_legacy_runtime_admission(&resume_fixture, &resume_admission_id);
         let (resumable_nonfirst, _, _, _, resumable_prompt) = start_synthetic_runtime_probe(
             &resume_fixture,
             &resume_admission_id,
@@ -7761,6 +8808,7 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
         )
         .unwrap();
         let dispatch_admission_id = dispatch_admission.entity_id;
+        freeze_legacy_runtime_admission(&dispatch_fixture, &dispatch_admission_id);
         let (failed_explorer, _, failed_nonce, failed_control, _) = start_synthetic_runtime_probe(
             &dispatch_fixture,
             &dispatch_admission_id,
@@ -7976,6 +9024,7 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
         "authorize-missing-context-runtime",
         &corrected,
     );
+    freeze_legacy_runtime_admission(&fixture, &corrected.entity_id);
     let (missing_context, _, missing_nonce, _, _) =
         start_synthetic_runtime_probe(&fixture, &corrected.entity_id, RoleKind::Explorer, true);
     let recall = agenticjira::trip::runtime_probe_resume_prompt(
@@ -8024,6 +9073,14 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
     .unwrap();
     authorize_runtime_admission(&fixture, &paths, "authorize-retryable", &retryable);
     record_synthetic_runtime_pass(&fixture, &retryable.entity_id, RoleKind::Explorer);
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT adapter_name || ':' || json_extract(capability_identity_json,'$.security_policy.qualification_contract')
+             FROM trip_runtime_probes WHERE admission_id='{}' AND role='explorer'",
+            retryable.entity_id
+        ),
+        "codex:functional-v2".into(),
+    );
     let adapters: String = fixture.scalar(&format!(
         "SELECT adapters_json FROM trip_config_revisions WHERE project_id='{project}' AND state='activated'"
     ));
@@ -8031,19 +9088,26 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
         "UPDATE trip_config_revisions SET adapters_json=json_remove(adapters_json,'$.adapters.codex') WHERE project_id=?1 AND state='activated'",
         params![project],
     );
+    fixture.assert_scalar::<Option<String>>(
+        &format!(
+            "SELECT json_type(adapters_json,'$.adapters.codex') FROM trip_config_revisions
+             WHERE project_id='{project}' AND state='activated'"
+        ),
+        None,
+    );
     let retry_action = TripHumanAction::PublishRuntimeProof {
         admission_id: retryable.entity_id.clone(),
         role: RoleKind::Explorer,
     };
-    assert!(execute_trip(
+    let publication_error = execute_trip(
         &fixture,
         &paths,
         "retry-same-runtime-publication",
         &retry_action,
     )
     .unwrap_err()
-    .to_string()
-    .contains("evidence remains recorded"));
+    .to_string();
+    assert_eq!(publication_error, "active adapter codex is missing");
     fixture.assert_scalar::<String>(
         &format!(
             "SELECT state FROM trip_runtime_probes WHERE admission_id='{}' AND role='explorer'",
@@ -8067,7 +9131,12 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
     )
     .unwrap();
     fixture.assert_scalar::<i64>(
-        &format!("SELECT COUNT(*) FROM role_results WHERE operation_id='synthetic-runtime-pass-{}-explorer'", retryable.entity_id),
+        &format!(
+            "SELECT COUNT(*) FROM role_results
+             WHERE operation_id=(SELECT 'functional-' || session_id FROM trip_runtime_probes
+               WHERE admission_id='{}' AND role='explorer')",
+            retryable.entity_id
+        ),
         1,
     );
 
@@ -8108,7 +9177,12 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
         "stale".into(),
     );
     fixture.assert_scalar::<i64>(
-        &format!("SELECT COUNT(*) FROM role_results WHERE operation_id='synthetic-runtime-pass-{}-plan_reviewer'", adapter_stale.entity_id),
+        &format!(
+            "SELECT COUNT(*) FROM role_results
+             WHERE operation_id=(SELECT 'functional-' || session_id FROM trip_runtime_probes
+               WHERE admission_id='{}' AND role='plan_reviewer')",
+            adapter_stale.entity_id
+        ),
         1,
     );
     fixture.execute(
@@ -8590,7 +9664,7 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
 #[test]
 fn trip_runtime_report_schema_and_commands_match_initial_and_recall_contracts() {
     let (fixture, paths, _project, admission) =
-        authorized_runtime_fixture_with_bundles("trip-runtime-report-contract", true);
+        authorized_legacy_runtime_fixture_with_bundles("trip-runtime-report-contract", true);
     let (context, _attempt, nonce, control, initial) =
         start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Explorer, false);
     let recall = agenticjira::trip::runtime_probe_resume_prompt(
@@ -8662,6 +9736,15 @@ fn trip_runtime_report_schema_and_commands_match_initial_and_recall_contracts() 
     .unwrap();
     let authenticated = fixture.store.role_context(&context.token).unwrap();
     let initial_context = application.role_context_payload(&authenticated).unwrap();
+    assert!(initial_context.get("context_scope").is_none());
+    assert_eq!(
+        initial_context["identity"],
+        serde_json::to_value(&authenticated).unwrap()
+    );
+    assert!(initial_context["commands"]["report"]
+        .as_str()
+        .unwrap()
+        .contains("role report --json "));
     assert_eq!(initial_context["setup_contract"]["nonce"], nonce);
     assert!(initial_context["project_policy"].is_null());
     assert!(initial_context["verification_catalog"].is_null());
@@ -8953,7 +10036,7 @@ fn trip_runtime_report_schema_and_commands_match_initial_and_recall_contracts() 
 #[test]
 fn runtime_provider_denial_is_accepted_as_failed_but_cannot_pass_restricted_operations() {
     let (fixture, _paths, _project, admission) =
-        authorized_runtime_fixture("runtime-provider-denial-failure");
+        authorized_legacy_runtime_fixture("runtime-provider-denial-failure");
     let cmux_socket = "/private/agenticjira-runtime-provider-denial-cmux.sock";
     fixture.execute(
         "UPDATE trip_runtime_probes SET cmux_socket_path=?1
@@ -9036,7 +10119,7 @@ fn runtime_provider_denial_is_accepted_as_failed_but_cannot_pass_restricted_oper
 #[test]
 fn claude_runtime_probe_policy_allows_only_frozen_commands_and_preserves_native_write_denials() {
     let (fixture, paths, _project, admission) =
-        authorized_runtime_fixture_with_bundles("claude-runtime-probe-command-policy", true);
+        authorized_legacy_runtime_fixture_with_bundles("claude-runtime-probe-command-policy", true);
     let (context, _attempt, nonce, control, _initial) =
         start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Explorer, true);
     let application = Application::new_with_synthetic_compatibility_for_tests(
@@ -9147,11 +10230,18 @@ fn claude_runtime_probe_policy_allows_only_frozen_commands_and_preserves_native_
         .security_policy
         .get("runtime_probe_command_policy")
         .is_none());
-    assert!(ordinary
-        .config
-        .security_policy
-        .pointer("/native_sandbox/filesystem_deny_write")
-        .is_none());
+    assert_eq!(
+        ordinary.config.security_policy["native_sandbox"]["filesystem_deny_write"],
+        serde_json::json!([context.workspace])
+    );
+    assert_eq!(
+        ordinary.config.security_policy["permission_mode"],
+        "default"
+    );
+    assert_eq!(
+        diagnostic.config.security_policy["permission_mode"],
+        "default"
+    );
     let ordinary_settings_index = ordinary
         .config
         .argv
@@ -9161,9 +10251,10 @@ fn claude_runtime_probe_policy_allows_only_frozen_commands_and_preserves_native_
         + 1;
     let ordinary_settings: serde_json::Value =
         serde_json::from_str(&ordinary.config.argv[ordinary_settings_index]).unwrap();
-    assert!(ordinary_settings
-        .pointer("/sandbox/filesystem/denyWrite")
-        .is_none());
+    assert_eq!(
+        ordinary_settings["sandbox"]["filesystem"]["denyWrite"],
+        serde_json::json!([context.workspace])
+    );
     assert!(!ordinary_settings["sandbox"]["filesystem"]["denyRead"]
         .as_array()
         .unwrap()
@@ -9175,10 +10266,10 @@ fn claude_runtime_probe_policy_allows_only_frozen_commands_and_preserves_native_
             .contains(&serde_json::json!(control))
     );
     let ordinary_identity = providers::capability_identity(&ordinary.config).unwrap();
-    assert!(ordinary_identity
-        .security_policy
-        .pointer("/native_sandbox/filesystem_deny_write")
-        .is_none());
+    assert_eq!(
+        ordinary_identity.security_policy["native_sandbox"]["filesystem_deny_write"],
+        serde_json::json!(["<attempt-worktree>"])
+    );
     require_fixture_current_policy(&fixture, &ordinary.config).unwrap();
 
     let settings_index = diagnostic
@@ -9190,9 +10281,12 @@ fn claude_runtime_probe_policy_allows_only_frozen_commands_and_preserves_native_
         + 1;
     let settings: serde_json::Value =
         serde_json::from_str(&diagnostic.config.argv[settings_index]).unwrap();
+    let mut expected_writes = vec![context.workspace.clone(), PathBuf::from(&control)];
+    expected_writes.sort();
+    expected_writes.dedup();
     assert_eq!(
         settings["sandbox"]["filesystem"]["denyWrite"],
-        serde_json::json!([context.workspace.to_string_lossy()]),
+        serde_json::json!(expected_writes)
     );
     assert!(settings["sandbox"]["filesystem"]["denyRead"]
         .as_array()
@@ -9377,15 +10471,22 @@ fn claude_runtime_probe_policy_allows_only_frozen_commands_and_preserves_native_
 #[test]
 fn claude_runtime_probe_policy_fences_reservation_resume_and_base_capability_promotion() {
     let (fixture, paths, _project, admission) =
-        authorized_claude_explorer_runtime_fixture("claude-runtime-policy-gates");
-    let attempt: String = fixture
+        authorized_legacy_claude_explorer_runtime_fixture("claude-runtime-policy-gates");
+    let (attempt, frozen_identity): (String, String) = fixture
         .connection()
         .query_row(
-            "SELECT attempt_id FROM trip_runtime_probes WHERE admission_id=?1 AND role='explorer'",
+            "SELECT attempt_id,capability_identity_json FROM trip_runtime_probes
+             WHERE admission_id=?1 AND role='explorer'",
             params![admission],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
+    let frozen_identity: agenticjira::domain::CapabilityIdentity =
+        serde_json::from_str(&frozen_identity).unwrap();
+    assert!(frozen_identity
+        .security_policy
+        .get("qualification_contract")
+        .is_none());
     let context = fixture
         .store
         .trip_setup_role_launch_context(&attempt, RoleKind::Explorer, true)
@@ -9397,7 +10498,7 @@ fn claude_runtime_probe_policy_fences_reservation_resume_and_base_capability_pro
     let runtime = capability_runtime(&fixture);
     let policy =
         runtime_probe_policy_for_test(&fixture, &admission, RoleKind::Explorer, &context.workspace);
-    let initial = providers::prepare_runtime_probe_role_launch_with_bundles(
+    let mut initial = providers::prepare_runtime_probe_role_launch_with_bundles(
         Provider::Claude,
         RoleKind::Explorer,
         &context.config.model,
@@ -9415,6 +10516,12 @@ fn claude_runtime_probe_policy_fences_reservation_resume_and_base_capability_pro
         fixture.synthetic_bundles.as_ref().unwrap(),
     )
     .unwrap();
+    initial
+        .config
+        .security_policy
+        .as_object_mut()
+        .unwrap()
+        .remove("qualification_contract");
     let (control_socket, cmux_socket): (String, String) = fixture
         .connection()
         .query_row(
@@ -9452,7 +10559,7 @@ fn claude_runtime_probe_policy_fences_reservation_resume_and_base_capability_pro
     drifted_policy.commands[0]
         .command
         .push_str(" ; /usr/bin/true");
-    let drifted = providers::prepare_runtime_probe_role_launch_with_bundles(
+    let mut drifted = providers::prepare_runtime_probe_role_launch_with_bundles(
         Provider::Claude,
         RoleKind::Explorer,
         &context.config.model,
@@ -9470,6 +10577,12 @@ fn claude_runtime_probe_policy_fences_reservation_resume_and_base_capability_pro
         fixture.synthetic_bundles.as_ref().unwrap(),
     )
     .unwrap();
+    drifted
+        .config
+        .security_policy
+        .as_object_mut()
+        .unwrap()
+        .remove("qualification_contract");
     assert_eq!(
         providers::capability_key(&initial.config).unwrap(),
         providers::capability_key(&drifted.config).unwrap(),
@@ -9483,8 +10596,9 @@ fn claude_runtime_probe_policy_fences_reservation_resume_and_base_capability_pro
     );
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM sessions", sessions_before);
     let mut read_drifted_policy = policy.clone();
-    read_drifted_policy.read_denials = vec![fixture.root.join("drifted-control.sock")];
-    let read_drifted = providers::prepare_runtime_probe_role_launch_with_bundles(
+    read_drifted_policy.read_denials =
+        vec![PathBuf::from(&control_socket).with_file_name("drifted-control.sock")];
+    let mut read_drifted = providers::prepare_runtime_probe_role_launch_with_bundles(
         Provider::Claude,
         RoleKind::Explorer,
         &context.config.model,
@@ -9502,6 +10616,16 @@ fn claude_runtime_probe_policy_fences_reservation_resume_and_base_capability_pro
         fixture.synthetic_bundles.as_ref().unwrap(),
     )
     .unwrap();
+    read_drifted
+        .config
+        .security_policy
+        .as_object_mut()
+        .unwrap()
+        .remove("qualification_contract");
+    assert_ne!(
+        initial.config.security_policy["native_sandbox"]["filesystem_deny_write"],
+        read_drifted.config.security_policy["native_sandbox"]["filesystem_deny_write"],
+    );
     assert_eq!(
         providers::capability_key(&initial.config).unwrap(),
         providers::capability_key(&read_drifted.config).unwrap(),
@@ -9566,7 +10690,7 @@ fn claude_runtime_probe_policy_fences_reservation_resume_and_base_capability_pro
     );
 
     let (publish_fixture, publish_paths, _publish_project, publish_admission) =
-        authorized_claude_explorer_runtime_fixture("claude-runtime-policy-promotion");
+        authorized_legacy_claude_explorer_runtime_fixture("claude-runtime-policy-promotion");
     let (publish_context, _, nonce, control, _) = start_synthetic_runtime_probe(
         &publish_fixture,
         &publish_admission,
@@ -9633,7 +10757,7 @@ fn claude_runtime_probe_policy_fences_reservation_resume_and_base_capability_pro
 #[test]
 fn trip_runtime_report_optional_sandbox_identity_preserves_frozen_policy_gate() {
     let (fixture, paths, _project, admission) =
-        authorized_runtime_fixture("trip-runtime-model-evidence-type");
+        authorized_legacy_runtime_fixture("trip-runtime-model-evidence-type");
     let (context, _, nonce, control, _) =
         start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Explorer, true);
     let before = runtime_probe_snapshot(&fixture, &admission, RoleKind::Explorer);
@@ -9742,6 +10866,18 @@ fn trip_runtime_report_optional_sandbox_identity_preserves_frozen_policy_gate() 
         runtime_probe_snapshot(&fixture, &admission, RoleKind::Explorer).0,
         "published"
     );
+    let state = workflow::state(&fixture.store).unwrap();
+    let projected = state
+        .trip_setups
+        .iter()
+        .flat_map(|setup| setup["runtime_admissions"].as_array().unwrap())
+        .find(|entry| entry["id"] == admission)
+        .unwrap();
+    assert!(projected["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|probe| probe.get("qualification_contract").is_none()));
 
     let (stale, _, stale_nonce, stale_control, _) =
         start_synthetic_runtime_probe(&fixture, &admission, RoleKind::PlanReviewer, true);
@@ -9784,7 +10920,7 @@ fn trip_runtime_report_optional_sandbox_identity_preserves_frozen_policy_gate() 
 #[test]
 fn trip_runtime_native_hook_commands_bind_report_acceptance_and_preserve_sibling() {
     let (fixture, _paths, _project, admission) =
-        authorized_runtime_fixture("trip-runtime-native-command-binding");
+        authorized_legacy_runtime_fixture("trip-runtime-native-command-binding");
     record_synthetic_runtime_pass(&fixture, &admission, RoleKind::Manager);
     let manager_state = runtime_probe_snapshot(&fixture, &admission, RoleKind::Manager);
     assert_eq!(manager_state.0, "evidence_recorded");
@@ -10042,7 +11178,7 @@ fn trip_runtime_native_hook_commands_bind_report_acceptance_and_preserve_sibling
         ),
     ] {
         let (separation, _paths, _project, separation_admission) =
-            authorized_runtime_fixture(&format!("trip-runtime-{label}"));
+            authorized_legacy_runtime_fixture(&format!("trip-runtime-{label}"));
         let (context, _, nonce, control, _) = start_synthetic_runtime_probe(
             &separation,
             &separation_admission,
@@ -10100,7 +11236,7 @@ fn trip_runtime_native_hook_commands_bind_report_acceptance_and_preserve_sibling
         ),
     ] {
         let (proof_fixture, proof_paths, _project, proof_admission) =
-            authorized_runtime_fixture(&format!("trip-runtime-{label}-permission-delivery"));
+            authorized_legacy_runtime_fixture(&format!("trip-runtime-{label}-permission-delivery"));
         record_synthetic_runtime_pass(&proof_fixture, &proof_admission, RoleKind::Implementer);
         proof_fixture.execute(mutation, params![&proof_admission]);
         let error = execute_trip(
@@ -10121,7 +11257,7 @@ fn trip_runtime_native_hook_commands_bind_report_acceptance_and_preserve_sibling
 #[test]
 fn trip_runtime_terminal_exit_allows_one_recall_then_fails_resumed_and_final() {
     let (fixture, paths, project, admission) =
-        authorized_runtime_fixture("trip-runtime-terminal-exit");
+        authorized_legacy_runtime_fixture("trip-runtime-terminal-exit");
     fixture.execute("DELETE FROM capabilities", []);
     let (sibling, _, _, _, _) =
         start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Manager, false);
@@ -10392,7 +11528,7 @@ fn trip_runtime_terminal_exit_allows_one_recall_then_fails_resumed_and_final() {
 #[test]
 fn trip_runtime_first_retained_exit_distinguishes_no_report_from_early_report() {
     let (fixture, _paths, _project, admission) =
-        authorized_runtime_fixture("trip-runtime-first-exit-report-phase");
+        authorized_legacy_runtime_fixture("trip-runtime-first-exit-report-phase");
     let (normal, _, _, _, _) =
         start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Explorer, false);
     let (normal_epoch, normal_process) = runtime_session_identity(&fixture, &normal.session_id);
@@ -10466,7 +11602,7 @@ fn trip_runtime_first_retained_exit_distinguishes_no_report_from_early_report() 
 #[test]
 fn trip_runtime_terminal_exit_fences_stale_live_and_reconciles_prior_exit() {
     let (fixture, _paths, _project, admission) =
-        authorized_runtime_fixture("trip-runtime-exit-fences");
+        authorized_legacy_runtime_fixture("trip-runtime-exit-fences");
     let (stale, _, _, _, _) =
         start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Explorer, false);
     let (first_epoch, first_process) = runtime_session_identity(&fixture, &stale.session_id);
@@ -10616,22 +11752,13 @@ fn record_synthetic_runtime_stop(fixture: &Fixture, context: &RoleContext, nativ
 fn runtime_completed_first_turn_stops_once_and_preserves_exact_recall_authority() {
     for provider in [Provider::Codex, Provider::Claude] {
         let (fixture, paths, _, admission) = if provider == Provider::Claude {
-            authorized_claude_runtime_fixture("runtime-first-stop-claude", RoleKind::Explorer)
+            authorized_legacy_claude_runtime_fixture(
+                "runtime-first-stop-claude",
+                RoleKind::Explorer,
+            )
         } else {
-            authorized_runtime_fixture_with_bundles("runtime-first-stop-codex", true)
+            authorized_legacy_runtime_fixture_with_bundles("runtime-first-stop-codex", true)
         };
-        let (launch, _, _, _, _) =
-            start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Explorer, false);
-        let native = uuid::Uuid::new_v4().to_string();
-        fixture.execute(
-            "UPDATE sessions SET native_session_id=?1 WHERE id=?2",
-            params![native, launch.session_id],
-        );
-        fixture.execute(
-            "UPDATE hook_events SET native_session_id=?1,payload_json=json_set(payload_json,'$.session_id',?1) WHERE session_id=?2",
-            params![native, launch.session_id],
-        );
-        let context = fixture.store.role_context(&launch.token).unwrap();
         let mut app = Application::new_with_synthetic_compatibility_for_tests(
             paths.clone(),
             fixture.store.clone(),
@@ -10640,6 +11767,44 @@ fn runtime_completed_first_turn_stops_once_and_preserves_exact_recall_authority(
         )
         .unwrap();
         app.paths.role_socket = fixture.root.join("role.sock");
+        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM sessions", 0);
+        let launched = app
+            .dispatch_runtime_probe("legacy-first-dispatch", &admission, RoleKind::Explorer)
+            .unwrap();
+        let bound: (String, String) = fixture.connection().query_row(
+            "SELECT state,session_id FROM trip_runtime_probes WHERE admission_id=?1 AND role='explorer'",
+            params![admission], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(bound, ("running".into(), launched.session_id.clone()));
+        let record = fixture.store.session_json(&launched.session_id).unwrap();
+        assert!(record["launch_config"]["security_policy"]
+            .get("qualification_contract")
+            .is_none());
+        let token = uuid::Uuid::new_v4().to_string();
+        fixture.execute(
+            "UPDATE role_credentials SET token_hash=?1 WHERE role_generation_id=?2 AND revoked_at IS NULL",
+            params![auth::hash_secret(&token),record["role_generation_id"].as_str()],
+        );
+        let context = fixture.store.role_context(&token).unwrap();
+        let native = uuid::Uuid::new_v4().to_string();
+        for event in ["SessionStart", "UserPromptSubmit"] {
+            fixture.store.save_hook_event(
+                &context,
+                &HookEnvelope {
+                    provider,
+                    payload: serde_json::json!({"hook_event_name":event,"session_id":native,
+                        "cwd":record["launch_config"]["cwd"],"model":record["launch_config"]["model"]}),
+                },
+                &RolePeerProvenance {
+                    peer_pid: 42,
+                    peer_process_group_id: 42,
+                    peer_start_marker: "synthetic-runtime-stop".into(),
+                    managed_root_pid: 42,
+                    managed_root_start_marker: "synthetic-runtime-root".into(),
+                    state: "managed_process_group_untrusted_payload".into(),
+                },
+            ).unwrap();
+        }
         record_synthetic_runtime_stop(&fixture, &context, &native);
         fixture.execute("UPDATE trip_runtime_probes SET session_id=NULL WHERE admission_id=?1 AND role='explorer'", params![admission]);
         assert_ne!(
@@ -10702,9 +11867,9 @@ fn runtime_completed_reports_close_retained_and_fresh_sessions_without_publishin
         (Provider::Codex, RoleKind::Explorer, true),
     ] {
         let (fixture, paths, _, admission) = if provider == Provider::Claude {
-            authorized_claude_runtime_fixture("runtime-report-stop-claude", role)
+            authorized_legacy_claude_runtime_fixture("runtime-report-stop-claude", role)
         } else {
-            authorized_runtime_fixture_with_bundles("runtime-report-stop-codex", true)
+            authorized_legacy_runtime_fixture_with_bundles("runtime-report-stop-codex", true)
         };
         let retained = role != RoleKind::FinalReviewer;
         let (launch, _, nonce, control, _) =
@@ -10850,9 +12015,9 @@ fn runtime_rejected_reports_close_once_without_acceptance_or_retry() {
         (Provider::Codex, RoleKind::Explorer, false, true),
     ] {
         let (fixture, paths, _, admission) = if provider == Provider::Claude {
-            authorized_claude_runtime_fixture("runtime-rejected-stop-claude", role)
+            authorized_legacy_claude_runtime_fixture("runtime-rejected-stop-claude", role)
         } else {
-            authorized_runtime_fixture_with_bundles("runtime-rejected-stop-codex", true)
+            authorized_legacy_runtime_fixture_with_bundles("runtime-rejected-stop-codex", true)
         };
         let retained = role != RoleKind::FinalReviewer;
         let (launch, _, nonce, control, _) =
@@ -10997,8 +12162,8 @@ fn runtime_rejected_reports_close_once_without_acceptance_or_retry() {
 
 #[test]
 fn runtime_provider_model_context_exposes_only_bound_native_observations() {
-    let (fixture, _, _, admission) =
-        authorized_claude_explorer_runtime_fixture("runtime-provider-model-context");
+    let (fixture, paths, _, admission) =
+        authorized_legacy_claude_explorer_runtime_fixture("runtime-provider-model-context");
     let (launch, _, _, _, initial) =
         start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Explorer, false);
     let context = fixture.store.role_context(&launch.token).unwrap();
@@ -11007,6 +12172,27 @@ fn runtime_provider_model_context_exposes_only_bound_native_observations() {
             .unwrap()
             .unwrap()
     };
+    let app = Application::new_with_synthetic_compatibility_for_tests(
+        paths,
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+        test_hooks(&fixture),
+    )
+    .unwrap();
+    assert_eq!(
+        app.role_context_payload(&context).unwrap()["setup_contract"],
+        read()
+    );
+    for cursor in [
+        None,
+        Some("v1:task:0:abababababababababababababababab:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"),
+    ] {
+        assert!(app
+            .role_context_delivery_payload(&context, cursor)
+            .unwrap_err()
+            .to_string()
+            .contains("unavailable during qualification"));
+    }
     assert!(initial.contains("Read role context once before these probe commands"));
     assert!(initial.contains("not attestation of the remote backend model"));
     assert!(read()["provider_model_observation"].is_null());
@@ -11074,7 +12260,7 @@ fn runtime_provider_model_report_checks_the_original_invocation_without_reopenin
         (Some(provider_model), true),
     ] {
         let (fixture, paths, project, admission) =
-            authorized_claude_explorer_runtime_fixture("runtime-provider-model-report");
+            authorized_legacy_claude_explorer_runtime_fixture("runtime-provider-model-report");
         let (launch, _, nonce, control, _) =
             start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Explorer, true);
         let context = fixture.store.role_context(&launch.token).unwrap();
@@ -11179,7 +12365,7 @@ fn runtime_provider_model_report_checks_the_original_invocation_without_reopenin
 fn runtime_unavailable_observation_names_the_missing_fact_without_granting_proof() {
     for missing in [Some("model_evidence"), None] {
         let (fixture, paths, _, admission) =
-            authorized_runtime_fixture("runtime-failure-diagnostic");
+            authorized_legacy_runtime_fixture("runtime-failure-diagnostic");
         let (launch, _, nonce, control, _) =
             start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Explorer, true);
         let context = fixture.store.role_context(&launch.token).unwrap();
@@ -11234,7 +12420,7 @@ fn runtime_unavailable_observation_names_the_missing_fact_without_granting_proof
 #[test]
 fn trip_runtime_terminal_exit_preserves_accepted_report_states() {
     let (fixture, paths, _project, admission) =
-        authorized_runtime_fixture("trip-runtime-reported-exits");
+        authorized_legacy_runtime_fixture("trip-runtime-reported-exits");
     let (failed, _, failed_nonce, failed_control, _) =
         start_synthetic_runtime_probe(&fixture, &admission, RoleKind::Explorer, true);
     let mut refused = readonly_runtime_outcomes(
@@ -11381,7 +12567,7 @@ fn trip_runtime_terminal_exit_preserves_accepted_report_states() {
 #[test]
 fn trip_runtime_recorded_command_mismatch_cannot_publish_or_replace_history() {
     let (fixture, paths, _project, admission) =
-        authorized_runtime_fixture("trip-runtime-recorded-command-mismatch");
+        authorized_legacy_runtime_fixture("trip-runtime-recorded-command-mismatch");
     record_synthetic_runtime_pass(&fixture, &admission, RoleKind::Manager);
     execute_trip(
         &fixture,
@@ -11572,6 +12758,7 @@ fn trip_runtime_scope_exactly_fences_project_and_task_authority() {
         .iter()
         .find(|value| value["role"] == "explorer")
         .unwrap();
+    assert_eq!(explorer["qualification_contract"], "functional-v2");
     assert_eq!(explorer["generic_capability_supported"], true);
     assert_eq!(explorer["exact_runtime_authority"], false);
     assert_eq!(explorer["status"], "unverified");
@@ -11644,6 +12831,14 @@ fn trip_runtime_scope_exactly_fences_project_and_task_authority() {
         .iter()
         .find(|value| value["role"] == "explorer")
         .unwrap();
+    assert_eq!(
+        corrected_explorer["qualification_contract"],
+        "functional-v2"
+    );
+    assert_eq!(
+        corrected_explorer["runtime_admission"]["qualification_contract"],
+        "functional-v2"
+    );
     assert_eq!(corrected_explorer["exact_runtime_authority"], true);
     assert_eq!(corrected_explorer["status"], "supported");
     let attempts_before: i64 = fixture.scalar(&format!(
@@ -11880,7 +13075,7 @@ fn trip_materialization_and_profile_drift_fail_closed() {
     let drift = Fixture::new("trip-materialization-drift");
     let repository = drift.repository("repo");
     let project = add_project(&drift, repository.clone(), "drift");
-    create_task(&drift, &project, "drifted-policy", 1);
+    let task = create_task(&drift, &project, "drifted-policy", 1);
     seed_supported_capabilities(&drift);
     std::fs::write(
         repository.join(".agents/trip-explorer/manifest.json"),
@@ -11891,24 +13086,24 @@ fn trip_materialization_and_profile_drift_fail_closed() {
     // hold instead of failing inside workspace materialization.
     let pickup = scheduler(&drift, drift.root.join("artifacts"));
     let nothing_started = || {
-        for table in [
-            "claims",
-            "workspaces",
-            "attempts",
-            "launch_permits",
-            "role_generations",
-            "sessions",
+        for query in [
+            format!("SELECT COUNT(*) FROM claims WHERE task_id='{task}'"),
+            format!("SELECT COUNT(*) FROM workspaces w JOIN attempts a ON a.id=w.attempt_id WHERE a.task_id='{task}'"),
+            format!("SELECT COUNT(*) FROM attempts WHERE task_id='{task}'"),
+            format!("SELECT COUNT(*) FROM launch_permits p JOIN attempts a ON a.id=p.attempt_id WHERE a.task_id='{task}'"),
+            format!("SELECT COUNT(*) FROM role_generations g JOIN attempts a ON a.id=g.attempt_id WHERE a.task_id='{task}'"),
+            format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id JOIN attempts a ON a.id=g.attempt_id WHERE a.task_id='{task}'"),
         ] {
-            drift.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM {table}"), 0);
+            drift.assert_scalar::<i64>(&query, 0);
         }
     };
     assert!(pickup.claim_next().unwrap().is_none());
     nothing_started();
     drift.assert_scalar::<String>(
-        "SELECT lifecycle || ':' || attention FROM tasks",
+        &format!("SELECT lifecycle || ':' || attention FROM tasks WHERE id='{task}'"),
         "ready:needs_input".into(),
     );
-    let held_version: i64 = drift.scalar("SELECT version FROM tasks");
+    let held_version: i64 = drift.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"));
     let state = workflow::state(&drift.store).unwrap();
     let decision = state
         .decisions
@@ -11945,7 +13140,10 @@ fn trip_materialization_and_profile_drift_fail_closed() {
         assert!(pickup.claim_next().unwrap().is_none());
     }
     nothing_started();
-    drift.assert_scalar::<i64>("SELECT version FROM tasks", held_version);
+    drift.assert_scalar::<i64>(
+        &format!("SELECT version FROM tasks WHERE id='{task}'"),
+        held_version,
+    );
 
     let stale = Fixture::new("trip-profile-drift");
     let (_, _, plan) = new_task(&stale, "stale", "stale-profile");
@@ -11972,7 +13170,10 @@ fn m4b_continue_rejects_post_request_ownership_uncertainty() {
     for cause in ["claim_unknown", "unresolved_recovery"] {
         let fixture = Fixture::new(&format!("m4b-continue-ownership-{cause}"));
         let (_, task, plan) = new_task(&fixture, "ownership-project", "ownership-task");
-        let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+        let version = fixture.scalar::<i64>(&format!(
+            "SELECT version FROM tasks WHERE id='{}'",
+            plan.task_id
+        ));
         workflow::execute(
             &fixture.store,
             &HumanCommand::Control {
@@ -12060,7 +13261,10 @@ fn m4b_continue_rejects_post_request_ownership_uncertainty() {
         );
         match cause {
             "claim_unknown" => fixture.assert_scalar::<String>(
-                "SELECT state FROM claims WHERE attempt_id=(SELECT id FROM attempts LIMIT 1)",
+                &format!(
+                    "SELECT state FROM claims WHERE attempt_id='{}'",
+                    plan.attempt_id
+                ),
                 "unknown".into(),
             ),
             _ => fixture.assert_scalar::<String>(
@@ -12955,7 +14159,10 @@ fn session_recovery_workspace_reservation_reconciles_or_cancels_the_complete_tup
             .reason_code,
         "scheduler.start_baseline_stale"
     );
-    missing.assert_scalar::<i64>("SELECT COUNT(*) FROM attempts", 0);
+    missing.assert_scalar::<i64>(
+        &format!("SELECT COUNT(*) FROM attempts WHERE task_id='{missing_task}'"),
+        0,
+    );
     missing.assert_scalar::<i64>("SELECT COUNT(*) FROM claims", 0);
     missing.assert_scalar::<i64>("SELECT COUNT(*) FROM workspaces", 0);
     missing.assert_scalar::<i64>("SELECT COUNT(*) FROM recovery_records", 0);
@@ -13281,12 +14488,12 @@ fn session_recovery_workspace_reservation_reconciles_or_cancels_the_complete_tup
     assert!(app
         .execute_human_command(&HumanCommand::RetryWorkspaceReservation {
             operation_id: "cancelled-workspace-stale-retry".into(),
-            task_id: cancellation_task,
+            task_id: cancellation_task.clone(),
             attempt_id: cancellation_attempt,
             workspace_id: cancellation_workspace,
-            expected_version: cancelled.scalar::<i64>(
-                "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)"
-            ),
+            expected_version: cancelled.scalar::<i64>(&format!(
+                "SELECT version FROM tasks WHERE id='{cancellation_task}'"
+            )),
         })
         .is_err());
 }
@@ -14812,16 +16019,37 @@ fn trip_legacy_migration_preserves_review_accounting_and_lineage() {
         "SELECT spent FROM review_budgets WHERE review_kind='plan'",
         1,
     );
-    fixture.assert_scalar::<i64>("SELECT legacy_migration_required FROM attempts", 0);
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT legacy_migration_required FROM attempts WHERE id='{}'",
+            plan.attempt_id
+        ),
+        0,
+    );
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM trip_legacy_migrations", 2);
     fixture.assert_scalar::<String>(
         "SELECT reviewed_plan_hash FROM trip_legacy_migrations WHERE id='historical-migration'",
         "historical-approved-plan".into(),
     );
-    fixture.assert_scalar::<String>("SELECT phase FROM attempts", "planning".into());
-    fixture.assert_scalar::<i64>("SELECT plan_hash IS NULL AND candidate_hash IS NULL AND plan_approved_at IS NULL AND human_acceptance_at IS NULL AND structured_plan_id IS NULL AND accepted_snapshot_id IS NULL FROM attempts", 1);
-    fixture.assert_scalar::<i64>("SELECT selected_checks_revision FROM attempts", 4);
-    fixture.assert_scalar::<i64>("SELECT manager_conformance_revision FROM attempts", 5);
+    fixture.assert_scalar::<String>(
+        &format!("SELECT phase FROM attempts WHERE id='{}'", plan.attempt_id),
+        "planning".into(),
+    );
+    fixture.assert_scalar::<i64>(&format!("SELECT plan_hash IS NULL AND candidate_hash IS NULL AND plan_approved_at IS NULL AND human_acceptance_at IS NULL AND structured_plan_id IS NULL AND accepted_snapshot_id IS NULL FROM attempts WHERE id='{}'",plan.attempt_id), 1);
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT selected_checks_revision FROM attempts WHERE id='{}'",
+            plan.attempt_id
+        ),
+        4,
+    );
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT manager_conformance_revision FROM attempts WHERE id='{}'",
+            plan.attempt_id
+        ),
+        5,
+    );
     fixture.assert_scalar::<String>(
         "SELECT verdict FROM review_requests WHERE id='historical-plan-review'",
         "approved".into(),
@@ -16019,7 +17247,7 @@ fn trip_disjoint_lanes_keep_independent_credentials_and_require_quiescence() {
         .reserve_error(&integration_context, &raced_integration)
         .contains("every reviewed parallel lane to yield"));
     fixture.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM role_generations WHERE role='implementer' AND lane_id='default'",
+        &format!("SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}' AND role='implementer' AND lane_id='default'", plan.attempt_id),
         0,
     );
     fixture.execute(
@@ -16272,7 +17500,7 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
     let planning = Fixture::new("current-busy-manager-plan");
     let mut planning_paths = instance_paths(&planning);
     planning_paths.role_socket = planning.root.join("role.sock");
-    let (_, _, _planning_plan) = new_task(&planning, "planning", "planning-task");
+    let (_, _, planning_plan) = new_task(&planning, "planning", "planning-task");
     let planning_app = Application::new_with_synthetic_dispatch_for_tests(
         planning_paths.clone(),
         planning.store.clone(),
@@ -16316,7 +17544,10 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         0,
     );
     planning.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM snapshots WHERE attempt_id=(SELECT id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT COUNT(*) FROM snapshots WHERE attempt_id='{owner_attempt}'",
+            owner_attempt = planning_plan.attempt_id
+        ),
         0,
     );
     let structured_plan = mb10_plan(&planning, &manager_context, "current busy manager plan");
@@ -16344,11 +17575,17 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
     assert_eq!(quiescing["action"], "quiescing_completed_role");
     assert_eq!(quiescing["session_id"], manager_session);
     planning.assert_scalar::<String>(
-        "SELECT status FROM sessions WHERE id=(SELECT id FROM sessions WHERE role_generation_id=(SELECT effective_generation_id FROM role_settings WHERE role='manager' LIMIT 1))",
+        &format!(
+            "SELECT status FROM sessions WHERE id='{owner_session}'",
+            owner_session = manager_session
+        ),
         "interrupt_requested".into(),
     );
     planning.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM snapshots WHERE attempt_id=(SELECT id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT COUNT(*) FROM snapshots WHERE attempt_id='{owner_attempt}'",
+            owner_attempt = planning_plan.attempt_id
+        ),
         0,
     );
     planning.execute(
@@ -16384,9 +17621,10 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
     let handoff_manager = handoff_app
         .synthetic_role_context_for_tests(handoff_session)
         .unwrap();
-    let original_invocation = handoff.scalar::<String>(
-        "SELECT invocation_input_json FROM sessions WHERE id=(SELECT id FROM sessions LIMIT 1)",
-    );
+    let original_invocation = handoff.scalar::<String>(&format!(
+        "SELECT invocation_input_json FROM sessions WHERE id='{owner_session}'",
+        owner_session = handoff_session
+    ));
     let handoff_repository = workspace::inspect(&handoff_plan.repository_path).unwrap();
     let handoff_preview = handoff.root.join("handoff-candidate-preview");
     let (_, handoff_candidate) = snapshot::capture(
@@ -16466,8 +17704,10 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
     record_manager_hook(&handoff, &handoff_manager, handoff_native, "PostToolUse");
     record_manager_hook(&handoff, &handoff_manager, handoff_native, "PreToolUse");
     record_manager_hook(&handoff, &handoff_manager, handoff_native, "Stop");
-    let stale_claim_version = handoff
-        .scalar::<i64>("SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)");
+    let stale_claim_version = handoff.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{owner_task}'",
+        owner_task = handoff_task
+    ));
     let stale_activity = handoff_app
         .synthetic_manager_service_stop_interleaving_for_tests(
             &handoff_plan.attempt_id,
@@ -16477,11 +17717,14 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         .unwrap();
     assert_eq!(stale_activity["outcome"], "stale");
     handoff.assert_scalar::<String>(
-        "SELECT status FROM sessions WHERE id=(SELECT id FROM sessions LIMIT 1)",
+        &format!(
+            "SELECT status FROM sessions WHERE id='{owner_session}'",
+            owner_session = handoff_session
+        ),
         "running".into(),
     );
     handoff.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM role_credentials WHERE id=(SELECT id FROM role_credentials LIMIT 1) AND revoked_at IS NOT NULL",
+        &format!("SELECT COUNT(*) FROM role_credentials WHERE id='{owner_credential}' AND revoked_at IS NOT NULL", owner_credential = handoff_manager.credential_id),
         0,
     );
     handoff.assert_scalar::<i64>(
@@ -16489,11 +17732,17 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         0,
     );
     handoff.assert_scalar::<i64>(
-        "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT version FROM tasks WHERE id='{owner_task}'",
+            owner_task = handoff_task
+        ),
         stale_claim_version,
     );
     handoff.assert_scalar::<String>(
-        "SELECT attention FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT attention FROM tasks WHERE id='{owner_task}'",
+            owner_task = handoff_task
+        ),
         "none".into(),
     );
     record_manager_hook(&handoff, &handoff_manager, handoff_native, "Stop");
@@ -16541,7 +17790,10 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
     assert_eq!(service_stop["completion_inferred"], false);
     assert_eq!(service_stop["automatic_escalation"], false);
     handoff.assert_scalar::<String>(
-        "SELECT status FROM sessions WHERE id=(SELECT id FROM sessions LIMIT 1)",
+        &format!(
+            "SELECT status FROM sessions WHERE id='{owner_session}'",
+            owner_session = handoff_session
+        ),
         "interrupt_requested".into(),
     );
     handoff.assert_scalar::<i64>(
@@ -16576,7 +17828,10 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         "manager_service_stop_quiescence"
     );
     handoff.assert_scalar::<String>(
-        "SELECT status FROM sessions WHERE id=(SELECT id FROM sessions LIMIT 1)",
+        &format!(
+            "SELECT status FROM sessions WHERE id='{owner_session}'",
+            owner_session = handoff_session
+        ),
         "interrupt_requested".into(),
     );
     finish_synthetic_role(&handoff, &handoff_manager);
@@ -16584,11 +17839,17 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
     assert_eq!(retained_resume["action"], "manager_resumed");
     assert_eq!(retained_resume["session_id"], handoff_session);
     handoff.assert_scalar::<i64>(
-        "SELECT resume_count FROM sessions WHERE id=(SELECT id FROM sessions LIMIT 1)",
+        &format!(
+            "SELECT resume_count FROM sessions WHERE id='{owner_session}'",
+            owner_session = handoff_session
+        ),
         1,
     );
     handoff.assert_scalar::<String>(
-        "SELECT invocation_input_json FROM sessions WHERE id=(SELECT id FROM sessions LIMIT 1)",
+        &format!(
+            "SELECT invocation_input_json FROM sessions WHERE id='{owner_session}'",
+            owner_session = handoff_session
+        ),
         original_invocation,
     );
     let resumed_handoff_manager = handoff_app
@@ -16678,36 +17939,56 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         params![handoff_plan.attempt_id],
     );
     finish_synthetic_role(&handoff, &resumed_handoff_manager);
-    let checks_version = handoff
-        .scalar::<i64>("SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)");
+    let checks_version = handoff.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{owner_task}'",
+        owner_task = handoff_task
+    ));
     let conformance_resume = handoff_app.coordinator_tick().unwrap();
     assert_eq!(conformance_resume["action"], "manager_resumed");
     assert_eq!(conformance_resume["context"], "checks_conformance");
     handoff.assert_scalar::<i64>(
-        "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT version FROM tasks WHERE id='{owner_task}'",
+            owner_task = handoff_task
+        ),
         checks_version,
     );
     let conformance_wait = handoff_app.coordinator_tick().unwrap();
     assert_eq!(conformance_wait["action"], "idle");
     handoff.assert_scalar::<String>(
-        "SELECT attention FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT attention FROM tasks WHERE id='{owner_task}'",
+            owner_task = handoff_task
+        ),
         "none".into(),
     );
-    handoff.assert_scalar::<String>("SELECT status FROM attempts LIMIT 1", "running".into());
+    handoff.assert_scalar::<String>(
+        &format!(
+            "SELECT status FROM attempts WHERE id='{owner_attempt}'",
+            owner_attempt = handoff_plan.attempt_id
+        ),
+        "running".into(),
+    );
     handoff.assert_scalar::<i64>(
-        "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT version FROM tasks WHERE id='{owner_task}'",
+            owner_task = handoff_task
+        ),
         checks_version,
     );
     handoff.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM guidance_messages
-         WHERE role_generation_id=(SELECT effective_generation_id FROM role_settings WHERE role='manager')
+        &format!(
+            "SELECT COUNT(*) FROM guidance_messages
+         WHERE role_generation_id='{owner_generation}'
            AND body LIKE '%submit exact candidate-bound manager conformance%'",
+            owner_generation = resumed_handoff_manager.role_generation_id
+        ),
         1,
     );
 
     handoff.execute_batch(
-        "UPDATE tasks SET attention='none' WHERE id=(SELECT task_id FROM attempts LIMIT 1);
-         UPDATE attempts SET status='running',manager_conformance_revision=1 WHERE id=(SELECT id FROM attempts LIMIT 1);",
+        &format!("UPDATE tasks SET attention='none' WHERE id='{owner_task}';
+         UPDATE attempts SET status='running',manager_conformance_revision=1 WHERE id='{owner_attempt}';", owner_task = handoff_task, owner_attempt = handoff_plan.attempt_id),
     );
     handoff.execute(
         "INSERT INTO trip_conformance_receipts(id,attempt_id,revision,candidate_hash,config_hash,
@@ -16729,20 +18010,28 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         .synthetic_role_context_for_tests(handoff_session)
         .unwrap();
     finish_synthetic_role(&handoff, &checks_manager);
-    let explorer_version = handoff
-        .scalar::<i64>("SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)");
+    let explorer_version = handoff.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{owner_task}'",
+        owner_task = handoff_task
+    ));
     let explorer_resume = handoff_app.coordinator_tick().unwrap();
     assert_eq!(explorer_resume["action"], "manager_resumed");
     assert_eq!(explorer_resume["context"], "checks_final_explorer_decision");
     handoff.assert_scalar::<i64>(
-        "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT version FROM tasks WHERE id='{owner_task}'",
+            owner_task = handoff_task
+        ),
         explorer_version,
     );
     assert_eq!(handoff_app.coordinator_tick().unwrap()["action"], "idle");
     handoff.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM guidance_messages
-         WHERE role_generation_id=(SELECT effective_generation_id FROM role_settings WHERE role='manager')
+        &format!(
+            "SELECT COUNT(*) FROM guidance_messages
+         WHERE role_generation_id='{owner_generation}'
            AND body LIKE '%final Explorer activation decision%'",
+            owner_generation = resumed_handoff_manager.role_generation_id
+        ),
         1,
     );
     handoff.execute(
@@ -16755,17 +18044,25 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
     let completed_checks_manager = handoff_app
         .synthetic_role_context_for_tests(handoff_session)
         .unwrap();
-    let completed_checks_version = handoff
-        .scalar::<i64>("SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)");
+    let completed_checks_version = handoff.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{owner_task}'",
+        owner_task = handoff_task
+    ));
     let busy_checks = handoff_app.coordinator_tick().unwrap();
     assert_eq!(busy_checks["action"], "waiting");
     assert_eq!(busy_checks["for"], "manager_safe_completion_boundary");
     handoff.assert_scalar::<String>(
-        "SELECT phase FROM attempts WHERE id=(SELECT id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT phase FROM attempts WHERE id='{owner_attempt}'",
+            owner_attempt = handoff_plan.attempt_id
+        ),
         "checks".into(),
     );
     handoff.assert_scalar::<i64>(
-        "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT version FROM tasks WHERE id='{owner_task}'",
+            owner_task = handoff_task
+        ),
         completed_checks_version,
     );
     record_unbalanced_manager_stop(&handoff, &completed_checks_manager, handoff_native);
@@ -16815,15 +18112,18 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
     assert_eq!(final_handoff_resume["context"], "final_handoff");
     assert_eq!(handoff_app.coordinator_tick().unwrap()["action"], "idle");
     handoff.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM guidance_messages
-         WHERE role_generation_id=(SELECT effective_generation_id FROM role_settings WHERE role='manager')
+        &format!(
+            "SELECT COUNT(*) FROM guidance_messages
+         WHERE role_generation_id='{owner_generation}'
            AND body LIKE '%Final review approved%'",
+            owner_generation = resumed_handoff_manager.role_generation_id
+        ),
         1,
     );
     let handoff_ready_manager = handoff_app
         .synthetic_role_context_for_tests(handoff_session)
         .unwrap();
-    handoff
+    let handoff_result_id = handoff
         .store
         .save_role_result(
             &handoff_ready_manager,
@@ -16838,19 +18138,47 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
                 }),
             },
         )
-        .unwrap();
-    let completed_handoff_version = handoff
-        .scalar::<i64>("SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)");
+        .unwrap()["result_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    handoff.execute(
+        "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+         SELECT 'stale-handoff-result','stale-handoff-operation',session_id,role_generation_id,
+           outcome,summary,evidence_json,json_set(metadata_json,'$.candidate_hash','stale-candidate'),
+           '2026-01-01T00:00:04Z' FROM role_results WHERE id=?1",
+        params![handoff_result_id],
+    );
+    handoff.execute(
+        "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+         SELECT 'older-handoff-result','older-handoff-operation',session_id,role_generation_id,
+           outcome,summary,evidence_json,metadata_json,'2026-01-01T00:00:04Z'
+         FROM role_results WHERE id=?1",
+        params![handoff_result_id],
+    );
+    let handoff_consumption_query =
+        format!("SELECT consumed_at FROM role_results WHERE id='{handoff_result_id}'");
+    let completed_handoff_version = handoff.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{owner_task}'",
+        owner_task = handoff_task
+    ));
     let busy_handoff = handoff_app.coordinator_tick().unwrap();
     assert_eq!(busy_handoff["action"], "waiting");
     assert_eq!(busy_handoff["for"], "manager_safe_completion_boundary");
+    handoff.assert_scalar::<Option<String>>(&handoff_consumption_query, None);
     handoff.assert_scalar::<String>(
-        "SELECT phase FROM attempts WHERE id=(SELECT id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT phase FROM attempts WHERE id='{owner_attempt}'",
+            owner_attempt = handoff_plan.attempt_id
+        ),
         "manager_handoff".into(),
     );
     handoff.assert_scalar::<i64>("SELECT COUNT(*) FROM snapshots WHERE kind='accepted'", 0);
     handoff.assert_scalar::<i64>(
-        "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT version FROM tasks WHERE id='{owner_task}'",
+            owner_task = handoff_task
+        ),
         completed_handoff_version,
     );
     for event in [
@@ -16916,28 +18244,68 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
     assert_eq!(unverified_exit["action"], "waiting");
     assert_eq!(unverified_exit["for"], "manager_quiescence_or_recovery");
     assert_eq!(unverified_exit["process_group_quiescent"], false);
+    handoff.assert_scalar::<Option<String>>(&handoff_consumption_query, None);
     handoff.assert_scalar::<String>(
-        "SELECT phase FROM attempts LIMIT 1",
+        &format!(
+            "SELECT phase FROM attempts WHERE id='{owner_attempt}'",
+            owner_attempt = handoff_plan.attempt_id
+        ),
         "manager_handoff".into(),
     );
     handoff.assert_scalar::<i64>("SELECT COUNT(*) FROM snapshots WHERE kind='accepted'", 0);
     handoff.assert_scalar::<i64>(
-        "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT version FROM tasks WHERE id='{owner_task}'",
+            owner_task = handoff_task
+        ),
         completed_handoff_version,
     );
     finish_synthetic_role(&handoff, &handoff_ready_manager);
     let human_ready = handoff_app.coordinator_tick().unwrap();
     assert_eq!(human_ready["action"], "human_review_ready");
     handoff.assert_scalar::<String>(
-        "SELECT phase FROM attempts WHERE id=(SELECT id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT phase FROM attempts WHERE id='{owner_attempt}'",
+            owner_attempt = handoff_plan.attempt_id
+        ),
         "awaiting_human_review".into(),
     );
     handoff.assert_scalar::<String>(
-        "SELECT attention FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT attention FROM tasks WHERE id='{owner_task}'",
+            owner_task = handoff_task
+        ),
         "needs_human_review".into(),
     );
     handoff.assert_scalar::<i64>(
-        "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        &format!(
+            "SELECT version FROM tasks WHERE id='{owner_task}'",
+            owner_task = handoff_task
+        ),
+        completed_handoff_version + 1,
+    );
+    let handoff_consumed_at = handoff.scalar::<String>(&handoff_consumption_query);
+    handoff.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM role_results
+         WHERE id IN ('stale-handoff-result','older-handoff-result') AND consumed_at IS NULL",
+        2,
+    );
+    handoff.assert_scalar::<String>(
+        &format!(
+            "SELECT json_extract(detail_json,'$.role_result_id') FROM audit_events
+             WHERE event_code='attempt.phase.changed' AND entity_id='{owner_attempt}'
+               AND json_extract(detail_json,'$.phase')='awaiting_human_review'",
+            owner_attempt = handoff_plan.attempt_id
+        ),
+        handoff_result_id,
+    );
+    assert_eq!(handoff_app.coordinator_tick().unwrap()["action"], "idle");
+    handoff.assert_scalar::<String>(&handoff_consumption_query, handoff_consumed_at);
+    handoff.assert_scalar::<i64>(
+        &format!(
+            "SELECT version FROM tasks WHERE id='{owner_task}'",
+            owner_task = handoff_task
+        ),
         completed_handoff_version + 1,
     );
     drop(handoff_app);
@@ -17009,7 +18377,10 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
     assert_eq!(transition["action"], "manager_transition_applied");
     assert_eq!(transition["phase"], "code_review");
     proposal.assert_scalar::<i64>(
-        "SELECT resume_count FROM sessions WHERE id=(SELECT id FROM sessions LIMIT 1)",
+        &format!(
+            "SELECT resume_count FROM sessions WHERE id='{owner_session}'",
+            owner_session = proposal_session
+        ),
         0,
     );
     drop(proposal_app);
@@ -17037,7 +18408,7 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         [],
     );
     let parallel_revision = parallel
-        .scalar::<String>("SELECT active_config_revision_id FROM trip_project_state LIMIT 1");
+        .scalar::<String>(&format!("SELECT active_config_revision_id FROM trip_project_state WHERE project_id='{owner_project}'", owner_project = parallel_project));
     let parallel_ownership = serde_json::json!({"lanes":[
         {"lane_key":"relay_alpha","owned_paths":["relay-alpha.txt"],"shared_paths":[],"protected_paths":[],"dependencies":[]},
         {"lane_key":"relay_beta","owned_paths":["relay-beta.txt"],"shared_paths":[],"protected_paths":[],"dependencies":["relay_alpha"]}
@@ -17073,17 +18444,17 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
     assert_eq!(waiting["reviewed_lanes"], 2);
     assert_eq!(waiting["configured_lanes"], 0);
     parallel.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM role_generations WHERE role='implementer'",
+        &format!("SELECT COUNT(*) FROM role_generations WHERE attempt_id='{owner_attempt}' AND role='implementer'", owner_attempt = parallel_plan.attempt_id),
         0,
     );
     parallel.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM launch_permits WHERE role='implementer'",
+        &format!("SELECT COUNT(*) FROM launch_permits WHERE attempt_id='{owner_attempt}' AND role='implementer'", owner_attempt = parallel_plan.attempt_id),
         0,
     );
 
     let manager = RoleContext {
         project_id: parallel_project,
-        task_id: parallel_task,
+        task_id: parallel_task.clone(),
         attempt_id: parallel_plan.attempt_id.clone(),
         role_generation_id: "parallel-manager-generation".into(),
         session_id: "parallel-manager-session".into(),
@@ -17135,7 +18506,7 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         .to_string()
         .contains("exactly match approved plan ownership"));
     parallel.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM launch_permits WHERE role='implementer'",
+        &format!("SELECT COUNT(*) FROM launch_permits WHERE attempt_id='{owner_attempt}' AND role='implementer'", owner_attempt = parallel_plan.attempt_id),
         0,
     );
     parallel.execute(
@@ -17168,7 +18539,7 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         .to_string()
         .contains("source drift before initial dispatch"));
     parallel.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM launch_permits WHERE role='implementer'",
+        &format!("SELECT COUNT(*) FROM launch_permits WHERE attempt_id='{owner_attempt}' AND role='implementer'", owner_attempt = parallel_plan.attempt_id),
         0,
     );
     std::fs::remove_file(parallel_plan.workspace_path.join("relay-alpha.txt")).unwrap();
@@ -17192,7 +18563,7 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         .to_string()
         .contains("unconsumed initial launch permit"));
     parallel.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM launch_permits WHERE role='implementer' AND state='issued'",
+        &format!("SELECT COUNT(*) FROM launch_permits WHERE attempt_id='{owner_attempt}' AND role='implementer' AND state='issued'", owner_attempt = parallel_plan.attempt_id),
         1,
     );
     parallel.execute(
@@ -17390,7 +18761,7 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         alpha_currency
     );
     parallel.assert_scalar::<String>(
-        "SELECT effective_generation_id FROM role_settings WHERE task_id=(SELECT task_id FROM attempts LIMIT 1) AND role='implementer' AND revision=1",
+        &format!("SELECT effective_generation_id FROM role_settings WHERE task_id='{owner_task}' AND role='implementer' AND revision=1", owner_task = parallel_task),
         "historical-default-generation".to_owned(),
     );
     let beta_lane = beta_record.1.clone();
@@ -17453,7 +18824,7 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         false
     );
     parallel.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM role_generations WHERE role='implementer'",
+        &format!("SELECT COUNT(*) FROM role_generations WHERE attempt_id='{owner_attempt}' AND role='implementer'", owner_attempt = parallel_plan.attempt_id),
         4,
     );
     parallel.execute(
@@ -17577,7 +18948,7 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         .unwrap();
     assert_eq!(independent_manager.provider, Provider::Claude);
     let independent_revision = independent
-        .scalar::<String>("SELECT active_config_revision_id FROM trip_project_state LIMIT 1");
+        .scalar::<String>(&format!("SELECT active_config_revision_id FROM trip_project_state WHERE project_id='{owner_project}'", owner_project = independent_project));
     let independent_ownership = serde_json::json!({"lanes":[
         {"lane_key":"relay_alpha","owned_paths":["relay-alpha.txt"],"shared_paths":[],"protected_paths":[],"dependencies":[]},
         {"lane_key":"relay_beta","owned_paths":["relay-beta.txt"],"shared_paths":[],"protected_paths":[],"dependencies":[]}
@@ -17670,7 +19041,7 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         );
     }
     independent.assert_scalar::<String>(
-        "SELECT effective_generation_id FROM role_settings WHERE task_id=(SELECT task_id FROM attempts LIMIT 1) AND role='implementer' AND revision=1",
+        &format!("SELECT effective_generation_id FROM role_settings WHERE task_id='{owner_task}' AND role='implementer' AND revision=1", owner_task = independent_task),
         "independent-historical-default".into(),
     );
     let capacity = workflow::state(&independent.store).unwrap().resources["capacity"].clone();
@@ -17705,7 +19076,7 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
     let ordinary = Fixture::new("reviewed-default-lane-authority");
     let (_, _, ordinary_plan) = new_task(&ordinary, "ordinary", "ordinary-task");
     let ordinary_revision = ordinary
-        .scalar::<String>("SELECT active_config_revision_id FROM trip_project_state LIMIT 1");
+        .scalar::<String>(&format!("SELECT active_config_revision_id FROM trip_project_state WHERE project_id='{owner_project}'", owner_project = ordinary_plan.project_id));
     ordinary.execute(
         "INSERT INTO trip_structured_plans(id,attempt_id,plan_hash,plan_json,workflow_id,profile_revision_id,criteria_hash,verification_hash,ownership_hash,conformance_hash,approved_at,implementation_authorized_at,created_at)
          VALUES('ordinary-plan',?1,'ordinary-plan','{\"ownership\":{\"paths\":[\"fixture.txt\"]}}',?2,?3,'criteria','verification','ownership','conformance','2026-01-01T00:00:00Z',NULL,'2026-01-01T00:00:00Z')",
@@ -17722,7 +19093,7 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         .to_string()
         .contains("human authorization"));
     ordinary.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM launch_permits WHERE role='implementer'",
+        &format!("SELECT COUNT(*) FROM launch_permits WHERE attempt_id='{owner_attempt}' AND role='implementer'", owner_attempt = ordinary_plan.attempt_id),
         0,
     );
     ordinary.execute(
@@ -17957,7 +19328,10 @@ fn t03_duplicate_operation_has_one_receipt_task_and_audit() {
     let first = create_task(&fixture, &project, "same-operation", 1);
     let second = create_task(&fixture, &project, "same-operation", 1);
     assert_eq!(first, second);
-    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM tasks", 1);
+    fixture.assert_scalar::<i64>(
+        &format!("SELECT COUNT(*) FROM tasks WHERE project_id='{project}'"),
+        1,
+    );
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM audit_events WHERE operation_id='same-operation'",
         1,
@@ -18171,8 +19545,11 @@ fn draft_deletion_preserves_references_and_audit_and_replays_exactly() {
         "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='delete-draft'",
         1_i64,
     );
-    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", 0_i64);
-    fixture.assert_scalar("SELECT queue_paused FROM projects", 0_i64);
+    fixture.assert_scalar(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id WHERE t.project_id='{project}'"), 0_i64);
+    fixture.assert_scalar(
+        &format!("SELECT queue_paused FROM projects WHERE id='{project}'"),
+        0_i64,
+    );
 }
 
 #[test]
@@ -18300,7 +19677,7 @@ fn queued_task_edits_reject_started_archived_and_historical_drafts() {
         "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='guard-history-delete'",
         0_i64,
     );
-    fixture.assert_scalar("SELECT COUNT(*) FROM attempts", 1_i64);
+    fixture.assert_scalar(&format!("SELECT COUNT(*) FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE t.project_id='{project}'"), 1_i64);
 }
 
 #[test]
@@ -19883,10 +21260,11 @@ fn t05_unknown_claim_cannot_be_replaced_or_cleared_by_human_text() {
             serde_json::to_string(&restore_identity).unwrap()
         ],
     );
-    restore.execute(
-        "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
-         VALUES('restore-capability','codex',?1,'manager','interactive_pty',?2,'supported','fixture','[]','2026-01-01T00:00:00Z','{\"actual_matching_fixture_identity\":true}')",
-        params![restore_launch.executable_version, restore_key],
+    seed_supported_restart_identity(
+        &restore,
+        "restore-session",
+        "restore-capability",
+        &restore_launch,
     );
     restore.execute(
         "INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
@@ -21330,6 +22708,22 @@ fn m7_retained_launch_and_resume_share_exact_bound_identity() {
         providers::capability_key(&fresh).unwrap(),
         providers::capability_key(&resumed).unwrap()
     );
+    let mut functional = fresh.clone();
+    functional.security_policy["qualification_contract"] = "functional-v2".into();
+    assert_ne!(
+        providers::capability_key(&fresh).unwrap(),
+        providers::capability_key(&functional).unwrap()
+    );
+    assert!(providers::require_qualification_contract(
+        &functional.security_policy,
+        &serde_json::json!({})
+    )
+    .is_err());
+    assert!(providers::require_qualification_contract(
+        &fresh.security_policy,
+        &serde_json::json!({"qualification_contract":"functional-v2"})
+    )
+    .is_err());
     resumed.compatibility.as_mut().unwrap().pack_revision = "display-only-v2".into();
     resumed.compatibility.as_mut().unwrap().bundle_hash = "different-provenance".into();
     assert_eq!(
@@ -21378,22 +22772,54 @@ fn seed_supported_restart_identity(
         )
         .optional()
         .unwrap();
+    let mut proof = serde_json::json!({"actual_matching_fixture_identity":true,"session_id":session_id,"config_hash":key});
+    if let Some(contract) = launch.security_policy.get("qualification_contract") {
+        proof["qualification_contract"] = contract.clone();
+    }
     if let Some(evidence) = existing_evidence {
+        let stored_proof: serde_json::Value = serde_json::from_str(&evidence.3).unwrap();
+        let source = stored_proof["session_id"].as_str().unwrap();
+        let (source_key, source_identity, source_launch): (String, String, String) = fixture
+            .connection()
+            .query_row(
+                "SELECT capability_key,capability_identity_json,launch_config_json FROM sessions WHERE id=?1",
+                params![source],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let source_identity: agenticjira::domain::CapabilityIdentity =
+            serde_json::from_str(&source_identity).unwrap();
+        let source_launch: LaunchConfig = serde_json::from_str(&source_launch).unwrap();
+        assert_eq!(source_key, key);
+        assert_eq!(
+            providers::capability_identity_key(&source_identity).unwrap(),
+            key
+        );
+        assert_eq!(
+            providers::capability_identity_key(
+                &providers::capability_identity(&source_launch).unwrap()
+            )
+            .unwrap(),
+            key
+        );
+        providers::require_qualification_contract(&source_identity.security_policy, &stored_proof)
+            .unwrap();
+        proof["session_id"] = source.into();
         assert_eq!(
             evidence,
             (
                 "supported".into(),
                 "fixture".into(),
                 "[]".into(),
-                r#"{"actual_matching_fixture_identity":true}"#.into()
+                proof.to_string()
             )
         );
         return;
     }
     fixture.execute(
         "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
-         VALUES(?1,?2,?3,?4,'interactive_pty',?5,'supported','fixture','[]','2026-01-01T00:00:00Z','{\"actual_matching_fixture_identity\":true}')",
-        params![capability_id,launch.provider.to_string(),launch.executable_version,launch.role.to_string(),key],
+         VALUES(?1,?2,?3,?4,'interactive_pty',?5,'supported','fixture','[]','2026-01-01T00:00:00Z',?6)",
+        params![capability_id,launch.provider.to_string(),launch.executable_version,launch.role.to_string(),key,proof.to_string()],
     );
 }
 
@@ -21596,12 +23022,11 @@ fn m5_restart_preview_classification_and_admission_share_current_authority_facts
             "parked-capability",
         ),
     ] {
-        seed_supported_restart_identity(
-            &fixture,
-            session,
-            capability,
-            &launch(role, "preview-model", repository.clone()),
-        );
+        let mut config = launch(role, "preview-model", repository.clone());
+        if session == "parked-session" {
+            config.security_policy["qualification_contract"] = "functional-v2".into();
+        }
+        seed_supported_restart_identity(&fixture, session, capability, &config);
     }
     let live = current_test_process_identity();
     let prior_boot = m4a_prior_boot_identity();
@@ -21755,6 +23180,29 @@ fn m5_restart_preview_classification_and_admission_share_current_authority_facts
     assert_eq!(action.binding.expected_project_version, Some(1));
     assert_eq!(action.binding.settings_revision, Some(1));
     assert_eq!(action.binding.candidate_hash.as_deref(), Some("fixture"));
+    assert_eq!(restart_preview_rows(&fixture), before_preview);
+
+    let functional_proof: String =
+        fixture.scalar("SELECT proof_json FROM capabilities WHERE id='parked-capability'");
+    fixture.execute("UPDATE capabilities SET proof_json=json_remove(proof_json,'$.qualification_contract') WHERE id='parked-capability'", []);
+    let mismatched = app.restart_preview().unwrap();
+    let parked = mismatched
+        .sessions
+        .iter()
+        .find(|item| item.decision.subject.session_id.as_deref() == Some("parked-session"))
+        .unwrap();
+    assert_eq!(
+        parked.classification,
+        RestartPreviewClassification::FreshOnly
+    );
+    assert_eq!(
+        parked.decision.reason_code,
+        "restart.current_capability_missing"
+    );
+    fixture.execute(
+        "UPDATE capabilities SET proof_json=?1 WHERE id='parked-capability'",
+        params![functional_proof],
+    );
     assert_eq!(restart_preview_rows(&fixture), before_preview);
 
     let before_launch = fixture.connection().query_row(
@@ -23003,7 +24451,10 @@ fn m4b_admission_keeps_unrelated_graceful_stop_incident() {
         "admission-graceful-project",
         "admission-graceful-task",
     );
-    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     seed_session(
         &fixture,
         &plan.attempt_id,
@@ -23133,13 +24584,16 @@ fn m4b_admission_keeps_unrelated_graceful_stop_incident() {
         "SELECT state FROM recovery_records WHERE id='dedicated-graceful'",
         "resolved_graceful_stop_quiescent".into(),
     );
-    let current_version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let current_version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     workflow::execute(
         &fixture.store,
         &HumanCommand::ResolveRecovery {
             operation_id: "graceful-admission-resolve".into(),
             task_id: task,
-            attempt_id: plan.attempt_id,
+            attempt_id: plan.attempt_id.clone(),
             recovery_id: admission_recovery.clone(),
             session_id: Some("graceful-session".into()),
             expected_version: current_version,
@@ -23157,18 +24611,18 @@ fn m4b_admission_keeps_unrelated_graceful_stop_incident() {
         "resolved_graceful_stop_quiescent".into(),
     );
     fixture.assert_scalar::<String>(
-        "SELECT status FROM attempts LIMIT 1",
+        &format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id),
         "restart_parked".into(),
     );
     fixture.assert_scalar::<String>(
-        "SELECT attention FROM tasks LIMIT 1",
+        &format!("SELECT attention FROM tasks WHERE id='{}'", plan.task_id),
         "restart_parked".into(),
     );
     fixture.assert_scalar::<String>(
         "SELECT status FROM sessions WHERE id='graceful-session'",
         "exited".into(),
     );
-    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM sessions", 1);
+    fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'",plan.attempt_id), 1);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM controls", 0);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM resume_invocations", 1);
     assert_restart_accounting(
@@ -23187,7 +24641,10 @@ fn m4b_admission_keeps_unrelated_graceful_stop_incident() {
 fn m4b_recorded_reserved_admission_counts_one_proven_failure() {
     let fixture = Fixture::new("m4b-reserved-admission");
     let (_, task, plan) = new_task(&fixture, "m4b-reserved-project", "m4b-reserved-task");
-    let version: i64 = fixture.scalar("SELECT version FROM tasks LIMIT 1");
+    let version: i64 = fixture.scalar(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     seed_session(
         &fixture,
         &plan.attempt_id,
@@ -23293,7 +24750,10 @@ fn m4b_recorded_reserved_admission_counts_one_proven_failure() {
 fn m4b_interrupted_spawning_admission_reuses_record_and_requires_current_proof() {
     let fixture = Fixture::new("m4b-interrupted-spawning");
     let (_, task, plan) = new_task(&fixture, "m4b-spawning-project", "m4b-spawning-task");
-    let initial_version: i64 = fixture.scalar("SELECT version FROM tasks LIMIT 1");
+    let initial_version: i64 = fixture.scalar(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     seed_session(
         &fixture,
         &plan.attempt_id,
@@ -23634,7 +25094,7 @@ fn m4b_interrupted_spawning_admission_reuses_record_and_requires_current_proof()
         &HumanCommand::ResolveRecovery {
             operation_id: "m4b-active-check-resolve".into(),
             task_id: task,
-            attempt_id: plan.attempt_id,
+            attempt_id: plan.attempt_id.clone(),
             recovery_id: "m4b-active-check-recovery".into(),
             session_id: None,
             expected_version: initial_version + 2,
@@ -23643,7 +25103,10 @@ fn m4b_interrupted_spawning_admission_reuses_record_and_requires_current_proof()
         },
     )
     .unwrap();
-    fixture.assert_scalar::<String>("SELECT status FROM attempts LIMIT 1", "running".into());
+    fixture.assert_scalar::<String>(
+        &format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id),
+        "running".into(),
+    );
     fixture.assert_scalar::<String>(
         "SELECT state FROM restart_candidates WHERE session_id='m4b-spawning-session'",
         "parked".into(),
@@ -23654,7 +25117,10 @@ fn m4b_interrupted_spawning_admission_reuses_record_and_requires_current_proof()
 fn m4b_resumed_spawning_rejects_prior_anchor_then_accepts_current_anchor() {
     let fixture = Fixture::new("m4b-resumed-prior-anchor");
     let (_, task, plan) = new_task(&fixture, "m4b-prior-project", "m4b-prior-task");
-    let initial_version: i64 = fixture.scalar("SELECT version FROM tasks LIMIT 1");
+    let initial_version: i64 = fixture.scalar(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     seed_session(
         &fixture,
         &plan.attempt_id,
@@ -23749,7 +25215,10 @@ fn m4b_resumed_spawning_rejects_prior_anchor_then_accepts_current_anchor() {
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM recovery_records WHERE session_id='m4b-prior-session' AND state='attention_required'",1,
     );
-    fixture.assert_scalar::<i64>("SELECT version FROM tasks LIMIT 1", initial_version);
+    fixture.assert_scalar::<i64>(
+        &format!("SELECT version FROM tasks WHERE id='{}'", plan.task_id),
+        initial_version,
+    );
     let new_pid = 4_000_002_u32;
     let new_anchor = serde_json::to_string(&ProcessGenerationAnchor {
         pid: new_pid,
@@ -24015,7 +25484,7 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         "SELECT COUNT(*) FROM role_credentials WHERE id='old-credential' AND revoked_at IS NULL",
         1,
     );
-    fixture.assert_scalar::<String>("SELECT effective_generation_id FROM role_settings WHERE task_id=(SELECT task_id FROM attempts LIMIT 1) AND role='code_reviewer' AND revision=1", "old".into());
+    fixture.assert_scalar::<String>(&format!("SELECT effective_generation_id FROM role_settings WHERE task_id='{owner_task}' AND role='code_reviewer' AND revision=1", owner_task = task), "old".into());
     let activate_profile = |operation, version| {
         agenticjira::trip::activate_task_profile(
             &fixture.store,
@@ -24037,8 +25506,8 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         "{refreshed_error:#}"
     );
     activate_profile("reactivate-settings-2", 4).unwrap();
-    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM trip_task_profile_activations WHERE role='code_reviewer' AND settings_revision=2",2);
-    fixture.assert_scalar::<i64>("SELECT COUNT(DISTINCT capability_proof_hash) FROM trip_task_profile_activations WHERE role='code_reviewer' AND settings_revision=2",2);
+    fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM trip_task_profile_activations WHERE task_id='{task}' AND role='code_reviewer' AND settings_revision=2"),2);
+    fixture.assert_scalar::<i64>(&format!("SELECT COUNT(DISTINCT capability_proof_hash) FROM trip_task_profile_activations WHERE task_id='{task}' AND role='code_reviewer' AND settings_revision=2"),2);
     let intent = request_switch(5).unwrap();
     assert_eq!(request_switch(5).unwrap(), intent);
     workflow::execute(
@@ -24109,7 +25578,7 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
     let abandoned = reopened
         .switched_validation_role_launch_context(&intent)
         .unwrap();
-    fixture.assert_scalar::<String>("SELECT state || ':' || COALESCE(new_generation_id,'none') FROM switch_intents WHERE id=(SELECT id FROM switch_intents LIMIT 1)", "validation_reserved:none".into());
+    fixture.assert_scalar::<String>(&format!("SELECT state || ':' || COALESCE(new_generation_id,'none') FROM switch_intents WHERE id='{owner_intent}'", owner_intent = intent), "validation_reserved:none".into());
     assert_eq!(
         reopened
             .release_unconsumed_launch_permits(
@@ -24121,14 +25590,20 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         1
     );
     fixture.assert_scalar::<String>(
-        "SELECT state FROM switch_intents WHERE id=(SELECT id FROM switch_intents LIMIT 1)",
+        &format!(
+            "SELECT state FROM switch_intents WHERE id='{owner_intent}'",
+            owner_intent = intent
+        ),
         "ready_for_dispatch".into(),
     );
     let captured = reopened
         .switched_validation_role_launch_context(&intent)
         .unwrap();
     fixture.assert_scalar::<String>(
-        "SELECT status FROM attempts WHERE id=(SELECT attempt_id FROM switch_intents LIMIT 1)",
+        &format!(
+            "SELECT status FROM attempts WHERE id='{owner_attempt}'",
+            owner_attempt = plan.attempt_id
+        ),
         "held".into(),
     );
     assert_eq!(captured.config.model, "replacement-model");
@@ -24162,10 +25637,19 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         )
         .unwrap();
     fixture.assert_scalar::<String>(
-        "SELECT status FROM attempts WHERE id=(SELECT attempt_id FROM switch_intents LIMIT 1)",
+        &format!(
+            "SELECT status FROM attempts WHERE id='{owner_attempt}'",
+            owner_attempt = plan.attempt_id
+        ),
         "held".into(),
     );
-    fixture.assert_scalar::<String>("SELECT attention FROM tasks WHERE id=(SELECT task_id FROM attempts WHERE id=(SELECT attempt_id FROM switch_intents LIMIT 1))", "paused".into());
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT attention FROM tasks WHERE id='{owner_task}'",
+            owner_task = task
+        ),
+        "paused".into(),
+    );
     reopened
         .mark_switch_dispatched(&intent, &captured.role_generation_id)
         .unwrap();
@@ -24177,10 +25661,19 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         .unwrap()
         .is_empty());
     fixture.assert_scalar::<String>(
-        "SELECT state FROM switch_intents WHERE id=(SELECT id FROM switch_intents LIMIT 1)",
+        &format!(
+            "SELECT state FROM switch_intents WHERE id='{owner_intent}'",
+            owner_intent = intent
+        ),
         "dispatched".into(),
     );
-    fixture.assert_scalar::<String>("SELECT new_generation_id FROM switch_intents WHERE id=(SELECT id FROM switch_intents LIMIT 1)", captured.role_generation_id.clone());
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT new_generation_id FROM switch_intents WHERE id='{owner_intent}'",
+            owner_intent = intent
+        ),
+        captured.role_generation_id.clone(),
+    );
     assert!(fixture
         .store
         .role_launch_context(&plan.attempt_id, RoleKind::CodeReviewer)
@@ -24301,9 +25794,9 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         "exited",
     );
     inherited.execute_batch(
-        "UPDATE attempts SET phase='implementation',plan_hash=NULL;
-         UPDATE role_settings SET effective_generation_id='manager-source' WHERE role='manager' AND revision=1;
-         INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at,source_role_generation_id,source_settings_revision,workspace_id,workspace_hash) SELECT 'manager-plan',a.id,'plan',a.base_revision,'manager-plan-hash','{}',1,'2026-01-01T00:00:00Z','manager-source',1,w.id,'manager-plan-hash' FROM attempts a JOIN workspaces w ON w.attempt_id=a.id;",
+        &format!("UPDATE attempts SET phase='implementation',plan_hash=NULL WHERE id='{owner_attempt}';
+         UPDATE role_settings SET effective_generation_id='manager-source' WHERE task_id='{owner_task}' AND role='manager' AND revision=1;
+         INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at,source_role_generation_id,source_settings_revision,workspace_id,workspace_hash) SELECT 'manager-plan',a.id,'plan',a.base_revision,'manager-plan-hash','{{}}',1,'2026-01-01T00:00:00Z','manager-source',1,w.id,'manager-plan-hash' FROM attempts a JOIN workspaces w ON w.attempt_id=a.id WHERE a.id='{owner_attempt}';", owner_attempt = inherited_plan.attempt_id, owner_task = inherited_task),
     );
     let inherited_roles = role_service(&inherited);
     let request_manager = |operation: &str, generation: &str, version| {
@@ -24346,7 +25839,10 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         &first_process,
     );
     inherited.finish_role(&first_replacement);
-    inherited.execute_batch("UPDATE attempts SET plan_hash='manager-plan-hash'");
+    inherited.execute_batch(&format!(
+        "UPDATE attempts SET plan_hash='manager-plan-hash' WHERE id='{owner_attempt}'",
+        owner_attempt = inherited_plan.attempt_id
+    ));
     inherited.execute("UPDATE capabilities SET proof_json=json_set(proof_json,'$.runtime_scope.scope_hash','manager-cli-upgrade','$.runtime_scopes[0].scope_hash','manager-cli-upgrade') WHERE id=(SELECT capability_id FROM trip_task_profile_activations WHERE task_id=?1 AND role='manager' AND settings_revision=2)", params![inherited_task]);
     agenticjira::trip::activate_task_profile(
         &inherited.store,
@@ -24369,21 +25865,30 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         request_manager(operation, &first_replacement.role_generation_id, 6)
     };
     for (case, corrupt, restore) in [
-        ("stale", "UPDATE switch_intents SET authority_fence='stale' WHERE id=(SELECT id FROM switch_intents LIMIT 1)", "UPDATE switch_intents SET authority_fence=(SELECT authority_generation FROM role_generations WHERE id='manager-source') WHERE id=(SELECT id FROM switch_intents LIMIT 1)"),
-        ("unrelated", "UPDATE switch_intents SET checkpoint_snapshot_id=NULL WHERE id=(SELECT id FROM switch_intents LIMIT 1)", "UPDATE switch_intents SET checkpoint_snapshot_id='manager-plan' WHERE id=(SELECT id FROM switch_intents LIMIT 1)"),
-        ("incomplete", "UPDATE switch_intents SET state='ready_for_dispatch' WHERE id=(SELECT id FROM switch_intents LIMIT 1)", "UPDATE switch_intents SET state='dispatched' WHERE id=(SELECT id FROM switch_intents LIMIT 1)"),
-        ("mismatched-permit", "UPDATE launch_permits SET settings_revision=1 WHERE switch_intent_id=(SELECT id FROM switch_intents LIMIT 1)", "UPDATE launch_permits SET settings_revision=2 WHERE switch_intent_id=(SELECT id FROM switch_intents LIMIT 1)"),
+        ("stale", &format!("UPDATE switch_intents SET authority_fence='stale' WHERE id='{owner_intent}'", owner_intent = first_intent), &format!("UPDATE switch_intents SET authority_fence=(SELECT authority_generation FROM role_generations WHERE id='manager-source') WHERE id='{owner_intent}'", owner_intent = first_intent)),
+        ("unrelated", &format!("UPDATE switch_intents SET checkpoint_snapshot_id=NULL WHERE id='{owner_intent}'", owner_intent = first_intent), &format!("UPDATE switch_intents SET checkpoint_snapshot_id='manager-plan' WHERE id='{owner_intent}'", owner_intent = first_intent)),
+        ("incomplete", &format!("UPDATE switch_intents SET state='ready_for_dispatch' WHERE id='{owner_intent}'", owner_intent = first_intent), &format!("UPDATE switch_intents SET state='dispatched' WHERE id='{owner_intent}'", owner_intent = first_intent)),
+        ("mismatched-permit", &format!("UPDATE launch_permits SET settings_revision=1 WHERE switch_intent_id='{owner_intent}'", owner_intent = first_intent), &format!("UPDATE launch_permits SET settings_revision=2 WHERE switch_intent_id='{owner_intent}'", owner_intent = first_intent)),
     ] {
         inherited.execute_batch(corrupt);
         let operation = format!("manager-{case}-lineage");
         assert!(request_inherited(&operation).is_err());
         inherited.execute_batch(restore);
     }
-    inherited.execute_batch("UPDATE attempts SET plan_hash=NULL");
+    inherited.execute_batch(&format!(
+        "UPDATE attempts SET plan_hash=NULL WHERE id='{owner_attempt}'",
+        owner_attempt = inherited_plan.attempt_id
+    ));
     assert!(request_inherited("manager-null-plan-lineage").is_err());
-    inherited.execute_batch("UPDATE attempts SET plan_hash='changed-plan'");
+    inherited.execute_batch(&format!(
+        "UPDATE attempts SET plan_hash='changed-plan' WHERE id='{owner_attempt}'",
+        owner_attempt = inherited_plan.attempt_id
+    ));
     assert!(request_inherited("manager-changed-plan-lineage").is_err());
-    inherited.execute_batch("UPDATE attempts SET plan_hash='manager-plan-hash'");
+    inherited.execute_batch(&format!(
+        "UPDATE attempts SET plan_hash='manager-plan-hash' WHERE id='{owner_attempt}'",
+        owner_attempt = inherited_plan.attempt_id
+    ));
     let inherited_intent = request_inherited("manager-inherited-switch").unwrap();
     inherited_roles.finish_switch(&inherited_intent).unwrap();
     let replacement = inherited
@@ -24401,8 +25906,8 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         .store
         .mark_switch_dispatched(&inherited_intent, &replacement.role_generation_id)
         .unwrap();
-    inherited.assert_scalar::<String>("SELECT activation_id FROM trip_attempt_profiles WHERE attempt_id=(SELECT id FROM attempts LIMIT 1) AND role='manager'", initial_activation.0.clone());
-    inherited.assert_scalar::<String>("SELECT capability_proof_hash FROM trip_attempt_profiles WHERE attempt_id=(SELECT id FROM attempts LIMIT 1) AND role='manager'", initial_activation.1.clone());
+    inherited.assert_scalar::<String>(&format!("SELECT activation_id FROM trip_attempt_profiles WHERE attempt_id='{owner_attempt}' AND role='manager'", owner_attempt = inherited_plan.attempt_id), initial_activation.0.clone());
+    inherited.assert_scalar::<String>(&format!("SELECT capability_proof_hash FROM trip_attempt_profiles WHERE attempt_id='{owner_attempt}' AND role='manager'", owner_attempt = inherited_plan.attempt_id), initial_activation.1.clone());
     let current_process = serde_json::json!({"fixture":"manager-lineage"}).to_string();
     start_session(
         &inherited,
@@ -24411,8 +25916,8 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         "manager-replacement-boot",
         &current_process,
     );
-    inherited.assert_scalar::<String>("SELECT activation_id FROM trip_attempt_profiles WHERE attempt_id=(SELECT id FROM attempts LIMIT 1) AND role='manager'", reactivated.0);
-    inherited.assert_scalar::<String>("SELECT capability_proof_hash FROM trip_attempt_profiles WHERE attempt_id=(SELECT id FROM attempts LIMIT 1) AND role='manager'", reactivated.1);
+    inherited.assert_scalar::<String>(&format!("SELECT activation_id FROM trip_attempt_profiles WHERE attempt_id='{owner_attempt}' AND role='manager'", owner_attempt = inherited_plan.attempt_id), reactivated.0);
+    inherited.assert_scalar::<String>(&format!("SELECT capability_proof_hash FROM trip_attempt_profiles WHERE attempt_id='{owner_attempt}' AND role='manager'", owner_attempt = inherited_plan.attempt_id), reactivated.1);
 
     let manager_fixture = Fixture::new("t06-manager-proposal");
     let manager_paths = instance_paths(&manager_fixture);
@@ -24463,16 +25968,25 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         1
     );
     manager_fixture.assert_scalar::<String>(
-        "SELECT state FROM launch_permits WHERE id=(SELECT id FROM launch_permits LIMIT 1)",
+        &format!(
+            "SELECT state FROM launch_permits WHERE id='{owner_permit}'",
+            owner_permit = ordinary_context.permit_id
+        ),
         "released_nondelivery".into(),
     );
-    manager_fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events WHERE event_code='launch.permit.released_nondelivery' AND entity_id=json_extract(detail_json,'$.permit_id') AND json_extract(detail_json,'$.attempt_id')=(SELECT id FROM attempts LIMIT 1) AND json_extract(detail_json,'$.role')='manager' AND json_extract(detail_json,'$.reason')='fixture unsupported admission'", 1);
-    manager_fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM role_generations", 0);
+    manager_fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM audit_events WHERE event_code='launch.permit.released_nondelivery' AND entity_id=json_extract(detail_json,'$.permit_id') AND json_extract(detail_json,'$.attempt_id')='{owner_attempt}' AND json_extract(detail_json,'$.role')='manager' AND json_extract(detail_json,'$.reason')='fixture unsupported admission'", owner_attempt = manager_plan.attempt_id), 1);
+    manager_fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT COUNT(*) FROM role_generations WHERE attempt_id='{owner_attempt}'",
+            owner_attempt = manager_plan.attempt_id
+        ),
+        0,
+    );
     manager_fixture.execute(
         "UPDATE tasks SET lifecycle='validation' WHERE id=?1",
         params![manager_task],
     );
-    manager_fixture.assert_scalar::<String>("SELECT a.status || ':' || t.lifecycle FROM attempts a JOIN tasks t ON t.id=a.task_id LIMIT 1", "running:validation".into());
+    manager_fixture.assert_scalar::<String>(&format!("SELECT a.status || ':' || t.lifecycle FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id='{owner_attempt}'", owner_attempt = manager_plan.attempt_id), "running:validation".into());
     let manager_context = manager_fixture
         .store
         .validation_role_launch_context(&manager_plan.attempt_id, RoleKind::Manager)
@@ -24546,7 +26060,7 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         lane_id: "default".into(),
         permissions: vec!["request_next_role".into()],
     };
-    manager_fixture
+    let manager_proposal = manager_fixture
         .store
         .save_transition_proposal(
             &manager_role,
@@ -24568,8 +26082,21 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
     )
     .unwrap();
     assert_eq!(manager_app.coordinator_tick().unwrap()["action"], "idle");
-    manager_fixture.assert_scalar::<String>("SELECT state FROM controls WHERE id=(SELECT id FROM controls WHERE kind='transition_proposal' LIMIT 1)", "proposed".into());
-    manager_fixture.assert_scalar::<String>("SELECT status FROM attempts WHERE id=(SELECT attempt_id FROM controls WHERE kind='transition_proposal' LIMIT 1)", "held".into());
+    manager_fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT state FROM controls WHERE attempt_id='{}' AND id='{}'",
+            manager_plan.attempt_id,
+            manager_proposal["proposal_id"].as_str().unwrap()
+        ),
+        "proposed".into(),
+    );
+    manager_fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT status FROM attempts WHERE id='{}'",
+            manager_plan.attempt_id
+        ),
+        "held".into(),
+    );
     drop(manager_app);
     let _ = std::fs::remove_dir_all(manager_paths.socket_dir);
 
@@ -24731,7 +26258,13 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         value["permit_id"].as_str() == Some(drift_context.permit_id.as_str())
             && value["state"] == "released_nondelivery"
     }));
-    writer_fixture.assert_scalar::<String>("SELECT state FROM launch_permits WHERE id=(SELECT id FROM launch_permits WHERE state='released_nondelivery' LIMIT 1)", "released_nondelivery".into());
+    writer_fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT state FROM launch_permits WHERE id='{}'",
+            drift_context.permit_id
+        ),
+        "released_nondelivery".into(),
+    );
     writer_fixture.execute(
         "UPDATE tasks SET lifecycle='validation' WHERE id=?1",
         params![writer_task],
@@ -24745,9 +26278,18 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
             &writer_resume_token,
         )
         .unwrap();
-    writer_fixture.assert_scalar::<String>("SELECT status FROM attempts WHERE id=(SELECT attempt_id FROM switch_intents WHERE id=(SELECT id FROM switch_intents ORDER BY created_at DESC LIMIT 1))", "held".into());
-    writer_fixture.assert_scalar::<String>("SELECT attention FROM tasks WHERE id=(SELECT task_id FROM attempts WHERE id=(SELECT attempt_id FROM switch_intents ORDER BY created_at DESC LIMIT 1))", "paused".into());
-    writer_fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM resume_invocations WHERE session_id=(SELECT id FROM sessions WHERE transcript_epoch='writer-resume-epoch')", 1);
+    writer_fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT status FROM attempts WHERE id='{}'",
+            writer_plan.attempt_id
+        ),
+        "held".into(),
+    );
+    writer_fixture.assert_scalar::<String>(
+        &format!("SELECT attention FROM tasks WHERE id='{writer_task}'"),
+        "paused".into(),
+    );
+    writer_fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM resume_invocations WHERE session_id='{}' AND transcript_epoch='writer-resume-epoch'",writer_context.session_id), 1);
     assert!(writer_fixture
         .store
         .role_launch_context(&writer_plan.attempt_id, RoleKind::Implementer)
@@ -24763,16 +26305,50 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
     assert_eq!(writer_app.coordinator_tick().unwrap()["action"], "idle");
     drop(writer_app);
     let _ = std::fs::remove_dir_all(writer_paths.socket_dir);
-    {
+    for same_revision in [false, true] {
         let fixture = Fixture::new("t06-manager-stop-change");
-        let (_, task, plan) = new_task(&fixture, "manager control", "stop then change");
-        seed_session(
+        let fixture = if same_revision {
+            fixture.with_synthetic_claude()
+        } else {
+            fixture
+        };
+        let (_, task, plan) = if same_revision {
+            let project = add_project(
+                &fixture,
+                fixture.repository("repo"),
+                "same-revision-manager",
+            );
+            fixture.execute(
+                "UPDATE projects SET settings_json=json_set(settings_json,'$.roles.manager',json(?1)) WHERE id=?2",
+                params![serde_json::to_string(&role_override(Provider::Claude)).unwrap(), project],
+            );
+            let task = create_task_with_manager_provider(
+                &fixture,
+                &project,
+                "same-revision-manager-task",
+                1,
+            );
+            fixture.assert_scalar::<String>(
+                &format!("SELECT lifecycle||':'||attention FROM tasks WHERE id='{task}'"),
+                "ready:none".into(),
+            );
+            let plan = claim(&fixture, fixture.root.join("artifacts"));
+            (project, task, plan)
+        } else {
+            new_task(&fixture, "manager control", "stop then change")
+        };
+        seed_session_for_provider(
             &fixture,
             &plan.attempt_id,
             "manager",
             "old-manager",
             "old-manager-session",
             "running",
+            if same_revision {
+                Provider::Claude
+            } else {
+                Provider::Codex
+            },
         );
         seed_session(
             &fixture,
@@ -24783,42 +26359,64 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
             "running",
         );
         fixture.execute("UPDATE role_settings SET effective_generation_id='old-manager' WHERE task_id=?1 AND role='manager' AND revision=1", params![task]);
-        fixture.execute("INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at) VALUES('old-manager-credential','old-manager',?1,'[\"read_context\"]','2026-01-01T00:00:00Z')", params![auth::hash_secret("old-manager-token")]);
+        fixture.execute("INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at) VALUES('old-manager-credential','old-manager',?1,?2,'2026-01-01T00:00:00Z')", params![auth::hash_secret("old-manager-token"),if same_revision {"[\"read_context\",\"report_result\"]"} else {"[\"read_context\"]"}]);
         let paths = instance_paths(&fixture);
         let runtime = capability_runtime_for_paths(&fixture, &paths);
-        let replacement = RoleOverride {
-            provider: Provider::Codex,
-            model: "manager-replacement".into(),
-            effort: "high".into(),
+        let replacement = if same_revision {
+            role_override(Provider::Claude)
+        } else {
+            RoleOverride {
+                provider: Provider::Codex,
+                model: "manager-replacement".into(),
+                effort: "high".into(),
+            }
         };
-        workflow::execute(
-            &fixture.store,
-            &HumanCommand::SetRoleSettings {
-                operation_id: "manager-settings-2".into(),
-                task_id: task.clone(),
-                role: RoleKind::Manager,
-                expected_version: 2,
-                config: replacement.clone(),
-            },
-        )
-        .unwrap();
+        if !same_revision {
+            workflow::execute(
+                &fixture.store,
+                &HumanCommand::SetRoleSettings {
+                    operation_id: "manager-settings-2".into(),
+                    task_id: task.clone(),
+                    role: RoleKind::Manager,
+                    expected_version: 2,
+                    config: replacement.clone(),
+                },
+            )
+            .unwrap();
+        }
         seed_supported_capabilities_for_config_with_runtime(&fixture, &replacement, &runtime);
-        agenticjira::trip::activate_task_profile(
-            &fixture.store,
-            &runtime,
-            "activate-manager-settings-2",
-            &task,
-            RoleKind::Manager,
-            2,
-            3,
-        )
-        .unwrap();
+        if !same_revision {
+            agenticjira::trip::activate_task_profile(
+                &fixture.store,
+                &runtime,
+                "activate-manager-settings-2",
+                &task,
+                RoleKind::Manager,
+                2,
+                3,
+            )
+            .unwrap();
+        } else {
+            fixture
+                .store
+                .save_role_result(
+                    &fixture.store.role_context("old-manager-token").unwrap(),
+                    &RoleResultReport {
+                        operation_id: "same-revision-old-report".into(),
+                        outcome: "needs_input".into(),
+                        summary: "Awaiting the human's replacement decision".into(),
+                        evidence: Vec::new(),
+                        metadata: serde_json::json!({}),
+                    },
+                )
+                .unwrap();
+        }
         let stop = workflow::execute_with_runtime(
             &fixture.store,
             &HumanCommand::Control {
                 operation_id: "stop-manager".into(),
                 task_id: task.clone(),
-                expected_version: 4,
+                expected_version: if same_revision { 2 } else { 4 },
                 action: "stop_manager".into(),
                 payload: serde_json::json!({}),
             },
@@ -24830,12 +26428,21 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
             .store
             .role_launch_context(&plan.attempt_id, RoleKind::Explorer)
             .is_err());
-        let app = Application::new_with_synthetic_dispatch_for_tests(
-            paths,
-            fixture.store.clone(),
-            std::env::current_exe().unwrap(),
-            test_hooks(&fixture),
-        )
+        let app = if same_revision {
+            Application::new_with_synthetic_compatibility_for_tests(
+                paths,
+                fixture.store.clone(),
+                std::env::current_exe().unwrap(),
+                test_hooks(&fixture),
+            )
+        } else {
+            Application::new_with_synthetic_dispatch_for_tests(
+                paths,
+                fixture.store.clone(),
+                std::env::current_exe().unwrap(),
+                test_hooks(&fixture),
+            )
+        }
         .unwrap();
         assert_eq!(
             app.coordinator_tick().unwrap()["action"],
@@ -24855,9 +26462,9 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
             &HumanCommand::Control {
                 operation_id: "change-manager-safe".into(),
                 task_id: task.clone(),
-                expected_version: 5,
+                expected_version: if same_revision { 3 } else { 5 },
                 action: "change_manager_safe_boundary".into(),
-                payload: serde_json::json!({"settings_revision":2}),
+                payload: serde_json::json!({"settings_revision":if same_revision {1} else {2}}),
             },
             Some(&runtime),
         )
@@ -24889,6 +26496,44 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
             1,
         );
         fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM launch_permits WHERE switch_intent_id=(SELECT id FROM switch_intents WHERE role='manager')", 0);
+        if same_revision {
+            assert_eq!(
+                app.coordinator_tick().unwrap()["action"],
+                "switch_old_quiescent"
+            );
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM switch_intents WHERE role='manager' AND requested_settings_revision=1 AND state='ready_for_dispatch'",1);
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM role_results WHERE operation_id='same-revision-old-report' AND consumed_at IS NOT NULL",1);
+            let dispatched = app.coordinator_tick().unwrap();
+            assert_eq!(dispatched["action"], "switch_dispatched", "{dispatched}");
+            let dispatched_managers: i64 = fixture
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM switch_intents intent
+                     JOIN role_generations generation ON generation.id=intent.new_generation_id
+                     JOIN sessions session ON session.role_generation_id=generation.id
+                     JOIN role_settings settings ON settings.task_id=?1 AND settings.role=intent.role
+                       AND settings.revision=intent.requested_settings_revision
+                     WHERE intent.id=?2 AND intent.attempt_id=?3 AND intent.role='manager'
+                       AND intent.old_generation_id='old-manager' AND intent.state='dispatched'
+                       AND intent.requested_settings_revision=1
+                       AND generation.attempt_id=intent.attempt_id AND generation.role=intent.role
+                       AND generation.provider='claude' AND generation.config_revision=settings.revision
+                       AND generation.status='running' AND session.id=?4
+                       AND session.provider='claude' AND session.status='running'
+                       AND session.launch_state='started'
+                       AND settings.effective_generation_id=generation.id",
+                    params![
+                        task,
+                        dispatched["intent_id"].as_str().unwrap(),
+                        plan.attempt_id,
+                        dispatched["session_id"].as_str().unwrap()
+                    ],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(dispatched_managers, 1, "{dispatched}");
+            assert!(fixture.store.role_context("old-manager-token").is_err());
+        }
     }
     {
         let fixture = Fixture::new("t06-manager-change-native-idle");
@@ -25028,6 +26673,301 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
 }
 
 #[test]
+fn settled_failed_main_verification_preserves_manager_controls_and_history() {
+    for history in ["quiescent", "nondelivery", "not_started"] {
+        for change_action in ["change_manager_safe_boundary", "change_manager_interrupt"] {
+            let (fixture, paths, app, task, manager) =
+                ordinary_manager_fixture(&format!("manager-failed-main-{history}-{change_action}"));
+            if history != "not_started" {
+                seed_session(
+                    &fixture,
+                    &manager.attempt_id,
+                    "implementer",
+                    "verification-generation",
+                    "verification-session",
+                    "exited",
+                );
+                fixture.execute_batch(
+                    "UPDATE role_generations SET status='exited' WHERE id='verification-generation';
+                     UPDATE sessions SET launch_state='finished' WHERE id='verification-session';",
+                );
+            }
+            let payload = if history == "not_started" {
+                serde_json::json!({"actor":"implementer","launch_disposition":"not_started","turns_reserved":0})
+            } else {
+                serde_json::json!({"actor":"implementer","session_id":"verification-session",
+                    "role_generation_id":"verification-generation","transcript_epoch":"e"})
+            };
+            if history == "nondelivery" {
+                fixture.execute_batch(
+                    "UPDATE sessions SET status='launch_failed',launch_state='failed',exit_json=NULL,
+                       process_identity_json=NULL WHERE id='verification-session';
+                     UPDATE role_generations SET status='launch_failed' WHERE id='verification-generation';",
+                );
+            }
+            if history != "not_started" {
+                fixture.execute(
+                    "INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,launch_config_json,capability_key,capability_identity_json,state,created_at,updated_at)
+                     VALUES('verification-resume','verification-session',1,'e','{}','k','{}',?1,
+                       '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                    params![if history == "nondelivery" { "proven_nondelivery" } else { "exited" }],
+                );
+            }
+            fixture.execute(
+                "INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+                 VALUES('failed-main-history',?1,'main_checkout_verify','failed',1,?2,
+                   '2026-01-01T00:00:00Z','2026-01-02T00:00:00Z')",
+                params![manager.attempt_id, payload.to_string()],
+            );
+            fixture.execute(
+                "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at)
+                 VALUES('preserved-guidance',?1,?2,'Preserve the existing plan gate','queued','2026-01-01T00:00:00Z')",
+                params![manager.attempt_id, manager.role_generation_id],
+            );
+            fixture.execute(
+                "UPDATE review_budgets SET initial_allowance=3,extension_allowance=1,spent=2
+                 WHERE attempt_id=?1 AND review_kind='code'",
+                params![manager.attempt_id],
+            );
+            let preserved_sql = format!(
+                "SELECT json_object('state',c.state,'payload',c.payload_json,'updated_at',c.updated_at,
+                   'plan_approved_at',a.plan_approved_at,
+                   'guidance',(SELECT json_group_array(json_array(id,state,submitted_at,acknowledged_at))
+                     FROM guidance_messages WHERE attempt_id=a.id),
+                   'budgets',(SELECT json_group_array(json_array(review_kind,initial_allowance,extension_allowance,spent))
+                     FROM review_budgets WHERE attempt_id=a.id))
+                 FROM controls c JOIN attempts a ON a.id=c.attempt_id
+                 WHERE c.id='failed-main-history' AND a.id='{}'",
+                manager.attempt_id
+            );
+            let preserved = fixture.scalar::<String>(&preserved_sql);
+            let control = |operation: &str, action: &str| {
+                app.execute_human_command(&HumanCommand::Control {
+                    operation_id: operation.into(),
+                    task_id: task.clone(),
+                    expected_version: fixture
+                        .scalar(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+                    action: action.into(),
+                    payload: serde_json::json!({"settings_revision":1}),
+                })
+            };
+            assert_eq!(
+                control("stop-manager", "stop_manager").unwrap().state,
+                "manager_stop_held"
+            );
+            fixture.assert_scalar::<String>(&preserved_sql, preserved.clone());
+            assert_eq!(
+                control("continue-manager", "continue_manager")
+                    .unwrap()
+                    .state,
+                "manager_stop_released"
+            );
+            fixture.assert_scalar::<String>(&preserved_sql, preserved.clone());
+            let native_idle =
+                history == "quiescent" && change_action == "change_manager_safe_boundary";
+            if native_idle {
+                let native = uuid::Uuid::new_v4().to_string();
+                for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
+                    record_manager_hook(&fixture, &manager, &native, event);
+                }
+            } else {
+                let process: String = fixture.scalar(&format!(
+                    "SELECT process_identity_json FROM sessions WHERE id='{}'",
+                    manager.session_id
+                ));
+                exit_session(
+                    &fixture,
+                    &manager.session_id,
+                    &manager.transcript_epoch,
+                    &process,
+                );
+            }
+            let change = control("change-manager", change_action).unwrap();
+            assert_eq!(
+                change.state,
+                if change_action == "change_manager_interrupt" {
+                    "manager_change_interrupt_requested"
+                } else {
+                    "manager_change_waiting_safe_boundary"
+                }
+            );
+            if change_action == "change_manager_safe_boundary" {
+                fixture.execute(
+                    "UPDATE controls SET payload_json=json_set(payload_json,'$.session_id','missing-session')
+                     WHERE id='failed-main-history'",
+                    [],
+                );
+                let waiting = app.coordinator_tick().unwrap();
+                assert_eq!(
+                    waiting["action"], "manager_change_waiting_safe_boundary",
+                    "{history}: {waiting}"
+                );
+                fixture.assert_scalar::<i64>(
+                    &format!("SELECT COUNT(*) FROM role_credentials WHERE id='{}' AND revoked_at IS NULL", manager.credential_id),
+                    1,
+                );
+                fixture.execute(
+                    "UPDATE controls SET payload_json=?1 WHERE id='failed-main-history'",
+                    params![payload.to_string()],
+                );
+            }
+            let advanced = app.coordinator_tick().unwrap();
+            assert_eq!(
+                advanced["action"], "manager_change_authority_revoked",
+                "{history}: {advanced}"
+            );
+            fixture.assert_scalar::<String>(&preserved_sql, preserved);
+            fixture.assert_scalar::<i64>(
+                &format!(
+                    "SELECT COUNT(*) FROM launch_permits WHERE attempt_id='{}' AND state='issued'",
+                    manager.attempt_id
+                ),
+                0,
+            );
+            drop(app);
+            let _ = std::fs::remove_dir_all(paths.socket_dir);
+        }
+    }
+}
+
+#[test]
+fn manager_controls_refuse_unsettled_failed_main_verification() {
+    let (fixture, paths, app, task, manager) = ordinary_manager_fixture("manager-unsettled-main");
+    seed_session(
+        &fixture,
+        &manager.attempt_id,
+        "implementer",
+        "verification-generation",
+        "verification-session",
+        "exited",
+    );
+    fixture.execute_batch(
+        "UPDATE role_generations SET status='exited' WHERE id='verification-generation';
+         UPDATE sessions SET launch_state='finished' WHERE id='verification-session';",
+    );
+    fixture.execute(
+        "INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+         SELECT 'other-attempt',task_id,context_id,'planning',base_revision,configuration_revision,'completed',
+           '2000-01-01T00:00:00Z','2000-01-01T00:00:00Z' FROM attempts WHERE id=?1",
+        params![manager.attempt_id],
+    );
+    let payload = serde_json::json!({"actor":"implementer","session_id":"verification-session",
+        "role_generation_id":"verification-generation","transcript_epoch":"e"})
+    .to_string();
+    fixture.execute(
+        "INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+         VALUES('failed-main-history',?1,'main_checkout_verify','failed',1,?2,'2026-01-01T00:00:00Z','2026-01-02T00:00:00Z')",
+        params![manager.attempt_id,payload],
+    );
+    let conflicts = [
+        ("running session", "UPDATE sessions SET status='running' WHERE id='verification-session'", ""),
+        ("missing quiescence", "UPDATE sessions SET exit_json='{}' WHERE id='verification-session'", ""),
+        ("uncertain launch", "UPDATE sessions SET status='launch_failed',launch_state='failed',process_identity_json='{}' WHERE id='verification-session'", ""),
+        ("running generation", "UPDATE role_generations SET status='running' WHERE id='verification-generation'", ""),
+        ("other attempt", "UPDATE role_generations SET attempt_id='other-attempt' WHERE id='verification-generation'", ""),
+        ("other actor", "UPDATE controls SET payload_json=json_set(payload_json,'$.actor','explorer') WHERE id='failed-main-history'", ""),
+        ("missing generation", "UPDATE controls SET payload_json=json_remove(payload_json,'$.role_generation_id') WHERE id='failed-main-history'", ""),
+        ("wrong epoch", "UPDATE controls SET payload_json=json_set(payload_json,'$.transcript_epoch','other-epoch') WHERE id='failed-main-history'", ""),
+        ("spawning resume", "INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,launch_config_json,capability_key,capability_identity_json,state,created_at,updated_at)
+           VALUES('history-resume','verification-session',1,'history-resume-epoch','{}','k','{}','spawning','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", "DELETE FROM resume_invocations WHERE id='history-resume'"),
+        ("uncertain resume", "INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,launch_config_json,capability_key,capability_identity_json,state,created_at,updated_at)
+           VALUES('history-resume','verification-session',1,'history-resume-epoch','{}','k','{}','delivery_unknown','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", "DELETE FROM resume_invocations WHERE id='history-resume'"),
+        ("open recovery", "INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at)
+           SELECT 'history-recovery','verification-session',attempt_id,'attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z' FROM controls WHERE id='failed-main-history'", "DELETE FROM recovery_records WHERE id='history-recovery'"),
+        ("parked restart", "INSERT INTO restart_candidates(session_id,attempt_id,task_id,source,state,reason,created_at,updated_at)
+           SELECT 'verification-session',a.id,a.task_id,'planned_shutdown','parked','fixture','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z' FROM attempts a JOIN controls c ON c.attempt_id=a.id WHERE c.id='failed-main-history'", "DELETE FROM restart_candidates WHERE session_id='verification-session'"),
+        ("live input lease", "INSERT INTO input_leases(session_id,lease_id_hash,owner_kind,owner_id,role_generation_id,process_identity_json,expires_at,created_at,updated_at)
+           VALUES('verification-session','history-lease','human','viewer','verification-generation','{}','9999-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", "DELETE FROM input_leases WHERE session_id='verification-session'"),
+        ("missing disposition", "UPDATE controls SET payload_json='{\"actor\":\"implementer\"}' WHERE id='failed-main-history'", ""),
+        ("issued reservation", "UPDATE controls SET payload_json='{\"actor\":\"implementer\",\"launch_disposition\":\"not_started\",\"turns_reserved\":0}' WHERE id='failed-main-history';
+           INSERT INTO launch_permits(id,attempt_id,role,settings_revision,state,created_at) SELECT 'history-permit',attempt_id,'implementer',1,'issued','2026-01-02T00:00:00Z' FROM controls WHERE id='failed-main-history'", "DELETE FROM launch_permits WHERE id='history-permit'"),
+        ("live reservation owner", "UPDATE controls SET payload_json='{\"actor\":\"implementer\",\"launch_disposition\":\"not_started\",\"turns_reserved\":0}' WHERE id='failed-main-history';
+           UPDATE role_generations SET status='launch_reserved',created_at='2026-01-02T00:00:00Z' WHERE id='verification-generation'", ""),
+        ("reserved turn", "UPDATE controls SET payload_json='{\"actor\":\"implementer\",\"launch_disposition\":\"not_started\",\"turns_reserved\":1}' WHERE id='failed-main-history'", ""),
+        ("bound reservation", "UPDATE controls SET payload_json='{\"actor\":\"implementer\",\"launch_disposition\":\"not_started\",\"turns_reserved\":0,\"launch_reservation\":{\"session_id\":\"verification-session\"}}' WHERE id='failed-main-history'", ""),
+        ("malformed payload", "UPDATE controls SET payload_json='{' WHERE id='failed-main-history'", ""),
+        ("active verification", "UPDATE controls SET state='native_running' WHERE id='failed-main-history'", ""),
+        ("requested pause", "INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+           SELECT 'unrelated-control',attempt_id,'pause_now','requested',1,'{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z' FROM controls WHERE id='failed-main-history'", "DELETE FROM controls WHERE id='unrelated-control'"),
+        ("another manager change", "INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+           SELECT 'unrelated-control',attempt_id,'manager_change','waiting_safe_boundary',1,'{\"old_generation_id\":\"another-manager\"}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z' FROM controls WHERE id='failed-main-history'", "DELETE FROM controls WHERE id='unrelated-control'"),
+    ];
+    let control = |operation: &str, action: &str| {
+        app.execute_human_command(&HumanCommand::Control {
+            operation_id: operation.into(),
+            task_id: task.clone(),
+            expected_version: fixture
+                .scalar(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+            action: action.into(),
+            payload: serde_json::json!({"settings_revision":1}),
+        })
+    };
+    for manager_stopped in [false, true] {
+        if manager_stopped {
+            assert_eq!(
+                control("stop-for-continue", "stop_manager").unwrap().state,
+                "manager_stop_held"
+            );
+        }
+        let actions: &[&str] = if manager_stopped {
+            &["continue_manager"]
+        } else {
+            &[
+                "stop_manager",
+                "change_manager_safe_boundary",
+                "change_manager_interrupt",
+            ]
+        };
+        for (name, setup, undo) in conflicts {
+            fixture.execute_batch(setup);
+            let before: String = fixture.scalar(&format!(
+                "SELECT version||':'||(SELECT COUNT(*) FROM controls)||':'||
+                   (SELECT state||':'||payload_json||':'||updated_at FROM controls WHERE id='failed-main-history')
+                 FROM tasks WHERE id='{task}'"
+            ));
+            for action in actions {
+                let operation = format!("refuse-{name}-{action}");
+                let error = control(&operation, action).unwrap_err().to_string();
+                assert!(
+                    error.contains("does not clear another active workflow hold"),
+                    "{name} {action}: {error}"
+                );
+                fixture.assert_scalar::<i64>(
+                    &format!(
+                        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='{operation}'"
+                    ),
+                    0,
+                );
+                fixture.assert_scalar::<String>(&format!(
+                    "SELECT version||':'||(SELECT COUNT(*) FROM controls)||':'||
+                       (SELECT state||':'||payload_json||':'||updated_at FROM controls WHERE id='failed-main-history')
+                     FROM tasks WHERE id='{task}'"
+                ), before.clone());
+            }
+            fixture.execute_batch(undo);
+            fixture.execute(
+                "UPDATE controls SET state='failed',payload_json=?1 WHERE id='failed-main-history'",
+                params![payload],
+            );
+            fixture.execute_batch(
+                "UPDATE sessions SET status='exited',launch_state='finished',process_identity_json=NULL,
+                   exit_json='{\"process_group_quiescent\":true}' WHERE id='verification-session';
+                 UPDATE role_generations SET status='exited',created_at='2026-01-01T00:00:00Z',
+                   attempt_id=(SELECT attempt_id FROM controls WHERE id='failed-main-history') WHERE id='verification-generation';",
+            );
+        }
+    }
+    assert_eq!(
+        control("continue-after-settlement", "continue_manager")
+            .unwrap()
+            .state,
+        "manager_stop_released"
+    );
+    drop(app);
+    let _ = std::fs::remove_dir_all(paths.socket_dir);
+}
+
+#[test]
 fn g14_failed_manager_signals_require_fresh_human_recovery() {
     let fixture = Fixture::new("g14-manager-signal-failure");
     let (_, task, plan) = new_task(&fixture, "manager signal failure", "recover manager");
@@ -25118,7 +27058,7 @@ fn g14_failed_manager_signals_require_fresh_human_recovery() {
     );
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM launch_permits", 0);
     fixture.assert_scalar::<i64>(
-        "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        &format!("SELECT version FROM tasks WHERE id='{}'", plan.task_id),
         6,
     );
     let failure_payload: serde_json::Value = fixture
@@ -25194,7 +27134,7 @@ fn g14_failed_manager_signals_require_fresh_human_recovery() {
         "superseded".into(),
     );
     fixture.assert_scalar::<i64>(
-        "SELECT version FROM tasks WHERE id=(SELECT task_id FROM attempts LIMIT 1)",
+        &format!("SELECT version FROM tasks WHERE id='{}'", plan.task_id),
         7,
     );
     drop(app);
@@ -26011,7 +27951,7 @@ fn t07_input_lease_excludes_guidance_and_rejects_stale_authority() {
     assert_eq!(guidance_state("enveloped-guidance"), "acknowledged");
 
     let (permission_fixture, _paths, _project, admission) =
-        authorized_runtime_fixture("t07-codex-permission-denial-readiness");
+        authorized_legacy_runtime_fixture("t07-codex-permission-denial-readiness");
     let (launch, _, _, _, _) = start_synthetic_runtime_probe(
         &permission_fixture,
         &admission,
@@ -27510,7 +29450,11 @@ fn ordinary_role_context_exposes_exact_bounded_contract_without_new_authority() 
         provider: Provider::Codex,
         configuration_revision: 1,
         lane_id: "default".into(),
-        permissions: vec!["report_result".into(), "request_next_role".into()],
+        permissions: vec![
+            "read_context".into(),
+            "report_result".into(),
+            "request_next_role".into(),
+        ],
     };
     fixture.execute(
         "UPDATE role_settings SET effective_generation_id='context-manager-generation'
@@ -27519,7 +29463,7 @@ fn ordinary_role_context_exposes_exact_bounded_contract_without_new_authority() 
     );
     fixture.execute(
         "INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at)
-         VALUES('context-manager-credential','context-manager-generation','context-manager-hash','[]','2026-01-01T00:00:00Z')",
+         VALUES('context-manager-credential','context-manager-generation','context-manager-hash','[\"read_context\",\"report_result\",\"request_next_role\"]','2026-01-01T00:00:00Z')",
         [],
     );
     let config_revision: String = fixture
@@ -27625,6 +29569,16 @@ fn ordinary_role_context_exposes_exact_bounded_contract_without_new_authority() 
     .unwrap();
 
     let context = app.role_context_payload(&manager).unwrap();
+    let initial_index = app.role_context_delivery_payload(&manager, None).unwrap();
+    assert_eq!(
+        initial_index,
+        app.role_context_delivery_payload(&manager, None).unwrap()
+    );
+    let initial_cursor = initial_index["entries"][0]["first"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(context.get("context_scope").is_none());
     let report_contract = agenticjira::domain::ROLE_RESULT_REPORT_CONTRACT;
     assert!(report_contract.contains("apply only to invoking `role report`"));
     assert!(report_contract.contains("ordinary task review"));
@@ -27837,7 +29791,20 @@ fn ordinary_role_context_exposes_exact_bounded_contract_without_new_authority() 
     assert!(yield_required.contains(&serde_json::json!("agent_claimed_output_hash")));
     assert!(!yield_required.contains(&serde_json::json!("output_hash")));
     fixture.execute(
-        "UPDATE attempts SET phase='implementation',plan_hash='feedback-plan' WHERE id=?1",
+        "UPDATE attempts SET plan_hash='feedback-plan' WHERE id=?1",
+        params![manager.attempt_id],
+    );
+    assert!(app
+        .role_context_delivery_payload(&manager, Some(&initial_cursor))
+        .unwrap_err()
+        .to_string()
+        .contains("cursor is stale"));
+    assert_ne!(
+        app.role_context_delivery_payload(&manager, None).unwrap()["revision"],
+        initial_index["revision"]
+    );
+    fixture.execute(
+        "UPDATE attempts SET phase='implementation' WHERE id=?1",
         params![manager.attempt_id],
     );
     fixture.execute(
@@ -28265,6 +30232,8 @@ fn ordinary_role_context_exposes_exact_bounded_contract_without_new_authority() 
         "tests/contracts.rs"
     );
     assert_eq!(plan_evidence["structured_plan"]["plan"], structured_plan);
+    assert_eq!(plan_evidence["ownership_mode"], "unavailable");
+    assert_eq!(plan_evidence["lanes"]["availability"], "unavailable");
     assert_eq!(
         plan_evidence["structured_plan"]["plan_review_receipt"]["availability"],
         "unavailable"
@@ -28372,6 +30341,135 @@ fn ordinary_role_context_exposes_exact_bounded_contract_without_new_authority() 
         [],
     );
     fixture.execute(
+        "UPDATE review_requests SET session_id='context-code-reviewer-session'
+         WHERE id='context-current-code-review'",
+        [],
+    );
+    fixture.execute(
+        "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,
+           session_id,prompt_hash,handoff_hash,delivery_state,prompt_text,handoff_json,created_at,updated_at)
+         VALUES('context-current-final-review',?1,'final',?2,'context-final-reviewer-generation',
+           'context-final-reviewer-session','current-final-prompt','current-final-handoff','delivered',
+           'verify exact current candidate','{\"final_request\":\"current\"}',
+           '2026-01-01T00:53:00Z','2026-01-01T00:53:00Z')",
+        params![manager.attempt_id, current_candidate_hash],
+    );
+    let default_context = app.role_context_payload(&final_reviewer).unwrap();
+    let default_evidence = &default_context["ordinary_review_evidence"];
+    assert_eq!(default_evidence["ownership_mode"], "default_single_writer");
+    assert_eq!(default_evidence["lanes"]["availability"], "not_applicable");
+    assert!(default_evidence["lanes"]["records"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        default_evidence["integration"]["availability"],
+        "not_applicable"
+    );
+    assert_eq!(
+        default_evidence["candidate_writer_evidence"]["availability"],
+        "unavailable"
+    );
+    assert!(default_evidence["candidate_writer_evidence"]["source_writer"].is_null());
+    fixture.execute(
+        "UPDATE role_generations SET status='exited',updated_at='2026-01-01T00:05:30Z'
+         WHERE id='context-lane-generation'",
+        [],
+    );
+    fixture.execute(
+        "UPDATE sessions SET native_session_id='context-writer-native',
+           launch_state='finished',updated_at='2026-01-01T00:05:30Z',
+           exit_json='{\"process_group_quiescent\":true,\"source\":\"synthetic_fixture\",\"observed_at\":\"2026-01-01T00:05:30Z\"}'
+         WHERE id='context-lane-session'",
+        [],
+    );
+    fixture.execute(
+        "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,
+           evidence_json,metadata_json,created_at,consumed_at)
+         VALUES('context-candidate-result','context-candidate-report','context-lane-session',
+           'context-lane-generation','candidate_ready','synthetic candidate','[]',?1,
+           '2026-01-01T00:05:00Z','2026-01-01T00:06:00Z')",
+        params![serde_json::json!({"lane_yield":{"plan_hash":current_plan_hash}}).to_string()],
+    );
+    fixture.execute(
+        "INSERT INTO freeze_intents(id,attempt_id,kind,source_role_generation_id,state,
+           result_snapshot_id,created_at,updated_at)
+         VALUES('context-candidate-freeze',?1,'candidate','context-lane-generation','complete',
+           'context-current-candidate','2026-01-01T00:05:40Z','2026-01-01T00:06:00Z')",
+        params![manager.attempt_id],
+    );
+    let default_context = app.role_context_payload(&final_reviewer).unwrap();
+    let writer_evidence = &default_context["ordinary_review_evidence"]["candidate_writer_evidence"];
+    assert_eq!(writer_evidence["availability"], "available");
+    assert_eq!(
+        writer_evidence["review_request_id"],
+        "context-current-final-review"
+    );
+    assert_eq!(writer_evidence["attempt_id"], manager.attempt_id);
+    assert_eq!(writer_evidence["candidate_hash"], current_candidate_hash);
+    assert_eq!(writer_evidence["snapshot_id"], "context-current-candidate");
+    let source_writer = &writer_evidence["source_writer"];
+    assert_eq!(
+        source_writer["role_generation_id"],
+        "context-lane-generation"
+    );
+    assert_eq!(source_writer["session_id"], "context-lane-session");
+    assert_eq!(source_writer["result_id"], "context-candidate-result");
+    assert_eq!(
+        source_writer["recorded_quiescence"]["process_group_quiescent"],
+        true
+    );
+    assert_eq!(
+        source_writer["recorded_quiescence"]["exit_source"],
+        "synthetic_fixture"
+    );
+    assert_eq!(
+        source_writer["recorded_quiescence"]["observed_at"],
+        "2026-01-01T00:05:30Z"
+    );
+    assert_eq!(
+        source_writer["freeze_observation"]["freeze_intent_id"],
+        "context-candidate-freeze"
+    );
+    assert_eq!(
+        writer_evidence["current_evaluation"]["persisted_receipt"],
+        false
+    );
+    assert_eq!(
+        writer_evidence["current_evaluation"]["writer_session_conflict"],
+        false
+    );
+    assert_eq!(
+        writer_evidence["current_evaluation"]["writer_generation_conflict"],
+        false
+    );
+    let mut configured_plan = structured_plan.clone();
+    configured_plan["ownership"] = serde_json::json!({"lanes":[
+        {"lane_key":"contracts","owned_paths":["tests/contracts.rs"],"shared_paths":[],"protected_paths":[],"dependencies":[]},
+        {"lane_key":"runtime","owned_paths":["src/runtime.rs"],"shared_paths":[],"protected_paths":[],"dependencies":[]}
+    ]});
+    fixture.execute(
+        "UPDATE trip_structured_plans SET plan_json=?1,ownership_hash=?2
+         WHERE id='context-current-structured-plan'",
+        params![
+            configured_plan.to_string(),
+            agenticjira::store::json_hash(&configured_plan["ownership"]).unwrap()
+        ],
+    );
+    let configured_missing = app.role_context_payload(&final_reviewer).unwrap();
+    assert_eq!(
+        configured_missing["ordinary_review_evidence"]["ownership_mode"],
+        "configured_lanes"
+    );
+    assert_eq!(
+        configured_missing["ordinary_review_evidence"]["lanes"]["availability"],
+        "unavailable"
+    );
+    assert_eq!(
+        configured_missing["ordinary_review_evidence"]["integration"]["availability"],
+        "unavailable"
+    );
+    fixture.execute(
         "INSERT INTO implementation_lanes(id,attempt_id,lane_key,owned_paths_json,shared_paths_json,
            protected_paths_json,dependencies_json,source_hashes_json,frozen_seams_hash,required,state,
            admitted_by_generation_id,yielded_at,receipt_json,created_at,updated_at)
@@ -28439,6 +30537,7 @@ fn ordinary_role_context_exposes_exact_bounded_contract_without_new_authority() 
         "recorded"
     );
     assert_eq!(code_evidence["lanes"]["records"][0]["state"], "yielded");
+    assert_eq!(code_evidence["lanes"]["availability"], "unavailable");
     assert_eq!(
         code_evidence["lanes"]["records"][0]["yield_receipt"]["agent_claimed_output_hash"],
         "context-output"
@@ -28613,14 +30712,6 @@ fn ordinary_role_context_exposes_exact_bounded_contract_without_new_authority() 
            '2026-01-01T00:55:00Z','2026-01-01T00:55:00Z')",
         params![manager.attempt_id, current_candidate_hash],
     );
-    fixture.execute(
-        "INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,
-           prompt_hash,handoff_hash,delivery_state,prompt_text,handoff_json,created_at,updated_at)
-         VALUES('context-current-final-review',?1,'final',?2,'context-final-reviewer-generation',
-           'current-final-prompt','current-final-handoff','delivered','verify exact current candidate',
-           '{\"final_request\":\"current\"}','2026-01-01T00:53:00Z','2026-01-01T00:53:00Z')",
-        params![manager.attempt_id, current_candidate_hash],
-    );
     let configuration_hash = fixture
         .connection()
         .query_row(
@@ -28723,6 +30814,10 @@ fn ordinary_role_context_exposes_exact_bounded_contract_without_new_authority() 
     );
     assert_eq!(final_evidence["manager_conformance_receipt"]["revision"], 2);
     assert_eq!(
+        final_evidence["manager_conformance_receipt"]["evidence_kind"],
+        "manager_submitted_assertions"
+    );
+    assert_eq!(
         final_evidence["manager_conformance_receipt"]["candidate_hash"],
         current_candidate_hash
     );
@@ -28779,6 +30874,355 @@ fn ordinary_role_context_exposes_exact_bounded_contract_without_new_authority() 
         .unwrap()
         .get("ordinary_review_evidence")
         .is_none());
+
+    assert_eq!(
+        final_evidence["candidate_writer_evidence"]["availability"],
+        "available"
+    );
+    let recorded_exit: String =
+        fixture.scalar("SELECT exit_json FROM sessions WHERE id='context-lane-session'");
+    for exit in [
+        serde_json::json!({"process_group_quiescent":false,"source":"synthetic_fixture"}),
+        serde_json::json!({"source":"synthetic_fixture"}),
+    ] {
+        fixture.execute(
+            "UPDATE sessions SET exit_json=?1 WHERE id='context-lane-session'",
+            params![exit.to_string()],
+        );
+        let current = app.role_context_payload(&final_reviewer).unwrap();
+        let writer = &current["ordinary_review_evidence"]["candidate_writer_evidence"];
+        assert_eq!(writer["availability"], "unavailable");
+        assert_eq!(
+            writer["current_evaluation"]["recorded_source_quiescent"],
+            false
+        );
+        assert_eq!(
+            writer["source_writer"]["recorded_quiescence"]["process_group_quiescent"],
+            exit["process_group_quiescent"]
+        );
+        assert_eq!(
+            writer["source_writer"]["freeze_observation"]["state"],
+            "complete"
+        );
+    }
+    fixture.execute(
+        "UPDATE sessions SET exit_json=?1 WHERE id='context-lane-session'",
+        params![recorded_exit],
+    );
+    seed_session(
+        &fixture,
+        &manager.attempt_id,
+        "implementer",
+        "context-conflicting-writer-generation",
+        "context-conflicting-writer-session",
+        "running",
+    );
+    let conflicting = app.role_context_payload(&final_reviewer).unwrap();
+    let conflicting_writer = &conflicting["ordinary_review_evidence"]["candidate_writer_evidence"];
+    assert_eq!(conflicting_writer["availability"], "unavailable");
+    assert_eq!(
+        conflicting_writer["current_evaluation"]["recorded_source_quiescent"],
+        true
+    );
+    assert_eq!(
+        conflicting_writer["current_evaluation"]["writer_session_conflict"],
+        true
+    );
+    assert_eq!(
+        conflicting_writer["current_evaluation"]["writer_generation_conflict"],
+        true
+    );
+    fixture.execute_batch(
+        "UPDATE sessions SET status='exited',exit_json='{\"process_group_quiescent\":true}'
+           WHERE id='context-conflicting-writer-session';
+         UPDATE role_generations SET status='exited' WHERE id='context-conflicting-writer-generation';",
+    );
+    for (mutation, restore) in [
+        (
+            "UPDATE freeze_intents SET result_snapshot_id='context-stale-candidate' WHERE id='context-candidate-freeze'",
+            "UPDATE freeze_intents SET result_snapshot_id='context-current-candidate' WHERE id='context-candidate-freeze'",
+        ),
+        (
+            "UPDATE freeze_intents SET source_role_generation_id='context-manager-generation' WHERE id='context-candidate-freeze'",
+            "UPDATE freeze_intents SET source_role_generation_id='context-lane-generation' WHERE id='context-candidate-freeze'",
+        ),
+        (
+            "UPDATE role_results SET session_id='context-other-manager-session' WHERE id='context-candidate-result'",
+            "UPDATE role_results SET session_id='context-lane-session' WHERE id='context-candidate-result'",
+        ),
+    ] {
+        fixture.execute(mutation, []);
+        let stale = app.role_context_payload(&final_reviewer).unwrap();
+        let writer = &stale["ordinary_review_evidence"]["candidate_writer_evidence"];
+        assert_eq!(writer["availability"], "unavailable", "{mutation}");
+        assert!(writer["source_writer"].is_null(), "{mutation}");
+        fixture.execute(restore, []);
+    }
+    let mut wrong_review_session = final_reviewer.clone();
+    wrong_review_session.session_id = manager.session_id.clone();
+    assert_eq!(
+        app.role_context_payload(&wrong_review_session).unwrap()["ordinary_review_evidence"]
+            ["candidate_writer_evidence"]["availability"],
+        "unavailable"
+    );
+    assert_eq!(
+        app.role_context_payload(&final_reviewer).unwrap()["ordinary_review_evidence"]
+            ["candidate_writer_evidence"]["availability"],
+        "available"
+    );
+
+    let explorer_candidate: String = fixture
+        .connection()
+        .query_row(
+            "SELECT candidate_hash FROM attempts WHERE id=?1",
+            params![manager.attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for (attempt, generation, session) in [
+        (
+            manager.attempt_id.as_str(),
+            "context-explorer-generation",
+            "context-explorer-session",
+        ),
+        (
+            "context-cross-attempt",
+            "context-cross-explorer-generation",
+            "context-cross-explorer-session",
+        ),
+    ] {
+        seed_session(&fixture, attempt, "explorer", generation, session, "exited");
+        fixture.execute(
+            "UPDATE role_generations SET status='exited' WHERE id=?1",
+            params![generation],
+        );
+    }
+    for index in 0..11 {
+        fixture.execute(
+            "INSERT INTO trip_explorer_decisions(id,attempt_id,stage,census_json,trigger,activated,
+               limits_json,candidate_hash,role_generation_id,outcome_json,created_at)
+             VALUES(?1,?2,'planning','{}','fixture',1,'{}',?3,'context-explorer-generation',?4,?5)",
+            params![
+                format!("context-older-explorer-{index}"), manager.attempt_id, explorer_candidate,
+                serde_json::json!({"outcome":"evidence_ready", "summary":"older_explorer_summary_sentinel",
+                    "evidence":["older_explorer_evidence_sentinel"]}).to_string(),
+                format!("2000-01-01T00:00:{index:02}Z")
+            ],
+        );
+    }
+    let current_outcome = serde_json::json!({
+        "outcome":"evidence_ready", "summary":"Current planning findings and consequences",
+        "evidence":["Keep the current entrypoint authorization boundary", "Read every evidence page", "Preserve exact report provenance"]
+    });
+    for (id, attempt, candidate, generation, outcome, created) in [
+        (
+            "context-current-explorer",
+            manager.attempt_id.as_str(),
+            explorer_candidate.as_str(),
+            "context-explorer-generation",
+            current_outcome.clone(),
+            "2098-01-01T00:00:00Z",
+        ),
+        (
+            "context-stale-explorer",
+            manager.attempt_id.as_str(),
+            "stale-explorer-candidate",
+            "context-explorer-generation",
+            serde_json::json!({"outcome":"evidence_ready", "summary":"stale_explorer_summary_sentinel",
+                "evidence":["stale_explorer_evidence_sentinel"]}),
+            "2099-01-01T00:00:00Z",
+        ),
+        (
+            "context-cross-explorer",
+            "context-cross-attempt",
+            explorer_candidate.as_str(),
+            "context-cross-explorer-generation",
+            serde_json::json!({"outcome":"evidence_ready", "summary":"cross_explorer_summary_sentinel",
+                "evidence":["cross_explorer_evidence_sentinel"]}),
+            "2099-01-01T00:00:01Z",
+        ),
+    ] {
+        fixture.execute(
+            "INSERT INTO trip_explorer_decisions(id,attempt_id,stage,census_json,trigger,activated,
+               limits_json,candidate_hash,role_generation_id,outcome_json,created_at)
+             VALUES(?1,?2,'planning','{}','fixture',1,'{}',?3,?4,?5,?6)",
+            params![
+                id,
+                attempt,
+                candidate,
+                generation,
+                outcome.to_string(),
+                created
+            ],
+        );
+    }
+    let explorer_context = app.role_context_payload(&manager).unwrap();
+    let current_explorer = &explorer_context["current_explorer_evidence"];
+    assert_eq!(current_explorer["decision_id"], "context-current-explorer");
+    assert_eq!(current_explorer["attempt_id"], manager.attempt_id);
+    assert_eq!(current_explorer["stage"], "planning");
+    assert_eq!(current_explorer["candidate_hash"], explorer_candidate);
+    assert_eq!(
+        current_explorer["reporting_generation_id"],
+        "context-explorer-generation"
+    );
+    assert_eq!(current_explorer["reporting_state"], "quiescent");
+    assert_eq!(current_explorer["outcome"], current_outcome["outcome"]);
+    assert_eq!(current_explorer["summary"], current_outcome["summary"]);
+    assert_eq!(current_explorer["evidence"], current_outcome["evidence"]);
+    assert_eq!(current_explorer["evidence_total_count"], 3);
+    assert_eq!(current_explorer["evidence_truncated"], false);
+    let historical = explorer_context["explorer_decisions"].as_array().unwrap();
+    assert_eq!(historical.len(), 10);
+    assert!(!historical
+        .iter()
+        .any(|decision| decision["decision_id"] == "context-current-explorer"));
+    assert!(historical.iter().all(|decision| {
+        decision["evidence_submitted"] == true
+            && decision.get("outcome").is_none()
+            && decision.get("summary").is_none()
+            && decision.get("evidence").is_none()
+    }));
+    let serialized_explorer = serde_json::to_string(&explorer_context).unwrap();
+    for sentinel in [
+        "older_explorer_summary_sentinel",
+        "older_explorer_evidence_sentinel",
+        "stale_explorer_summary_sentinel",
+        "stale_explorer_evidence_sentinel",
+        "cross_explorer_summary_sentinel",
+        "cross_explorer_evidence_sentinel",
+    ] {
+        assert!(!serialized_explorer.contains(sentinel), "{sentinel}");
+    }
+    let assert_paged_sections = |expected: &serde_json::Value, sections: &[&str]| {
+        let mut index = app.role_context_delivery_payload(&manager, None).unwrap();
+        let revision = index["revision"].as_str().unwrap().to_owned();
+        let scope = index["scope"].clone();
+        assert_eq!(scope.as_str().unwrap().len(), 32);
+        assert_eq!(revision, agenticjira::store::json_hash(expected).unwrap());
+        assert_eq!(revision.len(), 64);
+        let mut entries = Vec::new();
+        let mut index_pages = 0;
+        loop {
+            assert!(serde_json::to_string(&index).unwrap().len() + 1 <= 4096);
+            assert_eq!(index["page"], index_pages);
+            assert_eq!(index["revision"], revision);
+            assert_eq!(index["scope"], scope);
+            entries.extend(index["entries"].as_array().unwrap().iter().cloned());
+            index_pages += 1;
+            let Some(next) = index["next"].as_str() else {
+                assert_eq!(index["complete"], true);
+                assert_eq!(index["pages"], index_pages);
+                break;
+            };
+            assert_eq!(index["complete"], false);
+            index = app
+                .role_context_delivery_payload(&manager, Some(next))
+                .unwrap();
+        }
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        for name in sections {
+            let entry = entries.iter().find(|entry| entry["name"] == *name).unwrap();
+            let mut cursor = entry["first"].as_str().unwrap().to_owned();
+            let mut reconstructed = String::new();
+            let mut count = 0;
+            loop {
+                let page = app
+                    .role_context_delivery_payload(&manager, Some(&cursor))
+                    .unwrap();
+                assert!(format!("{}\n", serde_json::to_string(&page).unwrap()).len() <= 4096);
+                assert_eq!(page["revision"], revision);
+                assert_eq!(page["scope"], scope);
+                assert_eq!(page["section"], *name);
+                assert_eq!(page["page"], count);
+                assert_eq!(page["pages"], entry["pages"]);
+                assert_eq!(page["encoding"], "utf8_json_chunk");
+                reconstructed.push_str(page["chunk"].as_str().unwrap());
+                count += 1;
+                let Some(next) = page["next"].as_str() else {
+                    break;
+                };
+                cursor = next.to_owned();
+            }
+            assert_eq!(entry["pages"], count);
+            assert_eq!(entry["bytes"], reconstructed.len());
+            assert_eq!(entry["digest"], &sha256(reconstructed.as_bytes())[..32]);
+            assert_eq!(
+                reconstructed,
+                serde_json::to_string(&expected[*name]).unwrap()
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&reconstructed).unwrap(),
+                expected[*name]
+            );
+        }
+    };
+    assert_paged_sections(
+        &explorer_context,
+        &["current_explorer_evidence", "commands"],
+    );
+    fixture.execute(
+        "UPDATE sessions SET exit_json=NULL WHERE id='context-explorer-session'",
+        [],
+    );
+    assert_eq!(
+        app.role_context_payload(&manager).unwrap()["current_explorer_evidence"]["reporting_state"],
+        "pending"
+    );
+    fixture.execute("UPDATE sessions SET exit_json='{\"process_group_quiescent\":true}' WHERE id='context-explorer-session'", []);
+    let large_outcome = serde_json::json!({
+        "outcome":"evidence_ready", "summary":"s".repeat(64 * 1024),
+        "evidence":vec!["e".repeat(8192);128]
+    });
+    fixture.execute(
+        "UPDATE trip_explorer_decisions SET outcome_json=?1 WHERE id='context-current-explorer'",
+        params![large_outcome.to_string()],
+    );
+    fixture.execute(
+        "UPDATE tasks SET description=?1 WHERE id=?2",
+        params!["é中😀\"\\\n".repeat(4096), manager.task_id],
+    );
+    let bounded_context = app.role_context_payload(&manager).unwrap();
+    let bounded_explorer = &bounded_context["current_explorer_evidence"];
+    assert_eq!(bounded_explorer["summary"], large_outcome["summary"]);
+    assert_eq!(bounded_explorer["evidence_total_count"], 128);
+    assert_eq!(bounded_explorer["evidence_truncated"], true);
+    let truncation_guidance = bounded_explorer["guidance"].as_str().unwrap();
+    assert!(truncation_guidance.contains("disclose that evidence was omitted"));
+    assert!(truncation_guidance.contains("do not claim complete consumption"));
+    assert!(truncation_guidance
+        .contains("request the missing evidence through supported human guidance"));
+    assert!(truncation_guidance.contains("Dashboard inspection is for the human"));
+    assert!(truncation_guidance.contains("roles must not access the human-control channel"));
+    let bounded_items = bounded_explorer["evidence"].as_array().unwrap();
+    assert_eq!(bounded_items.len(), 32);
+    assert_eq!(
+        bounded_items
+            .iter()
+            .map(|item| item.as_str().unwrap().len())
+            .sum::<usize>(),
+        256 * 1024
+    );
+    assert!(serde_json::to_vec(&bounded_context).unwrap().len() <= 1024 * 1024);
+    assert_paged_sections(&bounded_context, &["current_explorer_evidence", "task"]);
+    let recorded_outcome: String = fixture.scalar(
+        "SELECT outcome_json FROM trip_explorer_decisions WHERE id='context-current-explorer'",
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&recorded_outcome).unwrap(),
+        large_outcome
+    );
 
     let oversized_output = "x".repeat(1024 * 1024);
     fixture.execute(
@@ -28865,15 +31309,15 @@ fn assert_mb10_needs_rework_returns_to_plan_review(automatic: bool) {
     );
     let connection = fixture.connection();
     connection.execute_batch(
-        "UPDATE role_settings SET effective_generation_id='manager-generation'
-           WHERE task_id=(SELECT id FROM tasks LIMIT 1) AND role='manager';
+        &format!("UPDATE role_settings SET effective_generation_id='manager-generation'
+           WHERE task_id='{task}' AND role='manager';
          UPDATE role_settings SET effective_generation_id='reviewer-generation'
-           WHERE task_id=(SELECT id FROM tasks LIMIT 1) AND role='plan_reviewer';
+           WHERE task_id='{task}' AND role='plan_reviewer';
          UPDATE sessions SET readiness_state='idle_candidate' WHERE id='manager-session';
          INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at)
            VALUES('manager-credential','manager-generation','manager-hash','[\"report_result\"]','2026-01-01T00:00:00Z');
          INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at)
-           VALUES('reviewer-credential','reviewer-generation','reviewer-hash','[\"report_result\"]','2026-01-01T00:00:00Z')",
+           VALUES('reviewer-credential','reviewer-generation','reviewer-hash','[\"report_result\"]','2026-01-01T00:00:00Z')"),
     ).unwrap();
     let manager_context = RoleContext {
         project_id: project.clone(),
@@ -29064,8 +31508,8 @@ fn assert_mb10_needs_rework_returns_to_plan_review(automatic: bool) {
         assert_eq!(applied["action"], "review_applied");
         assert_eq!(applied["verdict"], "needs_rework");
     } else {
-        let version = fixture
-            .scalar::<i64>("SELECT version FROM tasks WHERE id=(SELECT id FROM tasks LIMIT 1)");
+        let version =
+            fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"));
         let applied = app
             .execute_human_command(&HumanCommand::ReviewVerdict {
                 operation_id: "human-needs-rework-verdict".into(),
@@ -29113,8 +31557,7 @@ fn assert_mb10_needs_rework_returns_to_plan_review(automatic: bool) {
         ),
         1
     );
-    let version =
-        fixture.scalar::<i64>("SELECT version FROM tasks WHERE id=(SELECT id FROM tasks LIMIT 1)");
+    let version = fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"));
     app.execute_human_command(&HumanCommand::Control {
         operation_id: format!("{mode}-continue-needs-rework"),
         task_id: task.clone(),
@@ -29124,10 +31567,14 @@ fn assert_mb10_needs_rework_returns_to_plan_review(automatic: bool) {
     })
     .unwrap();
     assert_eq!(app.coordinator_tick().unwrap()["action"], "continued");
-    assert_eq!(fixture.scalar::<String>(
-        "SELECT a.phase || ':' || a.status || ':' || t.attention
-         FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=(SELECT id FROM attempts LIMIT 1)",
-    ), "planning:running:none");
+    assert_eq!(
+        fixture.scalar::<String>(&format!(
+            "SELECT a.phase || ':' || a.status || ':' || t.attention
+         FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id='{}'",
+            plan.attempt_id
+        ),),
+        "planning:running:none"
+    );
     fixture
         .store
         .save_role_result(
@@ -29167,7 +31614,10 @@ fn assert_mb10_needs_rework_returns_to_plan_review(automatic: bool) {
         "manager_transition_applied"
     );
     assert_eq!(
-        fixture.scalar::<String>("SELECT phase FROM attempts LIMIT 1"),
+        fixture.scalar::<String>(&format!(
+            "SELECT phase FROM attempts WHERE id='{}'",
+            plan.attempt_id
+        )),
         "plan_review"
     );
     if automatic {
@@ -29230,11 +31680,12 @@ fn assert_mb10_needs_rework_returns_to_plan_review(automatic: bool) {
                 |row| row.get(0),
             )
             .unwrap();
-        let version_before = fixture
-            .scalar::<i64>("SELECT version FROM tasks WHERE id=(SELECT id FROM tasks LIMIT 1)");
-        let spent_before = fixture.scalar::<i64>(
-            "SELECT spent FROM review_budgets WHERE attempt_id=(SELECT id FROM attempts LIMIT 1) AND review_kind='plan'",
-        );
+        let version_before =
+            fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+        let spent_before = fixture.scalar::<i64>(&format!(
+            "SELECT spent FROM review_budgets WHERE attempt_id='{}' AND review_kind='plan'",
+            plan.attempt_id
+        ));
         let database = fixture.database.clone();
         let root = fixture.root.clone();
         drop(reviews);
@@ -29417,12 +31868,79 @@ fn reviewed_unapproved_plan_revision_requires_exact_binding_and_review_allowance
             params![plan.attempt_id],
         )
         .unwrap();
+    let question = fixture
+        .store
+        .save_role_result(
+            &context,
+            &RoleResultReport {
+                operation_id: "revision-scope-question".into(),
+                outcome: "needs_input".into(),
+                summary: "Which navigation scope should the revision retain?".into(),
+                evidence: vec![],
+                metadata: serde_json::json!({}),
+            },
+        )
+        .unwrap();
+    let answered_revision = fixture
+        .store
+        .save_role_result(
+            &context,
+            &RoleResultReport {
+                operation_id: "answered-revised-plan".into(),
+                outcome: "plan_ready".into(),
+                summary: "revision after scope answer".into(),
+                evidence: vec!["navigation source and scope answer".into()],
+                metadata: serde_json::json!({
+                    "plan":"corrected navigation plan after scope answer",
+                    "structured_plan":structured,
+                    "supersedes_plan_hash":"reviewed-plan"
+                }),
+            },
+        )
+        .unwrap();
+    let retired = app.coordinator_tick().unwrap();
+    assert_eq!(retired["action"], "stale_reports_superseded", "{retired}");
+    assert!(retired["result_ids"]
+        .as_array()
+        .unwrap()
+        .contains(&question["result_id"]));
+    let superseded = app.coordinator_tick().unwrap();
     assert_eq!(
-        app.coordinator_tick().unwrap()["action"],
-        "unapproved_plan_superseded"
+        superseded["action"], "unapproved_plan_superseded",
+        "{superseded}"
+    );
+    assert_eq!(superseded["previous_plan_hash"], "reviewed-plan");
+    assert_eq!(superseded["role_result_id"], answered_revision["result_id"]);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE event_code='role_result.superseded'
+           AND entity_id=?1 AND json_extract(detail_json,'$.superseded_by')=?2",
+                params![
+                    question["result_id"].as_str().unwrap(),
+                    answered_revision["result_id"].as_str().unwrap()
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
     );
     assert_eq!(
-        fixture.scalar::<String>("SELECT phase FROM attempts LIMIT 1"),
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.attention.changed'
+           AND entity_id=?1 AND json_extract(detail_json,'$.reason')='role_needs_input'",
+                params![plan.attempt_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        fixture.scalar::<String>(&format!(
+            "SELECT phase FROM attempts WHERE id='{}'",
+            plan.attempt_id
+        )),
         "planning"
     );
     assert_eq!(app.coordinator_tick().unwrap()["action"], "plan_frozen");
@@ -29431,7 +31949,10 @@ fn reviewed_unapproved_plan_revision_requires_exact_binding_and_review_allowance
         "manager_transition_applied"
     );
     assert_eq!(
-        fixture.scalar::<String>("SELECT phase FROM attempts LIMIT 1"),
+        fixture.scalar::<String>(&format!(
+            "SELECT phase FROM attempts WHERE id='{}'",
+            plan.attempt_id
+        )),
         "plan_review"
     );
     assert_eq!(
@@ -29491,11 +32012,17 @@ fn reviewed_unapproved_plan_revision_requires_exact_binding_and_review_allowance
         "plan_approved"
     );
     assert_eq!(
-        fixture.scalar::<String>("SELECT structured_plan_id FROM attempts LIMIT 1"),
+        fixture.scalar::<String>(&format!(
+            "SELECT structured_plan_id FROM attempts WHERE id='{}'",
+            plan.attempt_id
+        )),
         structured_id
     );
     assert_eq!(
-        fixture.scalar::<String>("SELECT phase FROM attempts LIMIT 1"),
+        fixture.scalar::<String>(&format!(
+            "SELECT phase FROM attempts WHERE id='{}'",
+            plan.attempt_id
+        )),
         "awaiting_implementation_authorization"
     );
 }
@@ -29586,9 +32113,10 @@ fn mb10_human_plan_rejection_consumes_exact_result_and_requires_fresh_manager_pl
         "manager_transition_applied"
     );
     assert_eq!(
-        fixture.scalar::<String>(
-            "SELECT phase FROM attempts WHERE id=(SELECT id FROM attempts LIMIT 1)"
-        ),
+        fixture.scalar::<String>(&format!(
+            "SELECT phase FROM attempts WHERE id='{owner_attempt}'",
+            owner_attempt = plan.attempt_id
+        )),
         "plan_review"
     );
     let stale_proposal = fixture
@@ -29776,9 +32304,10 @@ fn mb10_human_plan_rejection_consumes_exact_result_and_requires_fresh_manager_pl
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    let later_role_setting_before = fixture.scalar::<String>(
-        "SELECT config_json FROM role_settings WHERE task_id=(SELECT id FROM tasks LIMIT 1) AND role='implementer'",
-    );
+    let later_role_setting_before = fixture.scalar::<String>(&format!(
+        "SELECT config_json FROM role_settings WHERE task_id='{owner_task}' AND role='implementer'",
+        owner_task = task
+    ));
     connection
         .execute(
             "UPDATE attempts SET status='held' WHERE id=?1",
@@ -29806,7 +32335,7 @@ fn mb10_human_plan_rejection_consumes_exact_result_and_requires_fresh_manager_pl
     assert_eq!(rejected.state, "request_changes");
     assert_eq!(
         fixture.scalar::<String>(
-            "SELECT a.status || ':' || t.attention FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=(SELECT id FROM attempts LIMIT 1)"
+            &format!("SELECT a.status || ':' || t.attention FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id='{owner_attempt}'", owner_attempt = plan.attempt_id)
         ),
         "held:paused"
     );
@@ -29961,7 +32490,10 @@ fn mb10_human_plan_rejection_consumes_exact_result_and_requires_fresh_manager_pl
         )
     );
     assert_eq!(
-        fixture.scalar::<String>("SELECT delivery_state FROM review_requests WHERE id=(SELECT id FROM review_requests LIMIT 1)"),
+        fixture.scalar::<String>(&format!(
+            "SELECT delivery_state FROM review_requests WHERE id='{}'",
+            first_review.request_id
+        )),
         "finished"
     );
     assert!(connection
@@ -30008,7 +32540,7 @@ fn mb10_human_plan_rejection_consumes_exact_result_and_requires_fresh_manager_pl
     );
     assert_eq!(
         fixture.scalar::<String>(
-            "SELECT config_json FROM role_settings WHERE task_id=(SELECT id FROM tasks LIMIT 1) AND role='implementer'"
+            &format!("SELECT config_json FROM role_settings WHERE task_id='{owner_task}' AND role='implementer'", owner_task = task)
         ),
         later_role_setting_before
     );
@@ -30051,9 +32583,10 @@ fn mb10_human_plan_rejection_consumes_exact_result_and_requires_fresh_manager_pl
         1
     );
     assert_eq!(
-        fixture.scalar::<Option<String>>(
-            "SELECT plan_hash FROM attempts WHERE id=(SELECT id FROM attempts LIMIT 1)"
-        ),
+        fixture.scalar::<Option<String>>(&format!(
+            "SELECT plan_hash FROM attempts WHERE id='{owner_attempt}'",
+            owner_attempt = plan.attempt_id
+        )),
         Some(rejected_hash.clone())
     );
 
@@ -30134,9 +32667,10 @@ fn mb10_human_plan_rejection_consumes_exact_result_and_requires_fresh_manager_pl
         "plan freeze authority or post-rejection causal identity changed before publication"
     ));
     assert_eq!(
-        fixture.scalar::<String>(
-            "SELECT plan_hash FROM attempts WHERE id=(SELECT id FROM attempts LIMIT 1)"
-        ),
+        fixture.scalar::<String>(&format!(
+            "SELECT plan_hash FROM attempts WHERE id='{owner_attempt}'",
+            owner_attempt = plan.attempt_id
+        )),
         fresh_candidate_hash
     );
     assert_eq!(
@@ -30161,9 +32695,10 @@ fn mb10_human_plan_rejection_consumes_exact_result_and_requires_fresh_manager_pl
         replacement["manifest"]["replaced_rejected_plan_hash"],
         rejected_hash
     );
-    let fresh_hash = fixture.scalar::<String>(
-        "SELECT plan_hash FROM attempts WHERE id=(SELECT id FROM attempts LIMIT 1)",
-    );
+    let fresh_hash = fixture.scalar::<String>(&format!(
+        "SELECT plan_hash FROM attempts WHERE id='{owner_attempt}'",
+        owner_attempt = plan.attempt_id
+    ));
     assert_ne!(fresh_hash, rejected_hash);
     assert_eq!(fresh_hash, fresh_candidate_hash);
     assert!(connection
@@ -30577,7 +33112,10 @@ fn t09_rework_is_idempotent_materializes_full_candidate_and_fences_carry() {
             .allowed_controls
             .contains(&unavailable.into()));
     }
-    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     app.execute_human_command(&HumanCommand::Control {
         operation_id: "pause-pending-rework".into(),
         task_id: task.clone(),
@@ -30621,7 +33159,10 @@ fn t09_rework_is_idempotent_materializes_full_candidate_and_fences_carry() {
             .unwrap(),
         "paused:held:paused"
     );
-    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     let continue_rework = HumanCommand::Control {
         operation_id: "continue-paused-rework-once".into(),
         task_id: task.clone(),
@@ -30637,7 +33178,7 @@ fn t09_rework_is_idempotent_materializes_full_candidate_and_fences_carry() {
     let before_duplicate = (
         fixture.scalar::<i64>("SELECT COUNT(*) FROM controls"),
         fixture.scalar::<i64>("SELECT COUNT(*) FROM operation_receipts"),
-        fixture.scalar::<i64>("SELECT version FROM tasks"),
+        fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{}'",plan.task_id)),
         fixture.scalar::<String>(
             "SELECT ri.state || ':' || a.status FROM rework_intents ri
              JOIN attempts a ON a.id=ri.new_attempt_id",
@@ -30659,7 +33200,7 @@ fn t09_rework_is_idempotent_materializes_full_candidate_and_fences_carry() {
         (
             fixture.scalar::<i64>("SELECT COUNT(*) FROM controls"),
             fixture.scalar::<i64>("SELECT COUNT(*) FROM operation_receipts"),
-            fixture.scalar::<i64>("SELECT version FROM tasks"),
+            fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{}'",plan.task_id)),
             fixture.scalar::<String>(
                 "SELECT ri.state || ':' || a.status FROM rework_intents ri
                  JOIN attempts a ON a.id=ri.new_attempt_id",
@@ -30687,8 +33228,8 @@ fn t09_rework_is_idempotent_materializes_full_candidate_and_fences_carry() {
         "reserved:materialization_pending"
     );
     let before_stale = (
-        fixture.scalar::<i64>("SELECT version FROM tasks"),
-        fixture.scalar::<String>("SELECT attention FROM tasks"),
+        fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{}'",plan.task_id)),
+        fixture.scalar::<String>(&format!("SELECT attention FROM tasks WHERE id='{}'",plan.task_id)),
         fixture.scalar::<String>("SELECT state FROM workspaces WHERE attempt_id=(SELECT new_attempt_id FROM rework_intents)"),
     );
     connection.execute(
@@ -30714,8 +33255,8 @@ fn t09_rework_is_idempotent_materializes_full_candidate_and_fences_carry() {
         "reserved:materialization_pending"
     );
     assert_eq!((
-        fixture.scalar::<i64>("SELECT version FROM tasks"),
-        fixture.scalar::<String>("SELECT attention FROM tasks"),
+        fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{}'",plan.task_id)),
+        fixture.scalar::<String>(&format!("SELECT attention FROM tasks WHERE id='{}'",plan.task_id)),
         fixture.scalar::<String>("SELECT state FROM workspaces WHERE attempt_id=(SELECT new_attempt_id FROM rework_intents)"),
     ), before_stale);
     connection
@@ -30742,7 +33283,10 @@ fn t09_rework_is_idempotent_materializes_full_candidate_and_fences_carry() {
         .control_policy
         .allowed_controls
         .contains(&"continue".into()));
-    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     app.execute_human_command(&HumanCommand::Control {
         operation_id: "continue-parked-paused-rework".into(),
         task_id: task.clone(),
@@ -30783,7 +33327,10 @@ fn t09_rework_is_idempotent_materializes_full_candidate_and_fences_carry() {
             params![first.entity_id],
         )
         .unwrap();
-    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     app.execute_human_command(&HumanCommand::Control {
         operation_id: "continue-failed-rework".into(),
         task_id: task.clone(),
@@ -30801,7 +33348,10 @@ fn t09_rework_is_idempotent_materializes_full_candidate_and_fences_carry() {
         ),
         "recovery_required:needs_recovery:needs_recovery"
     );
-    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     app.execute_human_command(&HumanCommand::Control {
         operation_id: "pause-failed-rework".into(),
         task_id: task.clone(),
@@ -30819,7 +33369,10 @@ fn t09_rework_is_idempotent_materializes_full_candidate_and_fences_carry() {
         ),
         "recovery_required:needs_recovery:paused"
     );
-    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     app.execute_human_command(&HumanCommand::Control {
         operation_id: "cancel-failed-rework".into(),
         task_id: task.clone(),
@@ -30933,7 +33486,10 @@ fn t09_rework_is_idempotent_materializes_full_candidate_and_fences_carry() {
             params![plan.attempt_id],
         )
         .unwrap();
-    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     app.execute_human_command(&HumanCommand::Control {
         operation_id: "cancel-failed-rework-after-rejection".into(),
         task_id: task.clone(),
@@ -30982,7 +33538,10 @@ fn t09_rework_is_idempotent_materializes_full_candidate_and_fences_carry() {
         ),
         0
     );
-    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     assert!(app
         .execute_human_command(&HumanCommand::ResolveRecovery {
             operation_id: "retry-terminal-rework".into(),
@@ -32124,6 +34683,382 @@ fn trusted_implementer_hooks_fixture(
     let context = fixture.store.role_context("credential").unwrap();
     let workspace = workspace_path.to_string_lossy().into_owned();
     (fixture, context, native, workspace)
+}
+
+#[test]
+fn claude_readonly_report_permission_is_exact_once_and_revalidated() {
+    let (fixture, _, native, workspace) =
+        trusted_implementer_hooks_fixture("claude-report-permission", Provider::Claude);
+    let fixture = fixture.with_synthetic_claude();
+    fixture.execute(
+        "UPDATE role_generations SET role='manager' WHERE id='generation'",
+        [],
+    );
+    let paths = instance_paths(&fixture);
+    let executable = std::env::current_exe().unwrap();
+    let prepared = providers::prepare_role_launch_with_bundles(
+        Provider::Claude,
+        RoleKind::Manager,
+        "claude-opus-4-1",
+        "high",
+        std::path::Path::new(&workspace),
+        "report permission contract",
+        &paths.role_socket,
+        "credential",
+        "generation",
+        "session",
+        None,
+        &test_hooks(&fixture),
+        &executable,
+        fixture.synthetic_bundles.as_ref().unwrap(),
+    )
+    .unwrap();
+    require_fixture_current_policy(&fixture, &prepared.config).unwrap();
+    let policy = providers::capability_key(&prepared.config).unwrap();
+    fixture.execute("UPDATE sessions SET launch_config_json=?1,capability_key=?2,executable_version=?3 WHERE id='session'",
+        params![serde_json::to_string(&prepared.config).unwrap(),policy,prepared.config.executable_version]);
+    let context = fixture.store.role_context("credential").unwrap();
+    assert_eq!(context.role, RoleKind::Manager);
+    let report = serde_json::json!({"operation_id":"native-plan-report","outcome":"plan_ready",
+        "summary":"Permission delivery is not report execution","evidence":[],"metadata":{}});
+    let command = format!(
+        "{} role report --json '{}'",
+        providers::shell_quote(&executable.to_string_lossy()),
+        report
+    );
+    let begin = |label: &str, tool: &str, command: &str| {
+        let mut payload = permission_payload(
+            &native,
+            label,
+            serde_json::json!({"command":command,"cwd":workspace}),
+            None,
+        );
+        payload["tool_name"] = tool.into();
+        agenticjira::permissions::begin_request(&fixture.store, &context, &payload, "boot", label)
+            .unwrap()
+    };
+    let request = match begin("report-once", "Bash", &command) {
+        agenticjira::permissions::BridgeStart::Pending { request_id } => request_id,
+        agenticjira::permissions::BridgeStart::Immediate(response) => {
+            panic!("report request was denied: {response}")
+        }
+    };
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT COUNT(*) FROM permission_requests WHERE id='{request}'
+        AND state='pending' AND family_json IS NULL AND policy_fingerprint='{policy}' AND cwd!=''"
+        ),
+        1,
+    );
+    let always = HumanCommand::DecidePermission {
+        operation_id: "report-always".into(),
+        request_id: request.clone(),
+        expected_revision: 1,
+        decision: PermissionDecision::AlwaysApprove,
+        lifetime: Some(PermissionLifetime::Project),
+        reason: String::new(),
+    };
+    assert!(workflow::execute(&fixture.store, &always)
+        .unwrap_err()
+        .to_string()
+        .contains("no safely reusable command family"));
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM permission_rules", 0);
+    decide_permission(
+        &fixture,
+        "report-once-decision",
+        &request,
+        PermissionDecision::ApproveOnce,
+        None,
+        "",
+    );
+    assert_eq!(
+        consume_permission(
+            &fixture,
+            &request,
+            "boot",
+            "report-once",
+            "credential",
+            &context
+        ),
+        "allow"
+    );
+    assert_eq!(
+        agenticjira::permissions::mark_response_delivered(&fixture.store, "report-once").unwrap(),
+        1
+    );
+    assert_eq!(
+        consume_permission(
+            &fixture,
+            &request,
+            "boot",
+            "report-once",
+            "credential",
+            &context
+        ),
+        "deny"
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM role_results WHERE outcome='plan_ready'",
+        0,
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_kind='role_report'",
+        0,
+    );
+
+    let cursor = format!("v1:task:0:{}:{}", "ab".repeat(16), "cd".repeat(16));
+    let page_command = format!(
+        "{} role context --page {cursor}",
+        providers::shell_quote(&executable.to_string_lossy())
+    );
+    for (label, command) in [
+        (
+            "context-index-once",
+            format!(
+                "{} role context --index",
+                providers::shell_quote(&executable.to_string_lossy())
+            ),
+        ),
+        ("context-page-once", page_command.clone()),
+    ] {
+        let request = match begin(label, "Bash", &command) {
+            agenticjira::permissions::BridgeStart::Pending { request_id } => request_id,
+            agenticjira::permissions::BridgeStart::Immediate(response) => {
+                panic!("{label} was denied: {response}")
+            }
+        };
+        fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM permission_requests WHERE id='{request}' AND state='pending' AND family_json IS NULL"), 1);
+        let always = HumanCommand::DecidePermission {
+            operation_id: format!("{label}-always"),
+            request_id: request.clone(),
+            expected_revision: 1,
+            decision: PermissionDecision::AlwaysApprove,
+            lifetime: Some(PermissionLifetime::Project),
+            reason: String::new(),
+        };
+        assert!(workflow::execute(&fixture.store, &always)
+            .unwrap_err()
+            .to_string()
+            .contains("no safely reusable command family"));
+        decide_permission(
+            &fixture,
+            &format!("{label}-approve"),
+            &request,
+            PermissionDecision::ApproveOnce,
+            None,
+            "",
+        );
+        assert_eq!(
+            consume_permission(&fixture, &request, "boot", label, "credential", &context),
+            "allow"
+        );
+        assert_eq!(
+            agenticjira::permissions::mark_response_delivered(&fixture.store, label).unwrap(),
+            1
+        );
+        assert_eq!(
+            consume_permission(&fixture, &request, "boot", label, "credential", &context),
+            "deny"
+        );
+    }
+    let changed_page = match begin("changed-page-delivery", "Bash", &page_command) {
+        agenticjira::permissions::BridgeStart::Pending { request_id } => request_id,
+        _ => panic!("expected a pending page permission"),
+    };
+    decide_permission(
+        &fixture,
+        "approve-changed-page",
+        &changed_page,
+        PermissionDecision::ApproveOnce,
+        None,
+        "",
+    );
+    let changed_input =
+        serde_json::json!({"command":format!("{page_command} > output"),"cwd":workspace})
+            .to_string();
+    fixture.execute(
+        "UPDATE permission_requests SET input_json=?1,input_digest=?2 WHERE id=?3",
+        params![
+            changed_input,
+            sha256(changed_input.as_bytes()),
+            changed_page
+        ],
+    );
+    assert_eq!(
+        consume_permission(
+            &fixture,
+            &changed_page,
+            "boot",
+            "changed-page-delivery",
+            "credential",
+            &context
+        ),
+        "deny"
+    );
+    let altered_page = match begin("changed-page-decision", "Bash", &page_command) {
+        agenticjira::permissions::BridgeStart::Pending { request_id } => request_id,
+        _ => panic!("expected a pending page permission"),
+    };
+    let altered_input =
+        serde_json::json!({"command":page_command.replace(":task:", ":secrets:"),"cwd":workspace})
+            .to_string();
+    fixture.execute(
+        "UPDATE permission_requests SET input_json=?1,input_digest=?2 WHERE id=?3",
+        params![
+            altered_input,
+            sha256(altered_input.as_bytes()),
+            altered_page
+        ],
+    );
+    assert!(workflow::execute(
+        &fixture.store,
+        &HumanCommand::DecidePermission {
+            operation_id: "deny-altered-page-decision".into(),
+            request_id: altered_page,
+            expected_revision: 1,
+            decision: PermissionDecision::ApproveOnce,
+            lifetime: None,
+            reason: String::new(),
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("not the exact read-only role report or paged context command"));
+
+    for (label, tool, input) in [
+        ("mutation", "Bash", "/usr/bin/touch forbidden".to_owned()),
+        ("edit", "Edit", "edit request".to_owned()),
+        (
+            "wrapper",
+            "Bash",
+            format!("/bin/sh -c {}", providers::shell_quote(&command)),
+        ),
+        ("pipe", "Bash", format!("{command} | /usr/bin/cat")),
+        ("extra", "Bash", format!("{command}; /usr/bin/true")),
+        (
+            "page-pipe",
+            "Bash",
+            format!("{page_command} | /usr/bin/cat"),
+        ),
+        (
+            "page-wrapper",
+            "Bash",
+            format!("/bin/sh -c {}", providers::shell_quote(&page_command)),
+        ),
+        (
+            "page-unknown-section",
+            "Bash",
+            page_command.replace(":task:", ":secrets:"),
+        ),
+        ("page-malformed", "Bash", format!("{page_command}x")),
+        (
+            "page-other-executable",
+            "Bash",
+            format!("/different/llmrelay role context --page {cursor}"),
+        ),
+        ("native-context-search", "Grep", "context lookup".to_owned()),
+        (
+            "context",
+            "Bash",
+            format!(
+                "{} role context",
+                providers::shell_quote(&executable.to_string_lossy())
+            ),
+        ),
+        (
+            "other-executable",
+            "Bash",
+            "/different/llmrelay role report --json '{}'".to_owned(),
+        ),
+    ] {
+        let response = match begin(label, tool, &input) {
+            agenticjira::permissions::BridgeStart::Immediate(response) => response,
+            agenticjira::permissions::BridgeStart::Pending { request_id } => {
+                panic!("{label} became actionable: {request_id}")
+            }
+        };
+        assert_eq!(response_behavior(&response), "deny", "{label}");
+        fixture.assert_scalar::<i64>(
+            &format!(
+                "SELECT COUNT(*) FROM permission_requests WHERE hook_invocation_nonce='{label}'
+            AND state='policy_denied' AND reserved_behavior='deny' AND family_json IS NULL"
+            ),
+            1,
+        );
+    }
+
+    let altered = match begin("alter-before-decision", "Bash", &command) {
+        agenticjira::permissions::BridgeStart::Pending { request_id } => request_id,
+        _ => panic!("expected pending report"),
+    };
+    fixture.execute(
+        "UPDATE permission_requests SET input_json=json_set(input_json,'$.command',?1) WHERE id=?2",
+        params![
+            format!(
+                "{} role report --json '{{\"summary\":\"changed\"}}'",
+                providers::shell_quote(&executable.to_string_lossy())
+            ),
+            altered
+        ],
+    );
+    assert!(workflow::execute(
+        &fixture.store,
+        &HumanCommand::DecidePermission {
+            operation_id: "altered-report-decision".into(),
+            request_id: altered,
+            expected_revision: 1,
+            decision: PermissionDecision::ApproveOnce,
+            lifetime: None,
+            reason: String::new(),
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("not the exact read-only role report"));
+
+    for drift in ["input", "native", "policy", "generation", "credential"] {
+        let request = match begin(drift, "Bash", &command) {
+            agenticjira::permissions::BridgeStart::Pending { request_id } => request_id,
+            _ => panic!("expected pending report for {drift}"),
+        };
+        decide_permission(
+            &fixture,
+            &format!("approve-{drift}"),
+            &request,
+            PermissionDecision::ApproveOnce,
+            None,
+            "",
+        );
+        match drift {
+            "input" => {
+                let input = serde_json::json!({"command":format!("{command}; /usr/bin/true"),"cwd":workspace}).to_string();
+                fixture.execute("UPDATE permission_requests SET input_json=?1,input_digest=?2 WHERE id=?3",params![input,sha256(input.as_bytes()),request]);
+            }
+            "native" => fixture.execute("UPDATE sessions SET native_session_id='changed' WHERE id='session'",[]),
+            "policy" => fixture.execute("UPDATE sessions SET capability_key='changed' WHERE id='session'",[]),
+            "generation" => fixture.execute("UPDATE role_generations SET status='replaced' WHERE id='generation'",[]),
+            "credential" => fixture.execute("UPDATE role_credentials SET revoked_at='2026-01-01T00:00:00Z' WHERE id='credential'",[]),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            consume_permission(&fixture, &request, "boot", drift, "credential", &context),
+            "deny",
+            "{drift}"
+        );
+        fixture.execute(
+            "UPDATE sessions SET native_session_id=?1,capability_key=?2 WHERE id='session'",
+            params![native, policy],
+        );
+        fixture.execute(
+            "UPDATE role_generations SET status='running' WHERE id='generation'",
+            [],
+        );
+        fixture.execute(
+            "UPDATE role_credentials SET revoked_at=NULL WHERE id='credential'",
+            [],
+        );
+    }
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM permission_rules", 0);
 }
 
 #[test]
@@ -35776,6 +38711,1970 @@ fn record_synthetic_main_turn(
     }
 }
 
+fn record_synthetic_functional_main_turn(
+    fixture: &Fixture,
+    application: &Application,
+    session: &str,
+    native: &str,
+    retained: Option<&serde_json::Value>,
+    submit_report: bool,
+    report_binding_override: Option<&str>,
+) -> serde_json::Value {
+    let token = uuid::Uuid::new_v4().to_string();
+    fixture.execute("UPDATE role_credentials SET token_hash=?1 WHERE role_generation_id=(SELECT role_generation_id FROM sessions WHERE id=?2) AND revoked_at IS NULL",
+        params![auth::hash_secret(&token),session]);
+    let context = fixture.store.role_context(&token).unwrap();
+    let record = fixture.store.session_json(session).unwrap();
+    let checkout = record["launch_config"]["cwd"].as_str().unwrap();
+    let provenance = RolePeerProvenance {
+        peer_pid: 4242,
+        peer_process_group_id: 4242,
+        peer_start_marker: "synthetic-functional-main".into(),
+        managed_root_pid: 4242,
+        managed_root_start_marker: "synthetic-functional-main".into(),
+        state: "managed_process_group_untrusted_payload".into(),
+    };
+    let hook = |event: &str, tool: Option<(&str, &str)>| {
+        let mut payload = serde_json::json!({"synthetic_fixture":true,"native_proof":false,
+            "hook_event_name":event,"session_id":native,"cwd":checkout});
+        if event == "SessionStart" {
+            payload["model"] = record["launch_config"]["model"].clone();
+        }
+        if let Some((tool_use_id, command)) = tool {
+            payload["tool_use_id"] = tool_use_id.into();
+            payload["tool_name"] = if context.provider == Provider::Claude {
+                "Bash"
+            } else {
+                "shell"
+            }
+            .into();
+            payload["tool_input"] = serde_json::json!({"command":command});
+        }
+        if event == "Stop" && context.provider == Provider::Claude {
+            payload["background_tasks"] = serde_json::json!([]);
+            payload["session_crons"] = serde_json::json!([]);
+        }
+        fixture
+            .store
+            .save_hook_event(
+                &context,
+                &HookEnvelope {
+                    provider: context.provider,
+                    payload,
+                },
+                &provenance,
+            )
+            .unwrap()
+    };
+    hook("SessionStart", None);
+    hook("UserPromptSubmit", None);
+    let contract = if let Some(retained) = retained {
+        assert!(application
+            .role_context_payload(&context)
+            .unwrap_err()
+            .to_string()
+            .contains("Main functional recall must report without rereading role context"));
+        assert!(application
+            .role_context_delivery_payload(&context, None)
+            .unwrap_err()
+            .to_string()
+            .contains("Main functional recall must report without rereading role context"));
+        retained.clone()
+    } else {
+        let command = format!(
+            "{} role context",
+            providers::shell_quote(&std::env::current_exe().unwrap().to_string_lossy())
+        );
+        let tool_use_id = uuid::Uuid::new_v4().to_string();
+        hook("PreToolUse", Some((&tool_use_id, &command)));
+        let expected_contract = agenticjira::trip::setup_context(&fixture.connection(), &context)
+            .unwrap()
+            .unwrap();
+        for cursor in [
+            None,
+            Some("v1:task:0:abababababababababababababababab:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"),
+        ] {
+            assert!(application
+                .role_context_delivery_payload(&context, cursor)
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable during qualification"));
+        }
+        const FUNCTIONAL_CONTEXT_BYTE_LIMIT: usize = 64 * 1024;
+        let payload = application.role_context_payload(&context).unwrap();
+        let serialized = serde_json::to_string_pretty(&payload).unwrap();
+        assert!(serialized.len() <= FUNCTIONAL_CONTEXT_BYTE_LIMIT);
+        assert_eq!(payload.as_object().unwrap().len(), 4);
+        assert_eq!(payload["context_scope"], "functional_qualification");
+        assert_eq!(payload["identity"], serde_json::to_value(&context).unwrap());
+        assert_eq!(payload["setup_contract"], expected_contract);
+        assert_eq!(payload["commands"]["context"], command);
+        let report_command = payload["commands"]["report"].as_str().unwrap();
+        assert!(report_command.contains("role report --functional-v2 "));
+        assert!(!report_command.contains("--json"));
+        assert!(
+            report_command.ends_with(if context.role == RoleKind::FinalReviewer {
+                "--session-mode=fresh"
+            } else {
+                "--session-mode=retained"
+            })
+        );
+        assert!(payload["commands"]["reporting_contract"]
+            .as_str()
+            .unwrap()
+            .contains("--functional-v2"));
+        let input = fixture.store.invocation_input(session).unwrap();
+        let prompt = input["prompt"].as_str().unwrap();
+        assert!(prompt
+            .contains("Never open provider-managed output files or use native file-search tools"));
+        assert!(prompt.contains("rerun the direct role context command or a permitted single-pipe"));
+        let mut contract = payload["setup_contract"].clone();
+        hook("PostToolUse", Some((&tool_use_id, &command)));
+        for command in [
+            command.clone(),
+            format!(r#"{command} | /usr/bin/grep -o '"setup_contract":{{[^}}]*}}'"#),
+            format!(r#"{command} | /usr/bin/grep -o '"binding_hash":"[^"]*"'"#),
+        ] {
+            let tool_use_id = uuid::Uuid::new_v4().to_string();
+            hook("PreToolUse", Some((&tool_use_id, &command)));
+            hook("PostToolUse", Some((&tool_use_id, &command)));
+        }
+        let request = contract["observation_request"].clone();
+        let command = request["command"].as_str().unwrap();
+        let tool_use_id = uuid::Uuid::new_v4().to_string();
+        hook("PreToolUse", Some((&tool_use_id, command)));
+        let challenge =
+            std::fs::read_to_string(request["permitted_read"]["path"].as_str().unwrap()).unwrap();
+        assert!(!serialized.contains(&challenge));
+        if let Some(writer) = request["owned_writer"]["path"].as_str() {
+            std::fs::write(writer, &challenge).unwrap();
+        }
+        hook("PostToolUse", Some((&tool_use_id, command)));
+        contract["observed_challenge"] = challenge.into();
+        contract
+    };
+    if submit_report && (context.role == RoleKind::FinalReviewer || retained.is_some()) {
+        let arguments = vec![
+            "--functional-v2".to_owned(),
+            format!("--operation-id=main-functional-{session}"),
+            "--status=passed".into(),
+            format!(
+                "--binding-hash={}",
+                report_binding_override.unwrap_or(contract["binding_hash"].as_str().unwrap())
+            ),
+            format!(
+                "--challenge={}",
+                contract["observed_challenge"].as_str().unwrap()
+            ),
+            format!(
+                "--session-mode={}",
+                if context.role == RoleKind::FinalReviewer {
+                    "fresh"
+                } else {
+                    "retained"
+                }
+            ),
+        ];
+        let report = agenticjira::domain::parse_functional_role_report_args(&arguments).unwrap();
+        let command = format!(
+            "{} role report {}",
+            providers::shell_quote(&std::env::current_exe().unwrap().to_string_lossy()),
+            arguments.join(" ")
+        );
+        let tool_use_id = uuid::Uuid::new_v4().to_string();
+        hook("PreToolUse", Some((&tool_use_id, &command)));
+        if report_binding_override.is_some() {
+            let error = fixture
+                .store
+                .save_role_result(&context, &report)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("exact native challenge or fresh/retained invocation"),
+                "{error:#}"
+            );
+            let replay = fixture
+                .store
+                .save_role_result(&context, &report)
+                .unwrap_err();
+            assert_eq!(replay.to_string(), error.to_string());
+            let mut changed = report.clone();
+            changed.summary.push_str(" changed");
+            assert!(fixture
+                .store
+                .save_role_result(&context, &changed)
+                .unwrap_err()
+                .to_string()
+                .contains("operation ID was already used with different input"));
+        } else {
+            fixture.store.save_role_result(&context, &report).unwrap();
+        }
+        hook("PostToolUse", Some((&tool_use_id, &command)));
+    }
+    assert_eq!(hook("Stop", None)["safe_idle_boundary"], true);
+    contract
+}
+
+#[test]
+fn main_checkout_functional_operations_publish_only_correlated_completed_evidence() {
+    for (role, scenario) in [
+        (RoleKind::Implementer, "passed"),
+        (RoleKind::Manager, "passed"),
+        (RoleKind::FinalReviewer, "passed"),
+        (RoleKind::Implementer, "cancel_changed_writer"),
+        (RoleKind::Implementer, "missing_report"),
+        (RoleKind::FinalReviewer, "rejected_report"),
+        (RoleKind::Implementer, "changed_after_report"),
+        (RoleKind::Manager, "held_resume_first"),
+        (RoleKind::Manager, "held_continue_first"),
+        (RoleKind::Manager, "held_historical_running"),
+        (RoleKind::Manager, "held_missing_report"),
+        (RoleKind::Manager, "held_prelaunch_failure"),
+        (RoleKind::Manager, "held_prepared_challenge"),
+        (RoleKind::Manager, "held_ambiguous_preparation"),
+        (RoleKind::Manager, "held_challenge_conflict"),
+        (RoleKind::Manager, "held_duplicate_rejection"),
+    ] {
+        let held = scenario.starts_with("held_");
+        let historical_running = scenario == "held_historical_running";
+        let cancel_with_changed_writer = scenario == "cancel_changed_writer";
+        let submit_report = !matches!(scenario, "missing_report" | "held_missing_report");
+        let rejected_report = scenario == "rejected_report";
+        let fixture = Fixture::new(&format!("main-functional-{role}")).with_synthetic_claude();
+        let repository = fixture.repository("repo");
+        let provider = if role == RoleKind::Manager {
+            Provider::Claude
+        } else {
+            Provider::Codex
+        };
+        let project = add_project_with_provider(
+            &fixture,
+            repository.clone(),
+            "functional-main-project",
+            provider,
+        );
+        let task = create_task_with_roles(
+            &fixture,
+            &project,
+            "functional-main-task",
+            1,
+            roles_for(provider),
+        );
+        fixture.execute(
+            "UPDATE tasks SET lifecycle='backlog' WHERE id=?1",
+            params![task],
+        );
+        let version: i64 = fixture
+            .connection()
+            .query_row(
+                "SELECT version FROM tasks WHERE id=?1",
+                params![task],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let selected = workflow_command(&fixture,serde_json::json!({"kind":"set_task_workflow","operation_id":"functional-main-select",
+            "task_id":task,"expected_version":version,"selection":{"family":"trip","workspace_mode":"main_checkout","check_ids":[]}})).unwrap();
+        let scope = workflow::state(&fixture.store)
+            .unwrap()
+            .tasks
+            .into_iter()
+            .find(|item| item.id == task)
+            .unwrap()
+            .workflow
+            .unwrap()
+            .checkout_scope
+            .unwrap();
+        let paths = instance_paths(&fixture);
+        let runtime = capability_runtime_for_paths(&fixture, &paths);
+        seed_supported_capabilities_for_config_with_runtime(
+            &fixture,
+            &role_override(provider),
+            &runtime,
+        );
+        let ready = workflow::execute_with_runtime(
+            &fixture.store,
+            &HumanCommand::MakeReady {
+                operation_id: "functional-main-authorize".into(),
+                task_id: task.clone(),
+                expected_version: selected.version.unwrap(),
+                checkout_authorization: Some(agenticjira::domain::CheckoutAuthorizationInput {
+                    scope_hash: scope.scope_hash,
+                }),
+            },
+            Some(&runtime),
+        )
+        .unwrap();
+        let initial_verification = if held {
+            "functional-main-initial-verify"
+        } else {
+            "functional-main-verify"
+        };
+        let scheduler = Scheduler::new(fixture.store.clone(), paths.artifacts.clone())
+            .with_runtime(runtime.hooks, runtime.role_socket, runtime.executable);
+        if held {
+            assert!(scheduler.claim_next().unwrap().is_none());
+            fixture.assert_scalar::<i64>(
+                &format!("SELECT COUNT(*) FROM attempts WHERE task_id='{task}'"),
+                0,
+            );
+        }
+        let queued = workflow_command(
+            &fixture,
+            serde_json::json!({"kind":"verify_main_checkout","operation_id":initial_verification,
+            "task_id":task,"expected_version":ready.version.unwrap(),"role":role}),
+        )
+        .unwrap();
+        assert_eq!(queued.detail["qualification_contract"], "functional-v2");
+        let plan = scheduler
+            .claim_next()
+            .unwrap()
+            .expect("the authorized Main verification must admit the task claim");
+        assert_eq!(plan.task_id, task);
+        let app = single_agent_application(&fixture);
+        let rejected_manager = if held {
+            let started = app.coordinator_tick().unwrap();
+            assert_eq!(started["action"], "main_verification_started", "{started}");
+            let session = started["launch"]["session_id"].as_str().unwrap().to_owned();
+            let native = uuid::Uuid::new_v4().to_string();
+            let contract = record_synthetic_functional_main_turn(
+                &fixture, &app, &session, &native, None, true, None,
+            );
+            for retained in [false, true] {
+                if retained {
+                    assert_eq!(
+                        app.coordinator_tick().unwrap()["action"],
+                        "main_verification_resume_started"
+                    );
+                    record_synthetic_functional_main_turn(
+                        &fixture,
+                        &app,
+                        &session,
+                        &native,
+                        Some(&contract),
+                        true,
+                        None,
+                    );
+                }
+                let waiting = app.coordinator_tick().unwrap();
+                assert_eq!(waiting["action"], "waiting", "{waiting}");
+                assert_eq!(waiting["for"], "main_verification_quiescence", "{waiting}");
+                fixture.store.mark_interrupt_requested(&session).unwrap();
+                let (epoch, process) = runtime_session_identity(&fixture, &session);
+                exit_session(&fixture, &session, &epoch, &process);
+            }
+            assert_eq!(
+                app.coordinator_tick().unwrap()["action"],
+                "main_verification_requires_native_evidence"
+            );
+            let record = fixture.store.session_json(&session).unwrap();
+            let generation = record["role_generation_id"].as_str().unwrap().to_owned();
+            let payload: serde_json::Value = serde_json::from_str(
+                &fixture
+                    .connection()
+                    .query_row::<String, _, _>(
+                        "SELECT payload_json FROM controls WHERE id=?1",
+                        params![initial_verification],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            let proof: agenticjira::domain::FunctionalCapabilityProofInput = serde_json::from_value(serde_json::json!({
+                "qualification_contract":"functional-v2","operation_id":"functional-main-initial-publish",
+                "session_id":session,"evidence_reference":"synthetic-functional-not-native-acceptance",
+                "main":{"observation_request_hash":payload["observation_request_hash"],"native_command":payload["observation_request"]["command"],
+                    "native_session_id":native,"role_generation_id":generation,"observation":{"status":"passed",
+                        "binding_hash":contract["binding_hash"],"challenge":contract["observed_challenge"],"session_mode":"retained"}}})).unwrap();
+            let published = fixture
+                .store
+                .record_functional_main_checkout_proof(&proof)
+                .unwrap();
+            assert_eq!(published["session_id"], session);
+            assert_eq!(published["config_hash"], record["capability_key"]);
+            assert_eq!(published["authorization"], payload["authorization"]);
+            fixture.assert_scalar::<String>(
+                "SELECT state FROM controls WHERE id='functional-main-initial-verify'",
+                "finished".into(),
+            );
+            std::fs::remove_file(
+                payload["observation_request"]["permitted_read"]["path"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            Some((session, generation))
+        } else {
+            None
+        };
+        let main_controls_before: String = fixture.scalar("SELECT json_group_array(json_object('id',id,'state',state,'payload',json(payload_json))) FROM controls WHERE kind='main_checkout_verify'");
+        let main_proofs_before: String = fixture.scalar("SELECT json_group_array(json_object('id',id,'key',config_hash,'status',status,'proof',json(proof_json))) FROM capabilities WHERE mode='main_checkout'");
+        let permits_before: i64 = fixture.scalar(&format!(
+            "SELECT COUNT(*) FROM launch_permits WHERE attempt_id='{}'",
+            plan.attempt_id
+        ));
+        if let Some((rejected_session, rejected_generation)) = &rejected_manager {
+            fixture.execute(
+                "UPDATE attempts SET phase='awaiting_plan_approval' WHERE id=?1",
+                params![plan.attempt_id],
+            );
+            if historical_running {
+                fixture.execute(
+                    "UPDATE attempts SET plan_hash='historical-unapproved-plan' WHERE id=?1",
+                    params![plan.attempt_id],
+                );
+            }
+            let rejection = seed_permanent_resume_rejection(
+                &fixture,
+                rejected_session,
+                rejected_generation,
+                "manager",
+                true,
+            );
+            fixture.execute("UPDATE audit_events SET detail_json=json_set(detail_json,'$.category','native_history_unavailable') WHERE id=?1", params![rejection]);
+            let version =
+                fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+            let request = serde_json::json!({"kind":"verify_main_checkout","operation_id":"functional-main-verify",
+                "task_id":task,"expected_version":version,"role":role});
+            if scenario == "held_duplicate_rejection" {
+                fixture.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+                    SELECT ?1,?1,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at FROM audit_events WHERE id=?2",
+                    params![uuid::Uuid::new_v4().to_string(), rejection]);
+                assert!(workflow_command(&fixture, request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("one exact unconsumed Manager resume rejection"));
+                fixture.assert_scalar(
+                    "SELECT json_group_array(json_object('id',id,'state',state,'payload',json(payload_json))) FROM controls WHERE kind='main_checkout_verify'",
+                    main_controls_before.clone(),
+                );
+                fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'", plan.attempt_id), 1);
+                continue;
+            }
+            if scenario == "held_resume_first" {
+                let saved: String = fixture
+                    .connection()
+                    .query_row(
+                        "SELECT detail_json FROM audit_events WHERE id=?1",
+                        params![rejection],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                for (field, value, expected) in [
+                    (
+                        "session_id",
+                        serde_json::json!("other-session"),
+                        "no longer matches",
+                    ),
+                    (
+                        "role_generation_id",
+                        serde_json::json!("other-generation"),
+                        "no longer matches",
+                    ),
+                    (
+                        "attempt_id",
+                        serde_json::json!("other-attempt"),
+                        "no longer matches",
+                    ),
+                    (
+                        "transcript_epoch",
+                        serde_json::json!("other-epoch"),
+                        "one exact unconsumed",
+                    ),
+                    ("resume_count", serde_json::json!(3), "one exact unconsumed"),
+                    ("config_revision", serde_json::json!(2), "no longer matches"),
+                    (
+                        "attempt_phase",
+                        serde_json::json!("implementation"),
+                        "no longer matches",
+                    ),
+                    (
+                        "candidate_hash",
+                        serde_json::json!("other-candidate"),
+                        "no longer matches",
+                    ),
+                    (
+                        "plan_hash",
+                        serde_json::json!("other-plan"),
+                        "no longer matches",
+                    ),
+                    (
+                        "category",
+                        serde_json::json!("unknown"),
+                        "does not authorize",
+                    ),
+                    (
+                        "same_profile_authority",
+                        serde_json::json!(false),
+                        "does not authorize",
+                    ),
+                ] {
+                    let mut detail: serde_json::Value = serde_json::from_str(&saved).unwrap();
+                    detail[field] = value;
+                    fixture.execute(
+                        "UPDATE audit_events SET detail_json=?1 WHERE id=?2",
+                        params![detail.to_string(), rejection],
+                    );
+                    let error = workflow_command(&fixture, request.clone()).unwrap_err();
+                    assert!(error.to_string().contains(expected), "{field}: {error:#}");
+                }
+                fixture.execute(
+                    "UPDATE audit_events SET detail_json=?1 WHERE id=?2",
+                    params![saved, rejection],
+                );
+                let mut stale = request.clone();
+                stale["expected_version"] = (version - 1).into();
+                assert!(workflow_command(&fixture, stale)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("task version is stale"));
+                let mut wrong_role = request.clone();
+                wrong_role["role"] = serde_json::json!(RoleKind::Implementer);
+                assert!(workflow_command(&fixture, wrong_role)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("only for the rejected Manager profile"));
+                fixture.execute("INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+                    VALUES('independent-main-hold',?1,'manager_stop','held',?2,'{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", params![plan.attempt_id, version]);
+                assert!(workflow_command(&fixture, request.clone())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("another hold is active"));
+                fixture.execute(
+                    "UPDATE controls SET state='cancelled' WHERE id='independent-main-hold'",
+                    [],
+                );
+                fixture.assert_scalar(
+                    "SELECT json_group_array(json_object('id',id,'state',state,'payload',json(payload_json))) FROM controls WHERE kind='main_checkout_verify'",
+                    main_controls_before.clone(),
+                );
+            }
+            if historical_running {
+                let mut historical_request = request.clone();
+                historical_request["operation_id"] = "functional-main-historical-verify".into();
+                let historical = workflow_command(&fixture, historical_request).unwrap();
+                assert_eq!(
+                    historical.detail["resume_rejection"]["rejection_event_id"],
+                    rejection
+                );
+                fixture.execute(
+                    "UPDATE controls SET state='cancelled' WHERE id='functional-main-historical-verify'",
+                    [],
+                );
+                fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM controls WHERE id='functional-main-historical-verify'
+                    AND kind='main_checkout_verify' AND state='cancelled' AND role_generation_id IS NULL
+                    AND json_type(payload_json,'$.session_id') IS NULL AND json_type(payload_json,'$.launch_reservation') IS NULL", 1);
+                fixture.execute(
+                    "UPDATE attempts SET status='held' WHERE id=?1",
+                    params![plan.attempt_id],
+                );
+                let error = workflow_command(&fixture, request.clone()).unwrap_err();
+                assert!(
+                    error.to_string().contains(
+                        "The rejected Manager attempt is not waiting for a recovery decision"
+                    ),
+                    "{scenario}: {error:#}"
+                );
+                fixture.assert_scalar::<i64>(
+                    "SELECT COUNT(*) FROM controls WHERE id='functional-main-verify'",
+                    0,
+                );
+            }
+            fixture.execute(
+                "UPDATE attempts SET status='running' WHERE id=?1",
+                params![plan.attempt_id],
+            );
+            let error = fixture
+                .store
+                .role_launch_context(&plan.attempt_id, RoleKind::Manager)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("held by a pending control or recovery decision"),
+                "{error:#}"
+            );
+            if !historical_running {
+                fixture.execute(
+                    "UPDATE attempts SET status='needs_input' WHERE id=?1",
+                    params![plan.attempt_id],
+                );
+            }
+            let queued = workflow_command(&fixture, request.clone()).unwrap();
+            assert_eq!(
+                queued.detail["resume_rejection"]["rejection_event_id"],
+                rejection
+            );
+            assert_eq!(queued.detail["admitted_under_hold"], true);
+            assert_eq!(queued.detail["task_version"], version);
+            assert_eq!(
+                workflow_command(&fixture, request).unwrap().detail,
+                queued.detail
+            );
+            if historical_running {
+                fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM attempts WHERE id='{}' AND status='running'
+                    AND phase='awaiting_plan_approval' AND plan_hash='historical-unapproved-plan' AND plan_approved_at IS NULL", plan.attempt_id), 1);
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                    "resume_failed".into(),
+                );
+                fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+                    WHERE g.attempt_id='{}'", plan.attempt_id), 1);
+            }
+            if scenario == "held_resume_first" {
+                fixture.execute(
+                    "UPDATE attempts SET status='running' WHERE id=?1",
+                    params![plan.attempt_id],
+                );
+                for (path, value, expected) in [
+                    (
+                        "/resume_rejection/session_id",
+                        serde_json::json!("other-session"),
+                        "admitted Manager resume rejection",
+                    ),
+                    (
+                        "/resume_rejection/role_generation_id",
+                        serde_json::json!("other-generation"),
+                        "admitted Manager resume rejection",
+                    ),
+                    (
+                        "/resume_rejection/rejection_event_id",
+                        serde_json::json!("other-event"),
+                        "admitted Manager resume rejection",
+                    ),
+                    (
+                        "/resume_rejection/transcript_epoch",
+                        serde_json::json!("other-epoch"),
+                        "admitted Manager resume rejection",
+                    ),
+                    (
+                        "/resume_rejection/resume_count",
+                        serde_json::json!(2),
+                        "admitted Manager resume rejection",
+                    ),
+                    (
+                        "/task_version",
+                        serde_json::json!(version - 1),
+                        "task changed",
+                    ),
+                    (
+                        "/attempt_id",
+                        serde_json::json!("other-attempt"),
+                        "task changed",
+                    ),
+                    (
+                        "/actor_settings/model",
+                        serde_json::json!("other-model"),
+                        "verification settings changed",
+                    ),
+                ] {
+                    let mut payload = queued.detail.clone();
+                    *payload.pointer_mut(path).unwrap() = value;
+                    fixture.execute(
+                        "UPDATE controls SET payload_json=?1 WHERE id='functional-main-verify'",
+                        params![payload.to_string()],
+                    );
+                    let error = fixture
+                        .store
+                        .role_launch_context(&plan.attempt_id, RoleKind::Manager)
+                        .unwrap_err();
+                    assert!(error.to_string().contains(expected), "{path}: {error:#}");
+                }
+                fixture.execute(
+                    "UPDATE controls SET payload_json=?1 WHERE id='functional-main-verify'",
+                    params![queued.detail.to_string()],
+                );
+                fixture.execute(
+                    "UPDATE attempts SET status='needs_input' WHERE id=?1",
+                    params![plan.attempt_id],
+                );
+                fixture.assert_scalar::<i64>(
+                    &format!(
+                        "SELECT COUNT(*) FROM launch_permits WHERE attempt_id='{}'",
+                        plan.attempt_id
+                    ),
+                    permits_before,
+                );
+            }
+            let effects = fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM launch_permits)");
+            assert!(fixture
+                .store
+                .role_launch_context(&plan.attempt_id, RoleKind::Explorer)
+                .is_err());
+            assert_eq!(fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM launch_permits)"), effects);
+        }
+        let baseline = std::fs::metadata(repository.join("fixture.txt"))
+            .unwrap()
+            .ino();
+        if matches!(
+            scenario,
+            "held_prelaunch_failure"
+                | "held_prepared_challenge"
+                | "held_ambiguous_preparation"
+                | "held_challenge_conflict"
+        ) {
+            let mut payload: serde_json::Value = serde_json::from_str(&fixture.scalar::<String>(
+                "SELECT payload_json FROM controls WHERE id='functional-main-verify'",
+            ))
+            .unwrap();
+            let challenge = repository.canonicalize().unwrap().join(format!(
+                ".llmrelay-main-{}-challenge",
+                payload["probe_id"].as_str().unwrap()
+            ));
+            if scenario == "held_challenge_conflict" {
+                std::fs::write(&challenge, b"unowned existing bytes").unwrap();
+            } else if scenario != "held_prelaunch_failure" {
+                std::fs::write(&challenge, payload["nonce"].as_str().unwrap()).unwrap();
+                payload["scope"] = serde_json::json!({"root":repository.canonicalize().unwrap(),
+                    "protected_roots":[paths.root.canonicalize().unwrap()],
+                    "protected_read_targets":[paths.root.canonicalize().unwrap()],"policy_denied_unobserved":[]});
+                payload["observation_request"] =
+                    providers::main_checkout_functional_observation_request(
+                        &payload["scope"],
+                        &challenge,
+                        None,
+                    )
+                    .unwrap();
+                payload["functional_challenge_created"] = true.into();
+                if scenario == "held_ambiguous_preparation" {
+                    seed_session_for_provider(
+                        &fixture,
+                        &plan.attempt_id,
+                        "manager",
+                        "uncertain-main-generation",
+                        "uncertain-main-session",
+                        "launch_reserved",
+                        provider,
+                    );
+                    fixture.execute("UPDATE role_generations SET status='launch_reserved' WHERE id='uncertain-main-generation'", []);
+                    fixture
+                        .store
+                        .mark_session_spawning(
+                            "uncertain-main-session",
+                            "e",
+                            "synthetic-unknown-spawn",
+                        )
+                        .unwrap();
+                    payload["launch_reservation"] = serde_json::json!({"session_id":"uncertain-main-session",
+                        "role_generation_id":"uncertain-main-generation","transcript_epoch":"e"});
+                }
+            } else {
+                payload["actor_settings"]["model"] = "unapproved-model".into();
+            }
+            fixture.execute(
+                "UPDATE controls SET payload_json=?1 WHERE id='functional-main-verify'",
+                params![payload.to_string()],
+            );
+            let effects = fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM launch_permits)||':'||(SELECT COUNT(*) FROM capabilities)");
+            let failed = app.coordinator_tick().unwrap();
+            if scenario == "held_ambiguous_preparation" {
+                assert_eq!(
+                    failed["action"], "main_verification_recovery_required",
+                    "{failed}"
+                );
+                assert_eq!(failed["not_started"], false);
+                assert_eq!(failed["retry_started"], false);
+                fixture.assert_scalar::<String>(
+                    "SELECT state FROM controls WHERE id='functional-main-verify'",
+                    "recovery_required".into(),
+                );
+                fixture.assert_scalar::<String>("SELECT json_extract(payload_json,'$.session_id') FROM controls WHERE id='functional-main-verify'", "uncertain-main-session".into());
+                fixture.assert_scalar::<String>("SELECT json_extract(detail_json,'$.prior_task_attention') FROM recovery_records WHERE session_id='uncertain-main-session' AND state='attention_required'", "resume_failed".into());
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                    "resume_failed".into(),
+                );
+                assert!(challenge.exists());
+                app.coordinator_tick().unwrap();
+                assert_eq!(fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM launch_permits)||':'||(SELECT COUNT(*) FROM capabilities)"), effects);
+                assert!(challenge.exists());
+                continue;
+            }
+            assert_eq!(failed["action"], "main_verification_failed", "{failed}");
+            assert_eq!(failed["not_started"], true);
+            assert_eq!(failed["retry_started"], false);
+            assert!(failed["reason"].as_str().unwrap().contains(match scenario {
+                "held_prepared_challenge" => "already attempted preparation",
+                "held_challenge_conflict" =>
+                    "Create the exact owned Main challenge without replacing a file",
+                _ => "selected Manager verification settings changed",
+            }));
+            if scenario == "held_challenge_conflict" {
+                assert_eq!(
+                    std::fs::read(&challenge).unwrap(),
+                    b"unowned existing bytes"
+                );
+            } else {
+                assert!(!challenge.exists());
+            }
+            fixture.assert_scalar::<String>(
+                "SELECT state FROM controls WHERE id='functional-main-verify'",
+                "failed".into(),
+            );
+            fixture.assert_scalar::<String>(
+                &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                "resume_failed".into(),
+            );
+            fixture.assert_scalar::<String>(
+                &format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id),
+                "needs_input".into(),
+            );
+            app.coordinator_tick().unwrap();
+            assert_eq!(fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM launch_permits)||':'||(SELECT COUNT(*) FROM capabilities)"), effects);
+            if scenario == "held_challenge_conflict" {
+                assert_eq!(
+                    std::fs::read(&challenge).unwrap(),
+                    b"unowned existing bytes"
+                );
+            }
+            fixture.assert_scalar(
+                "SELECT json_group_array(json_object('id',id,'key',config_hash,'status',status,'proof',json(proof_json))) FROM capabilities WHERE mode='main_checkout'",
+                main_proofs_before.clone(),
+            );
+            continue;
+        }
+        let started = app.coordinator_tick().unwrap();
+        assert_eq!(started["action"], "main_verification_started", "{started}");
+        let session = started["launch"]["session_id"].as_str().unwrap().to_owned();
+        if provider == Provider::Claude && scenario == "passed" {
+            let launch: LaunchConfig = serde_json::from_value(
+                fixture.store.session_json(&session).unwrap()["launch_config"].clone(),
+            )
+            .unwrap();
+            let identity = providers::capability_identity(&launch).unwrap();
+            providers::claude::require_current_native_policy(&identity).unwrap();
+            let mut old = identity.clone();
+            let is_paging_grant = |value: &str| {
+                value.contains(" role context --index)")
+                    || value.contains(" role context --page:*)")
+            };
+            old.effective_argv.retain(|value| !is_paging_grant(value));
+            old.security_policy["allowed_operations"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|value| !is_paging_grant(value.as_str().unwrap()));
+            assert_ne!(
+                providers::capability_identity_key(&old).unwrap(),
+                providers::capability_identity_key(&identity).unwrap()
+            );
+            assert!(providers::claude::require_current_native_policy(&old)
+                .unwrap_err()
+                .to_string()
+                .contains("exact paged context grants"));
+        }
+        let continue_request = |operation: &str| HumanCommand::Control {
+            operation_id: operation.into(),
+            task_id: task.clone(),
+            expected_version: fixture
+                .scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+            action: "continue".into(),
+            payload: serde_json::json!({}),
+        };
+        if held {
+            assert!(app
+                .execute_human_command(&continue_request("continue-running-verification"))
+                .unwrap_err()
+                .to_string()
+                .contains("current exact rejected-session fresh-route authority"));
+            fixture.assert_scalar::<String>(
+                &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                "resume_failed".into(),
+            );
+        }
+        let payload: serde_json::Value = serde_json::from_str(&fixture.scalar::<String>(
+            "SELECT payload_json FROM controls WHERE id='functional-main-verify'",
+        ))
+        .unwrap();
+        assert!(payload["observation_request"].get("targets").is_none());
+        assert_eq!(
+            payload["observation_request"]["owned_writer"].is_object(),
+            role == RoleKind::Implementer
+        );
+        assert_eq!(
+            fixture.scalar::<i64>("SELECT COUNT(*) FROM permission_requests"),
+            0
+        );
+        let native = uuid::Uuid::new_v4().to_string();
+        let invalid_binding = "00".repeat(32);
+        let contract = record_synthetic_functional_main_turn(
+            &fixture,
+            &app,
+            &session,
+            &native,
+            None,
+            submit_report,
+            rejected_report.then_some(invalid_binding.as_str()),
+        );
+        let waiting = app.coordinator_tick().unwrap();
+        assert_eq!(waiting["action"], "waiting", "{waiting}");
+        assert_eq!(waiting["for"], "main_verification_quiescence", "{waiting}");
+        fixture.store.mark_interrupt_requested(&session).unwrap();
+        let session_count = fixture.scalar::<i64>("SELECT COUNT(*) FROM sessions");
+        if cancel_with_changed_writer {
+            let writer = payload["observation_request"]["owned_writer"]["path"]
+                .as_str()
+                .unwrap();
+            std::fs::write(writer, b"changed by owner").unwrap();
+            let waiting = app.coordinator_tick().unwrap();
+            assert_eq!(waiting["for"], "main_verification_quiescence", "{waiting}");
+            assert_eq!(
+                fixture.scalar::<String>(
+                    "SELECT state FROM controls WHERE id='functional-main-verify'"
+                ),
+                "native_stopping"
+            );
+            assert_eq!(std::fs::read(writer).unwrap(), b"changed by owner");
+        }
+        let (epoch, process) = runtime_session_identity(&fixture, &session);
+        exit_session(&fixture, &session, &epoch, &process);
+        if cancel_with_changed_writer {
+            let version =
+                fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+            let requested = app
+                .execute_human_command(&HumanCommand::Control {
+                    operation_id: "cancel-functional-main".into(),
+                    task_id: task.clone(),
+                    expected_version: version,
+                    action: "cancel".into(),
+                    payload: serde_json::Value::Null,
+                })
+                .unwrap();
+            assert_eq!(requested.state, "control_requested");
+            fixture.assert_scalar::<i64>(
+                &format!(
+                    "SELECT COUNT(*) FROM controls WHERE attempt_id='{}' AND kind='cancel'
+                    AND requested_operation_id='cancel-functional-main' AND state='requested'",
+                    plan.attempt_id
+                ),
+                1,
+            );
+            let stopped = app.coordinator_tick().unwrap();
+            assert_eq!(stopped["action"], "main_verification_stopped", "{stopped}");
+            assert_eq!(stopped["success_proof"], false);
+            let (state, terminal_payload): (String, String) = fixture
+                .connection()
+                .query_row(
+                    "SELECT state,payload_json FROM controls WHERE id='functional-main-verify'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(state, "cancelled");
+            let terminal_payload: serde_json::Value =
+                serde_json::from_str(&terminal_payload).unwrap();
+            let writer = payload["observation_request"]["owned_writer"]["path"]
+                .as_str()
+                .unwrap();
+            assert!(terminal_payload["artifact_cleanup_error"]
+                .as_str()
+                .unwrap()
+                .contains(writer));
+            assert_eq!(std::fs::read(writer).unwrap(), b"changed by owner");
+            assert!(!std::path::Path::new(
+                payload["observation_request"]["permitted_read"]["path"]
+                    .as_str()
+                    .unwrap()
+            )
+            .exists());
+            fixture.assert_scalar::<i64>(
+                "SELECT COUNT(*) FROM capabilities WHERE mode='main_checkout'",
+                0,
+            );
+            assert!(app.resume_role_session(&session, "").is_err());
+            tick_until(&fixture, &app, "cancel");
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM sessions", session_count);
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM resume_invocations", 0);
+            assert_eq!(std::fs::read(writer).unwrap(), b"changed by owner");
+            continue;
+        }
+        if role != RoleKind::FinalReviewer {
+            assert_eq!(
+                app.coordinator_tick().unwrap()["action"],
+                "main_verification_resume_started"
+            );
+            record_synthetic_functional_main_turn(
+                &fixture,
+                &app,
+                &session,
+                &native,
+                Some(&contract),
+                submit_report,
+                None,
+            );
+            let waiting = app.coordinator_tick().unwrap();
+            assert_eq!(waiting["action"], "waiting", "{waiting}");
+            assert_eq!(waiting["for"], "main_verification_quiescence", "{waiting}");
+            fixture.store.mark_interrupt_requested(&session).unwrap();
+            let (epoch, process) = runtime_session_identity(&fixture, &session);
+            exit_session(&fixture, &session, &epoch, &process);
+        }
+        if scenario == "changed_after_report" {
+            fixture.assert_scalar::<i64>(
+                &format!("SELECT COUNT(*) FROM role_results WHERE session_id='{session}'"),
+                1,
+            );
+            std::fs::write(
+                payload["observation_request"]["owned_writer"]["path"]
+                    .as_str()
+                    .unwrap(),
+                b"changed after report",
+            )
+            .unwrap();
+        }
+        let settled = app.coordinator_tick().unwrap();
+        if !submit_report || rejected_report || scenario == "changed_after_report" {
+            assert_eq!(settled["action"], "main_verification_failed", "{settled}");
+            assert_eq!(settled["success_proof"], false);
+            assert_eq!(settled["retry_started"], false);
+            assert!(settled["message"]
+                .as_str()
+                .unwrap()
+                .contains("Prepare fresh Main verification"));
+            let reason = settled["reason"].as_str().unwrap();
+            assert!(
+                reason.contains(if rejected_report {
+                    "exact native challenge or fresh/retained invocation"
+                } else if scenario == "changed_after_report" {
+                    "Main functional writer artifact is missing or has different content"
+                } else {
+                    "exactly one accepted current report"
+                }),
+                "{settled}"
+            );
+            let record = fixture.store.session_json(&session).unwrap();
+            fixture.assert_scalar::<i64>(
+                &format!("SELECT COUNT(*) FROM role_results WHERE session_id='{session}'"),
+                if scenario == "changed_after_report" {
+                    1
+                } else {
+                    0
+                },
+            );
+            fixture.assert_scalar(
+                "SELECT json_group_array(json_object('id',id,'key',config_hash,'status',status,'proof',json(proof_json))) FROM capabilities WHERE mode='main_checkout'",
+                main_proofs_before.clone(),
+            );
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM controls WHERE kind='main_checkout_verify' AND state='awaiting_native_evidence'", 0);
+            fixture.assert_scalar::<String>(
+                "SELECT state FROM controls WHERE id='functional-main-verify'",
+                "failed".into(),
+            );
+            fixture.assert_scalar::<String>(
+                &format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id),
+                "needs_input".into(),
+            );
+            let failed_payload: serde_json::Value =
+                serde_json::from_str(&fixture.scalar::<String>(
+                    "SELECT payload_json FROM controls WHERE id='functional-main-verify'",
+                ))
+                .unwrap();
+            assert_eq!(failed_payload["failure_reason"], reason);
+            if rejected_report {
+                let receipt: serde_json::Value = serde_json::from_str(&fixture.connection().query_row::<String,_,_>(
+                    "SELECT result_json FROM operation_receipts WHERE operation_id=?1 AND actor_key=?2 AND operation_kind='role_report'",
+                    params![format!("main-functional-{session}"),record["role_generation_id"].as_str()], |row| row.get(0),
+                ).unwrap()).unwrap();
+                assert_eq!(receipt["accepted"], false);
+                assert_eq!(receipt["session_id"], session);
+                assert_eq!(receipt["transcript_epoch"], record["transcript_epoch"]);
+                assert_eq!(receipt["role_generation_id"], record["role_generation_id"]);
+                assert_eq!(receipt["rejection_code"], "main_functional_report_invalid");
+                let audits: i64 = fixture
+                    .connection()
+                    .query_row(
+                        "SELECT COUNT(*) FROM audit_events WHERE operation_id=?1 AND entity_id=?2
+                       AND event_code='main.verification.report.rejected' AND detail_json=?3",
+                        params![
+                            format!("main-functional-{session}"),
+                            session,
+                            receipt.to_string()
+                        ],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(audits, 1);
+            }
+            assert!(!std::path::Path::new(
+                payload["observation_request"]["permitted_read"]["path"]
+                    .as_str()
+                    .unwrap()
+            )
+            .exists());
+            if let Some(writer) = payload["observation_request"]["owned_writer"]["path"].as_str() {
+                if scenario == "changed_after_report" {
+                    assert_eq!(std::fs::read(writer).unwrap(), b"changed after report");
+                    assert!(failed_payload["artifact_cleanup_error"]
+                        .as_str()
+                        .unwrap()
+                        .contains(writer));
+                } else {
+                    assert!(!std::path::Path::new(writer).exists());
+                }
+            }
+            let effects = fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM resume_invocations)");
+            if held {
+                let launch: LaunchConfig =
+                    serde_json::from_value(record["launch_config"].clone()).unwrap();
+                fixture.assert_scalar::<i64>(
+                    &format!(
+                        "SELECT COUNT(*) FROM capabilities WHERE mode='main_checkout'
+                        AND status='supported' AND config_hash='{}'",
+                        record["capability_key"].as_str().unwrap()
+                    ),
+                    0,
+                );
+                let error = fixture
+                    .store
+                    .reserve_role_resume(
+                        &session,
+                        "failed-main-no-proof",
+                        &launch,
+                        "failed-main-token",
+                    )
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains(
+                        "Main functional read-only authority differs from its exact frozen request"
+                    ),
+                    "{error:#}"
+                );
+            } else {
+                assert!(app.resume_role_session(&session, "").is_err());
+            }
+            app.coordinator_tick().unwrap();
+            assert_eq!(fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM resume_invocations)"), effects);
+            if let Some((_, rejected_generation)) = &rejected_manager {
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                    "resume_failed".into(),
+                );
+                assert!(app
+                    .execute_human_command(&continue_request("continue-failed-verification"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("current exact rejected-session fresh-route authority"));
+                let retry = workflow_command(&fixture, serde_json::json!({"kind":"verify_main_checkout",
+                    "operation_id":"functional-main-retry","task_id":task,"expected_version":fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'")),"role":role})).unwrap();
+                assert_eq!(retry.detail["admitted_under_hold"], true);
+                assert_eq!(
+                    retry.detail["resume_rejection"]["role_generation_id"],
+                    rejected_generation.as_str()
+                );
+                assert_ne!(fixture.scalar::<String>(&format!("SELECT effective_generation_id FROM role_settings WHERE task_id='{task}' AND role='manager' AND revision=1")), rejected_generation.as_str());
+                assert_eq!(fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM resume_invocations)"), effects);
+            }
+            continue;
+        }
+        assert_eq!(
+            settled["action"],
+            "main_verification_requires_native_evidence"
+        );
+        if held {
+            fixture.assert_scalar::<String>(
+                &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                "resume_failed".into(),
+            );
+            assert!(app
+                .execute_human_command(&continue_request("continue-unpublished-verification"))
+                .unwrap_err()
+                .to_string()
+                .contains("current exact rejected-session fresh-route authority"));
+            assert!(workflow::state(&fixture.store)
+                .unwrap()
+                .continuation_actions
+                .iter()
+                .all(|action| action.binding["session_id"] != session
+                    || action.operation != "role_resume"));
+        }
+        let record = fixture.store.session_json(&session).unwrap();
+        let frozen_identity = record["capability_identity"].clone();
+        let proof: agenticjira::domain::FunctionalCapabilityProofInput = serde_json::from_value(serde_json::json!({
+            "qualification_contract":"functional-v2","operation_id":"functional-main-publish","session_id":session,"evidence_reference":"synthetic-functional-not-native-acceptance",
+            "main":{"observation_request_hash":payload["observation_request_hash"],"native_command":payload["observation_request"]["command"],
+                "native_session_id":native,"role_generation_id":record["role_generation_id"],"observation":{"status":"passed",
+                    "binding_hash":contract["binding_hash"],"challenge":contract["observed_challenge"],
+                    "session_mode":if role==RoleKind::FinalReviewer {"fresh"}else{"retained"}}}})).unwrap();
+        let mut wrong = proof.clone();
+        wrong.main = None;
+        assert!(fixture
+            .store
+            .record_functional_main_checkout_proof(&wrong)
+            .is_err());
+        let mut wrong = proof.clone();
+        wrong.main.as_mut().unwrap().observation_request_hash = "changed".into();
+        assert!(fixture
+            .store
+            .record_functional_main_checkout_proof(&wrong)
+            .is_err());
+        if role == RoleKind::Implementer {
+            let writer = payload["observation_request"]["owned_writer"]["path"]
+                .as_str()
+                .unwrap();
+            let bytes = std::fs::read(writer).unwrap();
+            std::fs::remove_file(writer).unwrap();
+            assert!(fixture
+                .store
+                .record_functional_main_checkout_proof(&proof)
+                .is_err());
+            std::fs::write(writer, bytes).unwrap();
+        }
+        let published = fixture
+            .store
+            .record_functional_main_checkout_proof(&proof)
+            .unwrap();
+        assert_eq!(published["qualification_contract"], "functional-v2");
+        assert_eq!(published["os_confinement_attested"], false);
+        assert_eq!(
+            fixture
+                .store
+                .record_functional_main_checkout_proof(&proof)
+                .unwrap(),
+            published
+        );
+        assert!(fixture.store.invocation_input(&session).unwrap()["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("Functional qualification is complete"));
+        std::fs::remove_file(
+            payload["observation_request"]["permitted_read"]["path"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        if let Some(writer) = payload["observation_request"]["owned_writer"]["path"].as_str() {
+            std::fs::remove_file(writer).unwrap();
+        }
+        if let Some((rejected_session, _)) = &rejected_manager {
+            if historical_running {
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                    "resume_failed".into(),
+                );
+                fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM attempts WHERE id='{}'
+                    AND phase='awaiting_plan_approval' AND plan_hash='historical-unapproved-plan' AND plan_approved_at IS NULL", plan.attempt_id), 1);
+            }
+            let projected = workflow::state(&fixture.store).unwrap();
+            let projected_task = projected
+                .tasks
+                .iter()
+                .find(|item| item.id == task)
+                .unwrap_or_else(|| {
+                    panic!("{scenario}: qualified Main task missing from projection")
+                });
+            let projected_session = projected
+                .active_sessions
+                .iter()
+                .find(|item| item["id"] == session)
+                .unwrap_or_else(|| {
+                    panic!("{scenario}: qualified Main session missing from projection")
+                });
+            let (verification_state, verification_attempt, completed): (String, String, String) = fixture
+                .connection()
+                .query_row(
+                    "SELECT state,attempt_id,payload_json FROM controls WHERE id='functional-main-verify'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let completed_payload: serde_json::Value = serde_json::from_str(&completed).unwrap();
+            let resume_eligibility = serde_json::json!({
+                "workflow_family":projected_task.workflow.as_ref().map(|workflow| workflow.family),
+                "workspace_mode":projected_task.workspace_mode,"lifecycle":projected_task.lifecycle,
+                "attention":projected_task.attention,"archived":projected_task.archived,
+                "attempt_current":projected_task.active_attempt.as_ref().is_some_and(|attempt| attempt["id"] == projected_session["attempt_id"]),
+                "generation_current":projected_task.role_settings.iter().any(|setting|
+                    setting["role"] == projected_session["role"] && setting["revision"] == projected_session["config_revision"]
+                        && setting["effective_generation_id"] == projected_session["role_generation_id"]),
+                "session_status":projected_session["status"],"generation_status":projected_session["generation_status"],
+                "has_newer_generation":projected_session["has_newer_generation"],
+                "quiescent":projected_session["process_group_quiescent"],
+                "native_session_available":projected_session["native_session_id"].as_str().is_some_and(|value| !value.is_empty()),
+                "reported_in_latest_invocation":projected_session["reported_in_latest_invocation"],
+                "validation_cell":projected_session["validation_cell"],"capability_current":projected_session["capability_current"],
+                "failure_stop_fenced":projected_session["failure_stop_fenced"],
+                "verification":{"state":verification_state,"coding_started":completed_payload["coding_started"],
+                    "attempt_matches":projected_session["attempt_id"] == verification_attempt,
+                    "actor_matches":completed_payload["actor"] == projected_session["role"],
+                    "session_matches":completed_payload["session_id"] == projected_session["id"],
+                    "generation_matches":completed_payload["role_generation_id"] == projected_session["role_generation_id"],
+                    "epoch_matches":completed_payload["transcript_epoch"] == projected_session["transcript_epoch"],
+                    "key_matches":completed_payload["capability_key"] == projected_session["capability_key"]},
+                "session_actions":projected.continuation_actions.iter().filter(|action| action.binding["session_id"] == session)
+                    .take(8).map(|action| serde_json::json!({"operation":action.operation,"kind":action.kind,"enabled":action.enabled})).collect::<Vec<_>>()
+            });
+            assert!(projected.controls.iter().all(|control| control["state"] != "finished"),
+                "{scenario}: finished controls leaked into active controls; eligibility={resume_eligibility}");
+            assert_eq!(projected.resources["active_controls"], 0,
+                "{scenario}: completed Main verification is not active; eligibility={resume_eligibility}");
+            let decision = projected
+                .decisions
+                .iter()
+                .find(|decision| {
+                    decision.subject.attempt_id.as_deref() == Some(plan.attempt_id.as_str())
+                        && decision.subject.session_id.is_none()
+                })
+                .unwrap_or_else(|| panic!("{scenario}: qualified Main decision missing; eligibility={resume_eligibility}"));
+            assert!(
+                decision
+                    .control_policy
+                    .allowed_controls
+                    .iter()
+                    .any(|control| control == "continue"),
+                "{scenario}: qualified Main Continue missing; eligibility={resume_eligibility}"
+            );
+            let resume = projected
+                .continuation_actions
+                .iter()
+                .find(|action| {
+                    action.operation == "role_resume" && action.binding["session_id"] == session
+                })
+                .unwrap_or_else(|| panic!("{scenario}: qualified Main role_resume missing; eligibility={resume_eligibility}"));
+            assert!(
+                resume.enabled,
+                "{scenario}: qualified Main role_resume disabled; eligibility={resume_eligibility}"
+            );
+            assert!(
+                matches!(
+                    resume.kind,
+                    agenticjira::domain::ContinuationActionKind::ExactResume
+                ),
+                "{scenario}: qualified Main continuation must be ExactResume; eligibility={resume_eligibility}"
+            );
+            for field in [
+                "session_id",
+                "role_generation_id",
+                "transcript_epoch",
+                "capability_key",
+            ] {
+                fixture.execute(&format!("UPDATE controls SET payload_json=json_set(payload_json,'$.{field}','mismatched') WHERE id='functional-main-verify'"), []);
+                assert!(
+                    workflow::state(&fixture.store)
+                        .unwrap()
+                        .continuation_actions
+                        .iter()
+                        .all(|action| action.binding["session_id"] != session
+                            || action.operation != "role_resume"),
+                    "{scenario}: mismatched {field} exposed qualified Main role_resume"
+                );
+                fixture.execute(
+                    "UPDATE controls SET payload_json=?1 WHERE id='functional-main-verify'",
+                    params![completed],
+                );
+            }
+            if scenario == "held_resume_first" {
+                let publication: String = fixture.scalar("SELECT result_json FROM operation_receipts WHERE operation_id='functional-main-publish' AND actor_key='human_control' AND operation_kind='functional_main_proof'");
+                let effects = fixture.scalar::<String>(&format!("SELECT (SELECT COUNT(*) FROM controls)||':'||(SELECT version FROM tasks WHERE id='{task}')"));
+                fixture.execute("UPDATE operation_receipts SET result_json=json_set(result_json,'$.session_id','mismatched') WHERE operation_id='functional-main-publish' AND actor_key='human_control' AND operation_kind='functional_main_proof'", []);
+                assert!(app
+                    .execute_human_command(&continue_request("continue-mismatched-publication"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("published proof for its exact held Main verification"));
+                fixture.execute("UPDATE operation_receipts SET result_json=?1 WHERE operation_id='functional-main-publish' AND actor_key='human_control' AND operation_kind='functional_main_proof'", params![publication]);
+                assert_eq!(fixture.scalar::<String>(&format!("SELECT (SELECT COUNT(*) FROM controls)||':'||(SELECT version FROM tasks WHERE id='{task}')")), effects);
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                    "resume_failed".into(),
+                );
+            }
+            let mut released_continue = None;
+            if scenario == "held_continue_first" {
+                let request = continue_request("continue-qualified-main");
+                let released = app.execute_human_command(&request).unwrap();
+                assert_eq!(released.state, "main_resume_failure_released");
+                fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM controls WHERE kind='continue' AND state='finished' AND requested_operation_id='continue-qualified-main'", 1);
+                let settled = app.coordinator_tick().unwrap();
+                assert_ne!(
+                    settled["action"], "continue_rejected",
+                    "{scenario}: {settled}"
+                );
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT phase FROM attempts WHERE id='{}'", plan.attempt_id),
+                    "awaiting_plan_approval".into(),
+                );
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id),
+                    "needs_input".into(),
+                );
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                    "none".into(),
+                );
+                released_continue = Some((request, released));
+            } else {
+                fixture.execute("INSERT INTO recovery_records(id,session_id,attempt_id,state,process_identity_json,detail_json,created_at,updated_at)
+                    VALUES('independent-recovery',?1,?2,'attention_required','{}','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", params![rejected_session, plan.attempt_id]);
+                assert!(app
+                    .execute_human_command(&continue_request("continue-independent-hold"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("current exact rejected-session fresh-route authority"));
+                let held_projection = workflow::state(&fixture.store).unwrap();
+                assert!(held_projection
+                    .decisions
+                    .iter()
+                    .filter(|decision| {
+                        decision.subject.attempt_id.as_deref() == Some(plan.attempt_id.as_str())
+                    })
+                    .all(|decision| !decision
+                        .control_policy
+                        .allowed_controls
+                        .iter()
+                        .any(|control| control == "continue")));
+                assert!(held_projection.continuation_actions.iter().any(|action| {
+                    action.operation == "role_resume"
+                        && action.binding["session_id"] == session
+                        && action.enabled
+                }), "{scenario}: independent source recovery hid qualified Main role_resume; initial eligibility={resume_eligibility}");
+            }
+            fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM audit_events WHERE entity_id='{session}'
+                AND event_code='main_verification.completed_turn.stop_claimed'
+                AND json_extract(detail_json,'$.control_id')='functional-main-verify'
+                AND json_extract(detail_json,'$.transcript_epoch')=(SELECT transcript_epoch FROM sessions WHERE id='{session}')
+                AND json_extract(detail_json,'$.turn')=2"), 1);
+            fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM role_credentials WHERE revoked_at IS NULL
+                AND role_generation_id=(SELECT role_generation_id FROM sessions WHERE id='{session}')"), 0);
+            app.resume_role_session(&session, "").unwrap();
+            fixture.assert_scalar::<String>(
+                &format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id),
+                "running".into(),
+            );
+            fixture.assert_scalar::<i64>("SELECT json_extract(payload_json,'$.coding_started') FROM controls WHERE id='functional-main-verify'", 1);
+            if scenario == "held_resume_first" || historical_running {
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                    "resume_failed".into(),
+                );
+                fixture.execute("UPDATE recovery_records SET state='resolved_quiescent' WHERE id='independent-recovery'", []);
+                let mut stale = continue_request("continue-stale-version");
+                if let HumanCommand::Control {
+                    expected_version, ..
+                } = &mut stale
+                {
+                    *expected_version -= 1;
+                }
+                assert!(app
+                    .execute_human_command(&stale)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("task version is stale"));
+                let request = continue_request("continue-qualified-main");
+                let released = app.execute_human_command(&request).unwrap();
+                assert_eq!(released.state, "main_resume_failure_released");
+                released_continue = Some((request, released));
+            }
+            let (release_request, released) = released_continue.unwrap();
+            assert_eq!(
+                released.detail["resume_rejection"],
+                completed_payload["resume_rejection"]
+            );
+            assert_eq!(
+                released.detail["verification"]["control_id"],
+                "functional-main-verify"
+            );
+            assert_eq!(released.detail["verification"]["session_id"], session);
+            assert_eq!(
+                released.detail["verification"]["role_generation_id"],
+                record["role_generation_id"]
+            );
+            assert_eq!(
+                released.detail["verification"]["transcript_epoch"],
+                completed_payload["transcript_epoch"]
+            );
+            assert_eq!(
+                released.detail["current"]["resume_count"],
+                if scenario == "held_continue_first" {
+                    1
+                } else {
+                    2
+                }
+            );
+            assert_eq!(
+                app.execute_human_command(&release_request).unwrap().detail,
+                released.detail
+            );
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM controls WHERE kind='continue' AND state='finished' AND requested_operation_id='continue-qualified-main'", 1);
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events WHERE operation_id='continue-qualified-main' AND actor_kind='service' AND event_code='session.resume.main_verification_released'", 1);
+            let effects = fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM resume_invocations)");
+            let settled = app.coordinator_tick().unwrap();
+            assert_ne!(
+                settled["action"], "continue_rejected",
+                "{scenario}: {settled}"
+            );
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM controls WHERE kind='continue' AND state='finished' AND requested_operation_id='continue-qualified-main'", 1);
+            fixture.assert_scalar::<String>(
+                &format!("SELECT phase FROM attempts WHERE id='{}'", plan.attempt_id),
+                "awaiting_plan_approval".into(),
+            );
+            fixture.assert_scalar::<String>(
+                &format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id),
+                "running".into(),
+            );
+            assert_eq!(fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM resume_invocations)"), effects);
+            assert!(app
+                .execute_human_command(&continue_request("continue-ordinary-phase"))
+                .unwrap_err()
+                .to_string()
+                .contains(
+                    "workflow control is not available in the current task and attempt state"
+                ));
+            fixture.assert_scalar::<String>(
+                &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                "none".into(),
+            );
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events WHERE event_code='session.resume.turn_reconciled' AND json_extract(detail_json,'$.hold_released')=1", 0);
+            record_synthetic_main_turn(&fixture, &session, &native, &repository);
+            fixture.store.mark_interrupt_requested(&session).unwrap();
+            let (epoch, process) = runtime_session_identity(&fixture, &session);
+            exit_session(&fixture, &session, &epoch, &process);
+            let ordinary = app
+                .dispatch_attempt_role(
+                    &plan.attempt_id,
+                    RoleKind::Manager,
+                    "Continue the approved planning conversation",
+                )
+                .unwrap();
+            assert_ne!(ordinary.session_id, session);
+            fixture.assert_scalar::<String>(
+                &format!(
+                    "SELECT status FROM sessions WHERE id='{}'",
+                    ordinary.session_id
+                ),
+                "running".into(),
+            );
+            fixture.assert_scalar::<i64>(
+                &format!("SELECT COUNT(*) FROM resume_invocations WHERE session_id='{session}'"),
+                2,
+            );
+            fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'", plan.attempt_id), 3);
+            fixture.assert_scalar::<i64>(
+                "SELECT COUNT(*) FROM controls WHERE id='functional-main-verify' AND kind='main_checkout_verify'",
+                1,
+            );
+            fixture.assert_scalar::<i64>(
+                "SELECT COUNT(*) FROM controls WHERE kind='main_checkout_verify'",
+                if historical_running { 3 } else { 2 },
+            );
+            assert!(!std::path::Path::new(
+                payload["observation_request"]["permitted_read"]["path"]
+                    .as_str()
+                    .unwrap()
+            )
+            .exists());
+            let ordinary_native = uuid::Uuid::new_v4().to_string();
+            record_synthetic_main_turn(
+                &fixture,
+                &ordinary.session_id,
+                &ordinary_native,
+                &repository,
+            );
+            fixture
+                .store
+                .mark_interrupt_requested(&ordinary.session_id)
+                .unwrap();
+            let (epoch, process) = runtime_session_identity(&fixture, &ordinary.session_id);
+            exit_session(&fixture, &ordinary.session_id, &epoch, &process);
+            if historical_running {
+                fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM controls WHERE id='functional-main-historical-verify'
+                    AND kind='main_checkout_verify' AND state='cancelled' AND role_generation_id IS NULL
+                    AND json_type(payload_json,'$.session_id') IS NULL AND json_type(payload_json,'$.launch_reservation') IS NULL", 1);
+                fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM attempts WHERE id='{}'
+                    AND phase='awaiting_plan_approval' AND plan_hash='historical-unapproved-plan' AND plan_approved_at IS NULL", plan.attempt_id), 1);
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                    "none".into(),
+                );
+                fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events WHERE event_code='session.resume.fresh_route.reserved'", 0);
+                fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events WHERE event_code='session.resume.turn_reconciled' AND json_extract(detail_json,'$.hold_released')=1", 0);
+                continue;
+            }
+            let ordinary_record = fixture.store.session_json(&ordinary.session_id).unwrap();
+            let next_rejection = seed_permanent_resume_rejection(
+                &fixture,
+                &ordinary.session_id,
+                ordinary_record["role_generation_id"].as_str().unwrap(),
+                "manager",
+                true,
+            );
+            fixture.execute("UPDATE audit_events SET detail_json=json_set(detail_json,'$.category','native_history_unavailable') WHERE id=?1", params![next_rejection]);
+            let next_request = serde_json::json!({"kind":"verify_main_checkout","operation_id":"functional-main-verify-again",
+                "task_id":task,"expected_version":fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'")),"role":"manager"});
+            let effects = fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM controls)||':'||(SELECT COUNT(*) FROM capabilities)");
+            let resolution: (String,String) = fixture.connection().query_row(
+                "SELECT id,detail_json FROM audit_events WHERE operation_id='continue-qualified-main' AND event_code='session.resume.main_verification_released'",
+                [], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            fixture.execute(
+                "UPDATE audit_events SET actor_kind='human' WHERE id=?1",
+                params![resolution.0],
+            );
+            assert!(workflow_command(&fixture, next_request.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("one exact unconsumed Manager resume rejection"));
+            fixture.execute("UPDATE audit_events SET actor_kind='service',detail_json=json_set(detail_json,'$.verification.control_id','mismatched') WHERE id=?1", params![resolution.0]);
+            assert!(workflow_command(&fixture, next_request.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("one exact unconsumed Manager resume rejection"));
+            fixture.execute(
+                "UPDATE audit_events SET detail_json=?1 WHERE id=?2",
+                params![resolution.1, resolution.0],
+            );
+            assert_eq!(fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM controls)||':'||(SELECT COUNT(*) FROM capabilities)"), effects);
+            let queued = workflow_command(&fixture, next_request).unwrap();
+            assert_eq!(
+                queued.detail["resume_rejection"]["rejection_event_id"],
+                next_rejection
+            );
+            assert_eq!(
+                queued.detail["resume_rejection"]["session_id"],
+                ordinary.session_id
+            );
+            let started = app.coordinator_tick().unwrap();
+            assert_eq!(
+                started["action"], "main_verification_started",
+                "{scenario}: {started}"
+            );
+            let next_session = started["launch"]["session_id"].as_str().unwrap().to_owned();
+            let next_native = uuid::Uuid::new_v4().to_string();
+            let next_contract = record_synthetic_functional_main_turn(
+                &fixture,
+                &app,
+                &next_session,
+                &next_native,
+                None,
+                true,
+                None,
+            );
+            for retained in [false, true] {
+                if retained {
+                    assert_eq!(
+                        app.coordinator_tick().unwrap()["action"],
+                        "main_verification_resume_started"
+                    );
+                    record_synthetic_functional_main_turn(
+                        &fixture,
+                        &app,
+                        &next_session,
+                        &next_native,
+                        Some(&next_contract),
+                        true,
+                        None,
+                    );
+                }
+                let waiting = app.coordinator_tick().unwrap();
+                assert_eq!(
+                    waiting["for"], "main_verification_quiescence",
+                    "{scenario}: {waiting}"
+                );
+                fixture
+                    .store
+                    .mark_interrupt_requested(&next_session)
+                    .unwrap();
+                let (epoch, process) = runtime_session_identity(&fixture, &next_session);
+                exit_session(&fixture, &next_session, &epoch, &process);
+            }
+            assert_eq!(
+                app.coordinator_tick().unwrap()["action"],
+                "main_verification_requires_native_evidence"
+            );
+            let next_record = fixture.store.session_json(&next_session).unwrap();
+            let next_payload: serde_json::Value = serde_json::from_str(&fixture.scalar::<String>(
+                "SELECT payload_json FROM controls WHERE id='functional-main-verify-again'",
+            ))
+            .unwrap();
+            let next_proof: agenticjira::domain::FunctionalCapabilityProofInput = serde_json::from_value(serde_json::json!({
+                "qualification_contract":"functional-v2","operation_id":"functional-main-publish-again","session_id":next_session,
+                "evidence_reference":"synthetic-functional-not-native-acceptance","main":{
+                    "observation_request_hash":next_payload["observation_request_hash"],"native_command":next_payload["observation_request"]["command"],
+                    "native_session_id":next_native,"role_generation_id":next_record["role_generation_id"],"observation":{
+                        "status":"passed","binding_hash":next_contract["binding_hash"],"challenge":next_contract["observed_challenge"],"session_mode":"retained"}}})).unwrap();
+            fixture
+                .store
+                .record_functional_main_checkout_proof(&next_proof)
+                .unwrap();
+            std::fs::remove_file(
+                next_payload["observation_request"]["permitted_read"]["path"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            if scenario == "held_continue_first" {
+                let concurrent = seed_permanent_resume_rejection(
+                    &fixture,
+                    rejected_session,
+                    released.detail["resume_rejection"]["role_generation_id"]
+                        .as_str()
+                        .unwrap(),
+                    "manager",
+                    true,
+                );
+                fixture.execute("UPDATE audit_events SET detail_json=json_set(detail_json,'$.category','native_history_unavailable') WHERE id=?1", params![concurrent]);
+                let forged_resolution = uuid::Uuid::new_v4().to_string();
+                fixture.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+                    SELECT ?1,operation_id,actor_kind,event_code,entity_kind,entity_id,json_set(detail_json,'$.resume_rejection.rejection_event_id',?2),created_at
+                    FROM audit_events WHERE id=?3",params![forged_resolution,concurrent,resolution.0]);
+                let effects = fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM controls)||':'||(SELECT COUNT(*) FROM capabilities)");
+                assert!(app
+                    .execute_human_command(&continue_request("continue-main-concurrent"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("current exact rejected-session fresh-route authority"));
+                assert!(workflow_command(&fixture,serde_json::json!({"kind":"verify_main_checkout","operation_id":"verify-main-concurrent",
+                    "task_id":task,"expected_version":fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'")),"role":"manager"}))
+                    .unwrap_err().to_string().contains("one exact unconsumed Manager resume rejection"));
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                    "resume_failed".into(),
+                );
+                assert_eq!(fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM controls)||':'||(SELECT COUNT(*) FROM capabilities)"), effects);
+            } else {
+                let request = continue_request("continue-main-again");
+                let next_release = app.execute_human_command(&request).unwrap();
+                assert_eq!(next_release.state, "main_resume_failure_released");
+                assert_eq!(
+                    next_release.detail["resume_rejection"]["rejection_event_id"],
+                    next_rejection
+                );
+                assert_eq!(
+                    next_release.detail["verification"]["control_id"],
+                    "functional-main-verify-again"
+                );
+                assert_eq!(next_release.detail["current"]["session_id"], next_session);
+                assert_eq!(
+                    app.execute_human_command(&request).unwrap().detail,
+                    next_release.detail
+                );
+                let settled = app.coordinator_tick().unwrap();
+                assert_ne!(
+                    settled["action"], "continue_rejected",
+                    "{scenario}: {settled}"
+                );
+                fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM controls WHERE kind='continue' AND state='finished' AND requested_operation_id IN ('continue-qualified-main','continue-main-again')",2);
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                    "none".into(),
+                );
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT phase FROM attempts WHERE id='{}'", plan.attempt_id),
+                    "awaiting_plan_approval".into(),
+                );
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id),
+                    "needs_input".into(),
+                );
+            }
+            fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'",plan.attempt_id),4);
+            fixture.assert_scalar::<i64>(
+                &format!(
+                    "SELECT COUNT(*) FROM resume_invocations WHERE session_id='{next_session}'"
+                ),
+                1,
+            );
+            fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM controls WHERE attempt_id='{}' AND kind='main_checkout_verify'",plan.attempt_id),3);
+            fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM capabilities WHERE mode='main_checkout' AND status='supported' AND config_hash='{}'",next_record["capability_key"].as_str().unwrap()),1);
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events WHERE event_code='session.resume.fresh_route.reserved'",0);
+            fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events WHERE event_code='session.resume.turn_reconciled' AND json_extract(detail_json,'$.hold_released')=1",0);
+            continue;
+        }
+        if role != RoleKind::FinalReviewer {
+            if role == RoleKind::Implementer {
+                authorize_ordinary_implementation(&fixture, &plan);
+            }
+            app.resume_role_session(&session, "").unwrap();
+            if role == RoleKind::Manager {
+                let token = uuid::Uuid::new_v4().to_string();
+                fixture.execute("UPDATE role_credentials SET token_hash=?1 WHERE role_generation_id=?2 AND revoked_at IS NULL",
+                    params![auth::hash_secret(&token),record["role_generation_id"].as_str()]);
+                fixture
+                    .store
+                    .save_role_result(
+                        &fixture.store.role_context(&token).unwrap(),
+                        &RoleResultReport {
+                            operation_id: "ordinary-after-functional-main".into(),
+                            outcome: "needs_input".into(),
+                            summary: "Continue with human input".into(),
+                            evidence: Vec::new(),
+                            metadata: serde_json::json!({}),
+                        },
+                    )
+                    .unwrap();
+                let control = "functional-main-verify";
+                record_synthetic_main_turn(&fixture, &session, &native, &repository);
+                let (epoch, process) = runtime_session_identity(&fixture, &session);
+                exit_session(&fixture, &session, &epoch, &process);
+                let reviewed_id = uuid::Uuid::new_v4().to_string();
+                let repo = workspace::inspect(&repository).unwrap();
+                let (manifest, candidate_hash) = snapshot::capture(
+                    &repo,
+                    &repository,
+                    &paths.artifacts.join("snapshots").join(&reviewed_id),
+                )
+                .unwrap();
+                fixture.execute("INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at,workspace_id,candidate_head)
+                    SELECT ?1,?2,'accepted',?3,?4,?5,1,'2026-01-01T00:00:00Z',id,?6 FROM workspaces WHERE attempt_id=?2",
+                    params![reviewed_id,plan.attempt_id,manifest.snapshot_base,candidate_hash,serde_json::to_string(&manifest).unwrap(),manifest.candidate_head]);
+                fixture.execute("UPDATE attempts SET phase='awaiting_human_review',candidate_hash=?1,accepted_snapshot_id=?2 WHERE id=?3",
+                    params![candidate_hash,reviewed_id,plan.attempt_id]);
+                fixture.execute(
+                    "UPDATE tasks SET lifecycle='awaiting_review' WHERE id=?1",
+                    params![task],
+                );
+                let version: i64 = fixture
+                    .connection()
+                    .query_row(
+                        "SELECT version FROM tasks WHERE id=?1",
+                        params![task],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let child = app
+                    .execute_human_command(&HumanCommand::HumanReview {
+                        operation_id: "functional-main-readonly-rework".into(),
+                        task_id: task.clone(),
+                        attempt_id: plan.attempt_id.clone(),
+                        expected_version: version,
+                        decision: "request_changes".into(),
+                        feedback: "Continue the same authorized task".into(),
+                        carry_plan_approval: false,
+                    })
+                    .unwrap()
+                    .entity_id;
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT state FROM rework_intents WHERE new_attempt_id='{child}'"),
+                    "completed".into(),
+                );
+                fixture.assert_scalar::<String>(
+                    &format!(
+                        "SELECT attempt_id FROM claims WHERE task_id='{task}' AND state='running'"
+                    ),
+                    child.clone(),
+                );
+                fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM controls WHERE attempt_id='{child}' AND kind='main_checkout_verify'"),0);
+                let effects = || {
+                    fixture.scalar::<String>("SELECT (SELECT COUNT(*) FROM sessions)||':'||(SELECT COUNT(*) FROM role_generations)
+                    ||':'||(SELECT COUNT(*) FROM role_credentials)||':'||(SELECT COUNT(*) FROM audit_events WHERE event_code='session.spawn.intent')")
+                };
+                let before = effects();
+                fixture.execute(
+                    "UPDATE controls SET state='native_running' WHERE id=?1",
+                    params![control],
+                );
+                let error = app
+                    .dispatch_attempt_role(&child, RoleKind::Manager, "Continue the task")
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Verify this Main read-only role"),
+                    "{error:#}"
+                );
+                let refused_permit: String = fixture
+                    .connection()
+                    .query_row(
+                        "SELECT id FROM launch_permits WHERE attempt_id=?1 AND role='manager'",
+                        params![child],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                fixture.assert_scalar::<String>(
+                    &format!("SELECT state FROM launch_permits WHERE id='{refused_permit}'"),
+                    "released_nondelivery".into(),
+                );
+                fixture.assert_scalar::<String>(&format!("SELECT json_extract(detail_json,'$.reason') FROM audit_events WHERE entity_id='{refused_permit}' AND event_code='launch.permit.released_nondelivery'"),"Main read-only command preparation failed".into());
+                assert_eq!(effects(), before);
+                fixture.execute(
+                    "UPDATE controls SET state='finished' WHERE id=?1",
+                    params![control],
+                );
+                let launched = app
+                    .dispatch_attempt_role(&child, RoleKind::Manager, "Continue the task")
+                    .unwrap();
+                let child_session = &launched.session_id;
+                let child_record = fixture.store.session_json(child_session).unwrap();
+                assert_eq!(child_record["capability_identity"], frozen_identity);
+                fixture.assert_scalar::<i64>(
+                    &format!("SELECT resume_count FROM sessions WHERE id='{child_session}'"),
+                    0,
+                );
+                assert_ne!(child_session, &session);
+                let retained_proof: serde_json::Value =
+                    serde_json::from_str(&fixture.scalar::<String>(
+                        "SELECT proof_json FROM capabilities WHERE mode='main_checkout'",
+                    ))
+                    .unwrap();
+                assert_eq!(retained_proof, published);
+                fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM launch_permits WHERE attempt_id='{child}' AND state='consumed'"),1);
+                fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM controls WHERE attempt_id='{child}' AND kind='main_checkout_verify'"),0);
+                let child_native = uuid::Uuid::new_v4().to_string();
+                record_synthetic_main_turn(&fixture, child_session, &child_native, &repository);
+                let (epoch, process) = runtime_session_identity(&fixture, child_session);
+                exit_session(&fixture, child_session, &epoch, &process);
+                let saved: String = fixture
+                    .connection()
+                    .query_row(
+                        "SELECT payload_json FROM controls WHERE id=?1",
+                        params![control],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let launch: LaunchConfig =
+                    serde_json::from_value(child_record["launch_config"].clone()).unwrap();
+                fixture.execute("UPDATE controls SET payload_json=json_set(payload_json,'$.readonly_command_policy.commands[0].command','changed command') WHERE id=?1",params![control]);
+                let error = fixture
+                    .store
+                    .reserve_role_resume(
+                        child_session,
+                        "refused-lineage-epoch",
+                        &launch,
+                        "refused-token",
+                    )
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("no frozen command authority"),
+                    "{error:#}"
+                );
+                fixture.execute(
+                    "UPDATE controls SET payload_json=?1 WHERE id=?2",
+                    params![saved, control],
+                );
+                let absent = payload["scope"]["policy_denied_unobserved"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|root| root.as_str().unwrap().ends_with(".local/worktree-cleanup"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap();
+                std::fs::create_dir_all(absent).unwrap();
+                let error = app.resume_role_session(child_session, "").unwrap_err();
+                assert!(format!("{error:#}").contains(absent), "{error:#}");
+                std::fs::remove_dir(absent).unwrap();
+                fixture.assert_scalar::<i64>(
+                    &format!(
+                        "SELECT COUNT(*) FROM resume_invocations WHERE session_id='{child_session}'"
+                    ),
+                    0,
+                );
+                fixture.assert_scalar::<i64>(
+                    "SELECT COUNT(*) FROM capabilities WHERE mode='main_checkout'",
+                    1,
+                );
+            }
+        } else {
+            assert!(app.resume_role_session(&session, "").is_err());
+        }
+        assert_eq!(
+            std::fs::metadata(repository.join("fixture.txt"))
+                .unwrap()
+                .ino(),
+            baseline
+        );
+        assert_eq!(plan.workspace_path, repository.canonicalize().unwrap());
+    }
+}
+
 #[test]
 fn main_checkout_proof_publication_resumes_completed_stops_and_keeps_ordinary_input() {
     // Synthetic native observations exercise publication and lifecycle, not live qualification.
@@ -35899,6 +40798,10 @@ fn main_checkout_proof_publication_resumes_completed_stops_and_keeps_ordinary_in
             workflow_command(&fixture,serde_json::json!({"kind":"verify_main_checkout",
                 "operation_id":format!("{task}-verify-main"),"task_id":task,"expected_version":ready.version.unwrap(),
                 "role":if readonly {Some("manager")} else {None}})).unwrap();
+            fixture.execute("UPDATE operation_receipts SET result_json=json_remove(result_json,'$.detail.qualification_contract')
+                WHERE operation_id=?1", params![format!("{task}-verify-main")]);
+            fixture.execute("UPDATE controls SET payload_json=json_remove(payload_json,'$.qualification_contract')
+                WHERE id=?1", params![format!("{task}-verify-main")]);
         };
         authorize(&task, if readonly { "trip" } else { family });
         let plan = Scheduler::new(fixture.store.clone(), paths.artifacts.clone())
@@ -35942,6 +40845,7 @@ fn main_checkout_proof_publication_resumes_completed_stops_and_keeps_ordinary_in
             let identity = providers::capability_identity(&launch).unwrap();
             providers::claude::require_current_native_policy(&identity).unwrap();
             assert_eq!(identity.security_policy["tools"], "Read,Grep,Glob,Bash");
+            assert_eq!(identity.security_policy["permission_mode"], "default");
             let settings: serde_json::Value = serde_json::from_str(
                 &launch
                     .argv
@@ -35953,6 +40857,14 @@ fn main_checkout_proof_publication_resumes_completed_stops_and_keeps_ordinary_in
             let writes = settings["sandbox"]["filesystem"]["denyWrite"]
                 .as_array()
                 .unwrap();
+            assert_eq!(
+                settings["sandbox"]["filesystem"]["denyWrite"],
+                policy["write_denials"]
+            );
+            assert_eq!(
+                settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
+                agenticjira::permissions::PROVIDER_PERMISSION_TIMEOUT_SECONDS
+            );
             assert!(writes.contains(&serde_json::json!(repository)));
             for root in frozen_identity["security_policy"]["checkout_scope"]["protected_roots"]
                 .as_array()
@@ -36543,6 +41455,7 @@ fn main_checkout_proof_publication_resumes_completed_stops_and_keeps_ordinary_in
                 "kind":"verify_main_checkout","operation_id":"verify-claude-without-observations",
                 "task_id":task,"expected_version":version,"role":"manager"
             })).unwrap();
+            fixture.execute("UPDATE controls SET payload_json=json_remove(payload_json,'$.qualification_contract') WHERE id='verify-claude-without-observations'",[]);
             let started = app.coordinator_tick().unwrap();
             assert_eq!(started["action"], "main_verification_started", "{started}");
             let claude_session = started["launch"]["session_id"].as_str().unwrap();
@@ -36704,6 +41617,7 @@ fn main_checkout_proof_publication_resumes_completed_stops_and_keeps_ordinary_in
             )
             .unwrap();
             let newer_control = "verify-codex-after-stop";
+            fixture.execute("UPDATE controls SET payload_json=json_remove(payload_json,'$.qualification_contract') WHERE id=?1",params![newer_control]);
             let newer_active = workflow::state(&fixture.store).unwrap();
             assert!(newer_active
                 .controls
@@ -36897,74 +41811,55 @@ fn main_checkout_proof_publication_resumes_completed_stops_and_keeps_ordinary_in
                 "UPDATE controls SET state='finished' WHERE id=?1",
                 params![control],
             );
-            let launched = app
-                .dispatch_attempt_role(&child, RoleKind::Manager, "Continue the task")
+            let permits = fixture.scalar::<i64>(&format!(
+                "SELECT COUNT(*) FROM launch_permits WHERE attempt_id='{child}'"
+            ));
+            let baseline: String = fixture
+                .connection()
+                .query_row(
+                    "SELECT policy_json FROM workspaces WHERE attempt_id=?1",
+                    params![child],
+                    |row| row.get(0),
+                )
                 .unwrap();
-            let child_session = &launched.session_id;
-            let child_record = fixture.store.session_json(child_session).unwrap();
-            assert_eq!(child_record["capability_identity"], frozen_identity);
+            let error = app
+                .dispatch_attempt_role(&child, RoleKind::Manager, "Continue the task")
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Verify this Main checkout's native permissions"),
+                "{error:#}"
+            );
+            assert_eq!(effects(), before);
             fixture.assert_scalar::<i64>(
-                &format!("SELECT resume_count FROM sessions WHERE id='{child_session}'"),
+                &format!("SELECT COUNT(*) FROM launch_permits WHERE attempt_id='{child}'"),
+                permits,
+            );
+            fixture.assert_scalar::<i64>(
+                &format!("SELECT COUNT(*) FROM launch_permits WHERE attempt_id='{child}' AND state='consumed'"),
                 0,
             );
-            assert_ne!(child_session, &session);
+            fixture.assert_scalar::<String>(
+                &format!(
+                    "SELECT attempt_id FROM claims WHERE task_id='{task}' AND state='running'"
+                ),
+                child.clone(),
+            );
+            fixture.assert_scalar::<String>(
+                &format!("SELECT policy_json FROM workspaces WHERE attempt_id='{child}'"),
+                baseline,
+            );
             let retained_proof: serde_json::Value =
                 serde_json::from_str(&fixture.scalar::<String>(
                     "SELECT proof_json FROM capabilities WHERE mode='main_checkout'",
                 ))
                 .unwrap();
             assert_eq!(retained_proof, published);
-            fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM launch_permits WHERE attempt_id='{child}' AND state='consumed'"),1);
-            fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM controls WHERE attempt_id='{child}' AND kind='main_checkout_verify'"),0);
-            let child_native = uuid::Uuid::new_v4().to_string();
-            record_synthetic_main_turn(&fixture, child_session, &child_native, &repository);
-            let (epoch, process) = runtime_session_identity(&fixture, child_session);
-            exit_session(&fixture, child_session, &epoch, &process);
-            let saved: String = fixture
-                .connection()
-                .query_row(
-                    "SELECT payload_json FROM controls WHERE id=?1",
-                    params![control],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            let launch: LaunchConfig =
-                serde_json::from_value(child_record["launch_config"].clone()).unwrap();
-            fixture.execute("UPDATE controls SET payload_json=json_set(payload_json,'$.readonly_command_policy.commands[0].command','changed command') WHERE id=?1",params![control]);
-            let error = fixture
-                .store
-                .reserve_role_resume(
-                    child_session,
-                    "refused-lineage-epoch",
-                    &launch,
-                    "refused-token",
-                )
-                .unwrap_err();
-            assert!(
-                error.to_string().contains("no frozen command authority"),
-                "{error:#}"
-            );
-            fixture.execute(
-                "UPDATE controls SET payload_json=?1 WHERE id=?2",
-                params![saved, control],
-            );
-            let absent = payload["scope"]["policy_denied_unobserved"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|root| root.as_str().unwrap().ends_with(".local/worktree-cleanup"))
-                .unwrap()
-                .as_str()
-                .unwrap();
-            std::fs::create_dir_all(absent).unwrap();
-            let error = app.resume_role_session(child_session, "").unwrap_err();
-            assert!(format!("{error:#}").contains(absent), "{error:#}");
-            std::fs::remove_dir(absent).unwrap();
+            assert!(retained_proof.get("qualification_contract").is_none());
             fixture.assert_scalar::<i64>(
-                &format!(
-                    "SELECT COUNT(*) FROM resume_invocations WHERE session_id='{child_session}'"
-                ),
-                0,
+                &format!("SELECT COUNT(*) FROM resume_invocations WHERE session_id='{session}'"),
+                3,
             );
             fixture.assert_scalar::<i64>(
                 "SELECT COUNT(*) FROM capabilities WHERE mode='main_checkout'",
@@ -39742,10 +44637,22 @@ args = ["--unicode"]
     assert!(admission
         .reserve_error(&admission_context, &admission_launch)
         .contains("provider capability is not proven"));
-    admission.assert_scalar::<i64>("SELECT COUNT(*) FROM sessions", 0);
-    admission.assert_scalar::<i64>("SELECT COUNT(*) FROM role_generations", 0);
+    admission.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'",admission_plan.attempt_id), 0);
+    admission.assert_scalar::<i64>(
+        &format!(
+            "SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}'",
+            admission_plan.attempt_id
+        ),
+        0,
+    );
     admission.assert_scalar::<i64>("SELECT COUNT(*) FROM role_credentials", 0);
-    admission.assert_scalar::<String>("SELECT state FROM launch_permits LIMIT 1", "issued".into());
+    admission.assert_scalar::<String>(
+        &format!(
+            "SELECT state FROM launch_permits WHERE id='{}'",
+            admission_context.permit_id
+        ),
+        "issued".into(),
+    );
     seed_supported_capabilities(&admission);
     admission.execute(
         "UPDATE capabilities SET checked_at='2026-01-02T00:00:00Z'
@@ -39753,11 +44660,23 @@ args = ["--unicode"]
         params![admission_key],
     );
     admission.reserve_role(&admission_context, &admission_launch);
-    admission.assert_scalar::<i64>("SELECT COUNT(*) FROM sessions", 1);
+    admission.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'",admission_plan.attempt_id), 1);
 
     let fixture = Fixture::new("c8-codex-native-policy");
     let (_project, _task, plan) = new_task(&fixture, "c8", "c8-task");
     authorize_ordinary_implementation(&fixture, &plan);
+    let legacy_project = add_project(
+        &fixture,
+        fixture.repository("legacy-diagnostic-repo"),
+        "c8-legacy-diagnostic",
+    );
+    let legacy_task = create_task(&fixture, &legacy_project, "c8-legacy-diagnostic-task", 1);
+    let legacy_plan = claim(&fixture, fixture.root.join("artifacts"));
+    assert_eq!(legacy_plan.task_id, legacy_task);
+    fixture.execute(
+        "UPDATE tasks SET lifecycle='validation',archived_at='2000-01-01T00:00:00Z' WHERE id=?1",
+        params![legacy_task],
+    );
     let implementer_context = fixture
         .store
         .role_launch_context(&plan.attempt_id, RoleKind::Implementer)
@@ -39808,6 +44727,15 @@ args = ["--unicode"]
     );
     let current_implementer_key =
         providers::capability_identity_key(&current_implementer_identity).unwrap();
+    let validation_project: String = fixture
+        .connection()
+        .query_row(
+            "SELECT json_extract(proof_json,'$.runtime_scope.fixture_project_id')
+             FROM capabilities WHERE config_hash=?1",
+            params![current_implementer_key],
+            |row| row.get(0),
+        )
+        .unwrap();
     fixture.execute(
         "UPDATE capabilities SET status='unverified',proof_json='{}' WHERE provider='codex' AND role='implementer' AND config_hash=?1",
         params![current_implementer_key],
@@ -39818,7 +44746,7 @@ args = ["--unicode"]
         .unwrap_err()
         .to_string()
         .contains("not proven"));
-    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM sessions", 0);
+    fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'",plan.attempt_id), 0);
 
     let recovery_generation = "current-codex-upgrade-recovery-generation";
     let recovery_session = "current-codex-upgrade-recovery-session";
@@ -39982,9 +44910,39 @@ args = ["--unicode"]
 
     let proof_generation = "current-codex-proof-generation";
     let proof_session = "current-codex-proof-session";
+    let mut legacy_diagnostic_launch = providers::prepare_role_launch(
+        Provider::Codex,
+        RoleKind::Implementer,
+        "gpt-5.6-sol",
+        "high",
+        &legacy_plan.workspace_path,
+        "legacy native policy admission fixture",
+        &fixture.root.join("role.sock"),
+        "legacy-diagnostic-token",
+        proof_generation,
+        proof_session,
+        None,
+        &test_hooks(&fixture),
+        &std::env::current_exe().unwrap(),
+    )
+    .unwrap()
+    .config;
+    assert_eq!(
+        legacy_diagnostic_launch
+            .security_policy
+            .as_object_mut()
+            .unwrap()
+            .remove("qualification_contract"),
+        Some(serde_json::json!("functional-v2"))
+    );
+    let legacy_diagnostic_identity =
+        providers::capability_identity(&legacy_diagnostic_launch).unwrap();
+    let legacy_diagnostic_key =
+        providers::capability_identity_key(&legacy_diagnostic_identity).unwrap();
+    assert_ne!(legacy_diagnostic_key, current_implementer_key);
     seed_session(
         &fixture,
-        &plan.attempt_id,
+        &legacy_plan.attempt_id,
         "implementer",
         proof_generation,
         proof_session,
@@ -39993,11 +44951,15 @@ args = ["--unicode"]
     let native_id = "11111111-1111-4111-8111-111111111111";
     let probe_relative = PathBuf::from("agenticjira-implementer-proof.txt");
     let probe_bytes = b"synthetic current implementer proof\n";
-    std::fs::write(plan.workspace_path.join(&probe_relative), probe_bytes).unwrap();
+    std::fs::write(
+        legacy_plan.workspace_path.join(&probe_relative),
+        probe_bytes,
+    )
+    .unwrap();
     let probe_hash = hex::encode(sha2::Sha256::digest(probe_bytes));
     fixture.execute(
         "UPDATE attempts SET status='capability_validation' WHERE id=?1",
-        params![plan.attempt_id],
+        params![legacy_plan.attempt_id],
     );
     fixture.execute(
         "UPDATE sessions SET validation_cell='L05',launch_config_json=?1,executable_version=?2,
@@ -40005,11 +44967,11 @@ args = ["--unicode"]
            capability_key=?4,capability_identity_json=?5,exit_json='{\"process_group_quiescent\":true}'
          WHERE id=?6",
         params![
-            serde_json::to_string(&prepared.config).unwrap(),
-            prepared.config.executable_version,
+            serde_json::to_string(&legacy_diagnostic_launch).unwrap(),
+            legacy_diagnostic_launch.executable_version,
             native_id,
-            current_implementer_key,
-            serde_json::to_string(&current_implementer_identity).unwrap(),
+            legacy_diagnostic_key,
+            serde_json::to_string(&legacy_diagnostic_identity).unwrap(),
             proof_session,
         ],
     );
@@ -40031,7 +44993,7 @@ args = ["--unicode"]
            'synthetic exact observation','[]','{\"history_nonce\":\"current-proof-nonce\",\"validation_observation\":\"retained native history\"}','2026-01-01T00:00:00Z')",
         params![proof_session, proof_generation],
     );
-    let current_proof = CapabilityProofInput {
+    let legacy_diagnostic_proof = CapabilityProofInput {
         operation_id: "current-codex-implementer-proof".into(),
         session_id: proof_session.into(),
         evidence_reference: "synthetic-current-proof-receipt".into(),
@@ -40052,7 +45014,7 @@ args = ["--unicode"]
     };
     assert!(fixture
         .store
-        .record_capability_proof(&current_proof)
+        .record_capability_proof(&legacy_diagnostic_proof)
         .unwrap_err()
         .to_string()
         .contains("completed PermissionRequest decision delivered"));
@@ -40071,23 +45033,77 @@ args = ["--unicode"]
            '2026-01-01T00:00:01Z','delivered','2026-01-01T00:00:02Z','2026-01-01T00:00:02Z'
          FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
            JOIN workspaces w ON w.attempt_id=a.id WHERE a.id=?5",
-        params![proof_session, proof_generation, native_id, current_implementer_key, plan.attempt_id],
+        params![proof_session, proof_generation, native_id, legacy_diagnostic_key, legacy_plan.attempt_id],
     );
-    let published_proof = fixture
+    let published_legacy_proof = fixture
         .store
-        .record_capability_proof(&current_proof)
+        .record_capability_proof(&legacy_diagnostic_proof)
         .unwrap();
-    assert_eq!(published_proof["status"], "supported");
-    assert!(published_proof["runtime_scope"].is_null());
-    assert_eq!(published_proof["runtime_scopes"], serde_json::json!([]));
+    assert_eq!(published_legacy_proof["status"], "supported");
+    assert!(published_legacy_proof["runtime_scope"].is_null());
     assert_eq!(
-        published_proof["local_mcp_coverage_revision"],
+        published_legacy_proof["runtime_scopes"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        published_legacy_proof["local_mcp_coverage_revision"],
         providers::codex::MCP_COVERAGE_REVISION
     );
     assert_eq!(
-        published_proof["native_approval_ownership_revision"],
+        published_legacy_proof["native_approval_ownership_revision"],
         providers::codex::APPROVAL_OWNERSHIP_REVISION
     );
+    assert_eq!(published_legacy_proof["session_id"], proof_session);
+    assert_eq!(published_legacy_proof["config_hash"], legacy_diagnostic_key);
+    assert!(published_legacy_proof
+        .get("qualification_contract")
+        .is_none());
+    assert!(fixture
+        .store
+        .require_supported_capability(&prepared.config)
+        .unwrap_err()
+        .to_string()
+        .contains("not proven"));
+    let after_legacy_support = workflow::state(&fixture.store)
+        .unwrap()
+        .continuation_actions
+        .into_iter()
+        .find(|action| action.binding["session_id"] == recovery_session)
+        .unwrap();
+    assert!(matches!(
+        after_legacy_support.kind,
+        agenticjira::domain::ContinuationActionKind::ReplaceStaleAuthority
+    ));
+    let mut functional_proof = serde_json::json!({
+        "fixture":true,"model":prepared.config.model,"effort":prepared.config.effort,
+        "compatibility":current_implementer_identity.compatibility,
+        "runtime_scope":null,"runtime_scopes":[],
+    });
+    seed_capability_source(
+        &fixture.connection(),
+        &validation_project,
+        &prepared.config,
+        &mut functional_proof,
+    );
+    assert_eq!(functional_proof["qualification_contract"], "functional-v2");
+    assert_eq!(functional_proof["config_hash"], current_implementer_key);
+    assert_ne!(functional_proof["session_id"], proof_session);
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT COUNT(*) FROM permission_requests WHERE session_id='{}'",
+            functional_proof["session_id"].as_str().unwrap()
+        ),
+        0,
+    );
+    fixture.execute(
+        "UPDATE capabilities SET status='supported',proof_json=?1,checked_at='2200-01-01T00:00:00Z'
+         WHERE provider='codex' AND role='implementer' AND config_hash=?2",
+        params![functional_proof.to_string(), current_implementer_key],
+    );
+    fixture
+        .store
+        .require_supported_capability(&prepared.config)
+        .unwrap();
     let after_current_support = workflow::state(&fixture.store)
         .unwrap()
         .continuation_actions
@@ -40228,7 +45244,7 @@ args = ["--unicode"]
 
     seed_session(
         &fixture,
-        &plan.attempt_id,
+        &legacy_plan.attempt_id,
         "implementer",
         "legacy-codex-generation",
         "legacy-codex-session",
@@ -40262,20 +45278,22 @@ args = ["--unicode"]
          VALUES(?1,'human_control','capability_proof',?2,'{\"status\":\"supported\",\"historical\":true}','2026-01-01T00:00:00Z')",
         params![&proof.operation_id, agenticjira::store::json_hash(&proof).unwrap()],
     );
-    let mut legacy_implementer_identity = current_implementer_identity.clone();
-    legacy_implementer_identity
+    let mut legacy_approval_launch = legacy_diagnostic_launch.clone();
+    legacy_approval_launch
         .security_policy
         .as_object_mut()
         .unwrap()
         .remove("native_approval_ownership");
+    let legacy_implementer_identity =
+        providers::capability_identity(&legacy_approval_launch).unwrap();
     let legacy_implementer_key =
         providers::capability_identity_key(&legacy_implementer_identity).unwrap();
     fixture.execute(
         "UPDATE sessions SET launch_config_json=?1,executable_version=?2,capability_key=?3,
             capability_identity_json=?4 WHERE id='legacy-codex-session'",
         params![
-            serde_json::to_string(&prepared.config).unwrap(),
-            prepared.config.executable_version,
+            serde_json::to_string(&legacy_approval_launch).unwrap(),
+            legacy_approval_launch.executable_version,
             legacy_implementer_key,
             serde_json::to_string(&legacy_implementer_identity).unwrap(),
         ],
@@ -40336,7 +45354,7 @@ args = ["--unicode"]
         ),
         0
     );
-    let mut old_coverage_launch = prepared.config.clone();
+    let mut old_coverage_launch = legacy_diagnostic_launch.clone();
     old_coverage_launch.security_policy["local_mcp_coverage"]["revision"] =
         PREVIOUS_MCP_COVERAGE_REVISION.into();
     old_coverage_launch.security_policy["local_mcp_coverage"]["shared_app_server"] =
@@ -40429,6 +45447,15 @@ args = ["--unicode"]
             providers::capability_key(&current_dispatch).unwrap(),
             current_key
         );
+        let validation_project: String = old_native
+            .connection()
+            .query_row(
+                "SELECT json_extract(proof_json,'$.runtime_scope.fixture_project_id')
+                 FROM capabilities WHERE config_hash=?1",
+                params![current_key],
+                |row| row.get(0),
+            )
+            .unwrap();
         old_native.execute(
             "UPDATE capabilities SET status='unverified',proof_json='{}',
                checked_at='2026-01-02T00:00:00Z'
@@ -40573,6 +45600,7 @@ args = ["--unicode"]
                 "effort":"high",
                 "mode":"interactive_pty",
                 "compatibility_hash":current_launch.compatibility.as_ref().unwrap().effective_hash,
+                "qualification_contract":"functional-v2",
             })
         );
         assert_ne!(old_key, current_key);
@@ -40628,13 +45656,22 @@ args = ["--unicode"]
              WHERE event_code='session.resume.fresh_route.reserved'",
             0,
         );
-        let current_proof = serde_json::json!({
+        let mut current_proof = serde_json::json!({
             "current":true,
             "model":"gpt-5.6-sol",
             "effort":"high",
             "compatibility":agenticjira::provider_compatibility::AuthorityBinding::from(
                 current_launch.compatibility.as_ref().unwrap()),
         });
+        seed_capability_source(
+            &old_native.connection(),
+            &validation_project,
+            &current_launch,
+            &mut current_proof,
+        );
+        assert_eq!(current_proof["qualification_contract"], "functional-v2");
+        assert_eq!(current_proof["config_hash"], current_key);
+        assert_ne!(current_proof["session_id"], "old-native-session");
         old_native.execute(
             "UPDATE capabilities SET status='supported',proof_json=?1,
                checked_at='2200-01-01T00:00:00Z'
@@ -40673,7 +45710,10 @@ args = ["--unicode"]
             &HumanCommand::Control {
                 operation_id: "old-native-wrong-contract-direct-continue".into(),
                 task_id: old_plan.task_id.clone(),
-                expected_version: old_native.scalar::<i64>("SELECT version FROM tasks LIMIT 1"),
+                expected_version: old_native.scalar::<i64>(&format!(
+                    "SELECT version FROM tasks WHERE id='{}'",
+                    old_plan.task_id
+                )),
                 action: "continue".into(),
                 payload: serde_json::json!({
                     "resume_rejection": current_proof_action.binding.clone(),
@@ -40900,7 +45940,9 @@ args = ["--unicode"]
                 operation_id: "c8-k1-k2-manager-setting".into(),
                 task_id: ordinary_task.clone(),
                 role: RoleKind::Manager,
-                expected_version: ordinary.scalar::<i64>("SELECT version FROM tasks"),
+                expected_version: ordinary.scalar::<i64>(&format!(
+                    "SELECT version FROM tasks WHERE id='{ordinary_task}'"
+                )),
                 config: ordinary_manager.clone(),
             },
         )
@@ -40914,7 +45956,9 @@ args = ["--unicode"]
             &ordinary_task,
             RoleKind::Manager,
             2,
-            ordinary.scalar::<i64>("SELECT version FROM tasks"),
+            ordinary.scalar::<i64>(&format!(
+                "SELECT version FROM tasks WHERE id='{ordinary_task}'"
+            )),
         )
         .unwrap();
         let initial_activation: (String, String, String) = ordinary
@@ -41202,15 +46246,22 @@ args = ["--unicode"]
             "exact resume capability is no longer supported for the frozen invocation identity"
         ));
         assert_eq!(ordinary_counts(), k2_counts);
+        let current_capability_error = ordinary
+            .store
+            .require_supported_capability(&ordinary_launch)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            current_capability_error,
+            "provider capability is not proven for this exact effective version, role, tool/network policy, and hook bytes"
+        );
         let rotation_token = auth::issue_secret();
         let rotation_error = ordinary
             .store
             .rotate_resume_credential("ordinary-k1-manager-session", &rotation_token)
             .unwrap_err()
             .to_string();
-        assert!(rotation_error.contains(
-            "same-generation native candidate with current Supported frozen capability evidence"
-        ));
+        assert_eq!(rotation_error, current_capability_error);
         assert_eq!(ordinary_counts(), k2_counts);
         let preparations = workflow::role_preparations(
             &ordinary.store,
@@ -41227,8 +46278,9 @@ args = ["--unicode"]
         assert_eq!(manager_preparation["status"], "unverified");
         assert_eq!(manager_preparation["generic_capability_supported"], false);
         assert_eq!(manager_preparation["exact_runtime_authority"], false);
-        let task_version_before_stale_activation =
-            ordinary.scalar::<i64>("SELECT version FROM tasks");
+        let task_version_before_stale_activation = ordinary.scalar::<i64>(&format!(
+            "SELECT version FROM tasks WHERE id='{ordinary_task}'"
+        ));
         let activation_count_before_stale = ordinary.scalar::<i64>(
             "SELECT COUNT(*) FROM trip_task_profile_activations
              WHERE task_id=(SELECT id FROM tasks WHERE title='c8-k1-k2-ordinary-task')
@@ -41249,7 +46301,7 @@ args = ["--unicode"]
             "exact current runtime-scoped ordinary production capability proof is missing or stale"
         ));
         ordinary.assert_scalar::<i64>(
-            "SELECT version FROM tasks",
+            &format!("SELECT version FROM tasks WHERE id='{ordinary_task}'"),
             task_version_before_stale_activation,
         );
         ordinary.assert_scalar::<i64>(
@@ -41417,7 +46469,9 @@ args = ["--unicode"]
                 operation_id: "c8-k2-supported-manager-setting".into(),
                 task_id: ordinary_task.clone(),
                 role: RoleKind::Manager,
-                expected_version: ordinary.scalar::<i64>("SELECT version FROM tasks"),
+                expected_version: ordinary.scalar::<i64>(&format!(
+                    "SELECT version FROM tasks WHERE id='{ordinary_task}'"
+                )),
                 config: ordinary_k2_manager.clone(),
             },
         )
@@ -41488,7 +46542,9 @@ args = ["--unicode"]
             &HumanCommand::Control {
                 operation_id: "c8-k2-supported-manager-replacement".into(),
                 task_id: ordinary_task.clone(),
-                expected_version: ordinary.scalar::<i64>("SELECT version FROM tasks"),
+                expected_version: ordinary.scalar::<i64>(&format!(
+                    "SELECT version FROM tasks WHERE id='{ordinary_task}'"
+                )),
                 action: "change_manager_safe_boundary".into(),
                 payload: serde_json::json!({"settings_revision":3}),
             },
@@ -41523,7 +46579,9 @@ args = ["--unicode"]
             &ordinary_task,
             RoleKind::Manager,
             3,
-            ordinary.scalar::<i64>("SELECT version FROM tasks"),
+            ordinary.scalar::<i64>(&format!(
+                "SELECT version FROM tasks WHERE id='{ordinary_task}'"
+            )),
         )
         .unwrap();
         assert_eq!(k2_activation.detail["capability_key"], ordinary_k2_key);
@@ -41633,14 +46691,36 @@ args = ["--unicode"]
              FROM audit_events WHERE event_code='session.resume.rejected'",
             setup_key.clone(),
         );
+        let validation_project: String = setup_fixture
+            .connection()
+            .query_row(
+                "SELECT project_id FROM tasks WHERE id=?1",
+                params![setup_context.task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut setup_proof = serde_json::json!({"current":true});
+        seed_capability_source(
+            &setup_fixture.connection(),
+            &validation_project,
+            &setup_launch,
+            &mut setup_proof,
+        );
+        assert_eq!(setup_proof["qualification_contract"], "functional-v2");
+        assert_eq!(setup_proof["config_hash"], setup_key);
+        assert_ne!(setup_proof["session_id"], setup_context.session_id);
         setup_fixture.execute(
             "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,
                status,evidence_reference,gaps_json,checked_at,proof_json)
              VALUES('setup-current-k1','codex',?1,'explorer','interactive_pty',?2,
-                    'supported','current setup proof','[]','2200-01-01T00:00:00Z','{\"current\":true}')
+                    'supported','current setup proof','[]','2200-01-01T00:00:00Z',?3)
              ON CONFLICT(provider,executable_version,role,mode,config_hash) DO UPDATE SET
                status='supported',proof_json=excluded.proof_json,checked_at=excluded.checked_at",
-            params![&setup_launch.executable_version, setup_key],
+            params![
+                &setup_launch.executable_version,
+                setup_key,
+                setup_proof.to_string()
+            ],
         );
         setup_fixture.execute(
             "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,
@@ -41700,7 +46780,7 @@ args = ["--unicode"]
         effort: "high".into(),
         prompt: "disposable bootstrap only".into(),
     };
-    let bootstrap_launch = providers::prepare_role_launch(
+    let mut bootstrap_launch = providers::prepare_role_launch(
         Provider::Codex,
         RoleKind::Implementer,
         &request.model,
@@ -41716,6 +46796,15 @@ args = ["--unicode"]
         &std::env::current_exe().unwrap(),
     )
     .unwrap();
+    assert_eq!(
+        bootstrap_launch
+            .config
+            .security_policy
+            .as_object_mut()
+            .unwrap()
+            .remove("qualification_contract"),
+        Some(serde_json::json!("functional-v2"))
+    );
     let prevalidation = workflow::state(&bootstrap.store).unwrap();
     assert!(prevalidation.capabilities.is_empty());
     assert_eq!(
@@ -43797,177 +48886,270 @@ fn make_effective(fixture: &Fixture, role: &str, generation: &str) {
 
 #[test]
 fn a_newer_report_from_the_asking_agent_releases_its_hold_exactly_once() {
-    let fixture = Fixture::new("hold-superseded");
-    seed_attempt(&fixture, "planning");
-    seed_session(
-        &fixture,
-        "a",
-        "manager",
-        "g-manager",
-        "s-manager",
-        "running",
-    );
-    seed_session(
-        &fixture,
-        "a",
-        "explorer",
-        "g-explorer",
-        "s-explorer",
-        "running",
-    );
-    make_effective(&fixture, "manager", "g-manager");
-    let hold = |event: &str, detail: &str, at: &str| {
-        fixture.execute_batch(&format!(
-            "UPDATE tasks SET attention='needs_input',version=4 WHERE id='t';
-             UPDATE attempts SET status='needs_input',updated_at='{at}' WHERE id='a';
-             INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
-               VALUES('{event}','{event}-op','service','attempt.attention.changed','attempt','a','{detail}','{at}');"
-        ));
-    };
-    let report = |id: &str, generation: &str, outcome: &str, consumed: Option<&str>| {
-        let session = if generation == "g-manager" {
-            "s-manager"
-        } else {
-            "s-explorer"
-        };
-        let metadata = if outcome == "plan_ready" {
-            r#"{"plan":"Answered plan"}"#
-        } else {
-            "{}"
-        };
-        fixture.execute(
-            "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
-             VALUES(?1,?1,?2,?3,?4,'Report','[]',?6,'2026-01-01T00:00:06Z',?5)",
-            params![id, session, generation, outcome, consumed, metadata],
+    for phase in ["planning", "awaiting_plan_approval"] {
+        let fixture = Fixture::new(&format!("hold-superseded-{phase}"));
+        seed_attempt(&fixture, phase);
+        seed_session(
+            &fixture,
+            "a",
+            "manager",
+            "g-manager",
+            "s-manager",
+            "running",
         );
-    };
-    let released =
-        || agenticjira::coordinator::reconcile_superseded_role_hold(&fixture.store).unwrap();
-    let question_state = || {
-        let content = workflow::task_content(&fixture.store, "t").unwrap();
-        let source = &content["current_input"];
-        assert!(source.get("report").is_none() || source["report"]["id"] == "question");
-        (
-            source["state"].as_str().unwrap().to_owned(),
-            source["unavailable_reason"].as_str().map(str::to_owned),
-        )
-    };
-    let available = || ("available".to_owned(), None::<String>);
-    let task_state = || {
-        fixture
+        seed_session(
+            &fixture,
+            "a",
+            "explorer",
+            "g-explorer",
+            "s-explorer",
+            "running",
+        );
+        make_effective(&fixture, "manager", "g-manager");
+        if phase == "awaiting_plan_approval" {
+            fixture.execute_batch(
+                "UPDATE attempts SET plan_hash='reviewed-plan' WHERE id='a';
+                 INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,extension_allowance,spent)
+                   VALUES('plan-budget','a','plan',2,1,1);",
+            );
+            fixture.execute(
+                "INSERT INTO trip_structured_plans(id,attempt_id,plan_hash,plan_json,workflow_id,
+                   profile_revision_id,criteria_hash,verification_hash,ownership_hash,conformance_hash,created_at)
+                 VALUES('answered-structured-plan','a',?1,'{}',?2,'synthetic-seeded-config',
+                   'criteria','verification','ownership','conformance','2026-01-01T00:00:06Z')",
+                params![sha256(b"Answered plan"), agenticjira::trip::WORKFLOW_ID],
+            );
+        }
+        let hold = |event: &str, detail: &str, at: &str| {
+            fixture.execute_batch(&format!(
+                "UPDATE tasks SET attention='needs_input',version=4 WHERE id='t';
+                 UPDATE attempts SET status='needs_input',updated_at='{at}' WHERE id='a';
+                 INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+                   VALUES('{event}','{event}-op','service','attempt.attention.changed','attempt','a','{detail}','{at}');"
+            ));
+        };
+        let report = |id: &str, generation: &str, outcome: &str, consumed: Option<&str>| {
+            let session = if generation == "g-manager" {
+                "s-manager"
+            } else {
+                "s-explorer"
+            };
+            let metadata = if outcome == "plan_ready" {
+                if phase == "awaiting_plan_approval" {
+                    r#"{"plan":"Answered plan","supersedes_plan_hash":"reviewed-plan"}"#
+                } else {
+                    r#"{"plan":"Answered plan"}"#
+                }
+            } else {
+                "{}"
+            };
+            fixture.execute(
+                "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
+                 VALUES(?1,?1,?2,?3,?4,'Report','[]',?6,'2026-01-01T00:00:06Z',?5)",
+                params![id, session, generation, outcome, consumed, metadata],
+            );
+        };
+        let released =
+            || agenticjira::coordinator::reconcile_superseded_role_hold(&fixture.store).unwrap();
+        let question_state = || {
+            let content = workflow::task_content(&fixture.store, "t").unwrap();
+            let source = &content["current_input"];
+            assert!(source.get("report").is_none() || source["report"]["id"] == "question");
+            (
+                source["state"].as_str().unwrap().to_owned(),
+                source["unavailable_reason"].as_str().map(str::to_owned),
+            )
+        };
+        let available = || ("available".to_owned(), None::<String>);
+        let task_state = || {
+            fixture
+                .connection()
+                .query_row(
+                    "SELECT t.attention,t.version,a.status FROM tasks t JOIN attempts a ON a.task_id=t.id WHERE t.id='t'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+                )
+                .unwrap()
+        };
+
+        // A hold recorded before holds named their source result is left alone.
+        report(
+            "question",
+            "g-manager",
+            "needs_input",
+            (phase == "planning").then_some("2026-01-01T00:00:05Z"),
+        );
+        hold(
+            "legacy",
+            r#"{"attention":"needs_input","reason":"role_needs_input","message":"m"}"#,
+            "2026-01-01T00:00:05Z",
+        );
+        report("plan", "g-manager", "plan_ready", None);
+        assert!(released().is_none());
+
+        // A newer report from a different agent does not answer the question.
+        let sourced = r#"{"attention":"needs_input","reason":"role_needs_input","message":"m","result_id":"question","role_generation_id":"g-manager"}"#;
+        fixture.execute("DELETE FROM role_results WHERE id='plan'", []);
+        hold("sourced", sourced, "2026-01-01T00:00:07Z");
+        report("explored", "g-explorer", "exploration_complete", None);
+        assert!(released().is_none());
+        assert_eq!(question_state(), available());
+        fixture.execute(
+            "UPDATE role_results SET consumed_at='2026-01-01T00:00:08Z' WHERE id='explored'",
+            [],
+        );
+
+        // Guidance whose delivery is unconfirmed keeps the hold, but the asking
+        // agent's usable report (with the same timestamp as its question) has
+        // answered the question, so it is no longer offered as current.
+        report("plan", "g-manager", "plan_ready", None);
+        fixture.execute(
+            "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at)
+             VALUES('answer','a','g-manager','Use the smaller scope','delivery_unknown','2026-01-01T00:00:07Z')",
+            [],
+        );
+        assert!(released().is_none());
+        assert_eq!(task_state().0, "needs_input");
+        assert_eq!(
+            question_state(),
+            ("unavailable".to_owned(), Some("superseded".to_owned()))
+        );
+
+        // So does another blocked report that nobody has read yet.
+        fixture.execute(
+            "UPDATE guidance_messages SET state='acknowledged' WHERE id='answer'",
+            [],
+        );
+        report("stuck", "g-explorer", "blocked", None);
+        assert!(released().is_none());
+        fixture.execute("DELETE FROM role_results WHERE id='stuck'", []);
+
+        // A plan the current phase would not consume does not answer the
+        // question: wrong phase, or a manager that is no longer the authority.
+        fixture.execute(
+            "UPDATE attempts SET phase='implementation' WHERE id='a'",
+            [],
+        );
+        assert!(released().is_none());
+        assert_eq!(question_state(), available());
+        fixture.execute("UPDATE attempts SET phase=?1 WHERE id='a'", params![phase]);
+        fixture.execute(
+            "UPDATE role_settings SET effective_generation_id=NULL WHERE role='manager'",
+            [],
+        );
+        assert!(released().is_none());
+        assert_eq!(question_state(), available());
+        fixture.execute(
+            "UPDATE role_settings SET effective_generation_id='g-manager' WHERE role='manager'",
+            [],
+        );
+
+        if phase == "awaiting_plan_approval" {
+            for (reason, change, restore) in [
+                (
+                    "stale supersedes binding",
+                    "UPDATE role_results SET metadata_json=json_set(metadata_json,'$.supersedes_plan_hash','wrong-plan') WHERE id='plan'",
+                    "UPDATE role_results SET metadata_json=json_set(metadata_json,'$.supersedes_plan_hash','reviewed-plan') WHERE id='plan'",
+                ),
+                (
+                    "no review extension",
+                    "UPDATE review_budgets SET extension_allowance=0 WHERE id='plan-budget'",
+                    "UPDATE review_budgets SET extension_allowance=1 WHERE id='plan-budget'",
+                ),
+                (
+                    "approved plan",
+                    "UPDATE attempts SET plan_approved_at='2026-01-01T00:00:00Z' WHERE id='a'",
+                    "UPDATE attempts SET plan_approved_at=NULL WHERE id='a'",
+                ),
+                (
+                    "pending control",
+                    "INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+                       VALUES('pending','a','continue','requested',4,'{}','2026-01-01T00:00:08Z','2026-01-01T00:00:08Z')",
+                    "UPDATE controls SET state='cancelled' WHERE id='pending'",
+                ),
+            ] {
+                fixture.execute_batch(change);
+                assert!(released().is_none(), "{reason} released the hold");
+                assert_eq!(
+                    task_state(),
+                    ("needs_input".to_owned(), 4, "needs_input".to_owned()),
+                    "{reason}"
+                );
+                fixture.execute_batch(restore);
+            }
+            seed_session(
+                &fixture,
+                "a",
+                "manager",
+                "g-manager-replacement",
+                "s-manager-replacement",
+                "running",
+            );
+            fixture.execute_batch(
+                "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+                   SELECT 'replacement-plan','replacement-plan','s-manager-replacement','g-manager-replacement',
+                     outcome,summary,evidence_json,metadata_json,created_at FROM role_results WHERE id='plan';
+                 UPDATE role_settings SET effective_generation_id='g-manager-replacement' WHERE role='manager';",
+            );
+            assert!(
+                released().is_none(),
+                "a different current Manager answered the old generation's hold"
+            );
+            assert_eq!(
+                task_state(),
+                ("needs_input".to_owned(), 4, "needs_input".to_owned())
+            );
+            fixture.execute(
+                "UPDATE role_settings SET effective_generation_id='g-manager' WHERE role='manager'",
+                [],
+            );
+        }
+
+        // The asking agent answered with a usable report: release exactly once.
+        let value = released().expect("the answered hold is released");
+        assert_eq!(value["action"], "hold_superseded");
+        assert_eq!(value["result_id"], "plan");
+        assert_eq!(task_state(), ("none".to_owned(), 5, "running".to_owned()));
+        let unconsumed: Option<String> = fixture
             .connection()
             .query_row(
-                "SELECT t.attention,t.version,a.status FROM tasks t JOIN attempts a ON a.task_id=t.id WHERE t.id='t'",
+                "SELECT consumed_at FROM role_results WHERE id='plan'",
                 [],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+                |row| row.get(0),
             )
-            .unwrap()
-    };
-
-    // A hold recorded before holds named their source result is left alone.
-    report(
-        "question",
-        "g-manager",
-        "needs_input",
-        Some("2026-01-01T00:00:05Z"),
-    );
-    hold(
-        "legacy",
-        r#"{"attention":"needs_input","reason":"role_needs_input","message":"m"}"#,
-        "2026-01-01T00:00:05Z",
-    );
-    report("plan", "g-manager", "plan_ready", None);
-    assert!(released().is_none());
-
-    // A newer report from a different agent does not answer the question.
-    let sourced = r#"{"attention":"needs_input","reason":"role_needs_input","message":"m","result_id":"question","role_generation_id":"g-manager"}"#;
-    fixture.execute("DELETE FROM role_results WHERE id='plan'", []);
-    hold("sourced", sourced, "2026-01-01T00:00:07Z");
-    report("explored", "g-explorer", "exploration_complete", None);
-    assert!(released().is_none());
-    assert_eq!(question_state(), available());
-    fixture.execute(
-        "UPDATE role_results SET consumed_at='2026-01-01T00:00:08Z' WHERE id='explored'",
-        [],
-    );
-
-    // Guidance whose delivery is unconfirmed keeps the hold, but the asking
-    // agent's usable report (with the same timestamp as its question) has
-    // answered the question, so it is no longer offered as current.
-    report("plan", "g-manager", "plan_ready", None);
-    fixture.execute(
-        "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at)
-         VALUES('answer','a','g-manager','Use the smaller scope','delivery_unknown','2026-01-01T00:00:07Z')",
-        [],
-    );
-    assert!(released().is_none());
-    assert_eq!(task_state().0, "needs_input");
-    assert_eq!(
-        question_state(),
-        ("unavailable".to_owned(), Some("superseded".to_owned()))
-    );
-
-    // So does another blocked report that nobody has read yet.
-    fixture.execute(
-        "UPDATE guidance_messages SET state='acknowledged' WHERE id='answer'",
-        [],
-    );
-    report("stuck", "g-explorer", "blocked", None);
-    assert!(released().is_none());
-    fixture.execute("DELETE FROM role_results WHERE id='stuck'", []);
-
-    // A plan the current phase would not consume does not answer the
-    // question: wrong phase, or a manager that is no longer the authority.
-    fixture.execute(
-        "UPDATE attempts SET phase='implementation' WHERE id='a'",
-        [],
-    );
-    assert!(released().is_none());
-    assert_eq!(question_state(), available());
-    fixture.execute("UPDATE attempts SET phase='planning' WHERE id='a'", []);
-    fixture.execute(
-        "UPDATE role_settings SET effective_generation_id=NULL WHERE role='manager'",
-        [],
-    );
-    assert!(released().is_none());
-    assert_eq!(question_state(), available());
-    fixture.execute(
-        "UPDATE role_settings SET effective_generation_id='g-manager' WHERE role='manager'",
-        [],
-    );
-
-    // The asking agent answered with a usable report: release exactly once.
-    let value = released().expect("the answered hold is released");
-    assert_eq!(value["action"], "hold_superseded");
-    assert_eq!(value["result_id"], "plan");
-    assert_eq!(task_state(), ("none".to_owned(), 5, "running".to_owned()));
-    let unconsumed: Option<String> = fixture
-        .connection()
-        .query_row(
-            "SELECT consumed_at FROM role_results WHERE id='plan'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(unconsumed.is_none(), "the phase logic consumes the report");
-    assert!(released().is_none());
-    assert_eq!(task_state(), ("none".to_owned(), 5, "running".to_owned()));
-    let audits: i64 = fixture
-        .connection()
-        .query_row(
-            "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.attention.superseded' AND entity_id='a'
-               AND json_extract(detail_json,'$.hold_event_id')='sourced'
-               AND json_extract(detail_json,'$.newer_result_id')='plan'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(audits, 1);
-    let state = workflow::state(&fixture.store).unwrap();
-    assert!(state
-        .attention
-        .iter()
-        .all(|item| item.id != "task:t:needs_input"));
+            .unwrap();
+        assert!(unconsumed.is_none(), "the phase logic consumes the report");
+        assert!(released().is_none());
+        assert_eq!(task_state(), ("none".to_owned(), 5, "running".to_owned()));
+        let audits: i64 = fixture
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE event_code='attempt.attention.superseded' AND entity_id='a'
+                   AND json_extract(detail_json,'$.hold_event_id')='sourced'
+                   AND json_extract(detail_json,'$.newer_result_id')='plan'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audits, 1);
+        if phase == "awaiting_plan_approval" {
+            fixture.assert_scalar::<i64>(
+                "SELECT COUNT(*) FROM role_results WHERE id='question' AND consumed_at IS NULL",
+                1,
+            );
+            fixture
+                .assert_scalar::<String>("SELECT phase FROM attempts WHERE id='a'", phase.into());
+            fixture.assert_scalar::<String>(
+                "SELECT plan_hash FROM attempts WHERE id='a'",
+                "reviewed-plan".into(),
+            );
+        }
+        let state = workflow::state(&fixture.store).unwrap();
+        assert!(state
+            .attention
+            .iter()
+            .all(|item| item.id != "task:t:needs_input"));
+    }
 }
 
 #[test]
@@ -45348,6 +50530,203 @@ fn ordinary_manager_fixture(
     (fixture, paths, app, task, manager)
 }
 
+#[test]
+fn ordinary_context_pages_bind_revision_credentials_and_resumed_invocation() {
+    let (fixture, _, app, _, manager) = ordinary_manager_fixture("context-page-binding");
+    let index = app.role_context_delivery_payload(&manager, None).unwrap();
+    assert_eq!(
+        index,
+        app.role_context_delivery_payload(&manager, None).unwrap()
+    );
+    let cursor = index["entries"][0]["first"].as_str().unwrap();
+    let mut out_of_range = cursor.split(':').collect::<Vec<_>>();
+    out_of_range[2] = "999999";
+    assert!(app
+        .role_context_delivery_payload(&manager, Some(&out_of_range.join(":")))
+        .unwrap_err()
+        .to_string()
+        .contains("page is out of range"));
+    out_of_range[1] = "index";
+    assert!(app
+        .role_context_delivery_payload(&manager, Some(&out_of_range.join(":")))
+        .unwrap_err()
+        .to_string()
+        .contains("index page is out of range"));
+    fixture.execute(
+        "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at)
+        VALUES('page-guidance',?1,?2,'New authenticated guidance','queued','2026-01-01T00:00:00Z')",
+        params![manager.attempt_id, manager.role_generation_id],
+    );
+    assert!(app
+        .role_context_delivery_payload(&manager, Some(cursor))
+        .unwrap_err()
+        .to_string()
+        .contains("cursor is stale"));
+    let changed = app.role_context_delivery_payload(&manager, None).unwrap();
+    assert_ne!(changed["revision"], index["revision"]);
+    assert_eq!(changed["scope"], index["scope"]);
+    let cursor = changed["entries"][0]["first"].as_str().unwrap().to_owned();
+    let (_other_fixture, _, other_app, _, other) =
+        ordinary_manager_fixture("context-page-other-scope");
+    assert!(other_app
+        .role_context_delivery_payload(&other, Some(&cursor))
+        .unwrap_err()
+        .to_string()
+        .contains("cursor is stale"));
+    for field in ["session", "generation", "epoch", "credential"] {
+        let mut wrong = manager.clone();
+        match field {
+            "session" => wrong.session_id = "other-session".into(),
+            "generation" => wrong.role_generation_id = "other-generation".into(),
+            "epoch" => wrong.transcript_epoch = "other-epoch".into(),
+            "credential" => wrong.credential_id = "other-credential".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            app.role_context_delivery_payload(&wrong, Some(&cursor))
+                .unwrap_err()
+                .to_string()
+                .contains("no longer current"),
+            "{field}"
+        );
+    }
+    fixture.execute(
+        "UPDATE role_credentials SET permissions_json='[]' WHERE id=?1",
+        params![manager.credential_id],
+    );
+    assert!(app
+        .role_context_delivery_payload(&manager, None)
+        .unwrap_err()
+        .to_string()
+        .contains("no longer current"));
+    fixture.execute(
+        "UPDATE role_credentials SET permissions_json=?1 WHERE id=?2",
+        params![
+            serde_json::to_string(&manager.permissions).unwrap(),
+            manager.credential_id
+        ],
+    );
+    finish_synthetic_role(&fixture, &manager);
+    fixture.execute(
+        "UPDATE sessions SET native_session_id='context-page-native' WHERE id=?1",
+        params![manager.session_id],
+    );
+    let launch: LaunchConfig = serde_json::from_value(
+        fixture.store.session_json(&manager.session_id).unwrap()["launch_config"].clone(),
+    )
+    .unwrap();
+    fixture
+        .store
+        .reserve_session_resume(
+            &manager.session_id,
+            "context-page-resumed-epoch",
+            &launch,
+            "context-page-resumed-token",
+        )
+        .unwrap();
+    let resumed = fixture
+        .store
+        .role_context("context-page-resumed-token")
+        .unwrap();
+    assert_ne!(resumed.credential_id, manager.credential_id);
+    assert_ne!(resumed.transcript_epoch, manager.transcript_epoch);
+    assert!(app
+        .role_context_delivery_payload(&manager, None)
+        .unwrap_err()
+        .to_string()
+        .contains("no longer current"));
+    assert!(app
+        .role_context_delivery_payload(&resumed, Some(&cursor))
+        .unwrap_err()
+        .to_string()
+        .contains("cursor is stale"));
+    let resumed_index = app.role_context_delivery_payload(&resumed, None).unwrap();
+    assert_ne!(resumed_index["scope"], changed["scope"]);
+    let mut prior_scope = resumed_index["entries"][0]["first"]
+        .as_str()
+        .unwrap()
+        .split(':')
+        .collect::<Vec<_>>();
+    prior_scope[4] = changed["scope"].as_str().unwrap();
+    assert!(app
+        .role_context_delivery_payload(&resumed, Some(&prior_scope.join(":")))
+        .unwrap_err()
+        .to_string()
+        .contains("cursor is stale"));
+    fixture.execute(
+        "UPDATE role_credentials SET revoked_at='2026-01-01T00:00:00Z' WHERE id=?1",
+        params![resumed.credential_id],
+    );
+    assert!(fixture
+        .store
+        .role_context("context-page-resumed-token")
+        .is_err());
+    assert!(app
+        .role_context_delivery_payload(&resumed, None)
+        .unwrap_err()
+        .to_string()
+        .contains("no longer current"));
+}
+
+#[test]
+fn ordinary_context_paging_refuses_validation_and_legacy_main_ownership() {
+    let (fixture, _, app, _, manager) = ordinary_manager_fixture("context-page-qualification");
+    let ordinary = app.role_context_payload(&manager).unwrap();
+    let index = app.role_context_delivery_payload(&manager, None).unwrap();
+    let cursor = index["entries"][0]["first"].as_str().unwrap();
+    fixture.execute(
+        "UPDATE sessions SET validation_cell='L05' WHERE id=?1",
+        params![manager.session_id],
+    );
+    for page in [None, Some(cursor)] {
+        assert!(app
+            .role_context_delivery_payload(&manager, page)
+            .unwrap_err()
+            .to_string()
+            .contains("unavailable during qualification"));
+    }
+    fixture.execute(
+        "UPDATE sessions SET validation_cell=NULL WHERE id=?1",
+        params![manager.session_id],
+    );
+    fixture.execute(
+        "UPDATE attempts SET status='capability_validation' WHERE id=?1",
+        params![manager.attempt_id],
+    );
+    assert!(app
+        .role_context_delivery_payload(&manager, None)
+        .unwrap_err()
+        .to_string()
+        .contains("unavailable during qualification"));
+    fixture.execute(
+        "UPDATE attempts SET status='running' WHERE id=?1",
+        params![manager.attempt_id],
+    );
+    fixture.execute("INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+        VALUES('legacy-main-page-control',?1,'main_checkout_verify','native_running',1,?2,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![manager.attempt_id,serde_json::json!({"session_id":manager.session_id}).to_string()]);
+    assert_eq!(app.role_context_payload(&manager).unwrap(), ordinary);
+    for state in [
+        "native_running",
+        "native_stopping",
+        "awaiting_native_evidence",
+    ] {
+        fixture.execute(
+            "UPDATE controls SET state=?1 WHERE id='legacy-main-page-control'",
+            params![state],
+        );
+        for page in [None, Some(cursor)] {
+            assert!(
+                app.role_context_delivery_payload(&manager, page)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unavailable during qualification"),
+                "{state}"
+            );
+        }
+    }
+}
+
 fn manager_report(
     fixture: &Fixture,
     manager: &RoleContext,
@@ -45413,7 +50792,8 @@ fn manager_hook_with(
 #[test]
 fn retry_consumes_the_newer_plan_instead_of_resurrecting_answered_questions() {
     let (fixture, paths, app, task, manager) = ordinary_manager_fixture("retry-stale-question");
-    let task_version = || fixture.scalar::<i64>("SELECT version FROM tasks");
+    let task_version =
+        || fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"));
     manager_report(
         &fixture,
         &manager,
@@ -45422,7 +50802,10 @@ fn retry_consumes_the_newer_plan_instead_of_resurrecting_answered_questions() {
         serde_json::json!({}),
     );
     assert_eq!(app.coordinator_tick().unwrap()["action"], "held");
-    fixture.assert_scalar::<String>("SELECT attention FROM tasks", "needs_input".into());
+    fixture.assert_scalar::<String>(
+        &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+        "needs_input".into(),
+    );
     // While the task waited the manager asked twice more, then wrote the plan
     // once it had its answer. This is the recorded Retry 22 -> 25 -> 28 shape.
     manager_report(
@@ -45479,7 +50862,10 @@ fn retry_consumes_the_newer_plan_instead_of_resurrecting_answered_questions() {
                 24,
                 "the Retry did not settle at 24: {versions:?}"
             );
-            fixture.assert_scalar::<String>("SELECT attention FROM tasks", "none".into());
+            fixture.assert_scalar::<String>(
+                &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+                "none".into(),
+            );
             // No second Retry is needed, or even offered, once the task runs.
             assert!(retry("retry-twice", 24).is_err());
         }
@@ -45516,7 +50902,10 @@ fn retry_consumes_the_newer_plan_instead_of_resurrecting_answered_questions() {
         Some("plan_frozen"),
         "{actions:?}"
     );
-    fixture.assert_scalar::<String>("SELECT attention FROM tasks", "none".into());
+    fixture.assert_scalar::<String>(
+        &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+        "none".into(),
+    );
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM role_results WHERE outcome='needs_input' AND consumed_at IS NULL",
         0,
@@ -45566,7 +50955,7 @@ fn an_answered_manager_question_reaches_the_plan_through_the_exact_boundary_once
         "busy_unresolved_hook_work".into(),
     );
     let body = "Use the smaller scope and keep the current API.";
-    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let version = fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"));
     let queued = app
         .execute_human_command(&HumanCommand::Guidance {
             operation_id: "answer".into(),
@@ -45647,7 +51036,10 @@ fn an_answered_manager_question_reaches_the_plan_through_the_exact_boundary_once
     manager_hook_with(&fixture, &manager, native, "Stop", serde_json::json!({}));
     let released = app.coordinator_tick().unwrap();
     assert_eq!(released["action"], "hold_superseded", "{released}");
-    fixture.assert_scalar::<String>("SELECT attention FROM tasks", "none".into());
+    fixture.assert_scalar::<String>(
+        &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+        "none".into(),
+    );
     let mut frozen = 0;
     for _ in 0..6 {
         let value = app.coordinator_tick().unwrap();
@@ -45945,8 +51337,8 @@ fn retry_releases_a_role_hold_without_discarding_its_accepted_candidate() {
     );
     assert_eq!(app.coordinator_tick().unwrap()["action"], "held");
     let explanation: String = fixture.scalar(
-        "SELECT json_extract(detail_json,'$.message') FROM audit_events
-         WHERE event_code='attempt.attention.changed' ORDER BY rowid DESC LIMIT 1",
+        &format!("SELECT json_extract(detail_json,'$.message') FROM audit_events
+         WHERE event_code='attempt.attention.changed' AND entity_id='{}' ORDER BY rowid DESC LIMIT 1",plan.attempt_id),
     );
     assert!(explanation.contains("choose Retry"), "{explanation}");
     assert!(!explanation.contains("choose Continue"), "{explanation}");
@@ -46020,7 +51412,10 @@ fn retry_releases_a_role_hold_without_discarding_its_accepted_candidate() {
     );
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM snapshots WHERE kind='candidate'", 1);
     fixture.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM role_generations WHERE role='implementer'",
+        &format!(
+            "SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}' AND role='implementer'",
+            plan.attempt_id
+        ),
         1,
     );
     drop(app);
@@ -46032,7 +51427,7 @@ fn a_second_candidate_after_an_implementer_question_is_frozen_exactly_once() {
     let fixture = Fixture::new("implementer-second-candidate");
     let mut paths = instance_paths(&fixture);
     paths.role_socket = fixture.root.join("role.sock");
-    let (_, _, plan) = new_task(&fixture, "second-candidate", "second-candidate-task");
+    let (project, _, plan) = new_task(&fixture, "second-candidate", "second-candidate-task");
     authorize_ordinary_implementation(&fixture, &plan);
     let app = Application::new_with_synthetic_dispatch_for_tests(
         paths.clone(),
@@ -46215,7 +51610,10 @@ fn a_second_candidate_after_an_implementer_question_is_frozen_exactly_once() {
         1,
     );
     fixture.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM role_generations WHERE role='implementer'",
+        &format!(
+            "SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}' AND role='implementer'",
+            plan.attempt_id
+        ),
         1,
     );
     fixture.assert_scalar::<i64>(
@@ -46254,6 +51652,222 @@ fn a_second_candidate_after_an_implementer_question_is_frozen_exactly_once() {
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM freeze_intents WHERE kind='candidate' AND state='complete'",
         2,
+    );
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM snapshots WHERE kind='candidate'", 1);
+    let snapshot_creation: (String, String, i64) = fixture.connection().query_row(
+        "SELECT created_at,source_role_generation_id,source_settings_revision FROM snapshots WHERE id=?1",
+        params![original_snapshot], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).unwrap();
+    let previous_publication: (String, String) = fixture
+        .connection()
+        .query_row(
+            "SELECT id,updated_at FROM freeze_intents WHERE attempt_id=?1 AND kind='candidate'
+           AND state='complete' ORDER BY rowid DESC LIMIT 1",
+            params![plan.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    fixture.execute(
+        "UPDATE trip_structured_plans SET reviewed_at=approved_at
+         WHERE id=(SELECT structured_plan_id FROM attempts WHERE id=?1)",
+        params![plan.attempt_id],
+    );
+    fixture.execute(
+        "UPDATE role_generations SET status='replaced' WHERE id=?1",
+        params![implementer.role_generation_id],
+    );
+    seed_session(
+        &fixture,
+        &plan.attempt_id,
+        "implementer",
+        "replacement-writer-generation",
+        "replacement-writer-session",
+        "exited",
+    );
+    fixture.execute(
+        "UPDATE role_generations SET status='exited',config_revision=2 WHERE id='replacement-writer-generation'",
+        [],
+    );
+    fixture.execute(
+        "INSERT INTO role_settings(id,task_id,role,revision,config_json,effective_generation_id,created_at)
+         SELECT 'replacement-writer-settings',task_id,role,2,config_json,'replacement-writer-generation',?1
+         FROM role_settings WHERE task_id=?2 AND role='implementer' AND revision=1",
+        params![chrono::Utc::now().to_rfc3339(),plan.task_id],
+    );
+    fixture.execute(
+        "UPDATE attempts SET phase='implementation',candidate_hash=NULL,status='running' WHERE id=?1",
+        params![plan.attempt_id],
+    );
+    fixture.execute(
+        "INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+         VALUES('replacement-candidate','replacement-candidate','replacement-writer-session',
+           'replacement-writer-generation','candidate_ready','same bytes from later writer','[]','{}',?1)",
+        params![chrono::Utc::now().to_rfc3339()],
+    );
+    let reviews = ReviewService::new(fixture.store.clone(), fixture.root.join("artifacts"));
+    let replacement = reviews.freeze(&plan.attempt_id, "candidate").unwrap();
+    assert_eq!(replacement["snapshot_id"], original_snapshot);
+    let publication: (String, String) = fixture
+        .connection()
+        .query_row(
+            "SELECT id,updated_at FROM freeze_intents WHERE attempt_id=?1 AND kind='candidate'
+           AND state='complete' ORDER BY rowid DESC LIMIT 1",
+            params![plan.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_ne!(publication.0, previous_publication.0);
+    let retained_creation: (String, String, i64) = fixture.connection().query_row(
+        "SELECT created_at,source_role_generation_id,source_settings_revision FROM snapshots WHERE id=?1",
+        params![original_snapshot], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).unwrap();
+    assert_eq!(retained_creation, snapshot_creation);
+    fixture.execute(
+        "UPDATE attempts SET phase='code_review' WHERE id=?1",
+        params![plan.attempt_id],
+    );
+    let review = reviews
+        .reserve_request(
+            &plan.attempt_id,
+            "code",
+            "review the republished candidate",
+            serde_json::json!({}),
+        )
+        .unwrap();
+    seed_session(
+        &fixture,
+        &plan.attempt_id,
+        "code_reviewer",
+        "publication-reviewer-generation",
+        "publication-reviewer-session",
+        "running",
+    );
+    reviews
+        .bind_launch_intent(
+            &review.request_id,
+            "publication-reviewer-session",
+            "publication-reviewer-generation",
+            1,
+        )
+        .unwrap();
+    reviews
+        .bind_delivery(
+            &review.request_id,
+            "publication-reviewer-session",
+            "publication-reviewer-generation",
+            1,
+        )
+        .unwrap();
+    let reviewer = RoleContext {
+        project_id: project,
+        task_id: plan.task_id.clone(),
+        attempt_id: plan.attempt_id.clone(),
+        role_generation_id: "publication-reviewer-generation".into(),
+        session_id: "publication-reviewer-session".into(),
+        credential_id: "publication-reviewer-credential".into(),
+        transcript_epoch: "e".into(),
+        role: RoleKind::CodeReviewer,
+        provider: Provider::Codex,
+        configuration_revision: 1,
+        lane_id: "default".into(),
+        permissions: vec!["read_context".into(), "report_result".into()],
+    };
+    let projected = app.role_context_payload(&reviewer).unwrap();
+    let writer = &projected["ordinary_review_evidence"]["candidate_writer_evidence"];
+    assert_eq!(writer["availability"], "available");
+    assert_eq!(
+        writer["source_writer"]["freeze_observation"]["freeze_intent_id"],
+        publication.0
+    );
+    assert_eq!(
+        writer["source_writer"]["result_id"],
+        "replacement-candidate"
+    );
+    assert_eq!(
+        writer["source_writer"]["role_generation_id"],
+        "replacement-writer-generation"
+    );
+    assert_eq!(
+        writer["source_writer"]["session_id"],
+        "replacement-writer-session"
+    );
+    assert_eq!(writer["source_writer"]["settings_revision"], 2);
+    assert_eq!(
+        writer["source_writer"]["settings_id"],
+        "replacement-writer-settings"
+    );
+    assert_eq!(
+        writer["snapshot_creation_provenance"]["created_at"],
+        snapshot_creation.0
+    );
+    assert_eq!(
+        writer["snapshot_creation_provenance"]["source_role_generation_id"],
+        implementer.role_generation_id
+    );
+    assert_eq!(
+        writer["snapshot_creation_provenance"]["source_settings_revision"],
+        1
+    );
+    let review_created_at: String = fixture
+        .connection()
+        .query_row(
+            "SELECT created_at FROM review_requests WHERE id=?1",
+            params![review.request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    fixture.execute(
+        "UPDATE review_requests SET created_at=?1 WHERE id=?2",
+        params![previous_publication.1, review.request_id],
+    );
+    let earlier_review = app.role_context_payload(&reviewer).unwrap();
+    let earlier_writer = &earlier_review["ordinary_review_evidence"]["candidate_writer_evidence"];
+    assert_eq!(earlier_writer["availability"], "unavailable");
+    assert_eq!(
+        earlier_writer["source_writer"]["freeze_observation"]["freeze_intent_id"],
+        previous_publication.0
+    );
+    assert_eq!(earlier_writer["source_writer"]["result_id"], "same-content");
+    assert_eq!(
+        earlier_writer["source_writer"]["generation_status"],
+        "replaced"
+    );
+    fixture.execute(
+        "UPDATE review_requests SET created_at=?1 WHERE id=?2",
+        params![review_created_at, review.request_id],
+    );
+    fixture.execute(
+        "UPDATE role_results SET consumed_at=?1 WHERE id='replacement-candidate'",
+        params![previous_publication.1],
+    );
+    let mismatched = app.role_context_payload(&reviewer).unwrap();
+    let mismatched_writer = &mismatched["ordinary_review_evidence"]["candidate_writer_evidence"];
+    assert_eq!(mismatched_writer["availability"], "unavailable");
+    assert!(mismatched_writer["source_writer"].is_null());
+    fixture.execute(
+        "UPDATE role_results SET consumed_at=?1 WHERE id='replacement-candidate'",
+        params![publication.1],
+    );
+    fixture.execute(
+        "UPDATE freeze_intents SET result_snapshot_id=NULL WHERE id=?1",
+        params![publication.0],
+    );
+    let missing = app.role_context_payload(&reviewer).unwrap();
+    let missing_writer = &missing["ordinary_review_evidence"]["candidate_writer_evidence"];
+    assert_eq!(missing_writer["availability"], "unavailable");
+    assert!(missing_writer["source_writer"].is_null());
+    fixture.execute(
+        "UPDATE freeze_intents SET result_snapshot_id=?1 WHERE id=?2",
+        params![original_snapshot, publication.0],
+    );
+    assert_eq!(
+        app.role_context_payload(&reviewer).unwrap()["ordinary_review_evidence"]
+            ["candidate_writer_evidence"]["availability"],
+        "available"
+    );
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM freeze_intents WHERE kind='candidate' AND state='complete'",
+        3,
     );
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM snapshots WHERE kind='candidate'", 1);
     drop(app);
@@ -47868,7 +53482,10 @@ fn a_reviewer_settings_change_binds_the_next_review_and_keeps_the_invalid_one_sp
         model: "replacement-model".into(),
         effort: "high".into(),
     };
-    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     workflow::execute(
         &fixture.store,
         &HumanCommand::SetRoleSettings {
@@ -47881,7 +53498,10 @@ fn a_reviewer_settings_change_binds_the_next_review_and_keeps_the_invalid_one_sp
     )
     .unwrap();
     seed_supported_capabilities_for_config(&fixture, &replacement);
-    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        plan.task_id
+    ));
     agenticjira::trip::activate_task_profile(
         &fixture.store,
         &capability_runtime(&fixture),
@@ -47912,12 +53532,13 @@ fn a_reviewer_settings_change_binds_the_next_review_and_keeps_the_invalid_one_sp
     assert_eq!(request.state, "reserved");
     assert_eq!(bound(), 2);
     fixture.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM audit_events WHERE event_code='task.profile.materialized_at_safe_boundary'
+        &format!("SELECT COUNT(*) FROM audit_events WHERE event_code='task.profile.materialized_at_safe_boundary'
+           AND entity_id='{}'
            AND json_extract(detail_json,'$.from_settings_revision')=1
            AND json_extract(detail_json,'$.to_settings_revision')=2
            AND json_extract(detail_json,'$.candidate_hash')='candidate'
            AND json_extract(detail_json,'$.phase')='code_review'
-           AND json_extract(detail_json,'$.task_version')=(SELECT version FROM tasks)",
+           AND json_extract(detail_json,'$.task_version')=(SELECT version FROM tasks WHERE id='{task}')",plan.attempt_id),
         1,
     );
     // The ready workspace policy records the new reviewer settings.
@@ -50091,6 +55712,16 @@ fn final_repair_recheck_fixture(name: &str) -> Fixture {
     ] {
         seed_session(&fixture, "a", role, generation, session, "exited");
     }
+    seed_supported_restart_identity(
+        &fixture,
+        "s-reviewer",
+        "reviewer-capability",
+        &launch(
+            RoleKind::CodeReviewer,
+            "reviewer-fixture",
+            fixture.root.clone(),
+        ),
+    );
     fixture.execute_batch(
         r#"UPDATE role_generations SET status='exited';
          UPDATE attempts SET final_repair_round=1,plan_hash='plan-hash',
@@ -50098,10 +55729,8 @@ fn final_repair_recheck_fixture(name: &str) -> Fixture {
          UPDATE tasks SET attention='needs_input',version=7 WHERE id='t';
          INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,extension_allowance,spent)
            VALUES('code-budget','a','code',2,4,6);
-         INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
-           VALUES('reviewer-capability','codex','fixture','code_reviewer','interactive_pty','reviewer-capability-key','supported','fixture','[]','2026-01-01T00:00:00Z','{}');
          INSERT INTO trip_attempt_profiles(attempt_id,role,settings_revision,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at)
-           VALUES('a','code_reviewer',1,'project_default','{}','reviewer-profile','synthetic-seeded-config','h','a','h','reviewer-capability','reviewer-capability-key','p','2026-01-01T00:00:00Z');
+           VALUES('a','code_reviewer',1,'project_default','{}','reviewer-profile','synthetic-seeded-config','h','a','h','reviewer-capability',(SELECT config_hash FROM capabilities WHERE id='reviewer-capability'),'p','2026-01-01T00:00:00Z');
          INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,session_id,settings_revision,prompt_hash,handoff_hash,delivery_state,verdict,budget_spent_at,created_at,updated_at)
            VALUES('approved-code','a','code','approved-candidate','g-approver','s-approver',1,'p','h','finished','approved','2026-01-01T00:00:01Z','2026-01-01T00:00:01Z','2026-01-01T00:00:01Z'),
                  ('final-changes','a','final','approved-candidate','g-final','s-final',1,'p','h','finished','request_changes','2026-01-01T00:00:02Z','2026-01-01T00:00:02Z','2026-01-01T00:00:02Z'),
@@ -50186,6 +55815,16 @@ fn deliver_final_repair_recheck(
         "g-recheck",
         "s-recheck",
         "running",
+    );
+    seed_supported_restart_identity(
+        fixture,
+        "s-recheck",
+        "reviewer-capability",
+        &launch(
+            RoleKind::CodeReviewer,
+            "reviewer-fixture",
+            fixture.root.clone(),
+        ),
     );
     assert!(reviews
         .bind_launch_intent(request, "s-recheck", "g-recheck", 2)
@@ -50824,6 +56463,14 @@ fn unconfirmed_guidance_abandonment_keeps_evidence_hold_and_review_counts() {
          INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,launch_config_json,capability_key,capability_identity_json,state,created_at,updated_at)
          VALUES('ri-manager-later','s-manager',2,'epoch-current','{}','k','{}','exited','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z');",
     );
+    fixture.execute_batch(
+        "INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+         VALUES('failed-main-history','a','main_checkout_verify','failed',1,
+           '{\"actor\":\"manager\",\"session_id\":\"s-manager\",\"role_generation_id\":\"g-manager\",\"transcript_epoch\":\"epoch-current\"}',
+           '2026-01-01T00:00:00Z','2026-01-02T00:00:00Z')",
+    );
+    let verification_sql = "SELECT state||':'||payload_json||':'||updated_at FROM controls WHERE id='failed-main-history'";
+    let verification = fixture.scalar::<String>(verification_sql);
     let previous = fixture.scalar::<String>(GUIDANCE_ROW);
     let wrong_epoch = abandon_guidance(
         &fixture,
@@ -50897,6 +56544,7 @@ fn unconfirmed_guidance_abandonment_keeps_evidence_hold_and_review_counts() {
         "{again}"
     );
     fixture.assert_scalar::<String>(GUIDANCE_HOLD_AND_REVIEWS, hold);
+    fixture.assert_scalar::<String>(verification_sql, verification);
 }
 
 #[test]
@@ -51809,6 +57457,16 @@ fn normal_final_repair_fixture(name: &str, spent: i64) -> Fixture {
     ] {
         seed_session(&fixture, "a", role, generation, session, "exited");
     }
+    seed_supported_restart_identity(
+        &fixture,
+        "s-approver",
+        "reviewer-capability",
+        &launch(
+            RoleKind::CodeReviewer,
+            "reviewer-fixture",
+            fixture.root.clone(),
+        ),
+    );
     fixture.execute_batch(
         r#"UPDATE role_generations SET status='exited';
          UPDATE attempts SET plan_hash='plan-hash',plan_approved_at='2026-01-01T00:00:00Z',
@@ -51817,10 +57475,8 @@ fn normal_final_repair_fixture(name: &str, spent: i64) -> Fixture {
            VALUES('manager-settings','t','manager',1,'{}','g-manager','2026-01-01T00:00:00Z'),
                  ('reviewer-settings','t','code_reviewer',1,'{}','g-approver','2026-01-01T00:00:00Z'),
                  ('final-settings','t','final_verifier',1,'{}','g-final','2026-01-01T00:00:00Z');
-         INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
-           VALUES('reviewer-capability','codex','fixture','code_reviewer','interactive_pty','reviewer-capability-key','supported','fixture','[]','2026-01-01T00:00:00Z','{}');
          INSERT INTO trip_attempt_profiles(attempt_id,role,settings_revision,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at)
-           VALUES('a','code_reviewer',1,'project_default','{}','reviewer-profile','synthetic-seeded-config','h','a','h','reviewer-capability','reviewer-capability-key','p','2026-01-01T00:00:00Z');
+           VALUES('a','code_reviewer',1,'project_default','{}','reviewer-profile','synthetic-seeded-config','h','a','h','reviewer-capability',(SELECT config_hash FROM capabilities WHERE id='reviewer-capability'),'p','2026-01-01T00:00:00Z');
          INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,spent)
            VALUES('final-budget','a','final',1,1);
          INSERT INTO review_requests(id,attempt_id,review_kind,candidate_hash,role_generation_id,session_id,settings_revision,prompt_hash,handoff_hash,delivery_state,verdict,budget_spent_at,created_at,updated_at)
@@ -52137,6 +57793,16 @@ fn normal_final_repair_recheck_spends_only_its_receipt_below_and_at_the_cap() {
             "g-recheck",
             "s-recheck",
             "running",
+        );
+        seed_supported_restart_identity(
+            &fixture,
+            "s-recheck",
+            "reviewer-capability",
+            &launch(
+                RoleKind::CodeReviewer,
+                "reviewer-fixture",
+                fixture.root.clone(),
+            ),
         );
         reviews
             .bind_launch_intent(&request.request_id, "s-recheck", "g-recheck", 1)
@@ -52462,6 +58128,16 @@ fn delivered_normal_recheck(name: &str) -> (Fixture, String) {
         "s-recheck",
         "running",
     );
+    seed_supported_restart_identity(
+        &fixture,
+        "s-recheck",
+        "reviewer-capability",
+        &launch(
+            RoleKind::CodeReviewer,
+            "reviewer-fixture",
+            fixture.root.clone(),
+        ),
+    );
     reviews
         .bind_launch_intent(&request, "s-recheck", "g-recheck", 1)
         .unwrap();
@@ -52724,7 +58400,10 @@ fn final_repair_gate_precedes_the_reviewer_safe_boundary_refresh() {
         effort: "high".into(),
     };
     let activate = |role: RoleKind, operation: &str| {
-        let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+        let version = fixture.scalar::<i64>(&format!(
+            "SELECT version FROM tasks WHERE id='{}'",
+            plan.task_id
+        ));
         workflow::execute(
             &fixture.store,
             &HumanCommand::SetRoleSettings {
@@ -52737,7 +58416,10 @@ fn final_repair_gate_precedes_the_reviewer_safe_boundary_refresh() {
         )
         .unwrap();
         seed_supported_capabilities_for_config(&fixture, &replacement);
-        let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+        let version = fixture.scalar::<i64>(&format!(
+            "SELECT version FROM tasks WHERE id='{}'",
+            plan.task_id
+        ));
         agenticjira::trip::activate_task_profile(
             &fixture.store,
             &capability_runtime(&fixture),
@@ -52773,8 +58455,14 @@ fn final_repair_gate_precedes_the_reviewer_safe_boundary_refresh() {
     assert_eq!(bound("code_reviewer"), 1);
     fixture.assert_scalar::<i64>(adoptions, 0);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM review_requests", 0);
-    fixture.assert_scalar::<String>("SELECT attention FROM tasks", "needs_input".into());
-    fixture.execute("UPDATE tasks SET attention='none'", []);
+    fixture.assert_scalar::<String>(
+        &format!("SELECT attention FROM tasks WHERE id='{}'", plan.task_id),
+        "needs_input".into(),
+    );
+    fixture.execute(
+        "UPDATE tasks SET attention='none' WHERE id=?1",
+        params![plan.task_id],
+    );
 
     // The gate governs code review only: a plan review still adopts.
     fixture.execute(
@@ -53941,6 +59629,319 @@ fn ordinary_policy_materialization_still_refuses_guidance_collisions() {
 }
 
 #[test]
+fn main_selected_check_rebinds_frozen_checkout_delta_and_refuses_drift() {
+    let fixture = Fixture::new("main-selected-check-manifest");
+    let (project, task, plan) = new_task(&fixture, "main-check-project", "main-check-task");
+    let paths = instance_paths(&fixture);
+    let other_project = add_project(
+        &fixture,
+        fixture.repository("other-repo"),
+        "other-baseline-project",
+    );
+    let other_task = create_task(&fixture, &other_project, "other-baseline-task", 1);
+    let other_plan = claim(&fixture, paths.artifacts.clone());
+    assert_eq!(other_plan.task_id, other_task);
+    let repository = workspace::inspect(&plan.repository_path).unwrap();
+    let other_repository = workspace::inspect(&other_plan.repository_path).unwrap();
+    let (other_baseline, other_hash) = snapshot::capture(
+        &other_repository,
+        &other_plan.workspace_path,
+        &paths.artifacts.join("snapshots/other-check-baseline"),
+    )
+    .unwrap();
+    fixture.execute("INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at,workspace_id,original_base,candidate_head,workspace_hash)
+        VALUES('other-check-baseline',?1,'baseline',?2,?3,?4,1,'2026-01-01T00:00:00Z',?5,?6,?7,?3)",
+        params![other_plan.attempt_id,other_baseline.snapshot_base,other_hash,serde_json::to_string(&other_baseline).unwrap(),other_plan.workspace_id,other_baseline.original_base,other_baseline.candidate_head]);
+    fixture.execute(
+        "UPDATE tasks SET lifecycle='backlog' WHERE id=?1",
+        params![task],
+    );
+    fixture.execute("INSERT INTO task_workflow_selections(task_id,family,check_ids_json,selection_revision,
+        selection_hash,admission_state,workspace_mode,created_at,updated_at)
+        VALUES(?1,'trip','[]',1,'main-check-selection','draft','main_checkout','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![task]);
+    let scope = workflow::state(&fixture.store)
+        .unwrap()
+        .tasks
+        .into_iter()
+        .find(|item| item.id == task)
+        .unwrap()
+        .workflow
+        .unwrap()
+        .checkout_scope
+        .unwrap();
+    let ready = workflow::execute_with_runtime(
+        &fixture.store,
+        &HumanCommand::MakeReady {
+            operation_id: "authorize-main-checkout-check".into(),
+            task_id: task.clone(),
+            expected_version: fixture
+                .scalar(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+            checkout_authorization: Some(agenticjira::domain::CheckoutAuthorizationInput {
+                scope_hash: scope.scope_hash,
+            }),
+        },
+        Some(&capability_runtime(&fixture)),
+    )
+    .unwrap();
+    let root = plan.repository_path.canonicalize().unwrap();
+    let policy = serde_json::json!({"workspace_mode":"main_checkout","workspace_ownership":"borrowed_checkout",
+        "checkout_authorization":ready.detail["checkout_authorization"],"writing_lane":"default",
+        "baseline_snapshot_id":"main-check-baseline"});
+    fixture.execute(
+        "UPDATE workspaces SET path=?1,policy_json=?2,state='reserved' WHERE id=?3",
+        params![
+            root.to_str().unwrap(),
+            policy.to_string(),
+            plan.workspace_id
+        ],
+    );
+    agenticjira::trip::materialize_project_policy(&fixture.store, &plan.attempt_id, &root).unwrap();
+    std::fs::write(root.join("fixture.txt"), b"dirty starting tracked bytes\n").unwrap();
+    std::fs::write(root.join("user-note.txt"), b"preexisting untracked bytes\n").unwrap();
+    let (baseline, baseline_hash) = snapshot::capture(
+        &repository,
+        &root,
+        &paths.artifacts.join("snapshots/main-check-baseline"),
+    )
+    .unwrap();
+    assert!(baseline
+        .entries
+        .iter()
+        .any(|entry| entry.path == "user-note.txt"));
+    fixture.execute("INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at,workspace_id,original_base,candidate_head,workspace_hash)
+        VALUES('main-check-baseline',?1,'baseline',?2,?3,?4,1,'2026-01-01T00:00:00Z',?5,?6,?7,?3)",
+        params![plan.attempt_id,baseline.snapshot_base,baseline_hash,serde_json::to_string(&baseline).unwrap(),plan.workspace_id,baseline.original_base,baseline.candidate_head]);
+    fixture.execute(
+        "UPDATE workspaces SET state='ready' WHERE id=?1",
+        params![plan.workspace_id],
+    );
+    fixture.execute(
+        "UPDATE tasks SET lifecycle='in_progress' WHERE id=?1",
+        params![task],
+    );
+    authorize_ordinary_implementation(&fixture, &plan);
+    for (role, generation, session) in [
+        (
+            "implementer",
+            "main-check-writer",
+            "main-check-writer-session",
+        ),
+        (
+            "manager",
+            "main-check-manager",
+            "main-check-manager-session",
+        ),
+    ] {
+        seed_session(
+            &fixture,
+            &plan.attempt_id,
+            role,
+            generation,
+            session,
+            "exited",
+        );
+        fixture.execute(
+            "UPDATE role_generations SET status='exited' WHERE id=?1",
+            params![generation],
+        );
+        fixture.execute(
+            "UPDATE role_settings SET effective_generation_id=?1 WHERE task_id=?2 AND role=?3",
+            params![generation, task, role],
+        );
+    }
+    let approved_plan: String = fixture.scalar(&format!(
+        "SELECT plan_hash FROM attempts WHERE id='{}'",
+        plan.attempt_id
+    ));
+    std::fs::write(root.join("fixture.txt"), b"reviewed task change\n").unwrap();
+    fixture.execute("INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+        VALUES('main-check-result','main-check-result','main-check-writer-session','main-check-writer','candidate_ready',
+          'frozen task change','[]',?1,'2026-01-01T00:00:00Z')",
+        params![serde_json::json!({"lane_yield":{"plan_hash":approved_plan}}).to_string()]);
+    let frozen = ReviewService::new(fixture.store.clone(), paths.artifacts.clone())
+        .freeze(&plan.attempt_id, "candidate")
+        .unwrap();
+    let candidate = frozen["manifest_hash"].as_str().unwrap();
+    let frozen_manifest: String = fixture.scalar(&format!(
+        "SELECT manifest_json FROM snapshots WHERE id='{}'",
+        frozen["snapshot_id"].as_str().unwrap()
+    ));
+    assert_eq!(
+        frozen["manifest"]["baseline_snapshot_id"],
+        "main-check-baseline"
+    );
+    assert_eq!(
+        frozen["manifest"]["task_changed_paths"],
+        serde_json::json!(["fixture.txt"])
+    );
+    assert_eq!(frozen["manifest"]["original_base"], plan.base_revision);
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM role_results WHERE id='main-check-result' AND consumed_at IS NOT NULL",1);
+    fixture.execute(
+        "UPDATE attempts SET phase='checks',selected_checks_revision=1 WHERE id=?1",
+        params![plan.attempt_id],
+    );
+    let config_revision: String = fixture
+        .connection()
+        .query_row(
+            "SELECT active_config_revision_id FROM trip_project_state WHERE project_id=?1",
+            params![project],
+            |row| row.get(0),
+        )
+        .unwrap();
+    fixture.execute("INSERT INTO trip_verification_checks(id,project_id,config_revision_id,check_key,category,
+        command_kind,executable,arguments_json,cwd,timeout_seconds,acceptance_rows_json,relevant_inputs_json,invalidation_json,original_text)
+        VALUES('main-manifest-check',?1,?2,'main-manifest-check','focused','structured_argv','/bin/sleep','[\"2\"]','.',30,'[]','[]','{}','unchanged candidate check')",
+        params![project,config_revision]);
+    fixture.execute("INSERT INTO trip_selected_checks(attempt_id,revision,check_id,required,selected_by_generation_id,created_at)
+        VALUES(?1,1,'main-manifest-check',1,'main-check-manager','2026-01-01T00:00:00Z')", params![plan.attempt_id]);
+    let selection = workflow::state(&fixture.store)
+        .unwrap()
+        .trip_task_verification
+        .into_iter()
+        .find(|entry| {
+            entry["attempt_id"] == plan.attempt_id && entry["check_id"] == "main-manifest-check"
+        })
+        .unwrap();
+    let checks = agenticjira::checks::CheckService::new(
+        fixture.store.clone(),
+        Supervisor::new(fixture.store.clone(), paths.artifacts.join("transcripts")),
+        paths.artifacts.clone(),
+    );
+    assert!(checks
+        .run_selected(&plan.attempt_id, "main-manifest-check")
+        .unwrap_err()
+        .to_string()
+        .contains("selected check is denied or awaiting a service-check permission decision"));
+    fixture.assert_scalar::<i64>(
+        &format!(
+            "SELECT COUNT(*) FROM check_runs WHERE attempt_id='{}'",
+            plan.attempt_id
+        ),
+        0,
+    );
+    let mut failures = Vec::<(String, String)>::new();
+    for case in [
+        "unchanged",
+        "tracked_edit",
+        "extra_path",
+        "other_task_baseline",
+    ] {
+        execute_trip(
+            &fixture,
+            &paths,
+            &format!("authorize-main-check-{case}"),
+            &TripHumanAction::AuthorizeCheck {
+                attempt_id: plan.attempt_id.clone(),
+                check_id: "main-manifest-check".into(),
+                selected_revision: 1,
+                exact_command_hash: selection["exact_command_hash"].as_str().unwrap().into(),
+                scope_hash: selection["scope_hash"].as_str().unwrap().into(),
+                decision: "approved".into(),
+                lifetime: "once".into(),
+            },
+        )
+        .unwrap();
+        match case {
+            "tracked_edit" => std::fs::write(root.join("fixture.txt"), b"unreviewed tracked edit\n").unwrap(),
+            "extra_path" => std::fs::write(root.join("extra-eligible.txt"), b"unreviewed new path\n").unwrap(),
+            "other_task_baseline" => fixture.execute("UPDATE workspaces SET policy_json=json_set(policy_json,'$.baseline_snapshot_id','other-check-baseline') WHERE id=?1", params![plan.workspace_id]),
+            _ => {}
+        }
+        let result = checks.run_selected(&plan.attempt_id, "main-manifest-check");
+        let run_id: String = fixture.connection().query_row(
+            "SELECT id FROM check_runs WHERE attempt_id=?1 AND check_id='main-manifest-check' ORDER BY rowid DESC LIMIT 1",
+            params![plan.attempt_id], |row| row.get(0),
+        ).unwrap();
+        if case == "unchanged" {
+            let receipt = result.unwrap();
+            assert_eq!(receipt["check_id"], run_id);
+            assert_eq!(receipt["candidate_hash"], candidate);
+            assert_eq!(receipt["passed"], true, "{receipt}");
+            assert_eq!(receipt["evidence"]["candidate_unchanged"], true);
+            fixture.assert_scalar::<i64>(
+                &format!("SELECT COUNT(*) FROM check_processes WHERE check_id='{run_id}'"),
+                1,
+            );
+        } else {
+            let error = result.unwrap_err();
+            if case == "other_task_baseline" {
+                assert!(
+                    matches!(
+                        error.downcast_ref::<rusqlite::Error>(),
+                        Some(rusqlite::Error::QueryReturnedNoRows)
+                    ),
+                    "{error:#}"
+                );
+            } else {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("workspace bytes drifted from exact frozen candidate"),
+                    "{case}: {error:#}"
+                );
+            }
+            fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM check_runs WHERE id='{run_id}'
+                AND candidate_hash='{candidate}' AND status='precondition_failed' AND launch_state='failed'
+                AND launch_boot_identity IS NULL AND recovery_anchor_json IS NULL AND recovery_root_pid IS NULL AND exit_code IS NULL"),1);
+            fixture.assert_scalar::<i64>(
+                &format!("SELECT COUNT(*) FROM check_processes WHERE check_id='{run_id}'"),
+                0,
+            );
+            failures.push((
+                run_id.clone(),
+                fixture.scalar(&format!(
+                    "SELECT evidence_json FROM check_runs WHERE id='{run_id}'"
+                )),
+            ));
+        }
+        for (id, evidence) in &failures {
+            fixture.assert_scalar::<String>(&format!("SELECT evidence_json FROM check_runs WHERE id='{id}' AND status='precondition_failed' AND launch_state='failed'"),evidence.clone());
+        }
+        assert!(std::fs::read_dir(paths.artifacts.join("checks"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("verify-")));
+        assert_eq!(
+            std::fs::read(root.join("user-note.txt")).unwrap(),
+            b"preexisting untracked bytes\n"
+        );
+        match case {
+            "tracked_edit" => {
+                assert_eq!(std::fs::read(root.join("fixture.txt")).unwrap(), b"unreviewed tracked edit\n");
+                std::fs::write(root.join("fixture.txt"), b"reviewed task change\n").unwrap();
+            }
+            "extra_path" => {
+                assert_eq!(std::fs::read(root.join("extra-eligible.txt")).unwrap(), b"unreviewed new path\n");
+                std::fs::remove_file(root.join("extra-eligible.txt")).unwrap();
+            }
+            "other_task_baseline" => fixture.execute("UPDATE workspaces SET policy_json=json_set(policy_json,'$.baseline_snapshot_id','main-check-baseline') WHERE id=?1", params![plan.workspace_id]),
+            _ => {}
+        }
+    }
+    fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM check_runs WHERE attempt_id='{}' AND candidate_hash='{candidate}' AND status='precondition_failed'",plan.attempt_id),3);
+    fixture.assert_scalar::<String>(
+        &format!(
+            "SELECT manifest_json FROM snapshots WHERE id='{}' AND manifest_hash='{candidate}'",
+            frozen["snapshot_id"].as_str().unwrap()
+        ),
+        frozen_manifest,
+    );
+    assert_eq!(
+        std::fs::read(
+            paths
+                .artifacts
+                .join("snapshots/main-check-baseline/fixture.txt")
+        )
+        .unwrap(),
+        b"dirty starting tracked bytes\n"
+    );
+}
+
+#[test]
 fn main_checkout_trip_preparation_preserves_guidance_metadata_and_frozen_policy() {
     let fixture = Fixture::new("main-checkout-trip-preparation");
     let (_, task, plan) = new_task(&fixture, "main-project", "main-task");
@@ -54301,7 +60302,10 @@ fn default_writer_receives_exact_approved_structure_without_a_manager_question()
         1_i64,
     );
     fixture.assert_scalar(
-        "SELECT COUNT(*) FROM role_generations WHERE role='implementer'",
+        &format!(
+            "SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}' AND role='implementer'",
+            plan.attempt_id
+        ),
         1_i64,
     );
     let mut corrected = report.clone();
@@ -54357,7 +60361,10 @@ fn default_writer_receives_exact_approved_structure_without_a_manager_question()
         ticks.push(app.coordinator_tick().unwrap());
     }
     fixture.assert_scalar(
-        "SELECT COUNT(*) FROM role_generations WHERE role='implementer'",
+        &format!(
+            "SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}' AND role='implementer'",
+            plan.attempt_id
+        ),
         1_i64,
     );
     assert!(
@@ -54520,7 +60527,10 @@ fn retry_after_a_completed_implementer_question_stops_the_retained_turn_once() {
     assert_ne!(next["action"], "quiescing_resolved_implementer_turn");
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events WHERE event_code='implementer.resolved_turn.stop_reserved'",1);
     fixture.assert_scalar::<i64>(
-        "SELECT COUNT(*) FROM role_generations WHERE role='implementer'",
+        &format!(
+            "SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}' AND role='implementer'",
+            plan.attempt_id
+        ),
         1,
     );
     fixture.assert_scalar::<i64>(
@@ -54586,7 +60596,10 @@ fn an_exited_unanswered_reviewer_gets_recovery_without_another_provider_call() {
                 result["action"], "review_session_recovery_required",
                 "{result}"
             );
-            fixture.assert_scalar::<String>("SELECT attention FROM tasks", "resume_failed".into());
+            fixture.assert_scalar::<String>(
+                &format!("SELECT attention FROM tasks WHERE id='{}'", plan.task_id),
+                "resume_failed".into(),
+            );
             fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM audit_events WHERE event_code='session.resume.rejected' AND json_extract(detail_json,'$.category')='native_history_unavailable'",1);
         } else {
             assert_eq!(
@@ -54609,7 +60622,7 @@ fn an_exited_unanswered_reviewer_gets_recovery_without_another_provider_call() {
             app.coordinator_tick().unwrap();
         }
         fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM review_requests", 1);
-        fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM sessions", 1);
+        fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'", plan.attempt_id), 1);
         fixture.assert_scalar::<i64>(
             "SELECT spent FROM review_budgets WHERE review_kind='code'",
             1,
@@ -54705,7 +60718,7 @@ fn prepared_ready_task_remains_paused_and_explains_continue_without_resuming_pro
         "UPDATE projects SET queue_paused=1 WHERE id=?1",
         params![project],
     );
-    let version = fixture.scalar::<i64>("SELECT version FROM tasks");
+    let version = fixture.scalar::<i64>(&format!("SELECT version FROM tasks WHERE id='{task}'"));
     workflow::execute(
         &fixture.store,
         &HumanCommand::Control {
@@ -54753,7 +60766,7 @@ fn prepared_ready_task_remains_paused_and_explains_continue_without_resuming_pro
         agenticjira::domain::AttentionActionKind::OpenTask
     );
     assert_eq!(action.action.label, "Open task");
-    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", 0_i64);
+    fixture.assert_scalar(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'",plan.attempt_id), 0_i64);
     workflow::execute(
         &fixture.store,
         &HumanCommand::Control {
@@ -54773,10 +60786,19 @@ fn prepared_ready_task_remains_paused_and_explains_continue_without_resuming_pro
     )
     .unwrap();
     assert_eq!(app.coordinator_tick().unwrap()["action"], "continued");
-    fixture.assert_scalar("SELECT status FROM attempts", "running".to_owned());
-    fixture.assert_scalar("SELECT attention FROM tasks", "none".to_owned());
-    fixture.assert_scalar("SELECT queue_paused FROM projects", 1_i64);
-    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", 0_i64);
+    fixture.assert_scalar(
+        &format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id),
+        "running".to_owned(),
+    );
+    fixture.assert_scalar(
+        &format!("SELECT attention FROM tasks WHERE id='{}'", plan.task_id),
+        "none".to_owned(),
+    );
+    fixture.assert_scalar(
+        &format!("SELECT queue_paused FROM projects WHERE id='{project}'"),
+        1_i64,
+    );
+    fixture.assert_scalar(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'",plan.attempt_id), 0_i64);
 }
 
 #[test]
@@ -54883,7 +60905,7 @@ fn reliability_manager_resume_after_plan_rejection_preserves_planning_and_feedba
     .unwrap();
     assert_eq!(feedback["feedback"], "Clarify the acceptance criteria.");
     fixture.assert_scalar("SELECT SUM(spent) FROM review_budgets", 1_i64);
-    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", 2_i64);
+    fixture.assert_scalar(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'", plan.attempt_id), 2_i64);
 }
 
 #[test]
@@ -54963,7 +60985,7 @@ fn reliability_manager_resume_projects_current_approvals_without_rewriting_saved
         fixture.store.invocation_input(&context.session_id).unwrap(),
         before
     );
-    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", 1_i64);
+    fixture.assert_scalar(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'", plan.attempt_id), 1_i64);
     fixture.assert_scalar("SELECT SUM(spent) FROM review_budgets", 0_i64);
     let resumed_context = app
         .synthetic_role_context_for_tests(&context.session_id)

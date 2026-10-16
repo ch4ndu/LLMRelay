@@ -1,5 +1,50 @@
 # LLMRelay roadmap and next task
 
+## Active qualification update — October 15, 2026
+
+Provider-independent functional-v2 qualification is implemented through backend
+admission, Main resume/publication, web transport and dashboard projections.
+The integrated verification suite passes: 118 frontend tests and 490 Rust tests,
+with two live-provider tests intentionally ignored. The all-Codex task
+AJ-B0B87291 and all-Claude task AJ-E58677BC are accepted and done. The Claude
+Main journey required stopping its completed read-only Manager before acceptance;
+this is evidence of completion through supported recovery, not seamless automation.
+The ordinary Claude continuity task AJ-7F5AE750 is also accepted and done.
+Its Implementer paused after an edit, exited quiescent, survived dashboard reload
+and resumed the same app/native session before submitting its candidate. Both
+service checks and independent code and fresh final reviews passed. The completed
+Manager lacked a recorded Stop event before final review and needed a supported
+stop. A later authenticated Stop advanced its handoff before process exit;
+acceptance still required all sessions stopped. This exercise does not establish
+unattended completion. Fresh engineering final
+verification approved the candidate. The refreshed local package passed its
+release build and archive-integrity check. Nothing was published. After this bounded task, continue the authorized engineering/refactor
+pipeline before optional distribution work. Earlier dated evidence below remains
+historical and does not qualify the new contract.
+
+## Claude Manager idle-boundary follow-up
+
+The completed diagnostic found no recorded Stop event for the stalled ordinary
+Claude Manager turn in AJ-7F5AE750. The service correctly kept that turn busy;
+these records cannot distinguish provider non-emission from hook-forwarding
+loss. A later authenticated Stop was admitted, and the handoff advanced before
+the Manager exited. Acceptance separately required all sessions quiescent.
+Elapsed time and terminal appearance must not become proof of readiness.
+
+The verified bounded repair marks the exact eligible Manager handoff report
+consumed in the existing transition transaction. The diagnostic found that the
+task advanced without recording consumption. It preserves candidate, generation,
+review and native readiness guards. Focused verification and independent code
+review and fresh final verification passed. The local package refresh includes
+this repair.
+
+Missing Stop evidence remains an operational follow-up. Investigate the exact
+provider/forwarder boundary only with a supported way to capture that evidence;
+do not add a speculative readiness fallback. Acceptance for any future readiness
+fix requires a native completed Manager handoff progressing without a manual
+stop plus a causal regression for the confirmed app-owned cause. Existing
+explicit stop controls remain the recovery path.
+
 ## Current status — October 14 completion checkpoint
 
 The finite stabilization/refactoring queue has delivered the draft cleanup fix,

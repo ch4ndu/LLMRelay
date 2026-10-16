@@ -1,8 +1,8 @@
 use crate::domain::{
     AttachmentBinding, CapabilityProofInput, CmuxAttachmentControlDisposition, CmuxAttachmentMode,
-    HumanCommand, PeerProcessIdentity, ProviderValidationPreviewRequest,
-    ProviderValidationStartRequest, RoleKind, ValidationLaunchRequest, WorkflowCommand,
-    WorkflowValidationRequest,
+    FunctionalCapabilityProofInput, HumanCommand, PeerProcessIdentity,
+    ProviderValidationPreviewRequest, ProviderValidationStartRequest, RoleKind,
+    ValidationLaunchRequest, WorkflowCommand, WorkflowValidationRequest,
 };
 use crate::operations::Application;
 use crate::protocol::{self, ClientKind, Declaration, Hello, HelloKind};
@@ -28,6 +28,24 @@ const MAX_CONTROL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 // live route or input lease indefinitely.
 const CONTROL_IDLE_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
 const CONTROL_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn deserialize_legacy_capability_proof<'de, D>(
+    deserializer: D,
+) -> Result<CapabilityProofInput, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if crate::domain::QualificationContract::from_record(&value)
+        .map_err(serde::de::Error::custom)?
+        != crate::domain::QualificationContract::Legacy
+    {
+        return Err(serde::de::Error::custom(
+            "functional proof requires its explicit control variant",
+        ));
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -151,7 +169,11 @@ pub enum ControlRequest {
         prompt: String,
     },
     CapabilityRecordProof {
+        #[serde(deserialize_with = "deserialize_legacy_capability_proof")]
         proof: CapabilityProofInput,
+    },
+    CapabilityRecordFunctionalProof {
+        proof: FunctionalCapabilityProofInput,
     },
     HumanCommand {
         command: HumanCommand,
@@ -1599,6 +1621,9 @@ fn dispatch(
         ControlRequest::CapabilityRecordProof { proof } => {
             ControlResponse::success(app.store.record_capability_proof(&proof)?)
         }
+        ControlRequest::CapabilityRecordFunctionalProof { proof } => {
+            ControlResponse::success(app.record_functional_main_checkout_proof(&proof)?)
+        }
         ControlRequest::HumanCommand { command } => {
             ControlResponse::success(app.execute_human_command(&command)?)
         }
@@ -1745,6 +1770,7 @@ fn blocking_control_request(request: &ControlRequest) -> bool {
         | ControlRequest::CapabilityInterrupt { .. }
         | ControlRequest::CapabilityResume { .. }
         | ControlRequest::CapabilityRecordProof { .. }
+        | ControlRequest::CapabilityRecordFunctionalProof { .. }
         | ControlRequest::HumanCommand { .. }
         | ControlRequest::SchedulerRunOnce
         | ControlRequest::SnapshotFreeze { .. }
@@ -1957,6 +1983,33 @@ mod tests {
     use std::cell::Cell;
     use std::os::fd::AsRawFd;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    #[test]
+    fn functional_main_proof_transport_keeps_the_contract_explicit() {
+        let proof = serde_json::json!({"qualification_contract":"functional-v2","operation_id":"publish",
+            "session_id":"session","evidence_reference":"native-reference","main":{
+                "observation_request_hash":"request","native_command":"/bin/cat -- '/owned/challenge'",
+                "native_session_id":"native","role_generation_id":"generation",
+                "observation":{"status":"passed","binding_hash":"binding","challenge":"nonce","session_mode":"retained"}}});
+        let request =
+            serde_json::json!({"kind":"capability_record_functional_proof","proof":proof});
+        let parsed: ControlRequest = serde_json::from_value(request.clone()).unwrap();
+        assert!(blocking_control_request(&parsed));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+        let mut wrong = request.clone();
+        wrong["kind"] = "capability_record_proof".into();
+        assert!(serde_json::from_value::<ControlRequest>(wrong).is_err());
+        let mut unknown = request;
+        unknown["proof"]["qualification_contract"] = "functional-v3".into();
+        assert!(serde_json::from_value::<ControlRequest>(unknown).is_err());
+        let mut legacy = serde_json::json!({"kind":"capability_record_proof","proof":{
+            "operation_id":"legacy","session_id":"session","evidence_reference":"native-reference",
+            "direct_write_denied":true,"compound_denied":true,"redirect_denied":true,
+            "sentinel_relative_path":"sentinel","native_resume_session_id":"native","history_nonce":"nonce"}});
+        assert!(serde_json::from_value::<ControlRequest>(legacy.clone()).is_ok());
+        legacy["proof"]["qualification_contract"] = "functional-v2".into();
+        assert!(serde_json::from_value::<ControlRequest>(legacy).is_err());
+    }
 
     fn control_test_application() -> (std::path::PathBuf, Application, AttachmentBinding) {
         let root =
