@@ -1061,7 +1061,8 @@ impl Scheduler {
                 }
                 SchedulerMutation::QueuedCapacity => {
                     transaction.execute(
-                        "UPDATE tasks SET attention='queued_capacity',updated_at=?1 WHERE id=?2",
+                        "UPDATE tasks SET attention=CASE WHEN attention='run_next_requested'
+                           THEN attention ELSE 'queued_capacity' END,updated_at=?1 WHERE id=?2",
                         params![now, task_id],
                     )?;
                 }
@@ -1174,6 +1175,17 @@ impl Scheduler {
                 workspace_policy.to_string(),now])?;
         transaction.execute("INSERT INTO scheduler_projects(project_id,last_claimed_at) VALUES(?1,?2) ON CONFLICT(project_id) DO UPDATE SET last_claimed_at=excluded.last_claimed_at", params![project_id,now])?;
         transaction.execute("UPDATE tasks SET lifecycle='in_progress',attention='none',version=version+1,updated_at=?1 WHERE id=?2", params![now,task_id])?;
+        crate::workflow::record_workspace_dispatch_intent(
+            &transaction,
+            &attempt_id,
+            if single_step {
+                crate::workflow::WorkspaceDispatchIntent::PrepareOnly
+            } else {
+                crate::workflow::WorkspaceDispatchIntent::Automatic
+            },
+            &uuid::Uuid::new_v4().to_string(),
+            &now,
+        )?;
         transaction.commit()?;
         drop(connection);
         let plan = DispatchPlan {
@@ -1597,8 +1609,9 @@ impl Scheduler {
             if crate::workspace::policy_mode(&serde_json::from_str(&policy_json)?)?
                 == crate::domain::WorkspaceMode::MainCheckout
             {
-                match validate_borrowed_reservation(&self.store,&attempt,&policy_json) {
-                    Ok(())=> {if promote_workspace_reservation(&self.store,&workspace,&attempt)? {recovered.push(attempt);} }
+                match validate_borrowed_reservation(&self.store,&attempt,&policy_json)
+                    .and_then(|()| promote_workspace_reservation(&self.store,&workspace,&attempt)) {
+                    Ok(promoted)=> {if promoted {recovered.push(attempt);} }
                     Err(error)=>record_workspace_reservation_recovery(&self.store,&attempt,&workspace,
                         &format!("Main checkout preparation needs recovery: {error:#}. The checkout was left unchanged."),
                         serde_json::json!({"stage":"main_checkout_startup","workspace_ownership":"borrowed_checkout"}))?,
@@ -1651,7 +1664,11 @@ impl Scheduler {
                 .and_then(serde_json::Value::as_str)
                 == Some(identity.as_str())
                 && observed.get("head").and_then(serde_json::Value::as_str) == Some(base.as_str());
-            let policy_validation = crate::trip::validate_materialized_policy(&policy_json);
+            let policy_validation = {
+                let connection = self.store.lock()?;
+                validate_workspace_recovery_policy(&connection, &attempt, &policy_json)
+            }
+            .and_then(|()| crate::workspace::require_no_gitlinks(Path::new(&path), &[&base]));
             if valid && policy_validation.is_ok() {
                 promote_workspace_reservation(&self.store, &workspace, &attempt)?;
                 recovered.push(attempt);
@@ -1676,6 +1693,48 @@ impl Scheduler {
         attempt_id: &str,
         workspace_id: &str,
         expected_version: i64,
+    ) -> Result<OperationResult> {
+        self.retry_workspace_reservation_inner(
+            operation_id,
+            task_id,
+            attempt_id,
+            workspace_id,
+            expected_version,
+            || {},
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn synthetic_workspace_retry_interleaving_for_tests(
+        &self,
+        operation_id: &str,
+        task_id: &str,
+        attempt_id: &str,
+        workspace_id: &str,
+        expected_version: i64,
+        before_promotion: impl FnOnce(),
+    ) -> Result<OperationResult> {
+        if !self.store.compatibility_bundles.is_synthetic() {
+            bail!("synthetic workspace recovery interleaving is unavailable in production")
+        }
+        self.retry_workspace_reservation_inner(
+            operation_id,
+            task_id,
+            attempt_id,
+            workspace_id,
+            expected_version,
+            before_promotion,
+        )
+    }
+
+    fn retry_workspace_reservation_inner(
+        &self,
+        operation_id: &str,
+        task_id: &str,
+        attempt_id: &str,
+        workspace_id: &str,
+        expected_version: i64,
+        before_promotion: impl FnOnce(),
     ) -> Result<OperationResult> {
         let request = serde_json::json!({
             "operation":"retry_workspace_reservation","task_id":task_id,
@@ -1751,6 +1810,41 @@ impl Scheduler {
             params![workspace_id],
             |row| row.get(0),
         )?;
+        let single_agent = {
+            let connection = self.store.lock()?;
+            crate::workflow::attempt_family(&connection, attempt_id)?
+                == crate::domain::WorkflowFamily::SingleAgent
+        };
+        let control_validation = {
+            let connection = self.store.lock()?;
+            require_workspace_recovery_without_cancellation(&connection, attempt_id)
+        };
+        if let Err(error) = control_validation {
+            return retain_workspace_recovery(
+                &self.store,
+                operation_id,
+                &request_hash,
+                &tuple,
+                &error.to_string(),
+                serde_json::json!({"stage":"retry_pending_cancellation"}),
+            );
+        }
+        if single_agent {
+            let validation = {
+                let connection = self.store.lock()?;
+                crate::workflow::require_single_agent_workspace_recovery(&connection, attempt_id)
+            };
+            if let Err(error) = validation {
+                return retain_workspace_recovery(
+                    &self.store,
+                    operation_id,
+                    &request_hash,
+                    &tuple,
+                    &format!("Single agent preparation cannot be restored safely: {error:#}"),
+                    serde_json::json!({"stage":"retry_single_agent_authority","error":format!("{error:#}")}),
+                );
+            }
+        }
         if crate::workspace::policy_mode(&serde_json::from_str(&policy_json)?)?
             == crate::domain::WorkspaceMode::MainCheckout
         {
@@ -1765,19 +1859,31 @@ impl Scheduler {
                     serde_json::json!({"borrowed_checkout_unchanged":true}),
                 );
             }
-            let trip = {
-                let connection = self.store.lock()?;
-                crate::workflow::attempt_family(&connection, attempt_id)?
-                    == crate::domain::WorkflowFamily::Trip
-            };
-            if trip {
+            if !single_agent {
                 crate::trip::materialize_project_policy(
                     &self.store,
                     attempt_id,
                     &tuple.workspace_path,
                 )?;
             }
-            let promoted = promote_workspace_reservation(&self.store, workspace_id, attempt_id)?;
+            before_promotion();
+            let promoted = match promote_workspace_reservation(
+                &self.store,
+                workspace_id,
+                attempt_id,
+            ) {
+                Ok(promoted) => promoted,
+                Err(error) => {
+                    return retain_workspace_recovery(
+                        &self.store,
+                        operation_id,
+                        &request_hash,
+                        &tuple,
+                        &format!("Main preparation changed before recovery publication: {error:#}"),
+                        serde_json::json!({"stage":"retry_promotion","error":format!("{error:#}")}),
+                    )
+                }
+            };
             let result = OperationResult {
                 operation_id: operation_id.into(),
                 entity_kind: "workspace".into(),
@@ -1838,23 +1944,54 @@ impl Scheduler {
                 serde_json::json!({"stage":"retry_postcreate_reinspection","observed":inspect_workspace_tuple(&tuple)}),
             );
         }
-        if let Err(error) = crate::trip::materialize_project_policy(
-            &self.store,
-            &tuple.attempt_id,
-            &tuple.workspace_path,
-        ) {
+        if let Err(error) =
+            crate::workspace::require_no_gitlinks(&tuple.workspace_path, &[&tuple.base_revision])
+        {
             return retain_workspace_recovery(
                 &self.store,
                 operation_id,
                 &request_hash,
                 &tuple,
                 &format!(
-                    "explicit worktree retry policy materialization requires recovery: {error:#}"
+                    "explicit worktree retry cannot safely prepare this repository: {error:#}"
                 ),
-                serde_json::json!({"stage":"retry_policy_materialization","error":format!("{error:#}"),"after":inspect_workspace_tuple(&tuple)}),
+                serde_json::json!({"stage":"retry_gitlink_inspection","error":format!("{error:#}")}),
             );
         }
-        let promoted = promote_workspace_reservation(&self.store, workspace_id, attempt_id)?;
+        if !single_agent {
+            if let Err(error) = crate::trip::materialize_project_policy(
+                &self.store,
+                &tuple.attempt_id,
+                &tuple.workspace_path,
+            ) {
+                return retain_workspace_recovery(
+                    &self.store,
+                    operation_id,
+                    &request_hash,
+                    &tuple,
+                    &format!(
+                        "explicit worktree retry policy materialization requires recovery: {error:#}"
+                    ),
+                    serde_json::json!({"stage":"retry_policy_materialization","error":format!("{error:#}"),"after":inspect_workspace_tuple(&tuple)}),
+                );
+            }
+        }
+        before_promotion();
+        let promoted = match promote_workspace_reservation(&self.store, workspace_id, attempt_id) {
+            Ok(promoted) => promoted,
+            Err(error) => {
+                return retain_workspace_recovery(
+                    &self.store,
+                    operation_id,
+                    &request_hash,
+                    &tuple,
+                    &format!(
+                        "Workspace preparation changed before recovery publication: {error:#}"
+                    ),
+                    serde_json::json!({"stage":"retry_promotion","error":format!("{error:#}")}),
+                )
+            }
+        };
         let result = OperationResult {
             operation_id: operation_id.to_owned(),
             entity_kind: "workspace".to_owned(),
@@ -2019,9 +2156,10 @@ impl Scheduler {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct WorkspaceRecoveryTuple {
     task_id: String,
+    task_version: i64,
     attempt_id: String,
     workspace_id: String,
     claim_id: String,
@@ -2044,7 +2182,9 @@ fn workspace_recovery_tuple_in(
              FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
              JOIN workspaces w ON w.attempt_id=a.id JOIN claims c ON c.attempt_id=a.id
              WHERE t.id=?1 AND t.version=?2 AND a.id=?3 AND a.status='needs_recovery'
+               AND t.lifecycle NOT IN ('done','cancelled') AND t.archived_at IS NULL
                AND w.id=?4 AND w.state IN ('unknown','recovery_required') AND c.state='unknown'
+               AND c.task_id=t.id AND c.repository_identity=w.repository_identity
                AND EXISTS(SELECT 1 FROM recovery_records r WHERE r.attempt_id=a.id
                    AND r.state='attention_required'
                    AND json_extract(r.detail_json,'$.kind')='workspace_reservation'
@@ -2053,6 +2193,7 @@ fn workspace_recovery_tuple_in(
             |row| {
                 Ok(WorkspaceRecoveryTuple {
                     task_id: row.get(0)?,
+                    task_version: expected_version,
                     attempt_id: row.get(1)?,
                     workspace_id: row.get(2)?,
                     claim_id: row.get(3)?,
@@ -2192,25 +2333,59 @@ fn retain_workspace_recovery(
     reason: &str,
     observation: serde_json::Value,
 ) -> Result<OperationResult> {
-    record_workspace_reservation_recovery(
-        store,
+    let mut connection = store.lock()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = workspace_recovery_tuple_in(
+        &transaction,
+        &tuple.task_id,
         &tuple.attempt_id,
         &tuple.workspace_id,
-        reason,
-        observation,
+        tuple.task_version,
     )?;
-    let result = OperationResult {
-        operation_id: operation_id.to_owned(),
-        entity_kind: "workspace".to_owned(),
-        entity_id: tuple.workspace_id.clone(),
-        version: None,
-        state: "workspace_recovery_required".to_owned(),
-        detail: serde_json::json!({
-            "task_id":tuple.task_id,"attempt_id":tuple.attempt_id,"reason":reason,
-            "worktree_deleted":false,
-        }),
+    // Filesystem work can outlive cancellation or another recovery. Only the
+    // original recovery tuple may be held again; a late failure owns its receipt.
+    let result = if current.as_ref() == Some(tuple) {
+        record_workspace_reservation_recovery_in(
+            &transaction,
+            &tuple.attempt_id,
+            Some(&tuple.task_id),
+            &tuple.workspace_id,
+            reason,
+            observation,
+        )?;
+        OperationResult {
+            operation_id: operation_id.to_owned(),
+            entity_kind: "workspace".to_owned(),
+            entity_id: tuple.workspace_id.clone(),
+            version: None,
+            state: "workspace_recovery_required".to_owned(),
+            detail: serde_json::json!({
+                "task_id":tuple.task_id,"attempt_id":tuple.attempt_id,"reason":reason,
+                "worktree_deleted":false,
+            }),
+        }
+    } else {
+        OperationResult {
+            operation_id: operation_id.to_owned(),
+            entity_kind: "workspace".to_owned(),
+            entity_id: tuple.workspace_id.clone(),
+            version: None,
+            state: "workspace_recovery_stale".to_owned(),
+            detail: serde_json::json!({
+                "task_id":tuple.task_id,"attempt_id":tuple.attempt_id,
+                "reason":"Workspace recovery was reconciled or superseded before this operation could record its failure.",
+                "worktree_deleted":false,
+            }),
+        }
     };
-    finalize_workspace_recovery_operation(store, operation_id, request_hash, &result)?;
+    finalize_workspace_recovery_operation_in(
+        &transaction,
+        operation_id,
+        request_hash,
+        &result,
+        &Utc::now().to_rfc3339(),
+    )?;
+    transaction.commit()?;
     Ok(result)
 }
 
@@ -2397,6 +2572,78 @@ fn validate_borrowed_reservation(store: &Store, attempt: &str, policy_json: &str
     Ok(())
 }
 
+fn require_workspace_recovery_without_cancellation(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<()> {
+    let cancellation_pending: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM controls WHERE attempt_id=?1 AND kind='cancel'
+           AND state IN ('requested','draining','recovery_required'))",
+        params![attempt_id],
+        |row| row.get(0),
+    )?;
+    if cancellation_pending {
+        bail!("Cancellation is still pending. Choose Verify and cancel reservation to finish cancelling this task.")
+    }
+    Ok(())
+}
+
+fn validate_workspace_recovery_policy(
+    connection: &Connection,
+    attempt_id: &str,
+    policy_json: &str,
+) -> Result<()> {
+    // Recovery proves workspace ownership, not permission to override a Cancel.
+    // Promotion repeats this check while holding its publication transaction.
+    require_workspace_recovery_without_cancellation(connection, attempt_id)?;
+    match crate::workflow::attempt_family(connection, attempt_id)? {
+        crate::domain::WorkflowFamily::Trip => {
+            crate::trip::validate_materialized_policy(policy_json)?;
+            Ok(())
+        }
+        crate::domain::WorkflowFamily::SingleAgent => {
+            let (task_id, path, repository_path, identity, base): (
+                String,
+                String,
+                String,
+                String,
+                String,
+            ) = connection.query_row(
+                "SELECT a.task_id,w.path,p.repository_path,w.repository_identity,w.base_revision
+                 FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
+                 JOIN workspaces w ON w.attempt_id=a.id WHERE a.id=?1",
+                params![attempt_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+            let policy: serde_json::Value = serde_json::from_str(policy_json)?;
+            crate::workflow::validate_workspace_checkout(connection, &task_id, &policy)?;
+            crate::workflow::require_single_agent_workspace_recovery(connection, attempt_id)?;
+            let repository = crate::workspace::inspect(Path::new(&repository_path))?;
+            let workspace = crate::workspace::inspect(Path::new(&path))?;
+            if repository.identity != identity
+                || repository.head != base
+                || workspace.identity != identity
+                || workspace.head != base
+                || workspace.root != Path::new(&path).canonicalize()?
+                || (crate::workspace::policy_mode(&policy)?
+                    == crate::domain::WorkspaceMode::IsolatedWorktree
+                    && workspace.root == repository.root)
+            {
+                bail!("Single agent recovery requires its exact repository, starting revision and separate isolated worktree")
+            }
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn promote_workspace_reservation(
     store: &Store,
     workspace_id: &str,
@@ -2443,7 +2690,7 @@ pub(crate) fn promote_workspace_reservation(
         )
         .optional()?
         .ok_or_else(|| anyhow!("workspace recovery tuple is stale or terminal"))?;
-    crate::trip::validate_materialized_policy(&policy_json)?;
+    validate_workspace_recovery_policy(&transaction, attempt_id, &policy_json)?;
     if main {
         if policy_json != prepared_policy {
             bail!("Main preparation policy changed before recovery publication")
@@ -2454,11 +2701,12 @@ pub(crate) fn promote_workspace_reservation(
             &serde_json::from_str(&policy_json)?,
         )?;
     }
-    let validation = serde_json::from_str::<serde_json::Value>(&policy_json)
+    let held = serde_json::from_str::<serde_json::Value>(&policy_json)
         .ok()
         .and_then(|value| value.get("validation").and_then(serde_json::Value::as_bool))
         == Some(true)
-        || lifecycle == "validation";
+        || lifecycle == "validation"
+        || !crate::workflow::workspace_automatic_dispatch_allowed(&transaction, attempt_id)?;
     let workspace_changed = transaction.execute(
         "UPDATE workspaces SET state='ready',updated_at=?1 WHERE id=?2 AND attempt_id=?3
            AND (state IN ('reserved','unknown','recovery_required')
@@ -2483,11 +2731,11 @@ pub(crate) fn promote_workspace_reservation(
     )?;
     let attempt_changed = transaction.execute(
         "UPDATE attempts SET status=?1,updated_at=?2 WHERE id=?3 AND status IN ('needs_recovery','workspace_reserved')",
-        params![if validation { "held" } else { "running" }, now, attempt_id],
+        params![if held { "held" } else { "running" }, now, attempt_id],
     )?;
     let task_changed = transaction.execute(
         "UPDATE tasks SET attention=?1,version=version+CASE WHEN attention=?1 THEN 0 ELSE 1 END,updated_at=?2 WHERE id=?3",
-        params![if validation { "paused" } else { "none" }, now, task_id],
+        params![if held { "paused" } else { "none" }, now, task_id],
     )?;
     if claim_changed != 1 || attempt_changed != 1 || task_changed != 1 {
         bail!("workspace recovery tuple changed before atomic promotion")

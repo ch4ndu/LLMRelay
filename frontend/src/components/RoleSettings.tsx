@@ -187,6 +187,11 @@ export function SingleAgentSelectionFields(
     );
   }
   const checks = configurationChecks(execution, value.execution_config_revision_id);
+  const missingConfiguration = !!value.execution_config_revision_id &&
+    !execution.configurations.some((item) => item.id === value.execution_config_revision_id);
+  const missingProfile = !!value.profile_revision_id &&
+    !profiles.some((item) => item.revision.id === value.profile_revision_id);
+  const missingChecks = value.check_ids.filter((id) => !checks.some((check) => check.id === id));
   const chosen = !!value.execution_config_revision_id &&
     !!value.profile_revision_id;
   return (
@@ -204,6 +209,7 @@ export function SingleAgentSelectionFields(
             })}
         >
           <option value="">Choose a configuration</option>
+          {missingConfiguration && <option value={value.execution_config_revision_id} disabled>Saved configuration is no longer available</option>}
           {execution.configurations.map((configuration) => (
             <option key={configuration.id} value={configuration.id}>
               Revision {configuration.revision} · approved{" "}
@@ -220,6 +226,7 @@ export function SingleAgentSelectionFields(
             onChange({ ...value, profile_revision_id: event.target.value })}
         >
           <option value="">Choose a profile</option>
+          {missingProfile && <option value={value.profile_revision_id} disabled>Saved profile revision is no longer available</option>}
           {profiles.map(({ profile, revision }) => (
             <option key={revision.id} value={revision.id}>
               {profile.display_name} · {providerName(revision.provider)} ·{" "}
@@ -228,6 +235,14 @@ export function SingleAgentSelectionFields(
           ))}
         </select>
       </label>
+      {missingChecks.length > 0 && (
+        <p className="warning" role="status">
+          Some saved checks are no longer available. Review the current checks before saving.
+          <button type="button" onClick={() => onChange({ ...value, check_ids: value.check_ids.filter((id) => !missingChecks.includes(id)) })}>
+            Remove unavailable checks
+          </button>
+        </p>
+      )}
       {checks.length > 0 && (
         <fieldset>
           <legend>Checks the result must pass</legend>

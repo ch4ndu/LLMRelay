@@ -16,6 +16,9 @@ use agenticjira::{
 };
 use base64::Engine;
 
+#[path = "support/provider_cli.rs"]
+mod provider_cli;
+
 fn synthetic_claude_contract() -> agenticjira::provider_compatibility::BundleSet {
     let codex = include_str!("../resources/provider-compatibility/codex.json");
     let mut claude: serde_json::Value = serde_json::from_str(include_str!(
@@ -375,6 +378,7 @@ struct T10Cleanup {
     socket_dir: Option<std::path::PathBuf>,
     original_home: Option<std::ffi::OsString>,
     original_codex_home: Option<std::ffi::OsString>,
+    original_path: Option<std::ffi::OsString>,
     supervisor: Option<Supervisor>,
     sessions: Vec<String>,
     releases: Vec<std::path::PathBuf>,
@@ -415,6 +419,7 @@ impl Drop for T10Cleanup {
         for (key, original) in [
             ("HOME", &self.original_home),
             ("CODEX_HOME", &self.original_codex_home),
+            ("PATH", &self.original_path),
         ] {
             match original {
                 Some(value) => std::env::set_var(key, value),
@@ -1866,11 +1871,13 @@ async fn t10_role_auth_hook_and_human_boundary() {
     ));
     let original_home = std::env::var_os("HOME");
     let original_codex_home = std::env::var_os("CODEX_HOME");
+    let original_path = std::env::var_os("PATH");
     let mut cleanup = T10Cleanup {
         root: root.clone(),
         socket_dir: None,
         original_home,
         original_codex_home,
+        original_path,
         supervisor: None,
         sessions: Vec::new(),
         releases: vec![root.join("root-release"), root.join("descendant-release")],
@@ -1879,6 +1886,7 @@ async fn t10_role_auth_hook_and_human_boundary() {
         retain_files: manual_attachment,
     };
     install_synthetic_codex_home(&root);
+    provider_cli::install_codex_version_probe(&root);
     let project = root.join("project");
     std::fs::create_dir_all(&project).unwrap();
     let project = std::fs::canonicalize(project).unwrap();

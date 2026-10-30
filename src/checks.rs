@@ -15,11 +15,16 @@ use sha2::Digest;
 use std::{
     collections::{HashMap, VecDeque},
     io::Read,
-    os::unix::process::CommandExt,
+    os::{fd::AsRawFd, unix::process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdout, Command, Stdio},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
+const PROCESS_INSPECTION_TIMEOUT: Duration = Duration::from_secs(2);
+const PROCESS_INSPECTION_LIMIT: usize = 4 * 1024 * 1024;
+const INSPECTION_REAP_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckSpec {
@@ -289,6 +294,15 @@ pub struct CheckService {
     store: Store,
     supervisor: Supervisor,
     root: PathBuf,
+    pending_children: Arc<Mutex<Vec<Child>>>,
+    pending_captures: Arc<Mutex<VecDeque<PendingCapture>>>,
+}
+
+struct PendingCapture {
+    check_id: String,
+    stdout: Option<PipeCapture<ChildStdout>>,
+    stderr: Option<PipeCapture<ChildStderr>>,
+    completion_error: Option<String>,
 }
 #[derive(Clone)]
 struct ProcessInfo {
@@ -322,6 +336,8 @@ impl CheckService {
             store,
             supervisor,
             root: artifacts.join("checks"),
+            pending_children: Arc::new(Mutex::new(Vec::new())),
+            pending_captures: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -637,53 +653,17 @@ impl CheckService {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            });
-        }
-        let boot_identity = crate::supervisor::system_boot_identity()?;
-        {
-            let connection = self.store.lock()?;
-            connection.execute("UPDATE check_runs SET launch_state='spawning',launch_boot_identity=?1 WHERE id=?2 AND status='launch_reserved'",params![boot_identity,id])?;
-        }
-        let mut child = match command
-            .spawn()
-            .with_context(|| format!("launch configured check {suite}"))
-        {
-            Ok(child) => child,
-            Err(error) => {
-                self.finish_failed(&id, "launch_failed", &format!("{error:#}"))?;
-                return Err(error);
-            }
-        };
+        let (mut child, pgid, boot_identity) =
+            self.spawn_reserved_check(&id, suite, &mut command)?;
         let root = child.id();
-        let start = match start_marker(root) {
+        let start = match self.start_marker(root, Instant::now() + PROCESS_INSPECTION_TIMEOUT) {
             Ok(start) => start,
             Err(error) => {
                 return self
-                    .fail_spawned(&id, attempt, &mut child, root, root as i32, None, error)
+                    .fail_spawned(&id, attempt, child, root, pgid, None, error)
                     .map(BrowserCheckRun::Started)
             }
         };
-        let pgid = unsafe { libc::getpgid(root as libc::pid_t) };
-        if pgid <= 0 {
-            return self
-                .fail_spawned(
-                    &id,
-                    attempt,
-                    &mut child,
-                    root,
-                    root as i32,
-                    Some(&start),
-                    anyhow!("check root has no observable process group"),
-                )
-                .map(BrowserCheckRun::Started);
-        }
         let anchor = crate::domain::ProcessGenerationAnchor {
             pid: root,
             process_group_id: pgid,
@@ -704,7 +684,7 @@ impl CheckService {
                     .fail_spawned(
                         &id,
                         attempt,
-                        &mut child,
+                        child,
                         root,
                         pgid,
                         Some(&start),
@@ -714,47 +694,15 @@ impl CheckService {
             }
             Err(error) => {
                 return self
-                    .fail_spawned(&id, attempt, &mut child, root, pgid, Some(&start), error)
+                    .fail_spawned(&id, attempt, child, root, pgid, Some(&start), error)
                     .map(BrowserCheckRun::Started)
             }
         }
         if let Err(error) = self.record_process(&id, root, &start, pgid, std::process::id()) {
             return self
-                .fail_spawned(&id, attempt, &mut child, root, pgid, Some(&start), error)
+                .fail_spawned(&id, attempt, child, root, pgid, Some(&start), error)
                 .map(BrowserCheckRun::Started);
         }
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                return self
-                    .fail_spawned(
-                        &id,
-                        attempt,
-                        &mut child,
-                        root,
-                        pgid,
-                        Some(&start),
-                        anyhow!("check stdout pipe missing"),
-                    )
-                    .map(BrowserCheckRun::Started)
-            }
-        };
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => {
-                return self
-                    .fail_spawned(
-                        &id,
-                        attempt,
-                        &mut child,
-                        root,
-                        pgid,
-                        Some(&start),
-                        anyhow!("check stderr pipe missing"),
-                    )
-                    .map(BrowserCheckRun::Started)
-            }
-        };
         let running_recorded = match (|| -> Result<usize> {
             let connection = self.store.lock()?;
             Ok(connection.execute("UPDATE check_runs SET status='running',launch_state='started' WHERE id=?1 AND status='launch_reserved'",params![id])?)
@@ -762,7 +710,7 @@ impl CheckService {
             Ok(changed) => changed,
             Err(error) => {
                 return self
-                    .fail_spawned(&id, attempt, &mut child, root, pgid, Some(&start), error)
+                    .fail_spawned(&id, attempt, child, root, pgid, Some(&start), error)
                     .map(BrowserCheckRun::Started)
             }
         };
@@ -771,7 +719,7 @@ impl CheckService {
                 .fail_spawned(
                     &id,
                     attempt,
-                    &mut child,
+                    child,
                     root,
                     pgid,
                     Some(&start),
@@ -779,6 +727,23 @@ impl CheckService {
                 )
                 .map(BrowserCheckRun::Started);
         }
+        if child.stdout.is_none() || child.stderr.is_none() {
+            return self
+                .fail_spawned(
+                    &id,
+                    attempt,
+                    child,
+                    root,
+                    pgid,
+                    Some(&start),
+                    anyhow!("check output pipe missing"),
+                )
+                .map(BrowserCheckRun::Started);
+        }
+        // Both pipes remain owned by Child until every fallible launch step has
+        // completed, so failure cleanup can retain them together.
+        let stdout = child.stdout.take().context("check stdout pipe missing")?;
+        let stderr = child.stderr.take().context("check stderr pipe missing")?;
         if background {
             let service = self.clone();
             let worker_id = id.clone();
@@ -806,6 +771,7 @@ impl CheckService {
                     child,
                     stdout,
                     stderr,
+                    || service.process_inventory(),
                 );
             });
             return Ok(BrowserCheckRun::Started(serde_json::json!({
@@ -813,117 +779,24 @@ impl CheckService {
                 "state":"running","browser_wait":"reservation_and_spawn_only",
             })));
         }
-        let execution_started = Instant::now();
-        let out_thread = std::thread::spawn(move || drain_bounded(stdout, 512 * 1024));
-        let err_thread = std::thread::spawn(move || drain_bounded(stderr, 512 * 1024));
-        let mut known = HashMap::from([(root, start.clone())]);
-        let deadline = Instant::now() + Duration::from_secs(spec.timeout_seconds);
-        let execution = (|| -> Result<_> {
-            loop {
-                let inventory = process_inventory()?;
-                observe_descendants(pgid, &mut known, &inventory);
-                self.record_known(&id, &known, &inventory)?;
-                if let Some(status) = child.try_wait()? {
-                    break Ok((status, false));
-                }
-                if Instant::now() >= deadline {
-                    signal_known(&known, libc::SIGKILL)?;
-                    break Ok((child.wait()?, true));
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        })();
-        let (status, timed_out) = match execution {
-            Ok(value) => value,
-            Err(error) => {
-                return self
-                    .fail_spawned(&id, attempt, &mut child, root, pgid, Some(&start), error)
-                    .map(BrowserCheckRun::Started)
-            }
-        };
-        let quiescence_deadline = Instant::now() + Duration::from_secs(3);
-        let quiescence = (|| -> Result<_> {
-            loop {
-                let inventory = process_inventory()?;
-                observe_descendants(pgid, &mut known, &inventory);
-                self.record_known(&id, &known, &inventory)?;
-                let live = live_known(&known, &inventory);
-                if live.is_empty() {
-                    break Ok(false);
-                }
-                signal_processes(&live, libc::SIGKILL)?;
-                if Instant::now() >= quiescence_deadline {
-                    break Ok(true);
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        })();
-        let descendants_remain = match quiescence {
-            Ok(value) => value,
-            Err(error) => {
-                return self
-                    .fail_spawned(&id, attempt, &mut child, root, pgid, Some(&start), error)
-                    .map(BrowserCheckRun::Started)
-            }
-        };
-        let stdout = match out_thread.join() {
-            Ok(Ok(value)) => value,
-            Ok(Err(error)) => {
-                return self
-                    .finish_capture_failed(&id, error)
-                    .map(BrowserCheckRun::Started)
-            }
-            Err(_) => {
-                return self
-                    .finish_capture_failed(&id, anyhow!("stdout drain panicked"))
-                    .map(BrowserCheckRun::Started)
-            }
-        };
-        let stderr = match err_thread.join() {
-            Ok(Ok(value)) => value,
-            Ok(Err(error)) => {
-                return self
-                    .finish_capture_failed(&id, error)
-                    .map(BrowserCheckRun::Started)
-            }
-            Err(_) => {
-                return self
-                    .finish_capture_failed(&id, anyhow!("stderr drain panicked"))
-                    .map(BrowserCheckRun::Started)
-            }
-        };
-        if let Err(error) =
-            crate::config::atomic_write(&check_root.join("stdout.log"), stdout.text.as_bytes())
-        {
-            return self
-                .finish_capture_failed(&id, error)
-                .map(BrowserCheckRun::Started);
-        }
-        if let Err(error) =
-            crate::config::atomic_write(&check_root.join("stderr.log"), stderr.text.as_bytes())
-        {
-            return self
-                .finish_capture_failed(&id, error)
-                .map(BrowserCheckRun::Started);
-        }
-        let candidate_validation = self.verify_candidate(&snapshot, &workspace, &candidate);
-        let candidate_unchanged = candidate_validation.is_ok();
-        let candidate_validation_error =
-            candidate_validation.err().map(|error| format!("{error:#}"));
-        let evidence = serde_json::json!({"suite":suite,"timed_out":timed_out,"process_group_id":pgid,"tracked_processes":known.len(),"descendants_remained_after_kill":descendants_remain,"candidate_unchanged":candidate_unchanged,"candidate_validation_error":candidate_validation_error,"stdout":stdout.text,"stderr":stderr.text,"output_truncated":stdout.truncated||stderr.truncated});
-        let persisted = if timed_out || descendants_remain || !candidate_unchanged {
-            None
-        } else {
-            status.code()
-        };
-        let connection = self.store.lock()?;
-        connection.execute("UPDATE check_runs SET status='finished',launch_state='finished',exit_code=?1,evidence_json=?2,finished_at=?3,elapsed_millis=?4,freshness_state=CASE WHEN ?1=0 THEN 'current' ELSE 'failed' END WHERE id=?5 AND status='running'",params![persisted,evidence.to_string(),Utc::now().to_rfc3339(),execution_started.elapsed().as_millis() as i64,id])?;
-        Ok(BrowserCheckRun::Started(serde_json::json!({
-            "check_id":id,"attempt_id":attempt,"candidate_hash":candidate,
-            "exit_code":status.code(),"timed_out":timed_out,
-            "passed":status.success()&&!timed_out&&!descendants_remain&&candidate_unchanged,
-            "evidence":evidence,
-        })))
+        self.complete_running_check(
+            id,
+            attempt.to_owned(),
+            suite.to_owned(),
+            spec.clone(),
+            workspace,
+            candidate,
+            snapshot,
+            check_root,
+            root,
+            start,
+            pgid,
+            child,
+            stdout,
+            stderr,
+            || self.process_inventory(),
+        )
+        .map(BrowserCheckRun::Started)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -943,129 +816,204 @@ impl CheckService {
         mut child: Child,
         stdout: ChildStdout,
         stderr: ChildStderr,
+        mut inventory: impl FnMut() -> Result<Vec<ProcessInfo>>,
     ) -> Result<serde_json::Value> {
         let execution_started = Instant::now();
-        let out_thread = std::thread::spawn(move || drain_bounded(stdout, 512 * 1024));
-        let err_thread = std::thread::spawn(move || drain_bounded(stderr, 512 * 1024));
+        let mut stdout = PipeCapture::new(stdout, 512 * 1024);
+        let mut stderr = PipeCapture::new(stderr, 512 * 1024);
         let mut known = HashMap::from([(root, start.clone())]);
-        let deadline = Instant::now() + Duration::from_secs(spec.timeout_seconds);
+        let deadline = execution_started + Duration::from_secs(spec.timeout_seconds);
         let execution = (|| -> Result<_> {
             loop {
-                let inventory = process_inventory()?;
-                observe_descendants(pgid, &mut known, &inventory);
-                self.record_known(&id, &known, &inventory)?;
+                stdout.read_available()?;
+                stderr.read_available()?;
+                let observed = inventory()?;
+                observe_descendants(pgid, &mut known, &observed);
+                self.record_known(&id, &known, &observed)?;
                 if let Some(status) = child.try_wait()? {
-                    break Ok((status, false));
+                    break Ok((Some(status), false));
                 }
                 if Instant::now() >= deadline {
-                    signal_known(&known, libc::SIGKILL)?;
-                    break Ok((child.wait()?, true));
+                    break Ok((None, true));
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(25));
             }
         })();
-        let (status, timed_out) = match execution {
+        let (mut status, timed_out) = match execution {
             Ok(value) => value,
             Err(error) => {
-                return self.fail_spawned(
+                return self.fail_spawned_retaining(
                     &id,
                     &attempt,
-                    &mut child,
+                    child,
                     root,
                     pgid,
                     Some(&start),
                     error,
+                    PendingCapture {
+                        check_id: id.clone(),
+                        stdout: Some(stdout),
+                        stderr: Some(stderr),
+                        completion_error: None,
+                    },
                 )
             }
         };
-        let quiescence_deadline = Instant::now() + Duration::from_secs(3);
-        let quiescence = (|| -> Result<_> {
+        let cleanup = (|| -> Result<_> {
+            let cleanup_deadline = Instant::now() + Duration::from_secs(3);
             loop {
-                let inventory = process_inventory()?;
-                observe_descendants(pgid, &mut known, &inventory);
-                self.record_known(&id, &known, &inventory)?;
-                let live = live_known(&known, &inventory);
-                if live.is_empty() {
-                    break Ok(false);
+                stdout.read_available()?;
+                stderr.read_available()?;
+                if status.is_none() {
+                    status = child.try_wait()?;
                 }
-                signal_processes(&live, libc::SIGKILL)?;
-                if Instant::now() >= quiescence_deadline {
-                    break Ok(true);
+                let observed = inventory()?;
+                observe_descendants(pgid, &mut known, &observed);
+                self.record_known(&id, &known, &observed)?;
+                let live = live_known(&known, &observed);
+                let unsettled = status.is_none() || !live.is_empty();
+                if !unsettled && stdout.eof && stderr.eof {
+                    break Ok((false, false));
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                self.signal_processes(&live, libc::SIGKILL, cleanup_deadline)?;
+                if Instant::now() >= cleanup_deadline {
+                    break Ok((unsettled, !stdout.eof || !stderr.eof));
+                }
+                std::thread::sleep(Duration::from_millis(25));
             }
         })();
-        let descendants_remain = match quiescence {
+        let (descendants_remain, capture_incomplete) = match cleanup {
             Ok(value) => value,
             Err(error) => {
-                return self.fail_spawned(
+                return self.fail_spawned_retaining(
                     &id,
                     &attempt,
-                    &mut child,
+                    child,
                     root,
                     pgid,
                     Some(&start),
                     error,
+                    PendingCapture {
+                        check_id: id.clone(),
+                        stdout: Some(stdout),
+                        stderr: Some(stderr),
+                        completion_error: None,
+                    },
                 )
             }
         };
-        let stdout = match out_thread.join() {
-            Ok(Ok(value)) => value,
-            Ok(Err(error)) => return self.finish_capture_failed(&id, error),
-            Err(_) => return self.finish_capture_failed(&id, anyhow!("stdout drain panicked")),
-        };
-        let stderr = match err_thread.join() {
-            Ok(Ok(value)) => value,
-            Ok(Err(error)) => return self.finish_capture_failed(&id, error),
-            Err(_) => return self.finish_capture_failed(&id, anyhow!("stderr drain panicked")),
-        };
-        if let Err(error) =
-            crate::config::atomic_write(&check_root.join("stdout.log"), stdout.text.as_bytes())
-        {
-            return self.finish_capture_failed(&id, error);
+        if status.is_none() {
+            self.retain_child(child);
         }
-        if let Err(error) =
-            crate::config::atomic_write(&check_root.join("stderr.log"), stderr.text.as_bytes())
-        {
-            return self.finish_capture_failed(&id, error);
-        }
-        let candidate_validation = self.verify_candidate(&snapshot, &workspace, &candidate);
-        let candidate_unchanged = candidate_validation.is_ok();
-        let candidate_validation_error =
-            candidate_validation.err().map(|error| format!("{error:#}"));
-        let evidence = serde_json::json!({
-            "suite":suite,"timed_out":timed_out,"process_group_id":pgid,
-            "tracked_processes":known.len(),"descendants_remained_after_kill":descendants_remain,
-            "candidate_unchanged":candidate_unchanged,
-            "candidate_validation_error":candidate_validation_error,
-            "stdout":stdout.text,"stderr":stderr.text,
-            "output_truncated":stdout.truncated||stderr.truncated,
-        });
-        let persisted = if timed_out || descendants_remain || !candidate_unchanged {
-            None
-        } else {
-            status.code()
+        let stdout_output = stdout.captured();
+        let stderr_output = stderr.captured();
+        let mut capture = PendingCapture {
+            check_id: id.clone(),
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            completion_error: None,
         };
-        let connection = self.store.lock()?;
-        connection.execute(
-            "UPDATE check_runs SET status='finished',launch_state='finished',exit_code=?1,evidence_json=?2,
-                    finished_at=?3,elapsed_millis=?4,
-                    freshness_state=CASE WHEN ?1=0 THEN 'current' ELSE 'failed' END
-             WHERE id=?5 AND status='running'",
-            params![
+        let completion = (|| -> Result<serde_json::Value> {
+            if !capture_incomplete {
+                self.persist_capture_settlement(&id)?;
+            }
+            let recovery_required = descendants_remain || capture_incomplete;
+            let capture_write = crate::config::atomic_write(
+                &check_root.join("stdout.log"),
+                stdout_output.text.as_bytes(),
+            )
+            .and_then(|_| {
+                crate::config::atomic_write(
+                    &check_root.join("stderr.log"),
+                    stderr_output.text.as_bytes(),
+                )
+            });
+            let capture_write_error = capture_write.err().map(|error| format!("{error:#}"));
+            if !recovery_required {
+                if let Some(error) = &capture_write_error {
+                    return self.finish_capture_failed(&id, anyhow!(error.clone()));
+                }
+            }
+            let candidate_validation = if recovery_required {
+                Err(anyhow!("check cleanup has not established quiescence"))
+            } else {
+                self.verify_candidate(&snapshot, &workspace, &candidate)
+            };
+            let candidate_unchanged = candidate_validation.is_ok();
+            let evidence = serde_json::json!({
+                "suite":suite,"timed_out":timed_out,"process_group_id":pgid,
+                "tracked_processes":known.len(),"descendants_remained_after_kill":descendants_remain,
+                "capture_incomplete":capture_incomplete,"capture_write_error":capture_write_error,
+                "candidate_unchanged":candidate_unchanged,
+                "candidate_validation_error":candidate_validation.err().map(|error| format!("{error:#}")),
+                "stdout":stdout_output.text,"stderr":stderr_output.text,
+                "output_truncated":stdout_output.truncated||stderr_output.truncated,
+            });
+            let exit_code = status.and_then(|status| status.code());
+            let persisted = if timed_out || recovery_required || !candidate_unchanged {
+                None
+            } else {
+                exit_code
+            };
+            self.persist_completion(
+                &id,
+                &attempt,
                 persisted,
-                evidence.to_string(),
-                Utc::now().to_rfc3339(),
-                execution_started.elapsed().as_millis() as i64,
-                id
-            ],
+                recovery_required,
+                &evidence,
+                execution_started.elapsed(),
+            )?;
+            Ok(serde_json::json!({
+                "check_id":id,"attempt_id":attempt,"candidate_hash":candidate,
+                "exit_code":exit_code,"timed_out":timed_out,
+                "passed":persisted==Some(0),"recovery_required":recovery_required,
+                "evidence":evidence,
+            }))
+        })();
+        if capture_incomplete || completion.is_err() {
+            capture.completion_error = completion.as_ref().err().map(|error| format!("{error:#}"));
+            self.retain_capture(capture);
+        }
+        completion
+    }
+
+    fn persist_completion(
+        &self,
+        id: &str,
+        attempt: &str,
+        exit_code: Option<i32>,
+        recovery_required: bool,
+        evidence: &serde_json::Value,
+        elapsed: Duration,
+    ) -> Result<()> {
+        let mut connection = self.store.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = Utc::now().to_rfc3339();
+        let changed = tx.execute(
+            "UPDATE check_runs SET status=CASE WHEN ?1 THEN 'recovery_required' ELSE 'finished' END,
+                launch_state=CASE WHEN ?1 THEN 'cleanup_unknown' ELSE 'finished' END,
+                exit_code=?2,evidence_json=json_patch(evidence_json,?3),finished_at=CASE WHEN ?1 THEN NULL ELSE ?4 END,
+                elapsed_millis=?5,freshness_state=CASE WHEN ?2=0 THEN 'current' ELSE 'failed' END
+             WHERE id=?6 AND status='running'",
+            params![recovery_required, if recovery_required { None } else { exit_code }, evidence.to_string(), now, elapsed.as_millis() as i64, id],
         )?;
-        Ok(serde_json::json!({
-            "check_id":id,"attempt_id":attempt,"candidate_hash":candidate,
-            "exit_code":status.code(),"timed_out":timed_out,
-            "passed":status.success()&&!timed_out&&!descendants_remain&&candidate_unchanged,
-            "evidence":evidence,
-        }))
+        if changed != 1 {
+            bail!("check completion lost its running reservation")
+        }
+        if recovery_required {
+            record_check_recovery(
+                &tx,
+                attempt,
+                &now,
+                serde_json::json!({
+                    "kind":"configured_check_cleanup_unknown", "check_id":id,
+                    "reason":"Check cleanup could not confirm that its processes and output writers stopped",
+                    "evidence":evidence,
+                }),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn reserve(
@@ -1338,6 +1286,35 @@ impl CheckService {
         }
         Ok(())
     }
+    fn spawn_reserved_check(
+        &self,
+        id: &str,
+        suite: &str,
+        command: &mut Command,
+    ) -> Result<(Child, i32, String)> {
+        let boot_identity = crate::supervisor::system_boot_identity()?;
+        let changed = self.store.lock()?.execute(
+            "UPDATE check_runs SET launch_state='spawning',launch_boot_identity=?1,
+                evidence_json=json_set(evidence_json,'$.capture_incomplete',json('true'))
+             WHERE id=?2 AND status='launch_reserved' AND launch_state='reserved'",
+            params![boot_identity, id],
+        )?;
+        if changed != 1 {
+            bail!("check lost its pre-spawn reservation")
+        }
+        // A crash or write failure after spawn must leave output ownership
+        // unresolved until positive EOF evidence has been saved.
+        match spawn_check_process(command)
+            .with_context(|| format!("launch configured check {suite}"))
+        {
+            Ok((child, pgid)) => Ok((child, pgid, boot_identity)),
+            Err(error) => {
+                self.finish_failed(id, "launch_failed", &format!("{error:#}"))?;
+                Err(error)
+            }
+        }
+    }
+
     fn finish_failed(&self, id: &str, status: &str, error: &str) -> Result<()> {
         let connection = self.store.lock()?;
         connection.execute(
@@ -1356,22 +1333,284 @@ impl CheckService {
         &self,
         id: &str,
         attempt: &str,
-        child: &mut Child,
+        mut child: Child,
         root_pid: u32,
         pgid: i32,
         start: Option<&str>,
         error: anyhow::Error,
     ) -> Result<serde_json::Value> {
-        self.fail_spawned_with_inventory(
+        let capture = PendingCapture {
+            check_id: id.to_owned(),
+            stdout: child
+                .stdout
+                .take()
+                .map(|reader| PipeCapture::new(reader, 0)),
+            stderr: child
+                .stderr
+                .take()
+                .map(|reader| PipeCapture::new(reader, 0)),
+            completion_error: None,
+        };
+        self.fail_spawned_retaining(id, attempt, child, root_pid, pgid, start, error, capture)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fail_spawned_retaining(
+        &self,
+        id: &str,
+        attempt: &str,
+        mut child: Child,
+        root_pid: u32,
+        pgid: i32,
+        start: Option<&str>,
+        error: anyhow::Error,
+        mut capture: PendingCapture,
+    ) -> Result<serde_json::Value> {
+        let result = self.fail_spawned_with_inventory(
             id,
             attempt,
-            child,
+            &mut child,
             root_pid,
             pgid,
             start,
             error,
-            process_inventory,
-        )
+            || self.process_inventory(),
+        );
+        if !child.try_wait().is_ok_and(|status| status.is_some()) {
+            self.retain_child(child);
+        }
+        capture.completion_error = result.as_ref().err().map(|error| format!("{error:#}"));
+        self.retain_capture(capture);
+        result
+    }
+
+    fn retain_capture(&self, mut capture: PendingCapture) {
+        if let Some(stdout) = &mut capture.stdout {
+            stdout.discard_output();
+        }
+        if let Some(stderr) = &mut capture.stderr {
+            stderr.discard_output();
+        }
+        self.pending_captures
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push_back(capture);
+    }
+
+    fn retain_child(&self, child: Child) {
+        // Durable check ownership is retained separately; this handle lets the
+        // service reap a child that exits after the bounded cleanup interval.
+        self.pending_children
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(child);
+    }
+
+    pub(crate) fn reap_pending_children(&self) -> Result<()> {
+        let reaped = {
+            let mut children = self
+                .pending_children
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            reap_children_with(&mut children, Child::try_wait)
+        };
+        let settled = self.settle_pending_captures();
+        reaped.and(settled)
+    }
+
+    fn settle_pending_captures(&self) -> Result<()> {
+        let mut captures = self
+            .pending_captures
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut first_error = None;
+        // Round-robin ownership with bounded nonblocking reads; no drain thread
+        // can wait indefinitely for an escaped or idle output writer.
+        for _ in 0..captures.len().min(8) {
+            let Some(mut capture) = captures.pop_front() else {
+                break;
+            };
+            let observed = (|| -> Result<bool> {
+                if let Some(stdout) = &mut capture.stdout {
+                    stdout.read_available()?;
+                }
+                if let Some(stderr) = &mut capture.stderr {
+                    stderr.read_available()?;
+                }
+                Ok(capture.stdout.as_ref().is_some_and(|stdout| stdout.eof)
+                    && capture.stderr.as_ref().is_some_and(|stderr| stderr.eof))
+            })();
+            // A retained reader also owns an abandoned completion. Repair that
+            // reservation even when reading fails, but publish EOF only after
+            // both readers positively observed it.
+            let settled = self
+                .persist_retained_capture(&capture, observed.as_ref().is_ok_and(|eof| *eof))
+                .and_then(|settled| observed.map(|_| settled));
+            match settled {
+                Ok(true) => {}
+                Ok(false) => captures.push_back(capture),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    captures.push_back(capture);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn persist_capture_settlement(&self, check_id: &str) -> Result<()> {
+        let mut connection = self.store.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        record_capture_settlement(&tx, check_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn persist_retained_capture(&self, capture: &PendingCapture, eof: bool) -> Result<bool> {
+        let mut connection = self.store.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (status, attempt): (String, String) = tx.query_row(
+            "SELECT status,attempt_id FROM check_runs WHERE id=?1",
+            params![capture.check_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        match status.as_str() {
+            "launch_reserved" | "running" | "launch_ambiguous" => {
+                let now = Utc::now().to_rfc3339();
+                let evidence = serde_json::json!({
+                    "capture_incomplete":true,
+                    "completion_error":capture.completion_error,
+                });
+                tx.execute(
+                    "UPDATE check_runs SET status='recovery_required',launch_state='cleanup_unknown',
+                        exit_code=NULL,finished_at=NULL,freshness_state='failed',
+                        evidence_json=json_patch(evidence_json,?1) WHERE id=?2",
+                    params![evidence.to_string(),capture.check_id],
+                )?;
+                record_check_recovery(
+                    &tx,
+                    &attempt,
+                    &now,
+                    serde_json::json!({
+                        "kind":"configured_check_completion_unknown", "check_id":capture.check_id,
+                        "reason":"The check stopped being monitored before its result could be saved. Resolve recovery before continuing.",
+                        "evidence":evidence,
+                    }),
+                )?;
+            }
+            "recovery_required" => {}
+            // Retry can supersede a capture-write failure before these readers
+            // are reaped. Terminal status never substitutes for observed EOF.
+            "finished" | "retry_superseded" | "reconciled_interrupted" | "reconciled_cancelled" => {
+                return Ok(eof)
+            }
+            _ => bail!("retained check output has unexpected check state {status}"),
+        }
+        if eof {
+            // Publish a missing recovery hold and its EOF proof together so a
+            // concurrent human resolution cannot race an abandoned completion.
+            record_capture_settlement(&tx, &capture.check_id)?;
+        }
+        tx.commit()?;
+        Ok(eof)
+    }
+
+    fn process_inventory(&self) -> Result<Vec<ProcessInfo>> {
+        let mut command = Command::new("/bin/ps");
+        command.args(["-axo", "pid=,ppid=,pgid=,lstart="]);
+        let bytes =
+            self.inspect_process_output(&mut command, Instant::now() + PROCESS_INSPECTION_TIMEOUT)?;
+        parse_process_inventory(bytes)
+    }
+
+    fn start_marker(&self, pid: u32, deadline: Instant) -> Result<String> {
+        let mut command = Command::new("/bin/ps");
+        command.args(["-o", "lstart=", "-p", &pid.to_string()]);
+        let bytes = self.inspect_process_output(&mut command, deadline)?;
+        let marker = String::from_utf8(bytes)?.trim().to_owned();
+        if marker.is_empty() {
+            bail!("cannot observe check PID start identity");
+        }
+        Ok(marker)
+    }
+
+    fn signal_processes(
+        &self,
+        processes: &[ProcessInfo],
+        signal: i32,
+        deadline: Instant,
+    ) -> Result<()> {
+        for process in processes {
+            if Instant::now() >= deadline {
+                bail!("check process signalling inspection deadline elapsed");
+            }
+            if self
+                .start_marker(process.pid, deadline)
+                .is_ok_and(|start| same_process_start(&start, &process.start))
+            {
+                let result = unsafe { libc::kill(process.pid as libc::pid_t, signal) };
+                if result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn inspect_process_output(&self, command: &mut Command, deadline: Instant) -> Result<Vec<u8>> {
+        if Instant::now() >= deadline {
+            bail!("check process inspection deadline elapsed");
+        }
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("launch check process inspection")?;
+        let result = (|| -> Result<Vec<u8>> {
+            let stdout = child
+                .stdout
+                .take()
+                .context("process inspection stdout missing")?;
+            let mut capture = PipeCapture::new(stdout, PROCESS_INSPECTION_LIMIT);
+            let mut status = None;
+            loop {
+                capture.read_available()?;
+                if capture.total > PROCESS_INSPECTION_LIMIT {
+                    bail!("check process inspection output exceeded its limit");
+                }
+                if status.is_none() {
+                    status = child.try_wait()?;
+                }
+                if let Some(status) = status {
+                    if !status.success() {
+                        bail!("check process inspection failed");
+                    }
+                    if capture.eof {
+                        return Ok(capture.tail.into_iter().collect());
+                    }
+                }
+                if Instant::now() >= deadline {
+                    bail!("check process inspection deadline elapsed");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })();
+        if result.is_err() {
+            let _ = child.kill();
+            if !reap_until(&mut child, Instant::now() + INSPECTION_REAP_GRACE).unwrap_or(false) {
+                self.retain_child(child);
+            }
+        }
+        result
     }
 
     fn fail_spawned_with_inventory<F>(
@@ -1388,7 +1627,25 @@ impl CheckService {
     where
         F: Fn() -> Result<Vec<ProcessInfo>>,
     {
-        let mut known = HashMap::new();
+        let recorded = (|| -> Result<(HashMap<u32, String>, bool)> {
+            let connection = self.store.lock()?;
+            let capture_incomplete = connection.query_row(
+                "SELECT COALESCE(json_extract(evidence_json,'$.capture_incomplete'),0)=1
+                 FROM check_runs WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )?;
+            let mut statement = connection
+                .prepare("SELECT pid,native_start_marker FROM check_processes WHERE check_id=?1")?;
+            let rows = statement
+                .query_map(params![id], |row| {
+                    Ok((row.get::<_, i64>(0)? as u32, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+            Ok((rows, capture_incomplete))
+        })();
+        let recorded_unknown = recorded.is_err();
+        let (mut known, capture_incomplete) = recorded.unwrap_or_default();
         if let Some(start) = start {
             known.insert(root_pid, start.to_owned());
             let _ = self.record_process(id, root_pid, start, pgid, std::process::id());
@@ -1397,11 +1654,15 @@ impl CheckService {
         if let Ok(inventory) = &before {
             observe_descendants(pgid, &mut known, inventory);
             let _ = self.record_known(id, &known, inventory);
-            let _ = signal_processes(&live_known(&known, inventory), libc::SIGKILL);
+            let _ = self.signal_processes(
+                &live_known(&known, inventory),
+                libc::SIGKILL,
+                Instant::now() + PROCESS_INSPECTION_TIMEOUT,
+            );
         }
         let _ = unsafe { libc::killpg(pgid, libc::SIGKILL) };
         let _ = child.kill();
-        let _ = child.wait();
+        let reaped = reap_until(child, Instant::now() + Duration::from_secs(3)).unwrap_or(false);
         let detail = format!("{error:#}");
         let after = inventory();
         let (inventory_state, members) = match after {
@@ -1415,8 +1676,12 @@ impl CheckService {
             }
             Err(_) => ("unknown", Vec::new()),
         };
-        let recovery_required =
-            before.is_err() || inventory_state == "unknown" || !members.is_empty();
+        let recovery_required = recorded_unknown
+            || capture_incomplete
+            || before.is_err()
+            || inventory_state == "unknown"
+            || !members.is_empty()
+            || !reaped;
         let mut connection = self.store.lock()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Utc::now().to_rfc3339();
@@ -1446,7 +1711,7 @@ impl CheckService {
             )?;
         }
         tx.execute(
-            "UPDATE check_runs SET status=?1,launch_state='delivery_unknown',launch_error=?2,evidence_json=?3,
+            "UPDATE check_runs SET status=?1,launch_state='delivery_unknown',launch_error=?2,evidence_json=json_patch(evidence_json,?3),
              recovery_root_pid=?4,recovery_process_group_id=?5,recovery_anchor_json=COALESCE(?6,recovery_anchor_json),finished_at=CASE WHEN ?7 THEN NULL ELSE ?8 END WHERE id=?9",
             params![
                 if recovery_required { "recovery_required" } else { "launch_ambiguous" },
@@ -1461,16 +1726,12 @@ impl CheckService {
             ],
         )?;
         if recovery_required {
-            tx.execute(
-                "UPDATE attempts SET status='needs_recovery',updated_at=?1 WHERE id=?2",
-                params![now, attempt],
+            record_check_recovery(
+                &tx,
+                attempt,
+                &now,
+                serde_json::json!({"kind":"configured_check_delivery_unknown","check_id":id,"root_pid":root_pid,"process_group_id":pgid,"pre_cleanup_inventory":if before.is_ok(){"observed"}else{"unknown"},"post_cleanup_inventory":inventory_state,"known_members":members.len(),"root_reaped":reaped,"evidence":{"capture_incomplete":capture_incomplete}}),
             )?;
-            tx.execute("UPDATE tasks SET attention='needs_recovery',version=version+1,updated_at=?1 WHERE id=(SELECT task_id FROM attempts WHERE id=?2)",params![now,attempt])?;
-            tx.execute(
-                "UPDATE claims SET state='unknown',updated_at=?1 WHERE attempt_id=?2",
-                params![now, attempt],
-            )?;
-            tx.execute("INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at) VALUES(?1,NULL,?2,'attention_required',?3,?4,?4)",params![uuid::Uuid::new_v4().to_string(),attempt,serde_json::json!({"kind":"configured_check_delivery_unknown","check_id":id,"root_pid":root_pid,"process_group_id":pgid,"pre_cleanup_inventory":if before.is_ok(){"observed"}else{"unknown"},"post_cleanup_inventory":inventory_state,"known_members":members.len()}).to_string(),now])?;
         }
         tx.commit()?;
         Err(error)
@@ -1480,7 +1741,7 @@ impl CheckService {
         let connection = self.store.lock()?;
         connection.execute(
             "UPDATE check_runs SET status='finished',launch_state='capture_failed',launch_error=?1,
-             evidence_json=?2,exit_code=NULL,finished_at=?3 WHERE id=?4 AND status='running'",
+             evidence_json=json_patch(evidence_json,?2),exit_code=NULL,finished_at=?3 WHERE id=?4 AND status='running'",
             params![
                 &detail,
                 serde_json::json!({"capture_failure":detail,"provider_output_in_database":false})
@@ -1508,6 +1769,7 @@ impl CheckService {
         Ok(())
     }
     pub fn active_status(&self) -> Result<Vec<serde_json::Value>> {
+        self.reap_pending_children()?;
         let running = {
             let connection = self.store.lock()?;
             let mut statement = connection.prepare(
@@ -1521,7 +1783,7 @@ impl CheckService {
         if running.is_empty() {
             return Ok(Vec::new());
         }
-        let inventory = match process_inventory() {
+        let inventory = match self.process_inventory() {
             Ok(inventory) => inventory,
             // Recorded runs stay listed so no caller can read this as quiescence.
             Err(error) => {
@@ -1550,7 +1812,7 @@ impl CheckService {
         Ok(result)
     }
     pub fn interrupt_all(&self) -> Result<Vec<String>> {
-        let inventory = process_inventory()?;
+        let inventory = self.process_inventory()?;
         let connection = self.store.lock()?;
         let mut statement=connection.prepare("SELECT DISTINCT cp.check_id,cp.pid,cp.native_start_marker,cp.process_group_id,cp.parent_pid FROM check_processes cp JOIN check_runs cr ON cr.id=cp.check_id WHERE cr.status IN ('launch_reserved','running','recovery_required')")?;
         let rows = statement
@@ -1569,12 +1831,13 @@ impl CheckService {
         drop(statement);
         drop(connection);
         let mut ids = Vec::new();
+        let signal_deadline = Instant::now() + PROCESS_INSPECTION_TIMEOUT;
         for (id, process) in rows {
             if inventory
                 .iter()
                 .any(|p| p.pid == process.pid && same_process_start(&p.start, &process.start))
             {
-                signal_processes(&[process], libc::SIGINT)?;
+                self.signal_processes(&[process], libc::SIGINT, signal_deadline)?;
                 if !ids.contains(&id) {
                     ids.push(id)
                 }
@@ -1690,47 +1953,188 @@ fn selected_check_authority(
     )
 }
 
-fn drain_bounded(mut reader: impl Read, limit: usize) -> Result<Captured> {
-    let mut tail = VecDeque::with_capacity(limit);
-    let mut buffer = [0u8; 16384];
-    let mut total = 0usize;
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        total = total.saturating_add(count);
-        for byte in &buffer[..count] {
-            if tail.len() == limit {
-                tail.pop_front();
+fn spawn_check_process(command: &mut Command) -> std::io::Result<(Child, i32)> {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
             }
-            tail.push_back(*byte);
+        });
+    }
+    let child = command.spawn()?;
+    // Successful spawn proves the original group was created before exec. A
+    // short check can exit before identity inspection finishes, so a later
+    // getpgid lookup cannot be required to rediscover this group.
+    let pgid = child.id() as i32;
+    Ok((child, pgid))
+}
+
+fn record_check_recovery(
+    tx: &rusqlite::Transaction<'_>,
+    attempt: &str,
+    now: &str,
+    detail: serde_json::Value,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE attempts SET status='needs_recovery',updated_at=?1 WHERE id=?2",
+        params![now, attempt],
+    )?;
+    tx.execute("UPDATE tasks SET attention='needs_recovery',version=version+1,updated_at=?1 WHERE id=(SELECT task_id FROM attempts WHERE id=?2)",params![now,attempt])?;
+    tx.execute(
+        "UPDATE claims SET state='unknown',updated_at=?1 WHERE attempt_id=?2",
+        params![now, attempt],
+    )?;
+    tx.execute("INSERT INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at) VALUES(?1,NULL,?2,'attention_required',?3,?4,?4)",params![uuid::Uuid::new_v4().to_string(),attempt,detail.to_string(),now])?;
+    Ok(())
+}
+
+fn record_capture_settlement(tx: &rusqlite::Transaction<'_>, check_id: &str) -> Result<()> {
+    let launch_boot: Option<String> = tx.query_row(
+        "SELECT launch_boot_identity FROM check_runs WHERE id=?1",
+        params![check_id],
+        |row| row.get(0),
+    )?;
+    let settlement = serde_json::json!({
+        "source":"retained_output_eof", "check_id":check_id,
+        "launch_boot_identity":launch_boot,
+        "stdout_eof":true, "stderr_eof":true, "observed_at":Utc::now().to_rfc3339(),
+    });
+    let changed = tx.execute(
+        "UPDATE check_runs SET evidence_json=json_set(evidence_json,'$.capture_settlement',json(?1))
+         WHERE id=?2 AND json_extract(evidence_json,'$.capture_incomplete')=1",
+        params![settlement.to_string(),check_id],
+    )?;
+    if changed != 1 {
+        bail!("retained check output lost its durable capture marker")
+    }
+    tx.execute(
+        "UPDATE recovery_records SET detail_json=json_set(detail_json,'$.evidence.capture_settlement',json(?1)),updated_at=?2
+         WHERE state='attention_required' AND json_extract(detail_json,'$.check_id')=?3",
+        params![settlement.to_string(),Utc::now().to_rfc3339(),check_id],
+    )?;
+    Ok(())
+}
+
+fn reap_children_with(
+    children: &mut Vec<Child>,
+    mut observe: impl FnMut(&mut Child) -> std::io::Result<Option<std::process::ExitStatus>>,
+) -> Result<()> {
+    let mut index = 0;
+    let mut first_error = None;
+    while index < children.len() {
+        match observe(&mut children[index]) {
+            Ok(Some(_)) => {
+                children.swap_remove(index);
+            }
+            Ok(None) => index += 1,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(anyhow!(error).context(format!(
+                        "could not reap retained check child {}",
+                        children[index].id()
+                    )));
+                }
+                index += 1;
+            }
         }
     }
-    Ok(Captured {
-        text: String::from_utf8_lossy(&tail.into_iter().collect::<Vec<_>>()).into_owned(),
-        truncated: total > limit,
-    })
-}
-fn start_marker(pid: u32) -> Result<String> {
-    let output = Command::new("/bin/ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .output()?;
-    let value = String::from_utf8(output.stdout)?.trim().to_owned();
-    if !output.status.success() || value.is_empty() {
-        bail!("cannot observe check PID start identity")
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
-    Ok(value)
 }
-fn process_inventory() -> Result<Vec<ProcessInfo>> {
-    let output = Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid=,pgid=,lstart="])
-        .output()?;
-    if !output.status.success() {
-        bail!("cannot inspect check process inventory")
+
+fn reap_until(child: &mut Child, deadline: Instant) -> Result<bool> {
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+struct PipeCapture<R> {
+    reader: R,
+    tail: VecDeque<u8>,
+    limit: usize,
+    total: usize,
+    eof: bool,
+    nonblocking: bool,
+}
+
+impl<R: Read + AsRawFd> PipeCapture<R> {
+    fn new(reader: R, limit: usize) -> Self {
+        Self {
+            reader,
+            tail: VecDeque::with_capacity(limit),
+            limit,
+            total: 0,
+            eof: false,
+            nonblocking: false,
+        }
+    }
+
+    fn read_available(&mut self) -> Result<()> {
+        if !self.nonblocking {
+            let fd = self.reader.as_raw_fd();
+            // Retain the owned reader if configuring it fails, and never read
+            // it in blocking mode. A later settlement pass can retry.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            self.nonblocking = true;
+        }
+        let mut buffer = [0_u8; 16384];
+        // A continuously writing child cannot monopolize timeout/ownership checks.
+        for _ in 0..64 {
+            match self.reader.read(&mut buffer) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(count) => {
+                    self.total = self.total.saturating_add(count);
+                    if self.limit != 0 {
+                        for byte in &buffer[..count] {
+                            if self.tail.len() == self.limit {
+                                self.tail.pop_front();
+                            }
+                            self.tail.push_back(*byte);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn captured(&self) -> Captured {
+        Captured {
+            text: String::from_utf8_lossy(&self.tail.iter().copied().collect::<Vec<_>>())
+                .into_owned(),
+            truncated: self.total > self.limit,
+        }
+    }
+
+    fn discard_output(&mut self) {
+        self.tail = VecDeque::new();
+        self.limit = 0;
+    }
+}
+
+fn parse_process_inventory(bytes: Vec<u8>) -> Result<Vec<ProcessInfo>> {
     let mut values = Vec::new();
-    for line in String::from_utf8(output.stdout)?
+    for line in String::from_utf8(bytes)?
         .lines()
         .filter(|line| !line.trim().is_empty())
     {
@@ -1785,23 +2189,6 @@ fn live_known(known: &HashMap<u32, String>, inventory: &[ProcessInfo]) -> Vec<Pr
         .filter(|process| is_known(known, process))
         .cloned()
         .collect()
-}
-fn signal_known(known: &HashMap<u32, String>, signal: i32) -> Result<()> {
-    signal_processes(&live_known(known, &process_inventory()?), signal)
-}
-fn signal_processes(processes: &[ProcessInfo], signal: i32) -> Result<()> {
-    for process in processes {
-        if start_marker(process.pid).is_ok_and(|start| same_process_start(&start, &process.start)) {
-            let result = unsafe { libc::kill(process.pid as libc::pid_t, signal) };
-            if result != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error.into());
-                }
-            }
-        }
-    }
-    Ok(())
 }
 fn validate_spec(spec: &CheckSpec) -> Result<()> {
     if !spec.executable.is_absolute() || !spec.executable.is_file() {
@@ -1864,7 +2251,7 @@ mod tests {
             ).unwrap();
             connection.execute(
                 "INSERT INTO check_runs(id,attempt_id,candidate_hash,executable,arguments_json,cwd,status,evidence_json,created_at,suite_name,check_suite_version,launch_state,launch_boot_identity)
-                 VALUES(?1,'a','candidate','/bin/sh','[]',?2,'launch_reserved','{}',?3,'causal',1,'spawning','fixture-boot')",
+                 VALUES(?1,'a','candidate','/bin/sh','[]',?2,'launch_reserved',json_object('capture_incomplete',json('true')),?3,'causal',1,'spawning','fixture-boot')",
                 params![check_id, root_text, now],
             ).unwrap();
         }
@@ -1890,10 +2277,43 @@ mod tests {
         }
         let child = command.spawn().unwrap();
         let root_pid = child.id();
-        let start = start_marker(root_pid).unwrap();
+        let start = crate::supervisor::native_start_marker(root_pid).unwrap();
         let pgid = unsafe { libc::getpgid(root_pid as libc::pid_t) };
         assert!(pgid > 0);
         (child, root_pid, pgid, start)
+    }
+
+    fn record_current_anchor(store: &Store, check_id: &str, pid: u32, pgid: i32, start: &str) {
+        let boot = crate::supervisor::system_boot_identity().unwrap();
+        let anchor = crate::domain::ProcessGenerationAnchor {
+            pid,
+            process_group_id: pgid,
+            native_start_marker: start.to_owned(),
+            boot_identity: boot.clone(),
+        };
+        store.lock().unwrap().execute(
+            "UPDATE check_runs SET launch_boot_identity=?1,recovery_root_pid=?2,recovery_process_group_id=?3,recovery_anchor_json=?4 WHERE id=?5",
+            params![boot,i64::from(pid),pgid,serde_json::to_string(&anchor).unwrap(),check_id],
+        ).unwrap();
+    }
+
+    fn recovery_command(store: &Store, check_id: &str) -> crate::domain::HumanCommand {
+        let (recovery_id, version) = store.lock().unwrap().query_row(
+            "SELECT r.id,t.version FROM recovery_records r JOIN attempts a ON a.id=r.attempt_id
+             JOIN tasks t ON t.id=a.task_id WHERE json_extract(r.detail_json,'$.check_id')=?1 AND r.state='attention_required'",
+            params![check_id],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        crate::domain::HumanCommand::ResolveRecovery {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            task_id: "t".into(),
+            attempt_id: "a".into(),
+            recovery_id,
+            session_id: None,
+            expected_version: version,
+            decision: "confirm_quiescent".into(),
+            evidence: "Checked the stopped check".into(),
+        }
     }
 
     fn durable_recovery_state(
@@ -1923,6 +2343,964 @@ mod tests {
                 },
             )
             .unwrap()
+    }
+
+    #[test]
+    fn capture_marker_write_failure_prevents_spawn_and_restart_proves_nondelivery() {
+        let (root, _cleanup) = temp_root("capture-before-spawn");
+        let (store, service) = seeded_service(&root, "unspawned-check");
+        store.lock().unwrap().execute_batch(
+            "UPDATE check_runs SET launch_state='reserved',launch_boot_identity=NULL,evidence_json='{}';
+             CREATE TRIGGER reject_capture_marker BEFORE UPDATE OF evidence_json ON check_runs
+             WHEN json_extract(NEW.evidence_json,'$.capture_incomplete')=1
+             BEGIN SELECT RAISE(ABORT, 'injected capture marker failure'); END;",
+        ).unwrap();
+        let started = root.join("spawned");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "printf spawned > \"$1\"", "check"])
+            .arg(&started);
+        let error = service
+            .spawn_reserved_check("unspawned-check", "causal", &mut command)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected capture marker failure"));
+        assert!(!started.exists());
+        assert_eq!(
+            durable_recovery_state(&store, "unspawned-check").1,
+            "reserved"
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_capture_marker")
+            .unwrap();
+        drop(service);
+        crate::recovery::reconcile_prior_boot(&store).unwrap();
+        let state = durable_recovery_state(&store, "unspawned-check");
+        assert_eq!(state.0, "launch_failed");
+        assert_eq!(state.1, "proven_nondelivery");
+        assert_eq!(state.4, "running");
+        assert_eq!(state.5, 0);
+    }
+
+    #[test]
+    fn proven_spawn_refusal_clears_provisional_capture_ownership() {
+        let (root, _cleanup) = temp_root("spawn-refused");
+        let (store, service) = seeded_service(&root, "refused-check");
+        store.lock().unwrap().execute_batch(
+            "UPDATE check_runs SET launch_state='reserved',launch_boot_identity=NULL,evidence_json='{}'",
+        ).unwrap();
+        let mut command = Command::new(root.join("missing-executable"));
+        assert!(service
+            .spawn_reserved_check("refused-check", "causal", &mut command)
+            .is_err());
+        let capture: Option<bool> = store.lock().unwrap().query_row(
+            "SELECT json_extract(evidence_json,'$.capture_incomplete') FROM check_runs WHERE id='refused-check'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_ne!(capture, Some(true));
+        drop(service);
+        crate::recovery::reconcile_prior_boot(&store).unwrap();
+        let state = durable_recovery_state(&store, "refused-check");
+        assert_eq!(state.0, "launch_failed");
+        assert_eq!(state.4, "running");
+        assert_eq!(state.5, 0);
+    }
+
+    #[test]
+    fn restart_before_completion_preserves_pre_spawn_capture_ownership() {
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+
+        let (root, _cleanup) = temp_root("restart-before-completion");
+        let (store, service) = seeded_service(&root, "interrupted-check");
+        store.lock().unwrap().execute_batch(
+            "UPDATE check_runs SET launch_state='reserved',launch_boot_identity=NULL,evidence_json='{}'",
+        ).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "read -r release"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (mut child, pgid, _) = service
+            .spawn_reserved_check("interrupted-check", "causal", &mut command)
+            .unwrap();
+        let pid = child.id();
+        let start = service
+            .start_marker(pid, Instant::now() + PROCESS_INSPECTION_TIMEOUT)
+            .unwrap();
+        record_current_anchor(&store, "interrupted-check", pid, pgid, &start);
+        service
+            .record_process("interrupted-check", pid, &start, pgid, std::process::id())
+            .unwrap();
+        store.lock().unwrap().execute("UPDATE check_runs SET status='running',launch_state='started' WHERE id='interrupted-check'", []).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let (reader, writer) = UnixStream::pair().unwrap();
+        // Model the descriptor inherited by an escaped writer before any
+        // completion/cleanup path has recorded an EOF observation.
+        child.stdout = Some(ChildStdout::from(OwnedFd::from(reader)));
+        drop(child);
+        drop(service);
+        crate::recovery::reconcile_prior_boot(&store).unwrap();
+        let error =
+            crate::workflow::execute(&store, &recovery_command(&store, "interrupted-check"))
+                .unwrap_err();
+        assert!(error.to_string().contains("Check output may still be open"));
+        assert_eq!(
+            durable_recovery_state(&store, "interrupted-check").4,
+            "unknown"
+        );
+        drop(writer);
+        assert!(crate::recovery::verify_check_quiescent(&store, "interrupted-check").is_err());
+    }
+
+    #[test]
+    fn early_execution_and_cleanup_errors_retain_output_until_durable_eof() {
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+
+        for fail_at in [0, 1] {
+            let (root, _cleanup) = temp_root("early-capture-error");
+            let (store, service) = seeded_service(&root, "early-check");
+            let (mut child, pid, pgid, start) = spawned_owned_child();
+            record_current_anchor(&store, "early-check", pid, pgid, &start);
+            child.kill().unwrap();
+            child.wait().unwrap();
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE check_runs SET status='running' WHERE id='early-check'",
+                    [],
+                )
+                .unwrap();
+            let (stdout, writer) = UnixStream::pair().unwrap();
+            let (stderr, stderr_writer) = UnixStream::pair().unwrap();
+            drop(stderr_writer);
+            let mut observations = 0;
+            let error = service
+                .complete_running_check(
+                    "early-check".into(),
+                    "a".into(),
+                    "causal".into(),
+                    CheckSpec {
+                        executable: "/bin/sh".into(),
+                        arguments: vec![],
+                        timeout_seconds: 1,
+                        suite_version: 1,
+                        cwd: ".".into(),
+                    },
+                    root.to_string_lossy().into_owned(),
+                    "candidate".into(),
+                    "unused-snapshot".into(),
+                    root.clone(),
+                    pid,
+                    start,
+                    pgid,
+                    child,
+                    ChildStdout::from(OwnedFd::from(stdout)),
+                    ChildStderr::from(OwnedFd::from(stderr)),
+                    || {
+                        let current = observations;
+                        observations += 1;
+                        if current == fail_at {
+                            bail!("injected check inventory failure")
+                        }
+                        service.process_inventory()
+                    },
+                )
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("injected check inventory failure"));
+            assert_eq!(observations, fail_at + 1);
+            assert_eq!(service.pending_captures.lock().unwrap().len(), 1);
+            assert_eq!(
+                durable_recovery_state(&store, "early-check").0,
+                "recovery_required"
+            );
+            assert!(crate::recovery::verify_check_quiescent(&store, "early-check").is_err());
+            let command = recovery_command(&store, "early-check");
+            assert!(crate::workflow::execute(&store, &command).is_err());
+            service.reap_pending_children().unwrap();
+            assert_eq!(service.pending_captures.lock().unwrap().len(), 1);
+            drop(writer);
+            service.reap_pending_children().unwrap();
+            assert!(service.pending_captures.lock().unwrap().is_empty());
+            let verified = crate::recovery::verify_check_quiescent(&store, "early-check").unwrap();
+            assert_eq!(
+                verified["capture_settlement"]["source"],
+                "retained_output_eof"
+            );
+            crate::workflow::execute(&store, &command).unwrap();
+            assert_eq!(durable_recovery_state(&store, "early-check").4, "running");
+        }
+    }
+
+    #[test]
+    fn spawned_group_survives_root_exit_before_completion() {
+        use std::io::Write;
+
+        let (root, _cleanup) = temp_root("fast-exit");
+        let (store, service) = seeded_service(&root, "fast-check");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "read -r release; printf 'finished'; exit 7"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (mut child, pgid) = spawn_check_process(&mut command).unwrap();
+        let pid = child.id();
+        let start = service
+            .start_marker(pid, Instant::now() + PROCESS_INSPECTION_TIMEOUT)
+            .unwrap();
+        assert_eq!(unsafe { libc::getpgid(pid as libc::pid_t) }, pgid);
+        let mut input = child.stdin.take().unwrap();
+        writeln!(input, "finish").unwrap();
+        drop(input);
+        assert_eq!(child.wait().unwrap().code(), Some(7));
+        assert!(unsafe { libc::getpgid(pid as libc::pid_t) } < 0);
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        service
+            .record_process("fast-check", pid, &start, pgid, std::process::id())
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE check_runs SET status='running' WHERE id='fast-check'",
+                [],
+            )
+            .unwrap();
+
+        let result = service
+            .complete_running_check(
+                "fast-check".into(),
+                "a".into(),
+                "causal".into(),
+                CheckSpec {
+                    executable: "/bin/sh".into(),
+                    arguments: vec![],
+                    timeout_seconds: 1,
+                    suite_version: 1,
+                    cwd: ".".into(),
+                },
+                root.to_string_lossy().into_owned(),
+                "candidate".into(),
+                "unused-snapshot".into(),
+                root.clone(),
+                pid,
+                start,
+                pgid,
+                child,
+                stdout,
+                stderr,
+                || service.process_inventory(),
+            )
+            .unwrap();
+        assert_eq!(result["exit_code"], 7);
+        assert_eq!(result["passed"], false);
+        assert_eq!(result["recovery_required"], false);
+        assert_eq!(result["evidence"]["stdout"], "finished");
+        assert_eq!(result["evidence"]["process_group_id"], pgid);
+        let settlement: String = store.lock().unwrap().query_row(
+            "SELECT json_extract(evidence_json,'$.capture_settlement.source') FROM check_runs WHERE id='fast-check'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(settlement, "retained_output_eof");
+        assert!(service.pending_captures.lock().unwrap().is_empty());
+        // The minimal fixture has no valid candidate, which must still fail
+        // validation without turning a fully reaped check into unknown ownership.
+        assert_eq!(result["evidence"]["candidate_unchanged"], false);
+        assert_eq!(
+            durable_recovery_state(&store, "fast-check"),
+            (
+                "finished".into(),
+                "finished".into(),
+                "running".into(),
+                "none".into(),
+                "running".into(),
+                0,
+            )
+        );
+        assert!(service.active_status().unwrap().is_empty());
+    }
+
+    #[test]
+    fn process_inspection_bounds_hanging_children_and_rejects_incomplete_inventory() {
+        let (root, _cleanup) = temp_root("inspection-bounds");
+        let (_, service) = seeded_service(&root, "inspection-check");
+        let began = Instant::now();
+        let error = service
+            .inspect_process_output(
+                Command::new("/bin/sh").args(["-c", "printf 'partial'; exec sleep 30"]),
+                Instant::now() + Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline elapsed"));
+        assert!(began.elapsed() < Duration::from_secs(3));
+        service.reap_pending_children().unwrap();
+        assert!(service.pending_children.lock().unwrap().is_empty());
+        let oversized = service
+            .inspect_process_output(
+                Command::new("/bin/sh").args(["-c", "exec /usr/bin/yes inventory-output"]),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap_err();
+        assert!(oversized.to_string().contains("output exceeded its limit"));
+        assert!(parse_process_inventory(b"123 1 malformed".to_vec()).is_err());
+        assert!(parse_process_inventory(vec![0xff]).is_err());
+        assert!(parse_process_inventory(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn shared_pending_child_registry_reaps_late_exits_after_another_observation_error() {
+        let (root, _cleanup) = temp_root("pending-children");
+        let (_, service) = seeded_service(&root, "pending-check");
+        let clone = service.clone();
+        let first = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 0.1"])
+            .spawn()
+            .unwrap();
+        let first_pid = first.id();
+        let mut second = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        second.wait().unwrap();
+        service.retain_child(first);
+        service.retain_child(second);
+        {
+            let mut children = clone.pending_children.lock().unwrap();
+            let result = reap_children_with(&mut children, |child| {
+                if child.id() == first_pid {
+                    Err(std::io::Error::other("injected wait failure"))
+                } else {
+                    child.try_wait()
+                }
+            });
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("could not reap retained check child"));
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0].id(), first_pid);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            clone.reap_pending_children().unwrap();
+            if service.pending_children.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "late child was not reaped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn retained_output_writer_finishes_capture_with_a_durable_recovery_hold() {
+        use std::{
+            io::Write,
+            os::{fd::OwnedFd, unix::net::UnixStream},
+        };
+        let (root, _cleanup) = temp_root("retained-writer");
+        let (store, service) = seeded_service(&root, "retained-check");
+        let (mut child, pid, pgid, start) = spawned_owned_child();
+        record_current_anchor(&store, "retained-check", pid, pgid, &start);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let (stdout_reader, mut stdout_writer) = UnixStream::pair().unwrap();
+        let (stderr_reader, stderr_writer) = UnixStream::pair().unwrap();
+        stdout_writer
+            .write_all(b"output before the retained pipe")
+            .unwrap();
+        drop(stderr_writer);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE check_runs SET status='running' WHERE id='retained-check'",
+                [],
+            )
+            .unwrap();
+        let began = Instant::now();
+        let result = service
+            .complete_running_check(
+                "retained-check".into(),
+                "a".into(),
+                "causal".into(),
+                CheckSpec {
+                    executable: "/bin/sh".into(),
+                    arguments: vec![],
+                    timeout_seconds: 1,
+                    suite_version: 1,
+                    cwd: ".".into(),
+                },
+                root.to_string_lossy().into_owned(),
+                "candidate".into(),
+                "unused-snapshot".into(),
+                root.clone(),
+                pid,
+                start,
+                pgid,
+                child,
+                ChildStdout::from(OwnedFd::from(stdout_reader)),
+                ChildStderr::from(OwnedFd::from(stderr_reader)),
+                || service.process_inventory(),
+            )
+            .unwrap();
+        assert!(began.elapsed() < Duration::from_secs(10));
+        assert_eq!(result["passed"], false);
+        assert_eq!(result["recovery_required"], true);
+        assert_eq!(result["evidence"]["capture_incomplete"], true);
+        assert_eq!(
+            result["evidence"]["stdout"],
+            "output before the retained pipe"
+        );
+        assert_eq!(
+            durable_recovery_state(&store, "retained-check"),
+            (
+                "recovery_required".into(),
+                "cleanup_unknown".into(),
+                "needs_recovery".into(),
+                "needs_recovery".into(),
+                "unknown".into(),
+                1,
+            )
+        );
+        assert_eq!(service.active_status().unwrap().len(), 1);
+        let paths = crate::config::InstancePaths::resolve(Some(root.join("app"))).unwrap();
+        paths.create().unwrap();
+        let app = crate::operations::Application::new(
+            paths,
+            store.clone(),
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        let coordinator_result = crate::coordinator::settle_selected_check_result(
+            &app,
+            "t",
+            "a",
+            "retained-check",
+            result,
+        )
+        .unwrap();
+        assert_eq!(coordinator_result["result"]["recovery_required"], true);
+        assert_eq!(
+            durable_recovery_state(&store, "retained-check").2,
+            "needs_recovery"
+        );
+        assert_eq!(
+            durable_recovery_state(&store, "retained-check").3,
+            "needs_recovery"
+        );
+        let command = recovery_command(&store, "retained-check");
+        assert!(crate::workflow::execute(&store, &command)
+            .unwrap_err()
+            .to_string()
+            .contains("Check output may still be open"));
+        assert_eq!(
+            durable_recovery_state(&store, "retained-check").4,
+            "unknown"
+        );
+        let clone = service.clone();
+        clone.settle_pending_captures().unwrap();
+        assert_eq!(service.pending_captures.lock().unwrap().len(), 1);
+        assert!(crate::recovery::verify_check_quiescent(&store, "retained-check").is_err());
+        drop(stdout_writer);
+        store.lock().unwrap().execute_batch(
+            "CREATE TRIGGER reject_capture_settlement BEFORE UPDATE OF detail_json ON recovery_records
+             BEGIN SELECT RAISE(ABORT, 'injected settlement failure'); END;",
+        ).unwrap();
+        assert!(clone
+            .settle_pending_captures()
+            .unwrap_err()
+            .to_string()
+            .contains("injected settlement failure"));
+        assert_eq!(service.pending_captures.lock().unwrap().len(), 1);
+        assert!(crate::recovery::verify_check_quiescent(&store, "retained-check").is_err());
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_capture_settlement")
+            .unwrap();
+        clone.settle_pending_captures().unwrap();
+        assert!(service.pending_captures.lock().unwrap().is_empty());
+        let verified = crate::recovery::verify_check_quiescent(&store, "retained-check").unwrap();
+        assert_eq!(
+            verified["verification"]["source"],
+            "generation_anchor_and_group_absent"
+        );
+        assert_eq!(
+            verified["capture_settlement"]["source"],
+            "retained_output_eof"
+        );
+        crate::workflow::execute(&store, &command).unwrap();
+        assert_eq!(
+            durable_recovery_state(&store, "retained-check").0,
+            "reconciled_interrupted"
+        );
+        assert_eq!(
+            durable_recovery_state(&store, "retained-check").4,
+            "running"
+        );
+        assert_eq!(durable_recovery_state(&store, "retained-check").5, 0);
+    }
+
+    #[test]
+    fn capture_write_failure_reaps_after_human_retry_supersedes_the_check() {
+        use std::io::Write;
+
+        let (root, _cleanup) = temp_root("capture-retry");
+        let (store, service) = seeded_service(&root, "retry-check");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "read -r release; printf completed"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (mut child, pgid) = spawn_check_process(&mut command).unwrap();
+        let pid = child.id();
+        let start = service
+            .start_marker(pid, Instant::now() + PROCESS_INSPECTION_TIMEOUT)
+            .unwrap();
+        record_current_anchor(&store, "retry-check", pid, pgid, &start);
+        service
+            .record_process("retry-check", pid, &start, pgid, std::process::id())
+            .unwrap();
+        store.lock().unwrap().execute_batch(
+            "UPDATE check_runs SET status='running',launch_state='started' WHERE id='retry-check';
+             UPDATE attempts SET candidate_hash='candidate' WHERE id='a';",
+        ).unwrap();
+        let mut input = child.stdin.take().unwrap();
+        writeln!(input, "finish").unwrap();
+        drop(input);
+        assert!(child.wait().unwrap().success());
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let check_root = root.join("capture");
+        // Publishing a log over a directory fails without making SQLite unwritable.
+        std::fs::create_dir_all(check_root.join("stdout.log")).unwrap();
+        let error = service
+            .complete_running_check(
+                "retry-check".into(),
+                "a".into(),
+                "causal".into(),
+                CheckSpec {
+                    executable: "/bin/sh".into(),
+                    arguments: vec![],
+                    timeout_seconds: 1,
+                    suite_version: 1,
+                    cwd: ".".into(),
+                },
+                root.to_string_lossy().into_owned(),
+                "candidate".into(),
+                "unused-snapshot".into(),
+                check_root,
+                pid,
+                start,
+                pgid,
+                child,
+                stdout,
+                stderr,
+                || service.process_inventory(),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("check process ended but output capture failed"));
+        let state = durable_recovery_state(&store, "retry-check");
+        assert_eq!(state.0, "finished");
+        assert_eq!(state.1, "capture_failed");
+        assert_eq!(service.pending_captures.lock().unwrap().len(), 1);
+
+        let paths = crate::config::InstancePaths::resolve(Some(root.join("app"))).unwrap();
+        paths.create().unwrap();
+        let mut app = crate::operations::Application::new(
+            paths,
+            store.clone(),
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        app.checks = service.clone();
+        // Seed the failure attention normally recorded by check classification;
+        // the Retry command and its supersession run through their public paths.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE tasks SET attention='needs_input' WHERE id='t';
+             UPDATE attempts SET status='needs_input' WHERE id='a';",
+            )
+            .unwrap();
+        let expected_version = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT version FROM tasks WHERE id='t'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        app.execute_human_command(&crate::domain::HumanCommand::Control {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            task_id: "t".into(),
+            expected_version,
+            action: "retry".into(),
+            payload: serde_json::json!({}),
+        })
+        .unwrap();
+        assert_eq!(app.coordinator_tick().unwrap()["action"], "retry_enabled");
+        assert_eq!(
+            durable_recovery_state(&store, "retry-check").0,
+            "retry_superseded"
+        );
+        assert_eq!(service.pending_captures.lock().unwrap().len(), 1);
+
+        service.reap_pending_children().unwrap();
+        assert!(service.pending_captures.lock().unwrap().is_empty());
+        assert!(app.checks.active_status().unwrap().is_empty());
+        assert_eq!(app.drain_status().unwrap()["quiescent"], true);
+    }
+
+    #[test]
+    fn superseded_check_retains_output_until_both_readers_observe_eof() {
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+
+        let (root, _cleanup) = temp_root("superseded-open-output");
+        let (store, service) = seeded_service(&root, "superseded-check");
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE check_runs SET status='retry_superseded' WHERE id='superseded-check'",
+                [],
+            )
+            .unwrap();
+        let (stdout, stdout_writer) = UnixStream::pair().unwrap();
+        let (stderr, stderr_writer) = UnixStream::pair().unwrap();
+        service.retain_capture(PendingCapture {
+            check_id: "superseded-check".into(),
+            stdout: Some(PipeCapture::new(
+                ChildStdout::from(OwnedFd::from(stdout)),
+                0,
+            )),
+            stderr: Some(PipeCapture::new(
+                ChildStderr::from(OwnedFd::from(stderr)),
+                0,
+            )),
+            completion_error: None,
+        });
+        service.reap_pending_children().unwrap();
+        assert_eq!(service.pending_captures.lock().unwrap().len(), 1);
+        drop(stdout_writer);
+        service.reap_pending_children().unwrap();
+        assert_eq!(service.pending_captures.lock().unwrap().len(), 1);
+        drop(stderr_writer);
+        service.reap_pending_children().unwrap();
+        assert!(service.pending_captures.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retained_completion_failure_becomes_actionable_recovery_without_restart() {
+        use std::io::Write;
+
+        for failure in ["initial_eof", "final_completion"] {
+            let (root, _cleanup) = temp_root(failure);
+            let (store, service) = seeded_service(&root, "unsaved-check");
+            let marker = root.join("executions");
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "printf 'ran\\n' >> \"$1\"; read -r release; printf completed; exit 0",
+                    "check",
+                ])
+                .arg(&marker)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let (mut child, pgid) = spawn_check_process(&mut command).unwrap();
+            let pid = child.id();
+            let start = service
+                .start_marker(pid, Instant::now() + PROCESS_INSPECTION_TIMEOUT)
+                .unwrap();
+            record_current_anchor(&store, "unsaved-check", pid, pgid, &start);
+            service
+                .record_process("unsaved-check", pid, &start, pgid, std::process::id())
+                .unwrap();
+            store.lock().unwrap().execute(
+                "UPDATE check_runs SET status='running',launch_state='started' WHERE id='unsaved-check'",
+                [],
+            ).unwrap();
+            let mut input = child.stdin.take().unwrap();
+            writeln!(input, "finish").unwrap();
+            drop(input);
+            assert_eq!(child.wait().unwrap().code(), Some(0));
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let trigger = if failure == "initial_eof" {
+                "CREATE TRIGGER reject_completion BEFORE UPDATE OF evidence_json ON check_runs
+                 WHEN json_extract(NEW.evidence_json,'$.capture_settlement.source')='retained_output_eof'
+                 BEGIN SELECT RAISE(ABORT, 'injected completion persistence failure'); END;"
+            } else {
+                "CREATE TRIGGER reject_completion BEFORE UPDATE OF status ON check_runs
+                 WHEN NEW.status IN ('finished','recovery_required')
+                 BEGIN SELECT RAISE(ABORT, 'injected completion persistence failure'); END;"
+            };
+            store.lock().unwrap().execute_batch(trigger).unwrap();
+            let error = service
+                .complete_running_check(
+                    "unsaved-check".into(),
+                    "a".into(),
+                    "causal".into(),
+                    CheckSpec {
+                        executable: "/bin/sh".into(),
+                        arguments: vec![],
+                        timeout_seconds: 1,
+                        suite_version: 1,
+                        cwd: ".".into(),
+                    },
+                    root.to_string_lossy().into_owned(),
+                    "candidate".into(),
+                    "unused-snapshot".into(),
+                    root.clone(),
+                    pid,
+                    start,
+                    pgid,
+                    child,
+                    stdout,
+                    stderr,
+                    || service.process_inventory(),
+                )
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("injected completion persistence failure"));
+            assert_eq!(service.pending_captures.lock().unwrap().len(), 1);
+            let before_repair = durable_recovery_state(&store, "unsaved-check");
+            assert_eq!(before_repair.0, "running");
+            assert_eq!(before_repair.5, 0);
+
+            // The completion caller performs no repair, as in the detached
+            // browser worker. A failed reaper transaction must retain ownership.
+            assert!(service
+                .reap_pending_children()
+                .unwrap_err()
+                .to_string()
+                .contains("injected completion persistence failure"));
+            assert_eq!(
+                durable_recovery_state(&store, "unsaved-check"),
+                before_repair
+            );
+            assert_eq!(service.pending_captures.lock().unwrap().len(), 1);
+            store
+                .lock()
+                .unwrap()
+                .execute_batch("DROP TRIGGER reject_completion")
+                .unwrap();
+            service.reap_pending_children().unwrap();
+            assert!(service.pending_captures.lock().unwrap().is_empty());
+            assert_eq!(
+                durable_recovery_state(&store, "unsaved-check"),
+                (
+                    "recovery_required".into(),
+                    "cleanup_unknown".into(),
+                    "needs_recovery".into(),
+                    "needs_recovery".into(),
+                    "unknown".into(),
+                    1,
+                )
+            );
+            let (exit, freshness): (Option<i32>, String) = store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT exit_code,freshness_state FROM check_runs WHERE id='unsaved-check'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert!(exit.is_none());
+            assert_eq!(freshness, "failed");
+            let verified =
+                crate::recovery::verify_check_quiescent(&store, "unsaved-check").unwrap();
+            assert_eq!(
+                verified["capture_settlement"]["source"],
+                "retained_output_eof"
+            );
+            assert_eq!(service.active_status().unwrap().len(), 1);
+            crate::workflow::execute(&store, &recovery_command(&store, "unsaved-check")).unwrap();
+            assert_eq!(
+                durable_recovery_state(&store, "unsaved-check").0,
+                "reconciled_interrupted"
+            );
+            assert_eq!(durable_recovery_state(&store, "unsaved-check").4, "running");
+            service.reap_pending_children().unwrap();
+            assert!(service.active_status().unwrap().is_empty());
+            assert_eq!(std::fs::read_to_string(marker).unwrap(), "ran\n");
+        }
+    }
+
+    #[test]
+    fn restarted_service_cannot_settle_lost_output_readers_on_the_same_boot() {
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+        for fail_hold in [false, true] {
+            let (root, _cleanup) = temp_root("lost-capture-owner");
+            let (store, service) = seeded_service(&root, "lost-check");
+            let (mut child, pid, pgid, start) = spawned_owned_child();
+            record_current_anchor(&store, "lost-check", pid, pgid, &start);
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let (stdout, writer) = UnixStream::pair().unwrap();
+            let (stderr, stderr_writer) = UnixStream::pair().unwrap();
+            drop(stderr_writer);
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE check_runs SET status='running' WHERE id='lost-check'",
+                    [],
+                )
+                .unwrap();
+            if fail_hold {
+                store
+                    .lock()
+                    .unwrap()
+                    .execute_batch(
+                        "CREATE TRIGGER reject_cleanup_hold BEFORE UPDATE OF attention ON tasks
+                     BEGIN SELECT RAISE(ABORT, 'injected final hold failure'); END;",
+                    )
+                    .unwrap();
+            }
+            let completion = service.complete_running_check(
+                "lost-check".into(),
+                "a".into(),
+                "causal".into(),
+                CheckSpec {
+                    executable: "/bin/sh".into(),
+                    arguments: vec![],
+                    timeout_seconds: 1,
+                    suite_version: 1,
+                    cwd: ".".into(),
+                },
+                root.to_string_lossy().into_owned(),
+                "candidate".into(),
+                "unused-snapshot".into(),
+                root.clone(),
+                pid,
+                start,
+                pgid,
+                child,
+                ChildStdout::from(OwnedFd::from(stdout)),
+                ChildStderr::from(OwnedFd::from(stderr)),
+                || service.process_inventory(),
+            );
+            if fail_hold {
+                assert!(completion
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected final hold failure"));
+                assert_eq!(durable_recovery_state(&store, "lost-check").0, "running");
+                store
+                    .lock()
+                    .unwrap()
+                    .execute_batch("DROP TRIGGER reject_cleanup_hold")
+                    .unwrap();
+            } else {
+                assert_eq!(completion.unwrap()["recovery_required"], true);
+            }
+            assert_eq!(service.pending_captures.lock().unwrap().len(), 1);
+            drop(service);
+            crate::recovery::reconcile_prior_boot(&store).unwrap();
+            let restarted = CheckService::new(
+                store.clone(),
+                Supervisor::new(store.clone(), root.join("transcripts")),
+                root.join("artifacts"),
+            );
+            restarted.reap_pending_children().unwrap();
+            let error = crate::workflow::execute(&store, &recovery_command(&store, "lost-check"))
+                .unwrap_err();
+            assert!(error.to_string().contains("Check output may still be open"));
+            drop(writer);
+            restarted.reap_pending_children().unwrap();
+            assert!(crate::recovery::verify_check_quiescent(&store, "lost-check").is_err());
+            assert_eq!(durable_recovery_state(&store, "lost-check").4, "unknown");
+        }
+    }
+
+    #[test]
+    fn surviving_check_completion_keeps_ownership_and_rolls_back_hold_failures() {
+        let (root, _cleanup) = temp_root("survivor-completion");
+        let (store, service) = seeded_service(&root, "survivor-check");
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE check_runs SET status='running' WHERE id='survivor-check'",
+                [],
+            )
+            .unwrap();
+        let (mut child, pid, pgid, start) = spawned_owned_child();
+        record_current_anchor(&store, "survivor-check", pid, pgid, &start);
+        service
+            .record_process("survivor-check", pid, &start, pgid, std::process::id())
+            .unwrap();
+        let evidence =
+            serde_json::json!({"descendants_remained_after_kill":true,"capture_incomplete":false});
+        store.lock().unwrap().execute_batch("CREATE TRIGGER reject_cleanup_hold BEFORE UPDATE OF attention ON tasks BEGIN SELECT RAISE(ABORT, 'injected hold failure'); END;").unwrap();
+        let failed = service.persist_completion(
+            "survivor-check",
+            "a",
+            None,
+            true,
+            &evidence,
+            Duration::from_secs(3),
+        );
+        assert!(format!("{:#}", failed.unwrap_err()).contains("injected hold failure"));
+        assert_eq!(
+            durable_recovery_state(&store, "survivor-check").0,
+            "running"
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_cleanup_hold")
+            .unwrap();
+        service
+            .persist_completion(
+                "survivor-check",
+                "a",
+                Some(0),
+                true,
+                &evidence,
+                Duration::from_secs(3),
+            )
+            .unwrap();
+        let active = service.active_status().unwrap();
+        let live = active[0]["live_pids"].as_array().unwrap();
+        assert!(live
+            .iter()
+            .any(|value| value.as_u64() == Some(u64::from(pid))));
+        let (exit, finished): (Option<i32>, Option<String>) = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT exit_code,finished_at FROM check_runs WHERE id='survivor-check'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(exit.is_none() && finished.is_none());
+        assert_eq!(
+            durable_recovery_state(&store, "survivor-check").4,
+            "unknown"
+        );
+        assert!(crate::recovery::verify_check_quiescent(&store, "survivor-check").is_err());
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+        child.wait().unwrap();
+        assert!(crate::recovery::verify_check_quiescent(&store, "survivor-check").is_ok());
     }
 
     #[test]

@@ -47,6 +47,7 @@ pub fn capture(
     destination: &Path,
 ) -> Result<(SnapshotManifest, String)> {
     let observed = crate::workspace::inspect(worktree)?;
+    crate::workspace::require_no_gitlinks(worktree, &[&repository.head, &observed.head])?;
     if observed.identity != repository.identity {
         bail!("snapshot worktree belongs to another physical repository")
     }
@@ -175,6 +176,10 @@ pub fn materialize(
     snapshot_root: &Path,
     worktree: &Path,
 ) -> Result<()> {
+    crate::workspace::require_no_gitlinks(
+        worktree,
+        &[original_base(manifest), candidate_head(manifest)],
+    )?;
     // Remove old leaves before creating replacements. A deleted Git leaf may
     // now be a directory, or be beneath a new file, without deleting that replacement.
     for entry in manifest.entries.iter().filter(|entry| entry.deleted) {
@@ -306,6 +311,10 @@ pub fn verify_integration(
     {
         bail!("candidate or integration commit does not descend from the original attempt base")
     }
+    crate::workspace::require_no_gitlinks(
+        &repository.root,
+        &[original_base, candidate_head, commit],
+    )?;
     let mut changed = Vec::new();
     for entry in &manifest.entries {
         let base = commit_entry(repository, original_base, &entry.path)?;
@@ -329,6 +338,7 @@ pub fn clean_candidate_commit(
     if !crate::workspace::commit_exists(repository, head)? {
         return Ok(None);
     }
+    crate::workspace::require_no_gitlinks(&repository.root, &[original_base(manifest), head])?;
     for entry in &manifest.entries {
         let observed = commit_entry(repository, head, &entry.path)?;
         if !entry_matches_commit(entry, observed.as_ref()) {
@@ -344,6 +354,14 @@ pub fn verify_materialized(manifest: &SnapshotManifest, worktree: &Path) -> Resu
         || observed.head != candidate_head(manifest)
     {
         return Ok(false);
+    }
+    match crate::workspace::require_no_gitlinks(
+        worktree,
+        &[original_base(manifest), &observed.head],
+    ) {
+        Ok(()) => {}
+        Err(error) if error.is::<crate::workspace::GitlinksUnsupported>() => return Ok(false),
+        Err(error) => return Err(error),
     }
     for entry in &manifest.entries {
         validate_relative(&entry.path)?;
@@ -561,6 +579,130 @@ fn prepare_owned_ancestors(root: &Path, relative: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod gitlink_tests {
+    use super::*;
+
+    fn git(root: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn gitlinks_in_index_current_or_base_tree_refuse_snapshot_and_preparation() {
+        let root = std::env::temp_dir().join(format!("llmrelay-gitlink-{}", uuid::Uuid::new_v4()));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        // Keep fixture commits attributed to the configured repository identity.
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for key in ["user.name", "user.email"] {
+            git(&repo, &["config", key, &git(source, &["config", key])]);
+        }
+        std::fs::write(repo.join("ordinary.txt"), b"reviewed").unwrap();
+        git(&repo, &["add", "ordinary.txt"]);
+        git(
+            &repo,
+            &["commit", "-qm", "Create snapshot regression fixture"],
+        );
+        assert_eq!(
+            git(&repo, &["log", "-1", "--format=%B"]),
+            "Create snapshot regression fixture"
+        );
+        let repository = crate::workspace::inspect(&repo).unwrap();
+        let (manifest, _) = capture(&repository, &repo, &root.join("baseline")).unwrap();
+        assert!(verify_materialized(&manifest, &repo).unwrap());
+        let mut missing_base = manifest.clone();
+        missing_base.original_base = "missing-original-commit".into();
+        assert!(verify_materialized(&missing_base, &repo)
+            .unwrap_err()
+            .to_string()
+            .contains("Could not inspect the repository"));
+        std::fs::write(repo.join("ordinary.txt"), b"changed").unwrap();
+        assert!(!verify_materialized(&manifest, &repo).unwrap());
+        std::fs::write(repo.join("ordinary.txt"), b"reviewed").unwrap();
+
+        std::fs::create_dir(repo.join("module")).unwrap();
+        std::fs::write(repo.join("module/value.txt"), b"unreviewed").unwrap();
+        git(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &repository.head,
+                "module",
+            ],
+        );
+        assert!(!verify_materialized(&manifest, &repo).unwrap());
+        for result in [
+            capture(&repository, &repo, &root.join("staged")).map(|_| ()),
+            materialize(&manifest, &root.join("baseline"), &repo),
+            crate::workspace::create_detached_worktree(
+                &repository,
+                &root.join("isolated"),
+                &repository.head,
+            ),
+            crate::workspace::prepare(
+                &repository,
+                &repo,
+                &repository.head,
+                &serde_json::json!({"workspace_mode":"main_checkout"}),
+            ),
+        ] {
+            assert!(result.unwrap_err().to_string().contains("Git submodules"));
+        }
+        assert!(!root.join("staged").exists());
+        assert!(!root.join("isolated").exists());
+        assert_eq!(
+            std::fs::read(repo.join("module/value.txt")).unwrap(),
+            b"unreviewed"
+        );
+
+        git(&repo, &["commit", "-qm", "Add unsupported gitlink fixture"]);
+        assert_eq!(
+            git(&repo, &["log", "-1", "--format=%B"]),
+            "Add unsupported gitlink fixture"
+        );
+        let with_gitlink = crate::workspace::inspect(&repo).unwrap();
+        git(&repo, &["update-index", "--force-remove", "module"]);
+        assert!(capture(&repository, &repo, &root.join("current-tree"))
+            .unwrap_err()
+            .to_string()
+            .contains("Git submodules"));
+        assert!(!verify_materialized(&manifest, &repo).unwrap());
+        let mut foreign_manifest = manifest.clone();
+        foreign_manifest.repository_identity = "another-repository".into();
+        foreign_manifest.original_base = "missing-foreign-commit".into();
+        foreign_manifest.candidate_head = with_gitlink.head.clone();
+        assert!(!verify_materialized(&foreign_manifest, &repo).unwrap());
+        git(
+            &repo,
+            &["commit", "-qm", "Remove unsupported gitlink fixture"],
+        );
+        assert_eq!(
+            git(&repo, &["log", "-1", "--format=%B"]),
+            "Remove unsupported gitlink fixture"
+        );
+        assert!(capture(&with_gitlink, &repo, &root.join("base-tree"))
+            .unwrap_err()
+            .to_string()
+            .contains("Git submodules"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn validate_relative(path: &str) -> Result<()> {

@@ -116,13 +116,19 @@ explicitly authorized target repository and preserving its original files.
 The existing `tests/runtime.rs` recursive child fixture exercises dropped Enter,
 `StopFailure` without a later `Stop`, an accepted turn that never completes,
 and a `permission_prompt` notification through a real managed PTY and role IPC.
-Run it with `cargo test --locked --test runtime` using the admitted provider CLI
-versions required by the existing fixture setup. The fixture launches its own
+Run it with `cargo test --locked --test runtime`. The fixture launches its own
 test executable, not a model session. It checks exact input bytes, accepted hook
 identity, unchanged launch inventories, attention routing and owned-process cleanup.
 These host-boundary tests do not establish native provider compatibility or
 Claude's handling of a bare image path. The corresponding signal boundaries are
 in [Permission and provider signals](PERMISSION_SIGNAL_MATRIX.md).
+
+The ordinary contract and managed-PTY fixtures supply a test-only Codex executable
+for version inspection. It reports the contract's pinned version and refuses every
+other invocation; it cannot launch a provider session. These tests exercise the
+host's policy and lifecycle logic independently of the installed Codex version.
+They do not qualify that installed version. Production admission and the explicitly
+ignored live-provider qualification tests retain their exact-version requirements.
 
 ## Codex capacity observation checks
 

@@ -117,6 +117,14 @@ A `--view-only` attachment reads captured output without requesting or renewing 
 
 Attaching does not launch another agent or resume an ended conversation. It stays bound to the exact session generation and transcript epoch; a service restart or replacement requires a new attachment after the appropriate recovery action. A control client renews its input lease while connected and releases it on normal detach. A connection that stops sending requests for 90 seconds is closed and its attachment ownership is released; normal output polling keeps a healthy attachment connected even when the agent is quiet. If ownership is lost, it becomes view-only and does not silently take control again. Output retained after a normal provider exit can drain to an already connected client, but a new live attachment requires a running session. A capture-gap message means older output was removed by bounded retention.
 
+## Editing drafts in multiple windows
+
+You can edit a task form in more than one dashboard window. Windows at the same browser origin coordinate saved-draft updates and the related workspace request records. When another window changes the saved copy, the form keeps your current text visible and offers recovery choices before saving again. There is still one durable saved draft for each task, and one shared new-task draft. Text kept only in an open form is not a separate durable draft: copy it before closing or refreshing that window.
+
+If the browser cannot coordinate safe saving, the form explains the problem and keeps your text visible. Keep the form open, copy your text, and restore browser support before trying again. A request is not sent until its recovery record can be saved safely. If the server has already saved a change but local cleanup cannot finish, use **Finish saving locally** after recovery; this does not send the task request again. For an uncertain request, refresh and check the task board before explicitly retrying the retained request.
+
+After upgrading LLMRelay, reload older dashboard tabs before editing across windows. Coordination requires all participating pages to use the updated dashboard at the same origin; older tabs do not participate.
+
 ## Restart and restore
 
 LLMRelay restores the browser workspace independently from execution. The selected project, open task, page, board and Workspace Active/Completed section persist locally, and an open task keeps its tab while the dashboard stays open. Live output belongs to cmux; old embedded-terminal layout and scrollback settings are no longer used. Reopening an ended session shows recorded history and never launches a provider. LLMRelay does not register its short-lived attachment command as cmux resume metadata: the command contains an exact process binding and route token which must not be restored after that binding changes. After a service restart, recover or resume eligible work in LLMRelay and open its current attachment; LLMRelay creates terminal access from the new current binding.
@@ -264,6 +272,24 @@ attempt, optional session and task version. Refresh after a stale-record refusal
 The service resolves that exact supported record; it does not select a different
 record because it is newer. Human evidence annotates the decision and does not
 replace process-ownership verification.
+
+Output ownership is recorded before a check starts, so a service interruption
+or an early inspection failure cannot erase the need to verify stream closure.
+A proven failure to start the process clears that provisional output hold.
+If a check stops but its output remains open, the task stays in recovery. Keep
+LLMRelay running: it retains the output readers and checks them without waiting
+indefinitely. Once both streams close, it saves that evidence before releasing
+the readers. Recovery still verifies the recorded process generations and group;
+closed output alone does not prove those processes stopped. Restarting LLMRelay
+before output closure loses those readers, so same-boot recovery cannot clear
+this particular hold using only absent recorded processes. A verified operating
+system restart can establish that the prior output writers are gone. Human
+annotations cannot replace either proof.
+
+If saving a check's completion fails, LLMRelay retains its pending recovery
+transition along with the output readers. Once storage is writable again, it
+records an actionable recovery hold and any observed output closure without
+rerunning the command or treating its unsaved result as a pass.
 
 ### Drain
 

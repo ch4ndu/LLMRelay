@@ -222,11 +222,12 @@ async function json<T>(
         const refusal = protocolRefusal(value);
         if (refusal) throw refusal;
       }
-      const body = value as { error?: string; operation_id?: string };
+      const body = value as { error?: string; operation_id?: string; outcome_unknown?: boolean };
       throw new ApiError(
         body.error || response.statusText,
         response.status,
         body.operation_id,
+        dispatchedMutation && body.outcome_unknown === true,
       );
     }
     return value as T;

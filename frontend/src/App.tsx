@@ -1,3 +1,4 @@
+import { readPreference, savePreference } from "./storagePreferences";
 import { ErrorNotice } from "./components/ErrorNotice";
 import {
   Fragment,
@@ -334,14 +335,14 @@ const empty: AppState = {
 export function App() {
   const [state, setState] = useState<AppState>(empty);
   const [page, setPage] = useState<Page>(() => {
-    const saved = localStorage.getItem("agenticjira.page");
+    const saved = readPreference("agenticjira.page");
     return isPage(saved) ? saved : "workspace";
   });
   const [project, setProject] = useState<string | undefined>(() =>
-    localStorage.getItem("agenticjira.project") || undefined
+    readPreference("agenticjira.project") || undefined
   );
   const [selectedId, setSelectedId] = useState<string | undefined>(() =>
-    localStorage.getItem("agenticjira.task") || undefined
+    readPreference("agenticjira.task") || undefined
   );
   const [form, setForm] = useState<"new" | "edit">();
   const [editing, setEditing] = useState<Task>();
@@ -544,18 +545,18 @@ export function App() {
     }
   }, [state, browserAlerts]);
   useEffect(() => {
-    if (state.incarnation) settleDraftDeletions(state);
+    try {
+      if (state.incarnation) settleDraftDeletions(state);
+    } catch { /* Failed cleanup leaves existing operation identities available for replay. */ }
   }, [state]);
   useEffect(() => {
-    localStorage.setItem("agenticjira.page", page);
+    savePreference("agenticjira.page", page);
   }, [page]);
   useEffect(() => {
-    if (project) localStorage.setItem("agenticjira.project", project);
-    else localStorage.removeItem("agenticjira.project");
+    savePreference("agenticjira.project", project);
   }, [project]);
   useEffect(() => {
-    if (selectedId) localStorage.setItem("agenticjira.task", selectedId);
-    else localStorage.removeItem("agenticjira.task");
+    savePreference("agenticjira.task", selectedId);
   }, [selectedId]);
   useEffect(() => {
     if (!state.generated_at) return;
@@ -792,7 +793,7 @@ export function App() {
   ).length;
   const approvalCount = pendingApprovalCount(state);
   const waits = currentWaits(state);
-  const dialogOpen = !!selected;
+  const dialogOpen = !!selected || !!form;
   return (
     <div className={`app-shell${menuOpen ? " menu-open" : ""}`}>
       <aside className="sidebar" inert={dialogOpen}>

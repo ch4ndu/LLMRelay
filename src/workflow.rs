@@ -249,8 +249,8 @@ pub(crate) fn ordinary_control_allowed(
     let Some(status) = attempt_status else {
         return false;
     };
-    // Single agent runs take only Cancel here; resume and result decisions
-    // are their own typed commands.
+    // Single agent resume and result decisions have typed commands. Initial
+    // Continue after preparation also requires the database-backed check below.
     if matches!(
         attempt_phase,
         Some("agent_execution" | "result_submitted" | "awaiting_checks" | "awaiting_human")
@@ -376,6 +376,99 @@ pub(crate) fn pending_continue(
         .map_err(Into::into)
 }
 
+fn prepared_single_agent_continue_allowed(
+    connection: &Connection,
+    task_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    // A held workspace is not resume authority. Only a never-started run with
+    // its exact ready workspace and known claim can take this initial start.
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
+             JOIN workflow_run_bindings b ON b.attempt_id=a.id AND b.family='single_agent'
+             JOIN workflow_run_profiles rp ON rp.attempt_id=a.id AND rp.slot_key=?3
+             JOIN profile_admissions pa ON pa.id=rp.admission_id
+             JOIN workspaces w ON w.attempt_id=a.id AND w.state='ready'
+             JOIN claims claim ON claim.attempt_id=a.id AND claim.task_id=t.id
+               AND claim.repository_identity=w.repository_identity AND claim.state='running'
+             WHERE t.id=?1 AND a.id=?2 AND t.archived_at IS NULL
+               AND t.lifecycle='in_progress' AND t.attention='paused'
+               AND a.status='held' AND a.phase='agent_execution'
+               AND a.candidate_hash IS NULL AND a.accepted_snapshot_id IS NULL
+               AND a.id=(SELECT id FROM attempts WHERE task_id=t.id ORDER BY created_at DESC LIMIT 1)
+               AND b.definition_state='available' AND b.definition_hash=?4
+               AND pa.profile_revision_id=rp.profile_revision_id
+               AND pa.execution_config_revision_id=b.execution_config_revision_id
+               AND (pa.state='activated' OR (pa.state='pending' AND pa.probe_task_id=t.id))
+               AND NOT EXISTS(SELECT 1 FROM role_generations WHERE attempt_id=a.id)
+               AND NOT EXISTS(SELECT 1 FROM execution_bindings WHERE attempt_id=a.id)
+               AND NOT EXISTS(SELECT 1 FROM launch_permits WHERE attempt_id=a.id)
+               AND NOT EXISTS(SELECT 1 FROM check_runs WHERE attempt_id=a.id)
+               AND NOT EXISTS(SELECT 1 FROM workflow_result_bindings WHERE attempt_id=a.id)
+               AND NOT EXISTS(SELECT 1 FROM freeze_intents WHERE attempt_id=a.id)
+               AND NOT EXISTS(SELECT 1 FROM claims WHERE attempt_id=a.id AND state!='running')
+               AND NOT EXISTS(SELECT 1 FROM workspaces WHERE attempt_id=a.id AND state!='ready')
+               AND NOT EXISTS(SELECT 1 FROM controls WHERE attempt_id=a.id
+                 AND state NOT IN ('finished','cancelled','superseded','rejected'))
+               AND NOT EXISTS(SELECT 1 FROM recovery_records WHERE attempt_id=a.id AND state='attention_required')
+               AND NOT EXISTS(SELECT 1 FROM rework_intents WHERE new_attempt_id=a.id
+                 AND state NOT IN ('completed','cancelled'))
+               AND NOT EXISTS(SELECT 1 FROM restart_candidates WHERE attempt_id=a.id
+                 AND state NOT IN ('resumed','released_fresh_dispatch','cancelled')))",
+            params![
+                task_id,
+                attempt_id,
+                SINGLE_AGENT_SLOT,
+                crate::workflow_resources::single_agent_definition_hash()
+            ],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceDispatchIntent {
+    PrepareOnly,
+    Automatic,
+}
+
+pub(crate) fn record_workspace_dispatch_intent(
+    connection: &Connection,
+    attempt_id: &str,
+    intent: WorkspaceDispatchIntent,
+    operation_id: &str,
+    now: &str,
+) -> Result<()> {
+    // The reservation must retain this authority even when TRIP replaces its
+    // policy document or the service exits before workspace publication.
+    connection.execute(
+        "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+         VALUES(?1,?2,'service','workspace.dispatch_intent','attempt',?3,?4,?5)",
+        params![uuid::Uuid::new_v4().to_string(), operation_id, attempt_id,
+            serde_json::json!({"intent":intent}).to_string(), now],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn workspace_automatic_dispatch_allowed(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<bool> {
+    let intent: Option<Option<String>> = connection
+        .query_row(
+            "SELECT json_extract(detail_json,'$.intent') FROM audit_events
+         WHERE event_code='workspace.dispatch_intent' AND entity_kind='attempt' AND entity_id=?1
+         ORDER BY rowid DESC LIMIT 1",
+            params![attempt_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    // A legacy reservation has no durable evidence of automatic-start intent.
+    Ok(intent.flatten().as_deref() == Some("automatic"))
+}
+
 pub(crate) fn ordinary_control_policy(
     connection: &Connection,
     task_id: &str,
@@ -474,6 +567,9 @@ pub(crate) fn ordinary_control_policy(
         }
     }
     if let Some(attempt_id) = attempt_id {
+        if prepared_single_agent_continue_allowed(connection, task_id, attempt_id)? {
+            controls.push("continue".to_owned());
+        }
         if attention == "resume_failed"
             && lifecycle == "in_progress"
             && task_family(connection, task_id)? == crate::domain::WorkflowFamily::Trip
@@ -2727,6 +2823,14 @@ pub fn execute_with_runtime(
                     "UPDATE tasks SET attention='run_next_requested',version=version+1,updated_at=?1 WHERE id=?2 AND version=?3",
                     params![now,task_id,expected_version],
                 )?;
+                // Preparation changes control intent, not the admitted task content.
+                // Only carry forward an admission that matched before this command.
+                transaction.execute(
+                    "UPDATE task_workflow_selections SET admitted_task_version=?1,updated_at=?2
+                     WHERE task_id=?3 AND family='single_agent' AND admission_state='admitted'
+                       AND admitted_task_version=?4",
+                    params![expected_version + 1, now, task_id, expected_version],
+                )?;
                 result(
                     operation_id,
                     "task",
@@ -2975,6 +3079,8 @@ pub fn execute_with_runtime(
                     params![attempt],
                     |row| row.get(0),
                 )?;
+                let initial_single_agent_start = action == "continue"
+                    && prepared_single_agent_continue_allowed(&transaction, task_id, &attempt)?;
                 if let Some((rework_state, cancellation_pending)) = &unfinished_rework {
                     if *cancellation_pending {
                         bail!("pending rework cancellation accepts only the recovery cancellation decision")
@@ -3005,6 +3111,7 @@ pub fn execute_with_runtime(
                     action.as_str(),
                     "continue" | "run_next" | "pause_after_role" | "pause_now" | "retry" | "cancel"
                 ) && !(action == "continue" && attention == "resume_failed")
+                    && !initial_single_agent_start
                     && !ordinary_control_allowed(
                         &lifecycle,
                         &attention,
@@ -3046,6 +3153,17 @@ pub fn execute_with_runtime(
                             "retry waits for the provider failure hold to end because it would replace the held work",
                         ));
                     }
+                }
+                if action == "continue"
+                    && !workspace_automatic_dispatch_allowed(&transaction, &attempt)?
+                {
+                    record_workspace_dispatch_intent(
+                        &transaction,
+                        &attempt,
+                        WorkspaceDispatchIntent::Automatic,
+                        operation_id,
+                        &now,
+                    )?;
                 }
                 if action == "stop_manager" {
                     if lifecycle == "awaiting_review" {
@@ -3237,6 +3355,34 @@ pub fn execute_with_runtime(
                         task_id.clone(),
                         Some(expected_version + 1),
                         "manager_stop_released",
+                    )
+                } else if initial_single_agent_start {
+                    let control_id = uuid::Uuid::new_v4().to_string();
+                    transaction.execute(
+                        "INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at,requested_operation_id)
+                         VALUES(?1,?2,'continue','finished',?3,?4,?5,?5,?6)",
+                        params![control_id, attempt, expected_version, serde_json::to_string(payload)?, now, operation_id],
+                    )?;
+                    transaction.execute(
+                        "UPDATE attempts SET status='running',updated_at=?1 WHERE id=?2 AND status='held'",
+                        params![now, attempt],
+                    )?;
+                    transaction.execute(
+                        "UPDATE tasks SET attention='none',version=version+1,updated_at=?1 WHERE id=?2 AND version=?3",
+                        params![now, task_id, expected_version],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+                         VALUES(?1,?2,'human','control.applied','control',?3,?4,?5)",
+                        params![uuid::Uuid::new_v4().to_string(), operation_id, control_id,
+                            serde_json::json!({"attention":"none","attempt_status":"running","initial_single_agent_start":true}).to_string(), now],
+                    )?;
+                    result(
+                        operation_id,
+                        "task",
+                        task_id.clone(),
+                        Some(expected_version + 1),
+                        "continued",
                     )
                 } else if let Some(mut release) = main_resume_release {
                     let control_id = uuid::Uuid::new_v4().to_string();
@@ -12936,6 +13082,87 @@ pub(crate) fn single_agent_guidance_problem(
     Ok(None)
 }
 
+/// Recovery may publish only the original, never-started Single agent run;
+/// it cannot turn an old workspace or profile into new execution authority.
+pub(crate) fn require_single_agent_workspace_recovery(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<()> {
+    let (task_id, project_id, config_id, config_hash, profile_id, profile_hash, policy_hash,
+         admitted_scope, scope_hash, title, description, criteria, base):
+        (String, String, String, String, String, String, String, String, String, String, String, String, String) =
+        connection.query_row(
+            "SELECT t.id,t.project_id,b.execution_config_revision_id,b.execution_config_hash,
+                    rp.profile_revision_id,rp.profile_hash,rp.policy_hash,pa.prepared_scope_hash,
+                    b.scope_hash,t.title,t.description,t.acceptance_criteria_json,a.base_revision
+             FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
+             JOIN workflow_run_bindings b ON b.attempt_id=a.id AND b.family='single_agent'
+             JOIN task_workflow_selections selection ON selection.task_id=t.id AND selection.family=b.family
+               AND selection.selection_hash=b.selection_hash
+               AND selection.execution_config_revision_id=b.execution_config_revision_id
+             JOIN workflow_run_profiles rp ON rp.attempt_id=a.id AND rp.slot_key='single_agent'
+               AND rp.profile_revision_id=selection.profile_revision_id AND rp.session_contract='retained'
+             JOIN profile_admissions pa ON pa.id=rp.admission_id
+               AND pa.profile_revision_id=rp.profile_revision_id
+               AND pa.execution_config_revision_id=b.execution_config_revision_id
+             JOIN workspaces w ON w.attempt_id=a.id AND w.base_revision=a.base_revision
+               AND w.repository_identity=p.repository_identity
+             JOIN claims claim ON claim.attempt_id=a.id AND claim.task_id=t.id
+               AND claim.repository_identity=w.repository_identity AND claim.state IN ('reserved','unknown','running')
+             WHERE a.id=?1 AND t.lifecycle='in_progress' AND t.archived_at IS NULL
+               AND a.id=(SELECT id FROM attempts WHERE task_id=t.id ORDER BY created_at DESC,rowid DESC LIMIT 1)
+               AND a.status IN ('workspace_reserved','needs_recovery') AND a.phase='agent_execution'
+               AND a.base_revision=p.base_revision AND a.scope_hash=b.scope_hash
+               AND a.configuration_hash=b.execution_config_hash
+               AND b.definition_id=?2 AND b.definition_hash=?3 AND b.definition_state='available'
+               AND a.workflow_version=b.definition_id AND a.workflow_hash=b.definition_hash
+               AND b.evaluator_revision=?4
+               AND (pa.state='activated' OR (pa.state='pending' AND pa.probe_task_id=t.id))
+               AND a.candidate_hash IS NULL AND a.accepted_snapshot_id IS NULL
+               AND NOT EXISTS(SELECT 1 FROM role_generations WHERE attempt_id=a.id)
+               AND NOT EXISTS(SELECT 1 FROM execution_bindings WHERE attempt_id=a.id)
+               AND NOT EXISTS(SELECT 1 FROM launch_permits WHERE attempt_id=a.id)
+               AND NOT EXISTS(SELECT 1 FROM check_runs WHERE attempt_id=a.id)
+               AND NOT EXISTS(SELECT 1 FROM workflow_result_bindings WHERE attempt_id=a.id)
+               AND NOT EXISTS(SELECT 1 FROM freeze_intents WHERE attempt_id=a.id)",
+            params![attempt_id, crate::workflow_resources::SINGLE_AGENT_DEFINITION_ID,
+                crate::workflow_resources::single_agent_definition_hash(),
+                crate::workflow_resources::SINGLE_AGENT_EVALUATOR_REVISION],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,
+                row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?)),
+        ).optional()?.context("Single agent workspace recovery requires its current, never-started run and exact admitted profile, configuration and repository claim")?;
+    let profile = writer_profile_revision(connection, &project_id, &profile_id)?;
+    let current_config_hash = execution_configuration_hash(connection, &project_id, &config_id)?;
+    let current_scope = json_hash(&serde_json::json!({
+        "title":title,"description":description,
+        "acceptance_criteria":serde_json::from_str::<serde_json::Value>(&criteria)?,
+        "base_revision":base,
+    }))?;
+    if profile.profile_hash != profile_hash
+        || profile.policy_hash != policy_hash
+        || config_hash != current_config_hash
+        || scope_hash != current_scope
+        || policy_hash
+            != crate::provider_compatibility::ExecutionPolicy::single_agent_writer(profile.provider)
+                .content_hash()
+        || admitted_scope
+            != admission_scope_hash(
+                connection,
+                &project_id,
+                &profile_id,
+                &profile,
+                &config_id,
+                &config_hash,
+            )?
+    {
+        bail!("Single agent workspace recovery no longer matches its pinned task, configuration or profile admission")
+    }
+    if let Some(problem) = single_agent_guidance_problem(connection, &task_id)? {
+        bail!("{problem}")
+    }
+    Ok(())
+}
+
 /// Records a claimed attempt's immutable Single agent run: definition,
 /// configuration, profile admission and the human check selection.
 pub(crate) fn bind_single_agent_run(
@@ -13153,6 +13380,10 @@ pub(crate) fn task_workflow_projection(
                 ("needs_input", _, _) => (
                     SingleAgentStage::NeedsAction,
                     held_reason.unwrap_or_else(|| "The run needs your decision.".into()),
+                ),
+                ("held", "agent_execution", _) if prepared_single_agent_continue_allowed(connection, task_id, &attempt_id)? => (
+                    SingleAgentStage::WaitingToStart,
+                    "The workspace is prepared. Choose Continue to start the agent.".into(),
                 ),
                 ("needs_recovery" | "held" | "restart_parked" | "failed" | "cancelled", _, _) => {
                     (SingleAgentStage::Blocked, format!("The run is {status}; open its recovery details."))

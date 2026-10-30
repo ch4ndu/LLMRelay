@@ -22376,6 +22376,151 @@ mod interruption_tests {
         std::fs::write(checkout.join("task-output.txt"), b"task bytes\n").unwrap();
         {
             let connection = store.lock().unwrap();
+            connection.execute_batch("UPDATE attempts SET status='running' WHERE id='a';
+                UPDATE tasks SET attention='none' WHERE id='t';
+                INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+                VALUES('review-generation','a','single_agent','codex',1,1,'exited','review-authority','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,exit_json,created_at,updated_at)
+                VALUES('review-session','review-generation','codex','exited','{}','fixture','review-epoch','{\"process_group_quiescent\":true}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+                VALUES('review-report','review-report-operation','review-session','review-generation','result_ready','Synthetic Main review','[]','{}','2026-01-01T00:00:00Z');").unwrap();
+            let (definition, definition_hash) = crate::workflow::ensure_single_agent_definition(
+                &connection,
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+            connection.execute("INSERT INTO workflow_run_bindings(attempt_id,family,definition_id,definition_hash,definition_state,evaluator_revision,execution_config_revision_id,execution_config_hash,selection_hash,scope_hash,created_at)
+                VALUES('a','single_agent',?1,?2,'available',?3,'config','config-hash','selection','scope','2026-01-01T00:00:00Z')",
+                params![definition,definition_hash,crate::workflow_resources::SINGLE_AGENT_EVALUATOR_REVISION]).unwrap();
+            connection.execute("INSERT INTO workflow_result_bindings(id,attempt_id,role_result_id,role_generation_id,session_id,transcript_epoch,snapshot_id,candidate_hash,criteria_hash,evidence_hash,profile_binding_hash,selected_check_revision,state,created_at,updated_at)
+                VALUES('review-result','a','review-report','review-generation','review-session','review-epoch',?1,?2,'criteria','evidence','profile',0,'awaiting_human','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",params![candidate_id,candidate_hash]).unwrap();
+        }
+        assert!(crate::workspace::check_reviewed_checkout(&store, "a")
+            .unwrap()
+            .is_some());
+        std::fs::create_dir(checkout.join("module")).unwrap();
+        std::fs::write(
+            checkout.join("module/unreviewed.txt"),
+            b"external module bytes\n",
+        )
+        .unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &repository.head,
+                "module"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let version: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT version FROM tasks WHERE id='t'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let error = crate::workflow::execute_workflow_command(
+            &store,
+            &crate::domain::WorkflowCommand::AcceptResult {
+                operation_id: "accept-main-after-staged-gitlink".into(),
+                task_id: "t".into(),
+                attempt_id: "a".into(),
+                expected_version: version,
+                result_binding_id: "review-result".into(),
+                candidate_hash: candidate_hash.clone(),
+                guidance_change_hash: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("changed after review"),
+            "{error}"
+        );
+        {
+            let connection = store.lock().unwrap();
+            let held: (String, String, String, String, String, i64) = connection
+                .query_row(
+                    "SELECT a.status,t.lifecycle,t.attention,c.state,r.state,t.version
+                 FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN claims c ON c.attempt_id=a.id
+                 JOIN workflow_result_bindings r ON r.attempt_id=a.id WHERE a.id='a'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                held,
+                (
+                    "held".into(),
+                    "awaiting_review".into(),
+                    "needs_input".into(),
+                    "running".into(),
+                    "awaiting_human".into(),
+                    version + 1
+                )
+            );
+            let reason: String = connection
+                .query_row(
+                    "SELECT state_reason FROM workflow_result_bindings WHERE id='review-result'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                reason.contains("live Main checkout changed after review"),
+                "{reason}"
+            );
+            assert_eq!(connection.query_row(
+                "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='accept-main-after-staged-gitlink'", [], |row| row.get::<_, i64>(0),
+            ).unwrap(), 0);
+            assert_eq!(connection.query_row(
+                "SELECT COUNT(*) FROM workflow_result_acceptances WHERE result_binding_id='review-result'", [], |row| row.get::<_, i64>(0),
+            ).unwrap(), 0);
+        }
+        let index = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["ls-files", "--stage", "--", "module"])
+            .output()
+            .unwrap();
+        assert!(index.status.success());
+        assert!(index.stdout.starts_with(b"160000 "));
+        assert_eq!(
+            crate::workspace::inspect(&checkout).unwrap().head,
+            repository.head
+        );
+        assert_eq!(
+            std::fs::read(checkout.join("module/unreviewed.txt")).unwrap(),
+            b"external module bytes\n"
+        );
+        assert_eq!(
+            std::fs::read(checkout.join("task-output.txt")).unwrap(),
+            b"task bytes\n"
+        );
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["update-index", "--force-remove", "module"])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::remove_dir_all(checkout.join("module")).unwrap();
+        {
+            let connection = store.lock().unwrap();
             let (definition, hash) = crate::workflow::ensure_single_agent_definition(
                 &connection,
                 "2026-01-01T00:00:00Z",

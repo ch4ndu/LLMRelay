@@ -763,6 +763,9 @@ pub(crate) async fn serve(
                     }
                     let tick_app=coordinator_app.clone();
                     match tokio::task::spawn_blocking(move||{
+                        if let Err(error) = tick_app.checks.reap_pending_children() {
+                            tracing::warn!(error=%error, "retained check cleanup deferred");
+                        }
                         let coordinator = tick_app.coordinator_tick();
                         let intake = tick_app.scheduled_intake_tick(chrono::Utc::now(), service_started_at);
                         (coordinator, intake)
@@ -1328,6 +1331,41 @@ async fn api_model_catalog(
     Json(crate::model_catalog::read(&query.provider)).into_response()
 }
 
+#[derive(Debug)]
+enum BlockingWorkError {
+    Admission,
+    Interrupted(tokio::task::JoinError),
+}
+
+impl std::fmt::Display for BlockingWorkError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission => formatter.write_str("blocking operation admission unavailable"),
+            Self::Interrupted(error) => {
+                write!(formatter, "blocking operation interrupted: {error}")
+            }
+        }
+    }
+}
+
+// The closure owns admission until the blocking work ends, even if its HTTP
+// caller disconnects or is cancelled while awaiting the result.
+async fn admitted_blocking_work<T: Send + 'static>(
+    permits: Arc<Semaphore>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, BlockingWorkError> {
+    let permit = permits
+        .acquire_owned()
+        .await
+        .map_err(|_| BlockingWorkError::Admission)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(BlockingWorkError::Interrupted)
+}
+
 async fn api_role_preparations(
     State(state): State<WebState>,
     AxumPath(task_id): AxumPath<String>,
@@ -1336,27 +1374,28 @@ async fn api_role_preparations(
     if let Err(response) = require_browser(&state, &headers) {
         return response;
     }
-    let executable = match std::env::current_exe() {
-        Ok(executable) => executable,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error":format!("resolve current LLMRelay executable: {error}")})),
-            )
-                .into_response()
-        }
-    };
-    match crate::workflow::role_preparations(
-        &state.app.store,
-        &task_id,
-        &state.app.hooks,
-        &state.app.paths.role_socket,
-        &executable,
-    ) {
-        Ok(value) => Json(value).into_response(),
-        Err(error) => (
+    let permits = Arc::clone(&state.app.blocking_operations);
+    match admitted_blocking_work(permits, move || -> Result<_> {
+        let executable = std::env::current_exe().context("resolve current LLMRelay executable")?;
+        crate::workflow::role_preparations(
+            &state.app.store,
+            &task_id,
+            &state.app.hooks,
+            &state.app.paths.role_socket,
+            &executable,
+        )
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error":format!("{error:#}")})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":format!("role preparation could not finish: {error:#}")})),
         )
             .into_response(),
     }
@@ -1420,21 +1459,47 @@ async fn api_command(
     headers: HeaderMap,
     Json(command): Json<HumanCommand>,
 ) -> Response {
+    api_command_with_executor(state, headers, command, |app, command| {
+        match app.execute_human_command(command) {
+            Ok(value) => Json(serde_json::json!({"result":value})).into_response(),
+            Err(error) => {
+                let _ = app.diagnostics.record(
+                    "warn",
+                    "human.command.rejected",
+                    "server",
+                    "rejected",
+                    Some(command.operation_id()),
+                    serde_json::json!({"cause":format!("{error:#}")}),
+                );
+                (StatusCode::CONFLICT, Json(serde_json::json!({"error":format!("{error:#}"),"operation_id":command.operation_id()}))).into_response()
+            }
+        }
+    }).await
+}
+
+async fn api_command_with_executor(
+    state: WebState,
+    headers: HeaderMap,
+    command: HumanCommand,
+    execute: impl FnOnce(&Application, &HumanCommand) -> Response + Send + 'static,
+) -> Response {
     if let Err(response) = require_browser(&state, &headers) {
         return response;
     }
-    match state.app.execute_human_command(&command) {
-        Ok(value) => Json(serde_json::json!({"result":value})).into_response(),
+    let permits = Arc::clone(&state.app.blocking_operations);
+    let operation_id = command.operation_id().to_owned();
+    match admitted_blocking_work(permits, move || execute(&state.app, &command)).await {
+        Ok(response) => response,
         Err(error) => {
-            let _ = state.app.diagnostics.record(
-                "warn",
-                "human.command.rejected",
-                "server",
-                "rejected",
-                Some(command.operation_id()),
-                serde_json::json!({"cause":format!("{error:#}")}),
-            );
-            (StatusCode::CONFLICT, Json(serde_json::json!({"error":format!("{error:#}"),"operation_id":command.operation_id()}))).into_response()
+            let outcome_unknown = matches!(error, BlockingWorkError::Interrupted(_));
+            let message = if outcome_unknown {
+                "The request outcome is unknown. Refresh and check before retrying."
+            } else {
+                "The request was not started because the service cannot accept more work."
+            };
+            (StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":format!("{message} {error}"),"operation_id":operation_id,"outcome_unknown":outcome_unknown})),
+            ).into_response()
         }
     }
 }
@@ -1491,7 +1556,7 @@ async fn api_operation(
         }
     };
     let blocking_state = state.clone();
-    let result = match tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+    let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
         let _permit = permit;
         let state = blocking_state;
         match operation {
@@ -1794,10 +1859,26 @@ async fn api_operation(
             )?),
         }
     })
-    .await
-    {
+    .await;
+    web_operation_response(&state, result)
+}
+
+fn web_operation_response(
+    state: &WebState,
+    result: std::result::Result<Result<serde_json::Value>, tokio::task::JoinError>,
+) -> Response {
+    let result = match result {
         Ok(result) => result,
-        Err(error) => Err(anyhow!("web operation blocking task failed: {error}")),
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": format!("The request may already have been applied. Refresh and check before retrying. Operation worker interrupted: {error}"),
+                    "outcome_unknown": true,
+                })),
+            )
+                .into_response();
+        }
     };
     match result {
         Ok(value) => Json(serde_json::json!({"result":value})).into_response(),
@@ -2878,6 +2959,280 @@ mod web_operation_tests {
             .await
             .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn command_and_role_preparation_keep_admission_until_cancelled_work_finishes() {
+        for preparation in [false, true] {
+            let (root, app, _, _) = server_test_application();
+            let (state, headers, _) = browser_state(app);
+            let store = state.app.store.clone();
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let locker = std::thread::spawn(move || {
+                let _guard = store.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+            locked_rx.recv().unwrap();
+            let initial = state.app.blocking_operations.available_permits();
+            let request_state = state.clone();
+            let request_headers = headers.clone();
+            let handler = tokio::spawn(async move {
+                if preparation {
+                    api_role_preparations(
+                        State(request_state),
+                        AxumPath("missing-task".to_owned()),
+                        request_headers,
+                    )
+                    .await
+                } else {
+                    api_command(
+                        State(request_state),
+                        request_headers,
+                        Json(HumanCommand::SetQueuePaused {
+                            operation_id: uuid::Uuid::new_v4().to_string(),
+                            project_id: "missing-project".into(),
+                            expected_version: 1,
+                            paused: true,
+                        }),
+                    )
+                    .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while state.app.blocking_operations.available_permits() == initial {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let diagnostics = tokio::time::timeout(
+                Duration::from_millis(250),
+                api_diagnostics(State(state.clone()), headers),
+            )
+            .await
+            .unwrap();
+            assert_eq!(diagnostics.status(), StatusCode::OK);
+            handler.abort();
+            assert!(handler.await.unwrap_err().is_cancelled());
+            assert_eq!(
+                state.app.blocking_operations.available_permits(),
+                initial - 1
+            );
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while state.app.blocking_operations.available_permits() != initial {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            locker.join().unwrap();
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_admission_refuses_before_dispatch_and_worker_failure_is_distinct() {
+        let permits = Arc::new(Semaphore::new(1));
+        permits.close();
+        let called = Arc::new(AtomicBool::new(false));
+        let called_inside = Arc::clone(&called);
+        let result = admitted_blocking_work(permits, move || {
+            called_inside.store(true, AtomicOrdering::SeqCst)
+        })
+        .await;
+        assert!(matches!(result, Err(BlockingWorkError::Admission)));
+        assert!(!called.load(AtomicOrdering::SeqCst));
+        let result = admitted_blocking_work(Arc::new(Semaphore::new(1)), || {
+            panic!("injected worker failure")
+        })
+        .await;
+        assert!(matches!(result, Err(BlockingWorkError::Interrupted(_))));
+    }
+
+    #[tokio::test]
+    async fn saturated_handlers_cancelled_before_admission_never_run() {
+        use std::{future::Future, task::Poll};
+        for preparation in [false, true] {
+            let (root, app, _, _) = server_test_application();
+            let (state, headers, _) = browser_state(app);
+            let capacity = state.app.blocking_operations.available_permits();
+            let held = state
+                .app
+                .blocking_operations
+                .clone()
+                .acquire_many_owned(capacity as u32)
+                .await
+                .unwrap();
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            let command = HumanCommand::SetQueuePaused {
+                operation_id: operation_id.clone(),
+                project_id: "project".into(),
+                expected_version: 1,
+                paused: false,
+            };
+            let request_state = state.clone();
+            let mut handler = Box::pin(async move {
+                if preparation {
+                    api_role_preparations(State(request_state), AxumPath("task".into()), headers)
+                        .await
+                } else {
+                    api_command(State(request_state), headers, Json(command)).await
+                }
+            });
+            std::future::poll_fn(|context| {
+                assert!(handler.as_mut().poll(context).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(state.app.blocking_operations.available_permits(), 0);
+            drop(handler);
+            drop(held);
+            tokio::task::yield_now().await;
+            assert_eq!(state.app.blocking_operations.available_permits(), capacity);
+            let connection = state.app.store.lock().unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id=?1",
+                        params![operation_id],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT version FROM projects WHERE id='project'",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+            drop(connection);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn command_handlers_distinguish_refused_admission_from_unknown_mutation_outcome() {
+        for interrupted in [false, true] {
+            let (root, app, _, _) = server_test_application();
+            let (state, headers, _) = browser_state(app);
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            let command = HumanCommand::SetQueuePaused {
+                operation_id: operation_id.clone(),
+                project_id: "project".into(),
+                expected_version: 1,
+                paused: false,
+            };
+            let response = if interrupted {
+                api_command_with_executor(state.clone(), headers, command, |app, command| {
+                    app.execute_human_command(command).unwrap();
+                    panic!("injected worker failure after committed command")
+                })
+                .await
+            } else {
+                state.app.blocking_operations.close();
+                let preparation = api_role_preparations(
+                    State(state.clone()),
+                    AxumPath("task".into()),
+                    headers.clone(),
+                )
+                .await;
+                assert_eq!(preparation.status(), StatusCode::SERVICE_UNAVAILABLE);
+                api_command(State(state.clone()), headers, Json(command)).await
+            };
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["operation_id"], operation_id);
+            assert_eq!(body["outcome_unknown"], interrupted);
+            assert!(body["error"].as_str().unwrap().contains(if interrupted {
+                "Refresh and check before retrying"
+            } else {
+                "request was not started"
+            }));
+            let receipt_count: i64 = state
+                .app
+                .store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_receipts WHERE operation_id=?1",
+                    params![operation_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(receipt_count, i64::from(interrupted));
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_worker_interruption_preserves_unknown_committed_outcome() {
+        let (root, app, _, _) = server_test_application();
+        let (state, _, _) = browser_state(app);
+        let command = crate::domain::WorkflowCommand::SetProjectWorkflowDefault {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            project_id: "project".into(),
+            expected_version: 0,
+            family: crate::domain::WorkflowFamily::SingleAgent,
+        };
+        let worker_state = state.clone();
+        let worker_command = command.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+            worker_state
+                .app
+                .execute_workflow_command(&worker_command)
+                .unwrap();
+            panic!("injected interruption after committed workflow operation")
+        })
+        .await;
+        let response = web_operation_response(&state, result);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["outcome_unknown"], true);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Refresh and check before retrying"));
+        // The original identity replays its committed result without incrementing
+        // the workflow default again, despite the interrupted HTTP worker.
+        let replay = state.app.execute_workflow_command(&command).unwrap();
+        assert_eq!(serde_json::to_value(replay).unwrap()["version"], 1);
+        assert_eq!(
+            state
+                .app
+                .store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT version FROM project_workflow_defaults WHERE project_id='project'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let refusal = web_operation_response(&state, Ok(Err(anyhow!("refused before mutation"))));
+        assert_eq!(refusal.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(refusal.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_ne!(body["outcome_unknown"], true);
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

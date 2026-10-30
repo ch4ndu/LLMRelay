@@ -48,6 +48,7 @@ pub fn create_detached_worktree(
     destination: &Path,
     base: &str,
 ) -> Result<()> {
+    require_no_gitlinks(&repository.root, &[base])?;
     if destination.exists() {
         bail!(
             "worktree destination already exists: {}",
@@ -75,6 +76,36 @@ pub fn create_detached_worktree(
     let created = inspect(destination)?;
     if created.identity != repository.identity || created.head != base {
         bail!("created worktree identity/base does not match reservation")
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("This repository contains Git submodules, which LLMRelay cannot snapshot safely yet. Use a project without submodules before preparing this task.")]
+pub(crate) struct GitlinksUnsupported;
+
+pub(crate) fn require_no_gitlinks(root: &Path, revisions: &[&str]) -> Result<()> {
+    let inventories = std::iter::once(vec!["ls-files", "--stage", "-z"]).chain(
+        revisions
+            .iter()
+            .map(|revision| vec!["ls-tree", "-r", "-z", *revision]),
+    );
+    for arguments in inventories {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(arguments)
+            .output()?;
+        if !output.status.success() {
+            bail!("Could not inspect the repository for Git submodules; preparation and snapshot verification cannot continue.")
+        }
+        if output
+            .stdout
+            .split(|byte| *byte == 0)
+            .any(|entry| entry.starts_with(b"160000 "))
+        {
+            return Err(GitlinksUnsupported.into());
+        }
     }
     Ok(())
 }
@@ -228,6 +259,7 @@ pub(crate) fn prepare(
         return create_detached_worktree(repository, destination, base);
     }
     require_checkout_environment()?;
+    require_no_gitlinks(&repository.root, &[base])?;
     if policy["workspace_ownership"].as_str() != Some("borrowed_checkout") {
         bail!("Main checkout preparation requires explicit borrowed workspace ownership")
     }

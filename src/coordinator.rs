@@ -4361,6 +4361,40 @@ fn final_explorer_ready_on(
         .optional()?)
 }
 
+pub(crate) fn settle_selected_check_result(
+    app: &Application,
+    task_id: &str,
+    attempt_id: &str,
+    check_id: &str,
+    result: serde_json::Value,
+) -> Result<serde_json::Value> {
+    if result
+        .get("recovery_required")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+        && result.get("passed").and_then(serde_json::Value::as_bool) != Some(true)
+    {
+        set_attention(
+            app,
+            task_id,
+            attempt_id,
+            "needs_input",
+            AttentionHold {
+                code: "check_failed",
+                message: format!(
+                    "The check {} did not pass. Open the Checks tab to read its result, then decide how to continue.",
+                    check_display_name(app, check_id)?
+                ),
+            },
+        )?;
+    }
+    Ok(serde_json::json!({
+        "action":"check_finished",
+        "check_id":check_id,
+        "result":result,
+    }))
+}
+
 fn advance_checks(
     app: &Application,
     attempt: &Attempt,
@@ -4413,26 +4447,7 @@ fn advance_checks(
                 }));
             }
             let result = app.checks.run_selected(&attempt.id, &check_id)?;
-            if result.get("passed").and_then(serde_json::Value::as_bool) != Some(true) {
-                set_attention(
-                    app,
-                    &attempt.task_id,
-                    &attempt.id,
-                    "needs_input",
-                    AttentionHold {
-                        code: "check_failed",
-                        message: format!(
-                            "The check {} did not pass. Open the Checks tab to read its result, then decide how to continue.",
-                            check_display_name(app, &check_id)?
-                        ),
-                    },
-                )?;
-            }
-            Ok(serde_json::json!({
-                "action":"check_finished",
-                "check_id":check_id,
-                "result":result,
-            }))
+            settle_selected_check_result(app, &attempt.task_id, &attempt.id, &check_id, result)
         }
         ChecksSelection::NoSelectedChecks => {
             set_attention(

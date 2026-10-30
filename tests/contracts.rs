@@ -37,6 +37,9 @@ use std::{
     sync::{Arc, Barrier, Mutex, OnceLock},
 };
 
+#[path = "support/provider_cli.rs"]
+mod provider_cli;
+
 // Observation tests require the shared synthetic HOME to be socket-free.
 static SYNTHETIC_CODEX_HOME_LOCK: Mutex<()> = Mutex::new(());
 
@@ -49,6 +52,7 @@ fn install_synthetic_codex_home() {
         ));
         let codex_home = home.join(".codex");
         std::fs::create_dir_all(&codex_home).unwrap();
+        provider_cli::install_codex_version_probe(&home);
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(
             codex_home.join("config.toml"),
@@ -14003,6 +14007,11 @@ fn session_recovery_workspace_reservation_reconciles_or_cancels_the_complete_tup
                 policy.to_string(),
             ],
         );
+        fixture.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES(?1,?1,'service','workspace.dispatch_intent','attempt',?2,'{\"intent\":\"automatic\"}','2026-01-01T00:00:00Z')",
+            params![format!("{name}-dispatch-intent"), attempt_id],
+        );
         (task_id, attempt_id, workspace_id, workspace_path)
     };
     let mark_workspace_recovery =
@@ -14039,6 +14048,109 @@ fn session_recovery_workspace_reservation_reconciles_or_cancels_the_complete_tup
             ],
         );
         };
+
+    let gitlink = Fixture::new("workspace-retry-existing-gitlink");
+    let (gitlink_task, gitlink_attempt, gitlink_workspace, gitlink_path) =
+        reserve_workspace(&gitlink, "gitlink");
+    mark_workspace_recovery(
+        &gitlink,
+        &gitlink_task,
+        &gitlink_attempt,
+        &gitlink_workspace,
+    );
+    let base = workspace::inspect(&gitlink_path).unwrap().head;
+    run(
+        &gitlink_path,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{base},nested"),
+        ],
+    );
+    let before_policy = std::fs::read(gitlink_path.join("fixture.txt")).unwrap();
+    let gitlink_app = Application::new_with_synthetic_dispatch_for_tests(
+        instance_paths(&gitlink),
+        gitlink.store.clone(),
+        std::env::current_exe().unwrap(),
+        test_hooks(&gitlink),
+    )
+    .unwrap();
+    let rejected_command = HumanCommand::RetryWorkspaceReservation {
+        operation_id: "retry-existing-gitlink".into(),
+        task_id: gitlink_task.clone(),
+        attempt_id: gitlink_attempt.clone(),
+        workspace_id: gitlink_workspace.clone(),
+        expected_version: gitlink.scalar(&format!(
+            "SELECT version FROM tasks WHERE id='{gitlink_task}'"
+        )),
+    };
+    let rejected = gitlink_app
+        .execute_human_command(&rejected_command)
+        .unwrap();
+    assert_eq!(rejected.state, "workspace_recovery_required");
+    assert!(rejected.detail["reason"]
+        .as_str()
+        .unwrap()
+        .contains("Git submodules"));
+    assert_eq!(
+        serde_json::to_value(
+            gitlink_app
+                .execute_human_command(&rejected_command)
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&rejected).unwrap(),
+    );
+    gitlink.assert_scalar(
+        &format!("SELECT state FROM workspaces WHERE id='{gitlink_workspace}'"),
+        "recovery_required".to_owned(),
+    );
+    gitlink.assert_scalar(
+        &format!("SELECT state FROM claims WHERE attempt_id='{gitlink_attempt}'"),
+        "unknown".to_owned(),
+    );
+    gitlink.assert_scalar(
+        &format!("SELECT status FROM attempts WHERE id='{gitlink_attempt}'"),
+        "needs_recovery".to_owned(),
+    );
+    gitlink.assert_scalar(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{gitlink_attempt}'"), 0_i64);
+    assert_eq!(
+        std::fs::read(gitlink_path.join("fixture.txt")).unwrap(),
+        before_policy
+    );
+    run(&gitlink_path, &["update-index", "--force-remove", "nested"]);
+    let recovered = gitlink_app
+        .execute_human_command(&HumanCommand::RetryWorkspaceReservation {
+            operation_id: "retry-after-removing-gitlink".into(),
+            task_id: gitlink_task.clone(),
+            attempt_id: gitlink_attempt.clone(),
+            workspace_id: gitlink_workspace.clone(),
+            expected_version: gitlink.scalar(&format!(
+                "SELECT version FROM tasks WHERE id='{gitlink_task}'"
+            )),
+        })
+        .unwrap();
+    assert_eq!(
+        recovered.state, "workspace_reservation_recovered",
+        "{recovered:?}"
+    );
+    gitlink.assert_scalar(
+        &format!("SELECT state FROM workspaces WHERE id='{gitlink_workspace}'"),
+        "ready".to_owned(),
+    );
+    gitlink.assert_scalar(
+        &format!("SELECT state FROM claims WHERE attempt_id='{gitlink_attempt}'"),
+        "running".to_owned(),
+    );
+    gitlink.assert_scalar(
+        &format!("SELECT status FROM attempts WHERE id='{gitlink_attempt}'"),
+        "running".to_owned(),
+    );
+    gitlink.assert_scalar(
+        &format!("SELECT attention FROM tasks WHERE id='{gitlink_task}'"),
+        "none".to_owned(),
+    );
 
     let first_inspection =
         Fixture::new("workspace-first-inspection-recovery").with_synthetic_claude();
@@ -33849,9 +33961,23 @@ fn t12_rotation_export_and_degraded_sink_redact_without_state_change() {
          INSERT INTO trip_runtime_admissions(id,project_id,scope_hash,state,fresh_call_count,failure_reason,created_at,updated_at)
            VALUES('runtime-admission-preserved','p','runtime-scope-hash-preserved','failed',1,'PATH-FAILURE-SENTINEL /private/runtime/control.sock','2026-01-02T00:00:00Z','2026-01-02T00:00:01Z');
          INSERT INTO trip_runtime_probes(admission_id,role,launch_config_json,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_key,capability_identity_json,fixture_project_id,fixture_repository_identity,fixture_root,workspace_path,service_sentinel_path,control_socket_path,nonce,state,failure_reason,created_at,updated_at)
-           VALUES('runtime-admission-preserved','explorer','{}','{\"provider\":\"codex\",\"model\":\"gpt-5.6-sol\",\"effort\":\"high\"}','runtime-profile-hash-preserved','runtime-config-preserved','configuration-hash-preserved','codex','runtime-adapter-hash-preserved','runtime-capability-key-preserved','{}','p','PATH-RUNTIME-IDENTITY-SENTINEL','/private/PATH-RUNTIME-FIXTURE-SENTINEL','/private/PATH-RUNTIME-WORKSPACE-SENTINEL','/private/PATH-RUNTIME-SERVICE-SENTINEL','/private/PATH-RUNTIME-CONTROL-SENTINEL','RUNTIME-NONCE-SENTINEL','failed','model_refusal','2026-01-02T00:00:00Z','2026-01-02T00:00:01Z');
-         INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
-           VALUES('runtime-capability-id-preserved','codex','codex-fixture','explorer','interactive_pty','runtime-capability-key-preserved','supported','runtime-proof-correlation-preserved','[]','2026-01-02T00:00:02Z','{\"status\":\"supported\",\"permission_policy\":\"PATH-RUNTIME-POLICY-SENTINEL /private/runtime/control.sock\",\"runtime_scope\":{\"scope_hash\":\"published-runtime-scope-hash-preserved\",\"fixture_repository_identity\":\"PATH-PUBLISHED-FIXTURE-IDENTITY-SENTINEL\",\"profiles\":[{\"capability_identity\":\"PATH-PUBLISHED-CAPABILITY-IDENTITY-SENTINEL /private/runtime/role.sock\"}]}}');",
+           VALUES('runtime-admission-preserved','explorer','{}','{\"provider\":\"codex\",\"model\":\"gpt-5.6-sol\",\"effort\":\"high\"}','runtime-profile-hash-preserved','runtime-config-preserved','configuration-hash-preserved','codex','runtime-adapter-hash-preserved','runtime-capability-key-preserved','{}','p','PATH-RUNTIME-IDENTITY-SENTINEL','/private/PATH-RUNTIME-FIXTURE-SENTINEL','/private/PATH-RUNTIME-WORKSPACE-SENTINEL','/private/PATH-RUNTIME-SERVICE-SENTINEL','/private/PATH-RUNTIME-CONTROL-SENTINEL','RUNTIME-NONCE-SENTINEL','failed','model_refusal','2026-01-02T00:00:00Z','2026-01-02T00:00:01Z');",
+    ).unwrap();
+    let published_runtime_scope_hash = hex::encode(sha2::Sha256::digest(
+        b"published-runtime-scope-hash-preserved",
+    ));
+    connection.execute(
+        "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,evidence_reference,gaps_json,checked_at,proof_json)
+           VALUES('runtime-capability-id-preserved','codex','codex-fixture','explorer','interactive_pty','runtime-capability-key-preserved','supported','runtime-proof-correlation-preserved','[]','2026-01-02T00:00:02Z',?1)",
+        params![serde_json::json!({
+            "status":"supported",
+            "permission_policy":"PATH-RUNTIME-POLICY-SENTINEL /private/runtime/control.sock",
+            "runtime_scope":{
+                "scope_hash":published_runtime_scope_hash,
+                "fixture_repository_identity":"PATH-PUBLISHED-FIXTURE-IDENTITY-SENTINEL",
+                "profiles":[{"capability_identity":"PATH-PUBLISHED-CAPABILITY-IDENTITY-SENTINEL /private/runtime/role.sock"}]
+            }
+        }).to_string()],
     ).unwrap();
     connection.execute_batch(
         "INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,setup_operation_id,created_at,updated_at)
@@ -33945,7 +34071,7 @@ fn t12_rotation_export_and_degraded_sink_redact_without_state_change() {
         "runtime-profile-hash-preserved",
         "runtime-adapter-hash-preserved",
         "runtime-capability-key-preserved",
-        "published-runtime-scope-hash-preserved",
+        published_runtime_scope_hash.as_str(),
         "configuration-hash-preserved",
         "model_refusal",
         "setup-session-correlation-preserved",
@@ -53258,11 +53384,17 @@ fn startup_check_recovery_publication_rolls_back_and_retries_exactly_once() {
         serde_json::json!({
             "check_id":"startup-check","observation":"recorded_processes_absent",
             "live_pids":[],"replacement_allowed":false,
+            "evidence":{"capture_incomplete":null,"capture_settlement":null},
         })
     );
+    let mut expected_evidence = record["detail"].clone();
+    expected_evidence["prior_evidence"] = true.into();
+    // Missing capture observations remain absent when the JSON merge patch
+    // preserves the earlier evidence document.
+    expected_evidence["evidence"] = serde_json::json!({});
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(state["evidence"].as_str().unwrap()).unwrap(),
-        record["detail"]
+        expected_evidence
     );
 
     assert!(recovery::reconcile_prior_boot(&fixture.store)
@@ -59791,7 +59923,7 @@ fn main_selected_check_rebinds_frozen_checkout_delta_and_refuses_drift() {
         .unwrap();
     fixture.execute("INSERT INTO trip_verification_checks(id,project_id,config_revision_id,check_key,category,
         command_kind,executable,arguments_json,cwd,timeout_seconds,acceptance_rows_json,relevant_inputs_json,invalidation_json,original_text)
-        VALUES('main-manifest-check',?1,?2,'main-manifest-check','focused','structured_argv','/bin/sleep','[\"2\"]','.',30,'[]','[]','{}','unchanged candidate check')",
+        VALUES('main-manifest-check',?1,?2,'main-manifest-check','focused','structured_argv','/usr/bin/true','[]','.',30,'[]','[]','{}','unchanged candidate check')",
         params![project,config_revision]);
     fixture.execute("INSERT INTO trip_selected_checks(attempt_id,revision,check_id,required,selected_by_generation_id,created_at)
         VALUES(?1,1,'main-manifest-check',1,'main-check-manager','2026-01-01T00:00:00Z')", params![plan.attempt_id]);
@@ -59820,6 +59952,60 @@ fn main_selected_check_rebinds_frozen_checkout_delta_and_refuses_drift() {
         ),
         0,
     );
+    for exit_code in [0, 7] {
+        let arguments =
+            serde_json::json!(["-c", format!("printf immediate-output; exit {exit_code}")]);
+        fixture.execute(
+            "UPDATE trip_verification_checks SET executable='/bin/sh',arguments_json=?1 WHERE id='main-manifest-check'",
+            params![arguments.to_string()],
+        );
+        let immediate_selection = workflow::state(&fixture.store)
+            .unwrap()
+            .trip_task_verification
+            .into_iter()
+            .find(|entry| {
+                entry["attempt_id"] == plan.attempt_id && entry["check_id"] == "main-manifest-check"
+            })
+            .unwrap();
+        execute_trip(
+            &fixture,
+            &paths,
+            &format!("authorize-immediate-check-{exit_code}"),
+            &TripHumanAction::AuthorizeCheck {
+                attempt_id: plan.attempt_id.clone(),
+                check_id: "main-manifest-check".into(),
+                selected_revision: 1,
+                exact_command_hash: immediate_selection["exact_command_hash"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+                scope_hash: immediate_selection["scope_hash"].as_str().unwrap().into(),
+                decision: "approved".into(),
+                lifetime: "once".into(),
+            },
+        )
+        .unwrap();
+        let immediate = checks
+            .run_selected(&plan.attempt_id, "main-manifest-check")
+            .unwrap();
+        assert_eq!(immediate["exit_code"], exit_code);
+        assert_eq!(immediate["passed"], exit_code == 0);
+        assert_eq!(immediate["recovery_required"], false, "{immediate}");
+        assert_eq!(immediate["evidence"]["stdout"], "immediate-output");
+        assert_eq!(immediate["evidence"]["capture_incomplete"], false);
+        assert_eq!(immediate["evidence"]["candidate_unchanged"], true);
+        let run_id = immediate["check_id"].as_str().unwrap();
+        let persisted: (String, String, i64) = fixture
+            .connection()
+            .query_row(
+                "SELECT status,launch_state,exit_code FROM check_runs WHERE id=?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, ("finished".into(), "finished".into(), exit_code));
+    }
+    fixture.execute("UPDATE trip_verification_checks SET executable='/usr/bin/true',arguments_json='[]' WHERE id='main-manifest-check'", []);
     let mut failures = Vec::<(String, String)>::new();
     for case in [
         "unchanged",
@@ -60707,6 +60893,1241 @@ fn completed_review_late_exit_settles_only_its_exact_recovery() {
             i64::from(resolved),
         );
     }
+}
+
+#[test]
+fn workspace_recovery_preserves_prepare_and_automatic_dispatch_intent() {
+    for (family, prepare, recovery, legacy) in [
+        ("trip", true, false, false),
+        ("trip", true, true, false),
+        ("single_agent", true, false, false),
+        ("single_agent", true, true, false),
+        ("single_agent", false, false, false),
+        ("single_agent", false, true, false),
+        ("single_agent", false, false, true),
+    ] {
+        let label = format!("recovered-intent-{family}-{prepare}-{recovery}-{legacy}");
+        let (fixture, project, task, version) = if family == "single_agent" {
+            let (fixture, repository) = single_agent_fixture(&label);
+            let setup = admitted_single_agent_project(&fixture, &repository);
+            let (task, version) = single_agent_task(&fixture, &setup);
+            let version = make_ready(&fixture, &task, version).unwrap();
+            (fixture, setup.project_id, task, version)
+        } else {
+            let fixture = Fixture::new(&label);
+            let project = add_project(&fixture, fixture.repository("project"), "project");
+            let task = create_task(&fixture, &project, "prepared-task", 0);
+            let version = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+            (fixture, project, task, version)
+        };
+        if prepare {
+            fixture.execute(
+                "UPDATE projects SET queue_paused=1 WHERE id=?1",
+                params![project],
+            );
+            workflow::execute(
+                &fixture.store,
+                &HumanCommand::Control {
+                    operation_id: "prepare-recovery".into(),
+                    task_id: task.clone(),
+                    expected_version: version,
+                    action: "run_next".into(),
+                    payload: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+        }
+        let plan = claim(&fixture, fixture.root.join("artifacts"));
+        assert_eq!(plan.task_id, task);
+        fixture.assert_scalar(
+            &format!("SELECT json_extract(detail_json,'$.intent') FROM audit_events WHERE event_code='workspace.dispatch_intent' AND entity_id='{}'", plan.attempt_id),
+            if prepare { "prepare_only" } else { "automatic" }.to_owned(),
+        );
+        if legacy {
+            fixture.execute("DELETE FROM audit_events WHERE event_code='workspace.dispatch_intent' AND entity_id=?1", params![plan.attempt_id]);
+        }
+        if family == "single_agent" && prepare && recovery {
+            run(
+                &plan.repository_path,
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    plan.workspace_path.to_str().unwrap(),
+                ],
+            );
+            assert!(!plan.workspace_path.exists());
+        }
+        rewind_workspace_publication(&fixture, &plan, recovery);
+        let sessions: i64 = fixture.scalar("SELECT COUNT(*) FROM sessions");
+        if recovery {
+            let app = if family == "single_agent" {
+                single_agent_application(&fixture)
+            } else {
+                Application::new_with_synthetic_dispatch_for_tests(
+                    instance_paths(&fixture),
+                    fixture.store.clone(),
+                    std::env::current_exe().unwrap(),
+                    test_hooks(&fixture),
+                )
+                .unwrap()
+            };
+            let command = HumanCommand::RetryWorkspaceReservation {
+                operation_id: "retry-prepared-workspace".into(),
+                task_id: task.clone(),
+                attempt_id: plan.attempt_id.clone(),
+                workspace_id: plan.workspace_id.clone(),
+                expected_version: fixture
+                    .scalar(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+            };
+            let result = app.execute_human_command(&command).unwrap();
+            assert_eq!(
+                result.state, "workspace_reservation_recovered",
+                "{label}: {result:?}"
+            );
+            assert_eq!(
+                serde_json::to_value(app.execute_human_command(&command).unwrap()).unwrap(),
+                serde_json::to_value(result).unwrap()
+            );
+        } else {
+            let restarted = Store::open(&fixture.database).unwrap();
+            assert_eq!(
+                Scheduler::new(restarted, fixture.root.join("artifacts"))
+                    .reconcile_unknown()
+                    .unwrap(),
+                vec![plan.attempt_id.clone()],
+                "{label}"
+            );
+        }
+        let held = prepare || legacy;
+        assert!(plan.workspace_path.join("fixture.txt").is_file(), "{label}");
+        fixture.assert_scalar(
+            &format!("SELECT a.status||':'||t.attention||':'||w.state||':'||c.state FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN workspaces w ON w.attempt_id=a.id JOIN claims c ON c.attempt_id=a.id WHERE a.id='{}'", plan.attempt_id),
+            if held { "held:paused:ready:running" } else { "running:none:ready:running" }.to_owned(),
+        );
+        fixture.assert_scalar(
+            &format!("SELECT queue_paused FROM projects WHERE id='{project}'"),
+            i64::from(prepare),
+        );
+        fixture.assert_scalar("SELECT COUNT(*) FROM sessions", sessions);
+        fixture.assert_scalar(
+            &format!(
+                "SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}'",
+                plan.attempt_id
+            ),
+            0_i64,
+        );
+        if held {
+            let command = HumanCommand::Control {
+                operation_id: "continue-recovered-workspace".into(),
+                task_id: task.clone(),
+                expected_version: fixture
+                    .scalar(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+                action: "continue".into(),
+                payload: serde_json::json!({}),
+            };
+            let continued = workflow::execute(&fixture.store, &command).unwrap();
+            assert_eq!(
+                serde_json::to_value(workflow::execute(&fixture.store, &command).unwrap()).unwrap(),
+                serde_json::to_value(continued).unwrap()
+            );
+            fixture.assert_scalar("SELECT COUNT(*) FROM audit_events WHERE operation_id='continue-recovered-workspace' AND event_code='workspace.dispatch_intent' AND json_extract(detail_json,'$.intent')='automatic'", 1_i64);
+            fixture.assert_scalar("SELECT COUNT(*) FROM sessions", sessions);
+        }
+    }
+}
+
+fn rewind_workspace_publication(
+    fixture: &Fixture,
+    plan: &agenticjira::scheduler::DispatchPlan,
+    recovery: bool,
+) {
+    fixture.execute(
+        "UPDATE workspaces SET state=?1 WHERE id=?2",
+        params![
+            if recovery {
+                "recovery_required"
+            } else {
+                "reserved"
+            },
+            plan.workspace_id
+        ],
+    );
+    fixture.execute(
+        "UPDATE attempts SET status=?1 WHERE id=?2",
+        params![
+            if recovery {
+                "needs_recovery"
+            } else {
+                "workspace_reserved"
+            },
+            plan.attempt_id
+        ],
+    );
+    fixture.execute(
+        "UPDATE claims SET state=?1 WHERE attempt_id=?2",
+        params![
+            if recovery { "unknown" } else { "reserved" },
+            plan.attempt_id
+        ],
+    );
+    fixture.execute(
+        "UPDATE tasks SET attention=?1 WHERE id=?2",
+        params![
+            if recovery { "needs_recovery" } else { "none" },
+            plan.task_id
+        ],
+    );
+    if recovery {
+        fixture.execute(
+            "INSERT INTO recovery_records(id,attempt_id,state,detail_json,created_at,updated_at)
+             VALUES(?1,?2,'attention_required',?3,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            params![uuid::Uuid::new_v4().to_string(), plan.attempt_id,
+                serde_json::json!({"kind":"workspace_reservation","workspace_id":plan.workspace_id,"attempt_id":plan.attempt_id,"task_id":plan.task_id}).to_string()],
+        );
+    }
+}
+
+#[test]
+fn single_agent_workspace_recovery_rechecks_pinned_authority_and_execution_history() {
+    let (fixture, repository) = single_agent_fixture("single-agent-recovery-authority");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task, version) = single_agent_task(&fixture, &setup);
+    make_ready(&fixture, &task, version).unwrap();
+    let plan = claim(&fixture, fixture.root.join("artifacts"));
+    rewind_workspace_publication(&fixture, &plan, true);
+    let app = single_agent_application(&fixture);
+    let bytes = std::fs::read(plan.workspace_path.join("fixture.txt")).unwrap();
+    for (label, apply, revert) in [
+        ("invalid-admission", "UPDATE profile_admissions SET state='invalidated' WHERE id=(SELECT admission_id FROM workflow_run_profiles WHERE attempt_id=?1)", "UPDATE profile_admissions SET state='activated' WHERE id=(SELECT admission_id FROM workflow_run_profiles WHERE attempt_id=?1)"),
+        ("changed-scope", "UPDATE tasks SET title='Changed after reservation' WHERE id=(SELECT task_id FROM attempts WHERE id=?1)", "UPDATE tasks SET title='Say done' WHERE id=(SELECT task_id FROM attempts WHERE id=?1)"),
+        ("changed-profile", "UPDATE workflow_run_profiles SET profile_hash='changed' WHERE attempt_id=?1", "UPDATE workflow_run_profiles SET profile_hash=(SELECT profile_hash FROM agent_profile_revisions WHERE id=workflow_run_profiles.profile_revision_id) WHERE attempt_id=?1"),
+        ("execution-history", "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at) VALUES('recovery-history',?1,'single_agent','codex',1,1,'exited','f','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", "DELETE FROM role_generations WHERE attempt_id=?1 AND id='recovery-history'"),
+    ] {
+        fixture.execute(apply, params![plan.attempt_id]);
+        assert!(scheduler(&fixture, fixture.root.join("artifacts")).reconcile_unknown().unwrap().is_empty(), "{label}");
+        let result = app.execute_human_command(&HumanCommand::RetryWorkspaceReservation {
+            operation_id: format!("refuse-recovery-{label}"), task_id: task.clone(),
+            attempt_id: plan.attempt_id.clone(), workspace_id: plan.workspace_id.clone(),
+            expected_version: fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+        }).unwrap();
+        assert_eq!(result.state, "workspace_recovery_required", "{label}: {result:?}");
+        assert!(result.detail["reason"].as_str().unwrap().contains("Single agent"), "{result:?}");
+        fixture.assert_scalar(&format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id), "needs_recovery".to_owned());
+        fixture.assert_scalar(&format!("SELECT state FROM claims WHERE attempt_id='{}'", plan.attempt_id), "unknown".to_owned());
+        assert_eq!(std::fs::read(plan.workspace_path.join("fixture.txt")).unwrap(), bytes);
+        fixture.execute(revert, params![plan.attempt_id]);
+    }
+    fixture.execute(
+        "UPDATE workspaces SET path=?1 WHERE id=?2",
+        params![repository.to_str().unwrap(), plan.workspace_id],
+    );
+    assert!(scheduler(&fixture, fixture.root.join("artifacts"))
+        .reconcile_unknown()
+        .unwrap()
+        .is_empty());
+    let refused_primary = app
+        .execute_human_command(&HumanCommand::RetryWorkspaceReservation {
+            operation_id: "refuse-primary-as-isolated-recovery".into(),
+            task_id: task.clone(),
+            attempt_id: plan.attempt_id.clone(),
+            workspace_id: plan.workspace_id.clone(),
+            expected_version: fixture
+                .scalar(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+        })
+        .unwrap();
+    assert_eq!(refused_primary.state, "workspace_recovery_required");
+    assert!(refused_primary.detail["reason"]
+        .as_str()
+        .unwrap()
+        .contains("separate isolated worktree"));
+    assert_eq!(
+        std::fs::read(repository.join("fixture.txt")).unwrap(),
+        bytes
+    );
+    fixture.execute(
+        "UPDATE workspaces SET path=?1 WHERE id=?2",
+        params![plan.workspace_path.to_str().unwrap(), plan.workspace_id],
+    );
+    assert_eq!(
+        scheduler(&fixture, fixture.root.join("artifacts"))
+            .reconcile_unknown()
+            .unwrap(),
+        vec![plan.attempt_id.clone()]
+    );
+    fixture.assert_scalar(
+        &format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id),
+        "running".to_owned(),
+    );
+    fixture.assert_scalar(
+        &format!(
+            "SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}'",
+            plan.attempt_id
+        ),
+        0_i64,
+    );
+}
+
+fn prepared_single_agent_main_workspace(
+    label: &str,
+) -> (
+    Fixture,
+    agenticjira::scheduler::DispatchPlan,
+    InstancePaths,
+    std::os::unix::net::UnixListener,
+) {
+    let (fixture, repository) = single_agent_fixture(label);
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task, version) = single_agent_task(&fixture, &setup);
+    let selected = workflow_command(&fixture, serde_json::json!({
+        "kind":"set_task_workflow","operation_id":"select-main-recovery","task_id":task,"expected_version":version,
+        "selection":{"family":"single_agent","workspace_mode":"main_checkout","execution_config_revision_id":setup.config_id,"profile_revision_id":setup.profile_revision_id,"check_ids":[]}
+    })).unwrap();
+    let scope = workflow::state(&fixture.store)
+        .unwrap()
+        .tasks
+        .into_iter()
+        .find(|item| item.id == task)
+        .unwrap()
+        .workflow
+        .unwrap()
+        .checkout_scope
+        .unwrap();
+    let ready = workflow::execute(
+        &fixture.store,
+        &HumanCommand::MakeReady {
+            operation_id: "authorize-main-recovery".into(),
+            task_id: task.clone(),
+            expected_version: selected.version.unwrap(),
+            checkout_authorization: Some(agenticjira::domain::CheckoutAuthorizationInput {
+                scope_hash: scope.scope_hash,
+            }),
+        },
+    )
+    .unwrap();
+    std::fs::write(
+        repository.join("fixture.txt"),
+        b"preserve Main dirty bytes\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repository.join("user-note.txt"),
+        b"preserve Main untracked bytes\n",
+    )
+    .unwrap();
+    let paths = instance_paths(&fixture);
+    std::fs::write(&paths.database, b"synthetic instance database").unwrap();
+    let control_listener = std::os::unix::net::UnixListener::bind(&paths.control_socket).unwrap();
+    workflow_command(&fixture, serde_json::json!({
+        "kind":"verify_main_checkout","operation_id":"verify-main-recovery","task_id":task,"expected_version":ready.version.unwrap()
+    })).unwrap();
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: "prepare-main-recovery".into(),
+            task_id: task.clone(),
+            expected_version: fixture
+                .scalar(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+            action: "run_next".into(),
+            payload: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    let plan = scheduler(&fixture, paths.artifacts.clone())
+        .claim_next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.state, "ready_held");
+    (fixture, plan, paths, control_listener)
+}
+
+fn workspace_recovery_state(
+    fixture: &Fixture,
+    plan: &agenticjira::scheduler::DispatchPlan,
+) -> serde_json::Value {
+    let state: String = fixture.connection().query_row(
+        "SELECT json_object(
+            'task',json_object('version',t.version,'lifecycle',t.lifecycle,'attention',t.attention,'updated_at',t.updated_at),
+            'attempt',json_object('status',a.status,'updated_at',a.updated_at),
+            'workspace',json_object('state',w.state,'path',w.path,'policy',w.policy_json,'updated_at',w.updated_at),
+            'claim',json_object('id',c.id,'state',c.state,'updated_at',c.updated_at),
+            'recoveries',json((SELECT json_group_array(json_object('id',r.id,'state',r.state,'detail',r.detail_json,
+                'resolved_at',r.resolved_at,'updated_at',r.updated_at)) FROM recovery_records r WHERE r.attempt_id=a.id)))
+         FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN workspaces w ON w.attempt_id=a.id
+         JOIN claims c ON c.attempt_id=a.id WHERE a.id=?1 AND w.id=?2",
+        params![plan.attempt_id, plan.workspace_id],
+        |row| row.get(0),
+    ).unwrap();
+    serde_json::from_str(&state).unwrap()
+}
+
+#[test]
+fn single_agent_workspace_recovery_preserves_generic_cancel() {
+    let (fixture, repository) = single_agent_fixture("workspace-recovery-generic-cancel");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task, version) = single_agent_task(&fixture, &setup);
+    make_ready(&fixture, &task, version).unwrap();
+    let plan = claim(&fixture, fixture.root.join("artifacts"));
+    assert_eq!(plan.state, "ready");
+    rewind_workspace_publication(&fixture, &plan, true);
+    let app = single_agent_application(&fixture);
+    let sessions: i64 = fixture.scalar("SELECT COUNT(*) FROM sessions");
+    let bytes = std::fs::read(plan.workspace_path.join("fixture.txt")).unwrap();
+    let cancelled = app
+        .execute_human_command(&HumanCommand::Control {
+            operation_id: "generic-cancel-before-recovery".into(),
+            task_id: task.clone(),
+            expected_version: fixture
+                .scalar(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+            action: "cancel".into(),
+            payload: serde_json::json!({}),
+        })
+        .unwrap();
+    assert_eq!(cancelled.state, "control_requested");
+    let stopped = tick_until(&fixture, &app, "recovery_required_for_cancel");
+    assert_eq!(stopped["attempt_id"], plan.attempt_id);
+    assert_eq!(stopped["public_resolution"], "cancel_workspace_reservation");
+    let cancellation_sql =
+        "SELECT json_object('id',id,'kind',kind,'state',state,'payload',payload_json,
+        'expected_version',expected_version,'updated_at',updated_at) FROM controls
+        WHERE requested_operation_id='generic-cancel-before-recovery'";
+    let cancellation: String = fixture.scalar(cancellation_sql);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&cancellation).unwrap()["state"],
+        "recovery_required"
+    );
+
+    let restarted = Store::open(&fixture.database).unwrap();
+    assert!(Scheduler::new(restarted, fixture.root.join("artifacts"))
+        .reconcile_unknown()
+        .unwrap()
+        .is_empty());
+    fixture.assert_scalar(cancellation_sql, cancellation.clone());
+    fixture.assert_scalar(
+        &format!("SELECT a.status||':'||t.attention||':'||w.state||':'||c.state FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN workspaces w ON w.attempt_id=a.id JOIN claims c ON c.attempt_id=a.id WHERE a.id='{}'", plan.attempt_id),
+        "needs_recovery:needs_recovery:recovery_required:unknown".to_owned(),
+    );
+    assert!(fixture
+        .store
+        .single_agent_launch_context(&plan.attempt_id)
+        .is_err());
+
+    let retry = HumanCommand::RetryWorkspaceReservation {
+        operation_id: "retry-after-generic-cancel".into(),
+        task_id: task.clone(),
+        attempt_id: plan.attempt_id.clone(),
+        workspace_id: plan.workspace_id.clone(),
+        expected_version: fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+    };
+    let refused = app.execute_human_command(&retry).unwrap();
+    assert_eq!(refused.state, "workspace_recovery_required");
+    assert!(refused.detail["reason"]
+        .as_str()
+        .unwrap()
+        .contains("Cancellation is still pending"));
+    assert_eq!(
+        serde_json::to_value(app.execute_human_command(&retry).unwrap()).unwrap(),
+        serde_json::to_value(refused).unwrap()
+    );
+    fixture.assert_scalar(cancellation_sql, cancellation.clone());
+    assert!(fixture
+        .store
+        .single_agent_launch_context(&plan.attempt_id)
+        .is_err());
+    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", sessions);
+    fixture.assert_scalar(
+        &format!(
+            "SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}'",
+            plan.attempt_id
+        ),
+        0_i64,
+    );
+    assert_eq!(
+        std::fs::read(plan.workspace_path.join("fixture.txt")).unwrap(),
+        bytes
+    );
+
+    let completed = app
+        .execute_human_command(&HumanCommand::CancelWorkspaceReservation {
+            operation_id: "finish-generic-workspace-cancel".into(),
+            task_id: task.clone(),
+            attempt_id: plan.attempt_id.clone(),
+            workspace_id: plan.workspace_id.clone(),
+            expected_version: fixture
+                .scalar(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+        })
+        .unwrap();
+    assert_eq!(completed.state, "workspace_reservation_cancelled");
+    fixture.assert_scalar(
+        &format!("SELECT lifecycle FROM tasks WHERE id='{task}'"),
+        "cancelled".to_owned(),
+    );
+    fixture.assert_scalar(cancellation_sql, cancellation);
+}
+
+#[test]
+fn single_agent_workspace_retry_preserves_intervening_generic_cancel() {
+    for cancel_state in ["requested", "draining", "recovery_required"] {
+        let (fixture, repository) =
+            single_agent_fixture(&format!("workspace-retry-cancel-{cancel_state}"));
+        let setup = admitted_single_agent_project(&fixture, &repository);
+        let (task, version) = single_agent_task(&fixture, &setup);
+        make_ready(&fixture, &task, version).unwrap();
+        let plan = claim(&fixture, fixture.root.join("artifacts"));
+        assert_eq!(plan.state, "ready");
+        rewind_workspace_publication(&fixture, &plan, true);
+        let app = single_agent_application(&fixture);
+        let version = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+        let sessions: i64 = fixture.scalar("SELECT COUNT(*) FROM sessions");
+        let cancellation_sql =
+            "SELECT json_object('id',id,'kind',kind,'state',state,'payload',payload_json,
+            'expected_version',expected_version,'updated_at',updated_at) FROM controls
+            WHERE requested_operation_id='cancel-during-workspace-retry'";
+        let mut winning_state = None;
+        let mut cancellation = None;
+        let late = app.scheduler.synthetic_workspace_retry_interleaving_for_tests(
+            "retry-before-generic-cancel", &task, &plan.attempt_id, &plan.workspace_id, version,
+            || {
+                let requested = app.execute_human_command(&HumanCommand::Control {
+                    operation_id: "cancel-during-workspace-retry".into(),
+                    task_id: task.clone(), expected_version: version,
+                    action: "cancel".into(), payload: serde_json::json!({}),
+                }).unwrap();
+                assert_eq!(requested.state, "control_requested");
+                match cancel_state {
+                    "recovery_required" => {
+                        let stopped = tick_until(&fixture, &app, "recovery_required_for_cancel");
+                        assert_eq!(stopped["attempt_id"], plan.attempt_id);
+                    }
+                    "draining" => {
+                        // Exercise the retained drain boundary without launching a writer.
+                        fixture.execute("UPDATE controls SET state='draining' WHERE requested_operation_id='cancel-during-workspace-retry'", []);
+                    }
+                    "requested" => {}
+                    _ => unreachable!(),
+                }
+                winning_state = Some(workspace_recovery_state(&fixture, &plan));
+                cancellation = Some(fixture.scalar::<String>(cancellation_sql));
+            },
+        ).unwrap();
+        assert_eq!(
+            late.state, "workspace_recovery_stale",
+            "{cancel_state}: {late:?}"
+        );
+        let winning_state = winning_state.unwrap();
+        assert_eq!(workspace_recovery_state(&fixture, &plan), winning_state);
+        fixture.assert_scalar(cancellation_sql, cancellation.unwrap());
+        assert_eq!(winning_state["attempt"]["status"], "needs_recovery");
+        assert_eq!(winning_state["claim"]["state"], "unknown");
+        assert_eq!(winning_state["workspace"]["state"], "recovery_required");
+        assert_eq!(winning_state["task"]["version"], version + 1);
+        assert_eq!(winning_state["task"]["attention"], "pause_requested");
+        let retry = HumanCommand::RetryWorkspaceReservation {
+            operation_id: "retry-before-generic-cancel".into(),
+            task_id: task.clone(),
+            attempt_id: plan.attempt_id.clone(),
+            workspace_id: plan.workspace_id.clone(),
+            expected_version: version,
+        };
+        assert_eq!(
+            serde_json::to_value(app.execute_human_command(&retry).unwrap()).unwrap(),
+            serde_json::to_value(late).unwrap()
+        );
+        assert_eq!(workspace_recovery_state(&fixture, &plan), winning_state);
+        assert!(fixture
+            .store
+            .single_agent_launch_context(&plan.attempt_id)
+            .is_err());
+        fixture.assert_scalar("SELECT COUNT(*) FROM sessions", sessions);
+        fixture.assert_scalar(
+            &format!(
+                "SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}'",
+                plan.attempt_id
+            ),
+            0_i64,
+        );
+    }
+}
+
+#[test]
+fn late_workspace_retry_preserves_winning_cancel_or_recovery() {
+    for main in [false, true] {
+        for cancel in [false, true] {
+            let label = format!("workspace-retry-race-{main}-{cancel}");
+            let (fixture, plan, paths, _control_listener) = if main {
+                let (fixture, plan, paths, listener) = prepared_single_agent_main_workspace(&label);
+                (fixture, plan, paths, Some(listener))
+            } else {
+                let (fixture, repository) = single_agent_fixture(&label);
+                let setup = admitted_single_agent_project(&fixture, &repository);
+                let (task, version) = single_agent_task(&fixture, &setup);
+                make_ready(&fixture, &task, version).unwrap();
+                let paths = instance_paths(&fixture);
+                let plan = claim(&fixture, paths.artifacts.clone());
+                (fixture, plan, paths, None)
+            };
+            rewind_workspace_publication(&fixture, &plan, true);
+            let app = Application::new_with_synthetic_compatibility_for_tests(
+                paths,
+                fixture.store.clone(),
+                std::env::current_exe().unwrap(),
+                test_hooks(&fixture),
+            )
+            .unwrap();
+            let version = fixture.scalar(&format!(
+                "SELECT version FROM tasks WHERE id='{}'",
+                plan.task_id
+            ));
+            let late_command = HumanCommand::RetryWorkspaceReservation {
+                operation_id: "late-retry".into(),
+                task_id: plan.task_id.clone(),
+                attempt_id: plan.attempt_id.clone(),
+                workspace_id: plan.workspace_id.clone(),
+                expected_version: version,
+            };
+            let winning_command = if cancel {
+                HumanCommand::CancelWorkspaceReservation {
+                    operation_id: "winning-cancel".into(),
+                    task_id: plan.task_id.clone(),
+                    attempt_id: plan.attempt_id.clone(),
+                    workspace_id: plan.workspace_id.clone(),
+                    expected_version: version,
+                }
+            } else {
+                HumanCommand::RetryWorkspaceReservation {
+                    operation_id: "winning-retry".into(),
+                    task_id: plan.task_id.clone(),
+                    attempt_id: plan.attempt_id.clone(),
+                    workspace_id: plan.workspace_id.clone(),
+                    expected_version: version,
+                }
+            };
+            let bytes = std::fs::read(plan.workspace_path.join("fixture.txt")).unwrap();
+            let sessions: i64 = fixture.scalar("SELECT COUNT(*) FROM sessions");
+            let mut winning_result = None;
+            let mut winning_state = None;
+            let late = app.scheduler.synthetic_workspace_retry_interleaving_for_tests(
+                "late-retry",
+                &plan.task_id,
+                &plan.attempt_id,
+                &plan.workspace_id,
+                version,
+                || {
+                    // The older Retry has reserved its receipt and completed
+                    // filesystem work; the competing command commits first.
+                    fixture.assert_scalar("SELECT json_extract(result_json,'$.state') FROM operation_receipts WHERE operation_id='late-retry'", "workspace_recovery_reserved".to_owned());
+                    let result = app.execute_human_command(&winning_command).unwrap();
+                    assert_eq!(result.state, if cancel { "workspace_reservation_cancelled" } else { "workspace_reservation_recovered" });
+                    winning_result = Some(serde_json::to_value(result).unwrap());
+                    winning_state = Some(workspace_recovery_state(&fixture, &plan));
+                },
+            ).unwrap();
+            assert_eq!(late.state, "workspace_recovery_stale", "{label}: {late:?}");
+            let winning_state = winning_state.unwrap();
+            assert_eq!(
+                workspace_recovery_state(&fixture, &plan),
+                winning_state,
+                "{label}"
+            );
+            assert_eq!(
+                winning_state["claim"]["state"],
+                if cancel { "cancelled" } else { "running" }
+            );
+            assert_eq!(
+                winning_state["attempt"]["status"],
+                if cancel {
+                    "cancelled"
+                } else if main {
+                    "held"
+                } else {
+                    "running"
+                }
+            );
+            assert_eq!(
+                winning_state["workspace"]["state"],
+                if cancel { "abandoned" } else { "ready" }
+            );
+            assert_eq!(
+                winning_state["task"]["lifecycle"],
+                if cancel { "cancelled" } else { "in_progress" }
+            );
+            assert_eq!(winning_state["task"]["version"], version + 1);
+            assert_eq!(
+                serde_json::to_value(app.execute_human_command(&late_command).unwrap()).unwrap(),
+                serde_json::to_value(late).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(app.execute_human_command(&winning_command).unwrap()).unwrap(),
+                winning_result.unwrap()
+            );
+            assert_eq!(workspace_recovery_state(&fixture, &plan), winning_state);
+            assert_eq!(
+                std::fs::read(plan.workspace_path.join("fixture.txt")).unwrap(),
+                bytes
+            );
+            fixture.assert_scalar("SELECT COUNT(*) FROM sessions", sessions);
+        }
+    }
+}
+
+#[test]
+fn workspace_retry_retains_only_its_original_recovery_version() {
+    let (fixture, repository) = single_agent_fixture("workspace-retry-version");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task, version) = single_agent_task(&fixture, &setup);
+    make_ready(&fixture, &task, version).unwrap();
+    let plan = claim(&fixture, fixture.root.join("artifacts"));
+    rewind_workspace_publication(&fixture, &plan, true);
+    let app = single_agent_application(&fixture);
+    for change_version in [false, true] {
+        let operation = format!("retry-version-{change_version}");
+        let version = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+        let mut before_failure = None;
+        let result = app.scheduler.synthetic_workspace_retry_interleaving_for_tests(
+            &operation, &task, &plan.attempt_id, &plan.workspace_id, version,
+            || {
+                fixture.execute("UPDATE workflow_run_profiles SET profile_hash='changed-before-publication' WHERE attempt_id=?1", params![plan.attempt_id]);
+                if change_version {
+                    fixture.execute("UPDATE tasks SET version=version+1 WHERE id=?1", params![task]);
+                }
+                before_failure = Some(workspace_recovery_state(&fixture, &plan));
+            },
+        ).unwrap();
+        assert_eq!(
+            result.state,
+            if change_version {
+                "workspace_recovery_stale"
+            } else {
+                "workspace_recovery_required"
+            }
+        );
+        if change_version {
+            assert_eq!(
+                workspace_recovery_state(&fixture, &plan),
+                before_failure.unwrap()
+            );
+        } else {
+            assert!(result.detail["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Single agent"));
+            fixture.assert_scalar(&format!("SELECT a.status||':'||w.state||':'||c.state FROM attempts a JOIN workspaces w ON w.attempt_id=a.id JOIN claims c ON c.attempt_id=a.id WHERE a.id='{}'", plan.attempt_id), "needs_recovery:recovery_required:unknown".to_owned());
+        }
+        let command = HumanCommand::RetryWorkspaceReservation {
+            operation_id: operation,
+            task_id: task.clone(),
+            attempt_id: plan.attempt_id.clone(),
+            workspace_id: plan.workspace_id.clone(),
+            expected_version: version,
+        };
+        assert_eq!(
+            serde_json::to_value(app.execute_human_command(&command).unwrap()).unwrap(),
+            serde_json::to_value(result).unwrap()
+        );
+        fixture.execute("UPDATE workflow_run_profiles SET profile_hash=(SELECT profile_hash FROM agent_profile_revisions WHERE id=workflow_run_profiles.profile_revision_id) WHERE attempt_id=?1", params![plan.attempt_id]);
+    }
+}
+
+#[test]
+fn single_agent_main_workspace_recovery_preserves_baseline_and_prepare_hold() {
+    for retry in [false, true] {
+        let (fixture, plan, paths, _control_listener) =
+            prepared_single_agent_main_workspace(&format!("single-agent-main-recovery-{retry}"));
+        let task = plan.task_id.clone();
+        let repository = plan.repository_path.clone();
+        let policy: String = fixture.scalar(&format!(
+            "SELECT policy_json FROM workspaces WHERE id='{}'",
+            plan.workspace_id
+        ));
+        let sessions: i64 = fixture.scalar("SELECT COUNT(*) FROM sessions");
+        rewind_workspace_publication(&fixture, &plan, retry);
+        if retry {
+            let app = Application::new_with_synthetic_compatibility_for_tests(
+                paths.clone(),
+                fixture.store.clone(),
+                std::env::current_exe().unwrap(),
+                test_hooks(&fixture),
+            )
+            .unwrap();
+            let result = app
+                .execute_human_command(&HumanCommand::RetryWorkspaceReservation {
+                    operation_id: "retry-main-workspace".into(),
+                    task_id: task.clone(),
+                    attempt_id: plan.attempt_id.clone(),
+                    workspace_id: plan.workspace_id.clone(),
+                    expected_version: fixture
+                        .scalar(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+                })
+                .unwrap();
+            assert_eq!(
+                result.state, "workspace_reservation_recovered",
+                "{result:?}"
+            );
+        } else {
+            assert_eq!(
+                scheduler(&fixture, paths.artifacts.clone())
+                    .reconcile_unknown()
+                    .unwrap(),
+                vec![plan.attempt_id.clone()]
+            );
+        }
+        fixture.assert_scalar(&format!("SELECT a.status||':'||t.attention FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id='{}'", plan.attempt_id), "held:paused".to_owned());
+        fixture.assert_scalar(
+            &format!(
+                "SELECT policy_json FROM workspaces WHERE id='{}'",
+                plan.workspace_id
+            ),
+            policy,
+        );
+        fixture.assert_scalar("SELECT COUNT(*) FROM sessions", sessions);
+        fixture.assert_scalar(
+            &format!(
+                "SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}'",
+                plan.attempt_id
+            ),
+            0_i64,
+        );
+        assert_eq!(
+            std::fs::read(repository.join("fixture.txt")).unwrap(),
+            b"preserve Main dirty bytes\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("user-note.txt")).unwrap(),
+            b"preserve Main untracked bytes\n"
+        );
+        assert!(!repository.join(".agents/trip-explorer").exists());
+    }
+}
+
+#[test]
+fn prepare_single_agent_preserves_current_admission_without_unpausing_project() {
+    let (fixture, repository) = single_agent_fixture("prepare-single-agent");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task, version) = single_agent_task(&fixture, &setup);
+    let admitted_version = make_ready(&fixture, &task, version).unwrap();
+    let sessions_before: i64 = fixture.scalar("SELECT COUNT(*) FROM sessions");
+    fixture.execute(
+        "UPDATE projects SET queue_paused=1 WHERE id=?1",
+        params![setup.project_id],
+    );
+    let command = HumanCommand::Control {
+        operation_id: "prepare-single-agent".into(),
+        task_id: task.clone(),
+        expected_version: admitted_version,
+        action: "run_next".into(),
+        payload: serde_json::json!({}),
+    };
+    let prepared = workflow::execute(&fixture.store, &command).unwrap();
+    assert_eq!(prepared.version, Some(admitted_version + 1));
+    assert_eq!(
+        workflow::execute(&fixture.store, &command).unwrap().version,
+        prepared.version,
+        "an exact replay cannot advance admission twice",
+    );
+    let binding: (String, i64, i64) = fixture
+        .connection()
+        .query_row(
+            "SELECT s.admission_state,s.admitted_task_version,t.version
+             FROM task_workflow_selections s JOIN tasks t ON t.id=s.task_id WHERE t.id=?1",
+            params![task],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        binding,
+        (
+            "admitted".into(),
+            admitted_version + 1,
+            admitted_version + 1
+        )
+    );
+    let plan = claim(&fixture, fixture.root.join("artifacts"));
+    assert_eq!(plan.task_id, task);
+    assert_eq!(plan.state, "ready_held");
+    fixture.assert_scalar(
+        &format!(
+            "SELECT queue_paused FROM projects WHERE id='{}'",
+            setup.project_id
+        ),
+        1_i64,
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", sessions_before);
+    fixture.assert_scalar(
+        &format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id JOIN attempts a ON a.id=g.attempt_id WHERE a.task_id='{task}'"),
+        0_i64,
+    );
+    let state = workflow::state(&fixture.store).unwrap();
+    let prepared_task = state.tasks.iter().find(|item| item.id == task).unwrap();
+    let run = prepared_task
+        .workflow
+        .as_ref()
+        .unwrap()
+        .run
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        run.stage,
+        agenticjira::domain::SingleAgentStage::WaitingToStart
+    );
+    assert!(run.stage_reason.contains("Choose Continue"));
+    assert!(run.resume.is_none());
+    assert!(state.decisions.iter().any(|decision| {
+        decision.subject.task_id.as_deref() == Some(task.as_str())
+            && decision
+                .control_policy
+                .allowed_controls
+                .contains(&"continue".into())
+    }));
+    let continue_command = HumanCommand::Control {
+        operation_id: "continue-prepared-single-agent".into(),
+        task_id: task.clone(),
+        expected_version: prepared_task.version,
+        action: "continue".into(),
+        payload: serde_json::json!({}),
+    };
+    let continued = workflow::execute(&fixture.store, &continue_command).unwrap();
+    assert_eq!(continued.state, "continued");
+    assert_eq!(continued.version, Some(prepared_task.version + 1));
+    assert_eq!(
+        serde_json::to_value(workflow::execute(&fixture.store, &continue_command).unwrap())
+            .unwrap(),
+        serde_json::to_value(&continued).unwrap(),
+    );
+    fixture.assert_scalar(
+        &format!("SELECT status FROM attempts WHERE id='{}'", plan.attempt_id),
+        "running".to_owned(),
+    );
+    fixture.assert_scalar(
+        &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+        "none".to_owned(),
+    );
+    fixture.assert_scalar(
+        &format!("SELECT version FROM tasks WHERE id='{task}'"),
+        prepared_task.version + 1,
+    );
+    fixture.assert_scalar(
+        &format!(
+            "SELECT queue_paused FROM projects WHERE id='{}'",
+            setup.project_id
+        ),
+        1_i64,
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", sessions_before);
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM controls WHERE requested_operation_id='continue-prepared-single-agent' AND kind='continue' AND state='finished'",
+        1_i64,
+    );
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE operation_id='continue-prepared-single-agent' AND event_code='control.applied'",
+        1_i64,
+    );
+    // The normal writer admission can now see the run, without launching it.
+    assert_eq!(
+        fixture
+            .store
+            .single_agent_launch_context(&plan.attempt_id)
+            .unwrap()
+            .attempt_id,
+        plan.attempt_id,
+    );
+    for (operation, version, action, payload, message) in [
+        (
+            "stale-single-agent-continue",
+            prepared_task.version,
+            "continue",
+            serde_json::json!({}),
+            "task version is stale",
+        ),
+        (
+            "duplicate-single-agent-continue",
+            prepared_task.version + 1,
+            "continue",
+            serde_json::json!({}),
+            "workflow control is not available",
+        ),
+        (
+            "continue-prepared-single-agent",
+            prepared_task.version,
+            "continue",
+            serde_json::json!({"changed":true}),
+            "operation ID was already used",
+        ),
+    ] {
+        let error = workflow::execute(
+            &fixture.store,
+            &HumanCommand::Control {
+                operation_id: operation.into(),
+                task_id: task.clone(),
+                expected_version: version,
+                action: action.into(),
+                payload,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(message), "{error}");
+    }
+}
+
+#[test]
+fn prepared_single_agent_continue_refuses_execution_history_and_unsafe_holds() {
+    let (fixture, repository) = single_agent_fixture("prepared-single-agent-fences");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task, version) = single_agent_task(&fixture, &setup);
+    let version = make_ready(&fixture, &task, version).unwrap();
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: "prepare-fenced-single-agent".into(),
+            task_id: task.clone(),
+            expected_version: version,
+            action: "run_next".into(),
+            payload: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    let plan = claim(&fixture, fixture.root.join("artifacts"));
+    assert_eq!(plan.state, "ready_held");
+    let version: i64 = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+    let attempt = &plan.attempt_id;
+    for (name, apply, revert) in [
+        ("unknown claim", "UPDATE claims SET state='unknown' WHERE attempt_id=?1", "UPDATE claims SET state='running' WHERE attempt_id=?1"),
+        ("workspace recovery", "UPDATE workspaces SET state='recovery_required' WHERE attempt_id=?1", "UPDATE workspaces SET state='ready' WHERE attempt_id=?1"),
+        ("open recovery", "INSERT INTO recovery_records(id,attempt_id,state,detail_json,created_at,updated_at) VALUES('prepared-fence',?1,'attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", "DELETE FROM recovery_records WHERE attempt_id=?1 AND id='prepared-fence'"),
+        ("pending cancellation", "INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at) VALUES('prepared-fence',?1,'cancel','requested',1,'{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", "DELETE FROM controls WHERE attempt_id=?1 AND id='prepared-fence'"),
+        ("launch permit history", "INSERT INTO launch_permits(id,attempt_id,role,settings_revision,state,created_at) VALUES('prepared-fence',?1,'implementer',1,'released_nondelivery','2026-01-01T00:00:00Z')", "DELETE FROM launch_permits WHERE attempt_id=?1 AND id='prepared-fence'"),
+        ("generation history", "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at) VALUES('prepared-fence',?1,'single_agent','codex',1,1,'exited','f','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", "DELETE FROM role_generations WHERE attempt_id=?1 AND id='prepared-fence'"),
+        ("candidate already captured", "UPDATE attempts SET candidate_hash='candidate' WHERE id=?1", "UPDATE attempts SET candidate_hash=NULL WHERE id=?1"),
+        ("definition unavailable", "UPDATE workflow_run_bindings SET definition_state='unavailable' WHERE attempt_id=?1", "UPDATE workflow_run_bindings SET definition_state='available' WHERE attempt_id=?1"),
+        ("admission invalidated", "UPDATE profile_admissions SET state='invalidated' WHERE id=(SELECT admission_id FROM workflow_run_profiles WHERE attempt_id=?1)", "UPDATE profile_admissions SET state='activated' WHERE id=(SELECT admission_id FROM workflow_run_profiles WHERE attempt_id=?1)"),
+    ] {
+        fixture.execute(apply, params![attempt]);
+        let state = workflow::state(&fixture.store).unwrap();
+        assert!(!state.decisions.iter().any(|decision| {
+            decision.subject.task_id.as_deref() == Some(task.as_str())
+                && decision.control_policy.allowed_controls.contains(&"continue".into())
+        }), "{name}");
+        let error = workflow::execute(&fixture.store, &HumanCommand::Control {
+            operation_id: format!("refuse-{name}"), task_id: task.clone(), expected_version: version,
+            action: "continue".into(), payload: serde_json::json!({}),
+        }).unwrap_err().to_string();
+        assert!(error.contains("workflow control is not available"), "{name}: {error}");
+        fixture.assert_scalar(&format!("SELECT status FROM attempts WHERE id='{attempt}'"), "held".to_owned());
+        fixture.assert_scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"), version);
+        fixture.execute(revert, params![attempt]);
+    }
+    // Even a proven exited session is history, not authority to start again.
+    seed_session(
+        &fixture,
+        attempt,
+        "single_agent",
+        "past-writer",
+        "past-writer-session",
+        "exited",
+    );
+    for action in ["continue", "run_next"] {
+        let error = workflow::execute(
+            &fixture.store,
+            &HumanCommand::Control {
+                operation_id: format!("refuse-exited-writer-{action}"),
+                task_id: task.clone(),
+                expected_version: version,
+                action: action.into(),
+                payload: serde_json::json!({}),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("workflow control is not available"),
+            "{error}"
+        );
+    }
+    fixture.assert_scalar(
+        &format!("SELECT COUNT(*) FROM controls WHERE attempt_id='{attempt}'"),
+        0_i64,
+    );
+    fixture.assert_scalar(
+        &format!("SELECT attention FROM tasks WHERE id='{task}'"),
+        "paused".to_owned(),
+    );
+}
+
+#[test]
+fn prepare_single_agent_does_not_refresh_a_stale_admission() {
+    let (fixture, repository) = single_agent_fixture("prepare-stale-single-agent");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task, version) = single_agent_task(&fixture, &setup);
+    let admitted_version = make_ready(&fixture, &task, version).unwrap();
+    let attempts_before: i64 = fixture.scalar("SELECT COUNT(*) FROM attempts");
+    let sessions_before: i64 = fixture.scalar("SELECT COUNT(*) FROM sessions");
+    // Represent an already stale persisted binding before the control command.
+    fixture.execute(
+        "UPDATE tasks SET version=version+1 WHERE id=?1",
+        params![task],
+    );
+    fixture.execute(
+        "UPDATE projects SET queue_paused=1 WHERE id=?1",
+        params![setup.project_id],
+    );
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: "prepare-stale-single-agent".into(),
+            task_id: task.clone(),
+            expected_version: admitted_version + 1,
+            action: "run_next".into(),
+            payload: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    fixture.assert_scalar(
+        &format!(
+            "SELECT admitted_task_version FROM task_workflow_selections WHERE task_id='{task}'"
+        ),
+        admitted_version,
+    );
+    assert!(scheduler(&fixture, fixture.root.join("artifacts"))
+        .claim_next()
+        .unwrap()
+        .is_none());
+    fixture.assert_scalar(
+        &format!("SELECT lifecycle||':'||attention FROM tasks WHERE id='{task}'"),
+        "backlog:needs_input".to_owned(),
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM attempts", attempts_before);
+    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", sessions_before);
+    fixture.assert_scalar(
+        &format!("SELECT COUNT(*) FROM attempts WHERE task_id='{task}'"),
+        0_i64,
+    );
+}
+
+#[test]
+fn prepare_task_survives_manager_capacity_wait_without_another_command() {
+    let fixture = Fixture::new("prepare-capacity-wait");
+    let active_project = add_project(&fixture, fixture.repository("active"), "active");
+    let paused_project = add_project(&fixture, fixture.repository("paused"), "paused");
+    let active_task = create_task(&fixture, &active_project, "active-task", 10);
+    let waiting_task = create_task(&fixture, &paused_project, "waiting-task", 1);
+    fixture.execute(
+        "UPDATE projects SET queue_paused=1 WHERE id=?1",
+        params![paused_project],
+    );
+    let scheduler = scheduler(&fixture, fixture.root.join("artifacts"));
+    let active_plan = scheduler.claim_next().unwrap().unwrap();
+    assert_eq!(active_plan.task_id, active_task);
+    seed_session(
+        &fixture,
+        &active_plan.attempt_id,
+        "manager",
+        "occupied-manager",
+        "occupied-manager-session",
+        "running",
+    );
+    let version = fixture.scalar::<i64>(&format!(
+        "SELECT version FROM tasks WHERE id='{waiting_task}'"
+    ));
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: "prepare-waiting-task".into(),
+            task_id: waiting_task.clone(),
+            expected_version: version,
+            action: "run_next".into(),
+            payload: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    assert!(scheduler.claim_next().unwrap().is_none());
+    let state = workflow::state(&fixture.store).unwrap();
+    assert!(state.decisions.iter().any(|decision| {
+        decision.subject.task_id.as_deref() == Some(waiting_task.as_str())
+            && decision.reason_code == "scheduler.manager_capacity_full"
+    }));
+    fixture.assert_scalar(
+        &format!("SELECT attention FROM tasks WHERE id='{waiting_task}'"),
+        "run_next_requested".to_owned(),
+    );
+    fixture.execute(
+        "UPDATE sessions SET status='exited',exit_json='{\"process_group_quiescent\":true}'
+         WHERE id='occupied-manager-session'",
+        [],
+    );
+    let prepared = scheduler.claim_next().unwrap().unwrap();
+    assert_eq!(prepared.task_id, waiting_task);
+    assert_eq!(prepared.state, "ready_held");
+    fixture.assert_scalar(
+        &format!("SELECT queue_paused FROM projects WHERE id='{paused_project}'"),
+        1_i64,
+    );
+    fixture.assert_scalar(
+        &format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'", prepared.attempt_id),
+        0_i64,
+    );
+}
+
+#[test]
+fn prepare_single_agent_survives_session_capacity_wait_without_another_command() {
+    let (fixture, repository) = single_agent_fixture("prepare-single-agent-capacity");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (waiting_task, version) = single_agent_task(&fixture, &setup);
+    let version = make_ready(&fixture, &waiting_task, version).unwrap();
+    fixture.execute(
+        "UPDATE projects SET queue_paused=1 WHERE id=?1",
+        params![setup.project_id],
+    );
+    let active_project = add_project(&fixture, fixture.repository("active"), "active");
+    let active_task = create_task(&fixture, &active_project, "active-task", 10);
+    let scheduler = scheduler(&fixture, fixture.root.join("artifacts"));
+    let active = scheduler.claim_next().unwrap().unwrap();
+    assert_eq!(active.task_id, active_task);
+    for (role, generation, session) in [
+        ("implementer", "occupied-writer", "occupied-writer-session"),
+        ("explorer", "occupied-explorer", "occupied-explorer-session"),
+    ] {
+        seed_session(
+            &fixture,
+            &active.attempt_id,
+            role,
+            generation,
+            session,
+            "running",
+        );
+    }
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: "prepare-single-agent-waiting-capacity".into(),
+            task_id: waiting_task.clone(),
+            expected_version: version,
+            action: "run_next".into(),
+            payload: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    assert!(scheduler.claim_next().unwrap().is_none());
+    let state = workflow::state(&fixture.store).unwrap();
+    assert!(state.decisions.iter().any(|decision| {
+        decision.subject.task_id.as_deref() == Some(waiting_task.as_str())
+            && decision.reason_code == "scheduler.global_capacity_full"
+    }));
+    fixture.assert_scalar(
+        &format!("SELECT attention FROM tasks WHERE id='{waiting_task}'"),
+        "run_next_requested".to_owned(),
+    );
+    fixture.execute("UPDATE sessions SET status='exited',exit_json='{\"process_group_quiescent\":true}' WHERE id='occupied-explorer-session'", []);
+    let prepared = scheduler.claim_next().unwrap().unwrap();
+    assert_eq!(prepared.task_id, waiting_task);
+    assert_eq!(prepared.state, "ready_held");
+    fixture.assert_scalar(
+        &format!(
+            "SELECT queue_paused FROM projects WHERE id='{}'",
+            setup.project_id
+        ),
+        1_i64,
+    );
+    fixture.assert_scalar(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{}'", prepared.attempt_id), 0_i64);
 }
 
 #[test]

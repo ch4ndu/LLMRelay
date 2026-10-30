@@ -1234,6 +1234,11 @@ button:disabled {
   grid-template-columns: 1fr 160px;
   gap: 12px;
 }
+.draft-text-preview dd {
+  margin-inline-start: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .modal details {
   border: 1px solid var(--line);
   border-radius: 8px;

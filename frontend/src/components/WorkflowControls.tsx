@@ -1,5 +1,5 @@
 import { ErrorNotice } from "./ErrorNotice";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ApiError,
   command,
@@ -28,31 +28,63 @@ import {
   type WorkflowControl,
   type WorkspaceMode,
 } from "../types";
+import { withStorageLock } from "../storageCoordination";
 
 type StoredIdentity = { body: string; id: string };
 
 const storedIdentity = (value: unknown): StoredIdentity | undefined => {
-  if (typeof value !== "object" || value === null) return undefined;
+  if (
+    typeof value !== "object" || value === null || Array.isArray(value) ||
+    Object.keys(value).sort().join() !== "body,id"
+  ) return undefined;
   const body: unknown = Reflect.get(value, "body");
   const id: unknown = Reflect.get(value, "id");
-  return typeof body === "string" && typeof id === "string"
-    ? { body, id }
-    : undefined;
+  if (typeof body !== "string" || typeof id !== "string" || !id.trim()) {
+    return undefined;
+  }
+  try {
+    const command: unknown = JSON.parse(body);
+    if (
+      typeof command !== "object" || command === null || Array.isArray(command)
+    ) {
+      return undefined;
+    }
+    const kind: unknown = Reflect.get(command, "kind");
+    return typeof kind === "string" && !!kind.trim() &&
+        typeof Reflect.get(command, "operation_id") === "string"
+      ? { body, id }
+      : undefined;
+  } catch {
+    return undefined;
+  }
 };
 
-const readIdentities = (storageKey: string): Map<string, StoredIdentity> => {
+const readIdentities = (
+  storageKey: string,
+  required = false,
+): Map<string, StoredIdentity> => {
   try {
-    const value: unknown = JSON.parse(localStorage.getItem(storageKey) || "[]");
-    if (!Array.isArray(value)) return new Map();
-    return new Map(value.flatMap((entry: unknown) => {
-      if (!Array.isArray(entry)) return [];
+    const raw = localStorage.getItem(storageKey);
+    if (raw === null) return new Map();
+    const value: unknown = JSON.parse(raw);
+    if (!Array.isArray(value)) throw new Error("Saved requests are invalid.");
+    const identities = new Map<string, StoredIdentity>();
+    for (const entry of value) {
+      if (!Array.isArray(entry) || entry.length !== 2) {
+        throw new Error("A saved request is invalid.");
+      }
       const name: unknown = entry[0];
       const identity = storedIdentity(entry[1]);
-      if (typeof name !== "string" || !identity) return [];
-      const pair: [string, StoredIdentity] = [name, identity];
-      return [pair];
-    }));
-  } catch {
+      if (
+        typeof name !== "string" || !name || !identity || identities.has(name)
+      ) {
+        throw new Error("A saved request is invalid.");
+      }
+      identities.set(name, identity);
+    }
+    return identities;
+  } catch (cause) {
+    if (required) throw cause;
     return new Map();
   }
 };
@@ -84,10 +116,15 @@ export interface WorkflowCommandRunner {
   reviewed: ReadonlySet<string>;
 }
 
+type JournalPublication =
+  | { kind: "uncoordinated" | "unreadable" | "unsaved" | "held" }
+  | { kind: "review"; prior: StoredIdentity }
+  | { kind: "send"; identity: StoredIdentity; replayingUnresolved: boolean };
+
 /**
  * Typed multi-workflow commands with persisted, replay-safe identities.
- * Storage is re-read on every change because several panels of one task can
- * share its key.
+ * Several panels and windows of one task can share its key, so each change
+ * re-reads storage under that key's storage lock.
  */
 export function useWorkflowCommands(
   storageKey: string,
@@ -101,14 +138,19 @@ export function useWorkflowCommands(
   const [reviewed, setReviewed] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  // Review consent covers only the earlier request that was shown, so another
+  // window replacing it needs a fresh review.
+  const reviewedIdentities = useRef(new Map<string, StoredIdentity>());
   const inFlight = useRef(false);
-  const update = (
-    change: (identities: Map<string, StoredIdentity>) => void,
-  ) => {
-    const identities = readIdentities(storageKey);
-    change(identities);
-    localStorage.setItem(storageKey, JSON.stringify([...identities]));
-  };
+  // Aborted when the panel closes or its storage key changes: a queued
+  // request is then neither published nor sent, and a request already sent
+  // settles its journal entry without UI callbacks.
+  const lifecycle = useRef(new AbortController());
+  useEffect(() => {
+    const current = new AbortController();
+    lifecycle.current = current;
+    return () => current.abort();
+  }, [storageKey]);
   const mark = (key: string, unknown: boolean) =>
     setUncertain((current) => {
       const next = new Set(current);
@@ -116,56 +158,129 @@ export function useWorkflowCommands(
       else next.delete(key);
       return next;
     });
-  const submit = async (
-    key: string,
-    build: (operationId: string) => WorkflowCommand,
-    options: { keepUnresolved?: boolean } = {},
-  ) => {
-    if (inFlight.current) return undefined;
-    const body = JSON.stringify(build(""));
-    const prior = readIdentities(storageKey).get(key);
-    if (prior && prior.body !== body && options.keepUnresolved) {
-      mark(key, true);
-      return undefined;
-    }
-    if (prior && prior.body !== body && !reviewed.has(key)) {
-      setReviewed((current) => new Set(current).add(key));
-      mark(key, true);
-      return undefined;
-    }
+  const markReviewed = (key: string, prior: StoredIdentity | undefined) => {
+    if (prior) reviewedIdentities.current.set(key, prior);
+    else reviewedIdentities.current.delete(key);
     setReviewed((current) => {
       const next = new Set(current);
-      next.delete(key);
+      if (prior) next.add(key);
+      else next.delete(key);
       return next;
     });
-    const id = prior?.body === body ? prior.id : newOperationId();
+  };
+  const publish = (
+    key: string,
+    body: string,
+    keepUnresolved: boolean,
+  ): JournalPublication => {
+    let identities: Map<string, StoredIdentity>;
+    try {
+      identities = readIdentities(storageKey, true);
+    } catch {
+      return { kind: "unreadable" };
+    }
+    const prior = identities.get(key);
+    if (prior && prior.body !== body) {
+      if (keepUnresolved) return { kind: "held" };
+      const consent = reviewedIdentities.current.get(key);
+      if (consent?.id !== prior.id || consent.body !== prior.body) {
+        return { kind: "review", prior };
+      }
+    }
+    const identity = { body, id: prior?.body === body ? prior.id : newOperationId() };
+    try {
+      identities.set(key, identity);
+      localStorage.setItem(storageKey, JSON.stringify([...identities]));
+    } catch {
+      return { kind: "unsaved" };
+    }
     // A refused replay (for example an expired sign-in rejected before the
     // service looks the operation up) says nothing about the stored original,
     // so only its own success settles it.
-    const replayingUnresolved = options.keepUnresolved === true &&
-      prior?.body === body;
-    update((identities) => identities.set(key, { body, id }));
-    const forget = () =>
-      update((identities) => {
-        if (identities.get(key)?.id === id) identities.delete(key);
-      });
-    inFlight.current = true;
-    setBusy(true);
+    return { kind: "send", identity, replayingUnresolved: keepUnresolved && prior?.body === body };
+  };
+  const forget = (key: string, identity: StoredIdentity) => {
+    const identities = readIdentities(storageKey, true);
+    const current = identities.get(key);
+    if (current?.id !== identity.id || current.body !== identity.body) return;
+    identities.delete(key);
+    localStorage.setItem(storageKey, JSON.stringify([...identities]));
+  };
+  const settle = (key: string, identity: StoredIdentity) =>
+    withStorageLock(storageKey, () => forget(key, identity)).catch(() => {
+      // Keeping a settled operation ID is safe to replay.
+    });
+  const publishAndSend = async (
+    key: string,
+    build: (operationId: string) => WorkflowCommand,
+    keepUnresolved: boolean,
+    signal: AbortSignal,
+  ) => {
+    const body = JSON.stringify(build(""));
+    const publication = await withStorageLock(
+      storageKey,
+      () => publish(key, body, keepUnresolved),
+      signal,
+    ).catch((): JournalPublication => ({ kind: "uncoordinated" }));
+    // An identity published just before the panel closed stays retained;
+    // replaying it later is safe because it was never sent.
+    if (!publication || signal.aborted) return undefined;
+    switch (publication.kind) {
+      case "uncoordinated":
+        setError("This browser could not coordinate browser storage with your other open LLMRelay windows, so this request was not saved and nothing new was sent. Keep this page open and try again.");
+        return undefined;
+      case "unreadable":
+        setError("Saved requests could not be read safely. They have been kept unchanged. Restore browser storage or the saved requests and refresh before trying again; nothing new was sent.");
+        return undefined;
+      case "unsaved":
+        setError("This request could not be saved for recovery. Restore browser storage and try again; nothing new was sent.");
+        return undefined;
+      case "held":
+        mark(key, true);
+        return undefined;
+      case "review":
+        markReviewed(key, publication.prior);
+        mark(key, true);
+        return undefined;
+      case "send":
+        break;
+    }
+    const { identity, replayingUnresolved } = publication;
+    markReviewed(key, undefined);
     setError("");
     try {
-      const result = await submitWorkflowCommand(build(id));
-      forget();
+      const result = await submitWorkflowCommand(build(identity.id));
+      await settle(key, identity);
+      if (signal.aborted) return undefined;
       mark(key, false);
       onChanged();
       return result;
     } catch (cause) {
       const unknown = replayingUnresolved ||
         (cause instanceof ApiError && cause.ambiguous);
-      if (!unknown) forget();
+      if (!unknown) await settle(key, identity);
+      if (signal.aborted) return undefined;
       mark(key, unknown);
       setError(cause instanceof Error ? cause.message : String(cause));
       onChanged();
       return undefined;
+    }
+  };
+  const submit = async (
+    key: string,
+    build: (operationId: string) => WorkflowCommand,
+    options: { keepUnresolved?: boolean } = {},
+  ) => {
+    if (inFlight.current) return undefined;
+    inFlight.current = true;
+    setBusy(true);
+    try {
+      return await publishAndSend(
+        key,
+        build,
+        options.keepUnresolved === true,
+        lifecycle.current.signal,
+      );
     } finally {
       inFlight.current = false;
       setBusy(false);

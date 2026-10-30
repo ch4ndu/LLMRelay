@@ -32,6 +32,7 @@ import type {
   TripTaskVerification,
 } from "./types";
 import type { LiveEnvironment, LiveStatus } from "./liveState";
+import type { WorkflowCommandRunner } from "./components/WorkflowControls";
 
 const window = new Window({ url: "http://127.0.0.1/" });
 for (
@@ -72,7 +73,10 @@ const { TaskDetail } = await import("./components/TaskDetail");
 const { TaskBoard } = await import("./components/TaskBoard");
 const { History } = await import("./components/History");
 const { Recipes } = await import("./components/Recipes");
-const { WorkflowControls } = await import("./components/WorkflowControls");
+const { WorkflowControls, useWorkflowCommands } = await import(
+  "./components/WorkflowControls"
+);
+const { storageLockName } = await import("./storageCoordination");
 const { ModelSelector } = await import("./components/ModelSelector");
 const { Workspace } = await import("./components/Workspace");
 const { SessionTree } = await import("./components/SessionTree");
@@ -138,6 +142,71 @@ Object.defineProperty(globalThis, "fetch", {
     fixtureFetch = wrapFetch(value[fixtureSource] ?? value);
   },
 });
+// Web Locks stand-in: one FIFO queue per name. Like browsers, the head is
+// granted in a later task (here a microtask), and a waiter aborted before its
+// grant leaves the queue. holdStorageLock occupies a name until released.
+type LockWaiter = { granted: boolean; run: () => void };
+const lockQueues = new Map<string, LockWaiter[]>();
+const scheduleLockGrant = (name: string) =>
+  queueMicrotask(() => {
+    const head = lockQueues.get(name)?.[0];
+    if (!head || head.granted) return;
+    head.granted = true;
+    head.run();
+  });
+const leaveLockQueue = (name: string, waiter: LockWaiter) => {
+  const queue = lockQueues.get(name) ?? [];
+  const index = queue.indexOf(waiter);
+  if (index >= 0) queue.splice(index, 1);
+  if (queue.length) scheduleLockGrant(name);
+  else lockQueues.delete(name);
+};
+const joinLockQueue = (name: string, waiter: LockWaiter) => {
+  const queue = lockQueues.get(name) ?? [];
+  lockQueues.set(name, queue);
+  queue.push(waiter);
+  if (queue.length === 1) scheduleLockGrant(name);
+};
+const storageLocks = {
+  request: (
+    name: string,
+    options: { signal?: AbortSignal },
+    callback: (lock: unknown) => unknown,
+  ) =>
+    new Promise<unknown>((resolve, reject) => {
+      const abort = () => reject(new DOMException("Lock request aborted", "AbortError"));
+      if (options.signal?.aborted) return abort();
+      const withdraw = () => {
+        if (waiter.granted) return;
+        leaveLockQueue(name, waiter);
+        abort();
+      };
+      const waiter: LockWaiter = {
+        granted: false,
+        run: () => {
+          options.signal?.removeEventListener("abort", withdraw);
+          try {
+            resolve(callback({ name, mode: "exclusive" }));
+          } catch (error) {
+            reject(error);
+          }
+          leaveLockQueue(name, waiter);
+        },
+      };
+      options.signal?.addEventListener("abort", withdraw);
+      joinLockQueue(name, waiter);
+    }),
+};
+const installStorageLocks = (locks: unknown) =>
+  Object.defineProperty(navigator, "locks", { configurable: true, value: locks });
+installStorageLocks(storageLocks);
+const holdStorageLock = (storageKey: string) => {
+  const name = storageLockName(storageKey);
+  if (lockQueues.has(name)) throw new Error(`storage lock is busy: ${name}`);
+  const holder: LockWaiter = { granted: true, run: () => {} };
+  lockQueues.set(name, [holder]);
+  return () => leaveLockQueue(name, holder);
+};
 
 Deno.test("ReviewPanel hides decisions for completed and cancelled tasks with retained review phases", () => {
   try {
@@ -3089,13 +3158,13 @@ function change(
     element.dispatchEvent(new Event("change", { bubbles: true }));
   });
 }
-function findField(label: string) {
-  const owner = [...document.querySelectorAll("label")].find((item) =>
+function findField(label: string, within: ParentNode = document) {
+  const owner = [...within.querySelectorAll("label")].find((item) =>
     item.textContent?.startsWith(label)
   );
   const element = owner?.querySelector<HTMLInputElement | HTMLTextAreaElement>(
     "input, textarea",
-  ) ?? [...document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+  ) ?? [...within.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
     "input, textarea",
   )].find((item) => item.getAttribute("aria-label") === label);
   if (!element) throw new Error(`field not found: ${label}`);
@@ -3114,8 +3183,8 @@ function findSelect(label: string) {
   if (!element) throw new Error(`select not found: ${label}`);
   return element;
 }
-function click(text: string) {
-  const button = [...document.querySelectorAll("button")].find((value) =>
+function click(text: string, within: ParentNode = document) {
+  const button = [...within.querySelectorAll("button")].find((value) =>
     value.textContent?.includes(text)
   ) as HTMLButtonElement;
   if (!button) {
@@ -3509,6 +3578,7 @@ for (
 
       const { operation_id: originalId, ...originalBody } = original;
       field("Title", "Edited after response loss");
+      await settle();
       unmount();
       mount(form());
       check(
@@ -19504,3 +19574,2130 @@ Deno.test("Providers is reachable outside Projects and opening it sends nothing"
     localStorage.clear();
   }
 });
+
+for (const retry of ["Save draft", "Retry exact unresolved create"]) {
+  Deno.test(`Audit task creation keeps original uncertainty after refused ${retry}`, async () => {
+    localStorage.clear();
+    const requests: Record<string, unknown>[] = [];
+    const committed = new Set<string>();
+    let saved = 0;
+    globalThis.fetch =
+      (async (_input: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        requests.push(body);
+        if (requests.length === 2) {
+          return new Response(JSON.stringify({ error: "Sign in again" }), {
+            status: 401,
+          });
+        }
+        committed.add(String(body.operation_id));
+        if (requests.length === 1) {
+          throw new TypeError("response lost after commit");
+        }
+        return new Response(
+          JSON.stringify({ result: { entity_id: "AJ-original", version: 1 } }),
+        );
+      }) as typeof fetch;
+    const form = () => (
+      <TaskForm
+        projects={[initialized]}
+        onSaved={() => saved++}
+        onClose={noop}
+      />
+    );
+    try {
+      mount(form());
+      field("Title", "Do this once");
+      click("Save draft");
+      await settle();
+      const stored = localStorage.getItem("agenticjira.new-task.operation");
+      click(retry);
+      await settle();
+      check(
+        requests.length === 2 && committed.size === 1 && saved === 0 &&
+          localStorage.getItem("agenticjira.new-task.operation") === stored &&
+          document.body.textContent?.includes("Retry exact unresolved create"),
+        "a refused replay settled the original unknown creation",
+      );
+      mount(form());
+      click("Retry exact unresolved create");
+      await settle();
+      check(
+        requests.length === 3 && requests.every((item) =>
+          item.operation_id === requests[0].operation_id
+        ) && committed.size === 1 && saved === 1,
+        "remount replay created another task or changed identity",
+      );
+    } finally {
+      unmount();
+      localStorage.clear();
+      globalThis.fetch = nativeFetch;
+    }
+  });
+}
+
+Deno.test("Audit Recipes retains a refused pending draft across remount", async () => {
+  sessionStorage.clear();
+  const body = {
+    kind: "create_draft_from_recipe",
+    project_id: "p1",
+    operation_id: "original-recipe-create",
+    recipe_id: "recipe-1",
+    recipe_revision_id: "recipe-rev-1",
+    expected_recipe_version: 1,
+  };
+  const stored = JSON.stringify([{
+    version: 1,
+    resource: "p1:recipe:recipe-1",
+    body,
+  }]);
+  const key = "llmrelay.m9.pending-commands.v1";
+  sessionStorage.setItem(key, stored);
+  const requests: Record<string, unknown>[] = [];
+  let opened = 0;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return requests.length === 1
+        ? new Response(JSON.stringify({ error: "Sign in again" }), {
+          status: 401,
+        })
+        : new Response(
+          JSON.stringify({ result: { entity_id: "AJ-original", version: 1 } }),
+        );
+    }) as typeof fetch;
+  const form = () => (
+    <Recipes
+      state={liveBase}
+      project={initialized}
+      onChanged={noop}
+      onOpenTask={() => opened++}
+    />
+  );
+  try {
+    mount(form());
+    click("Retry exact pending request");
+    await settle();
+    check(
+      sessionStorage.getItem(key) === stored && opened === 0,
+      "a refused recipe replay discarded durable uncertainty",
+    );
+    mount(form());
+    click("Retry exact pending request");
+    await settle();
+    check(
+      requests.length === 2 && requests.every((request) =>
+        JSON.stringify(request) === JSON.stringify(body)
+      ) && opened === 1 && sessionStorage.getItem(key) === "[]",
+      "recipe remount did not reconcile only the original request",
+    );
+  } finally {
+    unmount();
+    sessionStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Audit restored drafts retain exact workflow selections and require correction of missing choices", async () => {
+  localStorage.clear();
+  const alternate: ProjectExecution = {
+    ...singleAgentExecution,
+    default_family: "trip",
+    configurations: [...singleAgentExecution.configurations, {
+      ...singleAgentExecution.configurations[0],
+      id: "cfg-2",
+      revision: 3,
+      checks: [{ id: "check-2", original_text: "Focused tests pass" }],
+    }],
+    profiles: [...singleAgentExecution.profiles, {
+      ...singleAgentExecution.profiles[0],
+      id: "profile-2",
+      display_name: "Other writer",
+      current_revision: {
+        ...singleAgentExecution.profiles[0].current_revision!,
+        id: "prof-rev-2",
+      },
+    }],
+  };
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (!init?.body) return new Response("[]");
+      const body = JSON.parse(String(init.body));
+      requests.push(body);
+      return workflowResult(body);
+    }) as typeof fetch;
+  const form = (execution: ProjectExecution) => (
+    <TaskForm
+      projects={[initialized]}
+      workflowExecution={[execution]}
+      onSaved={noop}
+      onClose={noop}
+    />
+  );
+  try {
+    mount(form(alternate));
+    field("Title", "Preserve my choices");
+    act(() => choiceFor("Single agent (one agent").click());
+    change(findSelect("Execution configuration"), "cfg-2");
+    change(findSelect("Agent profile"), "prof-rev-2");
+    act(() => choiceFor("Focused tests pass").click());
+    await settle();
+    mount(form(alternate));
+    check(
+      choiceFor("Single agent (one agent").checked &&
+        findSelect("Execution configuration").value === "cfg-2" &&
+        findSelect("Agent profile").value === "prof-rev-2" &&
+        choiceFor("Focused tests pass").checked,
+      "draft remount lost explicit workflow, configuration, profile, or checks",
+    );
+    const savedDraft = localStorage.getItem("agenticjira.new-task")!;
+    mount(form(singleAgentExecution));
+    check(
+      findButton("Save draft").disabled &&
+        findSelect("Execution configuration").value === "cfg-2" &&
+        document.body.textContent?.includes("no longer available"),
+      "stale configuration was replaced silently or accepted",
+    );
+    change(findSelect("Execution configuration"), "cfg-1");
+    check(
+      findButton("Save draft").disabled &&
+        findSelect("Agent profile").value === "prof-rev-2",
+      "stale profile was replaced silently",
+    );
+    change(findSelect("Agent profile"), "prof-rev-1");
+    check(
+      !findButton("Save draft").disabled,
+      "explicit correction did not recover the saved draft",
+    );
+    localStorage.setItem("agenticjira.new-task", savedDraft);
+    mount(
+      form({
+        ...alternate,
+        configurations: alternate.configurations.map((config) => ({
+          ...config,
+          checks: [],
+        })),
+      }),
+    );
+    check(
+      findButton("Save draft").disabled &&
+        document.body.textContent?.includes("Remove unavailable checks"),
+      "removed checks were silently dropped",
+    );
+    click("Remove unavailable checks");
+    click("Save draft");
+    await settle();
+    check(
+      workflowCommands(requests).length === 1,
+      "corrected draft did not submit exactly once",
+    );
+  } finally {
+    unmount();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Audit New task is keyboard-modal, restores focus, and refuses Escape during save", async () => {
+  localStorage.clear();
+  const priorEnvironment = { ...liveEnvironment };
+  let respond: (response: Response) => void = noop;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.body) {
+        return await new Promise<Response>((resolve) => {
+          respond = resolve;
+        });
+      }
+      return new Response("{}");
+    }) as typeof fetch;
+  const escape = () =>
+    act(() =>
+      document.activeElement!.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Escape",
+          bubbles: true,
+          cancelable: true,
+        }),
+      )
+    );
+  try {
+    await mountLiveApp("board", {
+      ...snapshotAt("service-a", "1"),
+      projects: [initialized],
+    });
+    const opener = findButton("New task");
+    act(() => {
+      opener.focus();
+      opener.click();
+    });
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!;
+    check(
+      dialog?.getAttribute("aria-modal") === "true" &&
+        document.activeElement === findField("Title") &&
+        document.querySelector(".sidebar")?.hasAttribute("inert") &&
+        document.querySelector("main")?.hasAttribute("inert"),
+      "new task did not focus a modal with inert background",
+    );
+    const focusable = [
+      ...dialog.querySelectorAll<HTMLElement>(
+        "button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),summary",
+      ),
+    ];
+    for (const element of focusable) {
+      Object.defineProperty(element, "getClientRects", {
+        configurable: true,
+        value: () => [{}],
+      });
+    }
+    const first = focusable[0];
+    const last = focusable.at(-1)!;
+    act(() => {
+      last.focus();
+      last.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Tab",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    });
+    check(document.activeElement === first, "Tab escaped the new-task modal");
+    act(() =>
+      first.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Tab",
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      )
+    );
+    check(
+      document.activeElement === last,
+      "Shift+Tab escaped the new-task modal",
+    );
+    escape();
+    check(
+      !document.querySelector('[role="dialog"]') &&
+        document.activeElement === opener &&
+        !document.querySelector("main")?.hasAttribute("inert"),
+      "Escape did not close the form and restore its opener",
+    );
+    act(() => opener.click());
+    field("Title", "Pending save");
+    act(() => {
+      findButton("Save draft").click();
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Escape",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    });
+    await settle();
+    check(
+      !!document.querySelector('[role="dialog"]'),
+      "Escape closed a synchronously pending save",
+    );
+    respond(
+      new Response(
+        JSON.stringify({ result: { entity_id: "AJ-modal", version: 1 } }),
+      ),
+    );
+    await settle();
+    check(
+      !document.querySelector('[role="dialog"]'),
+      "successful save did not close the form",
+    );
+  } finally {
+    unmount();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+  }
+});
+
+for (const editing of [undefined, task]) {
+  Deno.test(`Task draft recovery preserves unread ${editing ? "edit" : "new"} text and keeps newer edits`, async () => {
+    const realStorage = localStorage;
+    realStorage.clear();
+    const key = editing ? `agenticjira.edit.${editing.id}` : "agenticjira.new-task";
+    const saved = {
+      project_id: initialized.id,
+      title: "Original saved title",
+      description: "Original saved description",
+      criteria: "Original saved criterion",
+      priority: 1,
+      ready: false,
+      workspace_mode: "isolated_worktree",
+      workflowChoice: { project_id: initialized.id, family: "single_agent" },
+      singleAgentChoice: { project_id: initialized.id, selection: {
+        execution_config_revision_id: "saved-configuration",
+        profile_revision_id: "saved-profile",
+        check_ids: ["saved-check"],
+      } },
+      roles: {},
+      roleOverrides: Object.fromEntries(ROLES.map((role) => [role, false])),
+    };
+    const original = JSON.stringify(saved, null, 2);
+    realStorage.setItem(key, original);
+    let failedReads = 0;
+    let draftWrites = 0;
+    let requests = 0;
+    globalThis.fetch = (async () => {
+      requests++;
+      return new Response("{}");
+    }) as typeof fetch;
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      writable: true,
+      value: {
+        getItem: (name: string) => {
+          if (name === key && failedReads === 0) {
+            failedReads++;
+            throw new DOMException("temporary read denial", "SecurityError");
+          }
+          return realStorage.getItem(name);
+        },
+        setItem: (name: string, value: string) => {
+          if (name === key) draftWrites++;
+          realStorage.setItem(name, value);
+        },
+        removeItem: (name: string) => realStorage.removeItem(name),
+      },
+    });
+    try {
+      mount(<TaskForm projects={[initialized]} editing={editing} onSaved={noop} onClose={noop} />);
+      await settle();
+      check(failedReads === 1 && draftWrites === 0 && realStorage.getItem(key) === original,
+        "mount autosaved fallback fields over the unread draft");
+      field("Title", "Newer in-memory title");
+      field("Description", "Newer in-memory description");
+      field("Acceptance criteria", "Newer in-memory criterion");
+      change(findSelect("Priority"), "-1");
+      click(editing ? "Save changes" : "Save draft");
+      await settle();
+      check(requests === 0 && draftWrites === 0 && realStorage.getItem(key) === original,
+        "editing or saving replaced unread text or dispatched before recovery");
+      click("Retry loading saved draft");
+      await settle();
+      check(findField("Title").value === "Newer in-memory title" &&
+        realStorage.getItem(key) === original && draftWrites === 0,
+        "rereading replaced the newer form or the original saved bytes");
+      click("Restore saved draft");
+      await settle();
+      const restored = JSON.parse(realStorage.getItem(key)!);
+      check(findField("Title").value === saved.title &&
+        findField("Description").value === saved.description &&
+        findField("Acceptance criteria").value === saved.criteria &&
+        findSelect("Priority").value === "1" &&
+        JSON.stringify(restored.workflowChoice) === JSON.stringify(saved.workflowChoice) &&
+        JSON.stringify(restored.singleAgentChoice) === JSON.stringify(saved.singleAgentChoice) &&
+        document.body.textContent?.includes("Newer in-memory title"),
+        "explicit restoration lost the original fields or discarded the newer copy");
+      click("Restore newer edits");
+      await settle();
+      const retained = JSON.parse(realStorage.getItem(key)!);
+      check(findField("Title").value === "Newer in-memory title" &&
+        findField("Description").value === "Newer in-memory description" &&
+        findField("Acceptance criteria").value === "Newer in-memory criterion" &&
+        findSelect("Priority").value === "-1" && retained.title === "Newer in-memory title" &&
+        retained.criteria === "Newer in-memory criterion" && requests === 0,
+        "explicit return to newer edits failed to preserve and autosave them");
+    } finally {
+      unmount();
+      Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: realStorage });
+      realStorage.clear();
+      globalThis.fetch = nativeFetch;
+    }
+  });
+}
+
+for (const editing of [undefined, task]) {
+  for (const scenario of ["normal read", "absent after failed read", "explicit replacement", "persistent denial"] as const) {
+    Deno.test(`Task draft recovery ${scenario} ${editing ? "edit" : "new"}`, async () => {
+      const realStorage = localStorage;
+      realStorage.clear();
+      const key = editing ? `agenticjira.edit.${editing.id}` : "agenticjira.new-task";
+      const saved = {
+        project_id: initialized.id,
+        title: "Stored original",
+        description: "Stored description",
+        criteria: "Stored criterion",
+        priority: 1,
+        ready: false,
+        workspace_mode: "isolated_worktree",
+        roles: {},
+        roleOverrides: {},
+      };
+      const original = JSON.stringify(saved, null, 2);
+      if (scenario !== "absent after failed read") realStorage.setItem(key, original);
+      const unsafeRequest = "Preserve this unread request";
+      if (scenario === "persistent denial") realStorage.setItem(`${key}.operation`, unsafeRequest);
+      let draftReads = 0;
+      let writes = 0;
+      let storageDenied = scenario === "persistent denial";
+      let requests = 0;
+      globalThis.fetch = (async () => {
+        requests++;
+        return new Response("{}");
+      }) as typeof fetch;
+      Object.defineProperty(globalThis, "localStorage", {
+        configurable: true,
+        writable: true,
+        value: {
+          getItem: (name: string) => {
+            if (name === key) draftReads++;
+            if (storageDenied || (name === key && draftReads === 1 && scenario !== "normal read")) {
+              throw new DOMException("read denied", "SecurityError");
+            }
+            return realStorage.getItem(name);
+          },
+          setItem: (name: string, value: string) => {
+            if (storageDenied) throw new DOMException("write denied", "SecurityError");
+            writes++;
+            realStorage.setItem(name, value);
+          },
+          removeItem: (name: string) => realStorage.removeItem(name),
+        },
+      });
+      try {
+        mount(<TaskForm projects={[initialized]} editing={editing} onSaved={noop} onClose={noop} />);
+        if (scenario === "normal read") {
+          check(findField("Title").value === saved.title &&
+            findField("Description").value === saved.description &&
+            findField("Acceptance criteria").value === saved.criteria &&
+            !document.querySelector('[aria-label="Saved draft recovery"]'),
+            "a healthy saved draft did not restore normally");
+          field("Description", "Normal autosave");
+          await settle();
+          check(JSON.parse(realStorage.getItem(key)!).description === "Normal autosave",
+            "normal-read control stopped autosaving");
+          return;
+        }
+        field("Title", "Keep my newer text");
+        field("Description", "Keep my newer description");
+        check(writes === 0 && realStorage.getItem(key) === (scenario === "absent after failed read" ? null : original),
+          "failed read was treated as permission to overwrite or as confirmed absence");
+        if (scenario === "absent after failed read") {
+          click("Retry loading saved draft");
+          await settle();
+          check(!document.querySelector('[aria-label="Saved draft recovery"]') &&
+            JSON.parse(realStorage.getItem(key)!).title === "Keep my newer text",
+            "confirmed absence did not resume autosaving the current form");
+        } else if (scenario === "explicit replacement") {
+          click("Replace saved draft with current form");
+          await settle();
+          check(!document.querySelector('[aria-label="Saved draft recovery"]') &&
+            JSON.parse(realStorage.getItem(key)!).title === "Keep my newer text" &&
+            findField("Description").value === "Keep my newer description",
+            "explicit replacement failed or discarded the current form");
+          field("Description", "Replacement autosave");
+          await settle();
+          check(JSON.parse(realStorage.getItem(key)!).description === "Replacement autosave",
+            "explicit replacement did not resume autosave");
+        } else {
+          click("Retry loading saved draft");
+          await settle();
+          click("Replace saved draft with current form");
+          await settle();
+          click(editing ? "Save changes" : "Save draft");
+          await settle();
+          check(realStorage.getItem(key) === original && writes === 0 && requests === 0 &&
+            findField("Title").value === "Keep my newer text" &&
+            !!document.querySelector('[aria-label="Saved draft recovery"]'),
+            "persistent denial lost either draft, cleared recovery, or sent a request");
+          storageDenied = false;
+          field("Description", "Still held after storage recovers");
+          check(realStorage.getItem(key) === original && writes === 0,
+            "storage recovery allowed typing to overwrite the unread copy");
+          click("Retry loading saved draft");
+          await settle();
+          check(realStorage.getItem(key) === original && findField("Title").value === "Keep my newer text",
+            "successful reread replaced either copy before a decision");
+          click("Replace saved draft with current form");
+          await settle();
+          click(editing ? "Save changes" : "Save draft");
+          await settle();
+          check(realStorage.getItem(`${key}.operation`) === unsafeRequest && requests === 0 &&
+            JSON.parse(realStorage.getItem(key)!).description === "Still held after storage recovers" &&
+            document.body.textContent?.includes("Saved task requests could not be read safely"),
+            "draft recovery bypassed the independent request identity safety check");
+        }
+        check(requests === 0, "local draft recovery sent a task request");
+      } finally {
+        unmount();
+        Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: realStorage });
+        realStorage.clear();
+        globalThis.fetch = nativeFetch;
+      }
+    });
+  }
+}
+
+Deno.test("Audit denied storage preserves navigation and keeps unsafe task requests unsent", async () => {
+  const realStorage = localStorage;
+  realStorage.clear();
+  const priorEnvironment = { ...liveEnvironment };
+  const live = liveHarness();
+  liveEnvironment.transport = live.environment.transport;
+  liveEnvironment.scheduler = live.environment.scheduler;
+  let writes = 0;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.body) writes++;
+      return new Response("{}");
+    }) as typeof fetch;
+  const denied = () => {
+    throw new DOMException("denied", "SecurityError");
+  };
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    writable: true,
+    value: {
+      getItem: denied,
+      setItem: denied,
+      removeItem: denied,
+      key: denied,
+      get length() {
+        return denied();
+      },
+    },
+  });
+  try {
+    mount(
+      <AppErrorBoundary>
+        <App />
+      </AppErrorBoundary>,
+    );
+    await settle();
+    live.reads[0].resolve({
+      ...snapshotAt("service-a", "1"),
+      projects: [initialized],
+    });
+    await settle();
+    click("Board");
+    click("New task");
+    field("Title", "Keep this text");
+    click("Save draft");
+    await settle();
+    check(
+      !document.body.textContent?.includes("The dashboard stopped working") &&
+        document.body.textContent?.includes(
+          "could not read your saved draft",
+        ) && findField("Title").value === "Keep this text" && writes === 0,
+      "denied storage crashed the dashboard, lost text, or dispatched a request",
+    );
+  } finally {
+    unmount();
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      writable: true,
+      value: realStorage,
+    });
+    realStorage.clear();
+    globalThis.fetch = nativeFetch;
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+  }
+});
+
+Deno.test("Audit quota failure leaves draft usable and gates request dispatch", async () => {
+  const realStorage = localStorage;
+  realStorage.clear();
+  let requests = 0;
+  globalThis.fetch = (async () => {
+    requests++;
+    return new Response("{}");
+  }) as typeof fetch;
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    writable: true,
+    value: {
+      getItem: (key: string) => realStorage.getItem(key),
+      setItem: () => {
+        throw new DOMException("quota exceeded", "QuotaExceededError");
+      },
+      removeItem: (key: string) => realStorage.removeItem(key),
+      key: (index: number) => realStorage.key(index),
+      get length() {
+        return realStorage.length;
+      },
+    },
+  });
+  try {
+    mount(
+      <AppErrorBoundary>
+        <TaskForm projects={[initialized]} onSaved={noop} onClose={noop} />
+      </AppErrorBoundary>,
+    );
+    field("Title", "Unsaved but retained");
+    click("Save draft");
+    await settle();
+    check(
+      requests === 0 && findField("Title").value === "Unsaved but retained" &&
+        document.body.textContent?.includes("Nothing new was sent") &&
+        document.body.textContent?.includes(
+          "could not save your draft locally",
+        ),
+      "quota failure dispatched a mutation or replaced the form",
+    );
+  } finally {
+    unmount();
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      writable: true,
+      value: realStorage,
+    });
+    realStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Audit transport preserves explicit unknown mutation outcome on server failure", async () => {
+  globalThis.fetch =
+    (async () =>
+      new Response(
+        JSON.stringify({
+          error: "Worker stopped before responding",
+          operation_id: "unknown-operation",
+          outcome_unknown: true,
+        }),
+        { status: 503 },
+      )) as typeof fetch;
+  try {
+    let mutation: unknown;
+    try {
+      await command({ kind: "create_task", operation_id: "unknown-operation" });
+    } catch (cause) {
+      mutation = cause;
+    }
+    check(
+      mutation instanceof ApiError && mutation.ambiguous &&
+        mutation.operationId === "unknown-operation",
+      "explicit server uncertainty became a definitive mutation refusal",
+    );
+    let read: unknown;
+    try {
+      await getState();
+    } catch (cause) {
+      read = cause;
+    }
+    check(
+      read instanceof ApiError && !read.ambiguous,
+      "a read failure was classified as a mutation",
+    );
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Audit malformed saved task requests survive attempted saves and remounts", async () => {
+  const requests: unknown[] = [];
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(init?.body);
+      return new Response(JSON.stringify({ result: { state: "updated" } }));
+    }) as typeof fetch;
+  try {
+    for (const editing of [undefined, task]) {
+      const key = editing
+        ? `agenticjira.edit.${editing.id}.operation`
+        : "agenticjira.new-task.operation";
+      for (
+        const stored of [
+          "null",
+          "",
+          JSON.stringify({ body: "not JSON", id: "original-request" }),
+          JSON.stringify({
+            body: JSON.stringify({ kind: "unrecognized_request" }),
+            id: "original-request",
+          }),
+          JSON.stringify({
+            body: JSON.stringify({
+              kind: editing ? "update_task" : "create_task",
+              title: "Incomplete",
+            }),
+            id: "original-request",
+          }),
+        ]
+      ) {
+        localStorage.clear();
+        localStorage.setItem(key, stored);
+        for (let remount = 0; remount < 2; remount++) {
+          mount(
+            <TaskForm
+              projects={[initialized]}
+              editing={editing}
+              onSaved={noop}
+              onClose={noop}
+            />,
+          );
+          field("Title", "Preserve the earlier request");
+          click(editing ? "Save changes" : "Save draft");
+          await settle();
+          check(
+            requests.length === 0 && localStorage.getItem(key) === stored &&
+              document.body.textContent?.includes(
+                "Saved task requests could not be read safely",
+              ),
+            "an invalid saved request was replaced, dispatched, or silently ignored",
+          );
+          unmount();
+        }
+      }
+    }
+  } finally {
+    unmount();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Audit a valid saved task edit reuses its original identity", async () => {
+  localStorage.clear();
+  const key = `agenticjira.edit.${task.id}.operation`;
+  const body = {
+    kind: "update_task",
+    task_id: task.id,
+    expected_version: task.version,
+    title: task.title,
+    description: task.description,
+    acceptance_criteria: task.acceptance_criteria,
+    priority: task.priority,
+    manual_order: task.manual_order,
+    role_overrides: null,
+  };
+  localStorage.setItem(
+    key,
+    JSON.stringify({ body: JSON.stringify(body), id: "original-edit" }),
+  );
+  const requests: Record<string, unknown>[] = [];
+  let saved = 0;
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ result: { state: "updated" } }));
+    }) as typeof fetch;
+  try {
+    mount(
+      <TaskForm
+        projects={[initialized]}
+        editing={task}
+        onSaved={() => saved++}
+        onClose={noop}
+      />,
+    );
+    click("Save changes");
+    await settle();
+    check(
+      requests.length === 1 && saved === 1 &&
+        JSON.stringify(requests[0]) ===
+          JSON.stringify({ ...body, operation_id: "original-edit" }) &&
+        localStorage.getItem(key) === null,
+      "a valid stored edit was blocked or replaced with a new operation identity",
+    );
+  } finally {
+    unmount();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Audit malformed workflow identity storage is preserved without dispatch", async () => {
+  const editing: Task = {
+    ...singleAgentTask(singleAgentRun()),
+    lifecycle: "ready",
+    active_attempt: undefined,
+  };
+  const key = `llmrelay.checkout.operations.${editing.id}`;
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      return workflowResult(body);
+    }) as typeof fetch;
+  const form = () => (
+    <TaskForm
+      projects={[initialized]}
+      editing={editing}
+      workflowExecution={[singleAgentExecution]}
+      onSaved={noop}
+      onClose={noop}
+    />
+  );
+  const validIdentity = {
+    body: JSON.stringify({ kind: "set_task_workflow", operation_id: "" }),
+    id: "original-workspace",
+  };
+  try {
+    for (
+      const stored of [
+        "null",
+        "",
+        "{}",
+        "[null]",
+        JSON.stringify([["workspace", { body: "{}", id: 7 }]]),
+        JSON.stringify([["workspace", validIdentity, "unexpected"]]),
+        JSON.stringify([["workspace", validIdentity], ["workspace", {
+          ...validIdentity,
+          id: "other",
+        }]]),
+        JSON.stringify([["unrelated", validIdentity], ["workspace", {
+          body: "{}",
+        }]]),
+        ...[
+          "{",
+          "null",
+          "7",
+          '"request"',
+          "[]",
+          "{}",
+          JSON.stringify({ operation_id: "" }),
+          JSON.stringify({ kind: "set_task_workflow" }),
+          JSON.stringify({ kind: "", operation_id: "" }),
+          JSON.stringify({ kind: "set_task_workflow", operation_id: null }),
+        ].map((body) =>
+          JSON.stringify([["workspace", { ...validIdentity, body }]])
+        ),
+      ]
+    ) {
+      localStorage.clear();
+      localStorage.setItem(key, stored);
+      for (let remount = 0; remount < 2; remount++) {
+        mount(form());
+        act(() => choiceFor("Main checkout").click());
+        click("Save workspace mode only");
+        await settle();
+        click("Save workspace mode only");
+        await settle();
+        check(
+          requests.length === 0 && localStorage.getItem(key) === stored &&
+            document.body.textContent?.includes(
+              "Saved requests could not be read safely",
+            ),
+          "malformed workflow identities were skipped, overwritten, or dispatched",
+        );
+        unmount();
+      }
+    }
+    localStorage.clear();
+    mount(form());
+    act(() => choiceFor("Main checkout").click());
+    click("Save workspace mode only");
+    await settle();
+    check(
+      requests.length === 1 &&
+        workflowCommands(requests)[0]?.kind === "set_task_workflow",
+      "absent recovery storage was incorrectly treated as corruption",
+    );
+  } finally {
+    unmount();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+for (const transition of ["single-agent", "main-checkout", "isolated-worktree"] as const) {
+  Deno.test(`Task completion preserves changed creation intent: ${transition}`, async () => {
+    localStorage.clear();
+    const requests: Record<string, unknown>[] = [];
+    let saved = 0;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      if (requests.length === 1) throw new TypeError("response lost after commit");
+      return body.kind === "workflow" ? workflowResult(body)
+        : new Response(JSON.stringify({ result: { entity_id: "original", version: 1 } }));
+    }) as typeof fetch;
+    const form = () => <TaskForm projects={[initialized]}
+      workflowExecution={[{ ...singleAgentExecution, default_family: "trip" }]}
+      onSaved={() => saved++} onClose={noop} />;
+    try {
+      mount(form());
+      field("Title", "Same title, different execution");
+      if (transition === "isolated-worktree") act(() => choiceFor("Main checkout").click());
+      click("Save draft");
+      await settle();
+      if (transition === "single-agent") {
+        act(() => choiceFor("Single agent (one agent").click());
+        change(findSelect("Agent profile"), "prof-rev-1");
+        act(() => choiceFor("Unit tests pass").click());
+      } else {
+        act(() => choiceFor(transition === "main-checkout" ? "Main checkout" : "Isolated worktree").click());
+      }
+      await settle();
+      const edited = localStorage.getItem("agenticjira.new-task");
+      click("Retry exact unresolved create");
+      await settle();
+      check(requests.length === 2 && JSON.stringify(requests[0]) === JSON.stringify(requests[1]) && saved === 1,
+        "reconciliation changed the original command or did not complete");
+      check(localStorage.getItem("agenticjira.new-task") === edited,
+        "reconciliation deleted the newer workflow or workspace draft");
+      mount(form());
+      check(transition === "single-agent"
+        ? choiceFor("Single agent (one agent").checked && findSelect("Agent profile").value === "prof-rev-1" && choiceFor("Unit tests pass").checked
+        : choiceFor(transition === "main-checkout" ? "Main checkout" : "Isolated worktree").checked,
+        "the newer execution choices did not survive remount");
+    } finally {
+      unmount();
+      localStorage.clear();
+      globalThis.fetch = nativeFetch;
+    }
+  });
+}
+
+for (const action of ["exact-create", "workspace"] as const) {
+  Deno.test(`Task completion retains unsaved fields after ${action} success`, async () => {
+    const storage = localStorage;
+    storage.clear();
+    const editing = action === "workspace" ? { ...task, lifecycle: "backlog", active_attempt: undefined } : undefined;
+    const key = editing ? `agenticjira.edit.${editing.id}` : "agenticjira.new-task";
+    let denyDraftWrites = false;
+    let saved = 0;
+    const requests: Record<string, unknown>[] = [];
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: {
+      getItem: (name: string) => storage.getItem(name),
+      setItem: (name: string, value: string) => {
+        if (name === key && denyDraftWrites) throw new DOMException("quota", "QuotaExceededError");
+        storage.setItem(name, value);
+      },
+      removeItem: (name: string) => storage.removeItem(name),
+    } });
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      if (action === "exact-create" && requests.length === 1) throw new TypeError("response lost after commit");
+      return body.kind === "workflow" ? workflowResult(body)
+        : new Response(JSON.stringify({ result: { entity_id: "original", version: 1 } }));
+    }) as typeof fetch;
+    const form = () => <TaskForm projects={[initialized]} editing={editing}
+      workflowExecution={[{ ...singleAgentExecution, default_family: "trip" }]}
+      onSaved={() => saved++} onClose={noop} />;
+    try {
+      mount(form());
+      await settle();
+      if (action === "exact-create") {
+        field("Title", "Original submitted text");
+        click("Save draft");
+        await settle();
+      }
+      denyDraftWrites = true;
+      field("Title", "Newer text only in memory");
+      if (action === "workspace") act(() => choiceFor("Main checkout").click());
+      click(action === "workspace" ? "Save workspace mode only" : "Retry exact unresolved create");
+      await settle();
+      const requestCount = requests.length;
+      check(saved === 0 && findField("Title").value === "Newer text only in memory" &&
+        document.body.textContent?.includes("already saved"),
+        "successful recovery closed the form or lost unsaved fields");
+      click("Finish saving locally");
+      await settle();
+      check(saved === 0 && requests.length === requestCount,
+        "failed local completion closed the form or repeated a server mutation");
+      denyDraftWrites = false;
+      click("Finish saving locally");
+      await settle();
+      check(saved === 1 && requests.length === requestCount &&
+        JSON.parse(storage.getItem(key)!).title === "Newer text only in memory",
+        "local recovery failed to preserve fields or sent another mutation");
+      mount(form());
+      check(findField("Title").value === "Newer text only in memory", "newer fields did not survive remount");
+    } finally {
+      unmount();
+      Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: storage });
+      storage.clear();
+      globalThis.fetch = nativeFetch;
+    }
+  });
+}
+
+for (const replay of [false, true]) {
+  Deno.test(`Task completion keeps identity when draft cleanup fails after ${replay ? "replay" : "create"}`, async () => {
+    const storage = localStorage;
+    storage.clear();
+    const key = "agenticjira.new-task";
+    let refuseDraftRemoval = true;
+    let saved = 0;
+    const requests: Record<string, unknown>[] = [];
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: {
+      getItem: (name: string) => storage.getItem(name),
+      setItem: (name: string, value: string) => storage.setItem(name, value),
+      removeItem: (name: string) => {
+        if (name === key && refuseDraftRemoval) throw new DOMException("temporary denial", "SecurityError");
+        storage.removeItem(name);
+      },
+    } });
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      if (replay && requests.length === 1) throw new TypeError("response lost after commit");
+      return new Response(JSON.stringify({ result: { entity_id: "original", version: 1 } }));
+    }) as typeof fetch;
+    const form = () => <TaskForm projects={[initialized]} onSaved={() => saved++} onClose={noop} />;
+    try {
+      mount(form());
+      field("Title", "Create only once");
+      click("Save draft");
+      await settle();
+      if (replay) {
+        click("Retry exact unresolved create");
+        await settle();
+      }
+      check(saved === 0 && storage.getItem(key) !== null && storage.getItem(`${key}.operation`) !== null,
+        "partial cleanup orphaned a submitted draft or closed the form");
+      const count = requests.length;
+      click("Save draft");
+      await settle();
+      check(requests.length === count, "a completed create dispatched a new request while local cleanup was pending");
+      mount(form());
+      refuseDraftRemoval = false;
+      click("Retry exact unresolved create");
+      await settle();
+      check(saved === 1 && requests.every((request) => request.operation_id === requests[0].operation_id) &&
+        storage.getItem(key) === null && storage.getItem(`${key}.operation`) === null,
+        "remount recovery created a second task or failed to clean the original identity");
+    } finally {
+      unmount();
+      Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: storage });
+      storage.clear();
+      globalThis.fetch = nativeFetch;
+    }
+  });
+}
+
+for (const action of ["create", "exact-create", "edit", "workspace"] as const) {
+  Deno.test(`Task completion preserves the recovered newer copy after ${action}`, async () => {
+    const storage = localStorage;
+    storage.clear();
+    const editing = action === "create" || action === "exact-create" ? undefined : { ...task, lifecycle: "backlog", active_attempt: undefined };
+    const key = editing ? `agenticjira.edit.${editing.id}` : "agenticjira.new-task";
+    storage.setItem(key, JSON.stringify({ project_id: initialized.id, title: "Original saved draft",
+      description: "Original description", criteria: "", priority: 0, ready: false,
+      workspace_mode: "isolated_worktree", roles: {}, roleOverrides: {} }));
+    if (action === "exact-create") storage.setItem(`${key}.operation`, JSON.stringify({
+      id: "original-create",
+      body: JSON.stringify({ kind: "create_task", project_id: initialized.id, title: "Original saved draft",
+        description: "Original description", acceptance_criteria: [], priority: 0, ready: false, role_overrides: {} }),
+    }));
+    let failedRead = false;
+    let saved = 0;
+    const requests: Record<string, unknown>[] = [];
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: {
+      getItem: (name: string) => {
+        if (name === key && !failedRead) {
+          failedRead = true;
+          throw new DOMException("temporary read denial", "SecurityError");
+        }
+        return storage.getItem(name);
+      },
+      setItem: (name: string, value: string) => storage.setItem(name, value),
+      removeItem: (name: string) => storage.removeItem(name),
+    } });
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      return body.kind === "workflow" ? workflowResult(body)
+        : new Response(JSON.stringify({ result: { entity_id: "original", version: 1 } }));
+    }) as typeof fetch;
+    try {
+      mount(<TaskForm projects={[initialized]} editing={editing}
+        workflowExecution={[{ ...singleAgentExecution, default_family: "trip" }]}
+        onSaved={() => saved++} onClose={noop} />);
+      field("Title", "Recovered newer copy");
+      field("Description", "Text that must survive completion");
+      click("Retry loading saved draft");
+      await settle();
+      click("Restore saved draft");
+      await settle();
+      if (action === "workspace") act(() => choiceFor("Main checkout").click());
+      click(action === "workspace" ? "Save workspace mode only" : action === "exact-create"
+        ? "Retry exact unresolved create" : editing ? "Save changes" : "Save draft");
+      await settle();
+      check(saved === 0 && document.body.textContent?.includes("Recovered newer copy") && requests.length === 1,
+        "successful save closed the form and destroyed its recovered newer copy");
+      click("Restore newer edits");
+      click("Finish saving locally");
+      await settle();
+      check(saved === 1 && requests.length === 1 && JSON.parse(storage.getItem(key)!).title === "Recovered newer copy",
+        "finishing recovery lost the newer copy or sent it as an unintended task mutation");
+    } finally {
+      unmount();
+      Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: storage });
+      storage.clear();
+      globalThis.fetch = nativeFetch;
+    }
+  });
+}
+
+Deno.test("Task completion preserves fields edited while the workspace request is pending", async () => {
+  const storage = localStorage;
+  storage.clear();
+  const editing = { ...task, lifecycle: "backlog", active_attempt: undefined };
+  const key = `agenticjira.edit.${editing.id}`;
+  let denyDraftWrites = false;
+  let saved = 0;
+  let respond: (response: Response) => void = noop;
+  const requests: Record<string, unknown>[] = [];
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: {
+    getItem: (name: string) => storage.getItem(name),
+    setItem: (name: string, value: string) => {
+      if (name === key && denyDraftWrites) throw new DOMException("quota", "QuotaExceededError");
+      storage.setItem(name, value);
+    },
+    removeItem: (name: string) => storage.removeItem(name),
+  } });
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return await new Promise<Response>((resolve) => { respond = resolve; });
+  }) as typeof fetch;
+  try {
+    mount(<TaskForm projects={[initialized]} editing={editing} workflowExecution={[singleAgentExecution]}
+      onSaved={() => saved++} onClose={noop} />);
+    act(() => choiceFor("Main checkout").click());
+    click("Save workspace mode only");
+    await settle();
+    denyDraftWrites = true;
+    field("Description", "Typed while the workspace save was pending");
+    respond(workflowResult(requests[0]));
+    await settle();
+    check(saved === 0 && findField("Description").value === "Typed while the workspace save was pending",
+      "workspace completion used stale render state and closed over newer unsaved fields");
+    denyDraftWrites = false;
+    click("Finish saving locally");
+    await settle();
+    check(saved === 1 && requests.length === 1 &&
+      JSON.parse(storage.getItem(key)!).description === "Typed while the workspace save was pending",
+      "local completion failed to persist the latest in-memory fields");
+  } finally {
+    unmount();
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: storage });
+    storage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+for (const action of ["exact-create", "workspace"] as const) {
+  Deno.test(`Task completion recovers another window's unsent draft after ${action}`, async () => {
+    localStorage.clear();
+    const editing = action === "workspace"
+      ? { ...task, lifecycle: "backlog", active_attempt: undefined }
+      : undefined;
+    const key = editing ? `agenticjira.edit.${editing.id}` : "agenticjira.new-task";
+    const requests: Record<string, unknown>[] = [];
+    let saved = 0;
+    let respond: (response: Response) => void = noop;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      if (action === "exact-create" && requests.length === 1) {
+        throw new TypeError("response lost after commit");
+      }
+      return await new Promise<Response>((resolve) => { respond = resolve; });
+    }) as typeof fetch;
+    try {
+      mount(<TaskForm projects={[initialized]} editing={editing}
+        workflowExecution={[{ ...singleAgentExecution, default_family: "trip" }]}
+        onSaved={() => saved++} onClose={noop} />);
+      if (action === "exact-create") {
+        field("Title", "Original submitted task");
+        click("Save draft");
+        await settle();
+      }
+      field("Title", "This window's newer draft");
+      if (editing) act(() => choiceFor("Main checkout").click());
+      click(editing ? "Save workspace mode only" : "Retry exact unresolved create");
+      await settle();
+      const operation = localStorage.getItem(`${key}.operation`);
+      const otherDraft = JSON.stringify({
+        ...JSON.parse(localStorage.getItem(key)!),
+        title: "Other window's unsent title",
+        description: "Other window's unsent description",
+      }, null, 2);
+      // The other window only autosaves fields; it neither replaces nor creates an operation.
+      localStorage.setItem(key, otherDraft);
+      respond(editing ? workflowResult(requests.at(-1)!)
+        : new Response(JSON.stringify({ result: { entity_id: "original", version: 1 } })));
+      await settle();
+      const requestCount = requests.length;
+      check(saved === 0 && localStorage.getItem(key) === otherDraft &&
+        localStorage.getItem(`${key}.operation`) === operation &&
+        findField("Title").value === "This window's newer draft" &&
+        document.body.textContent?.includes("Other window's unsent title") &&
+        !!document.querySelector('[aria-label="Saved draft recovery"]'),
+        "completion overwrote an unsent cross-window draft, lost this form, or cleared its request");
+      field("Description", "Still editable while the conflict is held");
+      click("Finish saving locally");
+      await settle();
+      check(saved === 0 && requests.length === requestCount &&
+        localStorage.getItem(key) === otherDraft &&
+        localStorage.getItem(`${key}.operation`) === operation,
+        "typing or local completion overwrote the conflicting draft before an explicit choice");
+      if (editing) {
+        click("Restore saved draft");
+        await settle();
+        check(findField("Title").value === "Other window's unsent title" &&
+          document.body.textContent?.includes("This window's newer draft") &&
+          document.body.textContent?.includes("Still editable while the conflict is held"),
+          "restoring the other window's copy discarded this window's newer fields");
+        click("Finish saving locally");
+        await settle();
+        check(saved === 0, "completion discarded the retained alternate copy");
+        click("Restore newer edits");
+      } else {
+        click("Replace saved draft with current form");
+        await settle();
+      }
+      click("Finish saving locally");
+      await settle();
+      const retained = JSON.parse(localStorage.getItem(key)!);
+      check(saved === 1 && requests.length === requestCount &&
+        retained.title === "This window's newer draft" &&
+        retained.description === "Still editable while the conflict is held" &&
+        localStorage.getItem(`${key}.operation`) === null,
+        "explicit recovery lost the chosen fields, failed to finish, or sent another mutation");
+    } finally {
+      unmount();
+      localStorage.clear();
+      globalThis.fetch = nativeFetch;
+    }
+  });
+}
+
+Deno.test("Task windows hold a foreign unresolved create before stale submission and reconcile it after remount", async () => {
+  localStorage.clear();
+  const key = "agenticjira.new-task";
+  const requests: Record<string, unknown>[] = [];
+  let rejectOriginal: (cause: Error) => void = noop;
+  let saved = 0;
+  const form = () => <TaskForm projects={[initialized]} onSaved={() => saved++} onClose={noop} />;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    if (requests.length === 1) return await new Promise<Response>((_resolve, reject) => { rejectOriginal = reject; });
+    return new Response(JSON.stringify({ result: { entity_id: "original-task", version: 1 } }));
+  }) as typeof fetch;
+  try {
+    mount(form());
+    field("Title", "Original task");
+    await settle();
+    mount(<><section data-window="a">{form()}</section><section data-window="b">{form()}</section></>);
+    const a = document.querySelector('[data-window="a"]')!;
+    const b = document.querySelector('[data-window="b"]')!;
+    click("Save draft", a);
+    await settle();
+    const original = localStorage.getItem(`${key}.operation`);
+    const savedDraft = localStorage.getItem(key);
+    click("Save draft", b);
+    await settle();
+    check(requests.length === 1 && localStorage.getItem(`${key}.operation`) === original &&
+      localStorage.getItem(key) === savedDraft && b.textContent?.includes("Another window saved a task request"),
+      "stale submission replaced the foreign request or sent a second create");
+    rejectOriginal(new TypeError("response lost after commit"));
+    await settle();
+    change(findField("Title", b), "This window's next task");
+    click("Save draft", b);
+    click("Retry exact unresolved create", b);
+    await settle();
+    check(requests.length === 1 && localStorage.getItem(`${key}.operation`) === original &&
+      localStorage.getItem(key) === savedDraft && findField("Title", b).value === "This window's next task",
+      "typing or retrying while recovery was held lost either copy or sent a request");
+    click("Replace saved draft with current form", b);
+    await settle();
+    mount(form());
+    check(findField("Title").value === "This window's next task" &&
+      document.body.textContent?.includes("Retry exact unresolved create"),
+      "remount lost the local draft or the original unresolved identity");
+    click("Save draft");
+    await settle();
+    check(requests.length === 1, "an edited draft bypassed the original unresolved create");
+    click("Retry exact unresolved create");
+    await settle();
+    check(requests.length === 2 && JSON.stringify(requests[0]) === JSON.stringify(requests[1]) && saved === 1 &&
+      JSON.parse(localStorage.getItem(key)!).title === "This window's next task" &&
+      localStorage.getItem(`${key}.operation`) === null &&
+      localStorage.getItem(`${key}.operation.${requests[0].operation_id}`) === null,
+      "reconciliation changed identity, lost the chosen draft, or failed to clean its own records");
+  } finally {
+    unmount();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Task windows hold a foreign autosaved draft until an explicit choice", async () => {
+  localStorage.clear();
+  const key = "agenticjira.new-task";
+  let requests = 0;
+  globalThis.fetch = (async () => { requests++; return new Response("{}"); }) as typeof fetch;
+  const form = () => <TaskForm projects={[initialized]} onSaved={noop} onClose={noop} />;
+  try {
+    mount(<><section data-window="a">{form()}</section><section data-window="b">{form()}</section></>);
+    await settle();
+    const a = document.querySelector('[data-window="a"]')!;
+    const b = document.querySelector('[data-window="b"]')!;
+    change(findField("Title", a), "Window A's unsent task");
+    await settle();
+    const foreignDraft = localStorage.getItem(key);
+    change(findField("Title", b), "Window B's unsent task");
+    await settle();
+    check(localStorage.getItem(key) === foreignDraft && findField("Title", b).value === "Window B's unsent task" &&
+      b.textContent?.includes("Window A's unsent task") && !!b.querySelector('[aria-label="Saved draft recovery"]'),
+      "ordinary autosave replaced a foreign draft or discarded this window's fields");
+    click("Save draft", b);
+    await settle();
+    check(requests === 0 && localStorage.getItem(key) === foreignDraft,
+      "a held autosave conflict submitted or overwrote the saved copy");
+    click("Restore saved draft", b);
+    await settle();
+    check(findField("Title", b).value === "Window A's unsent task" && b.textContent?.includes("Window B's unsent task"),
+      "restoring the saved copy discarded the other window's current edits");
+    click("Restore newer edits", b);
+    await settle();
+    check(JSON.parse(localStorage.getItem(key)!).title === "Window B's unsent task" && requests === 0,
+      "explicit recovery could not save the chosen local draft without a mutation");
+    mount(form());
+    check(findField("Title").value === "Window B's unsent task", "the explicitly chosen draft did not survive remount");
+  } finally {
+    unmount();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Task windows wait for the storage lock, so a second save observes the first create and sends nothing", async () => {
+  const storage = localStorage;
+  storage.clear();
+  const key = "agenticjira.new-task";
+  const requests: Record<string, unknown>[] = [];
+  let interleave = false;
+  let competingSave: HTMLButtonElement | undefined;
+  const form = () => <TaskForm projects={[initialized]} onSaved={noop} onClose={noop} />;
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: {
+    getItem: (name: string) => storage.getItem(name),
+    setItem: (name: string, value: string) => {
+      if (interleave && name.startsWith(`${key}.operation.`)) {
+        interleave = false;
+        // A has checked ownership but has not published its request yet.
+        competingSave!.click();
+      }
+      storage.setItem(name, value);
+    },
+    removeItem: (name: string) => storage.removeItem(name),
+    key: (index: number) => storage.key(index),
+    get length() { return storage.length; },
+  } });
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return await new Promise<Response>(() => {});
+  }) as typeof fetch;
+  try {
+    mount(form());
+    field("Title", "One intentional request");
+    await settle();
+    mount(<><section data-window="a">{form()}</section><section data-window="b">{form()}</section></>);
+    const a = document.querySelector('[data-window="a"]')!;
+    const b = document.querySelector('[data-window="b"]')!;
+    competingSave = [...b.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Save draft");
+    interleave = true;
+    click("Save draft", a);
+    await settle();
+    const retainedKeys = Array.from({ length: storage.length }, (_, index) => storage.key(index))
+      .filter((name) => name?.startsWith(`${key}.operation.`));
+    const published = storage.getItem(`${key}.operation`);
+    check(requests.length === 1 && !interleave && retainedKeys.length === 1 &&
+      published === storage.getItem(`${key}.operation.${requests[0].operation_id}`) &&
+      b.textContent?.includes("Another window saved a task request") &&
+      b.textContent.includes("Retry exact unresolved create"),
+      "the waiting window sent a second create or did not observe the first retained request");
+  } finally {
+    unmount();
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: storage });
+    storage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Task windows replay and settle each retained pre-upgrade create independently", async () => {
+  localStorage.clear();
+  const key = "agenticjira.new-task";
+  const createBody = (title: string) => JSON.stringify({ kind: "create_task", project_id: initialized.id, title,
+    description: "", acceptance_criteria: [], priority: 0, ready: false, role_overrides: {} });
+  const older = { body: createBody("Older page create"), id: "older-page-create" };
+  const newer = { body: createBody("Newer page create"), id: "newer-page-create" };
+  // Pages without storage locks could each publish before seeing the other.
+  localStorage.setItem(`${key}.operation.${older.id}`, JSON.stringify(older));
+  localStorage.setItem(`${key}.operation.${newer.id}`, JSON.stringify(newer));
+  localStorage.setItem(`${key}.operation`, JSON.stringify(newer));
+  const requests: Record<string, unknown>[] = [];
+  let saved = 0;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ result: { entity_id: `task-${requests.length}`, version: 1 } }));
+  }) as typeof fetch;
+  const form = () => <TaskForm projects={[initialized]} onSaved={() => saved++} onClose={noop} />;
+  try {
+    mount(form());
+    click("Retry exact unresolved create");
+    await settle();
+    check(saved === 1 && requests.length === 1 &&
+      JSON.stringify(requests[0]) === JSON.stringify({ ...JSON.parse(newer.body), operation_id: newer.id }) &&
+      localStorage.getItem(`${key}.operation`) === null &&
+      localStorage.getItem(`${key}.operation.${newer.id}`) === null &&
+      localStorage.getItem(`${key}.operation.${older.id}`) === JSON.stringify(older),
+      "settling one retained create changed its request or removed the other page's record");
+    mount(form());
+    click("Retry exact unresolved create");
+    await settle();
+    check(saved === 2 && requests.length === 2 &&
+      JSON.stringify(requests[1]) === JSON.stringify({ ...JSON.parse(older.body), operation_id: older.id }) &&
+      localStorage.getItem(`${key}.operation.${older.id}`) === null,
+      "the remaining retained create was not replayed exactly and settled");
+  } finally {
+    unmount();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Queued draft autosaves save the latest edit, hold a peer conflict, and are dropped when the form closes", async () => {
+  localStorage.clear();
+  const key = "agenticjira.new-task";
+  const form = () => <TaskForm projects={[initialized]} onSaved={noop} onClose={noop} />;
+  try {
+    mount(<><section data-window="a">{form()}</section><section data-window="b">{form()}</section></>);
+    await settle();
+    const a = document.querySelector('[data-window="a"]')!;
+    const b = document.querySelector('[data-window="b"]')!;
+    const shared = localStorage.getItem(key);
+    const release = holdStorageLock(key);
+    change(findField("Title", a), "Window A first edit");
+    change(findField("Title", a), "Window A latest edit");
+    change(findField("Title", b), "Window B edit");
+    check(localStorage.getItem(key) === shared, "an autosave wrote while another window held the storage lock");
+    release();
+    await settle();
+    check(JSON.parse(localStorage.getItem(key)!).title === "Window A latest edit" &&
+      findField("Title", b).value === "Window B edit" &&
+      b.textContent?.includes("Window A latest edit") &&
+      !!b.querySelector('[aria-label="Saved draft recovery"]'),
+      "queued autosaves lost the latest edit, overwrote the peer copy, or discarded this window's text");
+
+    mount(form());
+    await settle();
+    const saved = localStorage.getItem(key);
+    const releaseAfterClose = holdStorageLock(key);
+    field("Title", "Typed just before closing");
+    unmount();
+    releaseAfterClose();
+    await settle();
+    check(localStorage.getItem(key) === saved, "a closed form's queued autosave still wrote its draft");
+  } finally {
+    unmount();
+    localStorage.clear();
+  }
+});
+
+Deno.test("Successful completion and a peer's explicit draft replacement take turns under the storage lock", async () => {
+  const storage = localStorage;
+  storage.clear();
+  const key = "agenticjira.new-task";
+  const requests: Record<string, unknown>[] = [];
+  let respond: (response: Response) => void = noop;
+  let saved = 0;
+  let interleave = false;
+  let peerReplace: HTMLButtonElement | undefined;
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: {
+    getItem: (name: string) => {
+      const value = storage.getItem(name);
+      if (interleave && name === key) {
+        interleave = false;
+        // A has read the shared draft for completion but not yet removed it.
+        peerReplace!.click();
+      }
+      return value;
+    },
+    setItem: (name: string, value: string) => storage.setItem(name, value),
+    removeItem: (name: string) => storage.removeItem(name),
+    key: (index: number) => storage.key(index),
+    get length() { return storage.length; },
+  } });
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return await new Promise<Response>((resolve) => { respond = resolve; });
+  }) as typeof fetch;
+  const form = (onSaved: () => void) => <TaskForm projects={[initialized]} onSaved={onSaved} onClose={noop} />;
+  try {
+    mount(<><section data-window="a">{form(() => saved++)}</section><section data-window="b">{form(noop)}</section></>);
+    const a = document.querySelector('[data-window="a"]')!;
+    const b = document.querySelector('[data-window="b"]')!;
+    await settle();
+    change(findField("Title", a), "Window A submitted task");
+    await settle();
+    change(findField("Title", b), "Window B unsent task");
+    await settle();
+    click("Save draft", a);
+    await settle();
+    peerReplace = [...b.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent === "Replace saved draft with current form");
+    interleave = true;
+    respond(new Response(JSON.stringify({ result: { entity_id: "AJ-a", version: 1 } })));
+    await settle();
+    check(saved === 1 && requests.length === 1 && !interleave &&
+      storage.getItem(key) === null && storage.getItem(`${key}.operation`) === null &&
+      findField("Title", b).value === "Window B unsent task" &&
+      b.textContent?.includes("The saved draft changed again") &&
+      !!b.querySelector('[aria-label="Saved draft recovery"]'),
+      "completion and a peer replacement interleaved, losing the peer's chosen draft or redispatching");
+    click("Retry loading saved draft", b);
+    await settle();
+    check(JSON.parse(storage.getItem(key)!).title === "Window B unsent task" && requests.length === 1,
+      "the peer could not keep its draft after the completed save cleared storage");
+  } finally {
+    unmount();
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: storage });
+    storage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+for (const failure of ["missing", "rejected"] as const) {
+  Deno.test(`Task form keeps its text and sends nothing when storage locks are ${failure}`, async () => {
+    localStorage.clear();
+    const key = "agenticjira.new-task";
+    const savedDraft = JSON.stringify({ project_id: initialized.id, title: "Saved before locks failed",
+      description: "", criteria: "", priority: 0, ready: false, workspace_mode: "isolated_worktree",
+      roles: {}, roleOverrides: {} });
+    localStorage.setItem(key, savedDraft);
+    let requests = 0;
+    globalThis.fetch = (async () => {
+      requests++;
+      return new Response("{}");
+    }) as typeof fetch;
+    installStorageLocks(failure === "missing" ? undefined : {
+      request: () => Promise.reject(new DOMException("lock request refused", "SecurityError")),
+    });
+    try {
+      mount(<TaskForm projects={[initialized]} onSaved={noop} onClose={noop} />);
+      field("Title", "Typed while locks are unavailable");
+      await settle();
+      click("Save draft");
+      await settle();
+      check(requests === 0 && localStorage.getItem(key) === savedDraft &&
+        localStorage.getItem(`${key}.operation`) === null &&
+        findField("Title").value === "Typed while locks are unavailable" &&
+        document.body.textContent?.includes("could not coordinate saving your draft") &&
+        document.body.textContent.includes("nothing was saved and no new request was sent"),
+        "unavailable storage locks changed storage, sent a request, or gave no recovery guidance");
+    } finally {
+      unmount();
+      installStorageLocks(storageLocks);
+      localStorage.clear();
+      globalThis.fetch = nativeFetch;
+    }
+  });
+}
+
+Deno.test("Task completion keeps Finish saving locally when storage locks fail after a successful save", async () => {
+  localStorage.clear();
+  const key = "agenticjira.new-task";
+  const requests: Record<string, unknown>[] = [];
+  let respond: (response: Response) => void = noop;
+  let saved = 0;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return await new Promise<Response>((resolve) => { respond = resolve; });
+  }) as typeof fetch;
+  try {
+    mount(<TaskForm projects={[initialized]} onSaved={() => saved++} onClose={noop} />);
+    field("Title", "Saved once on the server");
+    click("Save draft");
+    await settle();
+    const operation = localStorage.getItem(`${key}.operation`);
+    installStorageLocks({
+      request: () => Promise.reject(new DOMException("lock request refused", "SecurityError")),
+    });
+    respond(new Response(JSON.stringify({ result: { entity_id: "AJ-saved", version: 1 } })));
+    await settle();
+    check(saved === 0 && requests.length === 1 && operation !== null &&
+      localStorage.getItem(`${key}.operation`) === operation &&
+      document.body.textContent?.includes("could not coordinate browser storage") &&
+      !!findButton("Finish saving locally"),
+      "a lock failure after success lost the completed state or its local finish");
+    installStorageLocks(storageLocks);
+    click("Finish saving locally");
+    await settle();
+    check(saved === 1 && requests.length === 1 &&
+      localStorage.getItem(key) === null && localStorage.getItem(`${key}.operation`) === null,
+      "finishing locally after the lock recovered resent the task or kept its records");
+  } finally {
+    unmount();
+    installStorageLocks(storageLocks);
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Workflow command journals keep concurrent windows' identities and rebind review to the observed request", async () => {
+  const storage = localStorage;
+  storage.clear();
+  const journal = "llmrelay.workflow.commands.journal-task";
+  const runners = new Map<string, WorkflowCommandRunner>();
+  function JournalWindow({ name }: { name: string }) {
+    runners.set(name, useWorkflowCommands(journal, noop));
+    return null;
+  }
+  const verify = (taskId: string, version = 1) => (operation_id: string) => ({
+    kind: "verify_main_checkout" as const, operation_id, task_id: taskId, expected_version: version,
+  });
+  const requests: Record<string, unknown>[] = [];
+  const responses = new Map<string, { resolve: (response: Response) => void; reject: (cause: Error) => void }>();
+  const sent = () => requests.map((request) => request.command as Record<string, unknown>);
+  let interleave = false;
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: {
+    getItem: (name: string) => storage.getItem(name),
+    setItem: (name: string, value: string) => {
+      if (interleave && name === journal) {
+        interleave = false;
+        // Alpha has read the journal but not yet written its identity.
+        void runners.get("b")!.submit("beta", verify("beta-task"));
+      }
+      storage.setItem(name, value);
+    },
+    removeItem: (name: string) => storage.removeItem(name),
+  } });
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (!init?.body) return new Response("[]");
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    requests.push(body);
+    const taskId = String((body.command as Record<string, unknown>).task_id);
+    return await new Promise<Response>((resolve, reject) => responses.set(taskId, { resolve, reject }));
+  }) as typeof fetch;
+  try {
+    mount(<><JournalWindow name="a" /><JournalWindow name="b" /></>);
+    interleave = true;
+    act(() => {
+      void runners.get("a")!.submit("alpha", verify("alpha-task"));
+    });
+    await settle();
+    const published = new Map<string, { body: string; id: string }>(JSON.parse(storage.getItem(journal)!));
+    check(!interleave && sent().length === 2 && ["alpha", "beta"].every((name) =>
+      sent().some((command) => command.task_id === `${name}-task` && command.operation_id === published.get(name)?.id)),
+      "one window's journal publication overwrote the other's retained identity");
+    const betaId = published.get("beta")!.id;
+    responses.get("alpha-task")!.resolve(workflowResult(requests.find((request) =>
+      (request.command as Record<string, unknown>).task_id === "alpha-task")!));
+    responses.get("beta-task")!.reject(new TypeError("response lost after commit"));
+    await settle();
+    const remaining = JSON.parse(storage.getItem(journal)!);
+    check(remaining.length === 1 && remaining[0][0] === "beta" && remaining[0][1].id === betaId &&
+      runners.get("b")!.uncertain.has("beta"),
+      "settling alpha removed beta's uncertain identity");
+
+    act(() => {
+      void runners.get("b")!.submit("beta", verify("beta-task"));
+    });
+    await settle();
+    check(sent().length === 3 && sent()[2].operation_id === betaId, "an unchanged retry did not replay its exact identity");
+    responses.get("beta-task")!.reject(new TypeError("response lost again"));
+    await settle();
+
+    act(() => {
+      void runners.get("b")!.submit("beta", verify("beta-task", 2));
+    });
+    await settle();
+    check(sent().length === 3 && runners.get("b")!.reviewed.has("beta"), "a changed request bypassed review");
+    const replaced = { body: JSON.stringify(verify("beta-task", 3)("")), id: "other-window-beta" };
+    storage.setItem(journal, JSON.stringify([["beta", replaced]]));
+    act(() => {
+      void runners.get("b")!.submit("beta", verify("beta-task", 2));
+    });
+    await settle();
+    check(sent().length === 3 && JSON.parse(storage.getItem(journal)!)[0][1].id === replaced.id,
+      "review of an earlier identity authorized replacing a different one");
+    act(() => {
+      void runners.get("b")!.submit("beta", verify("beta-task", 2));
+    });
+    await settle();
+    check(sent().length === 4 && sent()[3].expected_version === 2 &&
+      sent()[3].operation_id !== replaced.id && sent()[3].operation_id !== betaId,
+      "reviewing the current identity did not send exactly one new request");
+  } finally {
+    unmount();
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: storage });
+    storage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Workflow commands from a closed or rekeyed panel are not sent, and a sent one settles without callbacks", async () => {
+  localStorage.clear();
+  const journalA = "llmrelay.workflow.commands.panel-a";
+  const journalB = "llmrelay.workflow.commands.panel-b";
+  let runner: WorkflowCommandRunner | undefined;
+  let changes = 0;
+  function Panel({ storageKey }: { storageKey: string }) {
+    runner = useWorkflowCommands(storageKey, () => changes++);
+    return null;
+  }
+  const verify = (operation_id: string) => ({
+    kind: "verify_main_checkout" as const, operation_id, task_id: "panel-task", expected_version: 1,
+  });
+  const requests: Record<string, unknown>[] = [];
+  let respond: (response: Response) => void = noop;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (!init?.body) return new Response("[]");
+    requests.push(JSON.parse(String(init.body)));
+    return await new Promise<Response>((resolve) => { respond = resolve; });
+  }) as typeof fetch;
+  try {
+    for (const close of ["unmount", "key change"] as const) {
+      mount(<Panel storageKey={journalA} />);
+      const release = holdStorageLock(journalA);
+      act(() => {
+        void runner!.submit("verify", verify);
+      });
+      if (close === "unmount") unmount();
+      else rerender(<Panel storageKey={journalB} />);
+      release();
+      await settle();
+      check(requests.length === 0 && localStorage.getItem(journalA) === null && localStorage.getItem(journalB) === null,
+        `a request queued before ${close} was published or sent`);
+    }
+    mount(<Panel storageKey={journalA} />);
+    act(() => {
+      void runner!.submit("verify", verify);
+    });
+    await settle();
+    check(requests.length === 1 && localStorage.getItem(journalA) !== "[]", "the open panel did not publish and send");
+    unmount();
+    respond(workflowResult(requests[0]));
+    await settle();
+    check(localStorage.getItem(journalA) === "[]" && changes === 0,
+      "a request sent before closing was not settled, or its closed panel was refreshed");
+  } finally {
+    unmount();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Task draft recovery choices block closing while queued and are dropped if the form is removed", async () => {
+  localStorage.clear();
+  const key = "agenticjira.new-task";
+  let closes = 0;
+  const form = () => <TaskForm projects={[initialized]} onSaved={noop} onClose={() => closes++} />;
+  try {
+    mount(<><section data-window="a">{form()}</section><section data-window="b">{form()}</section></>);
+    await settle();
+    const a = document.querySelector('[data-window="a"]')!;
+    const b = document.querySelector('[data-window="b"]')!;
+    change(findField("Title", a), "Window A saved text");
+    await settle();
+    change(findField("Title", b), "Window B held text");
+    await settle();
+    const release = holdStorageLock(key);
+    click("Replace saved draft with current form", b);
+    click("Cancel", b);
+    check(closes === 0, "the form closed while its recovery choice was queued");
+    release();
+    await settle();
+    check(JSON.parse(localStorage.getItem(key)!).title === "Window B held text" &&
+      !b.querySelector('[aria-label="Saved draft recovery"]'),
+      "the queued replacement did not complete once the lock was free");
+
+    change(findField("Title", a), "Window A newer text");
+    await settle();
+    const saved = localStorage.getItem(key);
+    const releaseAfterRemoval = holdStorageLock(key);
+    click("Replace saved draft with current form", a);
+    unmount();
+    releaseAfterRemoval();
+    await settle();
+    check(localStorage.getItem(key) === saved, "a removed form's queued recovery choice replaced the saved draft");
+  } finally {
+    unmount();
+    localStorage.clear();
+  }
+});
+
+Deno.test("A queued task save stops when a waiting autosave finds unreadable saved requests", async () => {
+  localStorage.clear();
+  const key = "agenticjira.new-task";
+  const malformedKey = `${key}.operation.malformed`;
+  let requests = 0;
+  globalThis.fetch = (async () => {
+    requests++;
+    return new Response("{}");
+  }) as typeof fetch;
+  try {
+    mount(<TaskForm projects={[initialized]} onSaved={noop} onClose={noop} />);
+    await settle();
+    const release = holdStorageLock(key);
+    field("Title", "Saved while another window holds storage");
+    click("Save draft");
+    localStorage.setItem(malformedKey, "not a saved request");
+    release();
+    await settle();
+    const requestKeys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))
+      .filter((name) => name?.startsWith(`${key}.operation`));
+    check(requests === 0 && localStorage.getItem(malformedKey) === "not a saved request" &&
+      JSON.stringify(requestKeys) === JSON.stringify([malformedKey]) &&
+      document.body.textContent?.includes("Saved task requests could not be read safely"),
+      "a queued save published or sent a request after saved requests became unreadable");
+  } finally {
+    unmount();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Closed task forms settle requests already sent without callbacks and drop queued autosaves", async () => {
+  localStorage.clear();
+  const requests: Record<string, unknown>[] = [];
+  let respond: (response: Response) => void = noop;
+  let saved = 0;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (!init?.body) return new Response("[]");
+    requests.push(JSON.parse(String(init.body)));
+    return await new Promise<Response>((resolve) => { respond = resolve; });
+  }) as typeof fetch;
+  try {
+    const key = "agenticjira.new-task";
+    mount(<TaskForm projects={[initialized]} onSaved={() => saved++} onClose={noop} />);
+    field("Title", "Created after the form closed");
+    click("Save draft");
+    await settle();
+    check(requests.length === 1 && localStorage.getItem(`${key}.operation`) !== null, "the create was not sent");
+    unmount();
+    respond(new Response(JSON.stringify({ result: { entity_id: "AJ-closed", version: 1 } })));
+    await settle();
+    check(saved === 0 && localStorage.getItem(key) === null && localStorage.getItem(`${key}.operation`) === null &&
+      localStorage.getItem(`${key}.operation.${requests[0].operation_id}`) === null,
+      "a create sent before closing kept its records or called onSaved on the closed form");
+
+    const editing = { ...task, lifecycle: "backlog", active_attempt: undefined };
+    const editKey = `agenticjira.edit.${editing.id}`;
+    const journal = `llmrelay.checkout.operations.${editing.id}`;
+    mount(<TaskForm projects={[initialized]} editing={editing} workflowExecution={[singleAgentExecution]}
+      onSaved={() => saved++} onClose={noop} />);
+    act(() => choiceFor("Main checkout").click());
+    click("Save workspace mode only");
+    await settle();
+    const savedDraft = localStorage.getItem(editKey);
+    const release = holdStorageLock(editKey);
+    field("Description", "Typed while the workspace save was pending");
+    unmount();
+    release();
+    respond(workflowResult(requests[1]));
+    await settle();
+    check(saved === 0 && localStorage.getItem(editKey) === savedDraft && localStorage.getItem(journal) === "[]",
+      "a closed form autosaved queued text, kept its sent workspace identity, or called onSaved");
+  } finally {
+    unmount();
+    localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+for (const keepNewerEdits of [false, true]) {
+  Deno.test(`Task windows reconcile a superseded successful create without duplicating its ${keepNewerEdits ? "newer" : "submitted"} draft`, async () => {
+    const storage = localStorage;
+    storage.clear();
+    const key = "agenticjira.new-task";
+    const requests: Record<string, unknown>[] = [];
+    const committed = new Map<string, string>();
+    const responses = new Map<string, { resolve: (response: Response) => void; reject: (cause: Error) => void }>();
+    let saved = 0;
+    let interleave = false;
+    const form = () => <TaskForm projects={[initialized]} onSaved={() => saved++} onClose={noop} />;
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: {
+      getItem: (name: string) => storage.getItem(name),
+      setItem: (name: string, value: string) => {
+        if (interleave && name.startsWith(`${key}.operation.`)) {
+          interleave = false;
+          // A page from before storage locks publishes and sends B after A
+          // checked ownership but before A published its own request.
+          const olderBody = { ...JSON.parse(JSON.parse(value).body), title: "Window B submitted task" };
+          const olderRecord = JSON.stringify({ body: JSON.stringify(olderBody), id: "older-page-create" });
+          storage.setItem(`${key}.operation.older-page-create`, olderRecord);
+          storage.setItem(`${key}.operation`, olderRecord);
+          command({ ...olderBody, operation_id: "older-page-create" }).catch(noop);
+        }
+        storage.setItem(name, value);
+      },
+      removeItem: (name: string) => storage.removeItem(name),
+      key: (index: number) => storage.key(index),
+      get length() { return storage.length; },
+    } });
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(request);
+      const id = String(request.operation_id);
+      const body = JSON.stringify(request);
+      check(!committed.has(id) || committed.get(id) === body, "reconciliation changed an operation's body");
+      committed.set(id, body);
+      if (requests.length <= 2) return await new Promise<Response>((resolve, reject) => {
+        responses.set(String(request.title), { resolve, reject });
+      });
+      return new Response(JSON.stringify({ result: { entity_id: `task-${id}`, version: 1 } }));
+    }) as typeof fetch;
+    try {
+      mount(form());
+      field("Title", "Window A submitted task");
+      await settle();
+      const draftA = storage.getItem(key)!;
+      interleave = true;
+      click("Save draft");
+      await settle();
+      const requestA = requests.find((request) => request.title === "Window A submitted task")!;
+      const requestB = requests.find((request) => request.title === "Window B submitted task")!;
+      check(requests.length === 2 && !!requestA && !!requestB && requestA.operation_id !== requestB.operation_id &&
+        JSON.parse(storage.getItem(`${key}.operation`)!).id === requestB.operation_id && storage.getItem(key) === draftA,
+        "the distinct-body interleaving did not leave pointer B with draft A");
+      const retainedA = storage.getItem(`${key}.operation.${requestA.operation_id}`);
+      const retainedB = storage.getItem(`${key}.operation.${requestB.operation_id}`);
+      responses.get("Window A submitted task")!.resolve(new Response(JSON.stringify({ result: { entity_id: "task-a", version: 1 } })));
+      responses.get("Window B submitted task")!.reject(new TypeError("response lost after commit"));
+      await settle();
+      check(saved === 1 && committed.size === 2 && storage.getItem(key) === draftA &&
+        storage.getItem(`${key}.operation.${requestA.operation_id}`) === retainedA &&
+        storage.getItem(`${key}.operation.${requestB.operation_id}`) === retainedB &&
+        JSON.parse(storage.getItem(`${key}.operation`)!).id === requestB.operation_id,
+        "A's successful completion orphaned its submitted draft or removed B's recovery identity");
+
+      mount(form());
+      if (keepNewerEdits) field("Title", "A genuinely new task");
+      click("Retry exact unresolved create");
+      await settle();
+      check(saved === 2 && requests.length === 3 && requests[2].operation_id === requestB.operation_id &&
+        storage.getItem(`${key}.operation.${requestB.operation_id}`) === null &&
+        storage.getItem(`${key}.operation.${requestA.operation_id}`) === retainedA,
+        "B reconciliation removed A's outstanding recovery identity");
+      mount(form());
+      click("Save draft");
+      await settle();
+      if (keepNewerEdits) {
+        check(requests.length === 3 && findField("Title").value === "A genuinely new task",
+          "newer fields bypassed the remaining exact create reconciliation");
+        click("Retry exact unresolved create");
+        await settle();
+      }
+      check(saved === 3 && requests.length === 4 && committed.size === 2 &&
+        requests[3].operation_id === requestA.operation_id &&
+        storage.getItem(`${key}.operation`) === null &&
+        storage.getItem(`${key}.operation.${requestA.operation_id}`) === null,
+        "remount created A twice, changed its identity, or could not settle both original requests");
+      if (keepNewerEdits) {
+        mount(form());
+        check(findField("Title").value === "A genuinely new task", "reconciliation discarded the newer unsent fields");
+        click("Save draft");
+        await settle();
+        check(saved === 4 && requests.length === 5 && committed.size === 3 &&
+          requests[4].title === "A genuinely new task" &&
+          requests[4].operation_id !== requestA.operation_id && requests[4].operation_id !== requestB.operation_id,
+          "settled originals left the newer draft stuck or duplicated an earlier task");
+      }
+      check(storage.getItem(key) === null, "completed draft text remained available as an unsent task");
+    } finally {
+      unmount();
+      Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: storage });
+      storage.clear();
+      globalThis.fetch = nativeFetch;
+    }
+  });
+}
+
+for (const recoveryAction of ["Retry loading saved draft", "Replace saved draft with current form"]) {
+  Deno.test(`Task windows retain a peer-settled create through ${recoveryAction}`, async () => {
+    const storage = localStorage;
+    storage.clear();
+    const key = "agenticjira.new-task";
+    const requests: Record<string, unknown>[] = [];
+    const committed = new Set<string>();
+    let denyRetention = false;
+    let saved = 0;
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: {
+      getItem: (name: string) => storage.getItem(name),
+      setItem: (name: string, value: string) => {
+        if (denyRetention && name.startsWith(`${key}.operation.`)) {
+          throw new DOMException("request storage full", "QuotaExceededError");
+        }
+        storage.setItem(name, value);
+      },
+      removeItem: (name: string) => storage.removeItem(name),
+      key: (index: number) => storage.key(index),
+      get length() { return storage.length; },
+    } });
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(request);
+      committed.add(String(request.operation_id));
+      if (requests.length === 1) throw new TypeError("response lost after commit");
+      return new Response(JSON.stringify({ result: { entity_id: "original-task", version: 1 } }));
+    }) as typeof fetch;
+    const form = (onSaved: () => void) => <TaskForm projects={[initialized]} onSaved={onSaved} onClose={noop} />;
+    function Windows() {
+      const [otherOpen, setOtherOpen] = useState(false);
+      return <>
+        <section data-window="a">{form(() => saved++)}</section>
+        <button onClick={() => setOtherOpen(true)}>Open second task window</button>
+        {otherOpen && <section data-window="b">{form(() => { saved++; setOtherOpen(false); })}</section>}
+      </>;
+    }
+    try {
+      mount(<Windows />);
+      const a = document.querySelector('[data-window="a"]')!;
+      change(findField("Title", a), "Create once across windows");
+      click("Save draft", a);
+      await settle();
+      const original = storage.getItem(`${key}.operation`)!;
+      const retainedKey = `${key}.operation.${requests[0].operation_id}`;
+      click("Open second task window");
+      const b = document.querySelector('[data-window="b"]')!;
+      click("Retry exact unresolved create", b);
+      await settle();
+      check(saved === 1 && requests.length === 2 && committed.size === 1 &&
+        storage.getItem(key) === null && storage.getItem(`${key}.operation`) === null &&
+        storage.getItem(retainedKey) === null,
+        "the peer did not settle and clean the original request while the first window remained open");
+
+      denyRetention = true;
+      click("Save draft", a);
+      await settle();
+      click(recoveryAction, a);
+      await settle();
+      check(requests.length === 2 && storage.getItem(key) === null &&
+        storage.getItem(retainedKey) === null &&
+        !!a.querySelector('[aria-label="Saved draft recovery"]') &&
+        findField("Title", a).value === "Create once across windows",
+        "recovery resurrected submitted fields without retaining their request, or lost the held form");
+
+      denyRetention = false;
+      click(recoveryAction, a);
+      await settle();
+      check(storage.getItem(retainedKey) === original && storage.getItem(key) !== null &&
+        requests.length === 2 && !a.querySelector('[aria-label="Saved draft recovery"]'),
+        "local recovery did not retain the exact original request before resaving the draft");
+
+      mount(form(() => saved++));
+      check(document.body.textContent?.includes("Retry exact unresolved create"),
+        "remount lost the resurrected draft's original operation identity");
+      click(recoveryAction === "Retry loading saved draft" ? "Save draft" : "Retry exact unresolved create");
+      await settle();
+      check(saved === 2 && requests.length === 3 && committed.size === 1 &&
+        requests.every((request) => JSON.stringify(request) === JSON.stringify(requests[0])) &&
+        storage.getItem(key) === null && storage.getItem(retainedKey) === null,
+        "post-recovery submission changed the original body/id, created another task, or failed to settle");
+    } finally {
+      unmount();
+      Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: storage });
+      storage.clear();
+      globalThis.fetch = nativeFetch;
+    }
+  });
+}

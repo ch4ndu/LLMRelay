@@ -1236,7 +1236,7 @@ pub fn reconcile_prior_boot(store: &Store) -> Result<Vec<serde_json::Value>> {
     }
     let checks = {
         let mut statement =
-            connection.prepare("SELECT cr.id,cr.attempt_id,cr.launch_state,(SELECT COUNT(*) FROM check_processes cp WHERE cp.check_id=cr.id) FROM check_runs cr WHERE cr.status IN ('launch_reserved','running')")?;
+            connection.prepare("SELECT cr.id,cr.attempt_id,cr.launch_state,(SELECT COUNT(*) FROM check_processes cp WHERE cp.check_id=cr.id),cr.evidence_json FROM check_runs cr WHERE cr.status IN ('launch_reserved','running')")?;
         let rows = statement
             .query_map([], |row| {
                 Ok((
@@ -1244,6 +1244,7 @@ pub fn reconcile_prior_boot(store: &Store) -> Result<Vec<serde_json::Value>> {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1254,7 +1255,7 @@ pub fn reconcile_prior_boot(store: &Store) -> Result<Vec<serde_json::Value>> {
     } else {
         process_inventory()?
     };
-    for (check_id, attempt, launch_state, identity_count) in checks {
+    for (check_id, attempt, launch_state, identity_count, prior_evidence) in checks {
         if launch_state == "reserved" && identity_count == 0 {
             let now = Utc::now().to_rfc3339();
             connection.execute("UPDATE check_runs SET status='launch_failed',launch_state='proven_nondelivery',launch_error='service restarted before spawn began',evidence_json=?1,finished_at=?2 WHERE id=?3 AND status='launch_reserved'",
@@ -1273,15 +1274,20 @@ pub fn reconcile_prior_boot(store: &Store) -> Result<Vec<serde_json::Value>> {
             .map(|(pid, _, _)| *pid)
             .collect::<Vec<_>>();
         let now = Utc::now().to_rfc3339();
+        let prior_evidence: serde_json::Value = serde_json::from_str(&prior_evidence)?;
         let detail = serde_json::json!({
             "check_id":check_id,
             "observation":if live.is_empty(){"recorded_processes_absent"}else{"survivor_unattached"},
             "live_pids":live,
-            "replacement_allowed":false
+            "replacement_allowed":false,
+            "evidence":{
+                "capture_incomplete":prior_evidence.get("capture_incomplete"),
+                "capture_settlement":prior_evidence.get("capture_settlement"),
+            },
         });
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
-            "UPDATE check_runs SET status='recovery_required',launch_state=CASE WHEN launch_state='reserved' THEN 'delivery_unknown' ELSE launch_state END,evidence_json=?1 WHERE id=?2 AND status IN ('launch_reserved','running')",
+            "UPDATE check_runs SET status='recovery_required',launch_state=CASE WHEN launch_state='reserved' THEN 'delivery_unknown' ELSE launch_state END,evidence_json=json_patch(evidence_json,?1) WHERE id=?2 AND status IN ('launch_reserved','running')",
             params![detail.to_string(), check_id],
         )?;
         transaction.execute(
@@ -2812,15 +2818,33 @@ pub fn verify_attempt_quiescent(store: &Store, attempt: &str) -> Result<serde_js
 }
 
 pub fn verify_check_quiescent(store: &Store, check_id: &str) -> Result<serde_json::Value> {
-    let (recorded, group_anchor, anchor, launch_boot) = {
+    let (
+        recorded,
+        group_anchor,
+        anchor,
+        launch_boot,
+        capture_evidence,
+        recovery_capture_incomplete,
+    ) = {
         let connection = store.lock()?;
         let recorded = check_identities(&connection, check_id)?;
-        let (group, anchor, boot) = connection.query_row(
-            "SELECT recovery_process_group_id,recovery_anchor_json,launch_boot_identity FROM check_runs WHERE id=?1",
+        let (group, anchor, boot, evidence, recovery_capture_incomplete) = connection.query_row(
+            "SELECT recovery_process_group_id,recovery_anchor_json,launch_boot_identity,evidence_json,
+                EXISTS(SELECT 1 FROM recovery_records r WHERE r.state='attention_required'
+                    AND json_extract(r.detail_json,'$.check_id')=check_runs.id
+                    AND json_extract(r.detail_json,'$.evidence.capture_incomplete')=1)
+             FROM check_runs WHERE id=?1",
             params![check_id],
-            |row| Ok((row.get::<_, Option<i32>>(0)?,row.get::<_, Option<String>>(1)?,row.get::<_, Option<String>>(2)?)),
+            |row| Ok((row.get::<_, Option<i32>>(0)?,row.get::<_, Option<String>>(1)?,row.get::<_, Option<String>>(2)?,row.get::<_, String>(3)?,row.get::<_, bool>(4)?)),
         )?;
-        (recorded, group, anchor, boot)
+        (
+            recorded,
+            group,
+            anchor,
+            boot,
+            serde_json::from_str::<serde_json::Value>(&evidence)?,
+            recovery_capture_incomplete,
+        )
     };
     let inventory = process_inventory()?;
     let evidence = verify_generation_absent(
@@ -2832,7 +2856,53 @@ pub fn verify_check_quiescent(store: &Store, check_id: &str) -> Result<serde_jso
         launch_boot.as_deref(),
         &inventory,
     )?;
-    Ok(serde_json::json!({"check_id":check_id,"verification":evidence}))
+    let capture_settlement = verify_capture_settlement(
+        check_id,
+        launch_boot.as_deref(),
+        &capture_evidence,
+        recovery_capture_incomplete,
+        &evidence,
+    )?;
+    Ok(
+        serde_json::json!({"check_id":check_id,"verification":evidence,"capture_settlement":capture_settlement}),
+    )
+}
+
+fn verify_capture_settlement(
+    check_id: &str,
+    launch_boot: Option<&str>,
+    capture_evidence: &serde_json::Value,
+    recovery_capture_incomplete: bool,
+    generation_evidence: &serde_json::Value,
+) -> Result<Option<serde_json::Value>> {
+    if capture_evidence
+        .get("capture_incomplete")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+        && !recovery_capture_incomplete
+    {
+        return Ok(None);
+    }
+    if generation_evidence["source"] == "operating_system_boot_changed" {
+        return Ok(Some(
+            serde_json::json!({"source":"operating_system_boot_changed"}),
+        ));
+    }
+    let settlement = &capture_evidence["capture_settlement"];
+    if settlement["source"] == "retained_output_eof"
+        && settlement["check_id"].as_str() == Some(check_id)
+        && launch_boot.is_some_and(|boot| {
+            !boot.is_empty() && settlement["launch_boot_identity"].as_str() == Some(boot)
+        })
+        && settlement["stdout_eof"] == true
+        && settlement["stderr_eof"] == true
+        && settlement["observed_at"]
+            .as_str()
+            .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+    {
+        return Ok(Some(settlement.clone()));
+    }
+    bail!("Check output may still be open. Keep the service running while its output closes, then retry recovery. If the service restarted before it recorded closure, recovery requires a verified computer restart; absent recorded processes alone cannot settle an unknown output writer.")
 }
 
 fn verify_generation_absent(
@@ -3008,4 +3078,80 @@ pub fn parse_process_inventory(output: &[u8]) -> Result<Vec<(u32, i32, String)>>
         bail!("process inventory was empty; quiescence remains unknown")
     }
     Ok(values)
+}
+
+#[cfg(test)]
+mod capture_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_capture_requires_exact_eof_settlement_or_verified_prior_boot() {
+        let boot = "linux:11111111-1111-4111-8111-111111111111";
+        let later_boot = "linux:22222222-2222-4222-8222-222222222222";
+        let same_boot = serde_json::json!({"source":"generation_anchor_and_group_absent"});
+        let mut capture = serde_json::json!({"capture_incomplete":true});
+        assert!(
+            verify_capture_settlement("check", Some(boot), &capture, false, &same_boot).is_err()
+        );
+        capture["capture_settlement"] = serde_json::json!({
+            "source":"retained_output_eof", "check_id":"check", "launch_boot_identity":boot,
+            "stdout_eof":true, "stderr_eof":true, "observed_at":"2026-10-29T00:00:00Z",
+        });
+        assert!(
+            verify_capture_settlement("check", Some(boot), &capture, false, &same_boot)
+                .unwrap()
+                .is_some()
+        );
+        assert!(verify_capture_settlement(
+            "another-check",
+            Some(boot),
+            &capture,
+            false,
+            &same_boot
+        )
+        .is_err());
+        assert!(
+            verify_capture_settlement("check", Some(later_boot), &capture, false, &same_boot)
+                .is_err()
+        );
+        capture["capture_settlement"]["stderr_eof"] = false.into();
+        assert!(
+            verify_capture_settlement("check", Some(boot), &capture, false, &same_boot).is_err()
+        );
+        assert!(verify_capture_settlement(
+            "check",
+            Some(boot),
+            &serde_json::json!({}),
+            true,
+            &same_boot
+        )
+        .is_err());
+        let prior_boot = verify_generation_absent_evidence(
+            "check",
+            "check",
+            &[],
+            None,
+            None,
+            Some(boot),
+            later_boot,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(prior_boot["source"], "operating_system_boot_changed");
+        assert_eq!(
+            verify_capture_settlement("check", Some(boot), &capture, false, &prior_boot)
+                .unwrap()
+                .unwrap()["source"],
+            "operating_system_boot_changed"
+        );
+        assert!(verify_capture_settlement(
+            "ordinary-check",
+            Some(boot),
+            &serde_json::json!({}),
+            false,
+            &same_boot
+        )
+        .unwrap()
+        .is_none());
+    }
 }

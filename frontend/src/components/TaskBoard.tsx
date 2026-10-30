@@ -1,3 +1,4 @@
+import { readPreference, savePreference } from "../storagePreferences";
 import { ErrorNotice } from "./ErrorNotice";
 import { useMemo, useState } from "react";
 import { command, operationId } from "../api";
@@ -453,7 +454,7 @@ const priorityLabel = (task: Task) =>
 
 export type TaskSection = "active" | "completed";
 const savedSection = (key: string): TaskSection =>
-  localStorage.getItem(key) === "completed" ? "completed" : "active";
+  readPreference(key) === "completed" ? "completed" : "active";
 
 /** Active and Completed switch shared by the board and the Workspace list. */
 export function SectionSwitch(
@@ -568,7 +569,7 @@ export function TaskBoard(
     savedSection("llmrelay.board.section")
   );
   const [view, setView] = useState<"board" | "list">(() =>
-    localStorage.getItem("agenticjira.board.view") === "list" ? "list" : "board"
+    readPreference("agenticjira.board.view") === "list" ? "list" : "board"
   );
   const [error, setError] = useState("");
   const matching = useMemo(
@@ -596,11 +597,11 @@ export function TaskBoard(
   const projectFor = (id: string) => projects.find((value) => value.id === id);
   const chooseView = (value: "board" | "list") => {
     setView(value);
-    localStorage.setItem("agenticjira.board.view", value);
+    savePreference("agenticjira.board.view", value);
   };
   const chooseSection = (value: TaskSection) => {
     setSection(value);
-    localStorage.setItem("llmrelay.board.section", value);
+    savePreference("llmrelay.board.section", value);
   };
   const move = async (task: Task, offset: number) => {
     try {
@@ -829,7 +830,7 @@ export function TaskSections(
   const shown = section === "active" ? [...active].sort(reviewFirst) : completed;
   const choose = (value: TaskSection) => {
     setSection(value);
-    localStorage.setItem("llmrelay.workspace.section", value);
+    savePreference("llmrelay.workspace.section", value);
   };
   return (
     <section className="panel task-sections" id="workspace-tasks" aria-labelledby="workspace-tasks-title">

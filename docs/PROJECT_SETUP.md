@@ -4,6 +4,12 @@
 
 In the dashboard, choose **Add project**, enter a project name and the absolute path to an existing local Git repository, and submit the form. Field labels and validation explain missing values before submission; the service then validates the physical repository identity and current revision. A relink is accepted only for another path to the same physical repository and only while no attempt is active. **Validate and relink** also accepts the current path: use it after committing changes so new tasks start from the folder's current commit.
 
+Repositories containing Git submodules are not supported. LLMRelay refuses them
+because its reviewed snapshots cannot yet represent a submodule's revision and
+uncommitted contents. Use a repository without submodules; do not remove submodule
+files merely to bypass this check. Adding a submodule during a task also prevents
+snapshot verification and acceptance.
+
 ## Choose your setup path
 
 LLMRelay supports two workflows. **Single agent** uses one coding agent and your

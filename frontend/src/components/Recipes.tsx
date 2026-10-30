@@ -293,10 +293,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
       );
       onChanged();
     } catch (cause) {
-      if (!(cause instanceof ApiError && cause.ambiguous)) {
-        persistRecovery(recovery.current!.entries.filter((item) => item !== entry));
-      }
-      setError(`${cause instanceof Error ? cause.message : String(cause)}. Current state is refreshing; inspect it before a new action.`);
+      setError(`${cause instanceof Error ? cause.message : String(cause)}. The original request still has an unknown result. Refresh and inspect the current state; the exact request remains saved for reconciliation.`);
       onChanged();
     } finally {
       setPending(false);

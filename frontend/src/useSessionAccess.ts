@@ -70,15 +70,17 @@ export function useSessionAccess(
     if (latest) durableSurfaces.current[session.id] = latest;
   }
   useEffect(() => {
-    const keys = Array.from(
-      { length: localStorage.length },
-      (_, index) => localStorage.key(index),
-    );
-    for (const key of keys) {
-      if (typeof key === "string" && key.startsWith("agenticjira.terminal.")) {
-        localStorage.removeItem(key);
+    try {
+      const keys = Array.from(
+        { length: localStorage.length },
+        (_, index) => localStorage.key(index),
+      );
+      for (const key of keys) {
+        if (typeof key === "string" && key.startsWith("agenticjira.terminal.")) {
+          localStorage.removeItem(key);
+        }
       }
-    }
+    } catch { /* Legacy terminal preferences do not control current session access. */ }
   }, []);
   const durableSurfaceForSession = (sessionId: string) =>
     durableSurfaces.current[sessionId] ||
