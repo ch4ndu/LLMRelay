@@ -19698,6 +19698,214 @@ Deno.test("Audit Recipes retains a refused pending draft across remount", async 
   }
 });
 
+Deno.test("Audit Recipes settles only its exact journal entry after project switches", async () => {
+  sessionStorage.clear();
+  const key = "llmrelay.m9.pending-commands.v1";
+  const projectOne: Project = {
+    ...initialized,
+    trip: { ...initialized.trip!, active_config_revision_id: "config-1" },
+  };
+  const projectTwo: Project = { ...projectOne, id: "p2", display_name: "Other project" };
+  const state: AppState = { ...liveBase, projects: [projectOne, projectTwo] };
+  const deferred: Array<{
+    body: Record<string, unknown>;
+    resolve: (response: Response) => void;
+    reject: (cause: unknown) => void;
+  }> = [];
+  globalThis.fetch = (async (
+    _input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return await new Promise<Response>((resolve, reject) => {
+      deferred.push({ body, resolve, reject });
+    });
+  }) as typeof fetch;
+  const refreshed: string[] = [];
+  const recipes = (project: Project) => (
+    <Recipes
+      state={state}
+      project={project}
+      onChanged={() => refreshed.push(project.id)}
+      onOpenTask={noop}
+    />
+  );
+  const journal = () =>
+    JSON.stringify(
+      (JSON.parse(sessionStorage.getItem(key) ?? "[]") as Array<{
+        body: unknown;
+      }>).map((entry) => entry.body),
+    );
+  const created = (id: string) =>
+    new Response(JSON.stringify({ result: { entity_id: id, version: 1 } }));
+  try {
+    mount(recipes(projectOne));
+    field("Name", "Project one profile");
+    click("Save profile set");
+    await settle();
+    rerender(recipes(projectTwo));
+    field("Name", "Project two profile");
+    click("Save profile set");
+    await settle();
+    check(
+      deferred.length === 2 &&
+        journal() === JSON.stringify([deferred[0].body, deferred[1].body]),
+      "a project switch blocked the next project's save or it was not saved before sending",
+    );
+    deferred[0].resolve(created("profile-one"));
+    await settle();
+    check(
+      journal() === JSON.stringify([deferred[1].body]) &&
+        refreshed.length === 0 &&
+        !document.body.textContent?.includes("Saved.") &&
+        document.querySelector("section.panel h3")?.textContent ===
+          "New profile set" &&
+        findButton("Save profile set").disabled,
+      "the previous project's response updated the current form or its pending state",
+    );
+    mount(recipes(projectOne));
+    field("Name", "Second project one profile");
+    click("Save profile set");
+    await settle();
+    deferred[1].resolve(created("profile-two"));
+    await settle();
+    check(
+      journal() === JSON.stringify([deferred[2].body]) && refreshed.length === 0,
+      "a closed form's settlement removed a newer entry or refreshed its parent",
+    );
+    deferred[2].reject(new TypeError("Connection lost"));
+    await settle();
+    check(
+      journal() === JSON.stringify([deferred[2].body]) &&
+        refreshed.join() === "p1",
+      "an uncertain result discarded its exact recovery entry",
+    );
+    mount(recipes(projectOne));
+    click("Retry exact pending request");
+    await settle();
+    unmount();
+    deferred[3].resolve(created("profile-one-again"));
+    await settle();
+    check(
+      JSON.stringify(deferred[3].body) === JSON.stringify(deferred[2].body) &&
+        sessionStorage.getItem(key) === "[]" && refreshed.join() === "p1",
+      "the retry changed its request, kept a confirmed entry or refreshed after closing",
+    );
+    sessionStorage.setItem(key, "unreadable");
+    mount(recipes(projectTwo));
+    field("Name", "Unrecoverable profile");
+    click("Save profile set");
+    await settle();
+    check(
+      deferred.length === 4 && sessionStorage.getItem(key) === "unreadable",
+      "a request was sent without recovery or the unreadable journal was replaced",
+    );
+  } finally {
+    unmount();
+    sessionStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Audit configuration editor keeps its draft and starting revision until Load latest", async () => {
+  localStorage.clear();
+  const bodies: Record<string, unknown>[] = [];
+  let reply: "apply" | "refuse" | "lose" = "apply";
+  globalThis.fetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (!init?.body) return new Response("[]");
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      bodies.push(body);
+      if (reply === "lose") throw new TypeError("Connection lost");
+      if (reply === "refuse") {
+        return new Response(
+          JSON.stringify({ error: "configuration revision changed" }),
+          { status: 409 },
+        );
+      }
+      return workflowResult(body);
+    }) as typeof fetch;
+  const revision = (number: number, policy: string): ProjectExecution => ({
+    ...singleAgentExecution,
+    configurations: [{
+      ...singleAgentExecution.configurations[0],
+      id: `cfg-${number}`,
+      revision: number,
+      configuration: {
+        ...singleAgentExecution.configurations[0].configuration,
+        documentation_policy: policy,
+      },
+    }],
+  });
+  const settings = (execution: ProjectExecution) => (
+    <ProjectSettings
+      project={initialized}
+      execution={execution}
+      onChanged={noop}
+    />
+  );
+  const editor = () =>
+    document.querySelector<HTMLElement>(".execution-configuration");
+  const policy = () => findField("Documentation policy", editor()!);
+  const saves = () =>
+    workflowCommands(bodies).filter((command) =>
+      command.kind === "save_execution_configuration"
+    );
+  const save = async (outcome: typeof reply) => {
+    reply = outcome;
+    click("Save configuration revision");
+    await settle();
+  };
+  try {
+    mount(settings(revision(2, "Original policy")));
+    click("Create a new configuration revision");
+    change(policy(), "My unsaved policy");
+    rerender(settings(revision(3, "Policy saved elsewhere")));
+    check(
+      policy().value === "My unsaved policy" &&
+        editor()!.textContent?.includes("saved while you were editing"),
+      "a newer revision replaced the draft or its conflict was not shown",
+    );
+    await save("refuse");
+    check(
+      saves().length === 1 && saves()[0].expected_revision === 2 &&
+        (saves()[0].configuration as Record<string, unknown>)
+            .documentation_policy === "My unsaved policy" &&
+        policy().value === "My unsaved policy",
+      "the kept draft was sent against a newer revision or a refused save closed it",
+    );
+    click("Load latest configuration");
+    check(
+      policy().value === "Policy saved elsewhere" &&
+        !editor()!.textContent?.includes("saved while you were editing"),
+      "Load latest did not restart the draft from the newest revision",
+    );
+    await save("lose");
+    check(
+      saves().at(-1)?.expected_revision === 3 && !!editor() &&
+        editor()!.textContent?.includes("may already have been applied"),
+      "an uncertain save closed the editor or lost the reloaded revision",
+    );
+    await save("apply");
+    check(
+      saves().length === 3 && !editor(),
+      "a confirmed save left the editor open",
+    );
+    rerender(settings(revision(4, "Policy after save")));
+    click("Create a new configuration revision");
+    check(
+      policy().value === "Policy after save" &&
+        editor()!.textContent?.includes("based on revision 4") &&
+        !editor()!.textContent?.includes("saved while you were editing"),
+      "reopening did not start from the current saved configuration",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
 Deno.test("Audit restored drafts retain exact workflow selections and require correction of missing choices", async () => {
   localStorage.clear();
   const alternate: ProjectExecution = {

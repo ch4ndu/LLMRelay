@@ -214,6 +214,9 @@ struct BackupManifest {
     sqlite_schema_version: i64,
     integrity_check: String,
     foreign_key_violations: u64,
+    // Absent in pre-retention-domain manifests; such points are never pruned automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_instance: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -342,6 +345,7 @@ pub(crate) fn open_service_locked(paths: &InstancePaths, lock: &InstanceLock) ->
     }
     let destination = backup_root(paths, None)?;
     validate_backup_destination(paths, &destination)?;
+    let source_instance = backup_source_instance(paths)?;
     let (backup_budget, migration_budget) = source_storage_budgets(paths, &transaction)?;
     require_upgrade_capacity(&destination, &paths.state, backup_budget, migration_budget)?;
     create_private_directory(&destination)?;
@@ -350,7 +354,7 @@ pub(crate) fn open_service_locked(paths: &InstancePaths, lock: &InstanceLock) ->
     drop(transaction);
     drop(connection);
     drop(source);
-    let snapshot = finalize_backup(&destination, copied, None)
+    let snapshot = finalize_backup(&destination, copied, &source_instance, None)
         .and_then(PublishedBackup::require_complete)
         .context("publish verified pre-upgrade restore point")?;
     let backup = snapshot["backup"]
@@ -373,6 +377,7 @@ pub fn backup(paths: &InstancePaths, configured: Option<&Path>) -> Result<serde_
     let destination = backup_root(paths, configured)?;
     validate_live_database_family(paths)?;
     validate_backup_destination(paths, &destination)?;
+    let source_instance = backup_source_instance(paths)?;
     let source = Store::open_current_readonly(&paths.database)?;
     let connection = source.lock()?;
     let transaction = connection.unchecked_transaction()?;
@@ -384,7 +389,7 @@ pub fn backup(paths: &InstancePaths, configured: Option<&Path>) -> Result<serde_
     drop(transaction);
     drop(connection);
     drop(source);
-    finalize_backup(&destination, copied, None)?.require_complete()
+    finalize_backup(&destination, copied, &source_instance, None)?.require_complete()
 }
 
 pub(crate) fn validate_online_backup_destination(
@@ -410,6 +415,7 @@ pub(crate) fn backup_online(
     control.check()?;
     validate_online_backup_destination(paths, &lock, destination)?;
     validate_live_database_family(paths)?;
+    let source_instance = backup_source_instance(paths)?;
     let source = Store::open_current_readonly(&paths.database)?;
     let connection = source.lock()?;
     let transaction = connection.unchecked_transaction()?;
@@ -427,7 +433,17 @@ pub(crate) fn backup_online(
     drop(transaction);
     drop(connection);
     drop(source);
-    finalize_backup(destination, copied, Some(control))
+    finalize_backup(destination, copied, &source_instance, Some(control))
+}
+
+// The canonical instance root, not a database or boot identity, defines the
+// retention domain so restarts and restores keep it while relocations start anew.
+fn backup_source_instance(paths: &InstancePaths) -> Result<String> {
+    let root = resolve_missing(&paths.root).context("resolve canonical instance root")?;
+    let mut digest = Sha256::new();
+    digest.update(b"llmrelay-backup-source-instance-v1\0");
+    digest.update(root.as_os_str().as_bytes());
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn copy_backup_locked(
@@ -486,6 +502,7 @@ fn copy_backup_locked(
 fn finalize_backup(
     destination: &Path,
     copied: CopiedBackup,
+    source_instance: &str,
     control: Option<&OnlineBackupControl>,
 ) -> Result<PublishedBackup> {
     let CopiedBackup {
@@ -529,6 +546,7 @@ fn finalize_backup(
             sqlite_schema_version,
             integrity_check: integrity,
             foreign_key_violations: foreign_keys,
+            source_instance: Some(source_instance.to_owned()),
         };
         write_private_json(&staging.join("manifest.json"), &manifest)?;
         sync_directory(&staging)?;
@@ -568,7 +586,7 @@ fn finalize_backup(
                     TEST_BACKUP_PUBLICATION_FAILURE.with(|failure| failure.set(None));
                     bail!("injected retention failure")
                 }
-                prune_backups(destination, &published, control)
+                prune_backups(destination, &published, source_instance, control)
             })();
             match retention {
                 Ok(()) => BackupPublication::Complete,
@@ -2300,7 +2318,12 @@ fn require_capacity(path: &Path, required: u64) -> Result<()> {
     Ok(())
 }
 
-fn prune_backups(root: &Path, newest: &Path, control: Option<&OnlineBackupControl>) -> Result<()> {
+fn prune_backups(
+    root: &Path,
+    newest: &Path,
+    source_instance: &str,
+    control: Option<&OnlineBackupControl>,
+) -> Result<()> {
     let check_control = || -> Result<()> {
         if let Some(control) = control {
             control.check()?;
@@ -2328,6 +2351,10 @@ fn prune_backups(root: &Path, newest: &Path, control: Option<&OnlineBackupContro
         let Ok((_, manifest, _)) = load_manifest(&path) else {
             continue;
         };
+        // Ownerless and other-instance points never count against or yield to this domain's limits.
+        if manifest.source_instance.as_deref() != Some(source_instance) {
+            continue;
+        }
         check_control()?;
         if !app_owned_snapshot(&path)? {
             continue;
@@ -2646,7 +2673,7 @@ mod tests {
         drop(transaction);
         drop(connection);
         drop(source);
-        let error = finalize_backup(&destination, copied, Some(&expired))
+        let error = finalize_backup(&destination, copied, "test-instance", Some(&expired))
             .err()
             .unwrap();
         assert!(format!("{error:#}").contains("deadline"));

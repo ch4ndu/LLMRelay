@@ -117,16 +117,26 @@ const checkInput = (check: CheckDraft): ExecutionCheckInput =>
       original_text: check.original_text.trim(),
     };
 
-/** Saves a new, separately approved execution configuration revision. */
+/**
+ * Saves a new, separately approved execution configuration revision. The draft
+ * and its expected revision change together only through Load latest
+ * configuration, so a save never pairs older edits with a newer revision.
+ */
 function ExecutionConfigurationEditor(
-  { project, execution, commands }: {
+  { project, execution, commands, onSaved }: {
     project: Project;
     execution?: ProjectExecution;
     commands: WorkflowCommandRunner;
+    onSaved: () => void;
   },
 ) {
   const [draft, setDraft] = useState(() => configurationDraft(execution));
   const latestRevision = execution?.configurations[0]?.revision ?? 0;
+  const [baseRevision, setBaseRevision] = useState(latestRevision);
+  const loadLatest = () => {
+    setDraft(configurationDraft(execution));
+    setBaseRevision(latestRevision);
+  };
   const updateCheck = (index: number, change: Partial<CheckDraft>) =>
     setDraft((current) => ({
       ...current,
@@ -135,12 +145,12 @@ function ExecutionConfigurationEditor(
       ),
     }));
   const key = `configuration:${project.id}`;
-  const save = () =>
-    void commands.submit(key, (operation_id) => ({
+  const save = async () => {
+    const saved = await commands.submit(key, (operation_id) => ({
       kind: "save_execution_configuration",
       operation_id,
       project_id: project.id,
-      expected_revision: latestRevision,
+      expected_revision: baseRevision,
       configuration: {
         guidance_paths: draft.guidance_paths.split("\n").map((line) =>
           line.trim()
@@ -150,11 +160,13 @@ function ExecutionConfigurationEditor(
         checks: draft.checks.map(checkInput),
       },
     }));
+    if (saved) onSaved();
+  };
   return (
     <fieldset className="execution-configuration" disabled={commands.busy}>
       <legend>
-        {latestRevision
-          ? `New execution configuration (current revision ${latestRevision})`
+        {baseRevision
+          ? `New execution configuration (based on revision ${baseRevision})`
           : "First execution configuration"}
       </legend>
       <p className="hint">
@@ -162,6 +174,20 @@ function ExecutionConfigurationEditor(
         save; later edits in the folder are not included. Saving creates a new
         revision. Tasks and admissions keep the revision they chose.
       </p>
+      {latestRevision !== baseRevision && (
+        <div className="warning" role="status">
+          <p>
+            Revision {latestRevision} of this configuration was saved while you
+            were editing. Your edits are kept here and still start from the
+            configuration you opened. Copy anything you want to keep, then
+            choose Load latest configuration to start again from revision{" "}
+            {latestRevision}.
+          </p>
+          <button type="button" onClick={loadLatest}>
+            Load latest configuration
+          </button>
+        </div>
+      )}
       <label>
         Guidance files <small>One repository-relative path per line</small>
         <textarea
@@ -319,7 +345,7 @@ function ExecutionConfigurationEditor(
           type="button"
           className="primary"
           disabled={!draft.documentation_policy.trim()}
-          onClick={save}
+          onClick={() => void save()}
         >
           Save configuration revision
         </button>
@@ -635,13 +661,15 @@ function SingleAgentProjectSettings(
           ? (
             <>
               <ExecutionConfigurationEditor
-                key={latestConfiguration?.id ?? "first"}
+                key={project.id}
                 project={project}
                 execution={execution}
                 commands={commands}
+                onSaved={() => setEditingConfiguration(false)}
               />
               <button
                 type="button"
+                disabled={commands.busy}
                 onClick={() => setEditingConfiguration(false)}
               >
                 Close configuration editor

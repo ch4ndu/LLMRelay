@@ -21525,6 +21525,7 @@ mod interruption_tests {
     #[test]
     fn restorepoint_retention_keeps_each_schema_anchor_and_ignores_unverified_content() {
         let mut host = None;
+        let mut host_instance = serde_json::Value::Null;
         let mut anchors = Vec::new();
         for version in SERVICE_UPGRADABLE_SCHEMA_VERSIONS {
             let (paths, source) = restorepoint_fixture(version);
@@ -21537,6 +21538,13 @@ mod interruption_tests {
             let mut manifest: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
             manifest["created_at"] = "2000-01-01T00:00:00Z".into();
+            // Moved points stand in for the host's own earlier upgrades, so they join its retention domain.
+            if host.is_some() {
+                manifest["source_instance"] = host_instance.clone();
+            } else {
+                host_instance = manifest["source_instance"].clone();
+                assert!(host_instance.is_string());
+            }
             std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
             if let Some(host_paths) = &host {
                 let moved = restorepoint_root(host_paths).join(point.file_name().unwrap());

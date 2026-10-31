@@ -1355,15 +1355,32 @@ fn m4a_retention_prunes_only_verified_snapshots_and_preserves_other_state() {
     let backup_root = first_snapshot.parent().unwrap().to_owned();
     let unrelated = backup_root.join("operator-notes.txt");
     std::fs::write(&unrelated, b"unrelated").unwrap();
-    let manifest_path = first_snapshot.join("manifest.json");
-    let mut manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-    manifest["created_at"] = serde_json::Value::String("2000-01-01T00:00:00Z".into());
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
+    let expire = |snapshot: &std::path::Path, ownerless: bool| {
+        let manifest_path = snapshot.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["created_at"] = serde_json::Value::String("2000-01-01T00:00:00Z".into());
+        if ownerless {
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .remove("source_instance")
+                .unwrap();
+        }
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    };
+    let legacy = m4a_backup_path(&database::backup(&paths, None).unwrap());
+    expire(&first_snapshot, false);
+    expire(&legacy, true);
+    let other_instance = m4a_paths("retention-other-instance");
+    Store::open(&other_instance.database).unwrap();
+    let foreign = m4a_backup_path(&database::backup(&other_instance, Some(&backup_root)).unwrap());
+    assert_eq!(foreign.parent().unwrap(), backup_root);
+    expire(&foreign, false);
     let mut newest = PathBuf::new();
     for _ in 0..10 {
         newest = m4a_backup_path(&database::backup(&paths, None).unwrap());
@@ -1373,9 +1390,12 @@ fn m4a_retention_prunes_only_verified_snapshots_and_preserves_other_state() {
         .filter_map(Result::ok)
         .filter(|entry| entry.path().join("manifest.json").is_file())
         .count();
-    assert_eq!(snapshot_count, 10);
+    assert_eq!(snapshot_count, 10 + 2);
     assert!(!first_snapshot.exists());
     assert!(newest.exists());
+    database::verify(&legacy).unwrap();
+    database::verify(&foreign).unwrap();
+    database::restore(&m4a_paths("retention-cross-owner-restore"), &foreign).unwrap();
     assert!(unrelated.exists());
     assert!(quarantine.join("preserved.txt").exists());
 }
@@ -33810,6 +33830,57 @@ fn audit_snapshot_file_directory_transitions_round_trip_and_verify_integration()
             );
         }
     }
+}
+
+#[test]
+fn audit_snapshot_staged_removal_of_candidate_paths_is_captured_and_enforced() {
+    let fixture = Fixture::new("audit-candidate-removal");
+    let repo = fixture.repository("repo");
+    let repository = workspace::inspect(&repo).unwrap();
+    std::fs::write(repo.join("removed.txt"), "candidate only\n").unwrap();
+    std::fs::write(repo.join("moved.txt"), "renamed content\n").unwrap();
+    commit_all(&repo, "candidate adds paths");
+    let candidate = workspace::inspect(&repo).unwrap().head;
+    run(&repo, &["rm", "-q", "removed.txt"]);
+    let (deletion_only, _) =
+        snapshot::capture(&repository, &repo, &fixture.root.join("deletion-only")).unwrap();
+    assert!(
+        snapshot::clean_candidate_commit(&repository, &deletion_only)
+            .unwrap()
+            .is_none()
+    );
+    run(&repo, &["mv", "moved.txt", "renamed.txt"]);
+    let frozen = fixture.root.join("snapshot");
+    let (manifest, _) = snapshot::capture(&repository, &repo, &frozen).unwrap();
+    let destination = fixture.root.join("rework");
+    workspace::create_detached_worktree(&repository, &destination, &manifest.snapshot_base)
+        .unwrap();
+    snapshot::materialize(&manifest, &frozen, &destination).unwrap();
+    assert!(!destination.join("removed.txt").exists());
+    assert!(!destination.join("moved.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(destination.join("renamed.txt")).unwrap(),
+        "renamed content\n"
+    );
+    std::fs::write(repo.join("fixture.txt"), "unrelated integration edit\n").unwrap();
+    commit_all(&repo, "integrate removal");
+    let integrated = workspace::inspect(&repo).unwrap().head;
+    assert_eq!(
+        snapshot::verify_integration(&repository, &manifest, &integrated).unwrap(),
+        vec!["moved.txt", "removed.txt", "renamed.txt"]
+    );
+    run(
+        &repo,
+        &["checkout", candidate.as_str(), "--", "removed.txt"],
+    );
+    commit_all(&repo, "resurrect removed path");
+    let resurrected = workspace::inspect(&repo).unwrap().head;
+    assert!(
+        snapshot::verify_integration(&repository, &manifest, &resurrected)
+            .unwrap_err()
+            .to_string()
+            .contains("removed.txt")
+    );
 }
 
 #[test]

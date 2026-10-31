@@ -57,24 +57,17 @@ pub fn capture(
         bail!("registered project base is not an ancestor of the candidate worktree head")
     }
     let mut paths = snapshot_paths(worktree)?;
-    let base_output = Command::new("git")
-        .arg("-C")
-        .arg(&repository.root)
-        .args(["ls-tree", "-r", "-z", "--name-only", &repository.head])
-        .output()?;
-    if !base_output.status.success() {
-        bail!("git ls-tree failed while enumerating the original attempt base")
+    // Candidate-HEAD paths absent from the index are staged removals or renames to record.
+    for commit in [repository.head.as_str(), observed.head.as_str()] {
+        paths.extend(git_paths(
+            &repository.root,
+            &["ls-tree", "-r", "-z", "--name-only", commit],
+            "enumerating a snapshot tree",
+        )?);
     }
     std::fs::create_dir_all(destination)?;
     let mut entries = Vec::new();
     let mut total = 0_u64;
-    let base_paths = base_output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|part| !part.is_empty())
-        .map(|raw| String::from_utf8(raw.to_vec()))
-        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
-    paths.extend(base_paths);
     for relative in paths {
         validate_relative(&relative)?;
         if Path::new(&relative)
@@ -315,11 +308,31 @@ pub fn verify_integration(
         &repository.root,
         &[original_base, candidate_head, commit],
     )?;
+    let candidate_changes = git_paths(
+        &repository.root,
+        &[
+            "diff-tree",
+            "--no-renames",
+            "-r",
+            "-z",
+            "--name-only",
+            original_base,
+            candidate_head,
+        ],
+        "enumerating candidate changes",
+    )?;
+    for path in &candidate_changes {
+        validate_relative(path)?;
+    }
     let mut changed = Vec::new();
     for entry in &manifest.entries {
-        let base = commit_entry(repository, original_base, &entry.path)?;
-        if entry_matches_commit(entry, base.as_ref()) {
-            continue;
+        // Matching the base outside candidate changes means it also matches candidate HEAD,
+        // so the integration may legitimately alter it independently.
+        if !candidate_changes.contains(&entry.path) {
+            let base = commit_entry(repository, original_base, &entry.path)?;
+            if entry_matches_commit(entry, base.as_ref()) {
+                continue;
+            }
         }
         let integrated = commit_entry(repository, commit, &entry.path)?;
         if !entry_matches_commit(entry, integrated.as_ref()) {
@@ -513,19 +526,27 @@ fn expected_git_mode(entry: &SnapshotEntry) -> u32 {
 }
 
 fn snapshot_paths(worktree: &Path) -> Result<BTreeSet<String>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args([
+    git_paths(
+        worktree,
+        &[
             "ls-files",
             "-z",
             "--cached",
             "--others",
             "--exclude-standard",
-        ])
+        ],
+        "enumerating snapshot paths",
+    )
+}
+
+fn git_paths(directory: &Path, args: &[&str], purpose: &str) -> Result<BTreeSet<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(args)
         .output()?;
     if !output.status.success() {
-        bail!("git ls-files failed while enumerating snapshot paths")
+        bail!("git failed while {purpose}")
     }
     output
         .stdout

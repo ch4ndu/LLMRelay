@@ -1,5 +1,5 @@
 import { ErrorNotice } from "./ErrorNotice";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ApiError, command, operationId } from "../api";
 import {
   type AppState,
@@ -141,6 +141,25 @@ const readPending = (): PendingRecipeCommand[] => {
   }
   return entries;
 };
+const writePending = (entries: PendingRecipeCommand[]) =>
+  sessionStorage.setItem(pendingStorageKey, JSON.stringify(entries));
+const samePending = (left: PendingRecipeCommand, right: PendingRecipeCommand) =>
+  left.resource === right.resource &&
+  JSON.stringify(left.body) === JSON.stringify(right.body);
+// Removes only this exact request from the current journal, so entries added
+// meanwhile by another form instance survive. On storage failure it is kept.
+const settlePending = (settled: PendingRecipeCommand): boolean => {
+  try {
+    const entries = readPending();
+    const remaining = entries.filter((entry) => !samePending(entry, settled));
+    if (remaining.length !== entries.length) writePending(remaining);
+    return true;
+  } catch {
+    return false;
+  }
+};
+const unsettledMessage =
+  "The request finished, but this browser could not clear its saved recovery copy. Refresh and check the current state; Retry exact pending request sends that same request again, not a new one.";
 
 export function Recipes({ state, project, onChanged, onOpenTask }: {
   state: AppState;
@@ -160,20 +179,20 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
   const identities = useRef(new Map<string, string>());
   const projectId = project?.id;
   const [formProjectId, setFormProjectId] = useState(projectId);
-  const recovery = useRef<{ entries: PendingRecipeCommand[]; fault: string } | null>(null);
-  if (!recovery.current) {
-    try {
-      recovery.current = { entries: readPending(), fault: "" };
-    } catch (cause) {
-      recovery.current = { entries: [], fault: cause instanceof Error ? cause.message : String(cause) };
-    }
+  // Aborted on unmount or project change: a request already sent still
+  // settles its journal entry, but no longer updates this form or navigates.
+  const lifecycle = useRef(new AbortController());
+  useEffect(() => {
+    const current = new AbortController();
+    lifecycle.current = current;
+    return () => current.abort();
+  }, [projectId]);
+  let journal: { entries: PendingRecipeCommand[]; fault: string };
+  try {
+    journal = { entries: readPending(), fault: "" };
+  } catch (cause) {
+    journal = { entries: [], fault: cause instanceof Error ? cause.message : String(cause) };
   }
-  const [, showRecovery] = useState(0);
-  const persistRecovery = (entries: PendingRecipeCommand[]) => {
-    sessionStorage.setItem(pendingStorageKey, JSON.stringify(entries));
-    recovery.current!.entries = entries;
-    showRecovery((value) => value + 1);
-  };
   if (formProjectId !== projectId) {
     setFormProjectId(projectId);
     setProfile({ name: "", roles: blankRoles() });
@@ -181,6 +200,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
     setSchedule(blankSchedule());
     setError("");
     setNotice("");
+    setPending(false);
     identities.current.clear();
   }
   const profiles = state.profile_sets.filter((item) =>
@@ -202,56 +222,80 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
   );
   const ready = project?.trip?.readiness === "ready" && !!currentConfig;
   const submit = async (body: { kind: string; [key: string]: unknown }) => {
-    if (!projectId || pending || recovery.current!.fault) return undefined;
+    if (!projectId || pending) return undefined;
+    const signal = lifecycle.current.signal;
     const keyed = { ...body, project_id: projectId };
     const key = JSON.stringify(keyed);
     const resource = resourceFor(keyed as PendingRecipeCommand["body"]);
-    if (recovery.current!.entries.some((entry) => entry.resource === resource)) {
-      setError("This resource has a pending request. Use Retry exact pending request to recover its result before another action.");
-      return undefined;
-    }
     const id = identities.current.get(key) || operationId();
-    identities.current.set(key, id);
-    const request = { ...keyed, operation_id: id } as PendingRecipeCommand["body"];
-    const entry: PendingRecipeCommand = { version: 1, resource, body: request };
+    const entry: PendingRecipeCommand = {
+      version: 1,
+      resource,
+      body: { ...keyed, operation_id: id } as PendingRecipeCommand["body"],
+    };
     try {
-      persistRecovery([...recovery.current!.entries, entry]);
+      const entries = readPending();
+      if (entries.some((item) => item.resource === resource)) {
+        setError("This resource has a pending request. Use Retry exact pending request to recover its result before another action.");
+        return undefined;
+      }
+      if (entries.length >= 100) {
+        throw new Error("Too many requests are waiting for recovery. Retry or resolve them first.");
+      }
+      writePending([...entries, entry]);
     } catch (cause) {
-      setError(`Could not retain this request for recovery: ${cause instanceof Error ? cause.message : String(cause)}`);
+      setError(`Could not save this request for recovery, so it was not sent: ${cause instanceof Error ? cause.message : String(cause)}`);
       return undefined;
     }
+    identities.current.set(key, id);
     setPending(true);
     try {
-      const response = await command(request);
+      const response = await command(entry.body);
+      const cleared = settlePending(entry);
+      if (signal.aborted) return undefined;
       identities.current.delete(key);
-      persistRecovery(recovery.current!.entries.filter((item) => item !== entry));
-      setError("");
+      setError(cleared ? "" : unsettledMessage);
       setNotice("Saved. The latest state is loading.");
       onChanged();
       return response.result;
     } catch (cause) {
-      if (!(cause instanceof ApiError && cause.ambiguous)) {
-        identities.current.delete(key);
-        persistRecovery(recovery.current!.entries.filter((item) => item !== entry));
-      } else {
+      const ambiguous = cause instanceof ApiError && cause.ambiguous;
+      const cleared = !ambiguous && settlePending(entry);
+      if (signal.aborted) return undefined;
+      const message = cause instanceof Error ? cause.message : String(cause);
+      if (ambiguous) {
         onChanged();
+        setError(`${message} Current state is refreshing. The exact request is retained for explicit retry; your edited draft was kept.`);
+      } else {
+        identities.current.delete(key);
+        setError(`${message} Your edited draft was kept.${cleared ? "" : ` ${unsettledMessage}`}`);
       }
-      setError(
-        `${
-          cause instanceof Error ? cause.message : String(cause)
-        } Current state is refreshing. The exact request is retained for explicit retry; your edited draft was kept.`,
-      );
       return undefined;
     } finally {
-      setPending(false);
+      if (!signal.aborted) setPending(false);
     }
   };
   const retryPending = async (entry: PendingRecipeCommand) => {
-    if (pending || recovery.current!.fault || entry.body.project_id !== projectId) return;
+    if (pending || entry.body.project_id !== projectId) return;
+    const signal = lifecycle.current.signal;
+    let stillPending: boolean;
+    try {
+      stillPending = readPending().some((item) => samePending(item, entry));
+    } catch {
+      setError("The saved request could not be read, so nothing was sent.");
+      return;
+    }
+    if (!stillPending) {
+      setError("");
+      setNotice("This pending request was already resolved. The latest state is loading.");
+      onChanged();
+      return;
+    }
     setPending(true);
     try {
       const response = await command(entry.body);
-      persistRecovery(recovery.current!.entries.filter((item) => item !== entry));
+      const cleared = settlePending(entry);
+      if (signal.aborted) return;
       const result = response.result;
       if (typeof result?.entity_id === "string" && typeof result.version === "number") {
         const { entity_id, version } = result;
@@ -287,16 +331,17 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
         ));
         if (entry.body.kind === "create_draft_from_recipe") onOpenTask(result.entity_id);
       }
-      setError("");
+      setError(cleared ? "" : unsettledMessage);
       setNotice(
         "Pending request recovered. The latest state is loading. Select the recovered record before editing it if this form has changed.",
       );
       onChanged();
     } catch (cause) {
+      if (signal.aborted) return;
       setError(`${cause instanceof Error ? cause.message : String(cause)}. The original request still has an unknown result. Refresh and inspect the current state; the exact request remains saved for reconciliation.`);
       onChanged();
     } finally {
-      setPending(false);
+      if (!signal.aborted) setPending(false);
     }
   };
   const chooseProfile = (item: ProfileSet) => {
@@ -436,12 +481,12 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
       )}
       {error && <ErrorNotice error={error} />}
       {notice && <p role="status">{notice}</p>}
-      {recovery.current!.fault && <ErrorNotice error={recovery.current!.fault} />}
-      {recovery.current!.entries.filter((entry) => entry.body.project_id === projectId).map((entry) => (
+      {journal.fault && <ErrorNotice error={journal.fault} />}
+      {journal.entries.filter((entry) => entry.body.project_id === projectId).map((entry) => (
         <div className="warning" key={entry.resource}>
           {entry.body.kind} has an unknown result for {entry.resource}. The current state can be inspected,
           but its snapshot does not prove failure. Your edited form stays separate.
-          <button disabled={pending || !!recovery.current!.fault} onClick={() => void retryPending(entry)}>
+          <button disabled={pending} onClick={() => void retryPending(entry)}>
             Retry exact pending request
           </button>
         </div>

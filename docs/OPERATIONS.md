@@ -653,13 +653,25 @@ checks the combined amount. Otherwise it checks each location separately.
 Sizing failures and insufficient space refuse the operation. These allowances
 cannot prevent another process from consuming disk space afterward.
 
-Retention targets ten backups, thirty days and five GiB. It always preserves the
-newest verified restore point and the newest verified point for each supported
+Retention targets ten backups, thirty days and five GiB per source instance,
+identified by its canonical data-directory path. Instances may share a backup
+destination; each prunes only its own verified points. Restarting or restoring
+at the same path keeps that identity. Moving or copying an instance to another
+canonical path starts a separate retention group and preserves its earlier points.
+Within each group, retention always preserves the newest verified restore point
+and the newest verified point for each supported
 prior schema 31–36. These bounded schema anchors survive the ordinary limits so
 retries after a partial upgrade cannot erase the earlier recovery point. If
 protected points alone exceed a limit, they remain; later capacity checks may
 refuse another backup or upgrade. Unrecognized or unverified content, incomplete
 staging and displaced-state quarantine are not automatically removed.
+
+Older backups without a recorded source instance remain usable for verification
+and restore, including restore into another instance. They are excluded from
+automatic retention even in the default backup directory, because the location
+alone cannot prove which instance created them. Review and manually delete these
+older points when they are no longer needed; until then they remain beyond the
+ordinary retention limits.
 
 ### Scheduled backups while the service runs
 
