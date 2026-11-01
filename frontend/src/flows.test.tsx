@@ -9,6 +9,7 @@ import type {
   AttentionItem,
   AttentionTarget,
   CapabilityRecordFunctionalProofOperation,
+  CmuxKeyboardControlOutcome,
   CmuxSessionSurface,
   CmuxViewOutcome,
   ContinuationAction,
@@ -10390,6 +10391,256 @@ Deno.test("Role settings edit fields keep visible labels and save all six roles 
   }
 });
 
+const saveManagerEffort = async (effort: string) => {
+  click("Edit");
+  change(findSelect("Effort"), effort);
+  click("Save request");
+  await settle();
+};
+
+Deno.test("Role requests settle only their own saved entry and replay uncertain ones exactly after remount", async () => {
+  localStorage.clear();
+  const key = `llmrelay.role.operations.${task.id}`;
+  const pending: Array<{
+    body: Record<string, unknown>;
+    resolve: (response: Response) => void;
+    reject: (reason: unknown) => void;
+  }> = [];
+  globalThis.fetch = (async (_input, init) => {
+    if (!init?.body) return new Response("[]");
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    return await new Promise<Response>((resolve, reject) =>
+      pending.push({ body, resolve, reject })
+    );
+  }) as typeof fetch;
+  const resumable: Task = {
+    ...task,
+    role_settings: [{
+      id: "rs-manager",
+      role: "manager",
+      revision: 1,
+      config: { provider: "codex", model: "gpt-5.6-sol", effort: "high" },
+      effective_generation_id: "g1",
+    }],
+  };
+  const resume: ContinuationAction = {
+    kind: "exact_resume",
+    enabled: true,
+    owner: "human",
+    operation: "role_resume",
+    reason: "The stopped session can continue.",
+    binding: { session_id: managerSession.id },
+  };
+  const card = (value = resumable) => (
+    <RoleSettings
+      task={value}
+      project={initialized}
+      sessions={[managerSession]}
+      actions={[resume]}
+      onChanged={noop}
+    />
+  );
+  const savedIds = () =>
+    (JSON.parse(localStorage.getItem(key) ?? "[]") as Array<
+      [string, { id: string }]
+    >).map(([, identity]) => identity.id).sort().join();
+  const ids = (...requests: Record<string, unknown>[]) =>
+    requests.map((request) => String(request.operation_id)).sort().join();
+  try {
+    mount(card());
+    await settle();
+    await saveManagerEffort("high");
+    // Remounting stands in for a reload while the first save is pending.
+    mount(card());
+    await settle();
+    click("Resume the stopped session");
+    await settle();
+    await saveManagerEffort("low");
+    const [first, resumed, replacement] = pending.map((entry) => entry.body);
+    check(
+      pending.length === 3 && first.kind === "set_role_settings" &&
+        resumed.kind === "role_resume" &&
+        replacement.kind === "set_role_settings" &&
+        first.operation_id !== replacement.operation_id &&
+        savedIds() === ids(resumed, replacement),
+      "the remounted panel did not save its own requests over the pending one",
+    );
+    pending[0].resolve(
+      new Response(JSON.stringify({ result: { state: "requested" } })),
+    );
+    await settle();
+    check(
+      savedIds() === ids(resumed, replacement),
+      "an earlier panel's settlement removed a newer saved request",
+    );
+    pending[1].reject(new TypeError("Connection lost"));
+    pending[2].reject(new TypeError("Connection lost"));
+    await settle();
+    check(
+      savedIds() === ids(resumed, replacement),
+      "an uncertain request lost its saved identity",
+    );
+
+    mount(card({ ...resumable, version: resumable.version + 1 }));
+    await settle();
+    click("Resume the stopped session");
+    await settle();
+    await saveManagerEffort("low");
+    const [resumedAgain, replacementAgain] = pending.slice(3).map((entry) =>
+      entry.body
+    );
+    check(
+      pending.length === 5 &&
+        JSON.stringify(resumedAgain) === JSON.stringify(resumed) &&
+        JSON.stringify(replacementAgain) === JSON.stringify(replacement) &&
+        replacementAgain.expected_version === resumable.version,
+      "a retry after remount did not resend the exact uncertain request",
+    );
+    pending[3].resolve(
+      new Response(JSON.stringify({ result: { status: "running_resumed" } })),
+    );
+    pending[4].resolve(
+      new Response(
+        JSON.stringify({ error: "The requested settings were refused." }),
+        { status: 400 },
+      ),
+    );
+    await settle();
+    check(
+      localStorage.getItem(key) === "[]",
+      "a confirmed or refused request kept its saved identity",
+    );
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Role requests send nothing and keep saved requests that cannot be read, coordinated or saved", async () => {
+  const realStorage = localStorage;
+  realStorage.clear();
+  const key = `llmrelay.role.operations.${task.id}`;
+  const requests: Record<string, unknown>[] = [];
+  let respond = () =>
+    Promise.resolve(
+      new Response(JSON.stringify({ result: { state: "requested" } })),
+    );
+  globalThis.fetch = (async (_input, init) => {
+    if (!init?.body) return new Response("[]");
+    requests.push(JSON.parse(String(init.body)));
+    return await respond();
+  }) as typeof fetch;
+  let refreshes = 0;
+  const card = () => (
+    <RoleSettings
+      task={task}
+      project={initialized}
+      sessions={[]}
+      onChanged={() => refreshes++}
+    />
+  );
+  const refusedLocks = {
+    request: () =>
+      Promise.reject(new DOMException("lock request refused", "SecurityError")),
+  };
+  const quotaStorage = {
+    getItem: (name: string) => realStorage.getItem(name),
+    setItem: () => {
+      throw new DOMException("quota exceeded", "QuotaExceededError");
+    },
+    removeItem: (name: string) => realStorage.removeItem(name),
+    key: (index: number) => realStorage.key(index),
+    get length() {
+      return realStorage.length;
+    },
+  };
+  const useStorage = (value: unknown) =>
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      writable: true,
+      value,
+    });
+  const saved = {
+    body: JSON.stringify({ kind: "role_resume", session_id: "s1", prompt: "" }),
+    id: "saved-resume",
+  };
+  const valid = JSON.stringify([["role-resume:s1", saved]]);
+  const cases: Array<
+    { stored: string; failure?: "missing" | "refused" | "quota"; expected: string }
+  > = [
+    ...[
+      "{",
+      "{}",
+      JSON.stringify([["role-resume:s1", saved], ["role-resume:s1", saved]]),
+      JSON.stringify([["role-resume:s1", { ...saved, id: " " }]]),
+      JSON.stringify([["role-resume:s1", { ...saved, body: "[]" }]]),
+      JSON.stringify([["role-resume:s1", { ...saved, body: '{"kind":""}' }]]),
+    ].map((stored) => ({ stored, expected: "could not be read safely" })),
+    {
+      stored: valid,
+      failure: "missing",
+      expected: "could not coordinate browser storage",
+    },
+    {
+      stored: valid,
+      failure: "refused",
+      expected: "could not coordinate browser storage",
+    },
+    { stored: valid, failure: "quota", expected: "could not be saved for recovery" },
+  ];
+  try {
+    for (const { stored, failure, expected } of cases) {
+      realStorage.clear();
+      realStorage.setItem(key, stored);
+      if (failure === "missing") installStorageLocks(undefined);
+      if (failure === "refused") installStorageLocks(refusedLocks);
+      if (failure === "quota") useStorage(quotaStorage);
+      try {
+        mount(card());
+        await settle();
+        await saveManagerEffort("low");
+      } finally {
+        installStorageLocks(storageLocks);
+        useStorage(realStorage);
+      }
+      check(
+        requests.length === 0 && realStorage.getItem(key) === stored &&
+          document.body.textContent?.includes(expected),
+        `${failure ?? stored} sent a request, changed saved requests, or gave no recovery guidance`,
+      );
+      unmount();
+    }
+
+    realStorage.clear();
+    let finish!: (response: Response) => void;
+    respond = () =>
+      new Promise<Response>((resolve) => {
+        finish = resolve;
+      });
+    mount(card());
+    await settle();
+    await saveManagerEffort("low");
+    installStorageLocks(refusedLocks);
+    finish(new Response(JSON.stringify({ result: { state: "requested" } })));
+    await settle();
+    installStorageLocks(storageLocks);
+    check(
+      requests.length === 1 && refreshes === 1 &&
+        !document.querySelector(".role-edit-fields") &&
+        !document.querySelector(".error-notice") &&
+        realStorage.getItem(key)?.includes(String(requests[0].operation_id)),
+      "a confirmed save was shown as failed or lost its saved identity when cleanup could not coordinate",
+    );
+  } finally {
+    unmount();
+    installStorageLocks(storageLocks);
+    useStorage(realStorage);
+    realStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
 Deno.test("Open agent output routes to the task's Activity tab and its exact session", async () => {
   const live = liveHarness();
   const priorEnvironment = { ...liveEnvironment };
@@ -16734,6 +16985,168 @@ Deno.test("Stopped session recorded output survives historical cmux failures and
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Close output and newer Views keep late session results hidden while their native work finishes", async () => {
+  const { useSessionAccess } = await import("./components/SessionTree");
+  type Pending<T> = {
+    resolve: (value: T) => void;
+    reject: (reason: unknown) => void;
+  };
+  const views: Pending<CmuxViewOutcome>[] = [];
+  const keyboard: Array<Pending<CmuxKeyboardControlOutcome> & { action: string }> = [];
+  const discards: Pending<CmuxViewOutcome>[] = [];
+  let refreshes = 0;
+  const live = persistentSurface("presentation-route");
+  const controlled = persistentSurface("presentation-route", {
+    desired_input_state: "control",
+    actual_input_state: "control",
+    control_revision: 1,
+    applied_revision: 1,
+  });
+  const reserved: Session = {
+    ...managerSession,
+    id: "reserved-session",
+    cmux_surface: persistentSurface("reserved-route", {
+      surface_state: "unknown",
+      attachment_state: "ended",
+    }),
+  };
+  function Card({ session }: { session: Session }) {
+    const access = useSessionAccess([session], {
+      onView: () =>
+        new Promise<CmuxViewOutcome>((resolve, reject) =>
+          views.push({ resolve, reject })
+        ),
+      onSetKeyboardControl: (_sessionId, _surface, action) =>
+        new Promise<CmuxKeyboardControlOutcome>((resolve, reject) =>
+          keyboard.push({ action, resolve, reject })
+        ),
+      onDiscard: () =>
+        new Promise<CmuxViewOutcome>((resolve, reject) =>
+          discards.push({ resolve, reject })
+        ),
+      onChanged: () => refreshes++,
+    });
+    return (
+      <>
+        <button onClick={() => void access.view(session.id)}>View</button>
+        <button onClick={() => void access.take(session.id)}>Take</button>
+        <button onClick={() => void access.release(session.id)}>Release</button>
+        <button onClick={() => void access.discard(session.id)}>Discard</button>
+        <button onClick={() => access.close(session.id)}>Close</button>
+        <output>{access.routeFor(session.id)?.message ?? "hidden"}</output>
+        <small>{access.discarding[session.id] ? "discarding" : "settled"}</small>
+      </>
+    );
+  }
+  const shown = () => document.querySelector("output")?.textContent ?? "";
+  const viewed = (
+    message: string,
+    surface = live,
+  ): CmuxViewOutcome => ({
+    state: "view_only",
+    message,
+    retry_available: false,
+    surface,
+  });
+  try {
+    mount(<Card session={managerSession} />);
+    click("View");
+    check(shown().startsWith("Reserving"), "View did not show its pending output");
+    click("Close");
+    views[0].resolve(viewed("late view"));
+    await settle();
+    click("View");
+    click("Close");
+    views[1].reject(new Error("late view failure"));
+    await settle();
+    check(
+      shown() === "hidden" && refreshes === 1,
+      "a View answered after Close output reopened it or skipped its refresh",
+    );
+
+    click("View");
+    click("View");
+    views[3].resolve(viewed("newest view"));
+    await settle();
+    views[2].resolve(viewed("earlier view"));
+    await settle();
+    check(
+      shown() === "newest view",
+      "an earlier View replaced a newer one, or View could not reopen closed output",
+    );
+
+    let before = refreshes;
+    click("Take");
+    click("Close");
+    views[4].resolve(viewed("take view"));
+    await settle();
+    check(
+      keyboard.length === 1 && keyboard[0].action === "acquire" &&
+        shown() === "hidden",
+      "Close output during Take cancelled its keyboard request or reopened the output",
+    );
+    keyboard[0].resolve({
+      state: "control",
+      message: "control applied",
+      surface: controlled,
+    });
+    await settle();
+    check(
+      shown() === "hidden" && refreshes === before + 2,
+      "Take's late result reopened closed output or skipped its refresh",
+    );
+
+    click("View");
+    views[5].resolve(viewed("control shown", controlled));
+    await settle();
+    before = refreshes;
+    click("Release");
+    check(
+      shown().startsWith("Keyboard-control release is pending"),
+      "Release did not show its pending state",
+    );
+    click("Close");
+    keyboard[1].resolve({
+      state: "view_only",
+      message: "released",
+      surface: { ...live, control_revision: 2, applied_revision: 2 },
+    });
+    await settle();
+    check(
+      keyboard[1].action === "release" && shown() === "hidden" &&
+        refreshes === before + 1,
+      "Release's late result reopened closed output or skipped its refresh",
+    );
+
+    mount(<Card session={reserved} />);
+    before = refreshes;
+    click("Discard");
+    check(
+      document.querySelector("small")?.textContent === "discarding",
+      "Discard did not show it was busy",
+    );
+    click("Close");
+    discards[0].resolve({
+      state: "failed",
+      message: "reservation discarded",
+      retry_available: true,
+      surface: persistentSurface("reserved-route", {
+        surface_state: "retired",
+        attachment_state: "failed",
+      }),
+    });
+    await settle();
+    check(
+      shown() === "hidden" &&
+        document.querySelector("small")?.textContent === "settled" &&
+        refreshes === before + 1,
+      "Discard's late result reopened closed output or left it busy",
+    );
+  } finally {
+    unmount();
   }
 });
 

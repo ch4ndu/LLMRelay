@@ -7,7 +7,9 @@ import {
   getState,
   operation,
   reuseOperationIdentity,
+  type StableOperationIdentity,
 } from "../api";
+import { StorageLockUnavailableError, withStorageLock } from "../storageCoordination";
 import { ModelSelector } from "./ModelSelector";
 import {
   type CapabilityEvidence,
@@ -610,6 +612,94 @@ function SingleAgentSettings(
   );
 }
 
+const roleRequestsUnreadable =
+  "Saved requests for this task could not be read safely, so nothing was sent. They are kept unchanged. Restore browser storage, then refresh before trying again.";
+const roleRequestUnsaved =
+  "This request could not be saved for recovery, so nothing was sent. Restore browser storage and try again.";
+const roleRequestsUncoordinated =
+  "This browser could not coordinate browser storage with your other open LLMRelay windows, so nothing was sent. Keep this page open and try again.";
+
+const savedRoleRequest = (
+  value: unknown,
+): StableOperationIdentity | undefined => {
+  if (typeof value !== "object" || value === null) return undefined;
+  const body: unknown = Reflect.get(value, "body");
+  const id: unknown = Reflect.get(value, "id");
+  if (typeof body !== "string" || typeof id !== "string" || !id.trim()) {
+    return undefined;
+  }
+  try {
+    const request: unknown = JSON.parse(body);
+    if (
+      typeof request !== "object" || request === null || Array.isArray(request)
+    ) {
+      return undefined;
+    }
+    const kind: unknown = Reflect.get(request, "kind");
+    return typeof kind === "string" && kind.trim() ? { body, id } : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+// Entries are [key, { body, id }], where body is the original request without
+// its operation ID. Absent storage is empty; anything malformed throws, so no
+// request is sent and the stored value is left for recovery.
+const readRoleRequests = (storageKey: string) => {
+  const requests = new Map<string, StableOperationIdentity>();
+  const raw = localStorage.getItem(storageKey);
+  if (raw === null) return requests;
+  const entries: unknown = JSON.parse(raw);
+  if (!Array.isArray(entries)) throw new Error("Saved role requests are invalid.");
+  for (const entry of entries) {
+    const key: unknown = Array.isArray(entry) ? entry[0] : undefined;
+    const identity = Array.isArray(entry) && entry.length === 2
+      ? savedRoleRequest(entry[1])
+      : undefined;
+    if (typeof key !== "string" || !key || !identity || requests.has(key)) {
+      throw new Error("A saved role request is invalid.");
+    }
+    requests.set(key, identity);
+  }
+  return requests;
+};
+
+const publishRoleRequest = (
+  storageKey: string,
+  key: string,
+  request: Record<string, unknown>,
+) => {
+  let requests: Map<string, StableOperationIdentity>;
+  try {
+    requests = readRoleRequests(storageKey);
+  } catch {
+    throw new Error(roleRequestsUnreadable);
+  }
+  const stable = reuseOperationIdentity(requests.get(key), request);
+  const identity = { body: JSON.stringify(stable.request), id: stable.id };
+  requests.set(key, identity);
+  try {
+    localStorage.setItem(storageKey, JSON.stringify([...requests]));
+  } catch {
+    throw new Error(roleRequestUnsaved);
+  }
+  return { identity, request: stable.request };
+};
+
+// Another window may have replaced this key's entry since it was published,
+// so only the exact entry this request sent is removed.
+const forgetRoleRequest = (
+  storageKey: string,
+  key: string,
+  identity: StableOperationIdentity,
+) => {
+  const requests = readRoleRequests(storageKey);
+  const current = requests.get(key);
+  if (current?.id !== identity.id || current.body !== identity.body) return;
+  requests.delete(key);
+  localStorage.setItem(storageKey, JSON.stringify([...requests]));
+};
+
 export function RoleSettings(
   {
     task,
@@ -656,93 +746,49 @@ export function RoleSettings(
   const [config, setConfig] = useState<RoleConfig>();
   const [error, setError] = useState("");
   const operationStorageKey = `llmrelay.role.operations.${task.id}`;
-  const browserOperationIdentities = useRef(
-    new Map<string, { body: string; id: string }>(
-      (() => {
-        try {
-          const value = JSON.parse(
-            localStorage.getItem(operationStorageKey) || "[]",
-          );
-          return Array.isArray(value) ? value : [];
-        } catch {
-          return [];
-        }
-      })(),
-    ),
-  );
-  const runBrowserOperation = async (
+  // Other panels and windows of this task share its saved requests, so each
+  // change re-reads them under the storage lock. Unmounting cancels nothing:
+  // a click made before then still saves and sends its request.
+  const runSavedRequest = async (
+    key: string,
+    request: Record<string, unknown>,
+    send: (body: Record<string, unknown>) => Promise<unknown>,
+  ) => {
+    const published = await withStorageLock(
+      operationStorageKey,
+      () => publishRoleRequest(operationStorageKey, key, request),
+    ).catch((cause: unknown) => {
+      throw cause instanceof StorageLockUnavailableError
+        ? new Error(roleRequestsUncoordinated)
+        : cause;
+    });
+    if (!published) throw new Error(roleRequestsUncoordinated);
+    const { identity } = published;
+    const settle = () =>
+      withStorageLock(
+        operationStorageKey,
+        () => forgetRoleRequest(operationStorageKey, key, identity),
+      ).catch(() => {
+        // A kept entry only makes an identical retry reuse its operation ID.
+      });
+    try {
+      const result = await send({
+        ...published.request,
+        operation_id: identity.id,
+      });
+      await settle();
+      return result;
+    } catch (cause) {
+      if (!(cause instanceof ApiError && cause.ambiguous)) await settle();
+      throw cause;
+    }
+  };
+  const runBrowserOperation = (
     key: string,
     request: Record<string, unknown> & { kind: string },
-  ) => {
-    const stable = reuseOperationIdentity(
-      browserOperationIdentities.current.get(key),
-      request,
-    );
-    const { id, request: stableRequest } = stable;
-    browserOperationIdentities.current.set(key, {
-      body: JSON.stringify(stableRequest),
-      id,
-    });
-    localStorage.setItem(
-      operationStorageKey,
-      JSON.stringify([...browserOperationIdentities.current]),
-    );
-    try {
-      const result = await operation(
-        { ...stableRequest, operation_id: id } as never,
-      );
-      browserOperationIdentities.current.delete(key);
-      localStorage.setItem(
-        operationStorageKey,
-        JSON.stringify([...browserOperationIdentities.current]),
-      );
-      return result;
-    } catch (cause) {
-      if (!(cause instanceof ApiError && cause.ambiguous)) {
-        browserOperationIdentities.current.delete(key);
-        localStorage.setItem(
-          operationStorageKey,
-          JSON.stringify([...browserOperationIdentities.current]),
-        );
-      }
-      throw cause;
-    }
-  };
-  const runCommand = async (key: string, request: Record<string, unknown>) => {
-    const stable = reuseOperationIdentity(
-      browserOperationIdentities.current.get(key),
-      request,
-    );
-    const { id, request: stableRequest } = stable;
-    browserOperationIdentities.current.set(key, {
-      body: JSON.stringify(stableRequest),
-      id,
-    });
-    localStorage.setItem(
-      operationStorageKey,
-      JSON.stringify([...browserOperationIdentities.current]),
-    );
-    try {
-      const result = await command(
-        { ...stableRequest, operation_id: id } as never,
-      );
-      browserOperationIdentities.current.delete(key);
-      localStorage.setItem(
-        operationStorageKey,
-        JSON.stringify([...browserOperationIdentities.current]),
-      );
-      return result;
-    } catch (cause) {
-      if (!(cause instanceof ApiError && cause.ambiguous)) {
-        browserOperationIdentities.current.delete(key);
-        localStorage.setItem(
-          operationStorageKey,
-          JSON.stringify([...browserOperationIdentities.current]),
-        );
-      }
-      throw cause;
-    }
-  };
+  ) => runSavedRequest(key, request, (body) => operation(body as never));
+  const runCommand = (key: string, request: Record<string, unknown>) =>
+    runSavedRequest(key, request, (body) => command(body as never));
   const projectRoles =
     project?.settings.roles && typeof project.settings.roles === "object"
       ? project.settings.roles as Partial<Record<Role, RoleConfig>>

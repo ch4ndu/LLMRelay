@@ -91,12 +91,37 @@ export function useSessionAccess(
       (cmuxOutcomeWithDurableSurface(local, durableSurfaceForSession(sessionId)) ||
         local);
   };
-  const commitRoute = (sessionId: string, outcome: CmuxViewOutcome) => {
+  // Close and each explicit View or Take start a new local presentation of a
+  // session. A result from an earlier one still completes its native work and
+  // refresh, but must not reopen closed output or replace a newer view.
+  const presentations = useRef<Record<string, number>>({});
+  const currentPresentation = (sessionId: string) =>
+    presentations.current[sessionId] ?? 0;
+  const nextPresentation = (sessionId: string) => {
+    const next = currentPresentation(sessionId) + 1;
+    presentations.current[sessionId] = next;
+    return next;
+  };
+  const publishRoute = (
+    sessionId: string,
+    presentation: number,
+    outcome: CmuxViewOutcome,
+  ) =>
+    setRoutes((current) =>
+      currentPresentation(sessionId) === presentation
+        ? { ...current, [sessionId]: outcome }
+        : current
+    );
+  const commitRoute = (
+    sessionId: string,
+    presentation: number,
+    outcome: CmuxViewOutcome,
+  ) => {
     const committed = cmuxOutcomeWithDurableSurface(
       outcome,
       durableSurfaceForSession(sessionId),
     ) || outcome;
-    setRoutes((current) => ({ ...current, [sessionId]: committed }));
+    publishRoute(sessionId, presentation, committed);
     return committed;
   };
   const routeSurface = (sessionId: string) =>
@@ -105,57 +130,55 @@ export function useSessionAccess(
       durableSurfaceForSession(sessionId),
     )?.surface || durableSurfaceForSession(sessionId);
 
-  const view = async (sessionId: string) => {
-    setRoutes((current) => ({
-      ...current,
-      [sessionId]: {
-        state: "pending",
-        message: "Reserving the exact persistent cmux presentation…",
-        retry_available: false,
-      },
-    }));
+  // The outcome is returned even when its presentation is no longer current,
+  // so Take can still acquire the surface it viewed.
+  const presentView = async (sessionId: string, presentation: number) => {
+    publishRoute(sessionId, presentation, {
+      state: "pending",
+      message: "Reserving the exact persistent cmux presentation…",
+      retry_available: false,
+    });
     try {
       const result = commitRoute(
         sessionId,
+        presentation,
         cmuxViewOutcomeFromSurface(await handlers.onView(sessionId)),
       );
       handlers.onChanged();
       return result;
     } catch (cause) {
-      return commitRoute(sessionId, {
+      return commitRoute(sessionId, presentation, {
         state: "failed",
         message: cause instanceof Error ? cause.message : String(cause),
         retry_available: true,
       });
     }
   };
+  const view = (sessionId: string) =>
+    presentView(sessionId, nextPresentation(sessionId));
 
   const setKeyboardControl = async (
     sessionId: string,
     surface: CmuxSessionSurface,
     action: CmuxKeyboardControlAction,
+    presentation: number,
   ) => {
     const currentSurface = cmuxNewestSurface(
       durableSurfaceForSession(sessionId),
       surface,
     ) || surface;
-    const presentation = cmuxSurfacePresentation(currentSurface);
+    const actions = cmuxSurfacePresentation(currentSurface);
     if (
-      action === "acquire"
-        ? !presentation.takeAvailable
-        : !presentation.releaseAvailable
+      action === "acquire" ? !actions.takeAvailable : !actions.releaseAvailable
     ) return;
-    setRoutes((current) => ({
-      ...current,
-      [sessionId]: {
-        state: "pending",
-        message: action === "acquire"
-          ? "Keyboard control is pending on the existing authenticated cmux attachment…"
-          : "Keyboard-control release is pending on the existing authenticated cmux attachment…",
-        retry_available: false,
-        surface: currentSurface,
-      },
-    }));
+    publishRoute(sessionId, presentation, {
+      state: "pending",
+      message: action === "acquire"
+        ? "Keyboard control is pending on the existing authenticated cmux attachment…"
+        : "Keyboard-control release is pending on the existing authenticated cmux attachment…",
+      retry_available: false,
+      surface: currentSurface,
+    });
     try {
       const result = await handlers.onSetKeyboardControl(
         sessionId,
@@ -164,6 +187,7 @@ export function useSessionAccess(
       );
       commitRoute(
         sessionId,
+        presentation,
         cmuxViewOutcomeFromSurface({
           state: result.state === "retired" ? "failed" : result.state,
           message: result.message,
@@ -175,6 +199,7 @@ export function useSessionAccess(
     } catch (cause) {
       commitRoute(
         sessionId,
+        presentation,
         cmuxViewOutcomeFromSurface({
           state: "failed",
           message: cause instanceof Error ? cause.message : String(cause),
@@ -186,19 +211,22 @@ export function useSessionAccess(
   };
 
   const take = async (sessionId: string) => {
-    const viewed = await view(sessionId);
+    const presentation = nextPresentation(sessionId);
+    const viewed = await presentView(sessionId, presentation);
     const surface = viewed.surface || routeSurface(sessionId);
     if (!surface || !cmuxSurfacePresentation(surface).takeAvailable) return;
-    await setKeyboardControl(sessionId, surface, "acquire");
+    await setKeyboardControl(sessionId, surface, "acquire", presentation);
   };
 
   const release = async (sessionId: string) => {
+    const presentation = currentPresentation(sessionId);
     const surface = routeSurface(sessionId);
     if (!surface) return;
-    await setKeyboardControl(sessionId, surface, "release");
+    await setKeyboardControl(sessionId, surface, "release", presentation);
   };
 
   const discard = async (sessionId: string) => {
+    const presentation = currentPresentation(sessionId);
     const localRoute = routes[sessionId];
     const durable = durableSurfaceForSession(sessionId);
     // A stored unknown reservation is discardable without first opening the
@@ -229,10 +257,10 @@ export function useSessionAccess(
         retry.operationId,
       );
       delete discardOperations.current[sessionId];
-      commitRoute(sessionId, cmuxViewOutcomeFromSurface(result));
+      commitRoute(sessionId, presentation, cmuxViewOutcomeFromSurface(result));
       handlers.onChanged();
     } catch (cause) {
-      commitRoute(sessionId, {
+      commitRoute(sessionId, presentation, {
         ...currentRoute,
         message: cause instanceof Error ? cause.message : String(cause),
       });
@@ -241,11 +269,13 @@ export function useSessionAccess(
     }
   };
 
-  const close = (sessionId: string) =>
+  const close = (sessionId: string) => {
+    nextPresentation(sessionId);
     setRoutes((current) => {
       const { [sessionId]: _closed, ...rest } = current;
       return rest;
     });
+  };
 
   return {
     routes,
