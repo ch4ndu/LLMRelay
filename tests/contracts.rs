@@ -7922,59 +7922,37 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
     .contains("preimages changed"));
     assert!(agenticjira::trip::require_project_ready(&connection, &project).is_err());
     std::fs::remove_file(repository.join("AGENTS.md")).unwrap();
-    let staging = paths.artifacts.join("synthetic-interrupted-apply");
-    let frozen = {
-        let mut statement = connection
-            .prepare(
-                "SELECT relative_path,source_hash,preimage_hash,source_bytes
-             FROM trip_frozen_install_files WHERE setup_operation_id=?1 ORDER BY relative_path",
-            )
-            .unwrap();
-        statement
-            .query_map(params![setup], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                ))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap()
-    };
-    let mut approved_exclude = Vec::new();
-    for (relative, source_hash, preimage_hash, bytes) in &frozen {
-        let staged = staging.join(relative);
-        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
-        std::fs::write(&staged, bytes).unwrap();
-        let state = if relative == "@git-common/info/exclude" {
-            "applied"
-        } else {
-            "staged"
-        };
-        connection.execute(
-            "INSERT INTO trip_apply_journal(id,setup_operation_id,relative_path,source_hash,expected_preimage_hash,observed_preimage_hash,staged_path,state,created_by_operation,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?5,?6,?7,'synthetic-interrupted-apply','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
-            params![uuid::Uuid::new_v4().to_string(),setup,relative,source_hash,preimage_hash,staged.to_string_lossy(),state],
-        ).unwrap();
-        if state == "applied" {
-            approved_exclude = bytes.clone();
-            std::fs::write(repository.join(".git/info/exclude"), bytes).unwrap();
-        }
-    }
-    connection
-        .execute(
-            "UPDATE trip_setup_operations SET state='recovery_required' WHERE id=?1",
-            params![setup],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "UPDATE trip_project_state SET readiness='recovery_required' WHERE project_id=?1",
-            params![project],
-        )
-        .unwrap();
+    fixture.execute_batch(
+        "CREATE TRIGGER installation_terminal_receipt BEFORE INSERT ON operation_receipts
+        WHEN NEW.operation_id='apply-terminal-fault' AND NEW.operation_kind='trip_command'
+        BEGIN SELECT RAISE(ABORT,'installation terminal receipt'); END;",
+    );
+    let error = execute_trip(
+        &fixture,
+        &paths,
+        "apply-terminal-fault",
+        &TripHumanAction::ApplyInstallation {
+            setup_operation_id: setup.clone(),
+            proposal_hash: proposal.clone(),
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("installation terminal receipt"));
+    assert!(error.to_string().contains("durable progress"));
+    fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM trip_config_revisions WHERE project_id='{project}' AND state='activated'"), 0);
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='apply-terminal-fault'",
+        0_i64,
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM audit_events WHERE operation_id='apply-terminal-fault' AND event_code='trip.command.applied'", 0_i64);
+    fixture.assert_scalar(
+        &format!("SELECT readiness FROM trip_project_state WHERE project_id='{project}'"),
+        "recovery_required".to_owned(),
+    );
+    fixture.assert_scalar(&format!("SELECT COUNT(*) FROM trip_apply_journal WHERE setup_operation_id='{setup}' AND state!='applied'"), 0_i64);
+    let journal: String = fixture.scalar(&format!("SELECT json_group_array(json_array(id,relative_path,source_hash,staged_path,state)) FROM (SELECT * FROM trip_apply_journal WHERE setup_operation_id='{setup}' ORDER BY relative_path)"));
+    let approved_exclude = std::fs::read(repository.join(".git/info/exclude")).unwrap();
+    fixture.execute_batch("DROP TRIGGER installation_terminal_receipt;");
     let drifted_exclude = b"synthetic drift after partial apply\n";
     std::fs::write(repository.join(".git/info/exclude"), drifted_exclude).unwrap();
     assert!(execute_trip(
@@ -7998,6 +7976,32 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
     );
     fixture.assert_scalar::<i64>(&format!("SELECT COUNT(*) FROM trip_config_revisions WHERE project_id='{project}' AND state='activated'"), 0);
     std::fs::write(repository.join(".git/info/exclude"), approved_exclude).unwrap();
+    fixture.execute_batch(
+        "CREATE TRIGGER recovery_terminal_receipt BEFORE INSERT ON operation_receipts
+        WHEN NEW.operation_id='recover-approved-install' AND NEW.operation_kind='trip_command'
+        BEGIN SELECT RAISE(ABORT,'recovery terminal receipt'); END;",
+    );
+    let error = execute_trip(
+        &fixture,
+        &paths,
+        "recover-approved-install",
+        &TripHumanAction::RecoverInstallation {
+            setup_operation_id: setup.clone(),
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("recovery terminal receipt"));
+    assert!(error.to_string().contains("durable progress"));
+    fixture.assert_scalar(
+        &format!("SELECT readiness FROM trip_project_state WHERE project_id='{project}'"),
+        "recovery_required".to_owned(),
+    );
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='recover-approved-install'",
+        0_i64,
+    );
+    assert_eq!(fixture.scalar::<String>(&format!("SELECT json_group_array(json_array(id,relative_path,source_hash,staged_path,state)) FROM (SELECT * FROM trip_apply_journal WHERE setup_operation_id='{setup}' ORDER BY relative_path)")), journal);
+    fixture.execute_batch("DROP TRIGGER recovery_terminal_receipt;");
     let activated = execute_trip(
         &fixture,
         &paths,
@@ -8009,6 +8013,19 @@ fn trip_setup_separates_probe_install_and_preimage_authority() {
     .unwrap();
     assert_eq!(activated.state, "activated");
     assert_eq!(activated.detail["recovered"], true);
+    let replay = execute_trip(
+        &fixture,
+        &paths,
+        "recover-approved-install",
+        &TripHumanAction::RecoverInstallation {
+            setup_operation_id: setup.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(replay).unwrap(),
+        serde_json::to_value(&activated).unwrap()
+    );
     let setup_state = workflow::state(&fixture.store).unwrap();
     let projected_setup = setup_state
         .trip_setups
@@ -15550,7 +15567,7 @@ fn trip_standalone_adoption_requires_approval_and_retains_database_activation() 
     .unwrap_err()
     .to_string()
     .contains("host_manager is required"));
-    assert!(execute_trip(
+    let current_attempt_error = execute_trip(
         &fixture,
         &paths,
         "adopt-with-current-attempt",
@@ -15558,11 +15575,15 @@ fn trip_standalone_adoption_requires_approval_and_retains_database_activation() 
             project_id: project.clone(),
             expected_project_version: 2,
             configuration: proposal.clone(),
-        }
+        },
     )
-    .unwrap_err()
-    .to_string()
-    .contains("current-workflow attempts to finish"));
+    .unwrap_err();
+    assert!(
+        current_attempt_error
+            .to_string()
+            .contains("current-workflow attempts to finish"),
+        "{current_attempt_error:#}"
+    );
     fixture.execute("UPDATE attempts SET workflow_version='trip-explorer-0.9.0-llmrelay-1',workflow_hash='old',legacy_migration_required=0 WHERE id=?1", params![attempt.attempt_id]);
     let old_source: serde_json::Value = serde_json::from_str(include_str!(
         "../resources/trip-explorer/0.9.0/source-manifest.json"
@@ -16363,12 +16384,11 @@ fn trip_migration_freezes_authorized_guidance_for_exact_recovery() {
         plan.attempt_id
     ));
     let prior: serde_json::Value = serde_json::from_str(&prior_json).unwrap();
-    fixture.execute_batch(&format!(
-        "CREATE TRIGGER interrupt_migration_publication BEFORE UPDATE OF state ON workspaces
-         WHEN NEW.attempt_id='{}' AND NEW.state='ready'
+    fixture.execute_batch(
+        "CREATE TRIGGER interrupt_migration_publication BEFORE INSERT ON operation_receipts
+         WHEN NEW.operation_id='migrate-authorized-guidance' AND NEW.operation_kind='trip_command'
          BEGIN SELECT RAISE(ABORT,'migration publication interrupted'); END;",
-        plan.attempt_id
-    ));
+    );
     let interrupted = execute_trip(
         &fixture,
         &paths,
@@ -16380,7 +16400,14 @@ fn trip_migration_freezes_authorized_guidance_for_exact_recovery() {
         format!("{interrupted:#}").contains("migration publication interrupted"),
         "{interrupted:#}"
     );
+    assert!(interrupted.to_string().contains("durable progress"));
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='migrate-authorized-guidance'",
+        0_i64,
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM audit_events WHERE operation_id='migrate-authorized-guidance' AND event_code='trip.command.applied'", 0_i64);
     let version: i64 = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+    assert_eq!(version, reauthorized.version.unwrap() + 1);
     let frozen: String = fixture.scalar("SELECT json_extract(preserved_json,'$.prior_policy.policy_json') FROM trip_legacy_migrations");
     assert_eq!(frozen, prior_json);
     let current: serde_json::Value = serde_json::from_str(&fixture.scalar::<String>(&format!(
@@ -16443,6 +16470,24 @@ fn trip_migration_freezes_authorized_guidance_for_exact_recovery() {
     assert_eq!(migration.binding["plan_hash"], "prior-plan");
     assert_eq!(migration.binding["config_revision_id"], revision);
     fixture.execute_batch("DROP TRIGGER interrupt_migration_publication;");
+    let refused = execute_trip(
+        &fixture,
+        &paths,
+        "migrate-authorized-guidance",
+        &action(reauthorized.version.unwrap()),
+    )
+    .unwrap_err();
+    assert!(format!("{refused:#}").contains("task version is stale"));
+    assert!(refused.to_string().contains("durable progress"));
+    assert!(execute_trip(
+        &fixture,
+        &paths,
+        "migrate-authorized-guidance",
+        &action(version)
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("another unresolved request"));
 
     std::fs::write(
         workspace.join("fixture.txt"),
@@ -16476,6 +16521,23 @@ fn trip_migration_freezes_authorized_guidance_for_exact_recovery() {
     )
     .unwrap();
     assert_eq!(recovered.version, Some(version));
+    assert_eq!(
+        serde_json::to_value(
+            execute_trip(
+                &fixture,
+                &paths,
+                "recover-frozen-guidance",
+                &action(version)
+            )
+            .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&recovered).unwrap()
+    );
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='migrate-authorized-guidance'",
+        0_i64,
+    );
     let restored: serde_json::Value = serde_json::from_str(&fixture.scalar::<String>(&format!(
         "SELECT policy_json FROM workspaces WHERE attempt_id='{}'",
         plan.attempt_id
@@ -62760,5 +62822,431 @@ fn draft_deletion_removes_profile_and_recipe_bindings_but_keeps_shared_evidence(
     fixture.assert_scalar(
         "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='bound-delete'",
         1_i64,
+    );
+}
+
+#[test]
+fn trip_command_database_failures_roll_back_and_replay_exactly() {
+    let fixture = Fixture::new("trip-command-atomic-budget");
+    let (_, task, plan) = new_task(&fixture, "atomic-budget", "budget");
+    let paths = instance_paths(&fixture);
+    let action = TripHumanAction::ExtendReviewBudget {
+        task_id: task.clone(),
+        attempt_id: plan.attempt_id.clone(),
+        expected_task_version: 2,
+        review_kind: "plan".into(),
+        additional: 1,
+    };
+    let before: String = fixture.scalar("SELECT json_array(t.version,b.extension_allowance,b.version) FROM tasks t JOIN attempts a ON a.task_id=t.id JOIN review_budgets b ON b.attempt_id=a.id WHERE b.review_kind='plan'");
+    for (table, predicate) in [
+        ("audit_events", "NEW.event_code='trip.command.applied'"),
+        ("operation_receipts", "NEW.operation_kind='trip_command'"),
+    ] {
+        fixture.execute_batch(&format!("CREATE TRIGGER trip_command_fault BEFORE INSERT ON {table} WHEN NEW.operation_id='atomic-budget' AND {predicate} BEGIN SELECT RAISE(ABORT,'injected command persistence failure'); END;"));
+        let error = execute_trip(&fixture, &paths, "atomic-budget", &action).unwrap_err();
+        assert!(format!("{error:#}").contains("injected command persistence failure"));
+        assert!(!error.to_string().contains("durable progress"));
+        assert_eq!(fixture.scalar::<String>("SELECT json_array(t.version,b.extension_allowance,b.version) FROM tasks t JOIN attempts a ON a.task_id=t.id JOIN review_budgets b ON b.attempt_id=a.id WHERE b.review_kind='plan'"), before);
+        fixture.assert_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE operation_id='atomic-budget'",
+            0_i64,
+        );
+        fixture.assert_scalar(
+            "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='atomic-budget'",
+            0_i64,
+        );
+        fixture.execute_batch("DROP TRIGGER trip_command_fault;");
+    }
+    let saved = execute_trip(&fixture, &paths, "atomic-budget", &action).unwrap();
+    assert_eq!(saved.version, Some(3));
+    assert_eq!(saved.detail["total_allowance"], 3);
+    let replay = execute_trip(&fixture, &paths, "atomic-budget", &action).unwrap();
+    assert_eq!(
+        serde_json::to_value(replay).unwrap(),
+        serde_json::to_value(&saved).unwrap()
+    );
+    let conflicting = TripHumanAction::ExtendReviewBudget {
+        task_id: task,
+        attempt_id: plan.attempt_id,
+        expected_task_version: 2,
+        review_kind: "plan".into(),
+        additional: 2,
+    };
+    assert!(
+        execute_trip(&fixture, &paths, "atomic-budget", &conflicting)
+            .unwrap_err()
+            .to_string()
+            .contains("operation ID was already used with different input")
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM audit_events WHERE operation_id='atomic-budget' AND event_code='trip.command.applied'", 1_i64);
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='atomic-budget'",
+        1_i64,
+    );
+}
+
+#[test]
+fn trip_command_setup_readiness_waits_for_receipt_and_recovers_exact_reservation() {
+    let fixture = Fixture::new("trip-command-setup-publication");
+    let paths = instance_paths(&fixture);
+    let project = workflow::execute(
+        &fixture.store,
+        &HumanCommand::AddProject {
+            operation_id: "setup-project".into(),
+            path: fixture.repository("repo"),
+            display_name: "Setup publication".into(),
+        },
+    )
+    .unwrap()
+    .entity_id;
+    let manager = role_override(Provider::Codex);
+    let begin = TripHumanAction::BeginSetup {
+        project_id: project.clone(),
+        expected_project_version: 1,
+        host_manager: manager.clone(),
+    };
+    fixture.execute_batch("CREATE TRIGGER setup_progress_fault BEFORE INSERT ON audit_events WHEN NEW.operation_id='setup-begin' AND NEW.event_code='trip.command.progress' BEGIN SELECT RAISE(ABORT,'progress marker failure'); END;");
+    let refused = execute_trip(&fixture, &paths, "setup-begin", &begin).unwrap_err();
+    assert!(format!("{refused:#}").contains("progress marker failure"));
+    assert!(!refused.to_string().contains("durable progress"));
+    fixture.assert_scalar(
+        &format!("SELECT COUNT(*) FROM trip_setup_operations WHERE project_id='{project}'"),
+        0_i64,
+    );
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE operation_id='setup-begin'",
+        0_i64,
+    );
+    fixture.execute_batch("DROP TRIGGER setup_progress_fault;");
+    fixture.execute_batch("CREATE TRIGGER setup_receipt_fault BEFORE INSERT ON operation_receipts WHEN NEW.operation_id IN ('setup-begin','setup-probes') AND NEW.operation_kind='trip_command' BEGIN SELECT RAISE(ABORT,'setup terminal receipt failure'); END;");
+    let error = execute_trip(&fixture, &paths, "setup-begin", &begin).unwrap_err();
+    assert!(error.to_string().contains("durable progress"), "{error:#}");
+    let (setup, attempt, workspace): (String,String,String) = fixture.connection().query_row(
+        "SELECT so.id,so.discovery_attempt_id,w.path FROM trip_setup_operations so JOIN workspaces w ON w.attempt_id=so.discovery_attempt_id WHERE so.project_id=?1", params![project], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).unwrap();
+    fixture.assert_scalar(
+        &format!("SELECT state FROM workspaces WHERE attempt_id='{attempt}'"),
+        "reserved".to_owned(),
+    );
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='setup-begin'",
+        0_i64,
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM audit_events WHERE operation_id='setup-begin' AND event_code='trip.command.progress'", 1_i64);
+    let mut conflicting_manager = manager.clone();
+    conflicting_manager.model.push_str("-different");
+    assert!(execute_trip(
+        &fixture,
+        &paths,
+        "setup-begin",
+        &TripHumanAction::BeginSetup {
+            project_id: project.clone(),
+            expected_project_version: 1,
+            host_manager: conflicting_manager
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("another unresolved request"));
+    let protected = PathBuf::from(&workspace).join(".agents/trip-explorer/llmrelay-overlay.md");
+    let bytes = std::fs::read(&protected).unwrap();
+    std::fs::write(&protected, b"changed materialized bytes").unwrap();
+    let error = execute_trip(&fixture, &paths, "setup-begin", &begin).unwrap_err();
+    assert!(error.to_string().contains("durable progress"));
+    fixture.assert_scalar(
+        &format!("SELECT state FROM workspaces WHERE attempt_id='{attempt}'"),
+        "recovery_required".to_owned(),
+    );
+    std::fs::write(&protected, bytes).unwrap();
+    fixture.execute_batch("DROP TRIGGER setup_receipt_fault;");
+    let recovered = execute_trip(&fixture, &paths, "setup-begin", &begin).unwrap();
+    assert_eq!(recovered.entity_id, setup);
+    assert_eq!(recovered.detail["discovery_attempt_id"], attempt);
+    fixture.assert_scalar(
+        &format!("SELECT COUNT(*) FROM trip_setup_operations WHERE project_id='{project}'"),
+        1_i64,
+    );
+    record_synthetic_setup_observation(&fixture, &setup, RoleKind::Manager);
+    let draft = execute_trip(
+        &fixture,
+        &paths,
+        "setup-draft",
+        &TripHumanAction::SaveSetupDraft {
+            setup_operation_id: setup.clone(),
+            expected_project_version: 1,
+            proposal: setup_proposal(&manager),
+        },
+    )
+    .unwrap();
+    let probes = TripHumanAction::AuthorizeSetupProbes {
+        setup_operation_id: setup.clone(),
+        proposal_hash: draft.detail["proposal_hash"].as_str().unwrap().into(),
+    };
+    fixture.execute_batch("CREATE TRIGGER setup_receipt_fault BEFORE INSERT ON operation_receipts WHEN NEW.operation_id='setup-probes' AND NEW.operation_kind='trip_command' BEGIN SELECT RAISE(ABORT,'setup terminal receipt failure'); END;");
+    assert!(execute_trip(&fixture, &paths, "setup-probes", &probes)
+        .unwrap_err()
+        .to_string()
+        .contains("durable progress"));
+    let probe_attempt: String = fixture.scalar(&format!(
+        "SELECT probe_attempt_id FROM trip_setup_operations WHERE id='{setup}'"
+    ));
+    fixture.assert_scalar(
+        &format!("SELECT state FROM workspaces WHERE attempt_id='{probe_attempt}'"),
+        "reserved".to_owned(),
+    );
+    let permits: String = fixture.scalar(&format!("SELECT json_group_array(json_array(id,role,nonce,settings_revision)) FROM (SELECT * FROM trip_setup_permits WHERE attempt_id='{probe_attempt}' ORDER BY role)"));
+    fixture.execute_batch("DROP TRIGGER setup_receipt_fault;");
+    let recovered = execute_trip(&fixture, &paths, "setup-probes", &probes).unwrap();
+    assert_eq!(recovered.detail["probe_attempt_id"], probe_attempt);
+    assert_eq!(fixture.scalar::<String>(&format!("SELECT json_group_array(json_array(id,role,nonce,settings_revision)) FROM (SELECT * FROM trip_setup_permits WHERE attempt_id='{probe_attempt}' ORDER BY role)")), permits);
+    fixture.assert_scalar(
+        &format!("SELECT state FROM workspaces WHERE attempt_id='{probe_attempt}'"),
+        "ready".to_owned(),
+    );
+    assert_eq!(
+        serde_json::to_value(execute_trip(&fixture, &paths, "setup-probes", &probes).unwrap())
+            .unwrap(),
+        serde_json::to_value(recovered).unwrap()
+    );
+}
+
+#[test]
+fn trip_command_runtime_preparation_resumes_all_probes_without_new_reservations() {
+    let (fixture, paths, project, _) = authorized_runtime_fixture("trip-command-runtime-resume");
+    let admission =
+        prepare_runtime_admission(&fixture, &paths, "runtime-prepare-again", &project, None, 2);
+    let id = &admission.entity_id;
+    let action = TripHumanAction::AuthorizeRuntimeAdmission {
+        admission_id: id.clone(),
+        scope_hash: admission.detail["scope_hash"].as_str().unwrap().into(),
+    };
+    fixture.execute_batch(&format!("CREATE TRIGGER partial_runtime_reservation BEFORE UPDATE OF state ON trip_runtime_probes WHEN NEW.admission_id='{id}' AND NEW.role='plan_reviewer' AND NEW.state='authorized' BEGIN SELECT RAISE(ABORT,'partial runtime reservation'); END;"));
+    assert!(
+        execute_trip(&fixture, &paths, "runtime-authorize-again", &action)
+            .unwrap_err()
+            .to_string()
+            .contains("durable progress")
+    );
+    fixture.assert_scalar(&format!("SELECT COUNT(*) FROM trip_runtime_probes WHERE admission_id='{id}' AND state='authorized'"), 2_i64);
+    let partial: String = fixture.scalar(&format!("SELECT json_group_array(json_array(role,attempt_id,nonce,workspace_path)) FROM (SELECT * FROM trip_runtime_probes WHERE admission_id='{id}' AND role IN ('manager','explorer') ORDER BY role)"));
+    fixture.execute_batch("DROP TRIGGER partial_runtime_reservation; CREATE TRIGGER runtime_terminal_receipt BEFORE INSERT ON operation_receipts WHEN NEW.operation_id='runtime-authorize-again' AND NEW.operation_kind='trip_command' BEGIN SELECT RAISE(ABORT,'runtime terminal receipt'); END;");
+    assert!(
+        execute_trip(&fixture, &paths, "runtime-authorize-again", &action)
+            .unwrap_err()
+            .to_string()
+            .contains("durable progress")
+    );
+    fixture.assert_scalar(
+        &format!("SELECT state FROM trip_runtime_admissions WHERE id='{id}'"),
+        "pending_approval".to_owned(),
+    );
+    fixture.assert_scalar(&format!("SELECT COUNT(*) FROM trip_runtime_probes WHERE admission_id='{id}' AND state='authorized'"), 6_i64);
+    assert_eq!(fixture.scalar::<String>(&format!("SELECT json_group_array(json_array(role,attempt_id,nonce,workspace_path)) FROM (SELECT * FROM trip_runtime_probes WHERE admission_id='{id}' AND role IN ('manager','explorer') ORDER BY role)")), partial);
+    let bindings: String = fixture.scalar(&format!("SELECT json_group_array(json_array(p.role,p.attempt_id,p.nonce,p.workspace_path,permit.id,permit.settings_revision)) FROM trip_runtime_probes p JOIN trip_setup_permits permit ON permit.attempt_id=p.attempt_id AND permit.role=p.role WHERE p.admission_id='{id}' ORDER BY p.role"));
+    fixture.execute_batch("DROP TRIGGER runtime_terminal_receipt;");
+    let (workspace, nonce): (String,String) = fixture.connection().query_row("SELECT workspace_path,nonce FROM trip_runtime_probes WHERE admission_id=?1 AND role='manager'", params![id], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    let challenge = PathBuf::from(workspace).join("functional-challenge.txt");
+    std::fs::write(&challenge, b"a different challenge").unwrap();
+    assert!(
+        execute_trip(&fixture, &paths, "runtime-authorize-again", &action)
+            .unwrap_err()
+            .to_string()
+            .contains("recorded nonce")
+    );
+    std::fs::remove_file(&challenge).unwrap();
+    let challenge_target = fixture.root.join("challenge-target");
+    std::fs::write(&challenge_target, &nonce).unwrap();
+    std::os::unix::fs::symlink(&challenge_target, &challenge).unwrap();
+    assert!(
+        execute_trip(&fixture, &paths, "runtime-authorize-again", &action)
+            .unwrap_err()
+            .to_string()
+            .contains("safe regular file")
+    );
+    std::fs::remove_file(&challenge).unwrap();
+    std::fs::write(&challenge, nonce).unwrap();
+    fixture.execute("UPDATE trip_runtime_probes SET nonce='changed-binding' WHERE admission_id=?1 AND role='manager'", params![id]);
+    assert!(
+        execute_trip(&fixture, &paths, "runtime-authorize-again", &action)
+            .unwrap_err()
+            .to_string()
+            .contains("binding changed")
+    );
+    fixture.execute("UPDATE trip_runtime_probes SET nonce=(SELECT nonce FROM trip_setup_permits WHERE attempt_id=trip_runtime_probes.attempt_id AND role='manager') WHERE admission_id=?1 AND role='manager'", params![id]);
+    assert_eq!(fixture.connection().execute("UPDATE trip_runtime_probes SET state='failed' WHERE admission_id=?1 AND role='final_verifier'", params![id]).unwrap(), 1);
+    assert!(
+        execute_trip(&fixture, &paths, "runtime-authorize-again", &action)
+            .unwrap_err()
+            .to_string()
+            .contains("required probe failed")
+    );
+    assert_eq!(fixture.connection().execute("UPDATE trip_runtime_probes SET state='authorized' WHERE admission_id=?1 AND role='final_verifier'", params![id]).unwrap(), 1);
+    let result = execute_trip(&fixture, &paths, "runtime-authorize-again", &action).unwrap();
+    let probes = result.detail["probes"].as_array().unwrap();
+    assert_eq!(
+        probes
+            .iter()
+            .map(|p| p["role"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "manager",
+            "explorer",
+            "plan_reviewer",
+            "implementer",
+            "code_reviewer",
+            "final_verifier"
+        ]
+    );
+    assert_eq!(result.detail["fresh_call_count"], 6);
+    assert_eq!(fixture.scalar::<String>(&format!("SELECT json_group_array(json_array(p.role,p.attempt_id,p.nonce,p.workspace_path,permit.id,permit.settings_revision)) FROM trip_runtime_probes p JOIN trip_setup_permits permit ON permit.attempt_id=p.attempt_id AND permit.role=p.role WHERE p.admission_id='{id}' ORDER BY p.role")), bindings);
+    assert_eq!(
+        serde_json::to_value(
+            execute_trip(&fixture, &paths, "runtime-authorize-again", &action).unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(result).unwrap()
+    );
+}
+
+#[test]
+fn trip_command_functional_and_legacy_proof_terminal_failures_reuse_subreceipts() {
+    for legacy in [false, true] {
+        let (fixture, paths, _, admission) = if legacy {
+            authorized_legacy_runtime_fixture("trip-command-legacy-proof")
+        } else {
+            authorized_runtime_fixture("trip-command-functional-proof")
+        };
+        let role = RoleKind::Explorer;
+        record_synthetic_runtime_pass(&fixture, &admission, role);
+        fixture.execute("UPDATE resume_invocations SET state='exited' WHERE session_id=(SELECT session_id FROM trip_runtime_probes WHERE admission_id=?1 AND role='explorer')", params![admission]);
+        let action = TripHumanAction::PublishRuntimeProof {
+            admission_id: admission.clone(),
+            role,
+        };
+        fixture.execute_batch("CREATE TRIGGER proof_terminal_receipt BEFORE INSERT ON operation_receipts WHEN NEW.operation_id='publish-proof-atomic' AND NEW.operation_kind='trip_command' BEGIN SELECT RAISE(ABORT,'proof terminal receipt'); END;");
+        let error = execute_trip(&fixture, &paths, "publish-proof-atomic", &action).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("proof terminal receipt"),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("durable progress"));
+        fixture.assert_scalar(&format!("SELECT state FROM trip_runtime_probes WHERE admission_id='{admission}' AND role='explorer'"), "evidence_recorded".to_owned());
+        let kind = if legacy {
+            "capability_proof"
+        } else {
+            "functional_capability_proof"
+        };
+        let subreceipt: String = fixture.scalar(&format!("SELECT json_array(operation_id,request_hash,result_json,created_at) FROM operation_receipts WHERE operation_kind='{kind}' AND operation_id LIKE 'publish-proof-atomic:%'"));
+        let capability: String = fixture.scalar(&format!("SELECT json_array(c.id,c.proof_json,c.status,c.checked_at) FROM capabilities c JOIN trip_runtime_probes p ON p.capability_key=c.config_hash AND p.role=c.role WHERE p.admission_id='{admission}' AND p.role='explorer' AND c.status='supported'"));
+        fixture.execute_batch("DROP TRIGGER proof_terminal_receipt;");
+        if legacy {
+            let (session, native): (String, String) = fixture.connection().query_row(
+                "SELECT s.id,s.native_session_id FROM sessions s JOIN trip_runtime_probes p ON p.session_id=s.id WHERE p.admission_id=?1 AND p.role='explorer'",
+                params![admission], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            fixture.execute(
+                "UPDATE sessions SET native_session_id='changed-proof-native-session' WHERE id=?1",
+                params![session],
+            );
+            let mismatch =
+                execute_trip(&fixture, &paths, "publish-proof-atomic", &action).unwrap_err();
+            assert!(
+                format!("{mismatch:#}")
+                    .contains("operation ID was already used with different input"),
+                "{mismatch:#}"
+            );
+            fixture.assert_scalar(&format!("SELECT state FROM trip_runtime_probes WHERE admission_id='{admission}' AND role='explorer'"), "evidence_recorded".to_owned());
+            fixture.execute(
+                "UPDATE sessions SET native_session_id=?1 WHERE id=?2",
+                params![native, session],
+            );
+        }
+        let result = execute_trip(&fixture, &paths, "publish-proof-atomic", &action).unwrap();
+        assert_eq!(result.detail["role"], "explorer");
+        fixture.assert_scalar(&format!("SELECT state FROM trip_runtime_probes WHERE admission_id='{admission}' AND role='explorer'"), "published".to_owned());
+        assert_eq!(fixture.scalar::<String>(&format!("SELECT json_array(operation_id,request_hash,result_json,created_at) FROM operation_receipts WHERE operation_kind='{kind}' AND operation_id LIKE 'publish-proof-atomic:%'")), subreceipt);
+        assert_eq!(fixture.scalar::<String>(&format!("SELECT json_array(c.id,c.proof_json,c.status,c.checked_at) FROM capabilities c JOIN trip_runtime_probes p ON p.capability_key=c.config_hash AND p.role=c.role WHERE p.admission_id='{admission}' AND p.role='explorer' AND c.status='supported'")), capability);
+        fixture.assert_scalar("SELECT COUNT(*) FROM audit_events WHERE operation_id='publish-proof-atomic' AND event_code='trip.command.applied'", 1_i64);
+        assert_eq!(
+            serde_json::to_value(
+                execute_trip(&fixture, &paths, "publish-proof-atomic", &action).unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(result).unwrap()
+        );
+    }
+}
+
+#[test]
+fn trip_command_manager_replacement_recovers_with_new_begin_identity_and_version() {
+    let fixture = Fixture::new("trip-command-manager-replacement");
+    let paths = instance_paths(&fixture);
+    let project = workflow::execute(
+        &fixture.store,
+        &HumanCommand::AddProject {
+            operation_id: "replacement-project".into(),
+            path: fixture.repository("repo"),
+            display_name: "Replacement".into(),
+        },
+    )
+    .unwrap()
+    .entity_id;
+    let manager = role_override(Provider::Codex);
+    let setup = execute_trip(
+        &fixture,
+        &paths,
+        "replacement-begin",
+        &TripHumanAction::BeginSetup {
+            project_id: project.clone(),
+            expected_project_version: 1,
+            host_manager: manager.clone(),
+        },
+    )
+    .unwrap()
+    .entity_id;
+    let mut replacement = manager;
+    replacement.model.push_str("-replacement");
+    let action = TripHumanAction::ChangeSetupManager {
+        setup_operation_id: setup.clone(),
+        expected_project_version: 1,
+        host_manager: replacement.clone(),
+    };
+    fixture.execute_batch("CREATE TRIGGER replacement_receipt_fault BEFORE INSERT ON operation_receipts WHEN NEW.operation_id='change-manager-atomic' AND NEW.operation_kind='trip_command' BEGIN SELECT RAISE(ABORT,'replacement terminal receipt'); END;");
+    let error = execute_trip(&fixture, &paths, "change-manager-atomic", &action).unwrap_err();
+    assert!(format!("{error:#}").contains("replacement terminal receipt"));
+    assert!(error.to_string().contains("durable progress"));
+    fixture.assert_scalar(
+        &format!("SELECT version FROM projects WHERE id='{project}'"),
+        2_i64,
+    );
+    let replacement_setup: String = fixture.scalar(&format!(
+        "SELECT id FROM trip_setup_operations WHERE supersedes_setup_operation_id='{setup}'"
+    ));
+    fixture.assert_scalar(&format!("SELECT w.state FROM workspaces w JOIN trip_setup_operations so ON so.discovery_attempt_id=w.attempt_id WHERE so.id='{replacement_setup}'"), "reserved".to_owned());
+    fixture.execute_batch("DROP TRIGGER replacement_receipt_fault;");
+    assert!(
+        execute_trip(&fixture, &paths, "change-manager-atomic", &action)
+            .unwrap_err()
+            .to_string()
+            .contains("durable progress")
+    );
+    let recovery = TripHumanAction::BeginSetup {
+        project_id: project,
+        expected_project_version: 2,
+        host_manager: replacement,
+    };
+    let result = execute_trip(&fixture, &paths, "recover-replacement-begin", &recovery).unwrap();
+    assert_eq!(result.entity_id, replacement_setup);
+    assert_eq!(result.version, Some(2));
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='change-manager-atomic'",
+        0_i64,
+    );
+    assert_eq!(
+        serde_json::to_value(
+            execute_trip(&fixture, &paths, "recover-replacement-begin", &recovery).unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(result).unwrap()
     );
 }

@@ -1,6 +1,7 @@
 import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, command, reuseOperationIdentity } from "../api";
+import { withStorageLock } from "../storageCoordination";
 import {
   type AppState,
   type PermissionNativeResolution,
@@ -12,6 +13,58 @@ import {
 } from "../types";
 
 type Scope = "session" | "project";
+
+const operationStorageKey = "llmrelay.approval.operations";
+type ApprovalIdentity = { body: string; id: string };
+
+function readApprovalJournal(): Map<string, ApprovalIdentity> {
+  const invalid = (cause?: unknown) => new Error(
+    "Saved approval requests could not be read. Refresh and check their outcomes before retrying.",
+    { cause },
+  );
+  let entries: unknown;
+  try {
+    const raw = localStorage.getItem(operationStorageKey);
+    if (raw === null) return new Map();
+    entries = JSON.parse(raw);
+  } catch (cause) {
+    throw invalid(cause);
+  }
+  if (!Array.isArray(entries)) throw invalid();
+  const journal = new Map<string, ApprovalIdentity>();
+  for (const entry of entries) {
+    if (!Array.isArray(entry) || entry.length !== 2) throw invalid();
+    const [key, identity] = entry;
+    if (
+      typeof key !== "string" || !key.trim() || journal.has(key) ||
+      !identity || typeof identity !== "object" ||
+      typeof identity.id !== "string" || !identity.id.trim() ||
+      typeof identity.body !== "string"
+    ) throw invalid();
+    let body: unknown;
+    try {
+      body = JSON.parse(identity.body);
+    } catch {
+      throw invalid();
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body) ||
+      !("kind" in body) || typeof body.kind !== "string" ||
+      !body.kind.trim()) throw invalid();
+    journal.set(key, { id: identity.id, body: identity.body });
+  }
+  return journal;
+}
+
+function writeApprovalJournal(journal: Map<string, ApprovalIdentity>): void {
+  try {
+    localStorage.setItem(operationStorageKey, JSON.stringify([...journal]));
+  } catch (cause) {
+    throw new Error(
+      "Your approval request could not be saved for recovery. Check browser storage, then refresh and check the outcome before retrying.",
+      { cause },
+    );
+  }
+}
 
 export function ServiceCheckPermissionActions(
   { selection, busy = false, onDecision, onRevoke }: {
@@ -173,50 +226,64 @@ export function ApprovalInbox(
   const [scope, setScope] = useState<Scope>("session");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
-  const operationStorageKey = "llmrelay.approval.operations";
-  const operationIdentities = useRef(
-    new Map<string, { body: string; id: string }>(
-      (() => {
-        try {
-          const value = JSON.parse(
-            localStorage.getItem(operationStorageKey) || "[]",
-          );
-          return Array.isArray(value) ? value : [];
-        } catch {
-          return [];
-        }
-      })(),
-    ),
-  );
-  const execute = async (key: string, body: Record<string, unknown>) => {
-    const stable = reuseOperationIdentity(
-      operationIdentities.current.get(key),
-      body,
-    );
-    const { id, request } = stable;
-    operationIdentities.current.set(key, { body: JSON.stringify(request), id });
-    localStorage.setItem(
-      operationStorageKey,
-      JSON.stringify([...operationIdentities.current]),
-    );
+  const [notice, setNotice] = useState("");
+  const mountLifetime = useRef(new AbortController());
+  useEffect(() => {
+    const controller = new AbortController();
+    mountLifetime.current = controller;
+    return () => controller.abort();
+  }, []);
+
+  const execute = async (
+    key: string,
+    body: Record<string, unknown>,
+    signal: AbortSignal,
+  ) => {
+    const published = await withStorageLock(operationStorageKey, () => {
+      const journal = readApprovalJournal();
+      const previous = journal.get(key);
+      const { id, request } = reuseOperationIdentity(previous, body);
+      const identity = { id, body: JSON.stringify(request) };
+      journal.set(key, identity);
+      writeApprovalJournal(journal);
+      return { identity, request, unresolvedReplay: previous?.id === id };
+    }, signal);
+    if (!published || signal.aborted) return false;
+
+    const settleIdentity = () => withStorageLock(operationStorageKey, () => {
+      const journal = readApprovalJournal();
+      const current = journal.get(key);
+      if (current?.id !== published.identity.id ||
+        current.body !== published.identity.body) return;
+      journal.delete(key);
+      writeApprovalJournal(journal);
+    });
     try {
-      const result = await command({ ...request, operation_id: id } as never);
-      operationIdentities.current.delete(key);
-      localStorage.setItem(
-        operationStorageKey,
-        JSON.stringify([...operationIdentities.current]),
-      );
-      return result;
+      await command({
+        ...published.request,
+        operation_id: published.identity.id,
+      } as never);
     } catch (cause) {
-      if (!(cause instanceof ApiError && cause.ambiguous)) {
-        operationIdentities.current.delete(key);
-        localStorage.setItem(
-          operationStorageKey,
-          JSON.stringify([...operationIdentities.current]),
-        );
+      // A refused replay cannot resolve the earlier request's unknown outcome.
+      if (!published.unresolvedReplay &&
+        !(cause instanceof ApiError && cause.ambiguous)) {
+        try {
+          await settleIdentity();
+        } catch {
+          // Keep the request and report the original refusal if cleanup fails.
+        }
       }
       throw cause;
     }
+    try {
+      // Sent requests settle independently of the view's mounted lifetime.
+      await settleIdentity();
+    } catch {
+      if (!signal.aborted) setNotice(
+        "Your action was confirmed, but its saved request could not be cleared. Refresh and check the outcome before retrying.",
+      );
+    }
+    return true;
   };
 
   const decide = async (
@@ -224,20 +291,24 @@ export function ApprovalInbox(
     decision: "approve_once" | "always_approve" | "deny",
     lifetime?: Scope,
   ) => {
+    const signal = mountLifetime.current.signal;
     setBusy(request.id);
     setError("");
+    setNotice("");
     try {
-      await execute(`permission:${request.id}`, {
+      const completed = await execute(`permission:${request.id}`, {
         kind: "decide_permission",
         request_id: request.id,
         expected_revision: request.revision,
         decision,
         ...(lifetime ? { lifetime } : {}),
         reason: "",
-      });
+      }, signal);
+      if (!completed || signal.aborted) return;
       setPreview(undefined);
       onChanged();
     } catch (cause) {
+      if (signal.aborted) return;
       if (
         cause instanceof ApiError && (cause.status === 409 || cause.ambiguous)
       ) {
@@ -251,22 +322,26 @@ export function ApprovalInbox(
         setError(cause instanceof Error ? cause.message : String(cause));
       }
     } finally {
-      setBusy("");
+      if (!signal.aborted) setBusy("");
     }
   };
 
   const revoke = async (id: string, revision: number) => {
+    const signal = mountLifetime.current.signal;
     setBusy(id);
     setError("");
+    setNotice("");
     try {
-      await execute(`permission-rule:${id}`, {
+      const completed = await execute(`permission-rule:${id}`, {
         kind: "revoke_permission_rule",
         rule_id: id,
         expected_revision: revision,
         reason: "",
-      });
+      }, signal);
+      if (!completed || signal.aborted) return;
       onChanged();
     } catch (cause) {
+      if (signal.aborted) return;
       if (
         cause instanceof ApiError && (cause.status === 409 || cause.ambiguous)
       ) onChanged();
@@ -278,7 +353,7 @@ export function ApprovalInbox(
           : String(cause),
       );
     } finally {
-      setBusy("");
+      if (!signal.aborted) setBusy("");
     }
   };
 
@@ -287,10 +362,12 @@ export function ApprovalInbox(
     decision: "approved" | "denied",
     lifetime: "once" | "family",
   ) => {
+    const signal = mountLifetime.current.signal;
     setBusy(selection.check_id);
     setError("");
+    setNotice("");
     try {
-      await execute(`check:${selection.attempt_id}:${selection.check_id}`, {
+      const completed = await execute(`check:${selection.attempt_id}:${selection.check_id}`, {
         kind: "trip",
         action: "authorize_check",
         attempt_id: selection.attempt_id,
@@ -300,9 +377,11 @@ export function ApprovalInbox(
         scope_hash: selection.scope_hash!,
         decision,
         lifetime,
-      });
+      }, signal);
+      if (!completed || signal.aborted) return;
       onChanged();
     } catch (cause) {
+      if (signal.aborted) return;
       if (cause instanceof ApiError && cause.ambiguous) onChanged();
       setError(
         cause instanceof ApiError && cause.ambiguous
@@ -312,7 +391,35 @@ export function ApprovalInbox(
           : String(cause),
       );
     } finally {
-      setBusy("");
+      if (!signal.aborted) setBusy("");
+    }
+  };
+
+  const revokeCheck = async (id: string, revision: number) => {
+    const signal = mountLifetime.current.signal;
+    setBusy(id);
+    setError("");
+    setNotice("");
+    try {
+      const completed = await execute(`check-rule:${id}`, {
+        kind: "trip",
+        action: "revoke_check_permission_rule",
+        rule_id: id,
+        expected_revision: revision,
+      }, signal);
+      if (completed && !signal.aborted) onChanged();
+    } catch (cause) {
+      if (signal.aborted) return;
+      if (cause instanceof ApiError && (cause.status === 409 || cause.ambiguous)) {
+        onChanged();
+      }
+      setError(
+        cause instanceof ApiError && cause.ambiguous
+          ? `${cause.message} Refresh and reconcile before retrying.`
+          : cause instanceof Error ? cause.message : String(cause),
+      );
+    } finally {
+      if (!signal.aborted) setBusy("");
     }
   };
 
@@ -369,9 +476,11 @@ export function ApprovalInbox(
             )}
             <ServiceCheckPermissionActions
               selection={selection}
-              busy={busy === selection.check_id}
+              busy={busy === selection.check_id ||
+                busy === selection.authorization.matching_rule?.id}
               onDecision={(decision, lifetime) =>
                 decideCheck(selection, decision, lifetime)}
+              onRevoke={revokeCheck}
             />
           </article>
         );
@@ -393,6 +502,7 @@ export function ApprovalInbox(
         />
       ))}
       {!count && <p className="empty">No approvals are waiting.</p>}
+      {notice && <p className="hint" role="status">{notice}</p>}
       {error && <ErrorNotice error={error} />}
       {answeredInAgent.length > 0 && (
         <details className="decided-requests">

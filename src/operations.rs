@@ -5095,6 +5095,37 @@ impl Application {
     }
 
     pub fn execute_human_command(&self, command: &HumanCommand) -> Result<OperationResult> {
+        let prior_trip_progress = if let HumanCommand::Trip {
+            operation_id,
+            action,
+        } = command
+        {
+            if let Some(result) =
+                crate::trip::replay_human_command(&self.store, operation_id, action)?
+            {
+                return Ok(result);
+            }
+            crate::trip::has_human_command_progress(&self.store, operation_id, action)?
+        } else {
+            false
+        };
+        self.execute_human_command_inner(command).map_err(|error| {
+            if prior_trip_progress {
+                return crate::trip::outcome_unknown(error);
+            }
+            if let HumanCommand::Trip {
+                operation_id,
+                action,
+            } = command
+            {
+                crate::trip::classify_trip_error(&self.store, operation_id, action, error)
+            } else {
+                error
+            }
+        })
+    }
+
+    fn execute_human_command_inner(&self, command: &HumanCommand) -> Result<OperationResult> {
         if matches!(command, HumanCommand::StopFailedSession { .. }) {
             return self.supervisor.stop_failed_session(command);
         }
@@ -5194,40 +5225,43 @@ impl Application {
                 if let Some(result) = preparation.completed {
                     return Ok(result);
                 }
-                let signal_delivery = match preparation.session_id.as_deref() {
-                    Some(session_id) if self.synthetic_dispatch_for_tests => {
-                        self.store.mark_interrupt_requested(session_id)?;
-                        crate::trip::SetupManagerSignalDelivery::Requested
-                    }
-                    Some(session_id) => {
-                        let outcome = if preparation.retry_signal_delivery {
-                            self.supervisor
-                                .retry_setup_manager_interrupt_once(session_id)
-                        } else {
-                            self.supervisor.interrupt_once(session_id)
-                        };
-                        match outcome {
-                            Ok(crate::supervisor::InterruptOutcome::Requested) => {
-                                crate::trip::SetupManagerSignalDelivery::Requested
-                            }
-                            Ok(crate::supervisor::InterruptOutcome::AlreadyRequested) => {
-                                crate::trip::SetupManagerSignalDelivery::AlreadyRequested
-                            }
-                            Ok(crate::supervisor::InterruptOutcome::Stale) => {
-                                crate::trip::SetupManagerSignalDelivery::AlreadyQuiescent
-                            }
-                            Err(error) => crate::trip::SetupManagerSignalDelivery::Failed(format!(
-                                "manager-only signal delivery failed: {error:#}"
-                            )),
+                return (|| -> Result<OperationResult> {
+                    let signal_delivery = match preparation.session_id.as_deref() {
+                        Some(session_id) if self.synthetic_dispatch_for_tests => {
+                            self.store.mark_interrupt_requested(session_id)?;
+                            crate::trip::SetupManagerSignalDelivery::Requested
                         }
-                    }
-                    None => crate::trip::SetupManagerSignalDelivery::NotRunning,
-                };
-                return crate::trip::finish_setup_manager_stop(
-                    &self.store,
-                    &preparation,
-                    signal_delivery,
-                );
+                        Some(session_id) => {
+                            let outcome = if preparation.retry_signal_delivery {
+                                self.supervisor
+                                    .retry_setup_manager_interrupt_once(session_id)
+                            } else {
+                                self.supervisor.interrupt_once(session_id)
+                            };
+                            match outcome {
+                                Ok(crate::supervisor::InterruptOutcome::Requested) => {
+                                    crate::trip::SetupManagerSignalDelivery::Requested
+                                }
+                                Ok(crate::supervisor::InterruptOutcome::AlreadyRequested) => {
+                                    crate::trip::SetupManagerSignalDelivery::AlreadyRequested
+                                }
+                                Ok(crate::supervisor::InterruptOutcome::Stale) => {
+                                    crate::trip::SetupManagerSignalDelivery::AlreadyQuiescent
+                                }
+                                Err(error) => crate::trip::SetupManagerSignalDelivery::Failed(
+                                    format!("manager-only signal delivery failed: {error:#}"),
+                                ),
+                            }
+                        }
+                        None => crate::trip::SetupManagerSignalDelivery::NotRunning,
+                    };
+                    crate::trip::finish_setup_manager_stop(
+                        &self.store,
+                        &preparation,
+                        signal_delivery,
+                    )
+                })()
+                .map_err(crate::trip::outcome_unknown);
             }
             let runtime = crate::trip::CapabilityRuntime::from_store(
                 &self.store,

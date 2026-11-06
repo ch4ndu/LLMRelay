@@ -28,6 +28,37 @@ resume; the app should explain the next available action.
 The sections below retain detailed recovery rules for troubleshooting. For a
 first task, use the [README walkthrough](../README.md#create-a-useful-first-task).
 
+## Requests with an uncertain result
+
+Refresh and inspect the current state before retrying an action whose response
+was lost or whose error says its outcome is unknown. A completed TRIP command
+retains its original result: repeating its exact request and operation ID returns
+that result without executing the action again. Changing the request while
+reusing that ID is refused. A refusal of an unresolved retry does not establish
+that the original action made no changes.
+
+Database-only TRIP changes save their state, audit entry and result together. A
+failure that rolls back that transaction is a definite failure. Setup, runtime
+verification, installation and migration also have durable preparation steps;
+their files or reservations can remain even when final publication fails. Follow
+the recovery action offered for that state. An unknown result is not permission
+to repeat a provider launch or discard a reservation.
+
+The Approvals view keeps the original request for an unresolved action, including
+across closing and reopening the view. A refused retry retains that request until
+its original outcome is resolved. If saving or reading the browser's approval
+record fails, the view sends no new action. If the service confirms success but
+the browser cannot clear that record, the view reports the cleanup problem
+without treating the confirmed action as failed.
+
+Migration and setup-manager replacement can advance the version before final
+publication. Their recovery requires a separately authorized request with the
+refreshed version and a new operation ID; do not modify the saved original
+request to bypass its version check. For manager replacement, recovery resumes
+setup discovery with the newly selected manager. See
+[interrupted setup and workspace recovery](PROJECT_SETUP.md#interrupted-setup-and-workspace-recovery)
+for the corresponding project controls.
+
 ## Startup and browser authentication
 
 The dashboard waits for committed state changes instead of refreshing every two

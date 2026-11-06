@@ -566,7 +566,7 @@ impl Supervisor {
     }
 
     #[cfg(test)]
-    fn fail_process_inventory_for_tests(&self, reason: Option<&str>) {
+    pub(crate) fn fail_process_inventory_for_tests(&self, reason: Option<&str>) {
         *self.process_inventory_failure.write().unwrap() = reason.map(str::to_owned);
     }
 

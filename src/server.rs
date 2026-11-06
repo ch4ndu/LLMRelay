@@ -1471,10 +1471,18 @@ async fn api_command(
                     Some(command.operation_id()),
                     serde_json::json!({"cause":format!("{error:#}")}),
                 );
-                (StatusCode::CONFLICT, Json(serde_json::json!({"error":format!("{error:#}"),"operation_id":command.operation_id()}))).into_response()
+                human_command_error_response(command.operation_id(), &error)
             }
         }
-    }).await
+    })
+    .await
+}
+
+fn human_command_error_response(operation_id: &str, error: &anyhow::Error) -> Response {
+    let outcome_unknown = error.is::<crate::trip::TripOutcomeUnknown>();
+    (StatusCode::CONFLICT, Json(serde_json::json!({
+        "error":format!("{error:#}"), "operation_id":operation_id, "outcome_unknown":outcome_unknown
+    }))).into_response()
 }
 
 async fn api_command_with_executor(
@@ -3116,6 +3124,241 @@ mod web_operation_tests {
             drop(connection);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn trip_application_replays_exact_receipts_before_unavailable_inventory() {
+        let (root, app, _, _) = server_test_application();
+        app.store.lock().unwrap().execute_batch(
+            "INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,spent) VALUES('trip-budget','attempt','plan',2,0);"
+        ).unwrap();
+        let action = crate::domain::TripHumanAction::ExtendReviewBudget {
+            task_id: "task".into(),
+            attempt_id: "attempt".into(),
+            expected_task_version: 1,
+            review_kind: "plan".into(),
+            additional: 1,
+        };
+        let command = HumanCommand::Trip {
+            operation_id: "trip-saved".into(),
+            action: action.clone(),
+        };
+        let saved = app.execute_human_command(&command).unwrap();
+        app.supervisor
+            .fail_process_inventory_for_tests(Some("deterministic inventory failure"));
+        assert_eq!(
+            serde_json::to_value(app.execute_human_command(&command).unwrap()).unwrap(),
+            serde_json::to_value(saved).unwrap()
+        );
+        let conflicting = HumanCommand::Trip {
+            operation_id: "trip-saved".into(),
+            action: crate::domain::TripHumanAction::ExtendReviewBudget {
+                task_id: "task".into(),
+                attempt_id: "attempt".into(),
+                expected_task_version: 1,
+                review_kind: "plan".into(),
+                additional: 2,
+            },
+        };
+        assert!(app
+            .execute_human_command(&conflicting)
+            .unwrap_err()
+            .to_string()
+            .contains("another request"));
+        let missing = HumanCommand::Trip {
+            operation_id: "trip-missing".into(),
+            action,
+        };
+        let error = app.execute_human_command(&missing).unwrap_err();
+        assert!(format!("{error:#}").contains("deterministic inventory failure"));
+        assert!(!error.is::<crate::trip::TripOutcomeUnknown>());
+        let connection = app.store.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT extension_allowance FROM review_budgets WHERE id='trip-budget'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT version FROM tasks WHERE id='task'", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='trip-missing'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        drop(connection);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn trip_production_mapper_distinguishes_rollback_current_and_persisted_progress() {
+        let (root, app, _, _) = server_test_application();
+        app.store.lock().unwrap().execute_batch(
+            "INSERT INTO review_budgets(id,attempt_id,review_kind,initial_allowance,spent) VALUES('trip-budget','attempt','plan',2,0);
+             CREATE TRIGGER trip_mapper_receipt BEFORE INSERT ON operation_receipts
+             WHEN NEW.operation_id='mapper-rollback' BEGIN SELECT RAISE(ABORT,'mapper receipt failure'); END;"
+        ).unwrap();
+        let runtime = crate::trip::CapabilityRuntime::from_store(
+            &app.store,
+            app.hooks.clone(),
+            app.paths.role_socket.clone(),
+            std::env::current_exe().unwrap(),
+        );
+        let budget = crate::domain::TripHumanAction::ExtendReviewBudget {
+            task_id: "task".into(),
+            attempt_id: "attempt".into(),
+            expected_task_version: 1,
+            review_kind: "plan".into(),
+            additional: 1,
+        };
+        let rollback = crate::trip::execute_human_with_runtime(
+            &app.store,
+            &app.paths,
+            &runtime,
+            "mapper-rollback",
+            &budget,
+        )
+        .unwrap_err();
+        let refusal = crate::trip::execute_human_with_runtime(
+            &app.store,
+            &app.paths,
+            &runtime,
+            "mapper-refusal",
+            &crate::domain::TripHumanAction::ExtendReviewBudget {
+                task_id: "task".into(),
+                attempt_id: "attempt".into(),
+                expected_task_version: 1,
+                review_kind: "final".into(),
+                additional: 1,
+            },
+        )
+        .unwrap_err();
+        for (operation, error) in [("mapper-rollback", rollback), ("mapper-refusal", refusal)] {
+            let response = human_command_error_response(operation, &error);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["outcome_unknown"], false);
+            assert_eq!(body["operation_id"], operation);
+        }
+        let repository = root.join("mapper-repository");
+        std::fs::create_dir(&repository).unwrap();
+        for arguments in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "Fixture"],
+            vec!["config", "user.email", "fixture@example.invalid"],
+            vec!["commit", "--allow-empty", "-m", "fixture"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(&repository)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        }
+        let project = crate::workflow::execute(
+            &app.store,
+            &HumanCommand::AddProject {
+                operation_id: "mapper-project".into(),
+                path: repository,
+                display_name: "Mapper project".into(),
+            },
+        )
+        .unwrap()
+        .entity_id;
+        let begin = crate::domain::TripHumanAction::BeginSetup {
+            project_id: project.clone(),
+            expected_project_version: 1,
+            host_manager: crate::domain::RoleOverride {
+                provider: crate::domain::Provider::Codex,
+                model: "fixture-model".into(),
+                effort: "high".into(),
+            },
+        };
+        app.store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER trip_mapper_setup_receipt BEFORE INSERT ON operation_receipts
+             WHEN NEW.operation_id='mapper-progress' AND NEW.operation_kind='trip_command'
+             BEGIN SELECT RAISE(ABORT,'mapper setup receipt failure'); END;",
+            )
+            .unwrap();
+        let current = crate::trip::execute_human_with_runtime(
+            &app.store,
+            &app.paths,
+            &runtime,
+            "mapper-progress",
+            &begin,
+        )
+        .unwrap_err();
+        assert!(format!("{current:#}").contains("mapper setup receipt failure"));
+        app.store.lock().unwrap().execute_batch(
+            "CREATE TRIGGER trip_mapper_recovery_failure BEFORE UPDATE ON trip_setup_operations
+             WHEN NEW.state='workspace_recovery_required' BEGIN SELECT RAISE(ABORT,'recovery recording failed'); END;"
+        ).unwrap();
+        let workspace: String = app.store.lock().unwrap().query_row(
+            "SELECT w.path FROM workspaces w JOIN trip_setup_operations s ON s.discovery_attempt_id=w.attempt_id WHERE s.project_id=?1",
+            params![project], |row| row.get(0),
+        ).unwrap();
+        std::fs::write(
+            std::path::Path::new(&workspace).join(".agents/trip-explorer/llmrelay-overlay.md"),
+            b"drift",
+        )
+        .unwrap();
+        let persisted = crate::trip::execute_human_with_runtime(
+            &app.store,
+            &app.paths,
+            &runtime,
+            "mapper-progress",
+            &begin,
+        )
+        .unwrap_err();
+        assert!(format!("{persisted:#}").contains("recovery recording failed"));
+        app.store.lock().unwrap().execute("DELETE FROM audit_events WHERE operation_id='mapper-progress' AND event_code='trip.command.progress'", []).unwrap();
+        let historical = crate::trip::execute_human_with_runtime(
+            &app.store,
+            &app.paths,
+            &runtime,
+            "mapper-progress",
+            &begin,
+        )
+        .unwrap_err();
+        assert!(format!("{historical:#}").contains("recovery recording failed"));
+        for error in [current, persisted, historical] {
+            let response = human_command_error_response("mapper-progress", &error);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["outcome_unknown"], true);
+            assert_eq!(body["operation_id"], "mapper-progress");
+            assert!(body["error"]
+                .as_str()
+                .unwrap()
+                .contains("Refresh and check"));
+        }
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

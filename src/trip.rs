@@ -959,6 +959,17 @@ pub(crate) fn bind_attempt_profiles(
     runtime: &CapabilityRuntime,
     now: &str,
 ) -> Result<()> {
+    let profiles = prepare_attempt_profiles(connection, task_id, cwd, runtime)?;
+    persist_attempt_profiles(connection, attempt_id, &profiles, now)
+}
+
+fn prepare_attempt_profiles(
+    connection: &Connection,
+    task_id: &str,
+    cwd: &Path,
+    runtime: &CapabilityRuntime,
+) -> Result<Vec<TaskProfileAuthority>> {
+    let mut profiles = Vec::with_capacity(APP_ROLES.len());
     for role_name in APP_ROLES {
         let (revision,config_json):(i64,String)=connection.query_row(
             "SELECT revision,config_json FROM role_settings WHERE task_id=?1 AND role=?2 ORDER BY revision DESC LIMIT 1",
@@ -989,7 +1000,19 @@ pub(crate) fn bind_attempt_profiles(
             &prepared.config,
             &runtime.compatibility_bundles,
         )?;
-        connection.execute("INSERT INTO trip_attempt_profiles(attempt_id,role,settings_revision,activation_id,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![attempt_id,role_name,revision,authority.activation_id,authority.source,authority.profile_json.to_string(),authority.profile_hash,authority.project_config_revision_id,authority.project_configuration_hash,authority.adapter_name,authority.adapter_hash,authority.capability_id,authority.capability_key,authority.capability_proof_hash,now])?;
+        profiles.push(authority);
+    }
+    Ok(profiles)
+}
+
+fn persist_attempt_profiles(
+    connection: &Connection,
+    attempt_id: &str,
+    profiles: &[TaskProfileAuthority],
+    now: &str,
+) -> Result<()> {
+    for authority in profiles {
+        connection.execute("INSERT INTO trip_attempt_profiles(attempt_id,role,settings_revision,activation_id,source,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_id,capability_key,capability_proof_hash,bound_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![attempt_id,authority.role.to_string(),authority.settings_revision,authority.activation_id,authority.source,authority.profile_json.to_string(),authority.profile_hash,authority.project_config_revision_id,authority.project_configuration_hash,authority.adapter_name,authority.adapter_hash,authority.capability_id,authority.capability_key,authority.capability_proof_hash,now])?;
     }
     Ok(())
 }
@@ -1472,6 +1495,15 @@ pub fn require_attempt_ready(
     attempt_id: &str,
     setup_permit_id: Option<&str>,
 ) -> Result<()> {
+    require_attempt_ready_state(connection, attempt_id, setup_permit_id)?;
+    verify_ready_workspace_policy(connection, attempt_id)
+}
+
+fn require_attempt_ready_state(
+    connection: &Connection,
+    attempt_id: &str,
+    setup_permit_id: Option<&str>,
+) -> Result<()> {
     let (project_id, internal_purpose, setup_operation): (String, Option<String>, Option<String>) =
         connection.query_row(
             "SELECT t.project_id,p.internal_purpose,a.setup_operation_id
@@ -1515,7 +1547,6 @@ pub fn require_attempt_ready(
         if !valid {
             bail!("setup permit does not match the exact operation, attempt, fixture identity, and approved action")
         }
-        verify_ready_workspace_policy(connection, attempt_id)?;
         return Ok(());
     }
     require_project_ready(connection, &project_id)?;
@@ -1532,8 +1563,11 @@ pub fn require_attempt_ready(
     if !migrated {
         bail!("attempt requires explicit migration to the activated TRIP workflow before dispatch")
     }
-    verify_ready_workspace_policy(connection, attempt_id)?;
     Ok(())
+}
+
+fn attempt_workspace_binding(connection: &Connection, attempt: &str) -> Result<Option<String>> {
+    Ok(connection.query_row("SELECT json_array(id,path,state,policy_json,repository_identity,base_revision) FROM workspaces WHERE attempt_id=?1", params![attempt], |row| row.get(0)).optional()?)
 }
 
 fn verify_ready_workspace_policy(connection: &Connection, attempt_id: &str) -> Result<()> {
@@ -2432,6 +2466,31 @@ fn validate_policy_identity(
 }
 
 pub fn inspect_registered_project(store: &Store, project_id: &str) -> Result<serde_json::Value> {
+    inspect_project(store, project_id, None, true)
+}
+
+fn inspect_project_command(
+    store: &Store,
+    receipt: &CommandReceipt<'_>,
+    project_id: &str,
+) -> Result<OperationResult> {
+    let detail = inspect_project(store, project_id, Some(receipt), true)?;
+    Ok(operation_result(
+        receipt.operation_id,
+        "project",
+        project_id,
+        None,
+        "trip_inspected",
+        detail,
+    ))
+}
+
+fn inspect_project(
+    store: &Store,
+    project_id: &str,
+    receipt: Option<&CommandReceipt<'_>>,
+    publish: bool,
+) -> Result<serde_json::Value> {
     let (path, expected_identity): (String, String) = {
         let connection = store.lock()?;
         connection
@@ -2473,9 +2532,14 @@ pub fn inspect_registered_project(store: &Store, project_id: &str) -> Result<ser
     let observed_manifest =
         hash_file(&repository.root.join(".agents/trip-explorer/manifest.json"))?;
     let now = Utc::now().to_rfc3339();
-    let connection = store.lock()?;
+    let mut connection = store.lock()?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let bound: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1 AND repository_path=?2 AND repository_identity=?3 AND internal_purpose IS NULL)", params![project_id,path,expected_identity], |row| row.get(0))?;
+    if !bound {
+        bail!("registered repository binding changed during inspection")
+    }
     let (current, current_reason, activated_manifest, current_pins): (String, String, Option<String>, bool) =
-        connection.query_row(
+        tx.query_row(
             "SELECT s.readiness,s.reason,s.manifest_hash,
                 s.workflow_id=?2 AND s.package_version=?3 AND s.upstream_source_hash=?4 AND s.overlay_hash=?5
                 AND EXISTS(SELECT 1 FROM trip_config_revisions r WHERE r.id=s.active_config_revision_id
@@ -2505,21 +2569,34 @@ pub fn inspect_registered_project(store: &Store, project_id: &str) -> Result<ser
             };
             (readiness.as_str().into(), reason)
         };
-    connection.execute(
-        "UPDATE trip_project_state SET readiness=?1,reason=?2,detected_installation=?3,
+    if publish {
+        tx.execute(
+            "UPDATE trip_project_state SET readiness=?1,reason=?2,detected_installation=?3,
          detected_json=?4,updated_at=?5 WHERE project_id=?6",
-        params![
-            readiness,
-            reason,
-            observation.kind,
-            detected.to_string(),
-            now,
-            project_id
-        ],
-    )?;
-    Ok(
-        serde_json::json!({"project_id":project_id,"readiness":readiness,"reason":reason,"observation":detected}),
-    )
+            params![
+                readiness,
+                reason,
+                observation.kind,
+                detected.to_string(),
+                now,
+                project_id
+            ],
+        )?;
+    }
+    let detail = serde_json::json!({"project_id":project_id,"readiness":readiness,"reason":reason,"observation":detected});
+    if let Some(receipt) = receipt {
+        let result = operation_result(
+            receipt.operation_id,
+            "project",
+            project_id,
+            None,
+            "trip_inspected",
+            detail.clone(),
+        );
+        persist_trip_receipt(&tx, receipt, &result)?;
+    }
+    tx.commit()?;
+    Ok(detail)
 }
 
 fn detected_installation_configuration(
@@ -2554,6 +2631,9 @@ pub fn execute_human(
     operation_id: &str,
     action: &TripHumanAction,
 ) -> Result<OperationResult> {
+    if let Some(result) = replay_human_command(store, operation_id, action)? {
+        return Ok(result);
+    }
     paths.create()?;
     let executable = std::env::current_exe()?;
     let runtime = CapabilityRuntime::from_store(
@@ -2581,288 +2661,288 @@ pub fn execute_human_with_runtime(
     {
         return Ok(serde_json::from_value(result)?);
     }
-    let result = match action {
-        TripHumanAction::InspectProject { project_id } => {
-            let detail = inspect_registered_project(store, project_id)?;
-            operation_result(
-                operation_id,
-                "project",
+    let receipt = CommandReceipt::new(operation_id, &request_hash);
+    {
+        let connection = store.lock()?;
+        receipt.progressed.set(
+            validate_trip_progress(&connection, &receipt)?
+                || historical_trip_progress(&connection, action)?,
+        );
+    }
+    let execution = (|| -> Result<OperationResult> {
+        let result = match action {
+            TripHumanAction::InspectProject { project_id } => {
+                return inspect_project_command(store, &receipt, project_id);
+            }
+            TripHumanAction::BeginSetup {
                 project_id,
-                None,
-                "trip_inspected",
-                detail,
-            )
-        }
-        TripHumanAction::BeginSetup {
-            project_id,
-            expected_project_version,
-            host_manager,
-        } => begin_setup(
-            store,
-            paths,
-            operation_id,
-            project_id,
-            *expected_project_version,
-            host_manager,
-        )?,
-        TripHumanAction::SaveSetupDraft {
-            setup_operation_id,
-            expected_project_version,
-            proposal,
-        } => save_setup_draft(
-            store,
-            operation_id,
-            setup_operation_id,
-            *expected_project_version,
-            proposal,
-        )?,
-        TripHumanAction::ReviseSetupDraft {
-            setup_operation_id,
-            expected_project_version,
-            proposal,
-        } => revise_setup_draft(
-            store,
-            runtime,
-            operation_id,
-            setup_operation_id,
-            *expected_project_version,
-            proposal,
-        )?,
-        TripHumanAction::StopSetupManager { .. } => {
-            bail!("setup manager stop requires the application signal boundary")
-        }
-        TripHumanAction::ChangeSetupManager {
-            setup_operation_id,
-            expected_project_version,
-            host_manager,
-        } => change_setup_manager(
-            store,
-            paths,
-            operation_id,
-            setup_operation_id,
-            *expected_project_version,
-            host_manager,
-        )?,
-        TripHumanAction::AuthorizeSetupProbes {
-            setup_operation_id,
-            proposal_hash,
-        } => authorize_probes(
-            store,
-            paths,
-            runtime,
-            operation_id,
-            setup_operation_id,
-            proposal_hash,
-        )?,
-        TripHumanAction::PrepareRuntimeAdmission {
-            project_id,
-            task_id,
-            role,
-            settings_revision,
-            cmux_socket_path,
-            expected_version,
-        } => prepare_runtime_admission(
-            store,
-            runtime,
-            operation_id,
-            project_id,
-            task_id.as_deref(),
-            *role,
-            *settings_revision,
-            cmux_socket_path.as_deref(),
-            *expected_version,
-        )?,
-        TripHumanAction::AuthorizeRuntimeAdmission {
-            admission_id,
-            scope_hash,
-        } => authorize_runtime_admission(
-            store,
-            paths,
-            runtime,
-            operation_id,
-            admission_id,
-            scope_hash,
-        )?,
-        TripHumanAction::PublishRuntimeProof { admission_id, role } => {
-            publish_runtime_proof(store, runtime, operation_id, admission_id, *role)?
-        }
-        TripHumanAction::FinalizeInstallation {
-            setup_operation_id,
-            proposal_hash,
-        } => finalize_installation(
-            store,
-            runtime,
-            operation_id,
-            setup_operation_id,
-            proposal_hash,
-        )?,
-        TripHumanAction::AuthorizeInstallation {
-            setup_operation_id,
-            proposal_hash,
-            approved_preimages_hash,
-            final_source_set_hash,
-        } => authorize_installation(
-            store,
-            runtime,
-            operation_id,
-            setup_operation_id,
-            proposal_hash,
-            approved_preimages_hash,
-            final_source_set_hash,
-        )?,
-        TripHumanAction::ApplyInstallation {
-            setup_operation_id,
-            proposal_hash,
-        } => apply_installation(
-            store,
-            paths,
-            runtime,
-            operation_id,
-            setup_operation_id,
-            proposal_hash,
-        )?,
-        TripHumanAction::RecoverInstallation { setup_operation_id } => {
-            recover_installation(store, paths, runtime, operation_id, setup_operation_id)?
-        }
-        TripHumanAction::AdoptInstallation {
-            project_id,
-            expected_project_version,
-            configuration,
-        } => adopt_installation(
-            store,
-            runtime,
-            operation_id,
-            project_id,
-            *expected_project_version,
-            configuration,
-        )?,
-        TripHumanAction::MigrateAttempt {
-            task_id,
-            attempt_id,
-            expected_task_version,
-            reviewed_plan_hash,
-            config_revision_id,
-        } => migrate_attempt(
-            store,
-            runtime,
-            operation_id,
-            task_id,
-            attempt_id,
-            *expected_task_version,
-            reviewed_plan_hash,
-            config_revision_id,
-        )?,
-        TripHumanAction::AuthorizeCheck {
-            attempt_id,
-            check_id,
-            selected_revision,
-            exact_command_hash,
-            scope_hash,
-            decision,
-            lifetime,
-        } => authorize_check(
-            store,
-            operation_id,
-            attempt_id,
-            check_id,
-            *selected_revision,
-            exact_command_hash,
-            scope_hash,
-            decision,
-            lifetime,
-        )?,
-        TripHumanAction::RevokeCheckPermissionRule {
-            rule_id,
-            expected_revision,
-        } => revoke_check_permission_rule(store, operation_id, rule_id, *expected_revision)?,
-        TripHumanAction::ExtendReviewBudget {
-            task_id,
-            attempt_id,
-            expected_task_version,
-            review_kind,
-            additional,
-        } => extend_review_budget(
-            store,
-            operation_id,
-            task_id,
-            attempt_id,
-            *expected_task_version,
-            review_kind,
-            *additional,
-        )?,
-        TripHumanAction::AuthorizeImplementation {
-            task_id,
-            attempt_id,
-            expected_task_version,
-            plan_hash,
-        } => authorize_implementation(
-            store,
-            operation_id,
-            task_id,
-            attempt_id,
-            *expected_task_version,
-            plan_hash,
-        )?,
-        TripHumanAction::AuthorizeAdditionalExplorer {
-            task_id,
-            attempt_id,
-            expected_task_version,
-            stage,
-            justification,
-        } => authorize_additional_explorer(
-            store,
-            operation_id,
-            task_id,
-            attempt_id,
-            *expected_task_version,
-            stage,
-            justification,
-        )?,
-        TripHumanAction::AuthorizeFinalRepairRecheck {
-            task_id,
-            attempt_id,
-            expected_task_version,
-            approved_code_request_id,
-            prior_candidate_hash,
-            final_request_id,
-            rejected_code_request_id,
-            reviewer_generation_id,
-        } => authorize_final_repair_recheck(
-            store,
-            operation_id,
-            &request_hash,
-            task_id,
-            attempt_id,
-            *expected_task_version,
-            &FinalRepairLedger {
+                expected_project_version,
+                host_manager,
+            } => begin_setup(
+                store,
+                paths,
+                &receipt,
+                project_id,
+                *expected_project_version,
+                host_manager,
+            )?,
+            TripHumanAction::SaveSetupDraft {
+                setup_operation_id,
+                expected_project_version,
+                proposal,
+            } => save_setup_draft(
+                store,
+                &receipt,
+                setup_operation_id,
+                *expected_project_version,
+                proposal,
+            )?,
+            TripHumanAction::ReviseSetupDraft {
+                setup_operation_id,
+                expected_project_version,
+                proposal,
+            } => revise_setup_draft(
+                store,
+                runtime,
+                &receipt,
+                setup_operation_id,
+                *expected_project_version,
+                proposal,
+            )?,
+            TripHumanAction::StopSetupManager { .. } => {
+                bail!("setup manager stop requires the application signal boundary")
+            }
+            TripHumanAction::ChangeSetupManager {
+                setup_operation_id,
+                expected_project_version,
+                host_manager,
+            } => change_setup_manager(
+                store,
+                paths,
+                &receipt,
+                setup_operation_id,
+                *expected_project_version,
+                host_manager,
+            )?,
+            TripHumanAction::AuthorizeSetupProbes {
+                setup_operation_id,
+                proposal_hash,
+            } => authorize_probes(
+                store,
+                paths,
+                runtime,
+                &receipt,
+                setup_operation_id,
+                proposal_hash,
+            )?,
+            TripHumanAction::PrepareRuntimeAdmission {
+                project_id,
+                task_id,
+                role,
+                settings_revision,
+                cmux_socket_path,
+                expected_version,
+            } => prepare_runtime_admission(
+                store,
+                runtime,
+                &receipt,
+                project_id,
+                task_id.as_deref(),
+                *role,
+                *settings_revision,
+                cmux_socket_path.as_deref(),
+                *expected_version,
+            )?,
+            TripHumanAction::AuthorizeRuntimeAdmission {
+                admission_id,
+                scope_hash,
+            } => authorize_runtime_admission(
+                store,
+                paths,
+                runtime,
+                &receipt,
+                admission_id,
+                scope_hash,
+            )?,
+            TripHumanAction::PublishRuntimeProof { admission_id, role } => {
+                publish_runtime_proof(store, runtime, &receipt, admission_id, *role)?
+            }
+            TripHumanAction::FinalizeInstallation {
+                setup_operation_id,
+                proposal_hash,
+            } => {
+                finalize_installation(store, runtime, &receipt, setup_operation_id, proposal_hash)?
+            }
+            TripHumanAction::AuthorizeInstallation {
+                setup_operation_id,
+                proposal_hash,
+                approved_preimages_hash,
+                final_source_set_hash,
+            } => authorize_installation(
+                store,
+                runtime,
+                &receipt,
+                setup_operation_id,
+                proposal_hash,
+                approved_preimages_hash,
+                final_source_set_hash,
+            )?,
+            TripHumanAction::ApplyInstallation {
+                setup_operation_id,
+                proposal_hash,
+            } => apply_installation(
+                store,
+                paths,
+                runtime,
+                &receipt,
+                setup_operation_id,
+                proposal_hash,
+            )?,
+            TripHumanAction::RecoverInstallation { setup_operation_id } => {
+                recover_installation(store, paths, runtime, &receipt, setup_operation_id)?
+            }
+            TripHumanAction::AdoptInstallation {
+                project_id,
+                expected_project_version,
+                configuration,
+            } => adopt_installation(
+                store,
+                runtime,
+                &receipt,
+                project_id,
+                *expected_project_version,
+                configuration,
+            )?,
+            TripHumanAction::MigrateAttempt {
+                task_id,
+                attempt_id,
+                expected_task_version,
+                reviewed_plan_hash,
+                config_revision_id,
+            } => migrate_attempt(
+                store,
+                runtime,
+                &receipt,
+                task_id,
+                attempt_id,
+                *expected_task_version,
+                reviewed_plan_hash,
+                config_revision_id,
+            )?,
+            TripHumanAction::AuthorizeCheck {
+                attempt_id,
+                check_id,
+                selected_revision,
+                exact_command_hash,
+                scope_hash,
+                decision,
+                lifetime,
+            } => authorize_check(
+                store,
+                &receipt,
+                attempt_id,
+                check_id,
+                *selected_revision,
+                exact_command_hash,
+                scope_hash,
+                decision,
+                lifetime,
+            )?,
+            TripHumanAction::RevokeCheckPermissionRule {
+                rule_id,
+                expected_revision,
+            } => revoke_check_permission_rule(store, &receipt, rule_id, *expected_revision)?,
+            TripHumanAction::ExtendReviewBudget {
+                task_id,
+                attempt_id,
+                expected_task_version,
+                review_kind,
+                additional,
+            } => extend_review_budget(
+                store,
+                &receipt,
+                task_id,
+                attempt_id,
+                *expected_task_version,
+                review_kind,
+                *additional,
+            )?,
+            TripHumanAction::AuthorizeImplementation {
+                task_id,
+                attempt_id,
+                expected_task_version,
+                plan_hash,
+            } => authorize_implementation(
+                store,
+                &receipt,
+                task_id,
+                attempt_id,
+                *expected_task_version,
+                plan_hash,
+            )?,
+            TripHumanAction::AuthorizeAdditionalExplorer {
+                task_id,
+                attempt_id,
+                expected_task_version,
+                stage,
+                justification,
+            } => authorize_additional_explorer(
+                store,
+                &receipt,
+                task_id,
+                attempt_id,
+                *expected_task_version,
+                stage,
+                justification,
+            )?,
+            TripHumanAction::AuthorizeFinalRepairRecheck {
+                task_id,
+                attempt_id,
+                expected_task_version,
                 approved_code_request_id,
                 prior_candidate_hash,
                 final_request_id,
                 rejected_code_request_id,
                 reviewer_generation_id,
-            },
-        )?,
-    };
-    persist_trip_receipt(store, operation_id, &request_hash, &result)?;
-    Ok(result)
+            } => authorize_final_repair_recheck(
+                store,
+                &receipt,
+                task_id,
+                attempt_id,
+                *expected_task_version,
+                &FinalRepairLedger {
+                    approved_code_request_id,
+                    prior_candidate_hash,
+                    final_request_id,
+                    rejected_code_request_id,
+                    reviewer_generation_id,
+                },
+            )?,
+        };
+        Ok(result)
+    })();
+    execution.map_err(|error| {
+        if receipt.progressed.get() && !error.is::<TripOutcomeUnknown>() {
+            TripOutcomeUnknown { cause: error }.into()
+        } else {
+            classify_trip_error(store, operation_id, action, error)
+        }
+    })
 }
 
 fn begin_setup(
     store: &Store,
     paths: &InstancePaths,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     project_id: &str,
     expected_version: i64,
     host_manager: &RoleOverride,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     validate_role_override(host_manager)?;
-    if let Some(recovered) = retry_discovery_workspace(
-        store,
-        operation_id,
-        project_id,
-        expected_version,
-        host_manager,
-    )? {
+    if let Some(recovered) =
+        retry_discovery_workspace(store, receipt, project_id, expected_version, host_manager)?
+    {
         return Ok(recovered);
     }
     {
@@ -2976,9 +3056,11 @@ fn begin_setup(
             "UPDATE trip_project_state SET readiness='setup_in_progress',reason='Setup discovery is awaiting the selected manager',setup_operation_id=?1,detected_installation='unknown',updated_at=?2 WHERE project_id=?3",
             params![setup_id, now, project_id],
         )?;
+        record_trip_progress(&tx, receipt, "trip_setup", &setup_id)?;
         tx.commit()?;
+        receipt.progressed.set(true);
     }
-    if let Err(error) = prepare_setup_workspace(
+    let policy = match prepare_setup_workspace_files(
         store,
         &attempt_id,
         &fixture.root,
@@ -2986,11 +3068,14 @@ fn begin_setup(
         &fixture.head,
         &workspace_path,
     ) {
-        let detail = format!("setup discovery workspace materialization failed: {error:#}");
-        mark_setup_workspace_recovery(store, &setup_id, &attempt_id, &detail)?;
-        bail!("{detail}; retry begin_setup with the same project version and host manager")
-    }
-    Ok(operation_result(
+        Ok(policy) => policy,
+        Err(error) => {
+            let detail = format!("setup discovery workspace materialization failed: {error:#}");
+            mark_setup_workspace_recovery(store, &setup_id, &attempt_id, &detail)?;
+            bail!("{detail}; retry begin_setup with the same project version and host manager")
+        }
+    };
+    let result = operation_result(
         operation_id,
         "trip_setup",
         &setup_id,
@@ -3001,7 +3086,22 @@ fn begin_setup(
             "validation_task_id":task_id,"discovery_attempt_id":attempt_id,"target_inventory":target_inventory,
             "workspace_recovered":false
         }),
-    ))
+    );
+    let mut connection = store.lock()?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_setup_workspace_reservation(
+        &tx,
+        &attempt_id,
+        &workspace_path,
+        &fixture.identity,
+        &fixture.head,
+    )?;
+    require_setup_workspace_authority(&tx, &setup_id, &attempt_id, "discovery")?;
+    publish_setup_workspace(&tx, &attempt_id, &policy)?;
+    restore_setup_workspace_state(&tx, &setup_id, "discovery")?;
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 pub(crate) fn prepare_setup_manager_stop(
@@ -3165,6 +3265,12 @@ pub(crate) fn prepare_setup_manager_stop(
             bail!("setup manager hold changed before the explicit signal retry")
         }
     }
+    record_trip_progress(
+        &tx,
+        &CommandReceipt::new(operation_id, &request_hash),
+        "control",
+        &control_id,
+    )?;
     tx.commit()?;
     Ok(SetupManagerStopPreparation {
         completed: None,
@@ -3337,11 +3443,12 @@ fn retire_setup_manager_authority(
 fn change_setup_manager(
     store: &Store,
     paths: &InstancePaths,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     source_setup_id: &str,
     expected_project_version: i64,
     host_manager: &RoleOverride,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     validate_role_override(host_manager)?;
     let new_setup_id = uuid::Uuid::new_v4().to_string();
     let new_attempt_id = uuid::Uuid::new_v4().to_string();
@@ -3570,7 +3677,9 @@ fn change_setup_manager(
              WHERE project_id=?3 AND setup_operation_id=?4",
             params![new_setup_id, now, project_id, source_setup_id],
         )?;
+        record_trip_progress(&tx, receipt, "trip_setup", &new_setup_id)?;
         tx.commit()?;
+        receipt.progressed.set(true);
         (
             project_id,
             fixture_project_id,
@@ -3584,7 +3693,7 @@ fn change_setup_manager(
             settings_revision,
         )
     };
-    if let Err(error) = prepare_setup_workspace(
+    let policy = match prepare_setup_workspace_files(
         store,
         &new_attempt_id,
         Path::new(&fixture_root),
@@ -3592,11 +3701,15 @@ fn change_setup_manager(
         &fixture_head,
         &workspace_path,
     ) {
-        let detail = format!("replacement discovery workspace materialization failed: {error:#}");
-        mark_setup_workspace_recovery(store, &new_setup_id, &new_attempt_id, &detail)?;
-        bail!("{detail}; retry begin_setup only with the newly selected manager after the setup state refreshes")
-    }
-    Ok(operation_result(
+        Ok(policy) => policy,
+        Err(error) => {
+            let detail =
+                format!("replacement discovery workspace materialization failed: {error:#}");
+            mark_setup_workspace_recovery(store, &new_setup_id, &new_attempt_id, &detail)?;
+            bail!("{detail}; retry begin_setup only with the newly selected manager after the setup state refreshes")
+        }
+    };
+    let result = operation_result(
         operation_id,
         "trip_setup",
         &new_setup_id,
@@ -3616,16 +3729,32 @@ fn change_setup_manager(
             "fresh_launch_required":true,
             "resume_allowed":false
         }),
-    ))
+    );
+    let mut connection = store.lock()?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_setup_workspace_reservation(
+        &tx,
+        &new_attempt_id,
+        &workspace_path,
+        &fixture_identity,
+        &fixture_head,
+    )?;
+    require_setup_workspace_authority(&tx, &new_setup_id, &new_attempt_id, "discovery")?;
+    publish_setup_workspace(&tx, &new_attempt_id, &policy)?;
+    restore_setup_workspace_state(&tx, &new_setup_id, "discovery")?;
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn save_setup_draft(
     store: &Store,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     setup_id: &str,
     expected_project_version: i64,
     proposal_value: &serde_json::Value,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     let proposal = setup_proposal_preserving_configuration(store, setup_id, proposal_value)?;
     validate_setup_proposal(&proposal)?;
     validate_agents_preservation(store, setup_id, &proposal)?;
@@ -3646,6 +3775,9 @@ fn save_setup_draft(
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
     let (project_id, project_version): (String, i64) = tx.query_row(
         "SELECT so.project_id,p.version FROM trip_setup_operations so JOIN projects p ON p.id=so.project_id
          WHERE so.id=?1 AND so.state IN ('discovery','draft')",
@@ -3705,8 +3837,7 @@ fn save_setup_draft(
         "UPDATE trip_project_state SET reason='Setup draft requires separate probe authorization',updated_at=?1 WHERE project_id=?2",
         params![now, project_id],
     )?;
-    tx.commit()?;
-    Ok(operation_result(
+    let result = operation_result(
         operation_id,
         "trip_setup",
         setup_id,
@@ -3716,17 +3847,21 @@ fn save_setup_draft(
             "proposal_hash":proposal_hash,"approved_preimages_hash":preimages_hash,"preimages":preimages,
             "selected_profile_tuple_count":unique_profile_count(&proposal),"delegated_role_probe_count":DELEGATED_ROLES.len(),"total_role_preflight_count":1+DELEGATED_ROLES.len()
         }),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn revise_setup_draft(
     store: &Store,
     runtime: &CapabilityRuntime,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     source_setup_id: &str,
     expected_project_version: i64,
     proposal_value: &serde_json::Value,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     let proposal = setup_proposal_preserving_configuration(store, source_setup_id, proposal_value)?;
     validate_setup_proposal(&proposal)?;
     let manager = proposal
@@ -3752,8 +3887,30 @@ fn revise_setup_draft(
     )?;
     let new_setup_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
+    let (proof_bindings, reusable) = {
+        let connection = store.lock()?;
+        let mut reusable = BTreeMap::new();
+        for role in APP_ROLES {
+            let hash: Option<String> = connection.query_row("SELECT profile_hash FROM trip_setup_profile_selections WHERE setup_operation_id=?1 AND role=?2 AND selection_state='selected'", params![source_setup_id,role], |row| row.get(0)).optional()?;
+            if let Some(hash) = hash {
+                if let Some(receipt_id) =
+                    effective_receipt_id(&connection, source_setup_id, role, &hash, runtime)?
+                {
+                    reusable.insert(role.to_owned(), receipt_id);
+                }
+            }
+        }
+        (
+            setup_proof_bindings(&connection, source_setup_id)?,
+            reusable,
+        )
+    };
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
+    require_setup_proof_bindings(&tx, source_setup_id, &proof_bindings)?;
     let (project_id,project_version,source_state,fixture_project,validation_task,discovery_attempt,inventory):(String,i64,String,String,String,String,String)=tx.query_row(
         "SELECT so.project_id,p.version,so.state,so.fixture_project_id,so.validation_task_id,so.discovery_attempt_id,so.target_inventory_json
          FROM trip_setup_operations so JOIN projects p ON p.id=so.project_id
@@ -3812,7 +3969,7 @@ fn revise_setup_draft(
             params![source_setup_id,role],|row|row.get(0)
         ).optional()?;
         let receipt = if source_hash.as_deref() == Some(profile_hash.as_str()) {
-            effective_receipt_id(&tx, source_setup_id, &role, &profile_hash, runtime)?
+            reusable.get(&role).cloned()
         } else {
             None
         };
@@ -3831,8 +3988,7 @@ fn revise_setup_draft(
          reason='Pending reviewed configuration revision requires affected-profile preflight and separate activation',updated_at=?2 WHERE project_id=?3",
         params![new_setup_id,now,project_id],
     )?;
-    tx.commit()?;
-    Ok(operation_result(
+    let result = operation_result(
         operation_id,
         "trip_setup",
         &new_setup_id,
@@ -3840,7 +3996,10 @@ fn revise_setup_draft(
         "revision_draft_saved",
         serde_json::json!({"supersedes_setup_operation_id":source_setup_id,"proposal_hash":proposal_hash,
             "approved_preimages_hash":preimages_hash,"preimages":preimages,"affected_proof_roles":changed_roles}),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn project_runtime_profile(
@@ -3929,6 +4088,42 @@ fn project_runtime_profile(
         },
         repository,
     ))
+}
+
+fn runtime_source_bindings(
+    connection: &Connection,
+    project: &str,
+    task: Option<&str>,
+) -> Result<String> {
+    Ok(connection.query_row(
+        "SELECT json_array(p.version,p.repository_path,p.repository_identity,p.settings_json,
+          s.readiness,s.setup_operation_id,s.active_config_revision_id,s.manifest_hash,
+          r.config_json,r.adapters_json,r.configuration_hash,
+          (SELECT json_group_array(json_array(id,state,fixture_project_id,supersedes_setup_operation_id)) FROM
+            (SELECT * FROM trip_setup_operations WHERE project_id=p.id ORDER BY id)),
+          (SELECT json_group_array(json_array(id,repository_path,repository_identity,base_revision)) FROM
+            (SELECT * FROM projects WHERE id IN (SELECT fixture_project_id FROM trip_setup_operations WHERE project_id=p.id) ORDER BY id)),
+          (SELECT json_array(version,role_overrides_json,archived_at) FROM tasks WHERE id=?2 AND project_id=p.id),
+          (SELECT json_group_array(json_array(role,revision,config_json)) FROM
+            (SELECT * FROM role_settings WHERE task_id=?2 ORDER BY role,revision)))
+         FROM projects p JOIN trip_project_state s ON s.project_id=p.id
+         LEFT JOIN trip_config_revisions r ON r.id=s.active_config_revision_id WHERE p.id=?1",
+        params![project,task], |row| row.get(0),
+    )?)
+}
+
+fn runtime_admission_bindings(connection: &Connection, admission: &str) -> Result<String> {
+    let (project, task): (String, Option<String>) = connection.query_row(
+        "SELECT project_id,task_id FROM trip_runtime_admissions WHERE id=?1",
+        params![admission],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let source = runtime_source_bindings(connection, &project, task.as_deref())?;
+    let probes: String = connection.query_row(
+        "SELECT json_group_array(json_array(role,settings_revision,launch_config_json,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_key,capability_identity_json,fixture_project_id,fixture_repository_identity,fixture_root,cmux_socket_path,nonce)) FROM (SELECT * FROM trip_runtime_probes WHERE admission_id=?1 ORDER BY role)",
+        params![admission], |row| row.get(0),
+    )?;
+    Ok(serde_json::to_string(&(source, probes))?)
 }
 
 fn runtime_fixture_scope(
@@ -4096,7 +4291,7 @@ fn runtime_admission_scope_hash(
 fn prepare_runtime_admission(
     store: &Store,
     runtime: &CapabilityRuntime,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     project_id: &str,
     task_id: Option<&str>,
     requested_role: Option<RoleKind>,
@@ -4104,13 +4299,22 @@ fn prepare_runtime_admission(
     cmux_socket_path: Option<&str>,
     expected_version: i64,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     if task_id.is_some() != requested_revision.is_some()
         || (task_id.is_some() && requested_role.is_none())
         || (task_id.is_none() && requested_revision.is_some())
     {
         bail!("task runtime verification requires task_id, role, and settings_revision together; project role correction permits role without a settings revision")
     }
-    let (fixture_project, fixture_identity, fixture_root, _fixture_head, setup_id, mut plans) = {
+    let (
+        fixture_project,
+        fixture_identity,
+        fixture_root,
+        _fixture_head,
+        setup_id,
+        mut plans,
+        bindings,
+    ) = {
         let connection = store.lock()?;
         let current: bool = if let Some(task) = task_id {
             connection.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND project_id=?2 AND version=?3 AND archived_at IS NULL)",params![task,project_id,expected_version],|row|row.get(0))?
@@ -4145,6 +4349,7 @@ fn prepare_runtime_admission(
             fixture_head,
             setup_id,
             plans,
+            runtime_source_bindings(&connection, project_id, task_id)?,
         )
     };
     let cmux_socket_path = plans
@@ -4184,6 +4389,12 @@ fn prepare_runtime_admission(
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
+    if runtime_source_bindings(&tx, project_id, task_id)? != bindings {
+        bail!("runtime verification configuration changed during preparation")
+    }
     tx.execute("INSERT INTO trip_runtime_admissions(id,project_id,task_id,scope_hash,state,fresh_call_count,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",params![admission,project_id,task_id,scope_hash,state,fresh_call_count,now])?;
     for plan in plans.drain(..) {
         let probe_state = if plan.capability_id.is_some() {
@@ -4196,15 +4407,17 @@ fn prepare_runtime_admission(
             .flatten();
         tx.execute("INSERT INTO trip_runtime_probes(admission_id,role,settings_revision,launch_config_json,profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,adapter_hash,capability_key,capability_identity_json,fixture_project_id,fixture_repository_identity,fixture_root,cmux_socket_path,nonce,state,capability_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?20)",params![admission,plan.role.to_string(),plan.settings_revision,serde_json::to_string(&plan.config)?,plan.profile_json.to_string(),plan.profile_hash,plan.project_config_revision_id,plan.project_configuration_hash,plan.adapter_name,plan.adapter_hash,plan.capability_key,plan.capability_identity_json,fixture_project,fixture_identity,fixture_root,probe_cmux_socket,uuid::Uuid::new_v4().simple().to_string(),probe_state,plan.capability_id,now])?;
     }
-    tx.commit()?;
-    Ok(operation_result(
+    let result = operation_result(
         operation_id,
         "runtime_admission",
         &admission,
         None,
         state,
         serde_json::json!({"admission_id":admission,"scope_hash":scope_hash,"fresh_call_count":fresh_call_count,"profiles":scope,"target_execution":false,"setup_receipts_promoted":false}),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn validate_runtime_cmux_socket_path(value: Option<&str>) -> Result<String> {
@@ -4232,17 +4445,29 @@ fn authorize_runtime_admission(
     store: &Store,
     paths: &InstancePaths,
     runtime: &CapabilityRuntime,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     admission_id: &str,
     expected_scope_hash: &str,
 ) -> Result<OperationResult> {
-    let probes = {
+    let operation_id = receipt.operation_id;
+    let (probes, bindings) = {
         let connection = store.lock()?;
         let valid:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM trip_runtime_admissions WHERE id=?1 AND scope_hash=?2 AND state='pending_approval')",params![admission_id,expected_scope_hash],|row|row.get(0))?;
         if !valid {
             bail!("runtime admission scope changed, was already authorized, or is not pending")
         }
-        let mut statement=connection.prepare("SELECT p.role,p.launch_config_json,p.profile_hash,p.fixture_project_id,p.fixture_repository_identity,p.fixture_root,fixture.base_revision,active_setup.id FROM trip_runtime_probes p JOIN projects fixture ON fixture.id=p.fixture_project_id JOIN trip_runtime_admissions a ON a.id=p.admission_id JOIN trip_project_state s ON s.project_id=a.project_id JOIN trip_setup_operations selected ON selected.id=s.setup_operation_id JOIN trip_setup_operations active_setup ON active_setup.id=CASE WHEN selected.state='activated' THEN selected.id ELSE selected.supersedes_setup_operation_id END WHERE p.admission_id=?1 AND p.state='pending_approval' AND active_setup.state='activated' ORDER BY p.role")?;
+        match validate_current_runtime_admission_scope(&connection, runtime, admission_id)? {
+            RuntimeScopeValidation::Current(_) => {}
+            RuntimeScopeValidation::Drift(reason) => bail!("{reason}"),
+        }
+        let bindings = runtime_admission_bindings(&connection, admission_id)?;
+        require_pending_runtime_preparation(
+            &connection,
+            admission_id,
+            expected_scope_hash,
+            &bindings,
+        )?;
+        let mut statement=connection.prepare("SELECT p.role,p.launch_config_json,p.profile_hash,p.fixture_project_id,p.fixture_repository_identity,p.fixture_root,fixture.base_revision,active_setup.id FROM trip_runtime_probes p JOIN projects fixture ON fixture.id=p.fixture_project_id JOIN trip_runtime_admissions a ON a.id=p.admission_id JOIN trip_project_state s ON s.project_id=a.project_id JOIN trip_setup_operations selected ON selected.id=s.setup_operation_id JOIN trip_setup_operations active_setup ON active_setup.id=CASE WHEN selected.state='activated' THEN selected.id ELSE selected.supersedes_setup_operation_id END WHERE p.admission_id=?1 AND p.state IN ('pending_approval','authorized') AND active_setup.state='activated' ORDER BY p.role")?;
         let mut rows = statement
             .query_map(params![admission_id], |row| {
                 Ok((
@@ -4263,10 +4488,11 @@ fn authorize_runtime_admission(
                 .position(|role| *role == row.0)
                 .unwrap_or(APP_ROLES.len())
         });
-        rows
+        (rows, bindings)
     };
     let now = Utc::now().to_rfc3339();
     let mut prepared = Vec::new();
+    let mut workspace_publications = Vec::new();
     for (
         role_text,
         config_json,
@@ -4280,7 +4506,7 @@ fn authorize_runtime_admission(
     {
         let role: RoleKind = role_text.parse().map_err(|error: String| anyhow!(error))?;
         let config: RoleOverride = serde_json::from_str(&config_json)?;
-        let attempt = uuid::Uuid::new_v4().to_string();
+        let mut attempt = uuid::Uuid::new_v4().to_string();
         let workspace = paths
             .artifacts
             .join("runtime-probes")
@@ -4292,17 +4518,39 @@ fn authorize_runtime_admission(
         let (task_id, revision) = {
             let mut connection = store.lock()?;
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let task_id:String=tx.query_row("SELECT validation_task_id FROM trip_setup_operations WHERE id=?1 AND fixture_project_id=?2",params![setup_id,fixture_project],|row|row.get(0))?;
-            let revision:i64=tx.query_row("SELECT COALESCE(MAX(revision),0)+1 FROM role_settings WHERE task_id=?1 AND role=?2",params![task_id,role_text],|row|row.get(0))?;
-            tx.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at,scope_hash,configuration_hash,workflow_version,workflow_hash,setup_operation_id,upstream_source_hash,overlay_hash,legacy_migration_required) VALUES(?1,?2,?3,?4,?5,1,'held',?6,?6,?7,?8,?9,?10,?11,?12,?13,0)",params![attempt,task_id,uuid::Uuid::new_v4().to_string(),runtime_phase(role),fixture_head,now,expected_scope_hash,json_hash(&config)?,WORKFLOW_ID,crate::workflow_resources::workflow_hash(),setup_id,source_hash(),overlay_hash()])?;
-            tx.execute("INSERT INTO role_settings(id,task_id,role,revision,config_json,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![uuid::Uuid::new_v4().to_string(),task_id,role_text,revision,config_json,now])?;
-            tx.execute("INSERT INTO workspaces(id,attempt_id,repository_identity,path,base_revision,worktree_head,policy_json,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5,'{}','reserved',?6,?6)",params![uuid::Uuid::new_v4().to_string(),attempt,fixture_identity,workspace.to_string_lossy(),fixture_head,now])?;
-            tx.execute("INSERT INTO trip_setup_permits(id,setup_operation_id,attempt_id,fixture_project_id,fixture_repository_identity,role,profile_hash,settings_revision,purpose,approved_action,nonce,state,created_at) SELECT ?1,?2,?3,?4,?5,?6,?7,?8,'runtime_probe','ordinary_runtime_capability',nonce,'issued',?9 FROM trip_runtime_probes WHERE admission_id=?10 AND role=?6",params![uuid::Uuid::new_v4().to_string(),setup_id,attempt,fixture_project,fixture_identity,role_text,profile_hash,revision,now,admission_id])?;
-            tx.execute("UPDATE trip_runtime_probes SET attempt_id=?1,workspace_path=?2,service_sentinel_path=?3,control_socket_path=?4,state='authorized',updated_at=?5 WHERE admission_id=?6 AND role=?7 AND state='pending_approval'",params![attempt,workspace.to_string_lossy(),service_sentinel.to_string_lossy(),paths.control_socket.to_string_lossy(),now,admission_id,role_text])?;
-            tx.commit()?;
-            (task_id, revision)
+            require_pending_runtime_preparation(&tx, admission_id, expected_scope_hash, &bindings)?;
+            let existing: Option<String> = tx.query_row(
+                "SELECT attempt_id FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2 AND state='authorized'",
+                params![admission_id, role_text], |row| row.get(0),
+            ).optional()?;
+            if let Some(existing) = existing {
+                attempt = existing;
+                let binding = validate_runtime_preparation_binding(
+                    &tx,
+                    admission_id,
+                    &role_text,
+                    &attempt,
+                    &workspace,
+                    &service_sentinel,
+                    &paths.control_socket,
+                )?;
+                tx.commit()?;
+                binding
+            } else {
+                let task_id:String=tx.query_row("SELECT validation_task_id FROM trip_setup_operations WHERE id=?1 AND fixture_project_id=?2",params![setup_id,fixture_project],|row|row.get(0))?;
+                let revision:i64=tx.query_row("SELECT COALESCE(MAX(revision),0)+1 FROM role_settings WHERE task_id=?1 AND role=?2",params![task_id,role_text],|row|row.get(0))?;
+                tx.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at,scope_hash,configuration_hash,workflow_version,workflow_hash,setup_operation_id,upstream_source_hash,overlay_hash,legacy_migration_required) VALUES(?1,?2,?3,?4,?5,1,'held',?6,?6,?7,?8,?9,?10,?11,?12,?13,0)",params![attempt,task_id,uuid::Uuid::new_v4().to_string(),runtime_phase(role),fixture_head,now,expected_scope_hash,json_hash(&config)?,WORKFLOW_ID,crate::workflow_resources::workflow_hash(),setup_id,source_hash(),overlay_hash()])?;
+                tx.execute("INSERT INTO role_settings(id,task_id,role,revision,config_json,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![uuid::Uuid::new_v4().to_string(),task_id,role_text,revision,config_json,now])?;
+                tx.execute("INSERT INTO workspaces(id,attempt_id,repository_identity,path,base_revision,worktree_head,policy_json,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5,'{}','reserved',?6,?6)",params![uuid::Uuid::new_v4().to_string(),attempt,fixture_identity,workspace.to_string_lossy(),fixture_head,now])?;
+                tx.execute("INSERT INTO trip_setup_permits(id,setup_operation_id,attempt_id,fixture_project_id,fixture_repository_identity,role,profile_hash,settings_revision,purpose,approved_action,nonce,state,created_at) SELECT ?1,?2,?3,?4,?5,?6,?7,?8,'runtime_probe','ordinary_runtime_capability',nonce,'issued',?9 FROM trip_runtime_probes WHERE admission_id=?10 AND role=?6",params![uuid::Uuid::new_v4().to_string(),setup_id,attempt,fixture_project,fixture_identity,role_text,profile_hash,revision,now,admission_id])?;
+                tx.execute("UPDATE trip_runtime_probes SET attempt_id=?1,workspace_path=?2,service_sentinel_path=?3,control_socket_path=?4,state='authorized',updated_at=?5 WHERE admission_id=?6 AND role=?7 AND state='pending_approval'",params![attempt,workspace.to_string_lossy(),service_sentinel.to_string_lossy(),paths.control_socket.to_string_lossy(),now,admission_id,role_text])?;
+                record_trip_progress(&tx, receipt, "runtime_admission", admission_id)?;
+                tx.commit()?;
+                receipt.progressed.set(true);
+                (task_id, revision)
+            }
         };
-        if let Err(error) = prepare_setup_workspace(
+        let workspace_policy = match prepare_setup_workspace_files(
             store,
             &attempt,
             Path::new(&fixture_root),
@@ -4310,12 +4558,15 @@ fn authorize_runtime_admission(
             &fixture_head,
             &workspace,
         ) {
-            let reason = format!("ordinary runtime fixture preparation failed: {error:#}");
-            let connection = store.lock()?;
-            connection.execute("UPDATE trip_runtime_probes SET state='failed',failure_reason=?1,updated_at=?2 WHERE admission_id=?3 AND role=?4",params![reason,now,admission_id,role_text])?;
-            refresh_runtime_admission_state(&connection, admission_id, &now)?;
-            return Err(anyhow!(reason));
-        }
+            Ok(policy) => policy,
+            Err(error) => {
+                let reason = format!("ordinary runtime fixture preparation failed: {error:#}");
+                let connection = store.lock()?;
+                connection.execute("UPDATE trip_runtime_probes SET state='failed',failure_reason=?1,updated_at=?2 WHERE admission_id=?3 AND role=?4",params![reason,now,admission_id,role_text])?;
+                refresh_runtime_admission_state(&connection, admission_id, &now)?;
+                return Err(anyhow!(reason));
+            }
+        };
         let (nonce, identity): (String, String) = store.lock()?.query_row(
             "SELECT nonce,capability_identity_json FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2",
             params![admission_id, role_text], |row| Ok((row.get(0)?, row.get(1)?)),
@@ -4326,12 +4577,24 @@ fn authorize_runtime_admission(
             == QualificationContract::FunctionalV2
         {
             use std::io::Write;
-            let mut challenge = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(workspace.join("functional-challenge.txt"))
-                .context("create the exact functional challenge")?;
-            challenge.write_all(nonce.as_bytes())?;
+            let path = workspace.join("functional-challenge.txt");
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    if fs::read(&path)? != nonce.as_bytes() {
+                        bail!("functional challenge differs from the recorded nonce; prepare corrected runtime verification")
+                    }
+                }
+                Ok(_) => bail!("functional challenge is not a safe regular file"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let mut challenge = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .context("create the exact functional challenge")?;
+                    challenge.write_all(nonce.as_bytes())?;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         let mut ordinary_launch = crate::providers::prepare_role_launch_with_bundles(
             config.provider,
@@ -4392,18 +4655,93 @@ fn authorize_runtime_admission(
             } else {
                 None
             };
+        workspace_publications.push((
+            attempt.clone(),
+            workspace.clone(),
+            fixture_identity,
+            fixture_head,
+            workspace_policy,
+            role_text,
+            service_sentinel,
+        ));
         prepared.push(serde_json::json!({"role":role,"attempt_id":attempt,"task_id":task_id,"settings_revision":revision,"workspace":workspace,"capability_key":key,"runtime_probe_policy_key":diagnostic_key}));
     }
-    let connection = store.lock()?;
-    connection.execute("UPDATE trip_runtime_admissions SET state='authorized',authorized_at=?1,updated_at=?1 WHERE id=?2 AND state='pending_approval'",params![now,admission_id])?;
-    Ok(operation_result(
+    let mut connection = store.lock()?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_pending_runtime_preparation(&tx, admission_id, expected_scope_hash, &bindings)?;
+    for (attempt, workspace, identity, head, policy, role, sentinel) in &workspace_publications {
+        validate_runtime_preparation_binding(
+            &tx,
+            admission_id,
+            role,
+            attempt,
+            workspace,
+            sentinel,
+            &paths.control_socket,
+        )?;
+        require_setup_workspace_reservation(&tx, attempt, workspace, identity, head)?;
+        publish_setup_workspace(&tx, attempt, policy)?;
+    }
+    tx.execute("UPDATE trip_runtime_admissions SET state='authorized',authorized_at=?1,updated_at=?1 WHERE id=?2 AND state='pending_approval'",params![now,admission_id])?;
+    let result = operation_result(
         operation_id,
         "runtime_admission",
         admission_id,
         None,
         "authorized",
         serde_json::json!({"admission_id":admission_id,"scope_hash":expected_scope_hash,"fresh_call_count":prepared.len(),"probes":prepared,"launches_started":0}),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+fn require_pending_runtime_preparation(
+    connection: &Connection,
+    admission: &str,
+    scope: &str,
+    bindings: &str,
+) -> Result<()> {
+    let valid: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM trip_runtime_admissions a WHERE id=?1 AND scope_hash=?2 AND state='pending_approval' AND NOT EXISTS(SELECT 1 FROM trip_runtime_probes p WHERE p.admission_id=a.id AND p.state NOT IN ('current','pending_approval','authorized')))",
+        params![admission, scope], |row| row.get(0),
+    )?;
+    if !valid {
+        bail!("runtime admission preparation changed or a required probe failed; use explicit recovery or prepare corrected runtime verification")
+    }
+    if runtime_admission_bindings(connection, admission)? != bindings {
+        bail!("runtime admission configuration changed after preparation")
+    }
+    Ok(())
+}
+
+fn validate_runtime_preparation_binding(
+    connection: &Connection,
+    admission: &str,
+    role: &str,
+    attempt: &str,
+    workspace: &Path,
+    sentinel: &Path,
+    control: &Path,
+) -> Result<(String, i64)> {
+    connection.query_row(
+        "SELECT a.task_id,permit.settings_revision FROM trip_runtime_probes p
+         JOIN attempts a ON a.id=p.attempt_id
+         JOIN workspaces w ON w.attempt_id=a.id AND w.path=p.workspace_path
+           AND w.repository_identity=p.fixture_repository_identity
+         JOIN projects fixture ON fixture.id=p.fixture_project_id AND fixture.base_revision=w.base_revision
+         JOIN trip_setup_permits permit ON permit.attempt_id=a.id AND permit.role=p.role
+           AND permit.purpose='runtime_probe' AND permit.state='issued' AND permit.nonce=p.nonce
+           AND permit.fixture_project_id=p.fixture_project_id AND permit.fixture_repository_identity=p.fixture_repository_identity
+           AND permit.profile_hash=p.profile_hash AND permit.setup_operation_id=a.setup_operation_id
+         JOIN role_settings rs ON rs.task_id=a.task_id AND rs.role=p.role
+           AND rs.revision=permit.settings_revision AND rs.config_json=p.launch_config_json
+         WHERE p.admission_id=?1 AND p.role=?2 AND p.attempt_id=?3 AND p.workspace_path=?4
+           AND p.service_sentinel_path=?5 AND p.control_socket_path=?6 AND p.state='authorized'
+           AND a.status='held' AND w.state IN ('reserved','ready')",
+        params![admission, role, attempt, workspace.to_string_lossy(), sentinel.to_string_lossy(), control.to_string_lossy()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?.context("runtime probe reservation, nonce, permit or settings binding changed; prepare corrected runtime verification")
 }
 
 fn validate_current_runtime_admission_scope(
@@ -4705,20 +5043,36 @@ pub(crate) fn refresh_runtime_admission_state(
     Ok(state.to_owned())
 }
 
-fn mark_runtime_publication_stale(store: &Store, admission_id: &str, role: RoleKind) -> Result<()> {
+fn mark_runtime_publication_stale(
+    store: &Store,
+    receipt: &CommandReceipt<'_>,
+    admission_id: &str,
+    role: RoleKind,
+) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute(
+    let changed = tx.execute(
         "UPDATE trip_runtime_probes SET state='stale',failure_reason='runtime publication scope drifted',updated_at=?1 WHERE admission_id=?2 AND role=?3 AND state='evidence_recorded'",
         params![now, admission_id, role.to_string()],
     )?;
     refresh_runtime_admission_state(&tx, admission_id, &now)?;
+    if changed == 1 {
+        record_trip_progress(&tx, receipt, "runtime_admission", admission_id)?;
+    }
     tx.commit()?;
+    if changed == 1 {
+        receipt.progressed.set(true);
+    }
     Ok(())
 }
 
-fn mark_runtime_command_mismatch(store: &Store, admission_id: &str, role: RoleKind) -> Result<()> {
+fn mark_runtime_command_mismatch(
+    store: &Store,
+    receipt: &CommandReceipt<'_>,
+    admission_id: &str,
+    role: RoleKind,
+) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4736,17 +5090,24 @@ fn mark_runtime_command_mismatch(store: &Store, admission_id: &str, role: RoleKi
     if changed == 1 {
         refresh_runtime_admission_state(&tx, admission_id, &now)?;
     }
+    if changed == 1 {
+        record_trip_progress(&tx, receipt, "runtime_admission", admission_id)?;
+    }
     tx.commit()?;
+    if changed == 1 {
+        receipt.progressed.set(true);
+    }
     Ok(())
 }
 
 fn publish_runtime_proof(
     store: &Store,
     runtime: &CapabilityRuntime,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     admission_id: &str,
     role: RoleKind,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     let contract = {
         let connection = store.lock()?;
         let identity: String = connection.query_row(
@@ -4757,15 +5118,15 @@ fn publish_runtime_proof(
         QualificationContract::from_record(&identity.security_policy).map_err(anyhow::Error::msg)?
     };
     if contract == QualificationContract::FunctionalV2 {
-        return publish_functional_runtime_proof(store, runtime, operation_id, admission_id, role);
+        return publish_functional_runtime_proof(store, runtime, receipt, admission_id, role);
     }
-    let publication_scope = {
+    let (publication_scope, bindings) = {
         let connection = store.lock()?;
         match validate_current_runtime_admission_scope(&connection, runtime, admission_id) {
-            Ok(RuntimeScopeValidation::Current(scope)) => scope,
+            Ok(RuntimeScopeValidation::Current(scope)) => (scope, runtime_admission_bindings(&connection, admission_id)?),
             Ok(RuntimeScopeValidation::Drift(reason)) => {
                 drop(connection);
-                mark_runtime_publication_stale(store, admission_id, role)?;
+                mark_runtime_publication_stale(store, receipt, admission_id, role)?;
                 return Err(anyhow!(reason));
             }
             Err(error) => return Err(error.context("runtime publication scope could not be inspected; evidence remains recorded and publication may be retried after the unchanged environment is restored")),
@@ -4830,30 +5191,6 @@ fn publish_runtime_proof(
         observation.get("actual_outcomes"),
         true,
     )?;
-    let command_consistency = {
-        let connection = store.lock()?;
-        runtime_command_consistency(
-            &connection,
-            &session,
-            &role_generation_id,
-            provider,
-            role,
-            &nonce,
-            &workspace,
-            &fixture_root,
-            &service_sentinel,
-            &control_socket,
-            cmux_socket_path.as_deref(),
-            &outcomes,
-        )?
-    };
-    if matches!(
-        command_consistency,
-        RuntimeCommandConsistency::PermanentMismatch
-    ) {
-        mark_runtime_command_mismatch(store, admission_id, role)?;
-        bail!("recorded ordinary runtime evidence permanently mismatches the exact authenticated native hook commands or count; prepare corrected runtime verification for a fresh scope")
-    }
     let workspace = PathBuf::from(workspace);
     let permission_delivery_command = (role == RoleKind::Implementer
         && provider == Provider::Codex)
@@ -4915,6 +5252,7 @@ fn publish_runtime_proof(
     if cmux_socket_path.is_some() && !outcomes.cmux_socket_connection_denied {
         bail!("Claude ordinary proof lacks the exact observed cmux Unix-socket connection denial")
     }
+    require_runtime_probe_session_policy(&*store.lock()?, &session, role, None)?;
     let proof = CapabilityProofInput {
         operation_id: format!("{operation_id}:capability-proof"),
         session_id: session.clone(),
@@ -4951,10 +5289,18 @@ fn publish_runtime_proof(
         },
         runtime_scope: Some(publication_scope.clone()),
     };
-    let published = match store.record_capability_proof_with_guard(&proof, |transaction| {
-        if matches!(
+    // Legacy proof validation consumes observed_unverified trust. Exact retries reuse its subreceipt.
+    let existing = store.operation_receipt(
+        &proof.operation_id,
+        "human_control",
+        "capability_proof",
+        &json_hash(&proof)?,
+    )?;
+    if existing.is_none() {
+        let command_consistency = {
+            let connection = store.lock()?;
             runtime_command_consistency(
-                transaction,
+                &connection,
                 &session,
                 &role_generation_id,
                 provider,
@@ -4966,49 +5312,79 @@ fn publish_runtime_proof(
                 &control_socket,
                 cmux_socket_path.as_deref(),
                 &outcomes,
-            )?,
+            )?
+        };
+        if matches!(
+            command_consistency,
             RuntimeCommandConsistency::PermanentMismatch
         ) {
-            bail!("runtime native command mismatch during publication")
+            mark_runtime_command_mismatch(store, receipt, admission_id, role)?;
+            bail!("recorded ordinary runtime evidence permanently mismatches the exact authenticated native hook commands or count; prepare corrected runtime verification for a fresh scope")
         }
-        if let Some(command) = permission_delivery_command.as_deref() {
-            require_runtime_permission_delivery_denial(
-                transaction,
-                &session,
-                &role_generation_id,
-                workspace.to_string_lossy().as_ref(),
-                command,
-            )?;
-        }
-        require_runtime_probe_session_policy(transaction, &session, role, None)?;
-        match validate_current_runtime_admission_scope(transaction, runtime, admission_id) {
-            Ok(RuntimeScopeValidation::Current(current)) if current == publication_scope => Ok(()),
-            Ok(RuntimeScopeValidation::Current(_)) | Ok(RuntimeScopeValidation::Drift(_)) => {
+    }
+    let publication = match existing {
+        Some(result) => Ok(result),
+        None => store.record_capability_proof_with_guard(&proof, |transaction| {
+            record_trip_progress(transaction, receipt, "runtime_admission", admission_id)?;
+            if matches!(
+                runtime_command_consistency(
+                    transaction,
+                    &session,
+                    &role_generation_id,
+                    provider,
+                    role,
+                    &nonce,
+                    workspace.to_string_lossy().as_ref(),
+                    &fixture_root,
+                    &service_sentinel,
+                    &control_socket,
+                    cmux_socket_path.as_deref(),
+                    &outcomes,
+                )?,
+                RuntimeCommandConsistency::PermanentMismatch
+            ) {
+                bail!("runtime native command mismatch during publication")
+            }
+            if let Some(command) = permission_delivery_command.as_deref() {
+                require_runtime_permission_delivery_denial(
+                    transaction,
+                    &session,
+                    &role_generation_id,
+                    workspace.to_string_lossy().as_ref(),
+                    command,
+                )?;
+            }
+            require_runtime_probe_session_policy(transaction, &session, role, None)?;
+            if runtime_admission_bindings(transaction, admission_id)? != bindings {
                 bail!("runtime admission scope mismatch during publication")
             }
-            Err(error) => Err(error.context(
-                "runtime publication scope could not be inspected during transactional guard",
-            )),
-        }
-    }) {
+            Ok(())
+        }),
+    };
+    let published = match publication {
         Ok(value) => value,
         Err(error) => {
             let message = error.to_string();
             if message.contains("runtime admission scope mismatch during publication") {
-                mark_runtime_publication_stale(store, admission_id, role)?;
+                mark_runtime_publication_stale(store, receipt, admission_id, role)?;
             } else if message.contains("runtime native command mismatch during publication") {
-                mark_runtime_command_mismatch(store, admission_id, role)?;
+                mark_runtime_command_mismatch(store, receipt, admission_id, role)?;
             }
             return Err(error);
         }
     };
+    receipt.progressed.set(true);
     let now = Utc::now().to_rfc3339();
-    let connection = store.lock()?;
-    let capability_id:String=connection.query_row("SELECT id FROM capabilities WHERE config_hash=?1 AND role=?2 AND mode='interactive_pty' AND status='supported' AND proof_json!='{}'",params![capability_key,role.to_string()],|row|row.get(0))?;
-    connection.execute("UPDATE trip_runtime_probes SET state='published',capability_id=?1,published_at=?2,updated_at=?2 WHERE admission_id=?3 AND role=?4 AND state='evidence_recorded'",params![capability_id,now,admission_id,role.to_string()])?;
-    let remaining:i64=connection.query_row("SELECT COUNT(*) FROM trip_runtime_probes WHERE admission_id=?1 AND state NOT IN ('current','published')",params![admission_id],|row|row.get(0))?;
-    let admission_state = refresh_runtime_admission_state(&connection, admission_id, &now)?;
-    Ok(operation_result(
+    let mut connection = store.lock()?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if runtime_admission_bindings(&tx, admission_id)? != bindings {
+        bail!("runtime admission scope mismatch during publication")
+    }
+    let capability_id:String=tx.query_row("SELECT id FROM capabilities WHERE config_hash=?1 AND role=?2 AND mode='interactive_pty' AND status='supported' AND proof_json!='{}'",params![capability_key,role.to_string()],|row|row.get(0))?;
+    if tx.execute("UPDATE trip_runtime_probes SET state='published',capability_id=?1,published_at=?2,updated_at=?2 WHERE admission_id=?3 AND role=?4 AND state='evidence_recorded'",params![capability_id,now,admission_id,role.to_string()])? != 1 { bail!("runtime proof publication state changed") }
+    let remaining:i64=tx.query_row("SELECT COUNT(*) FROM trip_runtime_probes WHERE admission_id=?1 AND state NOT IN ('current','published')",params![admission_id],|row|row.get(0))?;
+    let admission_state = refresh_runtime_admission_state(&tx, admission_id, &now)?;
+    let result = operation_result(
         operation_id,
         "runtime_admission",
         admission_id,
@@ -5019,23 +5395,30 @@ fn publish_runtime_proof(
             "proof_published"
         },
         serde_json::json!({"admission_id":admission_id,"role":role,"capability_id":capability_id,"capability_key":capability_key,"remaining":remaining,"proof":published,"setup_receipt_promoted":false}),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn publish_functional_runtime_proof(
     store: &Store,
     runtime: &CapabilityRuntime,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     admission_id: &str,
     role: RoleKind,
 ) -> Result<OperationResult> {
-    let scope = {
+    let operation_id = receipt.operation_id;
+    let (scope, bindings) = {
         let connection = store.lock()?;
         match validate_current_runtime_admission_scope(&connection, runtime, admission_id)? {
-            RuntimeScopeValidation::Current(scope) => scope,
+            RuntimeScopeValidation::Current(scope) => (
+                scope,
+                runtime_admission_bindings(&connection, admission_id)?,
+            ),
             RuntimeScopeValidation::Drift(reason) => {
                 drop(connection);
-                mark_runtime_publication_stale(store, admission_id, role)?;
+                mark_runtime_publication_stale(store, receipt, admission_id, role)?;
                 bail!("{reason}")
             }
         }
@@ -5044,6 +5427,7 @@ fn publish_functional_runtime_proof(
         "SELECT session_id FROM trip_runtime_probes WHERE admission_id=?1 AND role=?2 AND state='evidence_recorded'",
         params![admission_id,role.to_string()], |row| row.get(0),
     )?;
+    require_runtime_probe_session_policy(&*store.lock()?, &session, role, None)?;
     let proof = FunctionalCapabilityProofInput {
         qualification_contract: FunctionalQualificationContract::V2,
         operation_id: format!("{operation_id}:functional-proof"),
@@ -5053,12 +5437,11 @@ fn publish_functional_runtime_proof(
     };
     let published =
         store.record_functional_capability_proof_with_guard(&proof, &scope, |connection| {
-            match validate_current_runtime_admission_scope(connection, runtime, admission_id)? {
-                RuntimeScopeValidation::Current(current) if current == scope => Ok(()),
-                RuntimeScopeValidation::Current(_) | RuntimeScopeValidation::Drift(_) => {
-                    bail!("runtime admission scope mismatch during publication")
-                }
+            record_trip_progress(connection, receipt, "runtime_admission", admission_id)?;
+            if runtime_admission_bindings(connection, admission_id)? != bindings {
+                bail!("runtime admission scope mismatch during publication")
             }
+            Ok(())
         });
     let published = match published {
         Ok(value) => value,
@@ -5067,24 +5450,29 @@ fn publish_functional_runtime_proof(
                 error.downcast_ref::<RuntimeReportRejection>(),
                 Some(RuntimeReportRejection::CommandMismatch)
             ) {
-                mark_runtime_command_mismatch(store, admission_id, role)?;
+                mark_runtime_command_mismatch(store, receipt, admission_id, role)?;
             } else if error
                 .to_string()
                 .contains("runtime admission scope mismatch during publication")
             {
-                mark_runtime_publication_stale(store, admission_id, role)?;
+                mark_runtime_publication_stale(store, receipt, admission_id, role)?;
             }
             return Err(error);
         }
     };
+    receipt.progressed.set(true);
     let capability = published["capability_id"]
         .as_str()
         .context("functional publication omitted capability ID")?;
     let now = Utc::now().to_rfc3339();
-    let connection = store.lock()?;
-    connection.execute("UPDATE trip_runtime_probes SET state='published',capability_id=?1,published_at=?2,updated_at=?2 WHERE admission_id=?3 AND role=?4 AND state='evidence_recorded'",params![capability,now,admission_id,role.to_string()])?;
-    let state = refresh_runtime_admission_state(&connection, admission_id, &now)?;
-    Ok(operation_result(
+    let mut connection = store.lock()?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if runtime_admission_bindings(&tx, admission_id)? != bindings {
+        bail!("runtime admission scope mismatch during publication")
+    }
+    if tx.execute("UPDATE trip_runtime_probes SET state='published',capability_id=?1,published_at=?2,updated_at=?2 WHERE admission_id=?3 AND role=?4 AND state='evidence_recorded'",params![capability,now,admission_id,role.to_string()])? != 1 { bail!("runtime proof publication state changed") }
+    let state = refresh_runtime_admission_state(&tx, admission_id, &now)?;
+    let result = operation_result(
         operation_id,
         "runtime_admission",
         admission_id,
@@ -5095,19 +5483,23 @@ fn publish_functional_runtime_proof(
             "proof_published"
         },
         serde_json::json!({"admission_id":admission_id,"role":role,"capability_id":capability,"proof":published,"setup_receipt_promoted":false}),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn authorize_probes(
     store: &Store,
     paths: &InstancePaths,
     runtime: &CapabilityRuntime,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     setup_id: &str,
     expected_proposal_hash: &str,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     if let Some(recovered) =
-        retry_probe_workspace(store, operation_id, setup_id, expected_proposal_hash)?
+        retry_probe_workspace(store, receipt, setup_id, expected_proposal_hash)?
     {
         return Ok(recovered);
     }
@@ -5136,7 +5528,7 @@ fn authorize_probes(
     }
     let proposal: SetupProposal = serde_json::from_str(&proposal_json)?;
     validate_setup_proposal(&proposal)?;
-    let affected = {
+    let (affected, proof_bindings) = {
         let connection = store.lock()?;
         let mut roles = Vec::new();
         for role in [
@@ -5161,12 +5553,20 @@ fn authorize_probes(
                 ));
             }
         }
-        roles
+        (roles, setup_proof_bindings(&connection, setup_id)?)
     };
     if affected.is_empty() {
         let now = Utc::now().to_rfc3339();
         let mut connection = store.lock()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+            return Ok(result);
+        }
+        require_setup_proof_bindings(&tx, setup_id, &proof_bindings)?;
+        let draft: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM trip_setup_operations WHERE id=?1 AND state='draft' AND proposal_hash=?2)", params![setup_id,expected_proposal_hash], |row| row.get(0))?;
+        if !draft {
+            bail!("setup proposal changed before probe authorization")
+        }
         tx.execute(
             "UPDATE trip_setup_operations SET state='preflight_complete',selected_profiles_hash=?1,probe_authorized_at=?2,updated_at=?2 WHERE id=?3 AND state='draft'",
             params![selected_profiles_hash(&proposal)?,now,setup_id],
@@ -5175,15 +5575,17 @@ fn authorize_probes(
             "UPDATE trip_project_state SET reason='All six exact unchanged profile proofs were explicitly accepted for reuse; installation is not authorized',updated_at=?1 WHERE setup_operation_id=?2",
             params![now,setup_id],
         )?;
-        tx.commit()?;
-        return Ok(operation_result(
+        let result = operation_result(
             operation_id,
             "trip_setup",
             setup_id,
             None,
             "preflight_complete",
             serde_json::json!({"probe_attempt_id":serde_json::Value::Null,"affected_proof_roles":[],"reused_exact_proofs":6}),
-        ));
+        );
+        persist_trip_receipt(&tx, receipt, &result)?;
+        tx.commit()?;
+        return Ok(result);
     }
     let attempt_id = uuid::Uuid::new_v4().to_string();
     let workspace_id = uuid::Uuid::new_v4().to_string();
@@ -5192,6 +5594,14 @@ fn authorize_probes(
     {
         let mut connection = store.lock()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+            return Ok(result);
+        }
+        require_setup_proof_bindings(&tx, setup_id, &proof_bindings)?;
+        let draft: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM trip_setup_operations WHERE id=?1 AND state='draft' AND proposal_hash=?2)", params![setup_id,expected_proposal_hash], |row| row.get(0))?;
+        if !draft {
+            bail!("setup proposal changed before probe authorization")
+        }
         let discovery_active: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
              WHERE rg.attempt_id=?1 AND s.status NOT IN ('exited','launch_failed'))",
@@ -5237,9 +5647,11 @@ fn authorize_probes(
             "UPDATE trip_project_state SET reason='Live profile probes are authorized but installation is not',updated_at=?1 WHERE setup_operation_id=?2",
             params![now, setup_id],
         )?;
+        record_trip_progress(&tx, receipt, "attempt", &attempt_id)?;
         tx.commit()?;
+        receipt.progressed.set(true);
     }
-    if let Err(error) = prepare_setup_workspace(
+    let policy = match prepare_setup_workspace_files(
         store,
         &attempt_id,
         Path::new(&root),
@@ -5247,11 +5659,14 @@ fn authorize_probes(
         &head,
         &workspace_path,
     ) {
-        let detail = format!("setup probe workspace materialization failed: {error:#}");
-        mark_setup_workspace_recovery(store, setup_id, &attempt_id, &detail)?;
-        bail!("{detail}; retry authorize_setup_probes with the same setup operation and proposal hash")
-    }
-    Ok(operation_result(
+        Ok(policy) => policy,
+        Err(error) => {
+            let detail = format!("setup probe workspace materialization failed: {error:#}");
+            mark_setup_workspace_recovery(store, setup_id, &attempt_id, &detail)?;
+            bail!("{detail}; retry authorize_setup_probes with the same setup operation and proposal hash")
+        }
+    };
+    let result = operation_result(
         operation_id,
         "trip_setup",
         setup_id,
@@ -5263,16 +5678,26 @@ fn authorize_probes(
             "affected_proof_roles":affected.iter().map(|(role,_,_)|role.to_string()).collect::<Vec<_>>(),
             "probe_contracts":probe_contracts(store,&attempt_id)?,"workspace_recovered":false
         }),
-    ))
+    );
+    let mut connection = store.lock()?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_setup_workspace_reservation(&tx, &attempt_id, &workspace_path, &identity, &head)?;
+    require_setup_workspace_authority(&tx, setup_id, &attempt_id, "probing")?;
+    publish_setup_workspace(&tx, &attempt_id, &policy)?;
+    restore_setup_workspace_state(&tx, setup_id, "probing")?;
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn retry_discovery_workspace(
     store: &Store,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     project_id: &str,
     expected_version: i64,
     host_manager: &RoleOverride,
 ) -> Result<Option<OperationResult>> {
+    let operation_id = receipt.operation_id;
     let recovery: Option<(
         String,
         String,
@@ -5336,7 +5761,7 @@ fn retry_discovery_workspace(
     {
         bail!("recovering setup discovery requires the originally selected host manager")
     }
-    if let Err(error) = prepare_setup_workspace(
+    let policy = match prepare_setup_workspace_files(
         store,
         &attempt_id,
         Path::new(&fixture_root),
@@ -5344,12 +5769,14 @@ fn retry_discovery_workspace(
         &fixture_head,
         Path::new(&workspace),
     ) {
-        let detail = format!("setup discovery workspace recovery failed: {error:#}");
-        mark_setup_workspace_recovery(store, &setup_id, &attempt_id, &detail)?;
-        bail!("{detail}; the setup remains recoverable by retrying begin_setup")
-    }
-    restore_setup_workspace_state(store, &setup_id, "discovery")?;
-    Ok(Some(operation_result(
+        Ok(policy) => policy,
+        Err(error) => {
+            let detail = format!("setup discovery workspace recovery failed: {error:#}");
+            mark_setup_workspace_recovery(store, &setup_id, &attempt_id, &detail)?;
+            bail!("{detail}; the setup remains recoverable by retrying begin_setup")
+        }
+    };
+    let result = operation_result(
         operation_id,
         "trip_setup",
         &setup_id,
@@ -5365,15 +5792,31 @@ fn retry_discovery_workspace(
             "workspace_recovered":setup_state == "workspace_recovery_required",
             "workspace_reused":true
         }),
-    )))
+    );
+    let mut connection = store.lock()?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_setup_workspace_reservation(
+        &tx,
+        &attempt_id,
+        Path::new(&workspace),
+        &fixture_identity,
+        &fixture_head,
+    )?;
+    require_setup_workspace_authority(&tx, &setup_id, &attempt_id, "discovery")?;
+    publish_setup_workspace(&tx, &attempt_id, &policy)?;
+    restore_setup_workspace_state(&tx, &setup_id, "discovery")?;
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(Some(result))
 }
 
 fn retry_probe_workspace(
     store: &Store,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     setup_id: &str,
     expected_proposal_hash: &str,
 ) -> Result<Option<OperationResult>> {
+    let operation_id = receipt.operation_id;
     let recovery: Option<(
         String,
         String,
@@ -5435,7 +5878,7 @@ fn retry_probe_workspace(
     }
     let proposal: SetupProposal = serde_json::from_str(&proposal_json)?;
     validate_setup_proposal(&proposal)?;
-    if let Err(error) = prepare_setup_workspace(
+    let policy = match prepare_setup_workspace_files(
         store,
         &attempt_id,
         Path::new(&fixture_root),
@@ -5443,12 +5886,14 @@ fn retry_probe_workspace(
         &fixture_head,
         Path::new(&workspace),
     ) {
-        let detail = format!("setup probe workspace recovery failed: {error:#}");
-        mark_setup_workspace_recovery(store, setup_id, &attempt_id, &detail)?;
-        bail!("{detail}; the setup remains recoverable by retrying authorize_setup_probes")
-    }
-    restore_setup_workspace_state(store, setup_id, "probing")?;
-    Ok(Some(operation_result(
+        Ok(policy) => policy,
+        Err(error) => {
+            let detail = format!("setup probe workspace recovery failed: {error:#}");
+            mark_setup_workspace_recovery(store, setup_id, &attempt_id, &detail)?;
+            bail!("{detail}; the setup remains recoverable by retrying authorize_setup_probes")
+        }
+    };
+    let result = operation_result(
         operation_id,
         "trip_setup",
         setup_id,
@@ -5466,17 +5911,42 @@ fn retry_probe_workspace(
             "workspace_recovered":setup_state == "workspace_recovery_required",
             "workspace_reused":true
         }),
-    )))
+    );
+    let mut connection = store.lock()?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_setup_workspace_reservation(
+        &tx,
+        &attempt_id,
+        Path::new(&workspace),
+        &fixture_identity,
+        &fixture_head,
+    )?;
+    require_setup_workspace_authority(&tx, setup_id, &attempt_id, "probing")?;
+    publish_setup_workspace(&tx, &attempt_id, &policy)?;
+    restore_setup_workspace_state(&tx, setup_id, "probing")?;
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(Some(result))
 }
 
-fn prepare_setup_workspace(
+fn prepare_setup_workspace_files(
     store: &Store,
     attempt_id: &str,
     fixture_root: &Path,
     expected_identity: &str,
     expected_head: &str,
     workspace: &Path,
-) -> Result<()> {
+) -> Result<String> {
+    {
+        let connection = store.lock()?;
+        require_setup_workspace_reservation(
+            &connection,
+            attempt_id,
+            workspace,
+            expected_identity,
+            expected_head,
+        )?;
+    }
     let fixture = crate::workspace::inspect(fixture_root)?;
     if fixture.identity != expected_identity || fixture.head != expected_head {
         bail!("setup fixture identity changed before workspace materialization")
@@ -5489,25 +5959,63 @@ fn prepare_setup_workspace(
     } else {
         crate::workspace::create_detached_worktree(&fixture, workspace, expected_head)?;
     }
-    {
-        let connection = store.lock()?;
-        connection.execute(
-            "UPDATE workspaces SET state='reserved',updated_at=?1
-             WHERE attempt_id=?2 AND state='recovery_required'",
-            params![Utc::now().to_rfc3339(), attempt_id],
-        )?;
-    }
-    materialize_setup_package(store, attempt_id, workspace)?;
-    let connection = store.lock()?;
-    let ready: bool = connection.query_row(
-        "SELECT state='ready' FROM workspaces WHERE attempt_id=?1",
-        params![attempt_id],
-        |row| row.get(0),
+    prepare_setup_package(workspace)
+}
+
+fn require_setup_workspace_reservation(
+    connection: &Connection,
+    attempt_id: &str,
+    workspace: &Path,
+    identity: &str,
+    head: &str,
+) -> Result<()> {
+    let valid: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspaces WHERE attempt_id=?1 AND path=?2 AND repository_identity=?3 AND base_revision=?4 AND state IN ('reserved','recovery_required','ready'))",
+        params![attempt_id, workspace.to_string_lossy(), identity, head], |row| row.get(0),
     )?;
-    if !ready {
-        bail!("setup workspace package materialization did not reach ready state")
+    if !valid {
+        bail!("setup workspace reservation changed before package publication")
     }
-    verify_ready_workspace_policy(&connection, attempt_id)
+    Ok(())
+}
+
+fn require_setup_workspace_authority(
+    connection: &Connection,
+    setup: &str,
+    attempt: &str,
+    phase: &str,
+) -> Result<()> {
+    let valid: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM trip_setup_operations so
+         JOIN trip_project_state state ON state.setup_operation_id=so.id AND state.project_id=so.project_id
+         JOIN attempts a ON a.id=?2 AND a.setup_operation_id=so.id
+         JOIN workspaces w ON w.attempt_id=a.id
+         WHERE so.id=?1 AND so.state IN (?3,'workspace_recovery_required')
+           AND ((?3='discovery' AND so.discovery_attempt_id=a.id AND so.probe_attempt_id IS NULL)
+             OR (?3='probing' AND so.probe_attempt_id=a.id))
+           AND EXISTS(SELECT 1 FROM trip_setup_permits p
+             JOIN role_settings rs ON rs.task_id=a.task_id AND rs.role=p.role AND rs.revision=p.settings_revision
+             JOIN trip_setup_profile_selections profile ON profile.setup_operation_id=so.id AND profile.role=p.role
+             WHERE p.attempt_id=a.id AND p.setup_operation_id=so.id AND p.fixture_project_id=so.fixture_project_id
+               AND p.fixture_repository_identity=w.repository_identity AND p.profile_hash=profile.profile_hash
+               AND p.state IN ('issued','consumed') AND p.purpose=CASE ?3 WHEN 'discovery' THEN 'setup_discovery' ELSE 'profile_probe' END))",
+        params![setup,attempt,phase], |row| row.get(0),
+    )?;
+    if !valid {
+        bail!("setup workspace authority changed during preparation")
+    }
+    Ok(())
+}
+
+fn publish_setup_workspace(connection: &Connection, attempt_id: &str, policy: &str) -> Result<()> {
+    let changed = connection.execute(
+        "UPDATE workspaces SET policy_json=?1,state='ready',updated_at=?2 WHERE attempt_id=?3 AND state IN ('reserved','recovery_required','ready')",
+        params![policy, Utc::now().to_rfc3339(), attempt_id],
+    )?;
+    if changed != 1 {
+        bail!("setup workspace reservation changed before package publication")
+    }
+    Ok(())
 }
 
 fn mark_setup_workspace_recovery(
@@ -5539,7 +6047,11 @@ fn mark_setup_workspace_recovery(
     Ok(())
 }
 
-fn restore_setup_workspace_state(store: &Store, setup_id: &str, state: &str) -> Result<()> {
+fn restore_setup_workspace_state(
+    connection: &Connection,
+    setup_id: &str,
+    state: &str,
+) -> Result<()> {
     if !matches!(state, "discovery" | "probing") {
         bail!("unsupported setup workspace recovery state")
     }
@@ -5549,30 +6061,30 @@ fn restore_setup_workspace_state(store: &Store, setup_id: &str, state: &str) -> 
         "Probe workspace recovered; authorized live profile probes may continue"
     };
     let now = Utc::now().to_rfc3339();
-    let mut connection = store.lock()?;
-    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute(
+    let restored = connection.execute(
         "UPDATE trip_setup_operations SET state=?1,error=NULL,updated_at=?2
          WHERE id=?3 AND state='workspace_recovery_required'",
         params![state, now, setup_id],
     )?;
-    tx.execute(
-        "UPDATE trip_project_state
+    if restored == 1 {
+        connection.execute(
+            "UPDATE trip_project_state
          SET readiness='setup_in_progress',reason=?1,updated_at=?2
          WHERE setup_operation_id=?3",
-        params![reason, now, setup_id],
-    )?;
-    tx.commit()?;
+            params![reason, now, setup_id],
+        )?;
+    }
     Ok(())
 }
 
 fn finalize_installation(
     store: &Store,
     runtime: &CapabilityRuntime,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     setup_id: &str,
     expected_proposal_hash: &str,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     let (repository_path, proposal_json, proposal_hash) = {
         let connection = store.lock()?;
         connection.query_row(
@@ -5601,8 +6113,16 @@ fn finalize_installation(
         .collect::<Vec<_>>();
     let preimages_hash = json_hash(&preimage_bindings)?;
     let now = Utc::now().to_rfc3339();
+    let proof_bindings = {
+        let connection = store.lock()?;
+        require_all_setup_proofs(&connection, setup_id, runtime)?;
+        setup_proof_bindings(&connection, setup_id)?
+    };
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
     let current:String=tx.query_row(
         "SELECT proposal_hash FROM trip_setup_operations WHERE id=?1 AND state IN ('probing','preflight_complete')",
         params![setup_id],|row|row.get(0)
@@ -5610,7 +6130,7 @@ fn finalize_installation(
     if current != proposal_hash {
         bail!("setup proposal changed during finalization")
     }
-    require_all_setup_proofs(&tx, setup_id, runtime)?;
+    require_setup_proof_bindings(&tx, setup_id, &proof_bindings)?;
     let active:bool=tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
          JOIN attempts a ON a.id=rg.attempt_id WHERE a.setup_operation_id=?1 AND s.status NOT IN ('exited','launch_failed'))",
@@ -5634,8 +6154,7 @@ fn finalize_installation(
         "UPDATE trip_project_state SET reason='Exact post-preflight installation bytes are frozen and awaiting human approval',updated_at=?1 WHERE setup_operation_id=?2",
         params![now,setup_id],
     )?;
-    tx.commit()?;
-    Ok(operation_result(
+    let result = operation_result(
         operation_id,
         "trip_setup",
         setup_id,
@@ -5643,22 +6162,25 @@ fn finalize_installation(
         "installation_finalized",
         serde_json::json!({"proposal_hash":proposal_hash,"approved_preimages_hash":preimages_hash,
             "final_source_set_hash":source_set_hash,"files":source_bindings}),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn authorize_installation(
     store: &Store,
     runtime: &CapabilityRuntime,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     setup_id: &str,
     expected_proposal_hash: &str,
     approved_preimages_hash: &str,
     final_source_set_hash: &str,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
-    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (proposal_hash, preimages_hash, frozen_hash,repository_path): (String, String, String,String) = tx.query_row(
+    let (proposal_hash, preimages_hash, frozen_hash,repository_path): (String, String, String,String) = connection.query_row(
         "SELECT so.proposal_hash,so.approved_preimages_hash,so.final_source_set_hash,p.repository_path
          FROM trip_setup_operations so JOIN projects p ON p.id=so.project_id
          WHERE so.id=?1 AND so.state='finalized'",
@@ -5671,8 +6193,9 @@ fn authorize_installation(
     {
         bail!("installation approval does not match the exact proposal, destination preimages, and frozen source set")
     }
-    require_all_setup_proofs(&tx, setup_id, runtime)?;
-    let frozen_files = frozen_installation_files_from(&tx, setup_id)?;
+    require_all_setup_proofs(&connection, setup_id, runtime)?;
+    let proof_bindings = setup_proof_bindings(&connection, setup_id)?;
+    let frozen_files = frozen_installation_files_from(&connection, setup_id)?;
     let frozen_bindings=frozen_files.iter().map(|file|serde_json::json!({
         "relative_path":file.relative,"source_sha256":file.source_hash,"preimage_sha256":file.preimage_hash
     })).collect::<Vec<_>>();
@@ -5683,6 +6206,27 @@ fn authorize_installation(
     if json_hash(&current_preimage_bindings(&root, &frozen_files)?)? != preimages_hash {
         bail!("destination preimages changed before installation approval")
     }
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
+    require_setup_proof_bindings(&tx, setup_id, &proof_bindings)?;
+    let current: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM trip_setup_operations WHERE id=?1 AND state='finalized' AND proposal_hash=?2 AND approved_preimages_hash=?3 AND final_source_set_hash=?4)",
+        params![setup_id,proposal_hash,preimages_hash,frozen_hash], |row| row.get(0),
+    )?;
+    if !current
+        || frozen_installation_files_from(&tx, setup_id)?
+            .iter()
+            .map(|file| (&file.relative, &file.source_hash, &file.preimage_hash))
+            .collect::<Vec<_>>()
+            != frozen_files
+                .iter()
+                .map(|file| (&file.relative, &file.source_hash, &file.preimage_hash))
+                .collect::<Vec<_>>()
+    {
+        bail!("installation authorization bindings changed during preparation")
+    }
     tx.execute(
         "UPDATE trip_setup_operations SET state='install_authorized',approved_source_set_hash=?1,install_authorized_at=?2,updated_at=?2 WHERE id=?3",
         params![frozen_hash,now, setup_id],
@@ -5691,8 +6235,7 @@ fn authorize_installation(
         "UPDATE trip_project_state SET reason='Installation authorized and awaiting staged apply',updated_at=?1 WHERE setup_operation_id=?2",
         params![now, setup_id],
     )?;
-    tx.commit()?;
-    Ok(operation_result(
+    let result = operation_result(
         operation_id,
         "trip_setup",
         setup_id,
@@ -5701,7 +6244,10 @@ fn authorize_installation(
         serde_json::json!({
             "proposal_hash":proposal_hash,"approved_preimages_hash":preimages_hash,"final_source_set_hash":frozen_hash
         }),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn attempt_session_fingerprints(
@@ -5844,10 +6390,11 @@ fn apply_installation(
     store: &Store,
     paths: &InstancePaths,
     runtime: &CapabilityRuntime,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     setup_id: &str,
     expected_proposal_hash: &str,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     let (
         project_id,
         repository_path,
@@ -5895,8 +6442,8 @@ fn apply_installation(
         .join(setup_id)
         .join("staged");
     stage_files(&staging, &files)?;
-    reserve_apply_journal(store, setup_id, &staging, &files)?;
-    if let Err(error) = apply_journal(store, setup_id, &root) {
+    reserve_apply_journal(store, receipt, setup_id, &staging, &files)?;
+    if let Err(error) = apply_journal(store, receipt, setup_id, &root) {
         mark_setup_recovery(store, setup_id, &format!("{error:#}"))?;
         return Err(error);
     }
@@ -5916,7 +6463,7 @@ fn apply_installation(
     let manifest_path = root.join(".agents/trip-explorer/manifest.json");
     let manifest_hash =
         hash_file(&manifest_path)?.ok_or_else(|| anyhow!("installed manifest is missing"))?;
-    let config_revision = match activate_configuration(
+    match activate_configuration(
         store,
         setup_id,
         &project_id,
@@ -5924,33 +6471,37 @@ fn apply_installation(
         &proposal,
         &manifest_hash,
         runtime,
+        receipt,
+        |config_revision| {
+            operation_result(
+                operation_id,
+                "trip_setup",
+                setup_id,
+                None,
+                "activated",
+                serde_json::json!({
+                    "project_id":project_id,"config_revision_id":config_revision,"manifest_hash":manifest_hash,
+                    "workflow_id":WORKFLOW_ID,"upstream_source_hash":source_hash(),"overlay_hash":overlay_hash()
+                }),
+            )
+        },
     ) {
-        Ok(revision) => revision,
+        Ok(result) => Ok(result),
         Err(error) => {
             mark_setup_recovery(store, setup_id, &format!("{error:#}"))?;
-            return Err(error);
+            Err(error)
         }
-    };
-    Ok(operation_result(
-        operation_id,
-        "trip_setup",
-        setup_id,
-        None,
-        "activated",
-        serde_json::json!({
-            "project_id":project_id,"config_revision_id":config_revision,"manifest_hash":manifest_hash,
-            "workflow_id":WORKFLOW_ID,"upstream_source_hash":source_hash(),"overlay_hash":overlay_hash()
-        }),
-    ))
+    }
 }
 
 fn recover_installation(
     store: &Store,
     _paths: &InstancePaths,
     runtime: &CapabilityRuntime,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     setup_id: &str,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     let (project_id, path, proposal_json): (String, String, String) = {
         let connection = store.lock()?;
         connection.query_row(
@@ -5961,7 +6512,7 @@ fn recover_installation(
         )?
     };
     let root = crate::workspace::inspect(Path::new(&path))?.root;
-    if let Err(error) = apply_journal(store, setup_id, &root) {
+    if let Err(error) = apply_journal(store, receipt, setup_id, &root) {
         mark_setup_recovery(store, setup_id, &format!("{error:#}"))?;
         return Err(error);
     }
@@ -5981,7 +6532,7 @@ fn recover_installation(
     let proposal: SetupProposal = serde_json::from_str(&proposal_json)?;
     let manifest_hash = hash_file(&root.join(".agents/trip-explorer/manifest.json"))?
         .ok_or_else(|| anyhow!("recovered manifest is missing"))?;
-    let revision = match activate_configuration(
+    match activate_configuration(
         store,
         setup_id,
         &project_id,
@@ -5989,34 +6540,38 @@ fn recover_installation(
         &proposal,
         &manifest_hash,
         runtime,
+        receipt,
+        |revision| {
+            operation_result(
+                operation_id,
+                "trip_setup",
+                setup_id,
+                None,
+                "activated",
+                serde_json::json!({
+                    "project_id":project_id,"config_revision_id":revision,"recovered":true
+                }),
+            )
+        },
     ) {
-        Ok(revision) => revision,
+        Ok(result) => Ok(result),
         Err(error) => {
             mark_setup_recovery(store, setup_id, &format!("{error:#}"))?;
-            return Err(error);
+            Err(error)
         }
-    };
-    Ok(operation_result(
-        operation_id,
-        "trip_setup",
-        setup_id,
-        None,
-        "activated",
-        serde_json::json!({
-            "project_id":project_id,"config_revision_id":revision,"recovered":true
-        }),
-    ))
+    }
 }
 
 fn adopt_installation(
     store: &Store,
     runtime: &CapabilityRuntime,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     project_id: &str,
     expected_version: i64,
     configuration: &serde_json::Value,
 ) -> Result<OperationResult> {
-    let observation = inspect_registered_project(store, project_id)?;
+    let operation_id = receipt.operation_id;
+    let observation = inspect_project(store, project_id, None, false)?;
     if observation
         .get("observation")
         .and_then(|value| value.get("kind"))
@@ -6061,8 +6616,25 @@ fn adopt_installation(
     let proposal_hash = json_hash(&serde_json::to_value(&proposal)?)?;
     let now = Utc::now().to_rfc3339();
     let quiescence = verify_project_activation_boundary(store, project_id)?;
+    let (setup_id, proof_bindings, preflight) = {
+        let connection = store.lock()?;
+        require_project_activation_boundary(&connection, project_id, &quiescence)?;
+        let setup_id: String = connection.query_row(
+            "SELECT id FROM trip_setup_operations WHERE project_id=?1 AND proposal_hash=?2 AND state IN ('probing','preflight_complete') ORDER BY created_at DESC LIMIT 1",
+            params![project_id,proposal_hash], |row| row.get(0),
+        ).optional()?.ok_or_else(||anyhow!("adoption requires the matching project-bound setup draft and approved live profile preflight"))?;
+        require_all_setup_proofs(&connection, &setup_id, runtime)?;
+        let preflight = effective_preflight_json(&connection, &setup_id, &proposal, runtime)?
+            ["receipts"]
+            .to_string();
+        let bindings = setup_proof_bindings(&connection, &setup_id)?;
+        (setup_id, bindings, preflight)
+    };
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
     let current: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1 AND version=?2)",
         params![project_id, expected_version],
@@ -6072,11 +6644,14 @@ fn adopt_installation(
         bail!("project version is stale")
     }
     require_project_activation_boundary(&tx, project_id, &quiescence)?;
-    let setup_id:String=tx.query_row(
+    let current_setup_id:String=tx.query_row(
         "SELECT id FROM trip_setup_operations WHERE project_id=?1 AND proposal_hash=?2 AND state IN ('probing','preflight_complete') ORDER BY created_at DESC LIMIT 1",
         params![project_id,proposal_hash],|row|row.get(0)
     ).optional()?.ok_or_else(||anyhow!("adoption requires the matching project-bound setup draft and approved live profile preflight"))?;
-    require_all_setup_proofs(&tx, &setup_id, runtime)?;
+    if current_setup_id != setup_id {
+        bail!("adoption setup changed during preparation")
+    }
+    require_setup_proof_bindings(&tx, &setup_id, &proof_bindings)?;
     let active_probe_sessions:bool=tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
            JOIN attempts a ON a.id=rg.attempt_id WHERE a.setup_operation_id=?1 AND s.status NOT IN ('exited','launch_failed'))",
@@ -6085,15 +6660,8 @@ fn adopt_installation(
     if active_probe_sessions {
         bail!("adoption waits for all setup preflight sessions to exit")
     }
-    let revision = insert_config_revision(
-        &tx,
-        project_id,
-        &proposal,
-        "activated",
-        &now,
-        &setup_id,
-        runtime,
-    )?;
+    let revision =
+        insert_config_revision(&tx, project_id, &proposal, "activated", &now, &preflight)?;
     tx.execute(
         "UPDATE trip_config_revisions SET state='superseded' WHERE project_id=?1 AND state='activated' AND id!=?2",
         params![project_id,revision],
@@ -6131,15 +6699,17 @@ fn adopt_installation(
         params![settings.to_string(), now, project_id],
     )?;
     mark_project_attempts_for_migration(&tx, project_id, &now)?;
-    tx.commit()?;
-    Ok(operation_result(
+    let result = operation_result(
         operation_id,
         "project",
         project_id,
         Some(expected_version + 1),
         "trip_adopted",
         serde_json::json!({"config_revision_id":revision}),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn verified_migration_guidance(
@@ -6394,21 +6964,22 @@ pub(crate) fn pending_attempt_migration(
 fn migrate_attempt(
     store: &Store,
     runtime: &CapabilityRuntime,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     task_id: &str,
     attempt_id: &str,
     expected_task_version: i64,
     reviewed_plan_hash: &str,
     config_revision_id: &str,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     if reviewed_plan_hash.trim().is_empty() {
         bail!("migration requires the exact reviewed structured-plan hash")
     }
     let quiescence = verify_attempt_migration_boundary(store, attempt_id)?;
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
-    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (workflow, task_version, project_id, workspace): (String, i64, String, String) = tx.query_row(
+    let preparation = &*connection;
+    let (workflow, task_version, project_id, workspace): (String, i64, String, String) = preparation.query_row(
         "SELECT a.workflow_version,t.version,t.project_id,w.path FROM attempts a JOIN tasks t ON t.id=a.task_id
          JOIN workspaces w ON w.attempt_id=a.id
          WHERE a.id=?1 AND a.task_id=?2 AND a.status IN ('running','held','needs_input','needs_recovery')",
@@ -6417,8 +6988,8 @@ fn migrate_attempt(
     if task_version != expected_task_version {
         bail!("task version is stale")
     }
-    require_project_ready(&tx, &project_id)?;
-    let config_valid: bool = tx.query_row(
+    require_project_ready(preparation, &project_id)?;
+    let config_valid: bool = preparation.query_row(
         "SELECT EXISTS(SELECT 1 FROM trip_config_revisions r JOIN trip_project_state s ON s.active_config_revision_id=r.id
          WHERE r.id=?1 AND r.project_id=?2 AND s.project_id=?2 AND r.state='activated'
            AND r.source_hash=?3 AND r.overlay_hash=?4)",
@@ -6427,14 +6998,14 @@ fn migrate_attempt(
     if !config_valid {
         bail!("migration configuration is not the activated project revision")
     }
-    require_attempt_migration_boundary(&tx, attempt_id, &quiescence)?;
-    let manifest_hash: String = tx.query_row(
+    require_attempt_migration_boundary(preparation, attempt_id, &quiescence)?;
+    let manifest_hash: String = preparation.query_row(
         "SELECT manifest_hash FROM trip_project_state WHERE project_id=?1",
         params![project_id],
         |row| row.get(0),
     )?;
     let mut preserved;
-    let existing:Option<(String,String,Option<String>,Option<String>,Option<String>,Option<String>,String,String)>=tx.query_row(
+    let existing:Option<(String,String,Option<String>,Option<String>,Option<String>,Option<String>,String,String)>=preparation.query_row(
         "SELECT reviewed_plan_hash,config_revision_id,target_workflow_hash,target_source_hash,target_overlay_hash,target_manifest_hash,preserved_json,from_workflow_id
          FROM trip_legacy_migrations WHERE attempt_id=?1 AND to_workflow_id=?2",
         params![attempt_id,WORKFLOW_ID],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?))
@@ -6461,7 +7032,7 @@ fn migrate_attempt(
         {
             bail!("legacy migration recovery must retain its originally authorized plan, configuration and source-target identity")
         }
-        match pending_attempt_migration(&tx, attempt_id)? {
+        match pending_attempt_migration(preparation, attempt_id)? {
             Some(Ok(_)) => {}
             Some(Err(reason)) => bail!("{reason}"),
             None => bail!("the authorized workflow migration has already been published or its recovery state changed"),
@@ -6470,10 +7041,10 @@ fn migrate_attempt(
         if preserved["prior_workflow"].as_str() != Some(from_workflow.as_str()) {
             bail!("migration receipt source workflow changed")
         }
-        verified_migration_guidance(&tx, attempt_id, Path::new(&workspace), &preserved)?;
+        verified_migration_guidance(preparation, attempt_id, Path::new(&workspace), &preserved)?;
         expected_task_version
     } else {
-        let migration_required: bool = tx.query_row(
+        let migration_required: bool = preparation.query_row(
             "SELECT legacy_migration_required=1 AND (workflow_version IS NOT ?2 OR workflow_hash IS NOT ?3
                OR upstream_source_hash IS NOT ?4 OR overlay_hash IS NOT ?5) FROM attempts WHERE id=?1",
             params![attempt_id,WORKFLOW_ID,crate::workflow_resources::workflow_hash(),source_hash(),overlay_hash()], |row| row.get(0),
@@ -6482,11 +7053,11 @@ fn migrate_attempt(
             bail!("attempt does not require an explicit workflow migration")
         }
         if let Some(reason) =
-            initial_attempt_migration_blocker(&tx, attempt_id, reviewed_plan_hash)?
+            initial_attempt_migration_blocker(preparation, attempt_id, reviewed_plan_hash)?
         {
             bail!("{reason}")
         }
-        let prior_policy: String = tx.query_row(
+        let prior_policy: String = preparation.query_row(
             "SELECT json_object('attempt_id',a.id,'workspace_id',w.id,'workspace_path',w.path,
                 'repository_identity',w.repository_identity,'workflow_id',a.workflow_version,
                 'workflow_hash',a.workflow_hash,'upstream_source_hash',a.upstream_source_hash,'overlay_hash',a.overlay_hash,
@@ -6504,15 +7075,54 @@ fn migrate_attempt(
                 .ok_or_else(|| anyhow!("migration prior policy is missing"))?
                 .as_bytes()
         ));
-        let reviewed_plan_id: String = tx.query_row(
+        let reviewed_plan_id: String = preparation.query_row(
             "SELECT structured_plan_id FROM attempts WHERE id=?1",
             params![attempt_id],
             |row| row.get(0),
         )?;
         preserved = serde_json::json!({"review_budgets":"preserved","snapshots":"preserved","review_requests":"preserved",
             "prior_workflow":workflow,"prior_policy":prior_policy,"reviewed_plan_id":reviewed_plan_id});
-        preserved["guidance"] =
-            verified_migration_guidance(&tx, attempt_id, Path::new(&workspace), &preserved)?;
+        preserved["guidance"] = verified_migration_guidance(
+            preparation,
+            attempt_id,
+            Path::new(&workspace),
+            &preserved,
+        )?;
+        expected_task_version + 1
+    };
+    let profiles = prepare_attempt_profiles(preparation, task_id, Path::new(&workspace), runtime)?;
+    let capability_bindings = profiles.iter().map(|profile| -> Result<String> {
+        Ok(preparation.query_row("SELECT json_array(id,status,config_hash,proof_json,checked_at) FROM capabilities WHERE id=?1", params![profile.capability_id], |row| row.get(0))?)
+    }).collect::<Result<Vec<_>>>()?;
+    let source_bindings = runtime_source_bindings(preparation, &project_id, Some(task_id))?;
+    let prior_workspace = attempt_workspace_binding(preparation, attempt_id)?;
+    let prior_attempt: String = preparation.query_row("SELECT json_array(workflow_version,workflow_hash,upstream_source_hash,overlay_hash,legacy_migration_required,phase,structured_plan_id,plan_hash,plan_approved_at,status) FROM attempts WHERE id=?1", params![attempt_id], |row| row.get(0))?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
+    if runtime_source_bindings(&tx, &project_id, Some(task_id))? != source_bindings
+        || attempt_workspace_binding(&tx, attempt_id)? != prior_workspace
+        || tx.query_row("SELECT json_array(workflow_version,workflow_hash,upstream_source_hash,overlay_hash,legacy_migration_required,phase,structured_plan_id,plan_hash,plan_approved_at,status) FROM attempts WHERE id=?1", params![attempt_id], |row| row.get::<_,String>(0))? != prior_attempt {
+        bail!("migration bindings changed during policy preparation")
+    }
+    for (profile, expected) in profiles.iter().zip(&capability_bindings) {
+        let current: String = tx.query_row("SELECT json_array(id,status,config_hash,proof_json,checked_at) FROM capabilities WHERE id=?1", params![profile.capability_id], |row| row.get(0))?;
+        if &current != expected {
+            bail!("migration capability changed during preparation")
+        }
+    }
+    require_attempt_migration_boundary(&tx, attempt_id, &quiescence)?;
+    if recovering {
+        if !matches!(pending_attempt_migration(&tx, attempt_id)?, Some(Ok(_))) {
+            bail!("migration authorization changed during preparation")
+        }
+    } else {
+        if let Some(reason) =
+            initial_attempt_migration_blocker(&tx, attempt_id, reviewed_plan_hash)?
+        {
+            bail!("{reason}")
+        }
         tx.execute(
             "INSERT INTO trip_legacy_migrations(id,attempt_id,from_workflow_id,to_workflow_id,preserved_json,reviewed_plan_hash,config_revision_id,authorized_at,
                target_workflow_hash,target_source_hash,target_overlay_hash,target_manifest_hash)
@@ -6549,8 +7159,7 @@ fn migrate_attempt(
             params![task_id],
         )?;
         retire_unmatchable_transition_proposals(&tx, attempt_id, "workflow_migration", &now)?;
-        expected_task_version + 1
-    };
+    }
     let changed=tx.execute("UPDATE workspaces SET state='recovery_required',updated_at=?1 WHERE attempt_id=?2 AND (state IN ('ready','recovery_required') OR (?3 AND state='reserved'))",params![now,attempt_id,recovering])?;
     if changed != 1 {
         bail!("legacy attempt workspace is not available for pinned policy materialization")
@@ -6567,15 +7176,10 @@ fn migrate_attempt(
         "DELETE FROM trip_attempt_profiles WHERE attempt_id=?1",
         params![attempt_id],
     )?;
-    bind_attempt_profiles(
-        &tx,
-        task_id,
-        attempt_id,
-        Path::new(&workspace),
-        runtime,
-        &now,
-    )?;
+    persist_attempt_profiles(&tx, attempt_id, &profiles, &now)?;
+    record_trip_progress(&tx, receipt, "attempt", attempt_id)?;
     tx.commit()?;
+    receipt.progressed.set(true);
     drop(connection);
     if let Err(error) = materialize_project_policy(store, attempt_id, Path::new(&workspace)) {
         let failed = Utc::now().to_rfc3339();
@@ -6626,20 +7230,22 @@ fn migrate_attempt(
          WHERE attempt_id=?2 AND to_workflow_id=?3",
         params![published_at,attempt_id,WORKFLOW_ID],
     )?;
-    tx.commit()?;
-    Ok(operation_result(
+    let result = operation_result(
         operation_id,
         "attempt",
         attempt_id,
         Some(migrated_version),
         "migration_review_required",
         serde_json::json!({"preserved":preserved,"policy_materialized":true}),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn authorize_check(
     store: &Store,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     attempt_id: &str,
     check_id: &str,
     selected_revision: i64,
@@ -6648,6 +7254,7 @@ fn authorize_check(
     decision: &str,
     lifetime: &str,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     store.require_execution_unheld("selected-check authorization")?;
     if !matches!(decision, "approved" | "denied") {
         bail!("check permission decision must be approved or denied")
@@ -6660,9 +7267,9 @@ fn authorize_check(
     }
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
-    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    require_attempt_ready(&tx, attempt_id, None)?;
-    let (kind, executable, arguments, shell, cwd, candidate): (String,Option<String>,Option<String>,Option<String>,String,String) = tx.query_row(
+    let workspace_binding = attempt_workspace_binding(&connection, attempt_id)?;
+    verify_ready_workspace_policy(&connection, attempt_id)?;
+    let (kind, executable, arguments, shell, cwd, candidate): (String,Option<String>,Option<String>,Option<String>,String,String) = connection.query_row(
         "SELECT c.command_kind,c.executable,c.arguments_json,c.shell_command,c.cwd,a.candidate_hash FROM trip_verification_checks c
          JOIN trip_selected_checks s ON s.check_id=c.id AND s.attempt_id=?1 AND s.revision=?2
          JOIN attempts a ON a.id=s.attempt_id AND s.revision=a.selected_checks_revision
@@ -6681,17 +7288,40 @@ fn authorize_check(
     if observed_scope != scope_hash {
         bail!("check authorization scope does not match the exact candidate and working directory")
     }
-    let matching_rule_id = if decision == "approved" && lifetime == "family" {
-        let family = crate::permissions::service_check_family(
-            &tx,
+    let prepared_family = if decision == "approved" && lifetime == "family" {
+        Some(crate::permissions::service_check_family(
+            &connection,
             attempt_id,
             &kind,
             executable.as_deref(),
             &cwd,
-        )?;
-        let id = if let Some((id, _)) =
-            crate::permissions::matching_service_check_rule(&tx, attempt_id, &family)?
-        {
+        )?)
+    } else {
+        None
+    };
+    let selected_binding: String = connection.query_row(
+        "SELECT json_array(a.phase,a.candidate_hash,a.selected_checks_revision,c.command_kind,c.executable,c.arguments_json,c.shell_command,c.cwd,c.enabled,s.required) FROM attempts a JOIN trip_selected_checks s ON s.attempt_id=a.id AND s.revision=a.selected_checks_revision JOIN trip_verification_checks c ON c.id=s.check_id WHERE a.id=?1 AND c.id=?2", params![attempt_id,check_id], |row| row.get(0),
+    )?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
+    require_attempt_ready_state(&tx, attempt_id, None)?;
+    if attempt_workspace_binding(&tx, attempt_id)? != workspace_binding {
+        bail!("attempt workspace binding changed during authorization")
+    }
+    let current_binding: String = tx.query_row(
+        "SELECT json_array(a.phase,a.candidate_hash,a.selected_checks_revision,c.command_kind,c.executable,c.arguments_json,c.shell_command,c.cwd,c.enabled,s.required) FROM attempts a JOIN trip_selected_checks s ON s.attempt_id=a.id AND s.revision=a.selected_checks_revision JOIN trip_verification_checks c ON c.id=s.check_id WHERE a.id=?1 AND c.id=?2", params![attempt_id,check_id], |row| row.get(0),
+    )?;
+    if current_binding != selected_binding {
+        bail!("selected check changed during authorization")
+    }
+    let matching_rule_id = if let Some(family) = prepared_family {
+        let matched: Option<(String, i64, Option<String>)> = tx.query_row(
+            "SELECT r.id,r.revision,r.revoked_at FROM trip_check_permission_rules r JOIN attempts a ON a.id=?1 JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id JOIN workspaces w ON w.attempt_id=a.id WHERE r.project_id=p.id AND r.source='service_check' AND r.registered_root=?2 AND r.repository_identity=?3 AND r.executable_kind=?4 AND r.executable_value=?5 AND p.repository_identity=r.repository_identity AND p.internal_purpose IS NULL AND w.state='ready' AND w.repository_identity=r.repository_identity ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1",
+            params![attempt_id,family.registered_root,family.repository_identity,family.executable_kind,family.executable_value], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional()?;
+        let id = if let Some((id, _, None)) = matched {
             id
         } else {
             let id = uuid::Uuid::new_v4().to_string();
@@ -6715,8 +7345,7 @@ fn authorize_check(
         params![uuid::Uuid::new_v4().to_string(),attempt_id,check_id,selected_revision,
             exact_command_hash,scope_hash,decision,lifetime,now,matching_rule_id],
     )?;
-    tx.commit()?;
-    Ok(operation_result(
+    let result = operation_result(
         operation_id,
         "check_authorization",
         check_id,
@@ -6724,18 +7353,26 @@ fn authorize_check(
         decision,
         serde_json::json!({"attempt_id":attempt_id,"exact_command_hash":exact_command_hash,
             "lifetime":lifetime,"source":"service_check","matching_rule_id":matching_rule_id}),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn revoke_check_permission_rule(
     store: &Store,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     rule_id: &str,
     expected_revision: i64,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     let now = Utc::now().to_rfc3339();
-    let connection = store.lock()?;
-    if connection.execute(
+    let mut connection = store.lock()?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
+    if tx.execute(
         "UPDATE trip_check_permission_rules SET revoked_at=?1,revoked_by='authenticated_human',
          revoke_reason='revoked from selected-check permission UI',revision=revision+1
          WHERE id=?2 AND source='service_check' AND revision=?3 AND revoked_at IS NULL",
@@ -6744,25 +7381,29 @@ fn revoke_check_permission_rule(
     {
         bail!("service-check permission rule is stale, unknown, or already revoked")
     }
-    Ok(operation_result(
+    let result = operation_result(
         operation_id,
         "check_permission_rule",
         rule_id,
         Some(expected_revision + 1),
         "revoked",
         serde_json::json!({"source":"service_check","future_reservations_only":true}),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn extend_review_budget(
     store: &Store,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     task_id: &str,
     attempt_id: &str,
     expected_version: i64,
     kind: &str,
     additional: i64,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     if !matches!(kind, "plan" | "code") {
         bail!("only ordinary plan and code review budgets can be explicitly extended")
     }
@@ -6772,6 +7413,9 @@ fn extend_review_budget(
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
     let (initial, extension): (i64,i64) = tx.query_row(
         "SELECT initial_allowance,extension_allowance FROM review_budgets b JOIN attempts a ON a.id=b.attempt_id
          JOIN tasks t ON t.id=a.task_id WHERE b.attempt_id=?1 AND b.review_kind=?2 AND t.id=?3 AND t.version=?4",
@@ -6787,29 +7431,40 @@ fn extend_review_budget(
         "UPDATE tasks SET version=version+1,updated_at=?1 WHERE id=?2 AND version=?3",
         params![now, task_id, expected_version],
     )?;
-    tx.commit()?;
-    Ok(operation_result(
+    let result = operation_result(
         operation_id,
         "task",
         task_id,
         Some(expected_version + 1),
         "review_budget_extended",
         serde_json::json!({"review_kind":kind,"total_allowance":initial+extension+additional}),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn authorize_implementation(
     store: &Store,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     task_id: &str,
     attempt_id: &str,
     expected_version: i64,
     plan_hash: &str,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
+    let workspace_binding = attempt_workspace_binding(&connection, attempt_id)?;
+    verify_ready_workspace_policy(&connection, attempt_id)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    require_attempt_ready(&tx, attempt_id, None)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
+    require_attempt_ready_state(&tx, attempt_id, None)?;
+    if attempt_workspace_binding(&tx, attempt_id)? != workspace_binding {
+        bail!("attempt workspace binding changed during authorization")
+    }
     let plan_id: String = tx
         .query_row(
             "SELECT sp.id FROM trip_structured_plans sp JOIN attempts a ON a.id=sp.attempt_id
@@ -6836,8 +7491,7 @@ fn authorize_implementation(
         "UPDATE tasks SET version=version+1,updated_at=?1 WHERE id=?2 AND version=?3",
         params![now, task_id, expected_version],
     )?;
-    tx.commit()?;
-    Ok(operation_result(
+    let result = operation_result(
         operation_id,
         "task",
         task_id,
@@ -6846,18 +7500,22 @@ fn authorize_implementation(
         serde_json::json!({
             "attempt_id":attempt_id,"plan_hash":plan_hash,"structured_plan_id":plan_id
         }),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn authorize_additional_explorer(
     store: &Store,
-    operation_id: &str,
+    receipt: &CommandReceipt<'_>,
     task_id: &str,
     attempt_id: &str,
     expected_version: i64,
     stage: &str,
     justification: &str,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
     if stage != "rescue" {
         bail!("only a second rescue Explorer can receive additional authorization")
     }
@@ -6870,8 +7528,16 @@ fn authorize_additional_explorer(
     }
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
+    let workspace_binding = attempt_workspace_binding(&connection, attempt_id)?;
+    verify_ready_workspace_policy(&connection, attempt_id)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    require_attempt_ready(&tx, attempt_id, None)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
+    require_attempt_ready_state(&tx, attempt_id, None)?;
+    if attempt_workspace_binding(&tx, attempt_id)? != workspace_binding {
+        bail!("attempt workspace binding changed during authorization")
+    }
     let eligible: bool = tx.query_row(
         "SELECT t.id=?2 AND t.version=?3 AND a.phase IN ('implementation','code_review','checks')
            AND (SELECT COUNT(*) FROM trip_explorer_decisions d WHERE d.attempt_id=a.id AND d.stage='rescue' AND d.activated=1)=1
@@ -6889,15 +7555,17 @@ fn authorize_additional_explorer(
         "UPDATE tasks SET version=version+1,updated_at=?1 WHERE id=?2 AND version=?3",
         params![now, task_id, expected_version],
     )?;
-    tx.commit()?;
-    Ok(operation_result(
+    let result = operation_result(
         operation_id,
         "task",
         task_id,
         Some(expected_version + 1),
         "additional_explorer_authorized",
         serde_json::json!({"attempt_id":attempt_id,"stage":"rescue","allowance":1}),
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 struct FinalRepairLedger<'a> {
@@ -6913,16 +7581,29 @@ struct FinalRepairLedger<'a> {
 /// are never relabeled or refunded: the receipt is a separate one-shot lane.
 fn authorize_final_repair_recheck(
     store: &Store,
-    operation_id: &str,
-    request_hash: &str,
+    receipt: &CommandReceipt<'_>,
     task_id: &str,
     attempt_id: &str,
     expected_version: i64,
     reviewed: &FinalRepairLedger<'_>,
 ) -> Result<OperationResult> {
+    let operation_id = receipt.operation_id;
+    let request_hash = receipt.request_hash;
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
+    let workspace_binding = attempt_workspace_binding(&connection, attempt_id)?;
+    let recorded_domain: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM final_repair_rechecks WHERE attempt_id=?1)",
+        params![attempt_id],
+        |row| row.get(0),
+    )?;
+    if !recorded_domain {
+        verify_ready_workspace_policy(&connection, attempt_id)?;
+    }
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
     let recorded: Option<(String, String, i64, String)> = tx
         .query_row(
             "SELECT operation_id,request_hash,authorized_task_version,detail_json
@@ -6935,16 +7616,22 @@ fn authorize_final_repair_recheck(
         if operation != operation_id || hash != request_hash {
             bail!("a final-repair recheck was already authorized for this attempt")
         }
-        return Ok(operation_result(
+        let result = operation_result(
             operation_id,
             "attempt",
             attempt_id,
             Some(version + 1),
             "final_repair_recheck_authorized",
             serde_json::from_str(&detail)?,
-        ));
+        );
+        persist_trip_receipt(&tx, receipt, &result)?;
+        tx.commit()?;
+        return Ok(result);
     }
-    require_attempt_ready(&tx, attempt_id, None)?;
+    require_attempt_ready_state(&tx, attempt_id, None)?;
+    if attempt_workspace_binding(&tx, attempt_id)? != workspace_binding {
+        bail!("attempt workspace binding changed during authorization")
+    }
     let current: Option<(String, Option<String>)> = tx
         .query_row(
             "SELECT a.plan_hash,a.configuration_hash
@@ -7167,15 +7854,17 @@ fn authorize_final_repair_recheck(
          VALUES(?1,?2,'human','attempt.final_repair_recheck.authorized','attempt',?3,?4,?5)",
         params![uuid::Uuid::new_v4().to_string(), operation_id, attempt_id, detail.to_string(), now],
     )?;
-    tx.commit()?;
-    Ok(operation_result(
+    let result = operation_result(
         operation_id,
         "attempt",
         attempt_id,
         Some(expected_version + 1),
         "final_repair_recheck_authorized",
         detail,
-    ))
+    );
+    persist_trip_receipt(&tx, receipt, &result)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 pub(crate) fn record_structured_plan(
@@ -13342,6 +14031,35 @@ fn service_manager_adapter(provider: Provider) -> serde_json::Value {
     })
 }
 
+fn setup_proof_bindings(connection: &Connection, setup: &str) -> Result<String> {
+    Ok(connection.query_row(
+        "SELECT json_array(so.proposal_hash,so.proposal_json,so.fixture_project_id,so.validation_task_id,so.discovery_attempt_id,
+          (SELECT json_array(repository_path,repository_identity,base_revision) FROM projects WHERE id=so.fixture_project_id),
+          (SELECT json_group_array(json_array(role,selection_state,profile_hash,profile_json)) FROM
+            (SELECT * FROM trip_setup_profile_selections WHERE setup_operation_id=so.id ORDER BY role)),
+          (SELECT json_group_array(json_array(id,role,profile_hash,capability_key,capability_identity_json,adapter_hash,result,evidence_json,model_evidence)) FROM
+            (SELECT * FROM trip_preflight_receipts WHERE setup_operation_id=so.id OR id IN (SELECT source_receipt_id FROM trip_setup_proof_reuse WHERE setup_operation_id=so.id) ORDER BY id)),
+          (SELECT json_group_array(json_array(role,profile_hash,source_receipt_id)) FROM
+            (SELECT * FROM trip_setup_proof_reuse WHERE setup_operation_id=so.id ORDER BY role)),
+          (SELECT json_group_array(json_array(s.id,s.status,s.launch_config_json,s.capability_key,s.capability_identity_json,s.workflow_version,s.workflow_hash,s.prompt_hash,g.id,g.status,a.workflow_version,a.workflow_hash,a.upstream_source_hash,a.overlay_hash))
+           FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id JOIN attempts a ON a.id=g.attempt_id
+           WHERE g.id IN (SELECT generation_id FROM trip_preflight_receipts WHERE setup_operation_id=so.id OR id IN (SELECT source_receipt_id FROM trip_setup_proof_reuse WHERE setup_operation_id=so.id))))
+         FROM trip_setup_operations so WHERE so.id=?1",
+        params![setup], |row| row.get(0),
+    )?)
+}
+
+fn require_setup_proof_bindings(
+    connection: &Connection,
+    setup: &str,
+    expected: &str,
+) -> Result<()> {
+    if setup_proof_bindings(connection, setup)? != expected {
+        bail!("setup proof or profile bindings changed during preparation")
+    }
+    Ok(())
+}
+
 fn require_all_setup_proofs(
     connection: &Connection,
     setup_id: &str,
@@ -13426,7 +14144,7 @@ fn effective_preflight_json(
     Ok(serde_json::json!({"receipts":receipts}))
 }
 
-fn materialize_setup_package(store: &Store, attempt_id: &str, workspace: &Path) -> Result<()> {
+fn prepare_setup_package(workspace: &Path) -> Result<String> {
     let mut policy_files = BTreeMap::new();
     for file in PACKAGE_FILES {
         let base_destination = workspace
@@ -13468,18 +14186,9 @@ fn materialize_setup_package(store: &Store, attempt_id: &str, workspace: &Path) 
         ".agents/trip-explorer/llmrelay-overlay.md".into(),
         sha256(OVERLAY.as_bytes()),
     );
-    let now = Utc::now().to_rfc3339();
     let policy = serde_json::json!({"kind":"setup_fixture","workflow_id":WORKFLOW_ID,"upstream_source_hash":source_hash(),"overlay_hash":overlay_hash(),"files":policy_files,"target_files_copied":false});
     validate_materialized_policy(&policy.to_string())?;
-    let connection = store.lock()?;
-    let changed = connection.execute(
-        "UPDATE workspaces SET policy_json=?1,state='ready',updated_at=?2 WHERE attempt_id=?3 AND state='reserved'",
-        params![policy.to_string(),now,attempt_id],
-    )?;
-    if changed != 1 {
-        bail!("setup workspace reservation changed before package publication")
-    }
-    Ok(())
+    Ok(policy.to_string())
 }
 
 /// Guidance a rework child may keep from its exact source snapshot although it
@@ -14308,27 +15017,39 @@ fn activate_configuration(
     proposal: &SetupProposal,
     manifest_hash: &str,
     runtime: &CapabilityRuntime,
-) -> Result<String> {
+    receipt: &CommandReceipt<'_>,
+    result_for_revision: impl FnOnce(&str) -> OperationResult,
+) -> Result<OperationResult> {
     verify_applied_journal(store, setup_id, root)?;
     let now = Utc::now().to_rfc3339();
     let quiescence = verify_project_activation_boundary(store, project_id)?;
+    let (proof_bindings, preflight) = {
+        let connection = store.lock()?;
+        require_all_setup_proofs(&connection, setup_id, runtime)?;
+        let preflight = effective_preflight_json(&connection, setup_id, proposal, runtime)?
+            ["receipts"]
+            .to_string();
+        (setup_proof_bindings(&connection, setup_id)?, preflight)
+    };
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_project_activation_boundary(&tx, project_id, &quiescence)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
+    let authorized: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM trip_setup_operations so JOIN trip_project_state s ON s.setup_operation_id=so.id AND s.project_id=so.project_id WHERE so.id=?1 AND so.project_id=?2 AND so.state IN ('applying','recovery_required'))", params![setup_id,project_id], |row| row.get(0),
+    )?;
+    if !authorized {
+        bail!("installation activation authority changed during preparation")
+    }
     let complete:bool=tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM trip_apply_journal WHERE setup_operation_id=?1 AND state!='applied')",params![setup_id],|row|row.get(0))?;
     if !complete {
         bail!("installation journal is incomplete")
     }
-    require_all_setup_proofs(&tx, setup_id, runtime)?;
-    let revision = insert_config_revision(
-        &tx,
-        project_id,
-        proposal,
-        "activated",
-        &now,
-        setup_id,
-        runtime,
-    )?;
+    require_setup_proof_bindings(&tx, setup_id, &proof_bindings)?;
+    let revision =
+        insert_config_revision(&tx, project_id, proposal, "activated", &now, &preflight)?;
     let manager_json:String=tx.query_row(
         "SELECT profile_json FROM trip_setup_profile_selections WHERE setup_operation_id=?1 AND role='manager' AND selection_state='selected'",
         params![setup_id],|row|row.get(0)
@@ -14392,8 +15113,10 @@ fn activate_configuration(
         params![settings.to_string(), now, project_id],
     )?;
     mark_project_attempts_for_migration(&tx, project_id, &now)?;
+    let result = result_for_revision(&revision);
+    persist_trip_receipt(&tx, receipt, &result)?;
     tx.commit()?;
-    Ok(revision)
+    Ok(result)
 }
 
 fn insert_config_revision(
@@ -14402,8 +15125,7 @@ fn insert_config_revision(
     proposal: &SetupProposal,
     state: &str,
     now: &str,
-    setup_id: &str,
-    runtime: &CapabilityRuntime,
+    preflight: &str,
 ) -> Result<String> {
     let id = uuid::Uuid::new_v4().to_string();
     let revision: i64 = connection.query_row(
@@ -14412,8 +15134,6 @@ fn insert_config_revision(
         |row| row.get(0),
     )?;
     let config = project_configuration(proposal)?;
-    let preflight =
-        effective_preflight_json(connection, setup_id, proposal, runtime)?["receipts"].to_string();
     connection.execute(
         "INSERT INTO trip_config_revisions(id,project_id,revision,state,config_json,adapters_json,preflight_json,verification_json,source_hash,overlay_hash,configuration_hash,created_at,activated_at)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)",
@@ -14472,6 +15192,7 @@ fn insert_verification_checks(
 
 fn reserve_apply_journal(
     store: &Store,
+    receipt: &CommandReceipt<'_>,
     setup_id: &str,
     staging: &Path,
     files: &[JournalFile],
@@ -14503,7 +15224,9 @@ fn reserve_apply_journal(
         "UPDATE trip_project_state SET readiness='setup_in_progress',reason='Authorized configuration apply is journaled; new task admission is paused',updated_at=?1 WHERE setup_operation_id=?2",
         params![now,setup_id],
     )?;
+    record_trip_progress(&tx, receipt, "trip_setup", setup_id)?;
     tx.commit()?;
+    receipt.progressed.set(true);
     Ok(())
 }
 
@@ -14558,7 +15281,12 @@ fn current_preimage_bindings(root: &Path, files: &[JournalFile]) -> Result<Vec<s
     }).collect()
 }
 
-fn apply_journal(store: &Store, setup_id: &str, root: &Path) -> Result<()> {
+fn apply_journal(
+    store: &Store,
+    receipt: &CommandReceipt<'_>,
+    setup_id: &str,
+    root: &Path,
+) -> Result<()> {
     let rows = {
         let connection = store.lock()?;
         let mut statement=connection.prepare("SELECT relative_path,source_hash,expected_preimage_hash,staged_path,state FROM trip_apply_journal WHERE setup_operation_id=?1 ORDER BY relative_path")?;
@@ -14586,8 +15314,12 @@ fn apply_journal(store: &Store, setup_id: &str, root: &Path) -> Result<()> {
             continue;
         }
         if observed.as_deref() == Some(source_hash.as_str()) {
-            let connection = store.lock()?;
-            connection.execute("UPDATE trip_apply_journal SET state='applied',updated_at=?1 WHERE setup_operation_id=?2 AND relative_path=?3",params![Utc::now().to_rfc3339(),setup_id,relative])?;
+            let mut connection = store.lock()?;
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute("UPDATE trip_apply_journal SET state='applied',updated_at=?1 WHERE setup_operation_id=?2 AND relative_path=?3",params![Utc::now().to_rfc3339(),setup_id,relative])?;
+            record_trip_progress(&tx, receipt, "trip_setup", setup_id)?;
+            tx.commit()?;
+            receipt.progressed.set(true);
             continue;
         }
         if observed != preimage {
@@ -14601,11 +15333,16 @@ fn apply_journal(store: &Store, setup_id: &str, root: &Path) -> Result<()> {
             ensure_safe_parent(root, &destination)?;
         }
         atomic_write(&destination, &bytes)?;
+        receipt.progressed.set(true);
         if hash_file(&destination)?.as_deref() != Some(source_hash.as_str()) {
             bail!("applied bytes failed verification: {relative}")
         }
-        let connection = store.lock()?;
-        connection.execute("UPDATE trip_apply_journal SET state='applied',updated_at=?1 WHERE setup_operation_id=?2 AND relative_path=?3",params![Utc::now().to_rfc3339(),setup_id,relative])?;
+        let mut connection = store.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE trip_apply_journal SET state='applied',updated_at=?1 WHERE setup_operation_id=?2 AND relative_path=?3",params![Utc::now().to_rfc3339(),setup_id,relative])?;
+        record_trip_progress(&tx, receipt, "trip_setup", setup_id)?;
+        tx.commit()?;
+        receipt.progressed.set(true);
     }
     verify_applied_journal(store, setup_id, root)
 }
@@ -14912,18 +15649,189 @@ fn operation_result(
         detail,
     }
 }
-fn persist_trip_receipt(
+// Set only after a durable phase commits; rolled-back SQL failures remain definite.
+struct CommandReceipt<'a> {
+    progressed: std::cell::Cell<bool>,
+    operation_id: &'a str,
+    request_hash: &'a str,
+}
+
+impl<'a> CommandReceipt<'a> {
+    fn new(operation_id: &'a str, request_hash: &'a str) -> Self {
+        Self {
+            operation_id,
+            request_hash,
+            progressed: std::cell::Cell::new(false),
+        }
+    }
+}
+
+pub(crate) fn replay_human_command(
     store: &Store,
     operation_id: &str,
-    request_hash: &str,
+    action: &TripHumanAction,
+) -> Result<Option<OperationResult>> {
+    let request_hash = json_hash(action)?;
+    lookup_trip_receipt(
+        &*store.lock()?,
+        &CommandReceipt::new(operation_id, &request_hash),
+    )
+}
+
+pub(crate) fn has_human_command_progress(
+    store: &Store,
+    operation_id: &str,
+    action: &TripHumanAction,
+) -> Result<bool> {
+    let request_hash = json_hash(action)?;
+    let connection = store.lock()?;
+    Ok(validate_trip_progress(
+        &connection,
+        &CommandReceipt::new(operation_id, &request_hash),
+    )? || historical_trip_progress(&connection, action)?)
+}
+
+fn lookup_trip_receipt(
+    connection: &Connection,
+    receipt: &CommandReceipt<'_>,
+) -> Result<Option<OperationResult>> {
+    let saved: Option<(String, String)> = connection.query_row(
+        "SELECT request_hash,result_json FROM operation_receipts WHERE operation_id=?1 AND actor_key='human_control' AND operation_kind='trip_command'",
+        params![receipt.operation_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    match saved {
+        Some((hash, _)) if hash != receipt.request_hash => {
+            bail!("operation_id was already used for another request")
+        }
+        Some((_, result)) => Ok(Some(serde_json::from_str(&result)?)),
+        None => Ok(None),
+    }
+}
+
+fn persist_trip_receipt(
+    connection: &Connection,
+    receipt: &CommandReceipt<'_>,
     result: &OperationResult,
 ) -> Result<()> {
-    let connection = store.lock()?;
     let now = Utc::now().to_rfc3339();
-    connection.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,new_version,detail_json,created_at) VALUES(?1,?2,'human','trip.command.applied',?3,?4,?5,?6,?7)",params![uuid::Uuid::new_v4().to_string(),operation_id,result.entity_kind,result.entity_id,result.version,serde_json::to_string(result)?,now])?;
-    connection.execute("INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at) VALUES(?1,'human_control','trip_command',?2,?3,?4)",params![operation_id,request_hash,serde_json::to_string(result)?,now])?;
+    validate_trip_progress(connection, receipt)?;
+    let serialized = serde_json::to_string(result)?;
+    connection.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,new_version,detail_json,created_at) VALUES(?1,?2,'human','trip.command.applied',?3,?4,?5,?6,?7)",params![uuid::Uuid::new_v4().to_string(),receipt.operation_id,result.entity_kind,result.entity_id,result.version,serialized,now])?;
+    connection.execute("INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at) VALUES(?1,'human_control','trip_command',?2,?3,?4)",params![receipt.operation_id,receipt.request_hash,serialized,now])?;
     Ok(())
 }
+
+fn validate_trip_progress(connection: &Connection, receipt: &CommandReceipt<'_>) -> Result<bool> {
+    let hash: Option<String> = connection.query_row(
+        "SELECT json_extract(detail_json,'$.request_hash') FROM audit_events WHERE operation_id=?1 AND event_code='trip.command.progress' ORDER BY created_at LIMIT 1",
+        params![receipt.operation_id], |row| row.get(0),
+    ).optional()?;
+    if hash
+        .as_deref()
+        .is_some_and(|hash| hash != receipt.request_hash)
+    {
+        bail!("operation_id was already used for another unresolved request")
+    }
+    Ok(hash.is_some())
+}
+
+fn record_trip_progress(
+    connection: &Connection,
+    receipt: &CommandReceipt<'_>,
+    kind: &str,
+    id: &str,
+) -> Result<()> {
+    if !validate_trip_progress(connection, receipt)? {
+        connection.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'human','trip.command.progress',?3,?4,?5,?6)",
+            params![uuid::Uuid::new_v4().to_string(), receipt.operation_id, kind, id,
+                serde_json::json!({"request_hash":receipt.request_hash,"recovery_identity":id}).to_string(), Utc::now().to_rfc3339()],
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) struct TripOutcomeUnknown {
+    cause: anyhow::Error,
+}
+
+impl std::fmt::Display for TripOutcomeUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "The request made durable progress, but its final outcome could not be confirmed. Refresh and check its outcome before retrying. Follow the available recovery action if recovery is required. Technical details: {:#}", self.cause)
+    }
+}
+
+impl std::error::Error for TripOutcomeUnknown {}
+
+pub(crate) fn outcome_unknown(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<TripOutcomeUnknown>() {
+        error
+    } else {
+        TripOutcomeUnknown { cause: error }.into()
+    }
+}
+
+pub(crate) fn classify_trip_error(
+    store: &Store,
+    operation_id: &str,
+    action: &TripHumanAction,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if error.is::<TripOutcomeUnknown>() {
+        return error;
+    }
+    let progressed = (|| -> Result<bool> {
+        let hash = json_hash(action)?;
+        let connection = store.lock()?;
+        let receipt = CommandReceipt::new(operation_id, &hash);
+        if lookup_trip_receipt(&connection, &receipt)?.is_some() {
+            return Ok(false);
+        }
+        if validate_trip_progress(&connection, &receipt)? {
+            return Ok(true);
+        }
+        historical_trip_progress(&connection, action)
+    })()
+    .unwrap_or(false);
+    if progressed {
+        TripOutcomeUnknown { cause: error }.into()
+    } else {
+        error
+    }
+}
+
+fn historical_trip_progress(connection: &Connection, action: &TripHumanAction) -> Result<bool> {
+    match action {
+        TripHumanAction::BeginSetup { project_id, expected_project_version, host_manager } => Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM trip_setup_operations so JOIN projects p ON p.id=so.project_id JOIN trip_setup_profile_selections profile ON profile.setup_operation_id=so.id AND profile.role='manager' WHERE so.project_id=?1 AND p.version=?2 AND profile.profile_hash=?3 AND so.state IN ('discovery','workspace_recovery_required'))",
+            params![project_id,expected_project_version,json_hash(host_manager)?], |row| row.get(0))?),
+        TripHumanAction::ChangeSetupManager { setup_operation_id, expected_project_version, host_manager } => Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM trip_setup_operations replacement JOIN projects p ON p.id=replacement.project_id JOIN trip_setup_profile_selections selection ON selection.setup_operation_id=replacement.id AND selection.role='manager' WHERE replacement.supersedes_setup_operation_id=?1 AND p.version=?2+1 AND selection.profile_hash=?3 AND replacement.state IN ('discovery','workspace_recovery_required'))",
+            params![setup_operation_id,expected_project_version,json_hash(host_manager)?], |row| row.get(0))?),
+        TripHumanAction::AuthorizeSetupProbes { setup_operation_id, proposal_hash } => Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM trip_setup_operations WHERE id=?1 AND proposal_hash=?2 AND probe_attempt_id IS NOT NULL AND state IN ('probing','workspace_recovery_required'))",
+            params![setup_operation_id,proposal_hash], |row| row.get(0))?),
+        TripHumanAction::AuthorizeRuntimeAdmission { admission_id, scope_hash } => Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM trip_runtime_admissions a JOIN trip_runtime_probes p ON p.admission_id=a.id WHERE a.id=?1 AND a.scope_hash=?2 AND p.attempt_id IS NOT NULL)",
+            params![admission_id,scope_hash], |row| row.get(0))?),
+        TripHumanAction::PublishRuntimeProof { admission_id, role } => Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM trip_runtime_probes p JOIN operation_receipts r ON r.actor_key='human_control' AND r.operation_kind IN ('capability_proof','functional_capability_proof') AND json_extract(r.result_json,'$.session_id')=p.session_id WHERE p.admission_id=?1 AND p.role=?2 AND p.state IN ('evidence_recorded','published'))",
+            params![admission_id,role.to_string()], |row| row.get(0))?),
+        TripHumanAction::ApplyInstallation { setup_operation_id, proposal_hash } => Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM trip_apply_journal j JOIN trip_setup_operations s ON s.id=j.setup_operation_id WHERE s.id=?1 AND s.proposal_hash=?2)",
+            params![setup_operation_id,proposal_hash], |row| row.get(0))?),
+        TripHumanAction::RecoverInstallation { setup_operation_id } => Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM trip_apply_journal WHERE setup_operation_id=?1)", params![setup_operation_id], |row| row.get(0))?),
+        TripHumanAction::MigrateAttempt { attempt_id, reviewed_plan_hash, config_revision_id, .. } => Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM trip_legacy_migrations WHERE attempt_id=?1 AND reviewed_plan_hash=?2 AND config_revision_id=?3 AND json_extract(preserved_json,'$.published_at') IS NULL)",
+            params![attempt_id,reviewed_plan_hash,config_revision_id], |row| row.get(0))?),
+        TripHumanAction::StopSetupManager { setup_operation_id, .. } => Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM controls c JOIN trip_setup_operations s ON s.discovery_attempt_id=c.attempt_id WHERE s.id=?1 AND c.kind='setup_manager_change' AND c.state='held')", params![setup_operation_id], |row| row.get(0))?),
+        _ => Ok(false),
+    }
+}
+
 fn pretty_json(value: &serde_json::Value) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');

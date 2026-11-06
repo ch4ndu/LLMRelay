@@ -22322,3 +22322,407 @@ for (const recoveryAction of ["Retry loading saved draft", "Replace saved draft 
     }
   });
 }
+
+const approvalJournalKey = "llmrelay.approval.operations";
+const approvalJournalState: AppState = {
+  ...liveBase,
+  permission_requests: [pendingPermission],
+};
+
+Deno.test("Approval journal preserves a peer's pending request when an unmounted request settles", async () => {
+  localStorage.clear();
+  const pending: Array<{
+    body: Record<string, unknown>;
+    resolve: (response: Response) => void;
+    reject: (reason: unknown) => void;
+  }> = [];
+  globalThis.fetch = (async (_input, init) =>
+    await new Promise<Response>((resolve, reject) => pending.push({
+      body: JSON.parse(String(init?.body)), resolve, reject,
+    }))) as typeof fetch;
+  let staleChanges = 0;
+  const second = { ...pendingPermission, id: "approval-peer", revision: 7 };
+  try {
+    mount(<ApprovalInbox state={approvalJournalState} onSelect={noop} onChanged={() => staleChanges++} />);
+    click("Approve once");
+    await settle();
+    const firstBody = pending[0].body;
+    mount(<ApprovalInbox state={{ ...liveBase, permission_requests: [second] }} onSelect={noop} onChanged={noop} />);
+    click("Deny");
+    await settle();
+    check(pending.length === 2, "the two views did not send their independent decisions");
+    const secondBody = pending[1].body;
+    pending[0].resolve(new Response(JSON.stringify({ result: { state: "applied" } })));
+    await settle();
+    const retained = JSON.parse(localStorage.getItem(approvalJournalKey)!);
+    check(retained.length === 1 && retained[0][0] === `permission:${second.id}` &&
+      retained[0][1].id === secondBody.operation_id &&
+      retained[0][1].id !== firstBody.operation_id && staleChanges === 0,
+      "an old settlement erased the peer's entry or refreshed its closed view");
+    pending[1].reject(new TypeError("Connection lost"));
+    await settle();
+    mount(<ApprovalInbox state={{ ...liveBase, permission_requests: [{ ...second, revision: 12 }] }} onSelect={noop} onChanged={noop} />);
+    click("Deny");
+    await settle();
+    check(pending.length === 3 && JSON.stringify(pending[2].body) === JSON.stringify(secondBody) &&
+      pending[2].body.expected_revision === 7,
+      "the peer's ambiguous decision lost its original full body or operation ID");
+    pending[2].resolve(new Response(JSON.stringify({ result: { state: "applied" } })));
+    await settle();
+    check(localStorage.getItem(approvalJournalKey) === "[]", "the exact successful replay did not settle");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Approval journal retains an ambiguous identity across a definite refused replay", async () => {
+  localStorage.clear();
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input, init) => {
+    requests.push(JSON.parse(String(init?.body)));
+    if (requests.length === 1) throw new TypeError("Connection lost");
+    return requests.length === 2
+      ? new Response(JSON.stringify({ error: "The current request is stale." }), { status: 409 })
+      : new Response(JSON.stringify({ result: { state: "applied" } }));
+  }) as typeof fetch;
+  try {
+    for (const revision of [3, 8, 11]) {
+      mount(<ApprovalInbox state={{ ...approvalJournalState, permission_requests: [{ ...pendingPermission, revision }] }} onSelect={noop} onChanged={noop} />);
+      click("Approve once");
+      await settle();
+      if (revision !== 11) {
+        const journal = JSON.parse(localStorage.getItem(approvalJournalKey)!);
+        check(journal.length === 1 && journal[0][1].id === requests[0].operation_id,
+          "ambiguity or refusal of an unresolved replay erased its original identity");
+      }
+    }
+    check(requests.length === 3 && requests.every((body) => JSON.stringify(body) === JSON.stringify(requests[0])) &&
+      localStorage.getItem(approvalJournalKey) === "[]",
+      "the successful replay changed the original full request or failed to settle it");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Approval journal settles only the exact key, ID and serialized body sent", async () => {
+  const pending: Array<{ body: Record<string, unknown>; resolve: (response: Response) => void }> = [];
+  globalThis.fetch = (async (_input, init) => await new Promise<Response>((resolve) =>
+    pending.push({ body: JSON.parse(String(init?.body)), resolve }))) as typeof fetch;
+  try {
+    for (const replacement of ["new-id", "same-id-different-body"]) {
+      localStorage.clear();
+      const offset = pending.length;
+      mount(<ApprovalInbox state={approvalJournalState} onSelect={noop} onChanged={noop} />);
+      click("Approve once");
+      await settle();
+      if (replacement === "new-id") {
+        mount(<ApprovalInbox state={approvalJournalState} onSelect={noop} onChanged={noop} />);
+        click("Deny");
+        await settle();
+        check(pending[offset + 1].body.operation_id !== pending[offset].body.operation_id,
+          "a changed decision reused the previous intent's identity");
+      } else {
+        const entries = JSON.parse(localStorage.getItem(approvalJournalKey)!);
+        const body = JSON.parse(entries[0][1].body);
+        entries[0][1].body = JSON.stringify({ ...body, reason: "peer replacement" });
+        localStorage.setItem(approvalJournalKey, JSON.stringify(entries));
+      }
+      const saved = localStorage.getItem(approvalJournalKey);
+      pending[offset].resolve(new Response(JSON.stringify({ result: { state: "applied" } })));
+      await settle();
+      check(localStorage.getItem(approvalJournalKey) === saved,
+        `${replacement}: the old response deleted a different saved identity`);
+      if (replacement === "new-id") {
+        pending[offset + 1].resolve(new Response(JSON.stringify({ result: { state: "applied" } })));
+        await settle();
+        check(localStorage.getItem(approvalJournalKey) === "[]", "the replacement could not settle itself");
+      }
+    }
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Approval journal refuses unreadable, malformed, uncoordinated or unsaved publication without sending", async () => {
+  const storage = localStorage;
+  let requests = 0;
+  globalThis.fetch = (async () => {
+    requests++;
+    return new Response(JSON.stringify({ result: { state: "applied" } }));
+  }) as typeof fetch;
+  const validIdentity = { id: "peer-id", body: JSON.stringify({ kind: "decide_permission", request_id: "peer" }) };
+  const malformed = [
+    "not json", "null", "{}", "[null]",
+    JSON.stringify([["permission:peer", { id: "", body: "{}" }]]),
+    JSON.stringify([["permission:peer", { id: "peer", body: "[]" }]]),
+    JSON.stringify([["permission:peer", { id: "peer", body: "not json" }]]),
+    JSON.stringify([["permission:peer", { id: "peer", body: '{"kind":""}' }]]),
+    JSON.stringify([["permission:peer", { id: "peer", body: "{}" }]]),
+    JSON.stringify([["permission:peer", validIdentity], ["permission:peer", validIdentity]]),
+  ];
+  try {
+    for (const raw of malformed) {
+      storage.setItem(approvalJournalKey, raw);
+      mount(<ApprovalInbox state={approvalJournalState} onSelect={noop} onChanged={noop} />);
+      click("Approve once");
+      await settle();
+      check(requests === 0 && storage.getItem(approvalJournalKey) === raw &&
+        document.body.textContent?.includes("Saved approval requests could not be read"),
+        "a malformed journal was overwritten or allowed a network mutation");
+    }
+    for (const failure of ["read", "write", "locks-missing", "locks-rejected"]) {
+      storage.clear();
+      const saved = JSON.stringify([["permission:peer", validIdentity]]);
+      storage.setItem(approvalJournalKey, saved);
+      Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: {
+        getItem: (key: string) => {
+          if (key === approvalJournalKey && failure === "read") throw new Error("Approval storage unavailable");
+          return storage.getItem(key);
+        },
+        setItem: (key: string, value: string) => {
+          if (key === approvalJournalKey && failure === "write") throw new Error("Approval storage full");
+          storage.setItem(key, value);
+        },
+      } });
+      if (failure === "locks-missing") installStorageLocks(undefined);
+      if (failure === "locks-rejected") installStorageLocks({ request: () => Promise.reject(new Error("Lock unavailable")) });
+      mount(<ApprovalInbox state={approvalJournalState} onSelect={noop} onChanged={noop} />);
+      click("Approve once");
+      await settle();
+      check(requests === 0 && storage.getItem(approvalJournalKey) === saved,
+        `${failure}: failed persistence or coordination sent or overwrote a request`);
+      check(document.body.textContent?.includes(failure.startsWith("locks")
+        ? "could not coordinate saving"
+        : failure === "read" ? "Saved approval requests could not be read"
+        : "could not be saved for recovery"),
+        `${failure}: the blocked action did not explain the storage failure`);
+      installStorageLocks(storageLocks);
+    }
+  } finally {
+    unmount();
+    installStorageLocks(storageLocks);
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: storage });
+    storage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Approval journal reads publication and settlement only after acquiring the storage lock", async () => {
+  localStorage.clear();
+  let resolve!: (response: Response) => void;
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input, init) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return await new Promise<Response>((done) => resolve = done);
+  }) as typeof fetch;
+  let release = holdStorageLock(approvalJournalKey);
+  try {
+    mount(<ApprovalInbox state={approvalJournalState} onSelect={noop} onChanged={noop} />);
+    click("Approve once");
+    await settle();
+    const peer = ["permission:peer", { id: "peer", body: JSON.stringify({ kind: "decide_permission", request_id: "peer" }) }];
+    localStorage.setItem(approvalJournalKey, JSON.stringify([peer]));
+    check(requests.length === 0, "publication sent while a peer held the journal lock");
+    release();
+    await settle();
+    check(requests.length === 1 && JSON.parse(localStorage.getItem(approvalJournalKey)!).length === 2,
+      "publication read before its lock grant and overwrote the peer's new entry");
+    release = holdStorageLock(approvalJournalKey);
+    resolve(new Response(JSON.stringify({ result: { state: "applied" } })));
+    await settle();
+    const entries = JSON.parse(localStorage.getItem(approvalJournalKey)!);
+    check(entries.length === 2, "settlement wrote while a peer held the journal lock");
+    const laterPeer = ["permission:later", { id: "later", body: JSON.stringify({ kind: "decide_permission", request_id: "later" }) }];
+    localStorage.setItem(approvalJournalKey, JSON.stringify([...entries, laterPeer]));
+    release();
+    await settle();
+    check(localStorage.getItem(approvalJournalKey) === JSON.stringify([peer, laterPeer]),
+      "settlement used a pre-lock journal and lost a newer peer entry");
+  } finally {
+    release();
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
+Deno.test("Approval journal preserves confirmed success when settlement cannot be saved", async () => {
+  const storage = localStorage;
+  storage.clear();
+  let failCleanup = false;
+  let changes = 0;
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: {
+    getItem: (key: string) => storage.getItem(key),
+    setItem: (key: string, value: string) => {
+      if (key === approvalJournalKey && failCleanup) throw new Error("Cleanup failed");
+      storage.setItem(key, value);
+    },
+  } });
+  globalThis.fetch = (async () => {
+    failCleanup = true;
+    return new Response(JSON.stringify({ result: { state: "applied" } }));
+  }) as typeof fetch;
+  try {
+    mount(<ApprovalInbox state={approvalJournalState} onSelect={noop} onChanged={() => changes++} />);
+    click("Approve once");
+    await settle();
+    check(changes === 1 && JSON.parse(storage.getItem(approvalJournalKey)!).length === 1 &&
+      document.body.textContent?.includes("Your action was confirmed") &&
+      !document.querySelector(".error-notice") &&
+      document.querySelector('[role="status"]')?.textContent?.includes("Your action was confirmed"),
+      "cleanup failure turned a confirmed decision into a rejected action or lost recovery identity");
+    check(!document.querySelector<HTMLButtonElement>(".approval-actions button")?.disabled,
+      "cleanup failure left the confirmed action busy");
+  } finally {
+    unmount();
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: storage });
+    storage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+const approvalJournalCheck: TripTaskVerification = {
+  attempt_id: "a1",
+  selected_revision: 2,
+  check_id: "approval-journal-check",
+  required: true,
+  candidate_hash: "candidate",
+  exact_command_hash: "command-hash",
+  scope_hash: "scope-hash",
+  command: { kind: "structured_argv", executable: "deno", arguments: ["check"], cwd: "." },
+  authorization: {
+    once_available: true,
+    reusable: false,
+    family: false,
+    authorized: false,
+    action_state: "actionable",
+    state: "pending",
+    source: "service_check",
+    matching_rule: { id: "approval-check-rule", revision: 5, display_family: "deno", source: "service_check" },
+  },
+};
+
+for (const path of [
+  {
+    name: "native decision",
+    state: approvalJournalState,
+    button: "Approve once",
+    key: `permission:${pendingPermission.id}`,
+    expected: { kind: "decide_permission", request_id: pendingPermission.id, expected_revision: pendingPermission.revision, decision: "approve_once", reason: "" },
+  },
+  {
+    name: "native rule revocation",
+    state: {
+      ...liveBase,
+      permission_rules: [{
+        id: "approval-native-rule", provider: "codex", project_id: "p1", role: "manager",
+        lifetime: "session", display_family: "deno", scope: {}, created_at: "2026-11-05T00:00:00Z", use_count: 1, revision: 4,
+      }],
+    } satisfies AppState,
+    button: "Revoke",
+    key: "permission-rule:approval-native-rule",
+    expected: { kind: "revoke_permission_rule", rule_id: "approval-native-rule", expected_revision: 4, reason: "" },
+  },
+  {
+    name: "service-check authorization",
+    state: { ...liveBase, trip_task_verification: [approvalJournalCheck] },
+    button: "Approve once",
+    key: "check:a1:approval-journal-check",
+    expected: { kind: "trip", action: "authorize_check", attempt_id: "a1", check_id: "approval-journal-check", selected_revision: 2, exact_command_hash: "command-hash", scope_hash: "scope-hash", decision: "approved", lifetime: "once" },
+  },
+  {
+    name: "service-check rule revocation",
+    state: { ...liveBase, trip_task_verification: [approvalJournalCheck] },
+    button: "Revoke service-check rule",
+    key: "check-rule:approval-check-rule",
+    expected: { kind: "trip", action: "revoke_check_permission_rule", rule_id: "approval-check-rule", expected_revision: 5 },
+  },
+]) {
+  Deno.test(`Approval journal cancels queued ${path.name} on unmount and settles sent work without stale callbacks`, async () => {
+    localStorage.clear();
+    const requests: Record<string, unknown>[] = [];
+    let resolve!: (response: Response) => void;
+    let changes = 0;
+    globalThis.fetch = (async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return await new Promise<Response>((done) => resolve = done);
+    }) as typeof fetch;
+    let release = holdStorageLock(approvalJournalKey);
+    const panel = () => <ApprovalInbox state={path.state} onSelect={noop} onChanged={() => changes++} />;
+    try {
+      mount(panel());
+      click(path.button);
+      await settle();
+      unmount();
+      release();
+      await settle();
+      check(requests.length === 0 && localStorage.getItem(approvalJournalKey) === null && changes === 0,
+        "a closed inbox published, sent, or called back after its queued lock was released");
+      for (const outcome of ["confirmed", "ambiguous"]) {
+        localStorage.clear();
+        mount(panel());
+        click(path.button);
+        await settle();
+        check(requests.length === (outcome === "confirmed" ? 1 : 2),
+          "the mounted action did not reach the shared runner");
+        const saved = localStorage.getItem(approvalJournalKey)!;
+        const entries = JSON.parse(saved);
+        const { operation_id: id, ...body } = requests.at(-1)!;
+        check(entries.length === 1 && entries[0][0] === path.key && entries[0][1].id === id &&
+          entries[0][1].body === JSON.stringify(path.expected) && JSON.stringify(body) === JSON.stringify(path.expected),
+          "the action was not journaled with its complete original body and operation ID before send");
+        unmount();
+        release = holdStorageLock(approvalJournalKey);
+        resolve(outcome === "confirmed"
+          ? new Response(JSON.stringify({ result: { state: "applied" } }))
+          : new Response(JSON.stringify({ error: "Outcome unknown", outcome_unknown: true }), { status: 503 }));
+        await settle();
+        check(localStorage.getItem(approvalJournalKey) === saved, "sent settlement bypassed the shared lock");
+        release();
+        await settle();
+        check(changes === 0 && localStorage.getItem(approvalJournalKey) === (outcome === "confirmed" ? "[]" : saved),
+          "a sent action lost its outcome after unmount or called its stale UI callback");
+      }
+    } finally {
+      release();
+      unmount();
+      globalThis.fetch = nativeFetch;
+      localStorage.clear();
+    }
+  });
+}
+
+Deno.test("Approval journal clears a definite refusal of a new request before a fresh retry", async () => {
+  localStorage.clear();
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input, init) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return requests.length === 1
+      ? new Response(JSON.stringify({ error: "Decision was refused before mutation." }), { status: 400 })
+      : new Response(JSON.stringify({ result: { state: "applied" } }));
+  }) as typeof fetch;
+  try {
+    mount(<ApprovalInbox state={approvalJournalState} onSelect={noop} onChanged={noop} />);
+    click("Approve once");
+    await settle();
+    check(requests.length === 1 && localStorage.getItem(approvalJournalKey) === "[]" &&
+      document.body.textContent?.includes("Decision was refused before mutation."),
+      "a definite refusal of a new request was incorrectly retained as unresolved");
+    mount(<ApprovalInbox state={{ ...approvalJournalState, permission_requests: [{ ...pendingPermission, revision: 9 }] }} onSelect={noop} onChanged={noop} />);
+    click("Approve once");
+    await settle();
+    check(requests.length === 2 && requests[0].operation_id !== requests[1].operation_id &&
+      requests[1].expected_revision === 9 && localStorage.getItem(approvalJournalKey) === "[]",
+      "a new retry reused a definitely refused identity or failed to settle its success");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});

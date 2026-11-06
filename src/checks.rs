@@ -1532,7 +1532,7 @@ impl CheckService {
         let mut command = Command::new("/bin/ps");
         command.args(["-o", "lstart=", "-p", &pid.to_string()]);
         let bytes = self.inspect_process_output(&mut command, deadline)?;
-        let marker = String::from_utf8(bytes)?.trim().to_owned();
+        let marker = canonical_start_marker(&String::from_utf8(bytes)?);
         if marker.is_empty() {
             bail!("cannot observe check PID start identity");
         }
@@ -1695,19 +1695,21 @@ impl CheckService {
                 &crate::domain::ProcessGenerationAnchor {
                     pid: root_pid,
                     process_group_id: pgid,
-                    native_start_marker: start.to_owned(),
+                    native_start_marker: canonical_start_marker(start),
                     boot_identity: boot_identity.to_owned(),
                 },
             )?),
             _ => None,
         };
         for process in &members {
-            tx.execute(
-                "INSERT INTO check_processes(check_id,pid,native_start_marker,process_group_id,parent_pid,last_seen_at)
-                 VALUES(?1,?2,?3,?4,?5,?6)
-                 ON CONFLICT(check_id,pid,native_start_marker) DO UPDATE SET
-                   process_group_id=excluded.process_group_id,parent_pid=excluded.parent_pid,last_seen_at=excluded.last_seen_at",
-                params![id,i64::from(process.pid),process.start,process.pgid,i64::from(process.ppid),now],
+            persist_check_process(
+                &tx,
+                id,
+                process.pid,
+                &process.start,
+                process.pgid,
+                process.ppid,
+                &now,
             )?;
         }
         tx.execute(
@@ -1753,8 +1755,10 @@ impl CheckService {
         Err(error.context("check process ended but output capture failed"))
     }
     fn record_process(&self, id: &str, pid: u32, start: &str, pgid: i32, ppid: u32) -> Result<()> {
-        let connection = self.store.lock()?;
-        connection.execute("INSERT INTO check_processes(check_id,pid,native_start_marker,process_group_id,parent_pid,last_seen_at) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(check_id,pid,native_start_marker) DO UPDATE SET process_group_id=excluded.process_group_id,parent_pid=excluded.parent_pid,last_seen_at=excluded.last_seen_at",params![id,pid as i64,start,pgid,ppid as i64,Utc::now().to_rfc3339()])?;
+        let mut connection = self.store.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        persist_check_process(&tx, id, pid, start, pgid, ppid, &Utc::now().to_rfc3339())?;
+        tx.commit()?;
         Ok(())
     }
     fn record_known(
@@ -2130,6 +2134,48 @@ impl<R: Read + AsRawFd> PipeCapture<R> {
         self.tail = VecDeque::new();
         self.limit = 0;
     }
+}
+
+fn canonical_start_marker(start: &str) -> String {
+    start.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn persist_check_process(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    pid: u32,
+    start: &str,
+    pgid: i32,
+    ppid: u32,
+    now: &str,
+) -> Result<()> {
+    let canonical = canonical_start_marker(start);
+    let markers = {
+        let mut statement = tx.prepare(
+            "SELECT native_start_marker FROM check_processes WHERE check_id=?1 AND pid=?2",
+        )?;
+        let rows = statement
+            .query_map(params![id, i64::from(pid)], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    // Reconcile only this observed generation; a reused PID can retain other starts.
+    for marker in markers {
+        if marker != canonical && canonical_start_marker(&marker) == canonical {
+            tx.execute(
+                "DELETE FROM check_processes WHERE check_id=?1 AND pid=?2 AND native_start_marker=?3",
+                params![id, i64::from(pid), marker],
+            )?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO check_processes(check_id,pid,native_start_marker,process_group_id,parent_pid,last_seen_at)
+         VALUES(?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(check_id,pid,native_start_marker) DO UPDATE SET
+           process_group_id=excluded.process_group_id,parent_pid=excluded.parent_pid,last_seen_at=excluded.last_seen_at",
+        params![id, i64::from(pid), canonical, pgid, i64::from(ppid), now],
+    )?;
+    Ok(())
 }
 
 fn parse_process_inventory(bytes: Vec<u8>) -> Result<Vec<ProcessInfo>> {
@@ -3301,6 +3347,213 @@ mod tests {
         }
         child.wait().unwrap();
         assert!(crate::recovery::verify_check_quiescent(&store, "survivor-check").is_ok());
+    }
+
+    #[test]
+    fn recording_process_reconciles_whitespace_without_merging_generations() {
+        let (root, _cleanup) = temp_root("canonical-process");
+        let (store, service) = seeded_service(&root, "canonical-check");
+        let padded = "Mon Jan  5 09:08:07 2026";
+        let canonical = "Mon Jan 5 09:08:07 2026";
+        let different = "Mon Jan 5 09:08:08 2026";
+        let observed =
+            parse_process_inventory(format!("123 1 123 {padded}\n").into_bytes()).unwrap();
+        assert_eq!(observed[0].start, canonical);
+
+        service
+            .record_process("canonical-check", 123, padded, 123, 1)
+            .unwrap();
+        service
+            .record_process("canonical-check", 123, &observed[0].start, 123, 1)
+            .unwrap();
+        let rows = || {
+            let connection = store.lock().unwrap();
+            let mut statement = connection.prepare(
+                "SELECT pid,native_start_marker,process_group_id,parent_pid,last_seen_at
+                 FROM check_processes WHERE check_id='canonical-check' ORDER BY pid,native_start_marker",
+            ).unwrap();
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i32>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        };
+        let initial = rows();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].1, canonical);
+        {
+            let connection = store.lock().unwrap();
+            for (pid, marker) in [(123, padded), (123, different), (456, padded)] {
+                connection.execute(
+                    "INSERT INTO check_processes(check_id,pid,native_start_marker,process_group_id,parent_pid,last_seen_at)
+                     VALUES('canonical-check',?1,?2,10,2,'historic')",
+                    params![pid, marker],
+                ).unwrap();
+            }
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_process_insert BEFORE INSERT ON check_processes
+                 BEGIN SELECT RAISE(ABORT, 'injected process insert failure'); END;",
+                )
+                .unwrap();
+        }
+        let historic = rows();
+        let error = service
+            .record_process("canonical-check", 123, canonical, 321, 3)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected process insert failure"));
+        assert_eq!(rows(), historic);
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_process_insert;")
+            .unwrap();
+
+        service
+            .record_process("canonical-check", 123, canonical, 321, 3)
+            .unwrap();
+        let reconciled = rows();
+        assert_eq!(reconciled.len(), 3);
+        assert_eq!(reconciled[0].0, 123);
+        assert_eq!(reconciled[0].1, canonical);
+        assert_eq!(reconciled[0].2, 321);
+        assert_eq!(reconciled[0].3, 3);
+        assert_ne!(reconciled[0].4, "historic");
+        assert_eq!(
+            reconciled[1],
+            (123, different.into(), 10, 2, "historic".into())
+        );
+        assert_eq!(
+            reconciled[2],
+            (456, padded.into(), 10, 2, "historic".into())
+        );
+    }
+
+    #[test]
+    fn fail_spawned_reconciles_process_generations_with_recovery_transaction() {
+        let padded = "Mon Jan  5 09:08:07 2026";
+        let canonical = "Mon Jan 5 09:08:07 2026";
+        let different = "Mon Jan 5 09:08:08 2026";
+        for rollback in [false, true] {
+            let (root, _cleanup) = temp_root("canonical-failure");
+            let (store, service) = seeded_service(&root, "failure-check");
+            let (mut child, root_pid, pgid, _) = spawned_owned_child();
+            {
+                let connection = store.lock().unwrap();
+                for marker in [padded, canonical, different] {
+                    connection.execute(
+                        "INSERT INTO check_processes(check_id,pid,native_start_marker,process_group_id,parent_pid,last_seen_at)
+                         VALUES('failure-check',?1,?2,10,2,'historic')",
+                        params![i64::from(root_pid), marker],
+                    ).unwrap();
+                }
+                if rollback {
+                    connection.execute_batch(
+                        "CREATE TRIGGER reject_check_attention BEFORE UPDATE OF attention ON tasks
+                         BEGIN SELECT RAISE(ABORT, 'injected transaction failure'); END;",
+                    ).unwrap();
+                }
+            }
+            let observations = std::cell::Cell::new(0);
+            let error = service
+                .fail_spawned_with_inventory(
+                    "failure-check",
+                    "a",
+                    &mut child,
+                    root_pid,
+                    pgid,
+                    None,
+                    anyhow!("injected post-spawn failure"),
+                    || {
+                        let call = observations.get();
+                        observations.set(call + 1);
+                        // Only the post-cleanup observation reaches the recovery transaction.
+                        Ok(if call == 0 {
+                            Vec::new()
+                        } else {
+                            vec![ProcessInfo {
+                                pid: root_pid,
+                                ppid: 3,
+                                pgid,
+                                start: padded.into(),
+                            }]
+                        })
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(observations.get(), 2);
+            assert!(child.try_wait().unwrap().is_some());
+            let processes = {
+                let connection = store.lock().unwrap();
+                let mut statement = connection.prepare(
+                    "SELECT native_start_marker,process_group_id,parent_pid,last_seen_at
+                     FROM check_processes WHERE check_id='failure-check' AND pid=?1 ORDER BY native_start_marker",
+                ).unwrap();
+                let rows = statement
+                    .query_map(params![i64::from(root_pid)], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i32>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                rows
+            };
+            if rollback {
+                assert!(format!("{error:#}").contains("injected transaction failure"));
+                assert_eq!(
+                    processes,
+                    vec![
+                        (padded.into(), 10, 2, "historic".into()),
+                        (canonical.into(), 10, 2, "historic".into()),
+                        (different.into(), 10, 2, "historic".into()),
+                    ]
+                );
+                assert_eq!(
+                    durable_recovery_state(&store, "failure-check"),
+                    (
+                        "launch_reserved".into(),
+                        "spawning".into(),
+                        "running".into(),
+                        "none".into(),
+                        "running".into(),
+                        0,
+                    )
+                );
+            } else {
+                assert!(error.to_string().contains("injected post-spawn failure"));
+                assert_eq!(processes.len(), 2);
+                assert_eq!(processes[0].0, canonical);
+                assert_eq!(processes[0].1, pgid);
+                assert_eq!(processes[0].2, 3);
+                assert_ne!(processes[0].3, "historic");
+                assert_eq!(processes[1], (different.into(), 10, 2, "historic".into()));
+                assert_eq!(
+                    durable_recovery_state(&store, "failure-check"),
+                    (
+                        "recovery_required".into(),
+                        "delivery_unknown".into(),
+                        "needs_recovery".into(),
+                        "needs_recovery".into(),
+                        "unknown".into(),
+                        1,
+                    )
+                );
+            }
+        }
     }
 
     #[test]
