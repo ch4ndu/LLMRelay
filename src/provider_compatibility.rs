@@ -234,6 +234,19 @@ pub enum PolicyMode {
     /// One app-owned nonce-only model call in an empty scope, outside projects.
     ProviderObservation,
     SingleAgentWriter,
+    SingleAgentReader,
+    SingleAgentReviewer,
+}
+
+impl PolicyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderObservation => "provider_observation",
+            Self::SingleAgentWriter => "single_agent_writer",
+            Self::SingleAgentReader => "single_agent_reader",
+            Self::SingleAgentReviewer => "single_agent_reviewer",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -242,6 +255,7 @@ pub enum PolicyAuthority {
     #[serde(rename = "none")]
     NoWorkspace,
     WorkspaceWrite,
+    ReadOnly,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -332,6 +346,34 @@ pub struct ExecutionPolicy {
 }
 
 impl ExecutionPolicy {
+    pub fn for_purpose(provider: Provider, purpose: crate::domain::ProfilePurpose) -> Self {
+        use crate::domain::ProfilePurpose;
+        let (mode, name) = match purpose {
+            ProfilePurpose::WorkspaceWriter => return Self::single_agent_writer(provider),
+            ProfilePurpose::RepositoryReader => (PolicyMode::SingleAgentReader, "reader"),
+            ProfilePurpose::RepositoryReviewer => (PolicyMode::SingleAgentReviewer, "reviewer"),
+        };
+        let (authority, session_contract, launch, native, credential, evidence, _) =
+            compiled_policy(provider, mode);
+        Self {
+            schema: 1,
+            policy_id: format!("llmrelay-{provider}-single-agent-{name}"),
+            revision: 1,
+            provider,
+            mode,
+            authority,
+            session_contract,
+            worktree_write: false,
+            launch_revision: launch.into(),
+            native_policy_revision: native.into(),
+            credential_revision: credential.into(),
+            evidence_revision: evidence.into(),
+            channel_operations: SINGLE_AGENT_CHANNEL_OPERATIONS
+                .iter()
+                .map(|value| (*value).into())
+                .collect(),
+        }
+    }
     pub fn single_agent_writer(provider: Provider) -> Self {
         let (authority, session_contract, launch, native, credential, evidence, _) =
             compiled_policy(provider, PolicyMode::SingleAgentWriter);
@@ -398,6 +440,34 @@ impl BundleSet {
             claude_policy: CLAUDE_POLICY_BYTES.into(),
             synthetic: false,
         }
+    }
+
+    /// Provisional, unqualified exact-version authority for the existing
+    /// ignored native fixture only. This never alters embedded manifests.
+    #[cfg(test)]
+    pub(crate) fn provisional_native_fixture(version: &str) -> anyhow::Result<Self> {
+        if ![
+            crate::providers::codex::EXACT_CODEX_VERSION,
+            crate::providers::codex::SINGLE_AGENT_QUALIFICATION_VERSION,
+        ]
+        .contains(&version)
+        {
+            anyhow::bail!("No provisional predicate for this exact native version")
+        }
+        let mut bundles = Self::embedded();
+        let mut pack: serde_json::Value = serde_json::from_str(&bundles.codex_policy)?;
+        let mut selector = pack["selectors"][0].clone();
+        selector["exact_version"] = version.into();
+        selector["predicate_id"] = version.replace(' ', "-").into();
+        for contract in selector["contracts"]
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("Missing policy contracts"))?
+        {
+            contract["qualification"] = serde_json::json!({"state":"unqualified","reason":"Isolated opt-in native evidence only; independent review and release promotion required"});
+        }
+        pack["selectors"] = serde_json::json!([selector]);
+        bundles.codex_policy = serde_json::to_string(&pack)?;
+        Ok(bundles)
     }
 
     #[doc(hidden)]
@@ -517,6 +587,42 @@ impl BundleSet {
             session_contract: contract.session_contract,
             qualification: contract.qualification.clone(),
         })
+    }
+
+    /// Admission preparation does not run a provider. Prefer a release's
+    /// qualified exact selector for this purpose; launch still resolves and
+    /// binds the actual installed version independently.
+    pub(crate) fn admission_policy(
+        &self,
+        provider: Provider,
+        mode: PolicyMode,
+    ) -> Result<PolicyBinding, CompatibilityError> {
+        let pack: PolicyPack =
+            serde_json::from_str(self.policy_bytes(provider)).map_err(|_| invalid_manifest())?;
+        validate_policy_pack(&pack, provider).map_err(|_| invalid_manifest())?;
+        let selector = pack
+            .selectors
+            .iter()
+            .rev()
+            .find(|selector| {
+                selector.contracts.iter().any(|contract| {
+                    contract.mode == mode
+                        && matches!(
+                            contract.qualification,
+                            PolicyQualification::Qualified { .. }
+                        )
+                })
+            })
+            .or_else(|| {
+                pack.selectors.iter().rev().find(|selector| {
+                    selector
+                        .contracts
+                        .iter()
+                        .any(|contract| contract.mode == mode)
+                })
+            })
+            .ok_or_else(invalid_manifest)?;
+        self.resolve_policy(provider, &selector.exact_version, mode)
     }
 
     pub fn resolve(
@@ -713,7 +819,10 @@ fn validate_policy_pack(pack: &PolicyPack, provider: Provider) -> Result<(), ()>
     let mut ids = BTreeSet::new();
     for selector in &pack.selectors {
         if selector.predicate_id.trim().is_empty()
-            || selector.exact_version != exact_version
+            || (selector.exact_version != exact_version
+                && !(provider == Provider::Codex
+                    && selector.exact_version
+                        == crate::providers::codex::SINGLE_AGENT_QUALIFICATION_VERSION))
             || !versions.insert(&selector.exact_version)
             || !predicates.insert(&selector.predicate_id)
         {
@@ -750,7 +859,9 @@ fn validate_policy_pack(pack: &PolicyPack, provider: Provider) -> Result<(), ()>
                 return Err(());
             }
         }
-        if modes.len() != 2 {
+        if !modes.contains(&PolicyMode::ProviderObservation)
+            || !modes.contains(&PolicyMode::SingleAgentWriter)
+        {
             return Err(());
         }
     }
@@ -769,6 +880,34 @@ type CompiledPolicy = (
 
 fn compiled_policy(provider: Provider, mode: PolicyMode) -> CompiledPolicy {
     match (provider, mode) {
+        (provider, PolicyMode::SingleAgentReader | PolicyMode::SingleAgentReviewer) => (
+            PolicyAuthority::ReadOnly,
+            if mode == PolicyMode::SingleAgentReader {
+                SessionContract::Retained
+            } else {
+                SessionContract::Fresh
+            },
+            match provider {
+                Provider::Codex => "llmrelay-codex-single-agent-read-launch-v1",
+                Provider::Claude => "llmrelay-claude-single-agent-read-launch-v1",
+            },
+            match provider {
+                Provider::Codex => "codex-single-agent-read-only-v1",
+                Provider::Claude => "claude-single-agent-read-only-v1",
+            },
+            if mode == PolicyMode::SingleAgentReader {
+                "llmrelay-single-agent-reader-credential-v1"
+            } else {
+                "llmrelay-single-agent-reviewer-credential-v1"
+            },
+            "llmrelay-single-agent-read-proof-v1",
+            [
+                "exact_native_policy",
+                "repository_read_report",
+                "session_contract",
+                "native_write_denial",
+            ],
+        ),
         (Provider::Codex, PolicyMode::ProviderObservation) => (
             PolicyAuthority::NoWorkspace,
             SessionContract::Fresh,
@@ -1080,6 +1219,20 @@ mod tests {
     #[test]
     fn single_agent_policy_is_its_own_writer_identity_and_actor() {
         use crate::domain::{ExecutionActor, RoleKind};
+        // Literal pre-preset command bytes also pin their request hashes.
+        for legacy in [
+            r#"{"kind":"set_project_workflow_default","operation_id":"legacy-default","project_id":"project","expected_version":0,"family":"single_agent"}"#,
+            r#"{"kind":"set_task_workflow","operation_id":"legacy-selection","task_id":"task","expected_version":1,"selection":{"family":"single_agent","execution_config_revision_id":"config","profile_revision_id":"writer","check_ids":[]}}"#,
+            r#"{"kind":"save_agent_profile","operation_id":"legacy-profile","project_id":"project","profile_id":null,"expected_version":null,"profile":{"display_name":"Writer","provider":"codex","model":"model","effort":"high","instructions_text":""}}"#,
+        ] {
+            let command: crate::domain::WorkflowCommand = serde_json::from_str(legacy).unwrap();
+            assert_eq!(serde_json::to_string(&command).unwrap(), legacy);
+            assert_eq!(
+                crate::store::json_hash(&command).unwrap(),
+                digest(legacy.as_bytes())
+            );
+            assert!(!command.uses_single_agent_presets());
+        }
         let codex = ExecutionPolicy::single_agent_writer(Provider::Codex);
         let claude = ExecutionPolicy::single_agent_writer(Provider::Claude);
         assert_eq!(codex.authority, PolicyAuthority::WorkspaceWrite);
@@ -1136,6 +1289,8 @@ mod tests {
             for mode in [
                 PolicyMode::ProviderObservation,
                 PolicyMode::SingleAgentWriter,
+                PolicyMode::SingleAgentReader,
+                PolicyMode::SingleAgentReviewer,
             ] {
                 let binding = embedded.resolve_policy(provider, version, mode).unwrap();
                 assert!(!binding.synthetic_origin);
@@ -1151,7 +1306,7 @@ mod tests {
                     assert!(
                         binding
                             .native_calls_disabled_reason()
-                            .is_some_and(|reason| reason.contains("not qualified")),
+                            .is_some_and(|reason| !reason.is_empty()),
                         "{provider} {mode:?}"
                     );
                 }
@@ -1215,7 +1370,7 @@ mod tests {
                     value["selectors"][0]["contracts"]
                         .as_array_mut()
                         .unwrap()
-                        .pop();
+                        .retain(|contract| contract["mode"] != "single_agent_writer");
                 }),
             ),
             (

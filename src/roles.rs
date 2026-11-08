@@ -951,6 +951,7 @@ impl RoleService {
             attempt,
             transcript_epoch,
             resume_invocation,
+            message_revision,
         ): (
             String,
             String,
@@ -961,6 +962,7 @@ impl RoleService {
             String,
             String,
             Option<String>,
+            i64,
         ) = {
             let connection = self.store.lock()?;
             let delivery = connection
@@ -969,7 +971,7 @@ impl RoleService {
                        s.transcript_epoch,
                        (SELECT ri.id FROM resume_invocations ri
                         WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
-                        ORDER BY ri.resume_ordinal DESC LIMIT 1)
+                        ORDER BY ri.resume_ordinal DESC LIMIT 1),g.message_revision
                      FROM guidance_messages g
                  JOIN sessions s ON s.role_generation_id=g.role_generation_id
                  JOIN attempts a ON a.id=g.attempt_id JOIN tasks t ON t.id=a.task_id
@@ -988,6 +990,7 @@ impl RoleService {
                             row.get(6)?,
                             row.get(7)?,
                             row.get(8)?,
+                            row.get(9)?,
                         ))
                     },
                 )
@@ -1087,8 +1090,19 @@ impl RoleService {
                 &transcript_epoch,
                 resume_invocation.as_deref(),
                 &submitted,
+                message_revision,
             ) {
-                Ok(reserved) => reserved,
+                Ok(crate::store::GuidanceReservation::Reserved) => true,
+                Ok(
+                    outcome @ (crate::store::GuidanceReservation::Edited
+                    | crate::store::GuidanceReservation::Cancelled),
+                ) => {
+                    let cancelled = outcome == crate::store::GuidanceReservation::Cancelled;
+                    return Ok(Some(
+                        serde_json::json!({"action":if cancelled {"guidance_cancelled"} else {"guidance_deferred"},"guidance_id":guidance_id,"attempt_id":attempt,"session_id":session,"state":if cancelled {"cancelled"} else {"queued"},"reason":"human_guidance_changed_before_reservation"}),
+                    ));
+                }
+                Ok(crate::store::GuidanceReservation::Conflict) => false,
                 Err(error) => {
                     return match crate::store::ProviderFailureHeld::in_error(&error) {
                         Some(held) => Ok(Some(held_queued(held))),
@@ -1250,8 +1264,10 @@ impl RoleService {
                 )
             })?;
             if let Some(outcome) = outcome {
-                let delivered =
-                    outcome.get("state").and_then(|state| state.as_str()) != Some("queued");
+                let delivered = match outcome.get("action").and_then(|action| action.as_str()) {
+                    Some("guidance_cancelled" | "guidance_deferred" | "guidance_queued") => false,
+                    _ => outcome.get("state").and_then(|state| state.as_str()) != Some("queued"),
+                };
                 outcomes.push(outcome);
                 if delivered {
                     break;

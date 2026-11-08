@@ -1,6 +1,7 @@
 import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import { ApiError, command, operationId } from "../api";
+import { SingleAgentSelectionFields, emptySingleAgentSelection, type SingleAgentSelection } from "./RoleSettings";
 import {
   type AppState,
   type ProfileSet,
@@ -28,6 +29,8 @@ type ProfileDraft = {
   roles: Record<Role, RoleConfig>;
 };
 type RecipeDraft = {
+  family?: "trip" | "single_agent";
+  selection?: SingleAgentSelection;
   id?: string;
   version?: number;
   name: string;
@@ -72,6 +75,7 @@ const commandFields: Record<string, string[]> = {
   upsert_profile_set: ["profile_set_id", "expected_version", "name", "roles"],
   archive_profile_set: ["profile_set_id", "expected_version"],
   upsert_task_recipe: ["recipe_id", "expected_version", "name", "title", "description", "acceptance_criteria", "priority", "profile_revision_id", "required_check_ids"],
+  upsert_single_agent_recipe: ["recipe_id", "expected_version", "recipe"],
   archive_task_recipe: ["recipe_id", "expected_version"],
   create_draft_from_recipe: ["recipe_id", "recipe_revision_id", "expected_recipe_version"],
   upsert_recipe_schedule: ["schedule_id", "expected_version", "name", "recipe_revision_id", "cadence", "anchor_utc"],
@@ -120,6 +124,13 @@ const validPending = (value: unknown): value is PendingRecipeCommand => {
           !["codex", "claude"].includes(String(fields.provider)) ||
           typeof fields.model !== "string" || typeof fields.effort !== "string";
       }))) return false;
+  if (body.kind === "upsert_single_agent_recipe") {
+    if (!body.recipe || typeof body.recipe !== "object" || Array.isArray(body.recipe)) return false;
+    const recipe = body.recipe as Record<string, unknown>;
+    if (["name", "title", "description"].some((key) => typeof recipe[key] !== "string") || !Number.isSafeInteger(recipe.priority) || !Array.isArray(recipe.acceptance_criteria) || recipe.acceptance_criteria.some((item) => typeof item !== "string") || !recipe.selection || typeof recipe.selection !== "object" || Array.isArray(recipe.selection)) return false;
+    const selection = recipe.selection as Record<string, unknown>;
+    if (selection.family !== "single_agent" || selection.workspace_mode !== "isolated_worktree" || typeof selection.execution_config_revision_id !== "string" || typeof selection.profile_revision_id !== "string" || !Array.isArray(selection.check_ids) || selection.check_ids.some((id) => typeof id !== "string") || (selection.preset !== undefined && !["single_agent", "repository_research", "build_and_review"].includes(String(selection.preset))) || (selection.reviewer_profile_revision_id !== undefined && typeof selection.reviewer_profile_revision_id !== "string")) return false;
+  }
   if (body.kind === "upsert_task_recipe" &&
     (["name", "title", "description", "profile_revision_id"].some((field) => typeof body[field] !== "string") ||
       !Array.isArray(body.acceptance_criteria) || body.acceptance_criteria.some((item) => typeof item !== "string") ||
@@ -178,6 +189,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
   const [pending, setPending] = useState(false);
   const identities = useRef(new Map<string, string>());
   const projectId = project?.id;
+  const execution = state.workflow_execution?.find((item) => item.project_id === projectId);
   const [formProjectId, setFormProjectId] = useState(projectId);
   // Aborted on unmount or project change: a request already sent still
   // settles its journal entry, but no longer updates this form or navigates.
@@ -324,6 +336,21 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
               JSON.stringify(entry.body.acceptance_criteria) &&
             JSON.stringify(draft.checkIds) === JSON.stringify(entry.body.required_check_ids),
         ));
+        if (entry.body.kind === "upsert_single_agent_recipe") setRecipe((draft) => {
+          const saved = entry.body.recipe as Record<string, unknown>;
+          const selection = saved.selection as Record<string, unknown>;
+          const current = draft.selection;
+          return apply(draft, entry.body.recipe_id,
+            draft.family === "single_agent" && draft.name === saved.name &&
+            draft.title === saved.title && draft.description === saved.description &&
+            draft.priority === saved.priority &&
+            JSON.stringify(draft.criteria.split("\n").map((text) => text.trim()).filter(Boolean)) === JSON.stringify(saved.acceptance_criteria) &&
+            (current?.preset ?? "single_agent") === (selection.preset ?? "single_agent") &&
+            current?.execution_config_revision_id === selection.execution_config_revision_id &&
+            current?.profile_revision_id === selection.profile_revision_id &&
+            current?.reviewer_profile_revision_id === selection.reviewer_profile_revision_id &&
+            JSON.stringify(current?.check_ids) === JSON.stringify(selection.check_ids));
+        });
         if (entry.body.kind === "upsert_recipe_schedule") setSchedule((draft) => apply(
           draft, entry.body.schedule_id,
           draft.name === entry.body.name && draft.recipeRevisionId === entry.body.recipe_revision_id &&
@@ -355,6 +382,8 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
   };
   const chooseRecipe = (item: TaskRecipe) => {
     setRecipe({
+      family: item.family ?? "trip",
+      selection: item.family === "single_agent" ? { preset: item.preset, execution_config_revision_id: item.execution_config_revision_id ?? "", profile_revision_id: item.primary_profile_revision_id ?? "", reviewer_profile_revision_id: item.reviewer_profile_revision_id ?? undefined, check_ids: item.required_check_ids } : undefined,
       id: item.id,
       version: item.version,
       name: item.name,
@@ -365,7 +394,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
       profileRevisionId: profiles.some((profile) =>
           profile.revision_id === item.profile_revision_id && !profile.archived
         )
-        ? item.profile_revision_id
+        ? item.profile_revision_id ?? ""
         : "",
       checkIds: [],
     });
@@ -401,7 +430,10 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
     }
   };
   const saveRecipe = async () => {
-    const result = await submit({
+    const result = await submit(recipe.family === "single_agent" ? {
+      kind: "upsert_single_agent_recipe", recipe_id: recipe.id ?? null, expected_version: recipe.version ?? null,
+      recipe: { name: recipe.name, title: recipe.title, description: recipe.description, acceptance_criteria: recipe.criteria.split("\n").map((text) => text.trim()).filter(Boolean), priority: recipe.priority, selection: { family: "single_agent", workspace_mode: "isolated_worktree", ...(recipe.selection ?? emptySingleAgentSelection(execution)) } },
+    } : {
       kind: "upsert_task_recipe",
       recipe_id: recipe.id ?? null,
       expected_version: recipe.version ?? null,
@@ -473,7 +505,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
           enter the queue.
         </p>
       )}
-      {!ready && (
+      {!ready && recipe.family !== "single_agent" && (
         <p className="warning">
           Activate this project’s TRIP configuration before saving or creating
           recipes.
@@ -624,10 +656,11 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
               <strong>{item.name}</strong> · revision {item.revision} ·{" "}
               {item.archived ? "Archived" : "Available"}
               <p className="hint">
-                Pinned configuration {item.config_revision_id} · workflow{" "}
+                {item.family === "single_agent" ? (item.preset ?? "single_agent").replaceAll("_", " ") : "TRIP"} · Pinned configuration {item.execution_config_revision_id ?? item.config_revision_id} · workflow{" "}
                 {item.workflow_version} · hash {item.workflow_hash.slice(0, 12)}
               </p>
-              {item.config_revision_id !== currentConfig && (
+              {item.revisions && <details><summary>Saved revisions and pins</summary><ul>{item.revisions.map((revision) => <li key={revision.id}>Revision {revision.revision} · {revision.family === "single_agent" ? revision.preset.replaceAll("_", " ") : "TRIP"} · {revision.workflow_version}<small>Configuration {revision.execution_config_revision_id ?? "TRIP pinned configuration"} · Primary {revision.primary_profile_revision_id ?? "TRIP profile set"}{revision.reviewer_profile_revision_id ? ` · Reviewer ${revision.reviewer_profile_revision_id}` : ""}</small></li>)}</ul></details>}
+              {item.family !== "single_agent" && item.config_revision_id !== currentConfig && (
                 <p className="warning">
                   Pinned configuration is superseded. Save a current profile set
                   and recipe before creating a draft.
@@ -641,8 +674,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
                   Edit
                 </button>
                 <button
-                  disabled={!ready || item.archived ||
-                    item.config_revision_id !== currentConfig || pending}
+                  disabled={item.archived || pending || (item.family !== "single_agent" && (!ready || item.config_revision_id !== currentConfig))}
                   onClick={async () => {
                     const result = await submit({
                       kind: "create_draft_from_recipe",
@@ -673,6 +705,8 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
           ))}
         </div>
         <h3>{recipe.id ? "Edit recipe" : "New recipe"}</h3>
+        <label>Workflow<select value={recipe.family ?? "trip"} onChange={(event) => setRecipe({ ...recipe, family: event.target.value as "trip" | "single_agent", selection: emptySingleAgentSelection(execution) })}><option value="trip">TRIP</option><option value="single_agent">Single agent presets</option></select></label>
+        {recipe.family === "single_agent" && <SingleAgentSelectionFields execution={execution} value={recipe.selection ?? emptySingleAgentSelection(execution)} onChange={(selection) => setRecipe({ ...recipe, selection })} disabled={pending} />}
         <label>
           Name{" "}
           <input
@@ -714,7 +748,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
               setRecipe({ ...recipe, priority: Number(event.target.value) })}
           />
         </label>
-        <label>
+        {recipe.family !== "single_agent" && <><label>
           Profile revision{" "}
           <select
             value={recipe.profileRevisionId}
@@ -754,10 +788,11 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
           The active configuration and workflow are pinned on save. Check
           selection here constrains the Manager’s later selection; it creates no
           selected-check rows.
-        </p>
+        </p></>}
+        {recipe.family === "single_agent" && <p className="hint">Saving pins the exact definition, configuration, profile revisions and checks. Creating from a recipe or schedule makes a draft; you still choose Make Ready.</p>}
         <div className="button-row">
           <button
-            disabled={!ready || !recipe.profileRevisionId || pending}
+            disabled={pending || (recipe.family === "single_agent" ? !recipe.selection?.profile_revision_id || (recipe.selection.preset === "build_and_review" && !recipe.selection.reviewer_profile_revision_id) : !ready || !recipe.profileRevisionId)}
             onClick={() => void saveRecipe()}
           >
             Save recipe
@@ -785,7 +820,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
               <p>
                 Pinned recipe: {item.recipe_name}
                 {item.recipe_archived ? " (archived; cannot enable)" : ""}
-                {item.recipe_config_revision_id !== currentConfig
+                {item.recipe_family !== "single_agent" && item.recipe_config_revision_id !== currentConfig
                   ? " (configuration superseded; save a current recipe and edit this schedule)"
                   : ""}
               </p>
@@ -815,8 +850,8 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
                 <button
                   disabled={item.archived || pending ||
                     (item.paused &&
-                      (!ready || item.recipe_archived ||
-                        item.recipe_config_revision_id !== currentConfig))}
+                      (item.recipe_archived || (item.recipe_family !== "single_agent" &&
+                        (!ready || item.recipe_config_revision_id !== currentConfig))))}
                   onClick={() =>
                     void submit({
                       kind: item.paused
@@ -864,7 +899,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
           >
             <option value="">Select a recipe revision</option>
             {recipes.filter((item) =>
-              !item.archived && item.config_revision_id === currentConfig
+              !item.archived && (item.family === "single_agent" || item.config_revision_id === currentConfig)
             ).map((item) => (
               <option key={item.revision_id} value={item.revision_id}>
                 {item.name} · revision {item.revision}
@@ -902,7 +937,8 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
         )}
         <div className="button-row">
           <button
-            disabled={!ready || !schedule.recipeRevisionId || pending}
+            disabled={!schedule.recipeRevisionId || pending ||
+              (!ready && !recipes.some((item) => item.revision_id === schedule.recipeRevisionId && item.family === "single_agent"))}
             onClick={() => void saveSchedule()}
           >
             Save schedule

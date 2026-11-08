@@ -10,6 +10,7 @@ import {
   command,
   operation,
   reuseOperationIdentity,
+  taskActivity,
 } from "../api";
 import {
   type AppState,
@@ -19,9 +20,9 @@ import {
   type CmuxViewOutcome,
   type PermissionRequest,
   type Role,
+  roleLabel,
   ROLES,
   type Session,
-  roleLabel,
   type Task,
   type TaskAction,
   type TaskProgress,
@@ -54,6 +55,7 @@ import { StatusBadge, taskStatus, taskSteps } from "./TaskBoard";
 import { useDialogFocus } from "../useDialogFocus";
 import { useTaskContent } from "../useTaskContent";
 import { PlanViewer } from "./PlanViewer";
+import { withStorageLock } from "../storageCoordination";
 import {
   CurrentInputReport,
   inputAuthor,
@@ -69,6 +71,60 @@ const TABS: Array<{ id: TaskTab; label: string }> = [
   { id: "roles", label: "Roles" },
   { id: "activity", label: "Activity" },
 ];
+
+type TaskCommandIdentity = { body: string; id: string };
+
+function readTaskJournal(storageKey: string): Map<string, TaskCommandIdentity> {
+  const invalid = (cause?: unknown) => new Error(
+    "Saved task requests could not be read. Refresh and check their outcomes before retrying.",
+    { cause },
+  );
+  let entries: unknown;
+  try {
+    const raw = localStorage.getItem(storageKey);
+    if (raw === null) return new Map();
+    entries = JSON.parse(raw);
+  } catch (cause) {
+    throw invalid(cause);
+  }
+  if (!Array.isArray(entries)) throw invalid();
+  const journal = new Map<string, TaskCommandIdentity>();
+  for (const entry of entries) {
+    if (!Array.isArray(entry) || entry.length !== 2) throw invalid();
+    const [key, identity] = entry;
+    if (
+      typeof key !== "string" || !key.trim() || journal.has(key) ||
+      !identity || typeof identity !== "object" ||
+      typeof identity.id !== "string" || !identity.id.trim() ||
+      typeof identity.body !== "string"
+    ) throw invalid();
+    let body: unknown;
+    try {
+      body = JSON.parse(identity.body);
+    } catch {
+      throw invalid();
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body) ||
+      !("kind" in body) || typeof body.kind !== "string" ||
+      !body.kind.trim()) throw invalid();
+    journal.set(key, { id: identity.id, body: identity.body });
+  }
+  return journal;
+}
+
+function writeTaskJournal(
+  storageKey: string,
+  journal: Map<string, TaskCommandIdentity>,
+): void {
+  try {
+    localStorage.setItem(storageKey, JSON.stringify([...journal]));
+  } catch (cause) {
+    throw new Error(
+      "Your task request could not be saved for recovery. Check browser storage, then refresh and check the outcome before retrying.",
+      { cause },
+    );
+  }
+}
 
 function PhaseProgress({ task }: { task: Task }) {
   const { steps, current } = taskSteps(task);
@@ -348,20 +404,8 @@ export function TaskDetail(
     target?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [recoveryFocus, tab]);
   const operationStorageKey = `llmrelay.task.operations.${task.id}`;
-  const commandIdentities = useRef(
-    new Map<string, { body: string; id: string }>(
-      (() => {
-        try {
-          const value = JSON.parse(
-            localStorage.getItem(operationStorageKey) || "[]",
-          );
-          return Array.isArray(value) ? value : [];
-        } catch {
-          return [];
-        }
-      })(),
-    ),
-  );
+  const commandIdentities = useRef(new Map<string, TaskCommandIdentity>());
+  const requestLifetime = useRef(new AbortController());
   const attempt = task.active_attempt;
   const singleAgent = isSingleAgentTask(task);
   const singleAgentRun = singleAgent ? task.workflow?.run ?? null : null;
@@ -430,8 +474,243 @@ export function TaskDetail(
   const askedBy = currentInput?.state === "available"
     ? inputAuthor(currentInput)
     : undefined;
+  const [commentDraft, setCommentDraft] = useState("");
+  const [editGuidance, setEditGuidance] = useState<string>();
+  const [editBody, setEditBody] = useState("");
+  const [activityPage, setActivityPage] = useState<
+    import("../types").TaskActivityPage
+  >();
+  const [activityError, setActivityError] = useState("");
+  const activityEpoch = useRef(0);
+  const activityLoad = useRef(false);
+  const activityRefresh = useRef(false);
+  const activityTask = useRef(task.id);
+  activityTask.current = task.id;
+  const interactionPending = useRef(new Set<string>());
+  const draftVersion = useRef(0);
+  const [interactionBusy, setInteractionBusy] = useState(false);
+  const draftRef = useRef({
+    task: task.id,
+    comment: commentDraft,
+    edit: editBody,
+  });
+  draftRef.current = { task: task.id, comment: commentDraft, edit: editBody };
+  useEffect(() => {
+    const controller = new AbortController();
+    requestLifetime.current = controller;
+    activityEpoch.current += 1;
+    activityLoad.current = false;
+    activityRefresh.current = false;
+    setActivityPage(undefined);
+    setActivityError("");
+    setCommentDraft("");
+    setEditGuidance(undefined);
+    setInteractionBusy(false);
+    queueGuard.current = false;
+    queueRequestPending.current = false;
+    setQueueBusy(false);
+    try {
+      commandIdentities.current = readTaskJournal(operationStorageKey);
+    } catch (cause) {
+      commandIdentities.current = new Map();
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+    return () => {
+      controller.abort();
+      activityEpoch.current += 1;
+    };
+  }, [task.id]);
+  const refreshActivity = async () => {
+    if (activityLoad.current) {
+      activityRefresh.current = true;
+      return;
+    }
+    activityLoad.current = true;
+    const epoch = activityEpoch.current;
+    const taskId = task.id;
+    try {
+      const page = await taskActivity(taskId);
+      if (epoch !== activityEpoch.current || activityTask.current !== taskId) {
+        return;
+      }
+      setActivityPage((prior) => {
+        if (!prior || !page.events.some((event) =>
+          prior.events.some((older) => older.id === event.id)
+        )) return page;
+        const events = [...page.events, ...(prior?.events || [])];
+        return {
+          ...page,
+          next_cursor: prior.next_cursor,
+          events: events.filter((event, index) =>
+            events.findIndex((other) => other.id === event.id) === index
+          ),
+        };
+      });
+      setActivityError("");
+    } catch (cause) {
+      if (epoch === activityEpoch.current && activityTask.current === taskId) {
+        setActivityError(String(cause));
+      }
+    } finally {
+      if (epoch === activityEpoch.current && activityTask.current === taskId) {
+        activityLoad.current = false;
+        if (activityRefresh.current) {
+          activityRefresh.current = false;
+          void refreshActivity();
+        }
+      }
+    }
+  };
+  useEffect(() => {
+    if (tab === "activity") void refreshActivity();
+  }, [task.id, state.history, tab]);
+  const loadOlderActivity = async () => {
+    const cursor = activityPage?.next_cursor;
+    if (!cursor || activityLoad.current) return;
+    activityLoad.current = true;
+    const epoch = activityEpoch.current;
+    const taskId = task.id;
+    try {
+      const page = await taskActivity(taskId, cursor);
+      if (epoch !== activityEpoch.current || activityTask.current !== taskId) {
+        return;
+      }
+      setActivityPage((prior) => {
+        if (!prior || prior.next_cursor !== cursor) return prior;
+        const events = [...prior.events, ...page.events];
+        return {
+          ...page,
+          events: events.filter((event, index) =>
+            events.findIndex((other) => other.id === event.id) === index
+          ),
+        };
+      });
+      setActivityError("");
+    } catch (cause) {
+      if (epoch === activityEpoch.current && activityTask.current === taskId) {
+        setActivityError(String(cause));
+      }
+    } finally {
+      if (epoch === activityEpoch.current && activityTask.current === taskId) {
+        activityLoad.current = false;
+        if (activityRefresh.current) {
+          activityRefresh.current = false;
+          void refreshActivity();
+        }
+      }
+    }
+  };
+  const executeTaskRequest = async (
+    key: string,
+    body: Record<string, unknown>,
+    interaction: boolean,
+    send: (request: never) => Promise<unknown> = command,
+    savedRequest?: TaskCommandIdentity,
+  ) => {
+    const signal = requestLifetime.current.signal;
+    const taskId = task.id;
+    const requestEpoch = activityEpoch.current;
+    const currentView = () => !signal.aborted &&
+      activityTask.current === taskId && activityEpoch.current === requestEpoch;
+    if (!currentView() || (interaction && interactionPending.current.has(key))) {
+      return false;
+    }
+    if (interaction) {
+      interactionPending.current.add(key);
+      setInteractionBusy(true);
+    }
+    try {
+      const publish = () => {
+        const journal = readTaskJournal(operationStorageKey);
+        const prior = journal.get(key);
+        if (savedRequest) {
+          if (currentView()) commandIdentities.current = journal;
+          if (prior?.id !== savedRequest.id || prior.body !== savedRequest.body) {
+            throw new Error(
+              "This saved request changed or was already reconciled in another window. Refresh and check its outcome before submitting again.",
+            );
+          }
+          return {
+            identity: savedRequest,
+            request: JSON.parse(savedRequest.body) as Record<string, unknown>,
+            unresolvedReplay: true,
+          };
+        }
+        if (interaction && prior && prior.body !== JSON.stringify(body)) {
+          throw new Error(
+            "An earlier request is unresolved. Refresh and check its outcome before changing this submission.",
+          );
+        }
+        const { id, request } = reuseOperationIdentity(prior, body);
+        const identity = { id, body: JSON.stringify(request) };
+        journal.set(key, identity);
+        writeTaskJournal(operationStorageKey, journal);
+        if (currentView()) commandIdentities.current = journal;
+        return { identity, request, unresolvedReplay: prior?.id === id };
+      };
+      const published = key
+        ? await withStorageLock(operationStorageKey, publish, signal)
+        : (() => {
+          const { id, request } = reuseOperationIdentity(undefined, body);
+          return {
+            identity: { id, body: JSON.stringify(request) },
+            request,
+            unresolvedReplay: false,
+          };
+        })();
+      if (!published || !currentView()) return false;
+      const settle = () => withStorageLock(operationStorageKey, () => {
+        const journal = readTaskJournal(operationStorageKey);
+        const saved = journal.get(key);
+        if (saved?.id !== published.identity.id ||
+          saved.body !== published.identity.body) return;
+        journal.delete(key);
+        writeTaskJournal(operationStorageKey, journal);
+        if (currentView()) commandIdentities.current = journal;
+      });
+      try {
+        await send({
+          ...published.request,
+          operation_id: published.identity.id,
+        } as never);
+      } catch (cause) {
+        // Refusing a replay cannot settle the original request's unknown outcome.
+        if (key && !published.unresolvedReplay &&
+          cause instanceof ApiError && !cause.ambiguous) {
+          try {
+            await settle();
+          } catch {
+            // Preserve the saved evidence and report the original refusal.
+          }
+        }
+        throw cause;
+      }
+      // A sent request settles only its own entry, even after navigation.
+      if (key) await settle();
+      if (!currentView()) return false;
+      setError("");
+      onChanged();
+      return true;
+    } catch (cause) {
+      if (!currentView()) return false;
+      setError(cause instanceof Error ? cause.message : String(cause));
+      onChanged();
+      return false;
+    } finally {
+      if (interaction) {
+        interactionPending.current.delete(key);
+        if (currentView()) setInteractionBusy(false);
+      }
+    }
+  };
   const apply = async (body: Record<string, unknown>) => {
-    const key = body.kind === "trip"
+    const interaction = ["edit_guidance", "cancel_guidance", "add_task_comment"]
+      .includes(String(body.kind));
+    const key = interaction
+      ? `${String(body.kind)}:${task.id}:${
+        String(body.guidance_id || "comment-draft")
+      }`
+      : body.kind === "trip"
       ? `${String(body.action)}:${
         String(body.attempt_id || body.task_id || "")
       }:${String(body.check_id || "")}`
@@ -447,40 +726,12 @@ export function TaskDetail(
         String(body.depends_on_task_id || "")
       }`
       : "";
-    const prior = key ? commandIdentities.current.get(key) : undefined;
-    const stable = reuseOperationIdentity(prior, body);
-    const { id, request } = stable;
-    if (key) {
-      commandIdentities.current.set(key, {
-        body: JSON.stringify(request),
-        id,
-      });
-    }
-    if (key) {
-      localStorage.setItem(
-        operationStorageKey,
-        JSON.stringify([...commandIdentities.current]),
-      );
-    }
-    try {
-      await command({ ...request, operation_id: id } as never);
-      if (key) commandIdentities.current.delete(key);
-      if (key) {
-        localStorage.setItem(
-          operationStorageKey,
-          JSON.stringify([...commandIdentities.current]),
-        );
-      }
-      setError("");
-      onChanged();
-      return true;
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-      return false;
-    }
+    return executeTaskRequest(key, body, interaction);
   };
   const queueMutation = async (body: Record<string, unknown>) => {
     if (queueGuard.current) return;
+    const signal = requestLifetime.current.signal;
+    const taskId = task.id;
     queueGuard.current = true;
     queueRequestPending.current = true;
     setQueueBusy(true);
@@ -488,15 +739,16 @@ export function TaskDetail(
     try {
       applied = await apply(body);
     } catch (cause) {
+      if (signal.aborted || activityTask.current !== taskId) return;
       setError(cause instanceof Error ? cause.message : String(cause));
     }
+    if (signal.aborted || activityTask.current !== taskId) return;
     queueRequestPending.current = false;
     if (!applied || currentTaskVersion.current !== task.version) {
       queueGuard.current = false;
       setQueueBusy(false);
     }
     if (applied && body.kind === "delete_draft_task") {
-      localStorage.removeItem(operationStorageKey);
       onClose();
     }
   };
@@ -677,6 +929,88 @@ export function TaskDetail(
   const overview = (
     <div className="task-overview">
       <div className="task-overview-main">
+        {guidance.length > 0 && (
+          <section className="panel">
+            <h4>Your replies</h4>
+            <ul className="guidance-history">
+              {guidance.map((item) => (
+                <li key={String(item.id)}>
+                  <span>{String(item.body)}</span>
+                  <em>{guidanceState(String(item.state))}</em>
+                  {item.state === "queued" && !item.report_reminder &&
+                      [
+                        "awaiting_supported_idle_boundary",
+                        "human_guidance_edited",
+                      ].includes(String(item.reason)) &&
+                      !item.delivery_session_id && item.unsubmitted === true &&
+                      managerGeneration === item.role_generation_id
+                    ? (
+                      <>
+                        <button
+                          onClick={() => {
+                            setEditGuidance(String(item.id));
+                            setEditBody(String(item.body));
+                            draftVersion.current += 1;
+                          }}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          onClick={() =>
+                            apply({
+                              kind: "cancel_guidance",
+                              task_id: task.id,
+                              guidance_id: item.id,
+                              expected_revision: item.message_revision,
+                              expected_version: task.version,
+                            })}
+                        >
+                          Cancel
+                        </button>
+                        {editGuidance === item.id && (
+                          <>
+                            <textarea
+                              value={editBody}
+                              onChange={(event) => {
+                                setEditBody(event.target.value);
+                                draftVersion.current += 1;
+                              }}
+                            />
+                            <button
+                              onClick={async () => {
+                                const revision = draftVersion.current;
+                                if (
+                                  await apply({
+                                    kind: "edit_guidance",
+                                    task_id: task.id,
+                                    guidance_id: item.id,
+                                    expected_revision: item.message_revision,
+                                    expected_version: task.version,
+                                    body: editBody,
+                                  }) && draftRef.current.task === task.id &&
+                                  draftRef.current.edit === editBody &&
+                                  draftVersion.current === revision
+                                ) setEditGuidance(undefined);
+                              }}
+                            >
+                              Save guidance
+                            </button>
+                          </>
+                        )}
+                      </>
+                    )
+                    : (
+                      <small>
+                        Only queued, unreserved, unsubmitted guidance for the
+                        current manager can be changed.
+                      </small>
+                    )}
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
         <section className="panel" aria-labelledby="task-summary-title">
           <h3 id="task-summary-title">Summary</h3>
           <ObservedUsageDetails usage={task.observed_usage} label="Task" />
@@ -857,19 +1191,6 @@ export function TaskDetail(
                   in Controls below.
                 </p>
               )}
-            {guidance.length > 0 && (
-              <>
-                <h4>Your replies</h4>
-                <ul className="guidance-history">
-                  {guidance.slice(0, 3).map((item) => (
-                    <li key={String(item.id)}>
-                      <span>{String(item.body)}</span>
-                      <em>{guidanceState(String(item.state))}</em>
-                    </li>
-                  ))}
-                </ul>
-              </>
-            )}
           </section>
         )}
         {planRequestProblem && (
@@ -1185,47 +1506,7 @@ export function TaskDetail(
                           };
                           const key =
                             `check_run:${body.attempt_id}:${body.check_id}`;
-                          const stable = reuseOperationIdentity(
-                            commandIdentities.current.get(key),
-                            body,
-                          );
-                          const { id, request } = stable;
-                          commandIdentities.current.set(key, {
-                            body: JSON.stringify(request),
-                            id,
-                          });
-                          localStorage.setItem(
-                            operationStorageKey,
-                            JSON.stringify([...commandIdentities.current]),
-                          );
-                          void operation(
-                            { ...request, operation_id: id } as never,
-                          ).then(() => {
-                            commandIdentities.current.delete(key);
-                            localStorage.setItem(
-                              operationStorageKey,
-                              JSON.stringify([...commandIdentities.current]),
-                            );
-                            onChanged();
-                          }).catch((cause) => {
-                            if (
-                              !(cause instanceof ApiError && cause.ambiguous)
-                            ) {
-                              commandIdentities.current.delete(key);
-                              localStorage.setItem(
-                                operationStorageKey,
-                                JSON.stringify([...commandIdentities.current]),
-                              );
-                            }
-                            setError(
-                              cause instanceof ApiError && cause.ambiguous
-                                ? `${cause.message} Refresh and reconcile before retrying.`
-                                : cause instanceof Error
-                                ? cause.message
-                                : String(cause),
-                            );
-                            onChanged();
-                          });
+                          void executeTaskRequest(key, body, false, operation);
                         }}
                       >
                         {selection.authorization.action_state ===
@@ -1367,7 +1648,7 @@ export function TaskDetail(
         />
       </section>
       <section className="panel">
-        <h3>Reports</h3>
+        <h3 id="task-activity-reports">Reports</h3>
         <ReportList
           content={content}
           error={contentError}
@@ -1391,16 +1672,107 @@ export function TaskDetail(
           ))}
         </details>
       )}
-      <details className="panel">
-        <summary>Task history</summary>
+      <section className="panel">
+        <h3>Task Activity</h3>
+        {[...commandIdentities.current].filter(([key]) =>
+          ["edit_guidance:", "cancel_guidance:", "add_task_comment:"].some((
+            prefix,
+          ) => key.startsWith(prefix))
+        ).map(([key, saved]) => (
+          <div key={key}>
+            <p>
+              A saved request needs reconciliation. Check the current task
+              before retrying this exact submission.
+            </p>
+            <TechnicalDetails>
+              <pre>{saved.body}</pre>
+            </TechnicalDetails>
+            <button
+              onClick={() =>
+                executeTaskRequest(
+                  key,
+                  JSON.parse(saved.body) as Record<string, unknown>,
+                  true,
+                  command,
+                  saved,
+                )}
+            >
+              Retry saved request
+            </button>
+          </div>
+        ))}
+        <label>
+          Human note<textarea
+            value={commentDraft}
+            onChange={(event) => {
+              setCommentDraft(event.target.value);
+              draftVersion.current += 1;
+            }}
+          />
+        </label>
+        <button
+          disabled={interactionBusy || !commentDraft.trim()}
+          onClick={async () => {
+            const revision = draftVersion.current;
+            if (
+              await apply({
+                kind: "add_task_comment",
+                task_id: task.id,
+                body: commentDraft,
+              })
+            ) {
+              if (
+                draftRef.current.task === task.id &&
+                draftRef.current.comment === commentDraft &&
+                draftVersion.current === revision
+              ) setCommentDraft("");
+              void refreshActivity();
+            }
+          }}
+        >
+          Add comment
+        </button>
+        <p>
+          Comments are human notes. They do not send instructions or approve
+          work.
+        </p>
+        {activityError && <ErrorNotice error={activityError} />}
         <ActivityTimeline
           tasks={state.tasks}
-          events={state.history.filter((event) =>
-            event.entity_id === task.id || event.entity_id === attempt?.id ||
-            taskSessions.some((session) => session.id === event.entity_id)
-          )}
+          events={activityPage?.events || []}
+          limit={activityPage?.events.length || 40}
+          references={Object.fromEntries([
+            ...(content?.records || []).filter((record) =>
+              record.kind === "report"
+            ).map((record) =>
+              [`role_result:${record.id}`, {
+                label: "Open recorded report",
+                open: () =>
+                  document.getElementById("task-activity-reports")
+                    ?.scrollIntoView({ block: "start" }),
+              }] as const
+            ),
+            ...checks.map((check) =>
+              [`check_run:${check.id}`, {
+                label: "Open checks",
+                open: () => chooseTab(singleAgent ? "overview" : "checks"),
+              }] as const
+            ),
+            ...(singleAgent ? [] : task.reviews).map((review) =>
+              [`review_request:${review.id}`, {
+                label: "Open reviews",
+                open: () => chooseTab("checks"),
+              }] as const
+            ),
+          ])}
         />
-      </details>
+        {activityPage?.historical_associations_incomplete && (
+          <p>Older events with no recorded task association are unavailable.</p>
+        )}
+        {activityPage?.next_cursor && (
+          <button onClick={loadOlderActivity}>Load older</button>
+        )}
+      </section>
       {task.recipe_provenance && (
         <section className="panel">
           <h3>Created from a TRIP recipe</h3>
@@ -1424,7 +1796,7 @@ export function TaskDetail(
             <p>
               Exact recipe revision {task.recipe_provenance.recipe_revision_id}
               {" "}
-              · profile revision {task.recipe_provenance.profile_revision_id}
+              · {task.recipe_provenance.family === "single_agent" ? `${(task.recipe_provenance.preset ?? "single_agent").replaceAll("_", " ")} · primary ${task.recipe_provenance.primary_profile_revision_id}${task.recipe_provenance.reviewer_profile_revision_id ? ` · reviewer ${task.recipe_provenance.reviewer_profile_revision_id}` : ""}` : `profile revision ${task.recipe_provenance.profile_revision_id}`}
               {task.recipe_provenance.schedule_id
                 ? ` · schedule ${task.recipe_provenance.schedule_id} at ${task.recipe_provenance.scheduled_for_utc}`
                 : ""}

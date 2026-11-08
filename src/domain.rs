@@ -406,6 +406,87 @@ impl FromStr for WorkflowFamily {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum SingleAgentPreset {
+    #[default]
+    SingleAgent,
+    RepositoryResearch,
+    BuildAndReview,
+}
+
+impl SingleAgentPreset {
+    pub fn is_legacy(&self) -> bool {
+        *self == Self::SingleAgent
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleAgent => "single_agent",
+            Self::RepositoryResearch => "repository_research",
+            Self::BuildAndReview => "build_and_review",
+        }
+    }
+    pub fn primary_purpose(self) -> ProfilePurpose {
+        match self {
+            Self::RepositoryResearch => ProfilePurpose::RepositoryReader,
+            Self::SingleAgent | Self::BuildAndReview => ProfilePurpose::WorkspaceWriter,
+        }
+    }
+}
+
+impl FromStr for SingleAgentPreset {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "single_agent" => Ok(Self::SingleAgent),
+            "repository_research" => Ok(Self::RepositoryResearch),
+            "build_and_review" => Ok(Self::BuildAndReview),
+            _ => Err(format!("Unknown Single agent preset {value:?}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfilePurpose {
+    #[default]
+    WorkspaceWriter,
+    RepositoryReader,
+    RepositoryReviewer,
+}
+
+impl ProfilePurpose {
+    pub fn is_writer(&self) -> bool {
+        *self == Self::WorkspaceWriter
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkspaceWriter => "workspace_writer",
+            Self::RepositoryReader => "repository_reader",
+            Self::RepositoryReviewer => "repository_reviewer",
+        }
+    }
+    pub fn slot(self) -> &'static str {
+        if self == Self::RepositoryReviewer {
+            "single_agent_reviewer"
+        } else {
+            "single_agent"
+        }
+    }
+}
+
+impl FromStr for ProfilePurpose {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "workspace_writer" => Ok(Self::WorkspaceWriter),
+            "repository_reader" => Ok(Self::RepositoryReader),
+            "repository_reviewer" => Ok(Self::RepositoryReviewer),
+            _ => Err(format!("Unknown profile purpose {value:?}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkspaceMode {
     #[default]
     IsolatedWorktree,
@@ -467,6 +548,7 @@ pub struct TaskCheckoutScope {
 pub enum ExecutionActor {
     TripRole(RoleKind),
     SingleAgent,
+    SingleAgentReviewer,
 }
 
 impl ExecutionActor {
@@ -476,12 +558,16 @@ impl ExecutionActor {
         match self {
             Self::TripRole(role) => role.to_string(),
             Self::SingleAgent => Self::SINGLE_AGENT_KEY.to_owned(),
+            Self::SingleAgentReviewer => "single_agent_reviewer".to_owned(),
         }
     }
 
     pub fn from_key(value: &str) -> Result<Self, String> {
         if value == Self::SINGLE_AGENT_KEY {
             return Ok(Self::SingleAgent);
+        }
+        if value == "single_agent_reviewer" {
+            return Ok(Self::SingleAgentReviewer);
         }
         value.parse().map(Self::TripRole)
     }
@@ -491,6 +577,8 @@ impl ExecutionActor {
 /// generation's execution binding before any context or report is served.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SingleAgentContext {
+    pub purpose: ProfilePurpose,
+    pub review_delivery_id: Option<String>,
     pub project_id: String,
     pub task_id: String,
     pub attempt_id: String,
@@ -601,6 +689,35 @@ pub struct SingleAgentResultMetadata {
     pub claimed_changes: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SingleAgentReviewMetadata {
+    pub delivery_id: String,
+    pub result_binding_id: String,
+    pub candidate_hash: String,
+    pub selected_check_revision: i64,
+    pub verdict: SingleAgentReviewVerdict,
+    pub findings: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SingleAgentReviewVerdict {
+    Approved,
+    ChangesRequested,
+    NeedsRework,
+}
+
+impl SingleAgentReviewVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::ChangesRequested => "changes_requested",
+            Self::NeedsRework => "needs_rework",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionCheckInput {
@@ -637,6 +754,8 @@ pub struct ExecutionConfigurationInput {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentProfileInput {
+    #[serde(default, skip_serializing_if = "ProfilePurpose::is_writer")]
+    pub purpose: ProfilePurpose,
     pub display_name: String,
     pub provider: Provider,
     pub model: String,
@@ -649,6 +768,10 @@ pub struct AgentProfileInput {
 #[serde(deny_unknown_fields)]
 pub struct TaskWorkflowSelectionInput {
     pub family: WorkflowFamily,
+    #[serde(default, skip_serializing_if = "SingleAgentPreset::is_legacy")]
+    pub preset: SingleAgentPreset,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_profile_revision_id: Option<String>,
     #[serde(default, skip_serializing_if = "WorkspaceMode::is_isolated_worktree")]
     pub workspace_mode: WorkspaceMode,
     #[serde(default)]
@@ -657,6 +780,17 @@ pub struct TaskWorkflowSelectionInput {
     pub profile_revision_id: Option<String>,
     #[serde(default)]
     pub check_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SingleAgentRecipeInput {
+    pub name: String,
+    pub title: String,
+    pub description: String,
+    pub acceptance_criteria: Vec<String>,
+    pub priority: i64,
+    pub selection: TaskWorkflowSelectionInput,
 }
 
 /// Human operations of the multi-workflow feature. Older TRIP commands keep
@@ -711,6 +845,8 @@ pub enum WorkflowCommand {
         /// The current default's version, or 0 when the project has none.
         expected_version: i64,
         family: WorkflowFamily,
+        #[serde(default, skip_serializing_if = "SingleAgentPreset::is_legacy")]
+        preset: SingleAgentPreset,
     },
     SetTaskWorkflow {
         operation_id: String,
@@ -791,6 +927,19 @@ pub enum CheckAuthorizationLifetime {
 }
 
 impl WorkflowCommand {
+    pub fn uses_single_agent_presets(&self) -> bool {
+        match self {
+            Self::SaveAgentProfile { profile, .. } => !profile.purpose.is_writer(),
+            Self::SetProjectWorkflowDefault { preset, .. } => !preset.is_legacy(),
+            Self::SetTaskWorkflow { selection, .. }
+            | Self::CreateTask {
+                selection: Some(selection),
+                ..
+            } => !selection.preset.is_legacy() || selection.reviewer_profile_revision_id.is_some(),
+            _ => false,
+        }
+    }
+
     pub fn operation_id(&self) -> &str {
         match self {
             Self::SaveExecutionConfiguration { operation_id, .. }
@@ -818,6 +967,9 @@ pub enum SingleAgentStage {
     Writing,
     ResultSubmittedWaitingForStop,
     AwaitingSelectedChecks,
+    AwaitingReview,
+    ReviewRunning,
+    ReviewBlocked,
     AwaitingHuman,
     Accepted,
     /// A profile probe recorded its admission evidence; nothing was accepted.
@@ -884,6 +1036,8 @@ pub struct SingleAgentCheckDto {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SingleAgentRunDto {
+    pub preset: SingleAgentPreset,
+    pub review: Option<serde_json::Value>,
     pub attempt_id: String,
     pub definition_id: Option<String>,
     pub definition_state: String,
@@ -922,6 +1076,10 @@ pub struct TaskSelectedProfileRevisionDto {
 pub struct TaskWorkflowDto {
     pub family: WorkflowFamily,
     #[serde(default)]
+    pub preset: SingleAgentPreset,
+    #[serde(default)]
+    pub reviewer_profile_revision_id: Option<String>,
+    #[serde(default)]
     pub workspace_mode: WorkspaceMode,
     #[serde(default)]
     pub checkout_scope: Option<TaskCheckoutScope>,
@@ -953,6 +1111,7 @@ pub struct ExecutionConfigurationDto {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentProfileRevisionDto {
+    pub purpose: ProfilePurpose,
     pub id: String,
     pub revision: i64,
     pub provider: Provider,
@@ -1000,6 +1159,7 @@ pub struct ProfileAdmissionDto {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectExecutionDto {
     pub project_id: String,
+    pub default_preset: SingleAgentPreset,
     pub default_family: WorkflowFamily,
     pub default_version: i64,
     pub configurations: Vec<ExecutionConfigurationDto>,
@@ -1911,6 +2071,100 @@ impl ObservedUsage {
 pub struct SessionObservedUsage {
     pub current_turn: ObservedUsage,
     pub session: ObservedUsage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistorySourceKind {
+    Task,
+    Comment,
+    Report,
+    Review,
+    ExplorerDecision,
+    ResultAcceptance,
+    Rework,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistorySearchQuery {
+    pub query: String,
+    pub project_id: Option<String>,
+    pub kind: Option<HistorySourceKind>,
+    #[serde(default)]
+    pub exclude_archived: bool,
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoricalSourceKey {
+    pub task_id: String,
+    pub attempt_id: Option<String>,
+    pub kind: HistorySourceKind,
+    pub id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistorySearchHit {
+    pub source: HistoricalSourceKey,
+    pub project_id: String,
+    pub project_name: String,
+    pub task_title: String,
+    pub created_at: String,
+    pub snippet: String,
+    pub archived: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HistorySearchPage {
+    pub results: Vec<HistorySearchHit>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HistoricalSource {
+    pub hit: HistorySearchHit,
+    pub text: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageGroupBy {
+    #[default]
+    Project,
+    Workflow,
+    Role,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageComparisonQuery {
+    #[serde(default)]
+    pub group_by: UsageGroupBy,
+    pub project_id: Option<String>,
+    pub workflow: Option<String>,
+    pub role: Option<String>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UsageComparisonGroup {
+    pub key: String,
+    pub label: String,
+    pub sessions: usize,
+    pub codex_sessions: usize,
+    pub claude_sessions: usize,
+    pub unknown_provider_sessions: usize,
+    pub sessions_with_observations: usize,
+    pub sessions_without_observations: usize,
+    pub usage: ObservedUsage,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UsageComparisonPage {
+    pub groups: Vec<UsageComparisonGroup>,
+    pub next_cursor: Option<String>,
 }
 
 /// Where a task stands, derived from authoritative workflow evidence. Hook
@@ -3108,6 +3362,156 @@ pub struct AttentionItem {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopActivation {
+    pub instance_key: String,
+    pub attention_id: String,
+    pub episode_key: String,
+}
+
+impl DesktopActivation {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.instance_key.len() != 64
+            || !self.instance_key.bytes().all(|b| b.is_ascii_hexdigit())
+            || self.attention_id.is_empty()
+            || self.attention_id.len() > 512
+            || self.episode_key.len() != 67
+            || !self.episode_key.starts_with("v1:")
+            || !self.episode_key[3..].bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            anyhow::bail!("invalid desktop activation identity")
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        instance_key: &str,
+        revision: &str,
+        incarnation: &str,
+        entries: Vec<DesktopAttentionEntry>,
+    ) -> DesktopTarget {
+        let stale = || {
+            DesktopTarget::Stale { message: "This attention episode changed or is no longer available. The dashboard was opened without selecting a replacement.".into() }
+        };
+        if self.instance_key != instance_key {
+            return stale();
+        }
+        let mut matching = entries
+            .into_iter()
+            .filter(|entry| entry.attention_id == self.attention_id);
+        let Some(entry) = matching.next() else {
+            return stale();
+        };
+        if matching.next().is_some() || entry.episode_key.as_deref() != Some(&self.episode_key) {
+            return stale();
+        }
+        entry
+            .target
+            .map(|target| DesktopTarget::Current {
+                attention_id: entry.attention_id,
+                target,
+                revision: revision.into(),
+                incarnation: incarnation.into(),
+            })
+            .unwrap_or_else(stale)
+    }
+}
+
+impl AttentionTarget {
+    pub(crate) fn desktop_episode_source(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::PermissionRequest {
+                request_id,
+                request_revision,
+                ..
+            } => Some(serde_json::json!([
+                "permission",
+                request_id,
+                request_revision
+            ])),
+            Self::RecoveryRecord { recovery_id, .. } => {
+                Some(serde_json::json!(["recovery", recovery_id]))
+            }
+            Self::ProjectSetup {
+                setup_operation_id: Some(operation),
+                ..
+            } => Some(serde_json::json!(["setup", operation])),
+            Self::RoleSettings {
+                task_id,
+                role,
+                settings_revision,
+                ..
+            } => Some(serde_json::json!([
+                "role_settings",
+                task_id,
+                role,
+                settings_revision
+            ])),
+            Self::Attempt {
+                attempt_id,
+                phase,
+                plan_hash,
+                candidate_hash,
+                ..
+            } => {
+                let identity = match phase.as_str() {
+                    "awaiting_plan_approval" | "awaiting_implementation_authorization" => {
+                        plan_hash.as_ref()
+                    }
+                    "awaiting_human_review" | "awaiting_human" | "awaiting_checks" => {
+                        candidate_hash.as_ref()
+                    }
+                    _ => None,
+                }?;
+                Some(serde_json::json!(["attempt", attempt_id, phase, identity]))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DesktopAttentionEntry {
+    pub attention_id: String,
+    pub category: AttentionCategory,
+    pub episode_key: Option<String>,
+    pub target: Option<AttentionTarget>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopSnapshotState {
+    Complete,
+    Truncated,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DesktopSnapshot {
+    pub instance_key: String,
+    pub incarnation: String,
+    pub revision: String,
+    pub count: usize,
+    pub state: DesktopSnapshotState,
+    pub entries: Vec<DesktopAttentionEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum DesktopTarget {
+    Current {
+        attention_id: String,
+        target: AttentionTarget,
+        revision: String,
+        incarnation: String,
+    },
+    Stale {
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppStateDto {
     pub schema: u8,
     pub generated_at: String,
@@ -3343,6 +3747,26 @@ fn approved_check_decision() -> String {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HumanCommand {
+    EditGuidance {
+        operation_id: String,
+        task_id: String,
+        guidance_id: String,
+        expected_revision: i64,
+        expected_version: i64,
+        body: String,
+    },
+    CancelGuidance {
+        operation_id: String,
+        task_id: String,
+        guidance_id: String,
+        expected_revision: i64,
+        expected_version: i64,
+    },
+    AddTaskComment {
+        operation_id: String,
+        task_id: String,
+        body: String,
+    },
     UpsertProfileSet {
         operation_id: String,
         project_id: String,
@@ -3369,6 +3793,13 @@ pub enum HumanCommand {
         priority: i64,
         profile_revision_id: String,
         required_check_ids: Vec<String>,
+    },
+    UpsertSingleAgentRecipe {
+        operation_id: String,
+        project_id: String,
+        recipe_id: Option<String>,
+        expected_version: Option<i64>,
+        recipe: SingleAgentRecipeInput,
     },
     ArchiveTaskRecipe {
         operation_id: String,
@@ -3721,9 +4152,13 @@ pub enum HumanCommand {
 impl HumanCommand {
     pub fn operation_id(&self) -> &str {
         match self {
-            Self::UpsertProfileSet { operation_id, .. }
+            Self::EditGuidance { operation_id, .. }
+            | Self::CancelGuidance { operation_id, .. }
+            | Self::AddTaskComment { operation_id, .. }
+            | Self::UpsertProfileSet { operation_id, .. }
             | Self::ArchiveProfileSet { operation_id, .. }
             | Self::UpsertTaskRecipe { operation_id, .. }
+            | Self::UpsertSingleAgentRecipe { operation_id, .. }
             | Self::ArchiveTaskRecipe { operation_id, .. }
             | Self::CreateDraftFromRecipe { operation_id, .. }
             | Self::UpsertRecipeSchedule { operation_id, .. }
@@ -4164,4 +4599,29 @@ mod task_action_tests {
         assert_eq!(actions[1].task_id, "b");
         assert_eq!(actions[1].item_ids, ["question"]);
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PermissionCoverageSample {
+    pub request_id: String,
+    pub expected_revision: i64,
+    pub command: String,
+    pub lifetime: PermissionLifetime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PermissionCoveragePreview {
+    pub status: String,
+    pub reason_code: String,
+    pub explanation: String,
+    pub family_compatible: bool,
+    pub recorded_state: String,
+    pub saved_rules: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskActivityPage {
+    pub events: Vec<serde_json::Value>,
+    pub next_cursor: Option<String>,
+    pub historical_associations_incomplete: bool,
 }

@@ -28,10 +28,11 @@ const eventLabel = (code: string) =>
 
 /** Recent recorded events, newest first, with plain names and task titles. */
 export function ActivityTimeline(
-  { events, tasks = [], limit = 40 }: {
+  { events, tasks = [], limit = 40, references = {} }: {
     events: Array<Record<string, unknown>>;
     tasks?: Task[];
     limit?: number;
+    references?: Record<string, { label: string; open: () => void }>;
   },
 ) {
   const taskTitle = (event: Record<string, unknown>) =>
@@ -46,6 +47,9 @@ export function ActivityTimeline(
       <ol>
         {events.slice(0, limit).map((event, index) => {
           const title = taskTitle(event);
+          const reference = references[
+            `${String(event.entity_kind)}:${String(event.entity_id)}`
+          ];
           return (
             <li key={String(event.id || index)}>
               <time dateTime={String(event.created_at)}>
@@ -60,8 +64,20 @@ export function ActivityTimeline(
                 <strong>{eventLabel(String(event.event_code || "event"))}</strong>
                 <small>
                   {title ? `${title} · ` : ""}
-                  {event.actor_kind === "human" ? "You" : "LLMRelay"}
+                  {String(event.actor_kind || "LLMRelay")}
+                  {event.attempt_id
+                    ? ` · Attempt ${String(event.attempt_id).slice(0, 8)}`
+                    : ""}
+                  {` · ${String(event.entity_kind || "event")}`}
                 </small>
+                {reference && (
+                  <button className="link-button" onClick={reference.open}>
+                    {reference.label}
+                  </button>
+                )}
+                {typeof event.body === "string" && (
+                  <p className="task-comment">{event.body}</p>
+                )}
               </div>
             </li>
           );

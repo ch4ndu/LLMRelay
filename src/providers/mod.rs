@@ -656,6 +656,7 @@ pub fn prepare_runtime_probe_role_launch_with_bundles(
 /// Everything one Single agent writer turn is prepared from. A retained turn
 /// names the native conversation it continues; a first turn names none.
 pub struct SingleAgentLaunchRequest<'a> {
+    pub purpose: crate::domain::ProfilePurpose,
     pub provider: Provider,
     pub model: &'a str,
     pub effort: &'a str,
@@ -681,6 +682,9 @@ struct SingleAgentReadScope {
 }
 
 fn single_agent_read_scope(request: &SingleAgentLaunchRequest<'_>) -> Result<SingleAgentReadScope> {
+    if !request.purpose.is_writer() && request.checkout_scope.is_some() {
+        bail!("Repository readers and reviewers require an isolated worktree")
+    }
     if let Some(scope) = request.checkout_scope {
         let root = PathBuf::from(scope["root"].as_str().context("Main scope has no root")?);
         if request.cwd.canonicalize()? != root
@@ -1321,6 +1325,11 @@ pub fn prepare_single_agent_launch(
 ) -> Result<SingleAgentLaunch> {
     require_provider_word("model", request.model)?;
     require_provider_word("effort", request.effort)?;
+    if request.purpose == crate::domain::ProfilePurpose::RepositoryReviewer
+        && request.native_session_id.is_some()
+    {
+        bail!("Independent reviewers must start a fresh conversation")
+    }
     let native = match request.provider {
         Provider::Codex => codex::single_agent_native(request)?,
         Provider::Claude => claude::single_agent_native(request)?,
@@ -1328,7 +1337,11 @@ pub fn prepare_single_agent_launch(
     let binding = request.bundles.resolve_policy(
         request.provider,
         &native.executable_version,
-        crate::provider_compatibility::PolicyMode::SingleAgentWriter,
+        crate::provider_compatibility::ExecutionPolicy::for_purpose(
+            request.provider,
+            request.purpose,
+        )
+        .mode,
     )?;
     if let Some(reason) = binding.native_calls_disabled_reason() {
         bail!("{reason}")
@@ -1358,8 +1371,10 @@ fn assemble_single_agent_launch(
         identity.security_policy["checkout_scope"] = scope.clone();
         identity.security_policy["execution_actor"] = "single_agent".into();
     }
-    let policy =
-        crate::provider_compatibility::ExecutionPolicy::single_agent_writer(request.provider);
+    let policy = crate::provider_compatibility::ExecutionPolicy::for_purpose(
+        request.provider,
+        request.purpose,
+    );
     let mut arguments = native.arguments;
     arguments.push(format!(
         "{}\n\n{}",
@@ -1372,7 +1387,7 @@ fn assemble_single_agent_launch(
     }
     let mut record = json!({
         "schema": 1,
-        "actor": crate::domain::ExecutionActor::SINGLE_AGENT_KEY,
+        "actor": request.purpose.slot(),
         "provider": request.provider,
         "executable": native.executable,
         "executable_version": identity.executable_version,

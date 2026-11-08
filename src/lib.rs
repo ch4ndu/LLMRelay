@@ -23,6 +23,7 @@ pub mod review;
 pub mod roles;
 pub mod scheduler;
 pub mod server;
+pub mod service;
 pub mod snapshot;
 pub mod store;
 pub mod supervisor;

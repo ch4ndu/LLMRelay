@@ -114,6 +114,8 @@ const allFeatures = [
   "history_view_v1",
   "provider_validation_v1",
   "multi_workflow_v1",
+  "task_interactions_v1",
+  "history_insights_v1",
 ];
 const protocolFixture = () =>
   new Response(
@@ -131,6 +133,8 @@ const wrapFetch = (source: typeof fetch): FixtureFetch => {
     ((input: string | URL | Request, init?: RequestInit) =>
       String(input) === "/api/protocol"
         ? protocolFixtureResponder()
+        : /^\/api\/tasks\/[^/]+\/activity(?:\?|$)/.test(String(input))
+        ? Promise.resolve(new Response(JSON.stringify({ events: [], next_cursor: null, historical_associations_incomplete: true }), { headers: { "content-type": "application/json" } }))
         : source(input, init)) as FixtureFetch;
   wrapped[fixtureSource] = source;
   return wrapped;
@@ -549,7 +553,7 @@ Deno.test("M9 Recipes creates an exact draft and explicitly arms a paused schedu
     change(recipeFields[0], "New review");
     change(recipeFields[1], "Review exact revision");
     change(
-      recipePanel.querySelector<HTMLSelectElement>("select")!,
+      recipePanel.querySelectorAll<HTMLSelectElement>("select")[1],
       "profile-rev-1",
     );
     click("Save recipe");
@@ -1029,7 +1033,7 @@ Deno.test("A05 recipe New controls preserve each form identity during deferred s
     change(recipeInputs[0], "Recipe being saved");
     change(recipeInputs[1], "Original recipe task");
     change(
-      recipePanel.querySelector<HTMLSelectElement>("select")!,
+      recipePanel.querySelectorAll<HTMLSelectElement>("select")[1],
       "profile-rev-1",
     );
     click("Save recipe");
@@ -1343,6 +1347,7 @@ Deno.test("M9 archived backlog drafts stay visible in History for Restore", asyn
       <History
         tasks={[archivedDraft]}
         projects={[initialized]}
+        incarnation="history-fixture"
         onOpen={noop}
         onChanged={noop}
       />,
@@ -17956,7 +17961,7 @@ Deno.test("Roles holds agent settings, Activity keeps output, and the full plan 
     check(
       !document.querySelector(".role-settings") &&
         document.body.textContent?.includes("Reports") &&
-        document.body.textContent.includes("Task history"),
+        document.body.textContent.includes("Task Activity"),
       "Activity still held agent settings or lost its records",
     );
     click("Overview");
@@ -18205,6 +18210,21 @@ Deno.test("A Single agent run sends only the service's offered decisions with th
       available_actions: ["accept_result", "authorize_check"],
     });
     const passed = singleAgentTask(passedRun);
+    const reviewing = singleAgentTask(singleAgentRun({
+      preset: "build_and_review", stage: "review_running", available_actions: [],
+      review: {
+        delivery_id: "delivery-1", state: "launched", reason: null, ordinal: 1,
+        remaining_deliveries: 1, repair_used: false, verdict: null, summary: null,
+        findings: [], candidate_hash: "candidate-1", result_binding_id: "result-1",
+      },
+    }));
+    const beforeReview = commands().length;
+    mount(<ReviewPanel task={reviewing} onChanged={noop} />);
+    check(
+      document.body.textContent?.includes("Independent review 1 of 2") &&
+        !document.body.textContent.includes("Accept result") && commands().length === beforeReview,
+      "independent review offered premature acceptance or sent an automatic command",
+    );
     mount(<ReviewPanel task={passed} onChanged={noop} />);
     check(
       document.querySelector(".verification-row .badge")?.textContent ===
@@ -18581,7 +18601,7 @@ Deno.test("New tasks follow the project default workflow, and draft choices bind
       />,
     );
     check(
-      choiceFor("Single agent (one agent").checked &&
+      choiceFor("Single agent presets").checked &&
         !document.body.textContent?.includes("Create Ready task"),
       "the project default was not preselected or a Single agent Ready create was offered",
     );
@@ -18639,7 +18659,7 @@ Deno.test("New tasks follow the project default workflow, and draft choices bind
       />,
     );
     await settle();
-    act(() => choiceFor("Single agent (one agent").click());
+    act(() => choiceFor("Single agent presets").click());
     change(findSelect("Agent profile"), "prof-rev-1");
     check(
       document.body.textContent?.includes(
@@ -20359,14 +20379,14 @@ Deno.test("Audit restored drafts retain exact workflow selections and require co
   try {
     mount(form(alternate));
     field("Title", "Preserve my choices");
-    act(() => choiceFor("Single agent (one agent").click());
+    act(() => choiceFor("Single agent presets").click());
     change(findSelect("Execution configuration"), "cfg-2");
     change(findSelect("Agent profile"), "prof-rev-2");
     act(() => choiceFor("Focused tests pass").click());
     await settle();
     mount(form(alternate));
     check(
-      choiceFor("Single agent (one agent").checked &&
+      choiceFor("Single agent presets").checked &&
         findSelect("Execution configuration").value === "cfg-2" &&
         findSelect("Agent profile").value === "prof-rev-2" &&
         choiceFor("Focused tests pass").checked,
@@ -21146,7 +21166,7 @@ for (const transition of ["single-agent", "main-checkout", "isolated-worktree"] 
       click("Save draft");
       await settle();
       if (transition === "single-agent") {
-        act(() => choiceFor("Single agent (one agent").click());
+        act(() => choiceFor("Single agent presets").click());
         change(findSelect("Agent profile"), "prof-rev-1");
         act(() => choiceFor("Unit tests pass").click());
       } else {
@@ -21162,7 +21182,7 @@ for (const transition of ["single-agent", "main-checkout", "isolated-worktree"] 
         "reconciliation deleted the newer workflow or workspace draft");
       mount(form());
       check(transition === "single-agent"
-        ? choiceFor("Single agent (one agent").checked && findSelect("Agent profile").value === "prof-rev-1" && choiceFor("Unit tests pass").checked
+        ? choiceFor("Single agent presets").checked && findSelect("Agent profile").value === "prof-rev-1" && choiceFor("Unit tests pass").checked
         : choiceFor(transition === "main-checkout" ? "Main checkout" : "Isolated worktree").checked,
         "the newer execution choices did not survive remount");
     } finally {

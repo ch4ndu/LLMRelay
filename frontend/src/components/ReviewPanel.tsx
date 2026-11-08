@@ -456,6 +456,9 @@ const stageHeadings: Record<SingleAgentStage, string> = {
   writing: "The agent is working",
   result_submitted_waiting_for_stop: "Result submitted; capturing the work",
   awaiting_selected_checks: "Waiting for the selected checks",
+  awaiting_review: "Waiting for independent review",
+  review_running: "The reviewer is reading the frozen result",
+  review_blocked: "Independent review needs attention",
   awaiting_human: "Review the result",
   accepted: "Result accepted",
   probe_evidence_recorded: "Profile probe finished",
@@ -620,6 +623,15 @@ function SingleAgentRunPanel(
     >
       <span className="eyebrow">Single agent run</span>
       <h3>{failedProbe ? "Profile probe failed" : stageHeadings[run.stage]}</h3>
+      {run.preset === "repository_research" && <p className="hint">Read-only repository research. Accepting records your decision on the report.</p>}
+      {run.review && <section className="single-agent-review" aria-label="Independent review">
+        <h4>Independent review {run.review.ordinal} of 2</h4>
+        <p>{run.review.verdict?.replaceAll("_", " ") ?? run.review.state.replaceAll("_", " ")} · {run.review.remaining_deliveries} review deliveries remaining · {run.review.repair_used ? "Repair already used" : "One repair available"}</p>
+        {run.review.summary && <p className="preserve-whitespace">{run.review.summary}</p>}
+        {run.review.reason && <p className="warning">{run.review.reason}</p>}
+        {run.review.findings.length > 0 && <ul>{run.review.findings.map((finding, index) => <li key={index}>{finding}</li>)}</ul>}
+        <p className="hint">Acceptance requires this exact result and its checks to remain current, an approved review, and both agents to have stopped.</p>
+      </section>}
       {failedProbe && (
         <div className="warning">
           <p>

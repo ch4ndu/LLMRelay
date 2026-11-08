@@ -12,6 +12,7 @@ Requirements:
 - Rust and Cargo 1.86.0.
 - Deno 2.9.5.
 - Python 3 for the installed-workflow validator exercised by the contract suite.
+- Xcode Command Line Tools, including Swift, for the macOS menu companion.
 - Installed and authenticated Codex and/or Claude Code CLIs for the profiles you choose. Setup validates those selected profiles; an unrelated second CLI is not a requirement.
 
 Clone or copy this repository, then fetch the exact locked dependencies and verify the integrated source:
@@ -24,15 +25,27 @@ cd ..
 ./scripts/verify.sh
 ```
 
-`scripts/verify.sh` compiles the locked Rust application, runs the Rust causal cases, type-checks and tests the dashboard, and builds the frontend assets. `build.rs` registers the complete Vite output in the executable; the server serves only those registered paths with fixed MIME types, loopback origin checks, and a restrictive content-security policy. Verification does not launch a provider or alter global provider configuration.
+`scripts/verify.sh` compiles the locked Rust application, runs the Rust causal cases, type-checks and tests the dashboard, and builds the frontend assets. On macOS it also builds the release executables, compiles the menu companion, checks its bundle and records the exact source, build configuration and artifact hashes. `build.rs` registers the complete Vite output in the executable; the server serves only those registered paths with fixed MIME types, loopback origin checks, and a restrictive content-security policy. Verification does not launch a provider or alter global provider configuration, install a login service, open the companion or request notification permission.
 
 To create a local ZIP after verification:
 
 ```sh
-./scripts/package.sh
+./scripts/package.sh --verified-receipt
 ```
 
-The archive is written beneath `.local/dist`. Packaging does not install, sign, notarize, publish, or upload it. See [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) before distributing a package outside this machine.
+This reuses verification only when the current inputs and produced artifacts
+still match its receipt. `./scripts/package.sh` without an argument runs
+verification first. There is no unchecked packaging mode. Clear custom Cargo
+target directories and compiler wrappers before verification. The receipt is
+bound to `frontend/package.json` as well as the source, lockfiles and toolchain.
+Both `AGENTICJIRA_FRONTEND_DIST` and `AGENTICJIRA_ALLOW_FOUNDATION` must be unset
+for normal distribution verification and receipt reuse; those recovery overrides
+cannot produce a normal package receipt. The archive is
+written beneath `.local/dist`; an older distribution without a matching ownership
+record is retained and must be moved aside explicitly before packaging.
+Packaging does not install, sign, notarize, publish, or upload it. See
+[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) before distributing a package
+outside this machine.
 
 To run the package built in this checkout, without installing it or adding anything to PATH:
 
@@ -159,7 +172,14 @@ frontend evidence remain separate from these storage checks.
 
 ## Package contents
 
-The package includes `bin/llmrelay`, the compatibility executable `bin/agenticjira`, and documentation under `share/llmrelay/`. The `docs/` subdirectory keeps the same relative layout as this source tree so the README links work after extraction. Packaging also includes the research plan and third-party notices. Local packaging does not grant release or publication authority.
+The package includes `bin/llmrelay`, the compatibility executable `bin/agenticjira`,
+`LLMRelay.app` with its matching bundled CLI, and documentation under
+`share/llmrelay/`. The `docs/` subdirectory keeps the same relative layout as this
+source tree so the README links work after extraction. Packaging also includes
+the research plan and third-party notices. Native compilation and static bundle
+checks do not establish installed launchd behavior, login startup, notification
+delivery or cmux endpoint access; those require separate runtime acceptance.
+Local packaging does not grant release or publication authority.
 
 Provider compatibility manifests under `resources/provider-compatibility/` are
 compiled into the executable. Changing them requires a rebuild; there is no runtime

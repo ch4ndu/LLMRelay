@@ -167,7 +167,7 @@ fn open_attachment_with_binding(
             state: "failed".to_owned(),
             mode,
             message: format!(
-                "Automatic cmux create, health, and focus are unavailable because this foreground LLMRelay host was not booted from a live cmux ancestor executable with the captured start identity. No route was reserved. Start the foreground `llmrelay serve` host from a cmux terminal, then retry. Manual attachment command: {fallback_command}"
+                "Automatic cmux routing has no current process proof. No route was reserved. Start foreground `llmrelay serve` in cmux, or run `llmrelay service pair-cmux --data-dir <instance>` there for a background service. Pair again after either process restarts; endpoint access remains independently required. Manual attachment command: {fallback_command}"
             ),
             retry_available: false,
             attachment_command: Some(fallback_command),
@@ -834,9 +834,10 @@ fn view_fresh(
         }
     };
     if !app.automatic_cmux_routing_permitted() {
+        let manual = attachment_command(app, &binding, None, CmuxAttachmentMode::Watch)?;
         return Ok(CmuxViewOutcome {
             state: "failed".to_owned(),
-            message: "Automatic cmux presentation is unavailable because this foreground LLMRelay host was not booted from a proven live cmux ancestor executable. No task workspace or terminal surface was created. Start the foreground service from cmux, then choose View output again.".to_owned(),
+            message: format!("Automatic cmux presentation has no current process proof. Pair this background instance from a cmux terminal with llmrelay service pair-cmux --data-dir <instance>, or start the foreground service there. Manual attachment: {manual}"),
             retry_available: false,
             surface: None,
             recorded_output: None,
@@ -873,8 +874,8 @@ fn view_fresh(
         return Ok(CmuxViewOutcome {
             state: "failed".to_owned(),
             message: format!(
-                "cmux did not satisfy the required persistent-routing contract: {}. No fallback workspace, shell command, title lookup, first surface, provider action, or keyboard lease was used.",
-                bounded_detail(&error)
+                "cmux endpoint access or its persistent-routing contract is unavailable: {}. Pairing cannot override cmux endpoint policy. Manual attachment: {}",
+                bounded_detail(&error), attachment_command(app, &binding, None, CmuxAttachmentMode::Watch)?
             ),
             retry_available: true,
             surface: Some(surface),
@@ -1729,7 +1730,7 @@ fn prepare_history_pane(
     }
     if !app.automatic_cmux_routing_permitted() {
         return Err(NotDelivered::new(
-            "A cmux pane can be created only when LLMRelay was started from a cmux terminal. No pane was created; read the output in the dashboard instead.",
+            "Automatic cmux access needs a current foreground ancestry proof or explicit service pair-cmux pairing, plus independent endpoint access. No pane was created; read the output in the dashboard instead.",
             false,
         ));
     }
@@ -1852,7 +1853,9 @@ const REQUIRED_PERSISTENT_CMUX_METHODS: &[&str] = &[
     "surface.resume.get",
 ];
 
-fn require_persistent_cmux_contract(app: &Application) -> std::result::Result<(), String> {
+pub(crate) fn require_persistent_cmux_contract(
+    app: &Application,
+) -> std::result::Result<(), String> {
     let response = cmux_rpc(app, "system.capabilities", json!({}))
         .map_err(|error| bounded_detail(&error.message()))?;
     let capability = structured_payload(&response)

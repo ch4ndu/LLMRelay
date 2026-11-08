@@ -12982,6 +12982,13 @@ fn task_verification_rows(connection: &Connection) -> Result<Vec<serde_json::Val
                         .and_then(|value| serde_json::from_str(value).ok())
                         .unwrap_or_else(|| serde_json::json!([]));
                     authorization["family_preview"] = family.preview.clone();
+                    let compatible_rule = crate::permissions::matching_service_check_rule(
+                        connection,
+                        &attempt_id,
+                        &family,
+                    )?;
+                    authorization["family_compatible"] =
+                        serde_json::json!(compatible_rule.is_some());
                     if !denied {
                         if let Some((rule_id, rule_revision)) =
                             crate::permissions::matching_service_check_rule(
@@ -13049,6 +13056,15 @@ fn task_verification_rows(connection: &Connection) -> Result<Vec<serde_json::Val
             "current_receipt"
         } else {
             "actionable"
+        });
+        authorization["coverage_explanation"] = serde_json::json!(if !active {
+            "This selection is inactive or its candidate is unavailable. Family compatibility grants no authorization."
+        } else if authorization["state"] == "denied" {
+            "The exact denial takes precedence over any compatible executable-family rule."
+        } else if authorization["authorized"] == true {
+            "Current service-check authorization is available; execution still checks candidate, selection and input freshness. Agent permissions are separate."
+        } else {
+            "No current unconsumed authorization covers this exact selection. A prior once approval may already be consumed."
         });
         authorization["inactive_reason"] = serde_json::json!(if !active {
             Some("Decisions are available only for a required, enabled current selection with a candidate during the active checks phase.")

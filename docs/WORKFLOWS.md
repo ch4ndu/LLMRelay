@@ -12,8 +12,10 @@
 For a first small task, start with [Single agent](#single-agent-workflow).
 For the full planning and review process, use [TRIP](#required-trip-workflow).
 A project can offer both. Neither workflow requires you to use both providers.
-Custom workflow editing, Build and review, and Research presets are not yet available.
-Recipes and schedules currently use TRIP.
+Single agent also offers **Repository research** and **Build and review** presets.
+Their exact provider policies must be qualified before they can run; the setup
+screen shows any blocker. Recipes and schedules can retain any of these choices.
+Custom workflow editing is not available.
 
 **Ready** means queued. **Your review** means the app is waiting for your decision.
 **Done** means you accepted the result; it does not mean the changes were merged
@@ -110,8 +112,8 @@ tasks is preselected. A draft or Ready task that has never started can change
 its workflow on its **Roles** tab. Changing a Ready task's choice moves it back
 to the drafts, and **Make Ready** checks it again. Tasks with work already
 started keep their workflow; use a new task to switch. Existing tasks and
-tasks without a choice are TRIP. Recipes, schedules and review allowances
-remain TRIP concepts and never create Single agent tasks.
+tasks without a choice are TRIP. Recipes and schedules preserve their own exact
+workflow and preset revisions; they create drafts and do not start agents.
 
 A Single agent task names an execution configuration revision, one agent
 profile revision and, optionally, checks from that configuration. Project
@@ -149,6 +151,38 @@ provider checks and ordinary task execution, including a controlled Claude
 restart and dashboard acceptance. Your own profile must still pass its admission
 check before activation; a result from another installation does not activate it.
 Follow [Single agent setup](PROJECT_SETUP.md#single-agent-setup).
+
+### Research and independent review presets
+
+Choose the preset in the task's workflow settings. **Repository research** uses
+an admitted repository-reader profile in an isolated worktree. It can read the
+repository and submit an authenticated report, but cannot edit it, use Main
+checkout, select service checks or acquire writer permissions. Its retained
+conversation can continue only through the offered resume action. The result
+still requires your acceptance.
+
+**Build and review** uses a writer and a separately admitted fresh reviewer.
+After the writer stops, LLMRelay captures the candidate and runs any selected,
+authorized checks. The reviewer receives a verified copy of that exact candidate,
+its report and check receipts. Both the checked and no-check paths require
+independent review before **Your review**. An approved verdict does not accept
+the task; the reviewer must stop and the same evidence must still be current
+before **Accept result** becomes available.
+
+The task has two independent review deliveries and one repair allowance across
+its entire run history. A changes-requested verdict can create one linked repair
+run from the rejected candidate, retaining the original configuration and
+profiles. The repaired candidate gets fresh checks and the remaining review.
+Restarting, changing profiles or requesting another child cannot reset the
+allowance. An uncertain delivery stays spent. Malformed, failed or exhausted
+reviews leave the task incomplete with a reason; no approval is inferred.
+Pausing before review starts keeps the pending candidate. **Continue** resumes
+that review without using an extra delivery.
+
+These presets require their own qualified provider policies and project
+admissions. A writer's proof never qualifies a reader or reviewer. The new reader
+and reviewer policies currently remain unavailable pending native qualification;
+see [Single agent setup](PROJECT_SETUP.md#single-agent-setup).
 
 ## Stop or change the task manager
 
@@ -191,6 +225,12 @@ The existing attachment connection holds a short, renewed input lease for you on
 A current manager code-review transition proposal suppresses further frozen-candidate reminders while its native turn finishes. This checks the exact manager generation, source phase, task version, plan, and candidate; it does not authorize transition before verified idle or process quiescence. Stale proposals do not suppress the reminder.
 
 Manager guidance is submitted once. It remains queued while a viewer owns input or while native work is active, and is delivered automatically after matching native submit/stop evidence and known helper descendants have exited. Claude must explicitly report empty background-task and scheduled-wakeup registries; missing or nonempty registries keep guidance queued, including after denied commands. Outstanding permission requests also prevent automatic delivery. For an exact pending service-owned Manager obligation, an otherwise current native turn whose latest real Stop has incomplete tool-hook bookkeeping may receive one service-initiated SIGINT stop request, distinct from verified native idle; the service still requires current generation, credential, invocation, candidate, permission, input, guidance, control, recovery, and whole-process-quiescence fences before it can retain-resume or transition. The atomic claim and the signal path are one-shot: another interrupt entry point does not send another signal, and drain reports the request separately as already pending. Completed checks/final-Explorer evidence and a completed final handoff are also held until the exact current Manager is either at a verified idle boundary or has exited with positively recorded whole-process quiescence; evidence recorded during a live busy turn is not consumed early. The stop has no timeout-based escalation and grants no blanket permission. If the process does not exit within the durable graceful-stop deadline, it enters explicit recovery with revoked role credentials and exact process controls; the service never fabricates idle, delivery, acknowledgement, or completion. Retained resume preserves the saved native invocation and its identity. The host-restart path adds a fixed interruption notice to its separately recorded delivered text so the agent verifies in-flight effects before repeating a command; ordinary resume does not add that notice. The Manager loads current obligations and queued notices from role context. Guidance uses a framed terminal paste and a separate Enter under the same input lease. Only matching native submission evidence advances it to submitted; only the role acknowledgement advances it to acknowledged. The dashboard shows queued, written, submitted, and acknowledged states separately.
+
+Queued ordinary user guidance for the current Manager offers **Edit** and **Cancel** until delivery is reserved. Both actions check the task version and message revision; edits retain the existing nonblank and encoded submission-size validation. If an edit wins before reservation, delivery defers the stale prepared text and a later ordinary evaluation can use the new revision. If reservation wins, the change is refused. Submitted or uncertain text, generated reminders, and historical generations cannot be changed through these controls. Cancelled guidance remains recorded.
+
+In **Activity**, **Add comment** saves a human note, including on completed tasks. Comments do not send agent instructions, approve work, or advance a workflow. A draft with comments is retained as task history and cannot be deleted; use Archive when available. The task timeline reads durable records across attempts, independently of the recent global activity window; **Load older** retrieves earlier pages. Events retain their actor, time, and attempt, with links when a corresponding report, check, or review is available. Events without a recorded task association are omitted rather than assigned by inference, and the view discloses that historical limitation.
+
+Guidance edits, cancellations, and comments keep an exact saved request identity while the result is uncertain, including across a reload. Refresh and inspect the task before using **Retry saved request**; it resubmits that same request. A definite refusal of a first submission permits a correction. Refusing a replay does not resolve the original request’s unknown outcome, so its saved identity remains until a confirmed result settles it. Two separately submitted identical comments remain separate notes.
 
 Ordinary authenticated role context exposes the newest activated Explorer decision
 for the exact attempt and current candidate as `current_explorer_evidence`, with
@@ -391,17 +431,20 @@ contract candidate alone is not a qualified role profile.
 
 ## Recipes and reusable project profiles
 
-Recipes, profile sets and schedules are TRIP features; they create TRIP drafts
-only. Select a project, then open **Recipes**. Save a profile set containing the six role
-configurations, then a recipe with task content, acceptance criteria, priority, an
-exact profile revision and required checks. Saved configurations are not capability
+Select a project, then open **Recipes** and choose its workflow. For TRIP,
+save a profile set containing the six role configurations, then a recipe with
+task content, acceptance criteria, priority, an exact profile revision and
+required checks. For Single agent presets, select the preset, execution
+configuration, primary profile and any reviewer and checks it requires. Saved configurations are not capability
 proofs; ordinary task-specific activation and Ready admission still apply. Templates
 are literal editable text, with no executable substitution language.
 
 **Create draft** creates an ordinary backlog task and opens its detail view. Inspect
 and edit it before making it Ready. Its provenance retains the exact recipe/profile
-revision. Required recipe checks constrain the Manager's later selection; they do
-not impersonate a Manager-selected check set. Revisions of recipes and profile sets
+revision. TRIP recipe checks constrain the Manager's later selection without
+impersonating that selection. Single agent recipes pin the definition, execution
+configuration, primary and reviewer profile revisions and selected check IDs;
+they copy no check authorization or acceptance authority. Revisions of recipes and profile sets
 do not silently change existing tasks or schedules.
 
 If project reactivation supersedes a recipe's configuration pin, re-save its profile

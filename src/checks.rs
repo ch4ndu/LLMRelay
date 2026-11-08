@@ -26,6 +26,66 @@ const PROCESS_INSPECTION_TIMEOUT: Duration = Duration::from_secs(2);
 const PROCESS_INSPECTION_LIMIT: usize = 4 * 1024 * 1024;
 const INSPECTION_REAP_GRACE: Duration = Duration::from_millis(250);
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct InterruptGeneration {
+    check_id: String,
+    pid: u32,
+    start: String,
+    group: i32,
+    launch_boot: Option<String>,
+    anchor: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum CheckInterruptOutcome {
+    Issued,
+    Pending { reason: String },
+    PositivelyStale,
+}
+
+#[derive(Default)]
+pub(crate) struct CheckInterruptProgress {
+    targets: HashMap<InterruptGeneration, CheckInterruptOutcome>,
+}
+
+impl CheckInterruptProgress {
+    fn attempt(
+        &mut self,
+        target: InterruptGeneration,
+        inspect_and_signal: impl FnOnce() -> CheckInterruptOutcome,
+    ) -> bool {
+        if matches!(
+            self.targets.get(&target),
+            Some(CheckInterruptOutcome::Issued | CheckInterruptOutcome::PositivelyStale)
+        ) {
+            return false;
+        }
+        let outcome = inspect_and_signal();
+        let issued = matches!(outcome, CheckInterruptOutcome::Issued);
+        self.targets.insert(target, outcome);
+        issued
+    }
+
+    pub(crate) fn pending(&self) -> bool {
+        self.targets
+            .values()
+            .any(|value| matches!(value, CheckInterruptOutcome::Pending { .. }))
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<serde_json::Value> {
+        self.targets
+            .iter()
+            .map(|(target, outcome)| {
+                serde_json::json!({
+                    "check_id":target.check_id,"pid":target.pid,"start_marker":target.start,
+                    "process_group":target.group,"outcome":outcome
+                })
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckSpec {
     pub executable: PathBuf,
@@ -191,13 +251,13 @@ pub(crate) fn single_agent_check_identity(
              FROM attempts a JOIN workspaces w ON w.attempt_id=a.id AND w.state='ready'
              JOIN workflow_run_bindings b ON b.attempt_id=a.id AND b.family='single_agent'
                AND b.definition_state='available'
-             JOIN workflow_result_bindings r ON r.attempt_id=a.id AND r.state=a.phase
+             JOIN workflow_result_bindings r ON r.attempt_id=a.id AND r.state IN ('awaiting_checks','awaiting_review','review_running','review_changes_requested','awaiting_human')
                AND r.candidate_hash=a.candidate_hash
              JOIN workflow_check_selections s ON s.attempt_id=a.id AND s.revision=r.selected_check_revision
                AND s.check_id=?2
              JOIN execution_verification_checks c ON c.id=s.check_id
                AND c.execution_config_revision_id=b.execution_config_revision_id
-             WHERE a.id=?1 AND a.phase IN ('awaiting_checks','awaiting_human')",
+             WHERE a.id=?1 AND a.phase IN ('awaiting_checks','awaiting_review','review_running','review_changes_requested','awaiting_human')",
             params![attempt, check_id],
             |row| {
                 Ok((
@@ -1549,10 +1609,7 @@ impl CheckService {
             if Instant::now() >= deadline {
                 bail!("check process signalling inspection deadline elapsed");
             }
-            if self
-                .start_marker(process.pid, deadline)
-                .is_ok_and(|start| same_process_start(&start, &process.start))
-            {
+            if same_process_start(&self.start_marker(process.pid, deadline)?, &process.start) {
                 let result = unsafe { libc::kill(process.pid as libc::pid_t, signal) };
                 if result != 0 {
                     let error = std::io::Error::last_os_error();
@@ -1815,41 +1872,142 @@ impl CheckService {
         }
         Ok(result)
     }
-    pub fn interrupt_all(&self) -> Result<Vec<String>> {
+    pub(crate) fn interrupt_pending(
+        &self,
+        progress: &mut CheckInterruptProgress,
+    ) -> Result<Vec<String>> {
         let inventory = self.process_inventory()?;
         let connection = self.store.lock()?;
-        let mut statement=connection.prepare("SELECT DISTINCT cp.check_id,cp.pid,cp.native_start_marker,cp.process_group_id,cp.parent_pid FROM check_processes cp JOIN check_runs cr ON cr.id=cp.check_id WHERE cr.status IN ('launch_reserved','running','recovery_required')")?;
+        let mut statement=connection.prepare("SELECT DISTINCT cp.check_id,cp.pid,cp.native_start_marker,cp.process_group_id,cr.launch_boot_identity,cr.recovery_anchor_json FROM check_processes cp JOIN check_runs cr ON cr.id=cp.check_id WHERE cr.status IN ('launch_reserved','running','recovery_required') ORDER BY cp.check_id,cp.pid")?;
         let rows = statement
             .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    ProcessInfo {
-                        pid: row.get::<_, i64>(1)? as u32,
-                        start: row.get(2)?,
-                        pgid: row.get(3)?,
-                        ppid: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as u32,
-                    },
-                ))
+                Ok(InterruptGeneration {
+                    check_id: row.get(0)?,
+                    pid: row.get::<_, i64>(1)? as u32,
+                    start: row.get(2)?,
+                    group: row.get(3)?,
+                    launch_boot: row.get(4)?,
+                    anchor: row.get(5)?,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         drop(connection);
         let mut ids = Vec::new();
         let signal_deadline = Instant::now() + PROCESS_INSPECTION_TIMEOUT;
-        for (id, process) in rows {
-            if inventory
+        let mut targets = rows;
+        targets.extend(
+            progress
+                .targets
                 .iter()
-                .any(|p| p.pid == process.pid && same_process_start(&p.start, &process.start))
-            {
-                self.signal_processes(&[process], libc::SIGINT, signal_deadline)?;
-                if !ids.contains(&id) {
-                    ids.push(id)
+                .filter(|(target, outcome)| {
+                    matches!(outcome, CheckInterruptOutcome::Pending { .. })
+                        && !inventory.iter().any(|process| {
+                            process.pid == target.pid
+                                && same_process_start(&process.start, &target.start)
+                        })
+                })
+                .map(|(target, _)| target.clone())
+                .collect::<Vec<_>>(),
+        );
+        for target in targets {
+            let issued = progress.attempt(target.clone(), || {
+                match inventory.iter().find(|process| process.pid == target.pid) {
+                    None => CheckInterruptOutcome::PositivelyStale,
+                    Some(process) if !same_process_start(&process.start, &target.start) => {
+                        CheckInterruptOutcome::PositivelyStale
+                    }
+                    Some(process) if process.pgid != target.group => {
+                        CheckInterruptOutcome::Pending {
+                            reason: "check process group changed; recovery must verify ownership"
+                                .into(),
+                        }
+                    }
+                    Some(_) => match self.start_marker(target.pid, signal_deadline) {
+                        Err(error) => CheckInterruptOutcome::Pending {
+                            reason: format!("{error:#}"),
+                        },
+                        Ok(start) if !same_process_start(&start, &target.start) => {
+                            CheckInterruptOutcome::PositivelyStale
+                        }
+                        Ok(_) => {
+                            if unsafe { libc::kill(target.pid as libc::pid_t, libc::SIGINT) } == 0 {
+                                CheckInterruptOutcome::Issued
+                            } else {
+                                let error = std::io::Error::last_os_error();
+                                if error.raw_os_error() == Some(libc::ESRCH) {
+                                    CheckInterruptOutcome::PositivelyStale
+                                } else {
+                                    CheckInterruptOutcome::Pending {
+                                        reason: error.to_string(),
+                                    }
+                                }
+                            }
+                        }
+                    },
                 }
+            });
+            if issued && !ids.contains(&target.check_id) {
+                ids.push(target.check_id.clone());
             }
         }
         Ok(ids)
     }
 }
+
+#[cfg(test)]
+pub(crate) fn assert_partial_drain_interrupt_progress() {
+    use std::cell::Cell;
+    let mut progress = CheckInterruptProgress::default();
+    let target = |id: &str, pid| InterruptGeneration {
+        check_id: id.into(),
+        pid,
+        start: "generation-one".into(),
+        group: pid as i32,
+        launch_boot: Some("boot-one".into()),
+        anchor: Some("exact-anchor".into()),
+    };
+    let a = target("a", 41);
+    let b = target("b", 42);
+    let a_signals = Cell::new(0);
+    let b_inspections = Cell::new(0);
+    let b_signals = Cell::new(0);
+    assert!(progress.attempt(a.clone(), || {
+        a_signals.set(1);
+        CheckInterruptOutcome::Issued
+    }));
+    assert!(!progress.attempt(b.clone(), || {
+        b_inspections.set(b_inspections.get() + 1);
+        CheckInterruptOutcome::Pending {
+            reason: "start-marker inspection unavailable".into(),
+        }
+    }));
+    assert!(progress.pending());
+    assert!(!progress.attempt(a.clone(), || {
+        a_signals.set(2);
+        CheckInterruptOutcome::Issued
+    }));
+    assert!(progress.attempt(b.clone(), || {
+        b_inspections.set(b_inspections.get() + 1);
+        b_signals.set(b_signals.get() + 1);
+        CheckInterruptOutcome::Issued
+    }));
+    assert!(!progress.pending());
+    assert!(!progress.attempt(b, || {
+        b_signals.set(2);
+        CheckInterruptOutcome::Issued
+    }));
+    assert_eq!(
+        (a_signals.get(), b_inspections.get(), b_signals.get()),
+        (1, 2, 1)
+    );
+    let mut replaced = a;
+    replaced.start = "generation-two".into();
+    assert!(progress.attempt(replaced, || CheckInterruptOutcome::Issued));
+}
+
+#[cfg(test)]
+pub(crate) use tests::{run_interruptible_drain_check, seeded_service as seeded_drain_service};
 
 pub(crate) fn selected_authorized_on(
     connection: &rusqlite::Connection,
@@ -2267,7 +2425,7 @@ mod tests {
         (root.clone(), Cleanup(root))
     }
 
-    fn seeded_service(root: &Path, check_id: &str) -> (Store, CheckService) {
+    pub(crate) fn seeded_service(root: &Path, check_id: &str) -> (Store, CheckService) {
         std::fs::create_dir_all(root).unwrap();
         let store = Store::open(&root.join("state.sqlite3")).unwrap();
         {
@@ -2304,6 +2462,60 @@ mod tests {
         let supervisor = Supervisor::new(store.clone(), root.join("transcripts"));
         let service = CheckService::new(store.clone(), supervisor, root.join("artifacts"));
         (store, service)
+    }
+
+    pub(crate) fn run_interruptible_drain_check(
+        service: CheckService,
+        root: PathBuf,
+        ready: std::sync::mpsc::Sender<()>,
+    ) -> Result<serde_json::Value> {
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        service.store.lock()?.execute(
+            "UPDATE check_runs SET launch_state='reserved' WHERE id='held-check'",
+            [],
+        )?;
+        let (mut child, pgid, _) =
+            service.spawn_reserved_check("held-check", "causal", &mut command)?;
+        let pid = child.id();
+        let start = service.start_marker(pid, Instant::now() + PROCESS_INSPECTION_TIMEOUT)?;
+        record_current_anchor(&service.store, "held-check", pid, pgid, &start);
+        service.record_process("held-check", pid, &start, pgid, std::process::id())?;
+        service.store.lock()?.execute(
+            "UPDATE check_runs SET status='running',launch_state='started' WHERE id='held-check'",
+            [],
+        )?;
+        let stdout = child.stdout.take().context("fixture stdout missing")?;
+        let stderr = child.stderr.take().context("fixture stderr missing")?;
+        // The caller owns the real coordinator mutex across this same completion
+        // path used by run_selected, including retained output and process proof.
+        ready.send(())?;
+        service.complete_running_check(
+            "held-check".into(),
+            "a".into(),
+            "causal".into(),
+            CheckSpec {
+                executable: "/bin/sleep".into(),
+                arguments: vec!["30".into()],
+                timeout_seconds: 8,
+                suite_version: 1,
+                cwd: ".".into(),
+            },
+            root.to_string_lossy().into_owned(),
+            "candidate".into(),
+            "unused-snapshot".into(),
+            root,
+            pid,
+            start,
+            pgid,
+            child,
+            stdout,
+            stderr,
+            || service.process_inventory(),
+        )
     }
 
     fn spawned_owned_child() -> (Child, u32, i32, String) {

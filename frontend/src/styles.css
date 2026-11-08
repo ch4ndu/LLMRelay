@@ -3292,3 +3292,28 @@ details.panel > summary,
 .guidance-diff .diff-unchanged {
   color: var(--muted);
 }
+
+.task-comment {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.history-views, .history-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 1rem;
+  margin-block: 1rem;
+}
+.history-filters label { display: grid; gap: .35rem; min-width: 0; max-width: 100%; }
+.history-filters fieldset { display: flex; flex-wrap: wrap; gap: 1rem; min-width: 0; max-width: 100%; }
+.history-filters input:not([type="checkbox"]), .history-filters select { min-width: 0; max-width: 100%; }
+.history-views [aria-pressed="true"] { font-weight: 700; text-decoration: underline; }
+.history-search-results article { margin-block: .75rem; }
+.history-search-results article > button { width: 100%; text-align: left; overflow-wrap: anywhere; }
+.history-search-results span, .history-search-results time, .usage-comparisons small { display: block; }
+.history-search-results p, .historical-source pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.historical-source { margin-block: 1.5rem; padding: 1rem; border: 1px solid var(--line); overflow-wrap: anywhere; }
+.historical-source pre { max-height: 32rem; overflow: auto; }
+.usage-comparisons { overflow-x: auto; }
+.usage-comparisons table { width: 100%; border-collapse: collapse; }
+.usage-comparisons th, .usage-comparisons td { text-align: left; vertical-align: top; padding: .75rem; border-bottom: 1px solid var(--line); }

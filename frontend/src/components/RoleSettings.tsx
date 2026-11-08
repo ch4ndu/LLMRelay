@@ -32,6 +32,7 @@ import {
   type Task,
   type TripLaneState,
   type WorkflowFamily,
+  type SingleAgentPreset,
 } from "../types";
 import {
   generationSettled,
@@ -108,6 +109,8 @@ export function CompatibilityDetails({
 }
 
 export interface SingleAgentSelection {
+  preset?: SingleAgentPreset;
+  reviewer_profile_revision_id?: string;
   execution_config_revision_id: string;
   profile_revision_id: string;
   check_ids: string[];
@@ -116,6 +119,7 @@ export interface SingleAgentSelection {
 export const emptySingleAgentSelection = (
   execution?: ProjectExecution,
 ): SingleAgentSelection => ({
+  ...(execution?.default_preset && execution.default_preset !== "single_agent" ? { preset: execution.default_preset } : {}),
   execution_config_revision_id: execution?.configurations[0]?.id ?? "",
   profile_revision_id: "",
   check_ids: [],
@@ -177,10 +181,13 @@ export function SingleAgentSelectionFields(
     disabled?: boolean;
   },
 ) {
-  const profiles = (execution?.profiles ?? []).flatMap((profile) =>
+  const allProfiles = (execution?.profiles ?? []).flatMap((profile) =>
     profile.current_revision ? [{ profile, revision: profile.current_revision }] : []
   );
-  if (!execution?.configurations.length || !profiles.length) {
+  const preset = value.preset ?? "single_agent";
+  const profiles = allProfiles.filter(({ revision }) => (revision.purpose ?? "workspace_writer") === (preset === "repository_research" ? "repository_reader" : "workspace_writer"));
+  const reviewers = allProfiles.filter(({ revision }) => revision.purpose === "repository_reviewer");
+  if (!execution?.configurations.length) {
     return (
       <p className="hint">
         This project has no Single agent setup yet. Add an execution
@@ -199,6 +206,17 @@ export function SingleAgentSelectionFields(
   return (
     <fieldset className="single-agent-selection" disabled={disabled}>
       <legend>Single agent setup</legend>
+      <label>Task type
+        <select value={preset} onChange={(event) => {
+          const preset = event.target.value as SingleAgentPreset;
+          onChange({ execution_config_revision_id: value.execution_config_revision_id, profile_revision_id: "", check_ids: [], ...(preset !== "single_agent" ? { preset } : {}) });
+        }}>
+          <option value="single_agent">Build with one agent</option>
+          <option value="repository_research">Research the repository</option>
+          <option value="build_and_review">Build and review independently</option>
+        </select>
+      </label>
+      <p className="hint">{preset === "repository_research" ? "Reads an isolated repository and returns a report. Cannot change files or run service checks." : preset === "build_and_review" ? "A writer builds the result. A fresh reader reviews an exact frozen copy before you can accept it. At most one repair and two reviews." : "One writer completes the task in its retained conversation."}</p>
       <label>
         Execution configuration
         <select
@@ -220,6 +238,17 @@ export function SingleAgentSelectionFields(
           ))}
         </select>
       </label>
+      {profiles.length === 0 && <p className="warning">Add a {preset === "repository_research" ? "repository reader" : "workspace writer"} profile in Project settings. Its exact provider version must be qualified and admitted before it can run.</p>}
+      {preset === "build_and_review" && <>
+        <label>Independent reviewer
+          <select value={value.reviewer_profile_revision_id ?? ""} onChange={(event) => onChange({ ...value, reviewer_profile_revision_id: event.target.value })}>
+            <option value="">Choose a fresh read-only reviewer</option>
+            {value.reviewer_profile_revision_id && !reviewers.some(({ revision }) => revision.id === value.reviewer_profile_revision_id) && <option value={value.reviewer_profile_revision_id} disabled>Saved reviewer revision is unavailable</option>}
+            {reviewers.map(({ profile, revision }) => <option key={revision.id} value={revision.id}>{profile.display_name} · {providerName(revision.provider)} · {revision.model} · {revision.effort}</option>)}
+          </select>
+        </label>
+        <p className="hint">{admissionSummary(latestAdmission(execution, value.reviewer_profile_revision_id ?? "", value.execution_config_revision_id))}</p>
+      </>}
       <label>
         Agent profile
         <select
@@ -245,7 +274,7 @@ export function SingleAgentSelectionFields(
           </button>
         </p>
       )}
-      {checks.length > 0 && (
+      {preset !== "repository_research" && checks.length > 0 && (
         <fieldset>
           <legend>Checks the result must pass</legend>
           {checks.map((check) => (
@@ -434,6 +463,8 @@ function WorkflowChoice(
   const [selection, setSelection] = useState<SingleAgentSelection>(() =>
     current?.family === "single_agent"
       ? {
+        preset: current.preset,
+        reviewer_profile_revision_id: current.reviewer_profile_revision_id ?? undefined,
         execution_config_revision_id: current.execution_config_revision_id ??
           "",
         profile_revision_id: current.profile_revision_id ?? "",
@@ -443,13 +474,14 @@ function WorkflowChoice(
   );
   const unchanged = family === (current?.family ?? "trip") &&
     (family === "trip" ||
-      (selection.execution_config_revision_id ===
+      ((selection.preset ?? "single_agent") === (current?.preset ?? "single_agent") &&
+        (selection.reviewer_profile_revision_id ?? "") === (current?.reviewer_profile_revision_id ?? "") && selection.execution_config_revision_id ===
           current?.execution_config_revision_id &&
         selection.profile_revision_id === current?.profile_revision_id &&
         [...selection.check_ids].sort().join() ===
           [...(current?.check_ids ?? [])].sort().join()));
   const incomplete = family === "single_agent" &&
-    (!selection.execution_config_revision_id || !selection.profile_revision_id);
+    (!selection.execution_config_revision_id || !selection.profile_revision_id || (selection.preset === "build_and_review" && !selection.reviewer_profile_revision_id));
   const key = `selection:${task.id}`;
   const save = () =>
     void commands.submit(key, (operation_id) => ({
@@ -458,7 +490,7 @@ function WorkflowChoice(
       task_id: task.id,
       expected_version: task.version,
       selection: {
-        workspace_mode: current?.workspace_mode ?? "isolated_worktree",
+        workspace_mode: family === "single_agent" && selection.preset && selection.preset !== "single_agent" ? "isolated_worktree" : current?.workspace_mode ?? "isolated_worktree",
         ...(family === "trip" ? { family } : { family, ...selection }),
       },
     }));
@@ -477,7 +509,7 @@ function WorkflowChoice(
             />
             {option === "trip"
               ? "TRIP (manager and five delegated roles)"
-              : "Single agent (one agent writes the whole task)"}
+              : "Single agent presets"}
           </label>
         ))}
       </div>
@@ -541,11 +573,15 @@ function SingleAgentSettings(
     session.task_id === task.id && session.role === "single_agent" &&
     session.attempt_id === task.active_attempt?.id
   );
+  const reviewer = sessions.find((session) =>
+    session.task_id === task.id && session.role === "single_agent_reviewer" &&
+    session.attempt_id === task.active_attempt?.id
+  );
   return (
     <section className="panel role-settings single-agent-settings">
       <header>
         <h3>Single agent</h3>
-        <span>One agent writes the whole task</span>
+        <span>{task.workflow?.preset === "repository_research" ? "Read-only repository research" : task.workflow?.preset === "build_and_review" ? "Writer with independent fresh review" : "One agent writes the whole task"}</span>
       </header>
       <dl className="progress-facts">
         <dt>Agent profile</dt>
@@ -577,6 +613,10 @@ function SingleAgentSettings(
             ? writer.status === "running" ? "Running now" : "Not running"
             : "Not started yet"}
         </dd>
+        {task.workflow?.preset === "build_and_review" && <>
+          <dt>Independent reviewer</dt>
+          <dd>{reviewer ? reviewer.status === "running" ? "Reviewing the frozen candidate" : "Stopped" : "Waiting for the result and selected checks"}</dd>
+        </>}
       </dl>
       {workflow && !workflow.run && (
         <p className="hint">

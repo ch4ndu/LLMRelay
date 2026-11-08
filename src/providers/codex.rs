@@ -22,6 +22,7 @@ pub const APPROVAL_OWNERSHIP_REVISION: &str = "codex-native-approval-ownership-v
 pub const LEGACY_MCP_COVERAGE_GAP: &str = "historical Codex configuration does not match the current exact local MCP-source coverage contract; fresh exact-version native validation is required";
 pub const LEGACY_APPROVAL_OWNERSHIP_GAP: &str = "historical Codex Implementer configuration does not match the current native approval ownership contract; fresh exact-version native validation is required";
 pub const EXACT_CODEX_VERSION: &str = "codex-cli 0.162.1";
+pub const SINGLE_AGENT_QUALIFICATION_VERSION: &str = "codex-cli 0.166.0";
 pub(crate) const SOURCE_VERSION: &str = "0.162.1";
 pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-codex-launch-v3";
 pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-codex-resume-v3";
@@ -406,6 +407,9 @@ pub(crate) fn single_agent_native(
     request: &super::SingleAgentLaunchRequest<'_>,
 ) -> Result<super::SingleAgentNative> {
     let scope = super::single_agent_read_scope(request)?;
+    let writer = request.purpose.is_writer();
+    let base = if writer { ":workspace" } else { ":read-only" };
+    let approval = if writer { "on-request" } else { "never" };
     let synthetic = request.bundles.is_synthetic();
     let (executable, version) = if synthetic {
         (
@@ -423,7 +427,7 @@ pub(crate) fn single_agent_native(
             None,
         )
     } else {
-        let compatibility = inspect_native_compatibility(
+        let compatibility = inspect_single_agent_compatibility(
             request.cwd,
             &version,
             NativeUserConfig::Load,
@@ -444,16 +448,16 @@ pub(crate) fn single_agent_native(
         cwd: &scope.worktree,
         model: request.model,
         effort: request.effort,
-        approval: "on-request",
+        approval,
         permission_profile: permission_profile(
-            ":workspace",
+            base,
             &canonical_control_socket,
             &scope.denied_roots,
             Some(&scope),
         )?,
         network_proxy: network_proxy(&canonical_role_socket)?,
         hook_command: &shell_quote(&request.assets.runner.to_string_lossy()),
-        writer: true,
+        writer,
         disabled_mcp_servers: &disabled_mcp_servers,
         native_session_id: request.native_session_id,
     })?;
@@ -462,14 +466,14 @@ pub(crate) fn single_agent_native(
     let security_policy = serde_json::json!({
         "permission_profile": {
             "name": DENIED_READ_FLOOR_PROFILE,
-            "extends": ":workspace",
-            "filesystem": {"deny": denied_paths, "write": ["<worktree>"],
+            "extends": base,
+            "filesystem": {"deny": denied_paths, "write": if writer { vec!["<worktree>"] } else { vec![] },
                 "read": &scope.executable_read, "temporary_directories": "read-only"},
         },
         "executable_read_exception": scope.executable_read.as_deref()
             .map(super::executable_fingerprint).transpose()?,
         "network_proxy": {"unix_sockets": [{"path": &canonical_role_socket, "access": "allow"}], "domains": {}},
-        "approval": "on-request",
+        "approval": approval,
         "approval_reviewer": "user",
         "permission_request_timeout_seconds": crate::permissions::PROVIDER_PERMISSION_TIMEOUT_SECONDS,
         "delegation": false,
@@ -873,8 +877,13 @@ fn permission_profile(
     }
     if let Some(scope) = single_agent_scope {
         filesystem.push_str(&format!(
-            ",{}=\"write\"",
-            toml_string(&scope.worktree.to_string_lossy())?
+            ",{}={}",
+            toml_string(&scope.worktree.to_string_lossy())?,
+            toml_string(if base == ":workspace" {
+                "write"
+            } else {
+                "read"
+            })?
         ));
         if let Some(executable) = &scope.executable_read {
             filesystem.push_str(&format!(
@@ -928,6 +937,18 @@ fn inspect_native_compatibility(
 ) -> Result<NativeCompatibility> {
     if version != EXACT_CODEX_VERSION {
         bail!("Codex local compatibility requires exact {EXACT_CODEX_VERSION}")
+    }
+    inspect_single_agent_compatibility(cwd, version, user_config, launch_mode)
+}
+
+fn inspect_single_agent_compatibility(
+    cwd: &Path,
+    version: &str,
+    user_config: NativeUserConfig,
+    launch_mode: NativeLaunchMode,
+) -> Result<NativeCompatibility> {
+    if ![EXACT_CODEX_VERSION, SINGLE_AGENT_QUALIFICATION_VERSION].contains(&version) {
+        bail!("This Codex version has no compiled Single agent compatibility predicate")
     }
     if std::env::var_os("CODEX_HOME").is_some() {
         bail!("Codex local compatibility does not support a parent CODEX_HOME override")
@@ -1033,7 +1054,7 @@ fn inspect_native_compatibility(
     let identity = serde_json::json!({
         "revision": MCP_COVERAGE_REVISION,
         "class": MCP_COVERAGE_CLASS,
-        "codex_version": EXACT_CODEX_VERSION,
+        "codex_version": version,
         "system_config": "enumerated_if_present",
         "user_config": match user_config {
             NativeUserConfig::Load => "enumerated_if_present",

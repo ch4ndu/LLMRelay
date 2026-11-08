@@ -51,6 +51,32 @@
             "evidence_reference": "docs/provider-qualification-20261011.md#claude-single-agent-writer"
           }
         }
+        ,{
+          "mode": "single_agent_reader",
+          "contract_id": "claude-single-agent-reader",
+          "contract_revision": "claude-single-agent-reader-v1",
+          "authority": "read_only",
+          "session_contract": "retained",
+          "launch_revision": "llmrelay-claude-single-agent-read-launch-v1",
+          "native_policy_revision": "claude-single-agent-read-only-v1",
+          "credential_revision": "llmrelay-single-agent-reader-credential-v1",
+          "evidence_revision": "llmrelay-single-agent-read-proof-v1",
+          "required_evidence": ["exact_native_policy", "repository_read_report", "session_contract", "native_write_denial"],
+          "qualification": {"state": "unqualified", "reason": "Claude repository research is unavailable until independent native read-only and retained-session qualification is reviewed."}
+        },
+        {
+          "mode": "single_agent_reviewer",
+          "contract_id": "claude-single-agent-reviewer",
+          "contract_revision": "claude-single-agent-reviewer-v1",
+          "authority": "read_only",
+          "session_contract": "fresh",
+          "launch_revision": "llmrelay-claude-single-agent-read-launch-v1",
+          "native_policy_revision": "claude-single-agent-read-only-v1",
+          "credential_revision": "llmrelay-single-agent-reviewer-credential-v1",
+          "evidence_revision": "llmrelay-single-agent-read-proof-v1",
+          "required_evidence": ["exact_native_policy", "repository_read_report", "session_contract", "native_write_denial"],
+          "qualification": {"state": "unqualified", "reason": "Claude independent review is unavailable until independent native read-only and fresh-session qualification is reviewed."}
+        }
       ]
     }
   ]

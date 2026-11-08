@@ -32,6 +32,38 @@ to their providers under your account's terms.
 The rest of this guide is technical reference for exact restrictions, supported
 versions and recovery decisions.
 
+History search, exact historical source reads and usage comparisons require an
+authenticated browser and the `history_insights_v1` feature declaration. Every
+read preserves the ordinary-project visibility boundary. Historical sources use
+exact persisted ownership and a closed public-field allowlist; report metadata
+outside the text-valued plan is excluded. These endpoints do not execute work,
+grant permissions or change workflow authority. See [History search](OPERATIONS.md#history-search)
+for the display and pagination limits.
+
+## Native companion authority
+
+The optional macOS companion invokes its bundled CLI with fixed arguments and
+an explicit canonical instance directory. Desktop attention, browser opening
+and cmux pairing require the `native_companion_v1` control capability and a
+same-user human peer whose retained macOS audit-token generation is revalidated
+at dispatch. Managed agent processes and their descendants cannot use that
+bridge. Pairing captures a separate exact cmux process generation; it does not
+weaken foreground ancestry checks or grant access through cmux's endpoint policy.
+
+Browser opening issues a single-use, 60-second pending credential. A new pending
+credential preserves existing browser cookies. The background service does not
+print credentials, and the browser immediately removes sign-in and navigation
+metadata from the fragment, including failed exchanges. Notification activation
+must pass both native and authenticated browser checks for the same immutable
+attention episode. It grants navigation only, never workflow authority.
+
+Service installation uses private per-user owned files, exact generation records
+and instance/lifecycle locking. Cleanup requires positive process quiescence,
+including persisted prior-boot recovery evidence; a timeout is not proof that
+work stopped. No root service, global provider setting or automatic trust
+acceptance is introduced. See [background operation](OPERATIONS.md#background-service-and-menu-bar)
+for environment, notification and lifecycle behavior.
+
 ## Functional qualification and local authority
 
 New Codex and Claude preparations use the explicit `functional-v2` contract.
@@ -169,6 +201,8 @@ The Approval inbox identifies the project, task, role, native session, requested
 
 A reusable command-family rule identifies one stable, verified absolute or project-relative executable and covers all current and future arguments. Changed filenames, counts, flags, targets, and configuration values therefore do not require tiny new grants when the same executable family remains faithful. The preview shows the executable family, all-arguments coverage, provider and role, complete validated configuration binding, and either the registered Project boundary or exact Session worktree/native identity. The same generic matcher remains in place for every provider; there are no command-specific families. Compounds, redirects, substitutions, shell or interpreter wrappers, different executables, unsafe paths, and ambiguous input cannot inherit a reusable rule. A completely represented action outside the matcher may still receive exact one-time human review. Bare PATH names and shell builtins whose executable identity cannot be verified remain exact-once, deny, or faithful native-fallback decisions; denial never triggers automatic rewriting or rerouting. Saved rules remain bound to the complete validated configuration disclosed in the preview.
 
+The scope dialog also accepts a sample command for a read-only coverage preview. The service checks the recorded request revision, current session and worktree, executable family, and selected lifetime, and explains eligible, ineligible, or unavailable results. Saved-rule diagnostics describe current matching conditions separately from the request’s recorded decision. Previewing never runs the command, creates an approval, consumes a rule use, or changes the request. A compatible executable family does not override an exact denial. Service-owned check explanations keep family compatibility separate from effective authorization, candidate freshness, and selection state. Native provider approvals remain outside this preview’s authority.
+
 Inspect saved rules in **Reusable permission rules** and choose **Revoke** to stop their future matching decisions. Revocation cannot undo an already dispatched command and does not revoke native Codex approvals. Requests are bound to the current role generation, native session, and live hook connection; stale or restarted requests cannot replay an allow. Workspace writers can receive action grants; read-only Claude roles can receive only the exact one-time report permission described above. Their workflow authority remains read-only, with the hook-unavailable native-prompt residual and sandbox limits stated above. For Codex, every role uses a strict named profile that denies the exact canonical sibling `control.sock` and sets `network.enabled=true` only so Codex retains an enforcing limited proxy. The complete proxy override has no allowed domains, allows only the exact canonical `role.sock`, and explicitly disables local binding, upstream proxies, SOCKS5 and SOCKS5 UDP, credential brokerage, non-loopback proxy exposure, and arbitrary Unix sockets. `features.exec_permission_approvals` and `features.request_permissions_tool` are pinned off, so the under-development additive-permission path is not admitted. An approval or inherited native allow can skip an inbox interaction, but it cannot discard the local-command sandbox; arbitrary approved writes outside the Implementer worktree are not supported.
 
 Codex Implementer is currently **eligible and validation-required**, not fixed Unsupported. LLMRelay pins `--strict-config`, `--ask-for-approval on-request`, `approvals_reviewer="user"`, the denied-read floor, the complete restricted-proxy configuration with an empty domain allowlist and one identity-bound role socket, and both additive-permission features false. Native approvals are honored; only new requests Codex actually emits can reach the inbox. Under the legacy diagnostic contract, a `Supported` proof additionally requires an actual completed decision whose response was delivered for the exact session and generation, alongside the existing worktree-write, protected-path-denial, native-history, quiescence, provenance, and typed-checkpoint contracts. Those legacy observations do not qualify functional-v2. New functional proof requires the permitted write, authenticated report, native continuity and correlated evidence described above; it does not require an artificial denial or a permission request that the provider never emits. For actual permission delivery, pending, reserved, unknown, stale, or other-generation requests do not count. The app neither claims that every action produces an inbox request nor introduces an API-key fallback.
@@ -301,9 +335,30 @@ and operation receipts. Saving a profile performs structural validation, not nat
 qualification. Materialization copies task content and role settings into a backlog
 draft without copying capability proofs, activations, approval or launch authority.
 Workflow/configuration pins and required checks are revalidated at Ready and claim;
-only the current Manager selects checks. Internal setup projects cannot receive
+only the current Manager selects TRIP checks. Single agent recipes instead pin
+their exact execution configuration, preset, primary/reviewer profile revisions
+and selected check IDs. They grant no check execution or result acceptance.
+Internal setup projects cannot receive
 recipe intake. Scheduled fire records, task insertion, provenance and next-fire
 advancement are transactional, with a unique schedule/time identity.
+
+## Single agent preset authority
+
+Repository readers and independent reviewers use distinct read-only native
+policies and credential identities. They cannot gain writer authority through
+permission approval, use Main checkout or execute selected service checks.
+Release qualification of that exact provider policy is separate from project
+admission; missing evidence blocks launch. Writer evidence cannot satisfy it.
+
+A reviewer credential names one delivery, result, candidate, check revision and
+fresh native conversation. Its repository is materialized and verified from the
+captured snapshot before launch. Partial materialization, changed evidence or a
+stale credential cannot supply approval. Authenticated reporting, native process
+quiescence and final human acceptance are separate gates. Reviewer-requested
+repair uses its own durable receipt, never a fabricated human decision.
+Task-level delivery and repair limits survive child runs and restart; unresolved
+delivery is not a free retry. Restore preserves spent accounting and holds
+unresolved review delivery for recovery rather than granting fresh authority.
 
 ## Observed native resolution and notification identity
 

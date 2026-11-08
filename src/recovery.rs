@@ -423,8 +423,11 @@ pub(crate) fn restart_session_facts(
          JOIN projects p ON p.id=t.project_id
          LEFT JOIN restart_candidates restart ON restart.session_id=s.id
          WHERE (?1 IS NULL OR s.id=?1)
-           -- A Single agent writer resumes only through its own shared rule.
-           AND rg.role!='single_agent'
+           -- Single agent writers own their resume rule; reviewers are fresh-only.
+           AND rg.role NOT IN ('single_agent','single_agent_reviewer')
+           AND NOT EXISTS(SELECT 1 FROM execution_bindings eb
+             WHERE eb.role_generation_id=rg.id
+               AND (eb.actor='single_agent_reviewer' OR eb.slot_key='single_agent_reviewer'))
          ORDER BY s.created_at,s.id",
     )?;
     let mut rows = statement
@@ -1518,6 +1521,62 @@ pub(crate) fn admission_proof_snapshot(
 
 fn admission_uses_prior_generation(proof: &serde_json::Value) -> bool {
     proof["current_anchor"] != true
+}
+
+pub(crate) fn verify_installed_root_quiescent(store: &Store) -> Result<()> {
+    let (sessions, checks, attempts) = {
+        let connection = store.lock()?;
+        let ids = |sql: &str| -> Result<Vec<String>> {
+            let mut statement = connection.prepare(sql)?;
+            let rows = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            Ok(rows)
+        };
+        // A reserved launch with no process evidence never entered spawning.
+        // Every other uncertain generation, including prior boots, uses the
+        // same anchor/group/capture verifier as explicit recovery.
+        let sessions = ids("SELECT id FROM sessions s WHERE
+            NOT (s.launch_state='reserved' AND s.process_identity_json IS NULL
+                 AND s.recovery_anchor_json IS NULL AND s.recovery_process_group_id IS NULL
+                 AND NOT EXISTS(SELECT 1 FROM session_processes p WHERE p.session_id=s.id)
+                 AND NOT EXISTS(SELECT 1 FROM resume_invocations i WHERE i.session_id=s.id))
+            AND NOT (COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)=1
+                     AND s.status NOT IN ('launch_reserved','running','recovery_required'))
+            AND NOT (s.launch_state='failed' AND s.process_identity_json IS NULL
+                     AND s.recovery_anchor_json IS NULL AND s.recovery_process_group_id IS NULL
+                     AND COALESCE(json_extract(s.exit_json,'$.delivery'),'')='proven_nondelivery'
+                     AND NOT EXISTS(SELECT 1 FROM session_processes p WHERE p.session_id=s.id))")?;
+        let checks = ids("SELECT id FROM check_runs c WHERE NOT
+            (c.launch_state IN ('reserved','proven_nondelivery')
+             AND c.recovery_anchor_json IS NULL AND c.recovery_process_group_id IS NULL
+             AND NOT EXISTS(SELECT 1 FROM check_processes p WHERE p.check_id=c.id)
+             AND COALESCE(json_extract(c.evidence_json,'$.capture_incomplete'),0)=0)")?;
+        let unbound = ids(
+            "SELECT id FROM recovery_records WHERE state='attention_required'
+            AND attempt_id IS NULL AND session_id IS NULL",
+        )?;
+        if !unbound.is_empty() {
+            bail!("Unresolved instance recovery has no exact process owner; resolve it before removing the installation")
+        }
+        let mut sessions = sessions;
+        sessions.extend(ids("SELECT DISTINCT session_id FROM recovery_records WHERE state='attention_required' AND session_id IS NOT NULL")?);
+        sessions.sort();
+        sessions.dedup();
+        let attempts = ids("SELECT DISTINCT attempt_id FROM recovery_records
+            WHERE state='attention_required' AND attempt_id IS NOT NULL")?;
+        (sessions, checks, attempts)
+    };
+    for session in sessions {
+        verify_session_quiescent(store, &session)?;
+    }
+    for check in checks {
+        verify_check_quiescent(store, &check)?;
+    }
+    for attempt in attempts {
+        verify_attempt_quiescent(store, &attempt)?;
+    }
+    Ok(())
 }
 
 pub fn verify_session_quiescent(store: &Store, session: &str) -> Result<serde_json::Value> {

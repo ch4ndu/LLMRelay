@@ -989,6 +989,8 @@ fn single_agent_decision(connection: &Connection, attempt: &Attempt) -> Result<A
         SingleAgentStep::RunCheck { .. } => ready("coordinator.single_agent.run_check"),
         SingleAgentStep::CompleteChecks => ready("coordinator.single_agent.checks_passed"),
         SingleAgentStep::SettleProbe => ready("coordinator.single_agent.settle_probe"),
+        SingleAgentStep::PrepareReview => ready("coordinator.single_agent.prepare_review"),
+        SingleAgentStep::SettleReview => ready("coordinator.single_agent.settle_review"),
         SingleAgentStep::Hold { reason } => {
             waiting_on_person("workflow.single_agent.needs_person", Some(reason))
         }
@@ -5239,6 +5241,8 @@ enum SingleAgentStep {
     RunCheck { check_id: String },
     CompleteChecks,
     SettleProbe,
+    PrepareReview,
+    SettleReview,
     Hold { reason: String },
     ReportedHold(WriterReport),
     Wait,
@@ -5301,6 +5305,19 @@ fn single_agent_step(connection: &Connection, attempt_id: &str) -> Result<Single
             })
         }
         "awaiting_checks" => selected_checks_step(connection, attempt_id),
+        "awaiting_review" => Ok(SingleAgentStep::PrepareReview),
+        "review_running" => {
+            if let Some(receipt) = crate::store::eligible_single_agent_stop(connection, attempt_id)?
+            {
+                return Ok(SingleAgentStep::StopWriter(receipt));
+            }
+            let stopped: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM single_agent_review_deliveries d JOIN sessions s ON s.id=d.session_id WHERE d.attempt_id=?1 AND d.state='launched' AND (s.status='launch_failed' OR (s.status='exited' AND COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)=1)))",[attempt_id],|row|row.get(0))?;
+            Ok(if stopped {
+                SingleAgentStep::SettleReview
+            } else {
+                SingleAgentStep::Wait
+            })
+        }
         "awaiting_human" => {
             let probe: bool = connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM attempts a
@@ -5325,7 +5342,7 @@ fn agent_execution_step(connection: &Connection, attempt_id: &str) -> Result<Sin
         .query_row(
             "SELECT s.id,s.status,COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)=1
              FROM execution_bindings eb JOIN sessions s ON s.role_generation_id=eb.role_generation_id
-             WHERE eb.attempt_id=?1 AND eb.actor='single_agent'",
+             WHERE eb.attempt_id=?1 AND eb.actor IN ('single_agent','single_agent_reviewer')",
             params![attempt_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -5496,6 +5513,54 @@ fn advance_one_single_agent_attempt(app: &Application) -> Result<Option<serde_js
         };
         match step {
             SingleAgentStep::Wait => continue,
+            SingleAgentStep::PrepareReview => {
+                if let Err(error) = app.reviews.prepare_single_agent_review(&attempt_id) {
+                    if error.is::<crate::review::SingleAgentReviewDeferred>() || {
+                        let connection = app.store.lock()?;
+                        crate::review::single_agent_review_preparation_deferred(
+                            &connection,
+                            &attempt_id,
+                        )?
+                    } {
+                        continue;
+                    }
+                    crate::workflow::block_single_agent_review(
+                        &app.store,
+                        &attempt_id,
+                        &format!("{error:#}"),
+                    )?;
+                    return Ok(Some(
+                        serde_json::json!({"action":"single_agent_review_blocked","attempt_id":attempt_id}),
+                    ));
+                }
+                match app.dispatch_single_agent(&attempt_id) {
+                    Ok(value) => return Ok(Some(value)),
+                    Err(error) if error.is::<crate::store::RoleLaunchCapacityError>() => continue,
+                    Err(error) => {
+                        if error.is::<crate::review::SingleAgentReviewDeferred>() || {
+                            let connection = app.store.lock()?;
+                            crate::review::single_agent_review_preparation_deferred(
+                                &connection,
+                                &attempt_id,
+                            )?
+                        } {
+                            continue;
+                        }
+                        crate::workflow::block_single_agent_review(
+                            &app.store,
+                            &attempt_id,
+                            &format!("{error:#}"),
+                        )?;
+                        return Err(failure(error, StepEffect::Possible));
+                    }
+                }
+            }
+            SingleAgentStep::SettleReview => {
+                crate::workflow::settle_single_agent_review(&app.store, &attempt_id)?;
+                return Ok(Some(
+                    serde_json::json!({"action":"single_agent_review_settled","attempt_id":attempt_id}),
+                ));
+            }
             SingleAgentStep::Dispatch => match app.dispatch_single_agent(&attempt_id) {
                 Ok(value) => return Ok(Some(value)),
                 Err(error) if error.is::<crate::store::RoleLaunchCapacityError>() => continue,
@@ -8548,6 +8613,8 @@ fn finish_continue_with_restart_hold(
         && latest_attempt
         && !crate::workflow::pending_continue(&tx, attempt, Some(id))?
         && crate::store::failure_stop_fence(&tx, attempt)? != Some(false)
+        && (!matches!(phase.as_str(), "awaiting_review" | "review_running")
+            || crate::workflow::single_agent_review_continue_allowed(&tx, attempt, Some(id))?)
         && (ordinary
             || parked
             || (reserved_fresh_route
@@ -8847,6 +8914,20 @@ fn finish_control_in_transaction(
         params![attempt, task, status, attention],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    if status == "held" && attention == "paused" {
+        // An undelivered independent review is still service work. Keep its
+        // normal Continue control available while preserving the exact candidate.
+        tx.execute(
+            "UPDATE tasks SET lifecycle='in_progress' WHERE id=?1 AND lifecycle='awaiting_review'
+               AND EXISTS(SELECT 1 FROM attempts a
+                 JOIN workflow_result_bindings r ON r.attempt_id=a.id AND r.state='awaiting_review'
+                 JOIN workflow_run_profiles rp ON rp.attempt_id=a.id AND rp.slot_key='single_agent_reviewer'
+                 WHERE a.id=?2 AND a.task_id=tasks.id AND a.phase='awaiting_review'
+                   AND NOT EXISTS(SELECT 1 FROM single_agent_review_deliveries d WHERE d.attempt_id=a.id
+                     AND d.state NOT IN ('reserved','materializing','ready')))",
+            params![task, attempt],
+        )?;
+    }
     tx.execute(
         "UPDATE tasks SET attention=?1,lifecycle=CASE WHEN ?2='cancelled' THEN 'cancelled' ELSE lifecycle END,version=version+1,updated_at=?3 WHERE id=?4",
         params![attention, status, now, task],

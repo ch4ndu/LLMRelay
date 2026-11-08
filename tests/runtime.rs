@@ -115,7 +115,12 @@ async fn idle_service_stop_cli_receives_success_before_host_exit() {
         .await
         .expect("fixture process did not exit")
     }
-    for drain in [false, true] {
+    for (drain, signal) in [
+        (false, None),
+        (true, None),
+        (true, Some(libc::SIGINT)),
+        (true, Some(libc::SIGTERM)),
+    ] {
         let root =
             std::env::temp_dir().join(format!("llmrelay-stop-reply-{}", uuid::Uuid::new_v4()));
         let mut service = ChildGuard(
@@ -141,6 +146,29 @@ async fn idle_service_stop_cli_receives_success_before_host_exit() {
             .unwrap()
             .unwrap();
         let paths = InstancePaths::resolve(Some(root.clone())).unwrap();
+        if let Some(signal) = signal {
+            let connection = rusqlite::Connection::open(&paths.database).unwrap();
+            connection.execute_batch("INSERT INTO recovery_records(id,state,detail_json,created_at,updated_at)
+                VALUES('database-restore-hold','attention_required','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');").unwrap();
+            let held = control::request(&paths.control_socket, &ControlRequest::SchedulerRunOnce)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                held.to_string(),
+                "coordinator execution is disabled by the database restore hold"
+            );
+            assert_eq!(unsafe { libc::kill(service.0.id() as i32, signal) }, 0);
+            assert!(
+                wait_for_exit(&mut service).await.success(),
+                "one signal must finish shutdown despite the held/failed normal tick"
+            );
+            assert_eq!(connection.query_row("SELECT COUNT(*) FROM audit_events WHERE event_code='restart.desired_running.captured'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+            drop(agenticjira::database::InstanceLock::acquire(&paths).unwrap());
+            drop((connection, service));
+            let _ = std::fs::remove_dir_all(root);
+            let _ = std::fs::remove_dir_all(paths.socket_dir);
+            continue;
+        }
         let idle = control::ControlConnection::connect(&paths.control_socket)
             .await
             .unwrap();

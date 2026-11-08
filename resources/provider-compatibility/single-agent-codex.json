@@ -51,6 +51,32 @@
             "evidence_reference": "docs/provider-qualification-20261011.md#codex-single-agent-writer"
           }
         }
+        ,{
+          "mode": "single_agent_reader",
+          "contract_id": "codex-single-agent-reader",
+          "contract_revision": "codex-single-agent-reader-v1",
+          "authority": "read_only",
+          "session_contract": "retained",
+          "launch_revision": "llmrelay-codex-single-agent-read-launch-v1",
+          "native_policy_revision": "codex-single-agent-read-only-v1",
+          "credential_revision": "llmrelay-single-agent-reader-credential-v1",
+          "evidence_revision": "llmrelay-single-agent-read-proof-v1",
+          "required_evidence": ["exact_native_policy", "repository_read_report", "session_contract", "native_write_denial"],
+          "qualification": {"state": "unqualified", "reason": "Repository research needs reviewed native read-only and retained-session evidence for this exact Codex version. No model call is available yet."}
+        },
+        {
+          "mode": "single_agent_reviewer",
+          "contract_id": "codex-single-agent-reviewer",
+          "contract_revision": "codex-single-agent-reviewer-v1",
+          "authority": "read_only",
+          "session_contract": "fresh",
+          "launch_revision": "llmrelay-codex-single-agent-read-launch-v1",
+          "native_policy_revision": "codex-single-agent-read-only-v1",
+          "credential_revision": "llmrelay-single-agent-reviewer-credential-v1",
+          "evidence_revision": "llmrelay-single-agent-read-proof-v1",
+          "required_evidence": ["exact_native_policy", "repository_read_report", "session_contract", "native_write_denial"],
+          "qualification": {"state": "unqualified", "reason": "Independent review needs reviewed native read-only and fresh-session evidence for this exact Codex version. No model call is available yet."}
+        }
       ]
     }
   ]

@@ -27,6 +27,10 @@ pub struct InstancePaths {
 }
 
 impl InstancePaths {
+    pub fn root_key(&self) -> String {
+        hex::encode(Sha256::digest(self.root.as_os_str().as_encoded_bytes()))
+    }
+
     pub fn resolve(override_path: Option<PathBuf>) -> Result<Self> {
         let root = match override_path {
             Some(path) => {

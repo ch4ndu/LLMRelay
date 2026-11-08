@@ -429,8 +429,13 @@ impl PermissionActor {
             params![context.attempt_id],
             |row| row.get(0),
         )?;
-        let compiled =
-            crate::provider_compatibility::ExecutionPolicy::single_agent_writer(context.provider);
+        let compiled = crate::provider_compatibility::ExecutionPolicy::for_purpose(
+            context.provider,
+            context.purpose,
+        );
+        if compiled.content_hash() != context.policy_hash {
+            bail!("The Single agent purpose does not match its authenticated policy")
+        }
         Ok(Self {
             project_id: context.project_id.clone(),
             task_id: context.task_id.clone(),
@@ -440,7 +445,7 @@ impl PermissionActor {
             credential_id: context.credential_id.clone(),
             transcript_epoch: context.transcript_epoch.clone(),
             provider: context.provider,
-            actor: crate::domain::ExecutionActor::SINGLE_AGENT_KEY.to_owned(),
+            actor: context.purpose.slot().to_owned(),
             writer: compiled.worktree_write && compiled.content_hash() == context.policy_hash,
             configuration_revision,
             lane_id: "default".to_owned(),
@@ -1351,7 +1356,12 @@ pub fn consume_actor_response(
                         Ok(family) => !matching_rule_current(
                             &transaction,
                             rule_id,
-                            credential_context,
+                            credential_context.provider,
+                            &credential_context.actor,
+                            &credential_context.project_id,
+                            &credential_context.attempt_id,
+                            &credential_context.session_id,
+                            &credential_context.role_generation_id,
                             request_context,
                             &family,
                         )?,
@@ -1571,7 +1581,12 @@ pub fn mark_response_delivery_unknown(
 fn matching_rule_current(
     transaction: &Transaction<'_>,
     rule_id: &str,
-    context: &PermissionActor,
+    provider: Provider,
+    actor: &str,
+    project_id: &str,
+    attempt_id: &str,
+    session_id: &str,
+    generation_id: &str,
     request: &RequestContext,
     family: &FamilyCandidate,
 ) -> Result<bool> {
@@ -1594,9 +1609,9 @@ fn matching_rule_current(
                AND revoked_at IS NULL",
             params![
                 rule_id,
-                context.project_id,
-                context.provider.to_string(),
-                context.actor,
+                project_id,
+                provider.to_string(),
+                actor,
                 request.policy_fingerprint
             ],
             |row| {
@@ -1630,8 +1645,8 @@ fn matching_rule_current(
         return Ok(false);
     }
     let scope_matches = if lifetime == "session" {
-        session.as_deref() == Some(context.session_id.as_str())
-            && generation.as_deref() == Some(context.role_generation_id.as_str())
+        session.as_deref() == Some(session_id)
+            && generation.as_deref() == Some(generation_id)
             && native.as_deref() == Some(request.native_session_id.as_str())
             && worktree
                 .as_deref()
@@ -1642,13 +1657,7 @@ fn matching_rule_current(
         lifetime == "project"
     };
     Ok(scope_matches
-        && project_scope_current(
-            transaction,
-            &context.project_id,
-            &context.attempt_id,
-            request,
-            family,
-        )?)
+        && project_scope_current(transaction, project_id, attempt_id, request, family)?)
 }
 
 pub fn apply_human_decision(
@@ -1755,7 +1764,13 @@ pub fn apply_human_decision(
     if deadline <= now {
         bail!("permission request deadline elapsed")
     }
-    let writer = matches!(role.as_str(), "implementer" | "single_agent");
+    let writer = role == "implementer" || (role == "single_agent" && transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM execution_bindings eb
+         JOIN workflow_run_profiles rp ON rp.attempt_id=eb.attempt_id AND rp.slot_key=eb.slot_key
+         JOIN agent_profile_revisions p ON p.id=rp.profile_revision_id AND p.policy_hash=eb.policy_hash
+         WHERE eb.role_generation_id=?1 AND p.purpose='workspace_writer' AND p.authority='workspace_write')",
+        [&generation], |row| row.get::<_,bool>(0),
+    )?);
     if !writer {
         let provider_kind: Provider = provider.parse().map_err(|error: String| anyhow!(error))?;
         let exact_input: serde_json::Value = serde_json::from_str(&input_json)
@@ -2074,7 +2089,7 @@ fn request_context(
     ) = {
         let connection = store.lock()?;
         connection.query_row(
-            "SELECT s.native_session_id,s.status,s.capability_key,w.path,w.state,p.repository_path,p.repository_identity,rg.status
+            "SELECT s.native_session_id,s.status,s.capability_key,COALESCE((SELECT materialization_path FROM single_agent_review_deliveries WHERE session_id=s.id AND role_generation_id=rg.id AND transcript_epoch=s.transcript_epoch AND state='launched'),w.path),w.state,p.repository_path,p.repository_identity,rg.status
              FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
              JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
              JOIN projects p ON p.id=t.project_id JOIN workspaces w ON w.attempt_id=a.id
@@ -3405,4 +3420,158 @@ mod tests {
         forbidden_missing.push("--sandbox-identity=not-allowed".into());
         assert!(parse_runtime_role_report_args(&forbidden_missing).is_err());
     }
+}
+
+/// Reads current bound evidence only. This path never records a decision or consumes a rule.
+pub fn coverage_preview(
+    store: &Store,
+    sample: &crate::domain::PermissionCoverageSample,
+) -> Result<crate::domain::PermissionCoveragePreview> {
+    if sample.command.len() > MAX_INPUT_BYTES {
+        bail!("sample command exceeds 64 KiB")
+    }
+    let mut connection = store.lock()?;
+    let tx = connection.transaction()?;
+    let (provider, role, tool, family, state, session, generation, native, policy, project, attempt):
+        (String,String,String,Option<String>,String,String,String,String,String,String,String) = tx.query_row(
+        "SELECT pr.provider,pr.role,pr.tool_name,pr.family_json,pr.state,pr.session_id,pr.role_generation_id,
+         pr.native_session_id,pr.policy_fingerprint,pr.project_id,pr.attempt_id
+         FROM permission_requests pr WHERE pr.id=?1 AND pr.revision=?2",
+        params![sample.request_id,sample.expected_revision], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?)))
+        .optional()?.ok_or_else(||anyhow!("permission request revision changed; refresh before previewing"))?;
+    let response = |status: &str, code: &str, explanation: &str, compatible: bool| {
+        crate::domain::PermissionCoveragePreview {
+            status: status.into(),
+            reason_code: code.into(),
+            explanation: explanation.into(),
+            family_compatible: compatible,
+            recorded_state: state.clone(),
+            saved_rules: Vec::new(),
+        }
+    };
+    let Some(family) = family else {
+        return Ok(response(
+            "unavailable",
+            "no_eligible_family",
+            "The recorded request has no reusable executable family.",
+            false,
+        ));
+    };
+    let family: FamilyCandidate = serde_json::from_str(&family)?;
+    let current: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
+        WHERE s.id=?1 AND rg.id=?2 AND s.native_session_id=?3 AND s.capability_key=?4 AND s.status='running'
+        AND rg.status NOT IN ('replaced','revoked')
+        AND EXISTS(SELECT 1 FROM permission_requests pr WHERE pr.id=?5 AND pr.deadline_at>?6 AND NOT EXISTS(SELECT 1 FROM permission_native_resolutions nr WHERE nr.permission_request_id=pr.id)))",params![session,generation,native,policy,sample.request_id,Utc::now().to_rfc3339()],|r|r.get(0))?;
+    if !current {
+        return Ok(response("unavailable","session_policy_binding_changed","The session, generation, native identity or frozen policy changed. Refresh the request.",false));
+    }
+    let context = RequestContext {
+        native_session_id: native,
+        workspace: PathBuf::from(&family.worktree_path),
+        registered_root: PathBuf::from(&family.registered_root),
+        repository_identity: family.repository_identity.clone(),
+        policy_fingerprint: policy,
+    };
+    if !project_scope_current(&tx, &project, &attempt, &context, &family)? {
+        return Ok(response(
+            "unavailable",
+            "stale_project_eligibility",
+            "The project or managed worktree is no longer eligible for this recorded family.",
+            false,
+        ));
+    }
+    let provider: Provider = provider.parse().map_err(|e: String| anyhow!(e))?;
+    let input = serde_json::json!({"command":sample.command});
+    let candidate = match classify_family(provider, &role, &tool, &input, &context) {
+        Ok((candidate, _)) => candidate,
+        Err(error) => {
+            return Ok(response(
+                "ineligible",
+                "command_policy",
+                &error.to_string(),
+                false,
+            ))
+        }
+    };
+    let compatible = candidate.executable_kind == family.executable_kind
+        && candidate.executable_value == family.executable_value;
+    if state == "denied" {
+        return Ok(response(
+            "ineligible",
+            "exact_denial",
+            "The recorded exact denial takes precedence over family compatibility.",
+            compatible,
+        ));
+    }
+    if state != "pending" {
+        return Ok(response("unavailable","recorded_decision_consumption","This request already has a recorded decision. A current authorization cannot be inferred from its family, delivery or consumption state.",compatible));
+    }
+    if !compatible {
+        return Ok(response(
+            "ineligible",
+            "executable_family_mismatch",
+            "The sample resolves to another executable family.",
+            false,
+        ));
+    }
+    let scope = match sample.lifetime { PermissionLifetime::Session => "This sample fits the recorded session family scope. Preview grants no permission and does not control inherited native approvals.", PermissionLifetime::Project => "This sample fits the current project family scope. Preview grants no permission and does not control inherited native approvals." };
+    let mut preview = response("eligible", "family_compatible", scope, true);
+    let mut statement = tx.prepare("SELECT id,provider,role,policy_fingerprint,revoked_at,executable_kind,executable_value,lifetime FROM permission_rules WHERE project_id=?1 ORDER BY created_at DESC LIMIT 50")?;
+    let rules = statement
+        .query_map(params![project], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, rule_provider, rule_role, rule_policy, revoked, kind, executable, lifetime) in rules {
+        let matches = matching_rule_current(
+            &tx,
+            &id,
+            provider,
+            &role,
+            &project,
+            &attempt,
+            &session,
+            &generation,
+            &context,
+            &candidate,
+        )?;
+        let (code, explanation) = if revoked.is_some() {
+            ("revoked_rule", "This saved rule was revoked.")
+        } else if rule_provider != provider.to_string() || rule_role != role {
+            (
+                "provider_role_mismatch",
+                "This rule belongs to another provider or role.",
+            )
+        } else if rule_policy != context.policy_fingerprint {
+            (
+                "policy_binding_mismatch",
+                "The frozen provider policy no longer matches this rule.",
+            )
+        } else if kind != candidate.executable_kind || executable != candidate.executable_value {
+            (
+                "executable_family_mismatch",
+                "This rule covers another executable family.",
+            )
+        } else if lifetime != sample.lifetime.to_string() {
+            (
+                "scope_mismatch",
+                "This rule has another lifetime than the selected sample scope.",
+            )
+        } else if !matches {
+            ("identity_binding_mismatch","Project, repository, session, generation, native identity or worktree binding no longer matches.")
+        } else {
+            ("current_rule_match","This active saved rule covers the sample family under its current binding. Exact decisions still take precedence.")
+        };
+        preview.saved_rules.push(serde_json::json!({"rule_id":id,"reason_code":code,"explanation":explanation,"eligible":matches && lifetime == sample.lifetime.to_string()}));
+    }
+    Ok(preview)
 }

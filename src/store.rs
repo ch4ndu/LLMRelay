@@ -2518,6 +2518,14 @@ pub enum AttachmentTranscriptAccess {
     CaptureComplete { sequence: u64 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuidanceReservation {
+    Reserved,
+    Edited,
+    Cancelled,
+    Conflict,
+}
+
 const MIGRATION_001: &str = include_str!("../migrations/001_initial.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_application.sql");
 const MIGRATION_003: &str = include_str!("../migrations/003_orchestration.sql");
@@ -2560,6 +2568,8 @@ const MIGRATION_038: &str = include_str!("../migrations/038_codex_observed_usage
 const MIGRATION_039: &str = include_str!("../migrations/039_multi_workflow.sql");
 const MIGRATION_040: &str = include_str!("../migrations/040_trusted_checkout.sql");
 const MIGRATION_041: &str = include_str!("../migrations/041_provider_error_recovery.sql");
+const MIGRATION_042: &str = include_str!("../migrations/042_task_interaction_history.sql");
+const MIGRATION_043: &str = include_str!("../migrations/043_single_agent_presets_recipes.sql");
 // Same value rusqlite installs at open; set explicitly before any pragma or DDL can contend.
 pub(crate) const STATE_DATABASE_BUSY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
@@ -3900,13 +3910,76 @@ impl Store {
                 | "SessionEnd"
         );
         let payload_cwd = envelope.payload.get("cwd").and_then(|value| value.as_str());
-        let expected_cwd = {
-            let connection = self.lock()?;
-            connection.query_row(
-                "SELECT COALESCE((SELECT path FROM workspaces WHERE attempt_id=?1),repository_path) FROM projects WHERE id=?2",
-                params![context.attempt_id, context.project_id], |row| row.get::<_, String>(0),
-            )?
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_invocation: Option<(String, String, String)> = transaction.query_row(
+            "SELECT rg.role,t.id,COALESCE((SELECT path FROM workspaces WHERE attempt_id=a.id),p.repository_path)
+               FROM role_credentials rc
+               JOIN role_generations rg ON rg.id=rc.role_generation_id
+               JOIN sessions s ON s.role_generation_id=rg.id
+               JOIN attempts a ON a.id=rg.attempt_id
+               JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
+               WHERE rc.id=?1 AND rc.role_generation_id=?2 AND rc.revoked_at IS NULL
+                 AND s.id=?3 AND s.transcript_epoch=?4
+                 AND rg.status='running' AND s.status='running'
+                 AND a.id=?5 AND p.id=?6 AND rg.provider=?7 AND s.provider=?7",
+            params![
+                context.credential_id,
+                context.role_generation_id,
+                context.session_id,
+                context.transcript_epoch,
+                context.attempt_id,
+                context.project_id,
+                context.provider.to_string()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?;
+        let Some((role, task_id, mut expected_cwd)) = current_invocation else {
+            bail!("hook credential or invocation identity is revoked, stale, or no longer running")
         };
+        if role == "single_agent_reviewer" {
+            let policy_hash = crate::provider_compatibility::ExecutionPolicy::for_purpose(
+                context.provider,
+                crate::domain::ProfilePurpose::RepositoryReviewer,
+            )
+            .content_hash();
+            let binding: Option<(String, Option<String>)> = transaction.query_row(
+                "SELECT rp.profile_revision_id,d.id FROM execution_bindings eb
+                 JOIN workflow_run_profiles rp ON rp.attempt_id=eb.attempt_id AND rp.slot_key=eb.slot_key
+                   AND rp.policy_hash=eb.policy_hash AND rp.session_contract=eb.session_contract
+                 JOIN agent_profile_revisions profile ON profile.id=rp.profile_revision_id
+                   AND profile.profile_hash=rp.profile_hash AND profile.policy_hash=rp.policy_hash
+                   AND profile.purpose='repository_reviewer' AND profile.provider=?7
+                 JOIN sessions s ON s.role_generation_id=eb.role_generation_id
+                   AND s.id=?3 AND s.transcript_epoch=?5 AND s.resume_count=0
+                 LEFT JOIN single_agent_review_deliveries d ON d.attempt_id=eb.attempt_id
+                   AND d.role_generation_id=eb.role_generation_id AND d.session_id=s.id
+                   AND d.credential_id=?4 AND d.transcript_epoch=s.transcript_epoch AND d.state='launched'
+                   AND d.reviewer_profile_revision_id=rp.profile_revision_id AND d.reviewer_profile_hash=rp.profile_hash
+                 WHERE eb.role_generation_id=?1 AND eb.attempt_id=?2
+                   AND eb.slot_key='single_agent_reviewer' AND eb.actor='single_agent_reviewer'
+                   AND eb.session_contract='fresh' AND eb.policy_hash=?6",
+                params![context.role_generation_id, context.attempt_id, context.session_id,
+                    context.credential_id, context.transcript_epoch, policy_hash, context.provider.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            let (profile, delivery) =
+                binding.context("The reviewer hook has no exact fresh policy binding")?;
+            if let Some(delivery) = delivery {
+                expected_cwd = crate::review::require_current_single_agent_delivery(
+                    &transaction,
+                    &delivery,
+                    true,
+                )?
+                .materialization_path
+                .to_string_lossy()
+                .into_owned();
+            } else if !crate::workflow::pending_read_probe(&transaction, &task_id, &profile)? {
+                // Only an admission probe may use the attempt workspace without a delivery.
+                bail!("The reviewer hook has no exact launched delivery")
+            }
+        }
         let expected_cwd = std::fs::canonicalize(&expected_cwd).ok();
         let cwd_matches = payload_cwd
             .and_then(|cwd| std::fs::canonicalize(cwd).ok())
@@ -3916,27 +3989,6 @@ impl Store {
             && native_session_id
                 .as_deref()
                 .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
-        let now = Utc::now().to_rfc3339();
-        let mut connection = self.lock()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current_invocation: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM role_credentials rc
-               JOIN role_generations rg ON rg.id=rc.role_generation_id
-               JOIN sessions s ON s.role_generation_id=rg.id
-               WHERE rc.id=?1 AND rc.role_generation_id=?2 AND rc.revoked_at IS NULL
-                 AND s.id=?3 AND s.transcript_epoch=?4
-                 AND rg.status='running' AND s.status='running')",
-            params![
-                context.credential_id,
-                context.role_generation_id,
-                context.session_id,
-                context.transcript_epoch
-            ],
-            |row| row.get(0),
-        )?;
-        if !current_invocation {
-            bail!("hook credential or invocation identity is revoked, stale, or no longer running")
-        }
         let hook_event_id = uuid::Uuid::new_v4().to_string();
         transaction.execute(
             "INSERT INTO hook_events(id, session_id, role_generation_id, provider, event_name, native_session_id, payload_json,
@@ -4785,19 +4837,20 @@ impl Store {
         transcript_epoch: &str,
         resume_invocation_id: Option<&str>,
         submitted_text: &str,
-    ) -> Result<bool> {
+        expected_revision: i64,
+    ) -> Result<GuidanceReservation> {
         let submitted_digest = json_hash(&submitted_text)?;
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_current_report_reminder(&transaction, guidance_id)?;
+        let report_reminder = require_current_report_reminder(&transaction, guidance_id)?;
         require_no_session_provider_failure_hold(&transaction, session_id)?;
         require_session_failure_stop_released(&transaction, session_id)?;
         let reserved = transaction.execute(
             "UPDATE guidance_messages SET state='delivery_reserved',reason='automatic_post_hook_idle_verified',
                delivery_session_id=?2,delivery_transcript_epoch=?3,delivery_resume_invocation_id=?4,
                submitted_text=?5,submitted_digest=?6
-             WHERE id=?1 AND state='queued'
+             WHERE id=?1 AND state='queued' AND message_revision=?7
                AND (submitted_text IS NULL OR (submitted_text=?5 AND submitted_digest=?6))
                AND EXISTS(SELECT 1 FROM sessions s
                  WHERE s.id=?2 AND s.role_generation_id=guidance_messages.role_generation_id
@@ -4816,7 +4869,8 @@ impl Store {
                 transcript_epoch,
                 resume_invocation_id,
                 submitted_text,
-                submitted_digest
+                submitted_digest,
+                expected_revision
             ],
         )? == 1;
         if reserved {
@@ -4825,8 +4879,53 @@ impl Store {
                 params![now, session_id],
             )?;
         }
+        let outcome = if reserved {
+            GuidanceReservation::Reserved
+        } else if report_reminder {
+            GuidanceReservation::Conflict
+        } else {
+            let changed: Option<(String, String, i64)> = transaction
+                .query_row(
+                    "SELECT state,COALESCE(reason,''),message_revision FROM guidance_messages
+                 WHERE id=?1 AND delivery_session_id IS NULL
+                   AND delivery_transcript_epoch IS NULL AND delivery_resume_invocation_id IS NULL
+                   AND submitted_text IS NULL AND submitted_digest IS NULL
+                   AND EXISTS(SELECT 1 FROM sessions s
+                     WHERE s.id=?2 AND s.role_generation_id=guidance_messages.role_generation_id
+                       AND s.status='running' AND s.readiness_state='idle_candidate'
+                       AND s.transcript_epoch=?3
+                       AND (SELECT ri.id FROM resume_invocations ri
+                            WHERE ri.session_id=s.id AND ri.transcript_epoch=s.transcript_epoch
+                            ORDER BY ri.resume_ordinal DESC LIMIT 1) IS ?4)",
+                    params![
+                        guidance_id,
+                        session_id,
+                        transcript_epoch,
+                        resume_invocation_id
+                    ],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            match changed {
+                Some((state, reason, revision))
+                    if revision > expected_revision
+                        && state == "queued"
+                        && reason == "human_guidance_edited" =>
+                {
+                    GuidanceReservation::Edited
+                }
+                Some((state, reason, revision))
+                    if revision > expected_revision
+                        && state == "cancelled"
+                        && reason == "human_guidance_cancelled" =>
+                {
+                    GuidanceReservation::Cancelled
+                }
+                _ => GuidanceReservation::Conflict,
+            }
+        };
         transaction.commit()?;
-        Ok(reserved)
+        Ok(outcome)
     }
 
     pub(crate) fn reserve_report_reminder(
@@ -5016,7 +5115,49 @@ impl Store {
         transcript_epoch: &str,
         boot_identity: &str,
     ) -> Result<()> {
-        let connection = self.lock()?;
+        let mut guard = self.lock()?;
+        let connection = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let review: Option<(String, String)> = connection
+            .query_row(
+                "SELECT id,attempt_id FROM single_agent_review_deliveries WHERE session_id=?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((delivery_id, attempt_id)) = review {
+            let current: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM single_agent_review_deliveries d
+                 JOIN sessions s ON s.id=d.session_id AND s.transcript_epoch=d.transcript_epoch
+                   AND s.role_generation_id=d.role_generation_id
+                 JOIN role_generations g ON g.id=s.role_generation_id AND g.attempt_id=d.attempt_id
+                   AND g.role='single_agent_reviewer' AND g.status='launch_reserved'
+                 JOIN role_credentials c ON c.id=d.credential_id AND c.role_generation_id=g.id AND c.revoked_at IS NULL
+                 WHERE d.id=?1 AND d.state='launched' AND s.transcript_epoch=?2
+                   AND s.status='launch_reserved' AND s.launch_state='reserved')",
+                params![delivery_id, transcript_epoch],
+                |row| row.get(0),
+            )?;
+            if !current {
+                bail!("The reviewer launch reservation is stale")
+            }
+            if let Err(error) = crate::review::require_single_agent_review_launch(
+                &connection,
+                &attempt_id,
+                "review_running",
+            ) {
+                if error.is::<crate::review::SingleAgentReviewDeferred>() {
+                    defer_single_agent_review_reservation(
+                        &connection,
+                        session_id,
+                        transcript_epoch,
+                        &error.to_string(),
+                    )?;
+                    connection.commit()?;
+                }
+                return Err(error);
+            }
+            crate::review::require_current_single_agent_delivery(&connection, &delivery_id, true)?;
+        }
         // A provider check cancelled after its reservation can no longer spawn.
         let changed = connection.execute(
             "UPDATE sessions SET launch_state='spawning',launch_boot_identity=?1,updated_at=?2
@@ -5036,7 +5177,45 @@ impl Store {
              WHERE session_id=?2 AND transcript_epoch=(SELECT transcript_epoch FROM sessions WHERE id=?2) AND state='reserved'",
             params![Utc::now().to_rfc3339(), session_id],
         )?;
+        connection.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn defer_single_agent_review_before_spawn(
+        &self,
+        session_id: &str,
+        transcript_epoch: &str,
+        service_draining: bool,
+    ) -> Result<bool> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt: String = tx.query_row(
+            "SELECT attempt_id FROM single_agent_review_deliveries WHERE session_id=?1 AND transcript_epoch=?2 AND state='launched'",
+            params![session_id, transcript_epoch],
+            |row| row.get(0),
+        )?;
+        let readiness = if service_draining {
+            Err(crate::review::SingleAgentReviewDeferred(
+                "The service is draining; the independent review will wait".into(),
+            )
+            .into())
+        } else {
+            crate::review::require_single_agent_review_launch(&tx, &attempt, "review_running")
+        };
+        if let Err(error) = readiness {
+            if !error.is::<crate::review::SingleAgentReviewDeferred>() {
+                return Err(error);
+            }
+            defer_single_agent_review_reservation(
+                &tx,
+                session_id,
+                transcript_epoch,
+                &error.to_string(),
+            )?;
+            tx.commit()?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub fn session_is_spawning_for_attachment(
@@ -13329,6 +13508,9 @@ pub struct SingleAgentResumeBinding<'a> {
 /// identities are fresh; the reservation rechecks every condition.
 #[derive(Clone, Debug)]
 pub struct SingleAgentLaunchContext {
+    pub purpose: crate::domain::ProfilePurpose,
+    pub preset: crate::domain::SingleAgentPreset,
+    pub review_delivery_id: Option<String>,
     pub task_id: String,
     pub attempt_id: String,
     pub workspace: std::path::PathBuf,
@@ -13437,7 +13619,7 @@ pub(crate) fn eligible_single_agent_stop(
         .query_row(
             "SELECT s.id,s.role_generation_id,s.transcript_epoch,s.process_identity_json,rr.id
              FROM attempts a
-             JOIN execution_bindings eb ON eb.attempt_id=a.id AND eb.actor='single_agent'
+             JOIN execution_bindings eb ON eb.attempt_id=a.id AND eb.actor IN ('single_agent','single_agent_reviewer')
              JOIN role_generations g ON g.id=eb.role_generation_id AND g.status='running'
              JOIN sessions s ON s.role_generation_id=g.id AND s.status='running'
                AND s.process_identity_json IS NOT NULL
@@ -13450,7 +13632,10 @@ pub(crate) fn eligible_single_agent_stop(
                AND ((a.phase='result_submitted' AND r.state='pending_quiescence'
                      AND r.session_id=s.id AND r.transcript_epoch=s.transcript_epoch)
                  OR (a.phase='agent_execution' AND r.id IS NULL
-                     AND rr.outcome IN ('blocked','needs_input') AND rr.consumed_at IS NULL))
+                     AND rr.outcome IN ('blocked','needs_input') AND rr.consumed_at IS NULL)
+                 OR (a.phase='review_running' AND eb.actor='single_agent_reviewer' AND EXISTS(
+                     SELECT 1 FROM single_agent_review_deliveries d WHERE d.attempt_id=a.id AND d.session_id=s.id
+                     AND d.role_generation_id=g.id AND d.transcript_epoch=s.transcript_epoch AND d.state='launched')))
              ORDER BY rr.created_at DESC,rr.rowid DESC LIMIT 1",
             params![attempt_id],
             |row| {
@@ -13477,6 +13662,57 @@ pub(crate) fn eligible_single_agent_stop(
         },
     )
     .transpose()
+}
+
+// Only an untouched reservation proves that no native process was spawned.
+// Keep the failed generation and an exact audit binding when reoffering its delivery.
+fn defer_single_agent_review_reservation(
+    connection: &Connection,
+    session_id: &str,
+    transcript_epoch: &str,
+    reason: &str,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let (delivery, attempt, generation, credential): (String, String, String, String) = connection
+        .query_row(
+            "SELECT d.id,d.attempt_id,d.role_generation_id,d.credential_id
+         FROM single_agent_review_deliveries d JOIN sessions s ON s.id=d.session_id
+           AND s.role_generation_id=d.role_generation_id AND s.transcript_epoch=d.transcript_epoch
+         WHERE d.session_id=?1 AND d.transcript_epoch=?2 AND d.state='launched'
+           AND s.status='launch_reserved' AND s.launch_state='reserved'
+           AND s.process_identity_json IS NULL AND s.native_session_id IS NULL
+           AND s.recovery_root_pid IS NULL AND s.recovery_process_group_id IS NULL
+           AND s.recovery_anchor_json IS NULL AND s.launch_boot_identity IS NULL
+           AND NOT EXISTS(SELECT 1 FROM role_results WHERE session_id=s.id)
+           AND NOT EXISTS(SELECT 1 FROM session_processes WHERE session_id=s.id)
+           AND NOT EXISTS(SELECT 1 FROM hook_events WHERE session_id=s.id)",
+            params![session_id, transcript_epoch],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .context("The review reservation has no exact proof of nondelivery")?;
+    let evidence = serde_json::json!({
+        "delivery_id": delivery, "attempt_id": attempt, "session_id": session_id,
+        "role_generation_id": generation, "credential_id": credential,
+        "transcript_epoch": transcript_epoch, "reason": reason,
+        "native_spawned": false, "process_group_quiescent": true,
+    });
+    connection.execute(
+        "UPDATE sessions SET status='launch_failed',launch_state='failed',launch_error=?1,exit_json=?2,updated_at=?3 WHERE id=?4",
+        params![reason, evidence.to_string(), now, session_id],
+    )?;
+    connection.execute(
+        "UPDATE role_generations SET status='launch_failed',updated_at=?1 WHERE id=?2",
+        params![now, generation],
+    )?;
+    connection.execute(
+        "UPDATE role_credentials SET revoked_at=COALESCE(revoked_at,?1) WHERE id=?2",
+        params![now, credential],
+    )?;
+    connection.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'service','single_agent_review.launch_deferred','session',?2,?3,?4)",params![uuid::Uuid::new_v4().to_string(),session_id,evidence.to_string(),now])?;
+    connection.execute("UPDATE single_agent_review_deliveries SET state='ready',reason=?1,updated_at=?2 WHERE id=?3",params![reason,now,delivery])?;
+    connection.execute("UPDATE workflow_result_bindings SET state='awaiting_review',updated_at=?1 WHERE id=(SELECT result_binding_id FROM single_agent_review_deliveries WHERE id=?2) AND state='review_running'",params![now,delivery])?;
+    connection.execute("UPDATE attempts SET phase='awaiting_review',updated_at=?1 WHERE id=?2 AND phase='review_running'",params![now,attempt])?;
+    Ok(())
 }
 
 /// Why the run's single writer cannot be launched now, in plain language.
@@ -13519,7 +13755,13 @@ fn single_agent_launch_blocker(
     };
     if definition_state != "available"
         || definition_hash.as_deref()
-            != Some(crate::workflow_resources::single_agent_definition_hash().as_str())
+            != Some(
+                crate::workflow_resources::single_agent_definition(crate::workflow::run_preset(
+                    connection, attempt_id,
+                )?)
+                .hash()
+                .as_str(),
+            )
     {
         return Ok(Some(
             "The run's Single agent definition is unavailable in this release; it cannot launch"
@@ -13555,7 +13797,7 @@ fn single_agent_launch_blocker(
         ("The agent profile admission is no longer active",
          "SELECT NOT EXISTS(SELECT 1 FROM workflow_run_profiles rp
             JOIN profile_admissions pa ON pa.id=rp.admission_id JOIN attempts a ON a.id=rp.attempt_id
-            WHERE rp.attempt_id=?1 AND rp.slot_key='single_agent'
+            WHERE rp.attempt_id=?1 AND (rp.slot_key='single_agent' OR (rp.slot_key='single_agent_reviewer' AND pa.state='pending' AND pa.probe_task_id=a.task_id))
               AND (pa.state='activated' OR (pa.state='pending' AND pa.probe_task_id=a.task_id)))"),
     ];
     for (reason, sql) in checks {
@@ -13571,11 +13813,15 @@ fn single_agent_launch_blocker(
     Ok(None)
 }
 
-fn single_agent_profile_binding_hash(connection: &Connection, attempt_id: &str) -> Result<String> {
+pub(crate) fn single_agent_profile_binding_hash(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<String> {
+    let slot = crate::workflow::single_agent_primary_slot(connection, attempt_id)?;
     let binding: (String, String, String, String, String) = connection.query_row(
         "SELECT profile_revision_id,admission_id,policy_hash,session_contract,profile_hash
-         FROM workflow_run_profiles WHERE attempt_id=?1 AND slot_key='single_agent'",
-        params![attempt_id],
+         FROM workflow_run_profiles WHERE attempt_id=?1 AND slot_key=?2",
+        params![attempt_id, slot],
         |row| {
             Ok((
                 row.get(0)?,
@@ -13588,7 +13834,7 @@ fn single_agent_profile_binding_hash(connection: &Connection, attempt_id: &str) 
     )?;
     json_hash(&serde_json::json!({
         "attempt_id": attempt_id,
-        "slot_key": "single_agent",
+        "slot_key": slot,
         "profile_revision_id": binding.0,
         "admission_id": binding.1,
         "policy_hash": binding.2,
@@ -13674,8 +13920,8 @@ impl Store {
                         rp.profile_revision_id,rp.admission_id,eb.policy_hash,eb.session_contract,
                         b.definition_hash,b.scope_hash,eb.channel_operations_json
                  FROM role_credentials rc
-                 JOIN role_generations rg ON rg.id=rc.role_generation_id AND rg.role='single_agent'
-                 JOIN execution_bindings eb ON eb.role_generation_id=rg.id AND eb.attempt_id=rg.attempt_id
+                 JOIN role_generations rg ON rg.id=rc.role_generation_id AND rg.role IN ('single_agent','single_agent_reviewer')
+                 JOIN execution_bindings eb ON eb.role_generation_id=rg.id AND eb.attempt_id=rg.attempt_id AND eb.slot_key=rg.role AND eb.actor=rg.role
                  JOIN workflow_run_profiles rp ON rp.attempt_id=eb.attempt_id AND rp.slot_key=eb.slot_key
                  JOIN workflow_run_bindings b ON b.attempt_id=eb.attempt_id AND b.family='single_agent'
                    AND b.definition_state='available'
@@ -13713,7 +13959,35 @@ impl Store {
             return Ok(None);
         };
         auth::verify_secret(token, &expected_hash)?;
+        let purpose: String = connection.query_row(
+            "SELECT purpose FROM agent_profile_revisions WHERE id=?1",
+            [&profile_revision_id],
+            |row| row.get(0),
+        )?;
+        let purpose: crate::domain::ProfilePurpose =
+            purpose.parse().map_err(|error: String| anyhow!(error))?;
+        let provider: Provider = provider.parse().map_err(|error: String| anyhow!(error))?;
+        if crate::provider_compatibility::ExecutionPolicy::for_purpose(provider, purpose)
+            .content_hash()
+            != policy_hash
+        {
+            bail!("The credential's execution purpose is stale")
+        }
+        let review_delivery_id: Option<String> = connection.query_row("SELECT id FROM single_agent_review_deliveries WHERE role_generation_id=?1 AND session_id=?2 AND credential_id=?3 AND transcript_epoch=?4 AND state='launched'",params![role_generation_id,session_id,credential_id,transcript_epoch],|row|row.get(0)).optional()?;
+        if purpose == crate::domain::ProfilePurpose::RepositoryReviewer
+            && !crate::workflow::pending_read_probe(&connection, &task_id, &profile_revision_id)?
+        {
+            crate::review::require_current_single_agent_delivery(
+                &connection,
+                review_delivery_id
+                    .as_deref()
+                    .context("The reviewer credential has no exact delivery")?,
+                true,
+            )?;
+        }
         Ok(Some(crate::domain::SingleAgentContext {
+            purpose,
+            review_delivery_id,
             project_id,
             task_id,
             attempt_id,
@@ -13721,7 +13995,7 @@ impl Store {
             session_id,
             credential_id,
             transcript_epoch,
-            provider: provider.parse().map_err(|error: String| anyhow!(error))?,
+            provider,
             profile_revision_id,
             admission_id,
             policy_hash,
@@ -13758,11 +14032,11 @@ impl Store {
             "SELECT t.title,t.description,t.acceptance_criteria_json,c.config_json,r.instructions_text,b.definition_id
              FROM attempts a JOIN tasks t ON t.id=a.task_id
              JOIN workflow_run_bindings b ON b.attempt_id=a.id
-             JOIN workflow_run_profiles rp ON rp.attempt_id=a.id AND rp.slot_key='single_agent'
+             JOIN workflow_run_profiles rp ON rp.attempt_id=a.id AND rp.slot_key=?2
              JOIN agent_profile_revisions r ON r.id=rp.profile_revision_id
              LEFT JOIN execution_config_revisions c ON c.id=b.execution_config_revision_id
              WHERE a.id=?1",
-            params![context.attempt_id],
+            params![context.attempt_id,context.purpose.slot()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         )?;
         let feedback: Option<String> = connection
@@ -13789,6 +14063,32 @@ impl Store {
             .as_deref()
             .map(serde_json::from_str::<serde_json::Value>)
             .transpose()?;
+        let preset = crate::workflow::run_preset(&connection, &context.attempt_id)?;
+        let review = context
+            .review_delivery_id
+            .as_ref()
+            .map(|id| crate::review::require_current_single_agent_delivery(&connection, id, true))
+            .transpose()?;
+        let challenge: Option<serde_json::Value> = connection.query_row("SELECT nonce,state FROM single_agent_admission_challenges WHERE task_id=?1 AND admission_id=?2",params![context.task_id,context.admission_id],|row|Ok(serde_json::json!({"nonce":row.get::<_,String>(0)?,"state":row.get::<_,String>(1)?,"path":crate::workflow::SINGLE_AGENT_READ_CHALLENGE,"report_evidence_format":"LLMRELAY-READ-PROBE:<nonce>:<exact file contents>","continuity":"Reader: first needs_input, then recall after explicit Resume agent. Reviewer: one fresh result_ready. Never invent write-denial evidence."}))).optional()?;
+        let reviewed_result = review.as_ref().map(|delivery| connection.query_row("SELECT rr.summary,rr.metadata_json FROM workflow_result_bindings r JOIN role_results rr ON rr.id=r.role_result_id WHERE r.id=?1",[&delivery.result_binding_id],|row|Ok(serde_json::json!({"summary":row.get::<_,String>(0)?,"metadata":serde_json::from_str::<serde_json::Value>(&row.get::<_,String>(1)?).unwrap_or_default()})))).transpose()?;
+        let mut reviewed_checks = Vec::new();
+        if let Some(delivery) = &review {
+            for receipt in &delivery.check_receipts {
+                let raw: String = connection.query_row("SELECT json_object('receipt_id',cr.id,'check_id',cr.check_id,'candidate_hash',cr.candidate_hash,'selected_check_revision',cr.selected_check_revision,'inputs_hash',cr.inputs_hash,'description',c.original_text,'executable',cr.executable,'arguments',json(cr.arguments_json),'exit_code',cr.exit_code,'evidence',json(cr.evidence_json)) FROM check_runs cr JOIN execution_verification_checks c ON c.id=cr.check_id WHERE cr.id=?1 AND cr.attempt_id=?2",params![receipt,context.attempt_id],|row|row.get(0))?;
+                let mut receipt: serde_json::Value = serde_json::from_str(&raw)?;
+                receipt["evidence_hash"] = json_hash(&receipt["evidence"])?.into();
+                for stream in ["stdout", "stderr"] {
+                    if let Some(output) = receipt["evidence"][stream].as_str() {
+                        if output.chars().count() > 2048 {
+                            let excerpt: String = output.chars().take(2048).collect();
+                            receipt["evidence"][stream] = excerpt.into();
+                            receipt["evidence"]["output_excerpted_for_context"] = true.into();
+                        }
+                    }
+                }
+                reviewed_checks.push(receipt);
+            }
+        }
         Ok(serde_json::json!({
             "schema": "llmrelay-single-agent-context-v1",
             "workflow": {"family": "single_agent", "definition_id": definition_id, "definition_hash": context.definition_hash},
@@ -13806,8 +14106,13 @@ impl Store {
             "documentation_policy": configuration.as_ref().map(|value| value["documentation_policy"].clone()),
             "selected_checks_run_by_llmrelay_after_your_result": selected_checks,
             "channel_operations": context.channel_operations,
-            "result_outcomes": {"completing": "result_ready", "non_completing": ["blocked", "needs_input"]},
-            "instructions": crate::workflow_resources::SINGLE_AGENT_PROMPT,
+            "result_outcomes": if review.is_some() { serde_json::json!({"review":"review_complete","verdicts":["approved","changes_requested","needs_rework"]}) } else { serde_json::json!({"completing": "result_ready", "non_completing": ["blocked", "needs_input"]}) },
+            "purpose": context.purpose,
+            "admission_challenge": challenge,
+            "primary_result": reviewed_result,
+            "reviewed_check_receipts": reviewed_checks,
+            "review_delivery": review,
+            "instructions": if context.review_delivery_id.is_some() { crate::workflow_resources::SINGLE_AGENT_REVIEWER_PROMPT } else { crate::workflow_resources::single_agent_definition(preset).prompt },
             "report_transport": crate::domain::ROLE_REPORT_SHELL_QUOTING_GUIDANCE,
         }))
     }
@@ -13820,6 +14125,9 @@ impl Store {
         context: &crate::domain::SingleAgentContext,
         report: &RoleResultReport,
     ) -> Result<serde_json::Value> {
+        if context.review_delivery_id.is_some() {
+            return crate::workflow::save_single_agent_review(self, context, report);
+        }
         if !context
             .channel_operations
             .iter()
@@ -13866,7 +14174,7 @@ impl Store {
                     AND a.status='running' AND a.phase='agent_execution'
                     AND b.definition_hash=?4 AND b.scope_hash=?5
                     AND rp.profile_revision_id=?6 AND rp.admission_id=?7
-                    AND eb.actor='single_agent' AND eb.policy_hash=rp.policy_hash AND eb.policy_hash=?8
+                    AND eb.actor=?9 AND eb.policy_hash=rp.policy_hash AND eb.policy_hash=?8
                     AND EXISTS(SELECT 1 FROM profile_admissions pa WHERE pa.id=rp.admission_id
                       AND (pa.state='activated' OR (pa.state='pending' AND pa.probe_task_id=a.task_id)))
                     AND EXISTS(SELECT 1 FROM role_credentials rc WHERE rc.role_generation_id=rg.id AND rc.revoked_at IS NULL)
@@ -13874,7 +14182,7 @@ impl Store {
              JOIN execution_bindings eb ON eb.role_generation_id=rg.id
              JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
              JOIN workflow_run_bindings b ON b.attempt_id=a.id
-             JOIN workflow_run_profiles rp ON rp.attempt_id=a.id AND rp.slot_key='single_agent'
+             JOIN workflow_run_profiles rp ON rp.attempt_id=a.id AND rp.slot_key=?9
              WHERE rg.id=?1",
             params![
                 context.role_generation_id,
@@ -13884,7 +14192,8 @@ impl Store {
                 context.scope_hash,
                 context.profile_revision_id,
                 context.admission_id,
-                context.policy_hash
+                context.policy_hash,
+                context.purpose.slot()
             ],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
@@ -13932,6 +14241,7 @@ impl Store {
                 now
             ],
         )?;
+        crate::workflow::record_read_probe_report(&transaction, context, report, &result_id, &now)?;
         let binding_id = match binding {
             Some((criteria_hash, evidence_hash, profile_binding_hash, check_revision)) => {
                 let id = uuid::Uuid::new_v4().to_string();
@@ -14029,6 +14339,33 @@ impl Store {
     ) -> Result<SingleAgentLaunchContext> {
         self.require_execution_unheld("Single agent launches")?;
         let connection = self.lock()?;
+        let phase: String = connection.query_row(
+            "SELECT phase FROM attempts WHERE id=?1",
+            [attempt_id],
+            |row| row.get(0),
+        )?;
+        let review_delivery_id: Option<String> = if phase == "awaiting_review" {
+            if resume_mode.is_some() || verification {
+                bail!("A reviewer must start a fresh independent invocation")
+            }
+            let id: String = connection.query_row("SELECT id FROM single_agent_review_deliveries WHERE attempt_id=?1 AND state='ready'",[attempt_id],|row|row.get(0))?;
+            crate::review::require_single_agent_review_launch(
+                &connection,
+                attempt_id,
+                "awaiting_review",
+            )?;
+            crate::workflow::single_agent_quiescence(&connection, attempt_id)?;
+            crate::review::require_current_single_agent_delivery(&connection, &id, true)?;
+            Some(id)
+        } else {
+            None
+        };
+        let slot = if review_delivery_id.is_some() {
+            "single_agent_reviewer".to_owned()
+        } else {
+            crate::workflow::single_agent_primary_slot(&connection, attempt_id)?
+        };
+        let preset = crate::workflow::run_preset(&connection, attempt_id)?;
         let resume = match resume_mode {
             Some(mode) => Some(
                 crate::workflow::single_agent_resume_target_for_verification(
@@ -14040,8 +14377,10 @@ impl Store {
                 .map_err(|reason| anyhow!(reason))?,
             ),
             None => {
-                if let Some(reason) = single_agent_launch_blocker(&connection, attempt_id)? {
-                    bail!("{reason}")
+                if review_delivery_id.is_none() {
+                    if let Some(reason) = single_agent_launch_blocker(&connection, attempt_id)? {
+                        bail!("{reason}")
+                    }
                 }
                 None
             }
@@ -14052,17 +14391,17 @@ impl Store {
             String, String, String, String, String, String, String, String, Option<String>, String, i64,
             (String, String, String), String, String,
         ) = connection.query_row(
-            "SELECT a.task_id,w.path,r.provider,r.model,r.effort,r.instructions_text,rp.profile_revision_id,
+            "SELECT a.task_id,COALESCE((SELECT materialization_path FROM single_agent_review_deliveries WHERE id=?3),w.path),r.provider,r.model,r.effort,r.instructions_text,rp.profile_revision_id,
                     rp.admission_id,pa.capability_key,rp.policy_hash,
                     COALESCE((SELECT selection_revision FROM task_workflow_selections WHERE task_id=a.task_id),1),
                     r.adapter_hash,rp.profile_hash,pa.prepared_scope_hash,p.repository_path,p.repository_identity
              FROM attempts a JOIN workspaces w ON w.attempt_id=a.id AND w.state='ready'
              JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
-             JOIN workflow_run_profiles rp ON rp.attempt_id=a.id AND rp.slot_key='single_agent'
+             JOIN workflow_run_profiles rp ON rp.attempt_id=a.id AND rp.slot_key=?2
              JOIN agent_profile_revisions r ON r.id=rp.profile_revision_id AND r.policy_hash=rp.policy_hash
              JOIN profile_admissions pa ON pa.id=rp.admission_id
              WHERE a.id=?1",
-            params![attempt_id],
+            params![attempt_id,slot,review_delivery_id],
             |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?,
                     row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?,
@@ -14070,6 +14409,19 @@ impl Store {
             },
         )?;
         let provider: Provider = provider.parse().map_err(|error: String| anyhow!(error))?;
+        let purpose: String = connection.query_row(
+            "SELECT purpose FROM agent_profile_revisions WHERE id=?1",
+            [&profile_revision_id],
+            |row| row.get(0),
+        )?;
+        let purpose: crate::domain::ProfilePurpose =
+            purpose.parse().map_err(|error: String| anyhow!(error))?;
+        if purpose.slot() != slot {
+            bail!("The profile belongs to a different execution slot")
+        }
+        if purpose == crate::domain::ProfilePurpose::RepositoryReviewer && resume_mode.is_some() {
+            bail!("Reviewer conversations cannot resume")
+        }
         crate::workflow::require_workspace_execution_supported(&connection, &task_id)?;
         let policy_json: String = connection.query_row(
             "SELECT policy_json FROM workspaces WHERE attempt_id=?1",
@@ -14118,7 +14470,7 @@ impl Store {
             }
         }
         let compiled =
-            crate::provider_compatibility::ExecutionPolicy::single_agent_writer(provider)
+            crate::provider_compatibility::ExecutionPolicy::for_purpose(provider, purpose)
                 .content_hash();
         if compiled != policy_hash {
             bail!("This release compiles a different Single agent policy than the run bound; request rework under current authority")
@@ -14152,6 +14504,9 @@ impl Store {
             crate::workspace::prepare(&repository, &workspace, &expected, &workspace_policy)?;
         }
         Ok(SingleAgentLaunchContext {
+            purpose,
+            preset,
+            review_delivery_id,
             task_id,
             attempt_id: attempt_id.to_owned(),
             workspace,
@@ -14479,12 +14834,29 @@ impl Store {
         if verifying != context.verification {
             bail!("The writer's verification authority changed before launch")
         }
-        if let Some(reason) = single_agent_launch_blocker(&transaction, &context.attempt_id)? {
+        if let Some(id) = &context.review_delivery_id {
+            crate::review::require_single_agent_review_launch(
+                &transaction,
+                &context.attempt_id,
+                "awaiting_review",
+            )?;
+            crate::workflow::single_agent_quiescence(&transaction, &context.attempt_id)?;
+            let delivery =
+                crate::review::require_current_single_agent_delivery(&transaction, id, true)?;
+            if delivery.state != "ready"
+                || delivery.attempt_id != context.attempt_id
+                || delivery.materialization_path != context.workspace
+                || context.purpose != crate::domain::ProfilePurpose::RepositoryReviewer
+            {
+                bail!("The exact reviewer delivery is not ready")
+            }
+        } else if let Some(reason) = single_agent_launch_blocker(&transaction, &context.attempt_id)?
+        {
             bail!("{reason}")
         }
         let bound: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_run_profiles rp JOIN profile_admissions pa ON pa.id=rp.admission_id
-               WHERE rp.attempt_id=?1 AND rp.slot_key='single_agent' AND rp.profile_revision_id=?2
+               WHERE rp.attempt_id=?1 AND rp.slot_key=?7 AND rp.profile_revision_id=?2
                  AND rp.admission_id=?3 AND rp.policy_hash=?4 AND pa.capability_key IS ?5
                  AND pa.prepared_scope_hash=?6)",
             params![
@@ -14493,7 +14865,8 @@ impl Store {
                 context.admission_id,
                 context.policy_hash,
                 context.core_capability_key,
-                context.prepared_scope_hash
+                context.prepared_scope_hash,
+                context.purpose.slot()
             ],
             |row| row.get(0),
         )?;
@@ -14515,16 +14888,27 @@ impl Store {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let operations = crate::provider_compatibility::SINGLE_AGENT_CHANNEL_OPERATIONS;
+        let generation: i64 = if context.review_delivery_id.is_some() {
+            transaction.query_row(
+                "SELECT COALESCE(MAX(generation),0)+1 FROM role_generations WHERE attempt_id=?1 AND role='single_agent_reviewer'",
+                [&context.attempt_id],
+                |row| row.get(0),
+            )?
+        } else {
+            1
+        };
         transaction.execute(
             "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at,lane_id)
-             VALUES(?1,?2,'single_agent',?3,1,?4,'launch_reserved',?5,?6,?6,'default')",
+             VALUES(?1,?2,?7,?3,?8,?4,'launch_reserved',?5,?6,?6,'default')",
             params![
                 context.role_generation_id,
                 context.attempt_id,
                 context.provider.to_string(),
                 context.selection_revision,
                 uuid::Uuid::new_v4().to_string(),
-                now
+                now,
+                context.purpose.slot(),
+                generation
             ],
         )?;
         transaction.execute(
@@ -14552,7 +14936,7 @@ impl Store {
                 now,
                 definition_id,
                 definition_hash,
-                crate::workflow_resources::single_agent_prompt_hash(),
+                if context.preset.is_legacy() { crate::workflow_resources::single_agent_prompt_hash() } else { launch.record["prompt_hash"].as_str().context("Prepared launch has no prompt hash")?.to_owned() },
                 capability_key,
                 serde_json::to_string(&launch.identity)?
             ],
@@ -14560,21 +14944,28 @@ impl Store {
         transaction.execute(
             "INSERT INTO execution_bindings(role_generation_id,attempt_id,slot_key,actor,policy_hash,session_contract,
                channel_operations_json,created_at)
-             VALUES(?1,?2,'single_agent','single_agent',?3,'retained',?4,?5)",
+             VALUES(?1,?2,?6,?6,?3,?7,?4,?5)",
             params![
                 context.role_generation_id,
                 context.attempt_id,
                 context.policy_hash,
                 serde_json::to_string(&operations)?,
-                now
+                now,
+                context.purpose.slot(),
+                if context.purpose == crate::domain::ProfilePurpose::RepositoryReviewer { "fresh" } else { "retained" }
             ],
         )?;
+        if let Some(id) = &context.review_delivery_id {
+            if transaction.execute("UPDATE single_agent_review_deliveries SET role_generation_id=?1,session_id=?2,credential_id=?3,transcript_epoch=?4,state='launched',reason=NULL,updated_at=?5 WHERE id=?6 AND state='ready'",params![context.role_generation_id,context.session_id,context.credential_id,context.transcript_epoch,now,id])? != 1 { bail!("The reviewer delivery was already reserved") }
+            transaction.execute("UPDATE workflow_result_bindings SET state='review_running',updated_at=?1 WHERE attempt_id=?2 AND state='awaiting_review'",params![now,context.attempt_id])?;
+            transaction.execute("UPDATE attempts SET phase='review_running',updated_at=?1 WHERE id=?2 AND phase='awaiting_review'",params![now,context.attempt_id])?;
+        }
         transaction.commit()?;
         Ok(())
     }
 }
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 41;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 43;
 
 /// Reads the durable state cursor. It is committed state only when the
 /// connection is in autocommit mode.
@@ -14586,13 +14977,13 @@ pub(crate) fn read_state_revision(connection: &Connection) -> rusqlite::Result<i
 
 /// The prior schemas an existing database may be migrated from at service
 /// start. Every other non-current version is left unchanged and refused.
-pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 10] =
-    [31, 32, 33, 34, 35, 36, 37, 38, 39, 40];
+pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 12] =
+    [31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42];
 
 pub(crate) fn require_maintenance_schema(connection: &Connection) -> Result<i64> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != CURRENT_SCHEMA_VERSION && !SERVICE_UPGRADABLE_SCHEMA_VERSIONS.contains(&version) {
-        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–41")
+        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–43")
     }
     Ok(version)
 }
@@ -15135,6 +15526,39 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction
             .commit()
             .context("commit provider error recovery migration")?;
+    }
+    if version <= 41 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_042)?;
+        transaction.pragma_update(None, "user_version", 42)?;
+        transaction
+            .commit()
+            .context("commit task interaction history migration")?;
+    }
+    if version <= 42 {
+        connection.pragma_update(None, "foreign_keys", "OFF")?;
+        let migrated = (|| -> Result<()> {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(MIGRATION_043)?;
+            let violations: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                [],
+                |row| row.get(0),
+            )?;
+            if violations != 0 {
+                bail!(
+                    "Single agent preset migration would leave {violations} foreign-key violations"
+                )
+            }
+            transaction.pragma_update(None, "user_version", 43)?;
+            transaction
+                .commit()
+                .context("commit Single agent preset migration")
+        })();
+        let restored = restore_foreign_key_enforcement(connection);
+        restored?;
+        migrated?;
     }
     Ok(())
 }
@@ -20708,8 +21132,80 @@ mod interruption_tests {
     }
 
     pub(super) fn prior_service_schema_sql(version: i64) -> String {
+        let mut drop_schema_43 = String::from(
+            "PRAGMA foreign_keys=OFF;
+            DROP TABLE single_agent_repair_receipts; DROP TABLE single_agent_review_results;
+            DROP TABLE single_agent_review_deliveries; DROP TABLE single_agent_review_budgets;
+            DROP TABLE single_agent_admission_challenges;",
+        );
+        for (table, source, columns) in [
+            ("workflow_run_profiles",MIGRATION_039,"attempt_id,slot_key,profile_revision_id,admission_id,policy_hash,session_contract,profile_hash,created_at"),
+            ("execution_bindings",MIGRATION_039,"role_generation_id,attempt_id,slot_key,actor,policy_hash,session_contract,channel_operations_json,created_at"),
+            ("workflow_result_bindings",MIGRATION_039,"id,attempt_id,role_result_id,role_generation_id,session_id,transcript_epoch,criteria_hash,evidence_hash,profile_binding_hash,selected_check_revision,snapshot_id,candidate_hash,state,state_reason,created_at,updated_at"),
+            ("task_recipe_revisions",MIGRATION_030,"id,recipe_id,revision,title,description,acceptance_criteria_json,priority,profile_revision_id,required_check_ids_json,config_revision_id,configuration_hash,workflow_version,workflow_hash,created_at"),
+            ("task_recipe_bindings",MIGRATION_030,"task_id,project_id,recipe_revision_id,profile_revision_id,required_check_ids_json,config_revision_id,configuration_hash,workflow_version,workflow_hash,schedule_id,scheduled_for_utc,created_at"),
+        ] {
+            let declaration = source.split_once(&format!("CREATE TABLE {table} (")).unwrap().1.split_once("\n);").unwrap().0;
+            drop_schema_43.push_str(&format!("CREATE TABLE {table}_schema42 ({declaration}\n); INSERT INTO {table}_schema42 SELECT {columns} FROM {table}; DROP TABLE {table}; ALTER TABLE {table}_schema42 RENAME TO {table};"));
+            for event in ["insert","update","delete"] {
+                let name = format!("CREATE TRIGGER state_revision_{table}_{event}");
+                let body = source.split_once(&name).unwrap().1.split_once("END;").unwrap().0;
+                drop_schema_43.push_str(&format!("{name}{body}END;"));
+            }
+        }
+        for name in [
+            "CREATE UNIQUE INDEX workflow_result_bindings_one_current",
+            "CREATE INDEX workflow_result_bindings_attempt",
+        ] {
+            let body = MIGRATION_039
+                .split_once(name)
+                .unwrap()
+                .1
+                .split_once(';')
+                .unwrap()
+                .0;
+            drop_schema_43.push_str(&format!("{name}{body};"));
+        }
+        for (table, columns, source) in [
+            ("agent_profile_revisions", &["purpose"][..], MIGRATION_039),
+            ("project_workflow_defaults", &["preset"][..], MIGRATION_039),
+            (
+                "task_workflow_selections",
+                &["preset", "reviewer_profile_revision_id"][..],
+                MIGRATION_040,
+            ),
+            (
+                "workflow_run_bindings",
+                &["research_snapshot_id"][..],
+                MIGRATION_039,
+            ),
+        ] {
+            let name = format!("state_revision_{table}_update");
+            drop_schema_43.push_str(&format!("DROP TRIGGER {name};"));
+            for column in columns {
+                drop_schema_43.push_str(&format!("ALTER TABLE {table} DROP COLUMN {column};"));
+            }
+            let body = source
+                .split_once(&format!("CREATE TRIGGER {name}"))
+                .unwrap()
+                .1
+                .split_once("END;")
+                .unwrap()
+                .0;
+            drop_schema_43.push_str(&format!("CREATE TRIGGER {name}{body}END;"));
+        }
+        let guidance_trigger_name = "CREATE TRIGGER state_revision_guidance_messages_update";
+        let guidance_trigger = MIGRATION_029.split_once(guidance_trigger_name).unwrap().1;
+        let guidance_trigger = guidance_trigger.split_once("END;").unwrap().0;
+        let drop_schema_42 = format!(
+            "{drop_schema_43} DROP TABLE task_comments;
+             DROP TRIGGER IF EXISTS state_revision_guidance_messages_update;
+             ALTER TABLE guidance_messages DROP COLUMN message_revision;
+             {guidance_trigger_name}{guidance_trigger}END;"
+        );
         let restore_schema_40 = format!(
-            "DROP TRIGGER state_revision_provider_failure_holds_insert;
+            "{drop_schema_42}
+             DROP TRIGGER state_revision_provider_failure_holds_insert;
              DROP TRIGGER state_revision_provider_failure_holds_update;
              DROP TRIGGER state_revision_provider_failure_holds_delete;
              DROP INDEX provider_failure_holds_attempt; DROP INDEX provider_failure_holds_session;
@@ -20770,6 +21266,8 @@ mod interruption_tests {
                      PRAGMA user_version=39;"
                 );
             }
+            42 => return format!("{drop_schema_43} PRAGMA user_version=42;"),
+            41 => return format!("{drop_schema_42} PRAGMA user_version=41;"),
             40 => return format!("{restore_schema_40} PRAGMA user_version=40;"),
             _ => panic!("unsupported fixture schema {version}"),
         };
@@ -21798,7 +22296,7 @@ mod interruption_tests {
 
         for _ in 0..2 {
             drop(Store::open_service(&database).unwrap());
-            assert_eq!(scalar(version), "Integer(41)");
+            assert_eq!(scalar(version), "Integer(43)");
             assert_eq!(scalar(history), expected_history);
             assert_eq!(scalar(schema), current_schema);
             assert_eq!(
@@ -21815,7 +22313,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(32))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(41)");
+        assert_eq!(scalar(version), "Integer(43)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         // Schema 33 gains only the guidance submitted form and the later migrations.
@@ -21824,7 +22322,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(33))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(41)");
+        assert_eq!(scalar(version), "Integer(43)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -21832,7 +22330,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(34))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(41)");
+        assert_eq!(scalar(version), "Integer(43)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -21840,7 +22338,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(35))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(41)");
+        assert_eq!(scalar(version), "Integer(43)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -21848,7 +22346,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(36))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(41)");
+        assert_eq!(scalar(version), "Integer(43)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -21856,7 +22354,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(37))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(41)");
+        assert_eq!(scalar(version), "Integer(43)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         assert_eq!(
@@ -21869,26 +22367,29 @@ mod interruption_tests {
             .unwrap();
         assert_eq!(scalar(version), "Integer(38)");
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(41)");
+        assert_eq!(scalar(version), "Integer(43)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         // An ordinary open of the current schema reopens it without migrating;
         // only a newer schema is refused as unknown.
         drop(Store::open(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(41)");
+        assert_eq!(scalar(version), "Integer(43)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
-        set_version(CURRENT_SCHEMA_VERSION + 1);
+        let future_version = CURRENT_SCHEMA_VERSION + 1;
+        set_version(future_version);
         let error = Store::open(&database).err().unwrap();
         assert!(
-            error.to_string().contains("database schema 42 is newer"),
+            error
+                .to_string()
+                .contains(&format!("database schema {future_version} is newer")),
             "{error:#}"
         );
-        assert_eq!(scalar(version), "Integer(42)");
+        assert_eq!(scalar(version), format!("Integer({future_version})"));
         assert_eq!(scalar(history), expected_history);
         set_version(CURRENT_SCHEMA_VERSION);
 
-        for unsupported in [0, 14, 29, 30, 42] {
+        for unsupported in [0, 14, 29, 30, future_version] {
             set_version(unsupported);
             let error = Store::open_service(&database).err().unwrap();
             assert!(
@@ -21940,7 +22441,7 @@ mod interruption_tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            41
+            43
         );
         assert_eq!(
             connection.query_row(
@@ -22683,7 +23184,7 @@ mod interruption_tests {
             1
         );
         drop(store);
-        assert_eq!(scalar("PRAGMA user_version"), "Integer(41)");
+        assert_eq!(scalar("PRAGMA user_version"), "Integer(43)");
         assert_eq!(scalar(SCHEMA_38_SESSION_ROWS), sessions);
         assert_eq!(scalar(references), "Text(\"1:1:1\")");
         assert_eq!(
@@ -24990,7 +25491,8 @@ mod attention_observation_tests {
             let id = reminder["guidance_id"].as_str().unwrap();
             assert!(session
                 .store
-                .reserve_guidance_delivery(id, "s", "e", None, REPORT_REMINDER_PROMPT)
+                .reserve_guidance_delivery(id, "s", "e", None, REPORT_REMINDER_PROMPT, 1)
+                .map(|outcome| outcome == GuidanceReservation::Reserved)
                 .unwrap());
             match changed {
                 "turn" => {
@@ -25301,6 +25803,106 @@ mod attention_observation_tests {
     }
 
     #[test]
+    fn stage_b_usage_conflicts_reach_visible_alternates_and_keep_zero_distinct() -> Result<()> {
+        use crate::domain::{ObservedUsageStatus, UsageComparisonQuery as Query, UsageGroupBy};
+        let session = ObservedSession::codex_capacity();
+        let record = serde_json::json!({"type":"token_usage_record","payload":{
+            "thread_id":CAPACITY_NATIVE,"session_id":CAPACITY_NATIVE,"turn_id":CAPACITY_TURN,
+            "root_turn_id":CAPACITY_TURN,"response_id":"zero","usage":{"input_tokens":0,
+                "cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0}}});
+        session.write_usage(CAPACITY_TURN, &[record]);
+        session.record_usage(&session.read_usage()[0])?;
+        session.store.lock()?.execute(
+            "UPDATE attempts SET workflow_version=?1",
+            params![crate::trip::WORKFLOW_ID],
+        )?;
+        session.execute("INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+            SELECT 'p-alt','Alternate','/tmp/alternate','alternate',base_revision,created_at,updated_at FROM projects;
+            INSERT INTO tasks(id,project_id,title,lifecycle,archived_at,created_at,updated_at)
+            SELECT 't-alt','p-alt','Archived','done',created_at,created_at,updated_at FROM tasks;
+            INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,workflow_version,created_at,updated_at)
+            SELECT 'a-alt','t-alt','alternate',phase,base_revision,configuration_revision,'completed',workflow_version,created_at,updated_at FROM attempts;
+            INSERT INTO workflow_run_bindings(attempt_id,family,definition_state,evaluator_revision,selection_hash,scope_hash,created_at)
+            VALUES('a-alt','single_agent','unavailable',1,'selection','scope','2026-01-01');
+            INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+            SELECT 'g-alt','a-alt','code_reviewer','codex',1,1,'exited','alt',created_at,updated_at FROM role_generations;
+            INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+            VALUES('s-alt','g-alt','codex','exited','{}','fixture','alt','2026-02-01T00:00:00Z','2026-02-01'),
+                  ('s-missing','g-alt','claude','exited','{}','fixture','missing','2026-02-01T23:59:59Z','2026-02-01');");
+        let compare = |query| crate::workflow::usage_comparisons(&session.store, query, "boot");
+        let before = compare(Query::default())?;
+        let zero = &before.groups[0];
+        assert_eq!(zero.key, "p");
+        assert_eq!(zero.usage.status, ObservedUsageStatus::Observed);
+        let counters = zero.usage.counters.as_ref().unwrap();
+        assert_eq!(counters.total_tokens, 0);
+        assert_eq!(counters.cache_write_input_tokens, None);
+        let missing = &before.groups[1];
+        assert_eq!(missing.key, "p-alt");
+        assert_eq!(missing.usage.status, ObservedUsageStatus::Unavailable);
+        assert!(missing.usage.counters.is_none());
+        assert_eq!(missing.sessions_without_observations, 2);
+        let families = compare(Query {
+            group_by: UsageGroupBy::Workflow,
+            ..Query::default()
+        })?;
+        assert!(families.groups.iter().any(|group| group.key == "trip"));
+        assert!(families
+            .groups
+            .iter()
+            .any(|group| group.key == "single_agent"));
+        for (identity, expected) in [
+            (crate::trip::WORKFLOW_ID, "trip"),
+            ("trip-explorer-0.11.0-llmrelay-1", "trip"),
+            ("trip-explorer-0.9.0-llmrelay-1", "trip"),
+            ("trip-v1", "trip"),
+            ("trip-explorer-0.99.0-llmrelay-1", "unknown"),
+            ("", "unknown"),
+        ] {
+            session
+                .store
+                .lock()?
+                .execute("UPDATE attempts SET workflow_version=?1", params![identity])?;
+            let page = compare(Query {
+                group_by: UsageGroupBy::Workflow,
+                workflow: Some(expected.into()),
+                ..Query::default()
+            })?;
+            assert_eq!(page.groups.len(), 1);
+            assert_eq!(page.groups[0].key, expected);
+            assert_eq!(page.groups[0].sessions, 1);
+        }
+        session.execute(r#"UPDATE projects SET internal_purpose='trip_setup_fixture' WHERE id='p';
+            UPDATE codex_usage_observations SET invalid=1,conflict_owners_json=
+            '[{"task_id":"t-alt","session_id":"s-alt"},{"task_id":"t-alt","session_id":"s-alt"}]';"#);
+        let query = Query {
+            group_by: UsageGroupBy::Role,
+            project_id: Some("p-alt".into()),
+            workflow: Some("single_agent".into()),
+            role: Some("code_reviewer".into()),
+            start_date: Some("2026-02-01".into()),
+            end_date: Some("2026-02-01".into()),
+            ..Query::default()
+        };
+        let revision = session.revision();
+        let page = compare(query.clone())?;
+        assert_eq!(page.groups.len(), 1);
+        let group = &page.groups[0];
+        assert_eq!(group.key, "code_reviewer");
+        assert_eq!(group.usage.status, ObservedUsageStatus::Invalid);
+        assert!(group.usage.counters.is_none());
+        assert_eq!(group.usage.observed_responses, Some(1));
+        assert_eq!(group.sessions_with_observations, 1);
+        assert_eq!(group.sessions_without_observations, 1);
+        assert_eq!(group.claude_sessions, 1);
+        assert_eq!(session.revision(), revision);
+        session.execute("UPDATE codex_usage_observations SET conflict_owners_json='[{}]'");
+        let unresolved = compare(query).unwrap_err().to_string();
+        assert!(unresolved.contains("cannot be linked"));
+        Ok(())
+    }
+
+    #[test]
     fn codex_usage_conflicts_keep_original_provenance_and_invalidate_both_turn_owners() {
         use crate::domain::ObservedUsageStatus;
         let session = ObservedSession::codex_capacity();
@@ -25516,7 +26118,7 @@ mod attention_observation_tests {
         let rows: String = session.scalar(OLD_ROWS);
         let revision = session.revision();
         let reopened = Store::open(&session.root.join("state.sqlite3")).unwrap();
-        assert_eq!(session.scalar::<i64>("PRAGMA user_version"), 41);
+        assert_eq!(session.scalar::<i64>("PRAGMA user_version"), 43);
         assert_eq!(session.scalar::<String>(OLD_ROWS), rows);
         assert_eq!(session.revision(), revision);
         let connection = reopened.lock().unwrap();

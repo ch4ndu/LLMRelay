@@ -153,6 +153,9 @@ const singleAgentStatus: Record<
     tone: "active",
   },
   awaiting_selected_checks: { label: "Waiting for checks", tone: "waiting" },
+  awaiting_review: { label: "Waiting for independent review", tone: "waiting" },
+  review_running: { label: "Independent review running", tone: "active" },
+  review_blocked: { label: "Independent review incomplete", tone: "danger" },
   awaiting_human: { label: "Awaiting your review", tone: "attention" },
   accepted: { label: "Completed", tone: "done" },
   probe_evidence_recorded: { label: "Probe finished", tone: "done" },
@@ -387,17 +390,26 @@ export function taskSteps(
   if (task.workflow?.family !== "single_agent") {
     return { steps: PHASE_STEPS, current: phaseStep(task) };
   }
+  const preset = task.workflow.run?.preset ?? task.workflow.preset;
+  const steps: readonly string[] = preset === "repository_research"
+    ? ["Research", "Report", "Your review"]
+    : preset === "build_and_review"
+    ? ["Build", "Result", "Checks", "Independent review", "Your review"]
+    : SINGLE_AGENT_STEPS;
   const order: Partial<Record<SingleAgentStage, number>> = {
     waiting_to_start: 0,
     writing: 0,
     result_submitted_waiting_for_stop: 1,
     awaiting_selected_checks: 2,
-    awaiting_human: 3,
-    accepted: SINGLE_AGENT_STEPS.length,
+    awaiting_review: 3,
+    review_running: 3,
+    review_blocked: 3,
+    awaiting_human: steps.length - 1,
+    accepted: steps.length,
   };
   const stage = task.workflow.run?.stage;
   return {
-    steps: SINGLE_AGENT_STEPS,
+    steps,
     current: stage === undefined ? -1 : order[stage] ?? -1,
   };
 }

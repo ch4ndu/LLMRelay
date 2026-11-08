@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "family": "single_agent",
+  "id": "llmrelay-repository-research-v1",
+  "version": "repository-research-v1",
+  "description": "Read an isolated repository and deliver an authenticated research report for human acceptance.",
+  "evaluator": {"id": "llmrelay-single-agent-evaluator", "revision": 1},
+  "steps": ["agent_execution", "structured_result", "unchanged_candidate", "human_decision"],
+  "slots": [{"key": "single_agent", "policy_mode": "single_agent_reader", "authority": "read_only", "session_contract": "retained", "count": 1}],
+  "result": {"schema_revision": 1, "completing_outcome": "result_ready", "non_completing_outcomes": ["blocked", "needs_input"], "evidence_kinds": ["source", "manual", "not_run"]},
+  "workspace_mode": "isolated_worktree",
+  "check_requirement": "none",
+  "human_acceptance": "required"
+}

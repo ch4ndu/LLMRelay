@@ -1,4 +1,5 @@
 import { readPreference, savePreference } from "./storagePreferences";
+import { withStorageLock } from "./storageCoordination";
 import { ErrorNotice } from "./components/ErrorNotice";
 import {
   Fragment,
@@ -10,6 +11,9 @@ import {
 } from "react";
 import {
   bootstrap,
+  desktopTarget,
+  pendingDesktopActivation,
+  clearDesktopActivation,
   command,
   discardUnknownCmuxSurface,
   operationId,
@@ -99,34 +103,49 @@ const TASK_OPERATIONS_PREFIX = "llmrelay.task.operations.";
  * nothing, and an unreadable request is never settled; both stay stored for
  * an exact replay. Other stored requests are kept untouched.
  */
-function settleDraftDeletions(state: AppState) {
+async function settleDraftDeletions(state: AppState, signal: AbortSignal) {
+  const storageKeys: string[] = [];
   for (let index = localStorage.length - 1; index >= 0; index -= 1) {
     const storageKey = localStorage.key(index);
-    if (!storageKey?.startsWith(TASK_OPERATIONS_PREFIX)) continue;
-    const taskId = storageKey.slice(TASK_OPERATIONS_PREFIX.length);
-    let entries: unknown;
+    if (storageKey?.startsWith(TASK_OPERATIONS_PREFIX)) storageKeys.push(storageKey);
+  }
+  for (const storageKey of storageKeys) {
+    if (signal.aborted) return;
     try {
-      entries = JSON.parse(localStorage.getItem(storageKey) || "[]");
+      await withStorageLock(storageKey, () => {
+        const entries: unknown = JSON.parse(localStorage.getItem(storageKey) || "[]");
+        if (!Array.isArray(entries)) return;
+        for (const entry of entries) {
+          if (!Array.isArray(entry) || entry.length !== 2 ||
+            typeof entry[0] !== "string") return;
+          const identity: unknown = entry[1];
+          if (!identity || typeof identity !== "object" ||
+            !("id" in identity) || typeof identity.id !== "string" ||
+            !("body" in identity) || typeof identity.body !== "string") return;
+          const body: unknown = JSON.parse(identity.body);
+          if (!body || typeof body !== "object" || Array.isArray(body)) return;
+        }
+        const taskId = storageKey.slice(TASK_OPERATIONS_PREFIX.length);
+        const task = state.tasks.find((item) => item.id === taskId);
+        const deletePrefix = `delete_draft_task:${taskId}:`;
+        const kept = entries.filter((entry: unknown) => {
+          if (!Array.isArray(entry) || typeof entry[0] !== "string") return true;
+          const key: string = entry[0];
+          if (!key.startsWith(deletePrefix)) return true;
+          const versionText = key.slice(deletePrefix.length).split(":")[0];
+          const version = Number(versionText);
+          if (!/^(0|[1-9][0-9]*)$/.test(versionText) || !Number.isSafeInteger(version)) {
+            return true;
+          }
+          return task !== undefined && task.version <= version;
+        });
+        if (kept.length === entries.length) return;
+        if (kept.length) localStorage.setItem(storageKey, JSON.stringify(kept));
+        else localStorage.removeItem(storageKey);
+      }, signal);
     } catch {
-      continue;
+      // Failed cleanup retains the journal for exact replay; never write without its lock.
     }
-    if (!Array.isArray(entries)) continue;
-    const task = state.tasks.find((item) => item.id === taskId);
-    const deletePrefix = `delete_draft_task:${taskId}:`;
-    const kept = entries.filter((entry: unknown) => {
-      if (!Array.isArray(entry) || typeof entry[0] !== "string") return true;
-      const key: string = entry[0];
-      if (!key.startsWith(deletePrefix)) return true;
-      const versionText = key.slice(deletePrefix.length).split(":")[0];
-      const version = Number(versionText);
-      if (!/^(0|[1-9][0-9]*)$/.test(versionText) || !Number.isSafeInteger(version)) {
-        return true;
-      }
-      return task !== undefined && task.version <= version;
-    });
-    if (kept.length === entries.length) continue;
-    if (kept.length) localStorage.setItem(storageKey, JSON.stringify(kept));
-    else localStorage.removeItem(storageKey);
   }
 }
 export type Appearance = "system" | "light" | "dark";
@@ -378,14 +397,24 @@ export function App() {
   // A fresh object per Open plan click, so a repeated click opens it again.
   const [planRequest, setPlanRequest] = useState<AttemptTarget>();
   const live = useRef<LiveStateController | undefined>(undefined);
+  const acceptedSnapshots = useRef(0);
+  const [hasAcceptedSnapshot, setHasAcceptedSnapshot] = useState(false);
+  const [desktopRetry, setDesktopRetry] = useState(0);
   const currentProject = useRef(project);
   currentProject.current = project;
   const currentPage = useRef(page);
   currentPage.current = page;
-  const refresh = useCallback(
-    () => live.current?.refresh() ?? Promise.resolve(),
-    [],
-  );
+  const refresh = useCallback(async () => {
+    const controller = live.current;
+    const before = acceptedSnapshots.current;
+    await controller?.refresh();
+    if (
+      controller && live.current === controller &&
+      acceptedSnapshots.current > before
+    ) {
+      setDesktopRetry((value) => value + 1);
+    }
+  }, []);
   const viewCmuxSession = useCallback(async (sessionId: string) => {
     const result = await viewCmuxSurface(sessionId, operationId());
     await refresh();
@@ -430,6 +459,8 @@ export function App() {
       try {
         controller = startLiveState({
           onState: (next) => {
+            acceptedSnapshots.current += 1;
+            setHasAcceptedSnapshot(true);
             setState(next);
             setLastSuccessfulAt(next.generated_at || new Date().toISOString());
             setError("");
@@ -545,9 +576,13 @@ export function App() {
     }
   }, [state, browserAlerts]);
   useEffect(() => {
-    try {
-      if (state.incarnation) settleDraftDeletions(state);
-    } catch { /* Failed cleanup leaves existing operation identities available for replay. */ }
+    const controller = new AbortController();
+    if (state.incarnation) {
+      void settleDraftDeletions(state, controller.signal).catch(() => {
+        // Unreadable storage leaves existing operation identities available for replay.
+      });
+    }
+    return () => controller.abort();
   }, [state]);
   useEffect(() => {
     savePreference("agenticjira.page", page);
@@ -688,6 +723,57 @@ export function App() {
     setAttentionFocus({ ...target });
     pendingFocus.current = { title, target, openPlan };
   };
+  useEffect(() => {
+    const controller = live.current;
+    const snapshot = controller?.latest();
+    if (!hasAcceptedSnapshot || !controller || !snapshot) return;
+    const activation = pendingDesktopActivation();
+    if (!activation) return;
+    if (activation === "stale") {
+      clearDesktopActivation(activation);
+      setNavigationNotice("This desktop attention episode changed or could not be identified. Choose an item from the current dashboard.");
+      return;
+    }
+    const request = new AbortController();
+    let cancelled = false;
+    const stillCurrent = () => !cancelled && live.current === controller &&
+      controller.latest()?.incarnation === snapshot.incarnation &&
+      controller.latest()?.revision === snapshot.revision &&
+      pendingDesktopActivation() === activation;
+    void desktopTarget(activation, request.signal).then((result) => {
+      if (!stillCurrent()) return;
+      if (result.outcome === "stale") {
+        clearDesktopActivation(activation);
+        setNavigationNotice(result.message);
+        return;
+      }
+      const latest = controller.latest();
+      if (
+        !latest || latest.incarnation !== result.incarnation ||
+        latest.revision !== result.revision
+      ) {
+        setNavigationNotice("Attention changed while the desktop item was opening. Refresh the dashboard and select the current item.");
+        return;
+      }
+      const item = latest.attention.find((entry) => entry.id === result.attention_id);
+      if (!item) {
+        clearDesktopActivation(activation);
+        setNavigationNotice("That attention episode is no longer in the current dashboard. Refresh to inspect current items.");
+        return;
+      }
+      clearDesktopActivation(activation);
+      const problem = navigateAttention(item, result.target);
+      if (problem) setNavigationNotice(problem);
+    }).catch(() => {
+      if (stillCurrent()) setNavigationNotice("Desktop attention could not be revalidated. Sign in or refresh to retry opening this item.");
+    });
+    // Same-revision watchdog reads do not retry a failed target read. A changed
+    // accepted snapshot or an explicit successful refresh provides the next try.
+    return () => {
+      cancelled = true;
+      request.abort();
+    };
+  }, [hasAcceptedSnapshot, state.incarnation, state.revision, desktopRetry]);
   // Rechecks the wait against the newest accepted snapshot; opening never acts.
   const openWait = (wait: WaitNotice) => {
     setNavigationNotice("");
@@ -1181,6 +1267,8 @@ export function App() {
           <History
             tasks={state.tasks}
             projects={state.projects}
+            projectId={project}
+            incarnation={state.incarnation}
             onOpen={openTask}
             onChanged={refresh}
           />

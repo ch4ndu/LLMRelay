@@ -5,7 +5,7 @@ export type Role =
   | "implementer"
   | "code_reviewer"
   | "final_verifier";
-export type ExecutionActor = Role | "single_agent";
+export type ExecutionActor = Role | "single_agent" | "single_agent_reviewer";
 export type Provider = "codex" | "claude";
 export interface ProtocolDescriptor {
   generation: number;
@@ -426,6 +426,8 @@ export interface TripTaskVerification {
     cwd: string;
   };
   authorization: {
+    family_compatible?: boolean;
+    coverage_explanation?: string;
     once_available: boolean;
     reusable: boolean;
     family: boolean;
@@ -474,6 +476,13 @@ export interface ProfileSet {
   configuration_hash: string;
 }
 export interface TaskRecipe {
+  family?: WorkflowFamily;
+  preset?: SingleAgentPreset;
+  definition_id?: string | null;
+  execution_config_revision_id?: string | null;
+  primary_profile_revision_id?: string | null;
+  reviewer_profile_revision_id?: string | null;
+  revisions?: Array<{ id: string; revision: number; family: WorkflowFamily; preset: SingleAgentPreset; definition_id: string | null; execution_config_revision_id: string | null; primary_profile_revision_id: string | null; reviewer_profile_revision_id: string | null; workflow_version: string; workflow_hash: string }>;
   id: string;
   project_id: string;
   name: string;
@@ -485,14 +494,16 @@ export interface TaskRecipe {
   description: string;
   acceptance_criteria: string[];
   priority: number;
-  profile_revision_id: string;
+  profile_revision_id: string | null;
   required_check_ids: string[];
-  config_revision_id: string;
+  config_revision_id: string | null;
   configuration_hash: string;
   workflow_version: string;
   workflow_hash: string;
 }
 export interface RecipeSchedule {
+  recipe_family?: WorkflowFamily;
+  recipe_preset?: SingleAgentPreset;
   id: string;
   project_id: string;
   name: string;
@@ -592,13 +603,19 @@ export interface Task {
   can_archive: boolean;
   draft_deletion?: { allowed: boolean; reason: string | null } | null;
   recipe_provenance?: null | {
+    family?: WorkflowFamily;
+    preset?: SingleAgentPreset;
+    definition_id?: string | null;
+    execution_config_revision_id?: string | null;
+    primary_profile_revision_id?: string | null;
+    reviewer_profile_revision_id?: string | null;
     recipe_id: string;
     recipe_name: string;
     recipe_revision_id: string;
     recipe_revision: number;
-    profile_revision_id: string;
+    profile_revision_id: string | null;
     required_check_ids: string[];
-    config_revision_id: string;
+    config_revision_id: string | null;
     configuration_hash: string;
     workflow_version: string;
     workflow_hash: string;
@@ -912,6 +929,9 @@ export type SingleAgentStage =
   | "writing"
   | "result_submitted_waiting_for_stop"
   | "awaiting_selected_checks"
+  | "awaiting_review"
+  | "review_running"
+  | "review_blocked"
   | "awaiting_human"
   | "accepted"
   | "probe_evidence_recorded"
@@ -976,6 +996,12 @@ export interface SingleAgentCheck {
   latest_run_passed: boolean | null;
 }
 export interface SingleAgentRun {
+  preset?: SingleAgentPreset;
+  review?: {
+    delivery_id: string; state: string; reason: string | null; ordinal: number;
+    remaining_deliveries: number; repair_used: boolean; verdict: string | null;
+    summary: string | null; findings: string[]; candidate_hash: string; result_binding_id: string;
+  } | null;
   attempt_id: string;
   definition_id: string | null;
   definition_state: string;
@@ -1000,6 +1026,8 @@ export interface SingleAgentRun {
   integration_recorded: boolean;
 }
 export type WorkspaceMode = "isolated_worktree" | "main_checkout";
+export type SingleAgentPreset = "single_agent" | "repository_research" | "build_and_review";
+export type ProfilePurpose = "workspace_writer" | "repository_reader" | "repository_reviewer";
 export interface TaskCheckoutScope {
   task_id: string;
   project_id: string;
@@ -1013,6 +1041,8 @@ export interface TaskCheckoutScope {
   scope_hash: string;
 }
 export interface TaskWorkflow {
+  preset?: SingleAgentPreset;
+  reviewer_profile_revision_id?: string | null;
   family: WorkflowFamily;
   workspace_mode?: WorkspaceMode;
   checkout_scope?: TaskCheckoutScope | null;
@@ -1037,6 +1067,7 @@ export interface ExecutionConfiguration {
   approved_at: string;
 }
 export interface AgentProfileRevision {
+  purpose?: ProfilePurpose;
   id: string;
   revision: number;
   provider: ValidationProvider;
@@ -1077,6 +1108,7 @@ export interface ProfileAdmission {
   probe_unavailable_reason: string | null;
 }
 export interface ProjectExecution {
+  default_preset?: SingleAgentPreset;
   project_id: string;
   default_family: WorkflowFamily;
   default_version: number;
@@ -1103,6 +1135,7 @@ export interface ExecutionConfigurationInput {
   checks: ExecutionCheckInput[];
 }
 export interface AgentProfileInput {
+  purpose?: ProfilePurpose;
   display_name: string;
   provider: ValidationProvider;
   model: string;
@@ -1110,6 +1143,8 @@ export interface AgentProfileInput {
   instructions_text: string;
 }
 export interface TaskWorkflowSelectionInput {
+  preset?: SingleAgentPreset;
+  reviewer_profile_revision_id?: string | null;
   family: WorkflowFamily;
   workspace_mode?: WorkspaceMode;
   execution_config_revision_id?: string | null;
@@ -1161,6 +1196,7 @@ export type WorkflowCommand =
   }
   | {
     kind: "set_project_workflow_default";
+    preset?: SingleAgentPreset;
     operation_id: string;
     project_id: string;
     expected_version: number;
@@ -1601,6 +1637,16 @@ export interface AttentionItem {
   /** Raw diagnostic text, shown only under Technical details. */
   details?: string | null;
 }
+
+export interface DesktopActivation {
+  instance_key: string;
+  attention_id: string;
+  episode_key: string;
+}
+
+export type DesktopTarget =
+  | { outcome: "current"; attention_id: string; target: AttentionTarget; revision: string; incarnation: string }
+  | { outcome: "stale"; message: string };
 /** Where an unfinished task stands, from authoritative workflow evidence. */
 export interface TaskProgress {
   reason_code: string;
@@ -2144,4 +2190,82 @@ export function qualificationContractLabel(contract: unknown): string {
   if (contract === undefined) return "Legacy denial diagnostic";
   if (contract === "functional-v2") return "Functional qualification";
   return "Unknown qualification contract";
+}
+
+export interface PermissionCoveragePreview {
+  status: string;
+  reason_code: string;
+  explanation: string;
+  family_compatible: boolean;
+  recorded_state: string;
+  saved_rules: Array<
+    {
+      rule_id: string;
+      reason_code: string;
+      explanation: string;
+      eligible: boolean;
+    }
+  >;
+}
+
+export interface TaskActivityPage {
+  events: Array<Record<string, unknown>>;
+  next_cursor: string | null;
+  historical_associations_incomplete: boolean;
+}
+
+export type HistorySourceKind = "task" | "comment" | "report" | "review" | "explorer_decision" | "result_acceptance" | "rework";
+export interface HistoricalSourceKey {
+  task_id: string;
+  attempt_id: string | null;
+  kind: HistorySourceKind;
+  id: string;
+}
+export interface HistorySearchHit {
+  source: HistoricalSourceKey;
+  project_id: string;
+  project_name: string;
+  task_title: string;
+  created_at: string;
+  snippet: string;
+  archived: boolean;
+}
+export interface HistorySearchFilters {
+  query: string;
+  project_id?: string;
+  kind?: HistorySourceKind;
+  exclude_archived: boolean;
+}
+export interface HistorySearchPage {
+  results: HistorySearchHit[];
+  next_cursor: string | null;
+}
+export interface HistoricalSource {
+  hit: HistorySearchHit;
+  text: string;
+  truncated: boolean;
+}
+export type UsageGroupBy = "project" | "workflow" | "role";
+export interface UsageComparisonFilters {
+  group_by: UsageGroupBy;
+  project_id?: string;
+  workflow?: string;
+  role?: string;
+  start_date?: string;
+  end_date?: string;
+}
+export interface UsageComparisonGroup {
+  key: string;
+  label: string;
+  sessions: number;
+  codex_sessions: number;
+  claude_sessions: number;
+  unknown_provider_sessions: number;
+  sessions_with_observations: number;
+  sessions_without_observations: number;
+  usage: ObservedUsage;
+}
+export interface UsageComparisonPage {
+  groups: UsageComparisonGroup[];
+  next_cursor: string | null;
 }

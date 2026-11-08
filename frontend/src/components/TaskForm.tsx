@@ -198,15 +198,16 @@ const pendingWorkflowCreate = (
       Object.keys(selection).sort().join() !== "family,workspace_mode") return undefined;
     parsedSelection = { family: "trip", workspace_mode: "main_checkout" };
   } else if (selection.family === "single_agent" &&
-    Object.keys(selection).sort().join() ===
-      (selection.workspace_mode === undefined
-        ? "check_ids,execution_config_revision_id,family,profile_revision_id"
-        : "check_ids,execution_config_revision_id,family,profile_revision_id,workspace_mode") &&
+    Object.keys(selection).every((key) => ["family", "check_ids", "execution_config_revision_id", "profile_revision_id", "workspace_mode", "preset", "reviewer_profile_revision_id"].includes(key)) &&
+    (selection.preset === undefined || selection.preset === "single_agent" || selection.preset === "repository_research" || selection.preset === "build_and_review") &&
+    (selection.reviewer_profile_revision_id === undefined || typeof selection.reviewer_profile_revision_id === "string") &&
     typeof selection.execution_config_revision_id === "string" &&
     typeof selection.profile_revision_id === "string" &&
     isStringList(selection.check_ids)) {
     parsedSelection = {
       family: "single_agent",
+      ...(selection.preset === undefined ? {} : { preset: selection.preset }),
+      ...(selection.reviewer_profile_revision_id === undefined ? {} : { reviewer_profile_revision_id: selection.reviewer_profile_revision_id }),
       execution_config_revision_id: selection.execution_config_revision_id,
       profile_revision_id: selection.profile_revision_id,
       check_ids: selection.check_ids,
@@ -316,6 +317,8 @@ const normalizeDraft = (value: unknown): TaskDraft | undefined => {
         typeof value.singleAgentChoice.selection.profile_revision_id === "string" &&
         isStringList(value.singleAgentChoice.selection.check_ids)
       ? { singleAgentChoice: { project_id: value.singleAgentChoice.project_id, selection: {
+        ...(value.singleAgentChoice.selection.preset === "repository_research" || value.singleAgentChoice.selection.preset === "build_and_review" ? { preset: value.singleAgentChoice.selection.preset } : {}),
+        ...(typeof value.singleAgentChoice.selection.reviewer_profile_revision_id === "string" ? { reviewer_profile_revision_id: value.singleAgentChoice.selection.reviewer_profile_revision_id } : {}),
         execution_config_revision_id: value.singleAgentChoice.selection.execution_config_revision_id,
         profile_revision_id: value.singleAgentChoice.selection.profile_revision_id,
         check_ids: value.singleAgentChoice.selection.check_ids,
@@ -938,6 +941,8 @@ export function TaskForm(
       return "Choose an execution configuration and an agent profile for the Single agent.";
     }
     if (singleAgent) {
+      if (singleAgentSelection.preset && singleAgentSelection.preset !== "single_agent" && mainCheckout) return "Research and independent review require an isolated worktree.";
+      if (singleAgentSelection.preset === "build_and_review" && !singleAgentSelection.reviewer_profile_revision_id) return "Choose an independent reviewer profile.";
       const configuration = execution?.configurations.find((item) => item.id === singleAgentSelection.execution_config_revision_id);
       if (!configuration) return "The saved execution configuration is no longer available. Choose a current configuration.";
       if (!execution?.profiles.some((item) => item.current_revision?.id === singleAgentSelection.profile_revision_id)) {
@@ -1202,6 +1207,10 @@ export function TaskForm(
             execution_config_revision_id: editing.workflow.execution_config_revision_id,
             profile_revision_id: editing.workflow.profile_revision_id,
             check_ids: editing.workflow.check_ids,
+            ...(editing.workflow.preset && editing.workflow.preset !== "single_agent"
+              ? { preset: editing.workflow.preset } : {}),
+            ...(editing.workflow.reviewer_profile_revision_id
+              ? { reviewer_profile_revision_id: editing.workflow.reviewer_profile_revision_id } : {}),
           } : {}),
         },
       }));
@@ -1326,7 +1335,7 @@ export function TaskForm(
                   />
                   {option === "trip"
                     ? "TRIP (manager and five delegated roles)"
-                    : "Single agent (one agent writes the whole task)"}
+                    : "Single agent presets (build, research, or build and review)"}
                 </label>
               ))}
             </div>
@@ -1348,6 +1357,9 @@ export function TaskForm(
                     type="radio"
                     name="task-workspace"
                     checked={draft.workspace_mode === mode}
+                    disabled={mode === "main_checkout" && (editing
+                      ? editing.workflow?.family === "single_agent" && !!editing.workflow.preset && editing.workflow.preset !== "single_agent"
+                      : singleAgent && !!singleAgentSelection.preset && singleAgentSelection.preset !== "single_agent")}
                     onChange={() => update("workspace_mode", mode)}
                   />
                   {mode === "main_checkout" ? "Main checkout" : "Isolated worktree"}
@@ -1387,8 +1399,9 @@ export function TaskForm(
             <SingleAgentSelectionFields
               execution={execution}
               value={singleAgentSelection}
-              onChange={(selection) =>
-                update("singleAgentChoice", { project_id: draft.project_id, selection })}
+              onChange={(selection) => {
+                setDraft((current) => ({ ...current, singleAgentChoice: { project_id: current.project_id, selection }, workspace_mode: selection.preset && selection.preset !== "single_agent" ? "isolated_worktree" : current.workspace_mode }));
+              }}
               disabled={saving}
             />
           )

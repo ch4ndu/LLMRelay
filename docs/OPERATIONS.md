@@ -8,7 +8,7 @@ Examples below use `llmrelay` on PATH. If you have not added it to PATH, substit
 
 | What you see | What to do first |
 | --- | --- |
-| The dashboard will not sign in | Use the one-use login link printed by the running app. A clean URL alone does not sign in another browser. |
+| The dashboard will not sign in | Choose **Open dashboard** in the companion, or use the current one-use link from a foreground terminal. A clean URL alone does not sign in another browser. |
 | A task is Ready but has not started | Check whether the project queue is paused, another task is using the repository, or the app shows a missing prerequisite. |
 | An agent asks for folder trust or terminal input | Open its output and take keyboard control. Read and answer the prompt, then release control with **Ctrl-]**. |
 | A task needs a decision | Open **Needs your attention** and follow the action for that task. |
@@ -27,6 +27,106 @@ resume; the app should explain the next available action.
 
 The sections below retain detailed recovery rules for troubleshooting. For a
 first task, use the [README walkthrough](../README.md#create-a-useful-first-task).
+
+## Background service and menu bar
+
+Background use is optional. Open the packaged `LLMRelay.app` to see the selected
+instance's status, attention count and explicit controls. Opening or quitting the
+companion does not start or stop the engine. Its default data directory is
+`~/Library/Application Support/AgenticJira`; for a different instance, launch its
+executable with `--data-dir /absolute/path`. Every action and notification is
+bound to that canonical directory. Inspect the directory shown in the menu
+before installing or starting it.
+
+Choose **Install dormant service**, then **Start service** when ready. Installation
+copies the executable into an owned per-user installation and does not launch
+agents. **Enable start at login** affects future login only; it does not start
+current work. **Stop service and drain work** records stopped intent before drain,
+so a deliberate Stop stays stopped at the next login until you explicitly Start
+again. Disabling login startup does not stop a currently running instance.
+**Quit companion (leave service running)** closes only the menu app.
+
+If a login change is interrupted, status shows the current effective startup
+setting and the unfinished Enable or Disable operation separately. Use **Finish
+enable start at login** or **Finish disable start at login** to complete the
+original choice. The equivalent terminal command repeats that same direction;
+an unfinished operation must be reconciled before changing it to the opposite
+choice or uninstalling. A staged login publication is retained until its original
+login command finishes; uninstall will not discard its ownership record.
+
+Equivalent terminal controls use the same explicit instance directory:
+
+```sh
+llmrelay service --data-dir /absolute/path install
+llmrelay service --data-dir /absolute/path start
+llmrelay service --data-dir /absolute/path status
+llmrelay service --data-dir /absolute/path login enable
+llmrelay service --data-dir /absolute/path dashboard
+llmrelay service --data-dir /absolute/path stop
+llmrelay service --data-dir /absolute/path login disable
+llmrelay service --data-dir /absolute/path uninstall
+```
+
+These are individual operations, not an automatic setup script. Install/replace
+and uninstall refuse active or uncertain process ownership. Uninstall requests
+drain, then removes only the verified owned installation and matching login file;
+it retains instance data, task history, logs, repositories and recovery records.
+An interrupted install is reconciled by repeating Install with the same executable.
+Changed, foreign or unrecognized files are retained for inspection. A concurrent
+Start or replacement invalidates uninstall's exact installation, intent and host
+binding; it must refuse before stopping the newer host or removing its installation.
+Repeated Stop preserves an already-stopped interrupted installation's recovery
+identity. Check status after any uncertain result before retrying.
+If uninstall was interrupted after deleting its owned executable or login file,
+repeat Uninstall to finish cleanup. It accepts those already-removed files while
+rechecking stopped ownership and the current installation binding; it does not
+recreate them or require a login-preference change first.
+
+The service uses a fixed nonsecret environment, including the account's home
+directory and PATH entries for Homebrew, `/usr/local/bin`, `~/.local/bin` and
+system tools. It does not inherit shell startup files, caller tokens or proxy
+variables. Providers must be installed and authenticated normally for that account.
+The per-user installation lives under
+`~/Library/Application Support/LLMRelay/Services/`; logs stay in the selected
+instance's `logs` directory, available through **Show diagnostics folder**.
+
+**Open dashboard** requests a fresh one-use sign-in and opens the browser. The
+pending sign-in expires after 60 seconds; requesting another replaces only the
+pending link, leaving existing signed-in browser sessions valid. Background logs
+and command responses contain no sign-in token. A clean dashboard URL alone is
+insufficient for authentication.
+
+Choose **Enable notifications…** to request macOS notification permission.
+Notifications contain generic attention text, without task titles or transcripts.
+The current attention list establishes a quiet baseline. New supported attention
+episodes can notify; unsupported or ambiguous episodes remain in the count.
+Clicking a notification revalidates its exact instance and episode before opening
+the current dashboard item. It never approves, resumes or executes work. Changed
+episodes open the dashboard with an explanation instead of selecting a replacement.
+Navigation metadata stays in memory through a failed initial sign-in or state
+read, after the URL fragment is removed. A successful state load or explicit
+refresh can retry validation; opening still requires the current authenticated
+snapshot and exact episode.
+
+The companion persists notification attempts and checks pending/delivered macOS
+requests after restart. An uncertain delivery is suppressed; a confirmed failure
+gets at most one retry. Bounded history, missing status and truncated snapshots
+can establish another quiet baseline. This favors avoiding replay and historical
+notification floods; it does not promise exactly-once delivery or delivery of
+every episode. The dashboard remains the complete attention surface.
+
+For automatic output routing from a background host, run the following from a
+human terminal inside the supported cmux application:
+
+```sh
+llmrelay service --data-dir /absolute/path pair-cmux
+```
+
+Pairing belongs to that live cmux generation and service incarnation. It survives
+the pairing command's exit, but cmux or service restart requires pairing again.
+It does not change cmux settings or bypass its independent endpoint policy.
+If endpoint access is unavailable, use [manual terminal attachment](#attach-from-a-terminal).
+Foreground hosting inside cmux retains its existing ancestry checks.
 
 ## Requests with an uncertain result
 
@@ -101,8 +201,9 @@ approval and implementation authorization alongside their saved original prompt,
 so a satisfied approval checkpoint does not require another approval. Independent
 holds, verification permissions and final human acceptance still apply.
 
-Native OS notifications are deferred; the dashboard attention rail is the
-implemented notification surface for this milestone.
+The optional menu companion can send native notifications after you explicitly
+enable them. The dashboard attention rail remains the authoritative list; see
+[background service and menu bar](#background-service-and-menu-bar).
 
 The default macOS data directory is `~/Library/Application Support/AgenticJira`. An explicit data directory must be absolute and must be reused for every command targeting that instance.
 
@@ -629,8 +730,8 @@ reuse old qualification evidence to bypass these checks.
 ## Database restore points
 
 The database commands operate on the instance selected by `--data-dir` and never
-migrate it. Inspect, check and manual backup require current schema 40. Verify
-and restore accept schema 40 and the supported prior schemas 31–39, requiring the
+migrate it. Inspect, check and manual backup require current schema 43. Verify
+and restore accept schema 43 and the supported prior schemas 31–42, requiring the
 manifest version to match the actual SQLite version. Unknown versions are refused.
 
 Service start holds the exclusive instance lock, reconciles an interrupted
@@ -641,7 +742,7 @@ the default backup directory. It checks migration space again after publication.
 A failed preflight or backup prevents migration. Missing and already-current
 databases do not require this extra snapshot.
 
-Supported schemas 31–39 then upgrade to 40 through the existing migration
+Supported schemas 31–42 then upgrade to 43 through the existing migration
 transactions. Each failed migration rolls back its own transaction; earlier
 successful steps may remain committed. The failure identifies the verified
 restore point and offline recovery command. Startup never automatically restores
@@ -652,7 +753,7 @@ durable attention observations; 37 adds TRIP migration receipts; 38 adds
 Codex observed usage; 39 adds the Single agent workflow records, app-wide
 provider check records and read-only history pane records. Schema 39 rebuilds
 the sessions table so a session belongs to exactly one role generation or one
-provider check, keeping every existing session row and reference unchanged. Schema 40 adds task checkout mode and scoped authorization; existing tasks retain isolated-worktree mode.
+provider check, keeping every existing session row and reference unchanged. Schema 40 adds task checkout mode and scoped authorization; existing tasks retain isolated-worktree mode. Schema 41 records provider failure holds observed in Codex history while preserving existing holds; schema 42 adds guidance revisions and human task comments. Schema 43 adds Single agent preset/profile purpose, discriminated recipe pins and durable review/admission records. It preserves old IDs, definition versions and command receipts, rebuilds the constrained tables transactionally and checks foreign keys before committing.
 
 ```sh
 llmrelay database --data-dir <ABSOLUTE_INSTANCE_PATH> inspect
@@ -769,7 +870,7 @@ permission rules and automatic resume authority are invalidated. The dashboard
 may be available for inspection and safe recovery, but execution remains fenced.
 Restoring an older snapshot first installs its original schema and commits this
 hold. A later service start makes a new verified snapshot and attempts the
-supported forward upgrade while retaining the hold. This build serves schema 40;
+supported forward upgrade while retaining the hold. This build serves schema 43;
 a persistent migration defect still requires a corrected build or operator
 repair. Restoring the data does not promise that a failing migration will succeed
 or launch a compatible older executable.
@@ -1057,6 +1158,30 @@ The existing guidance display records the reservation count and delivery state. 
 
 Disabling and saving prevents future writes, including Enter if it has not been written yet. Text already pasted cannot be retracted. Pauses, permission requests, recovery holds and manual input ownership continue to take precedence. Missing trustworthy safe-stop evidence leaves the session ineligible: reminders do not resolve the provider-dependent automatic-readiness limitation.
 
+## History search
+
+**History → Tasks** retains completed and archived tasks with the existing
+Archive and Restore controls. **Search** reads saved task text, human comments,
+report summaries and plans, review feedback, Explorer decisions, result feedback
+and rework feedback across all attempts. Archived tasks are included unless you
+select **Exclude archived tasks**. Internal setup fixtures are excluded, even
+when an internal project identifier is supplied directly.
+
+Choose a project or source filter, enter text, then select **Search**. Matching
+is literal: `%`, `_` and quotes have no special meaning. ASCII letters ignore
+case; other letters match case exactly. Queries are limited to 256 UTF-8 bytes.
+Results show bounded excerpts, with up to 40 results per page. **Load more**
+continues the same query; if saved state changes or the service restarts, use
+**Refresh search**. Changing filters discards the earlier pages.
+
+Select a result to read that exact saved source, including a previous attempt.
+The reader checks its task and attempt ownership again and reports a missing
+source instead of substituting a current report. **Open task** separately opens
+the current task. Source text is displayed literally; long sources are marked
+as truncated. Search pages and source responses are bounded to 128 KiB. Search
+does not read raw transcripts, files or arbitrary report metadata, and opening
+historical evidence never grants approval or changes workflow state.
+
 ## Codex observed usage
 
 Session cards show **Observed usage (partial)** or **Usage unavailable**. Expand
@@ -1067,8 +1192,27 @@ recent-history window. Cached input is included in input; reasoning is included
 in output. Neither is added again to the provider-reported total. An explicitly
 observed zero is zero; an absent cache-write count is unavailable.
 
-The reader accepts only exact Codex 0.157.1 response records tied to the current
-managed accepted turn. It uses the existing no-follow history path safeguards,
+**History → Observed usage** compares projects, workflow families or roles.
+Choose filters and select **Apply**. **Sessions started (UTC)** selects sessions
+by their saved start date, including both selected endpoint dates; the values
+include those sessions' lifetime observations, even responses observed later.
+These are session cohorts, not spending totals for a calendar interval. Archived
+tasks and earlier attempts in ordinary projects are included; internal setup
+fixtures are excluded. Unrecognized workflow identities appear as **Unknown
+workflow**.
+
+Each group shows its session population and observation coverage separately.
+Sessions without observations and unsupported Claude sessions remain visible;
+they do not become zero-token sessions. Valid measured subtotals remain partial.
+Conflicting observations invalidate every affected group, including an alternate
+owner in a different project or role. Groups must not be added together when
+they share conflicting observations. Unresolvable saved ownership makes the
+comparison unavailable rather than publishing guessed totals. Pages contain up
+to 100 groups within 128 KiB. Refresh comparisons after saved state changes or a
+service restart before loading another page.
+
+The reader accepts exact Codex response records under a supported version-specific
+contract tied to the current managed accepted turn. It uses the existing no-follow history path safeguards,
 256 KiB record limit and 1 MiB tail. A missing turn boundary, incomplete file,
 unsafe identity, missed observation or unsupported payload supplies no new count.
 It does not backfill old history or count cumulative snapshots, inherited records
@@ -1134,10 +1278,14 @@ remain holds; absence of a session alone does not prove that nothing started.
 Check old-generation guidance and permission waits before replacement. Safe-idle
 replacement requires attention `none` and no unresolved native permission; the
 interrupt form requests a stop when that boundary is unavailable, without
-clearing unrelated attention or recovery holds. There is no general human cancel
-operation for ordinary queued guidance. Reminder cancellation handles generated
-reminders only, and abandonment handles the specifically bound unconfirmed
-delivery states. Neither is a substitute for disposing of ordinary queued text.
+clearing unrelated attention or recovery holds. **Edit** and **Cancel** apply only
+to unreserved ordinary queued guidance for the current Manager generation, as
+described in [Workflows](WORKFLOWS.md#dashboard-workspace). A version conflict
+on a first submission requires refreshing before submitting a correction. An uncertain
+response retains the original request: inspect its outcome before retrying that saved
+request. A refusal of the replay does not settle the earlier unknown outcome.
+Generated reminders, old-generation messages, and reserved or unconfirmed
+deliveries still require their specifically bound recovery actions.
 If it cannot be delivered legitimately to the original generation, stop migration
 for a bounded recovery decision rather than editing records or claiming delivery.
 This change performs no live migration and does not attest network, process or

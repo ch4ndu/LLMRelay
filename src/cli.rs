@@ -26,6 +26,10 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Serve(ServeArgs),
+    /// Explicit per-user background installation and desktop controls.
+    Service(ServiceArgs),
+    #[command(hide = true)]
+    ServiceRun(ServiceRunArgs),
     Status(InstanceArgs),
     Stop(StopArgs),
     Attach(AttachArgs),
@@ -55,6 +59,46 @@ enum Command {
     InternalLaunch(InternalLaunchArgs),
     #[command(hide = true)]
     UnixConnectProbe(UnixConnectProbeArgs),
+}
+
+#[derive(Debug, Args)]
+struct ServiceArgs {
+    #[arg(long, global = true)]
+    data_dir: Option<PathBuf>,
+    #[command(subcommand)]
+    action: ServiceAction,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceAction {
+    Resolve,
+    Install,
+    Start,
+    Stop,
+    Status,
+    Login {
+        #[arg(value_parser = ["enable", "disable"])]
+        mode: String,
+    },
+    Uninstall,
+    Attention,
+    Dashboard {
+        #[arg(long, requires_all = ["attention_id", "episode_key"])]
+        instance_key: Option<String>,
+        #[arg(long, requires_all = ["instance_key", "episode_key"])]
+        attention_id: Option<String>,
+        #[arg(long, requires_all = ["instance_key", "attention_id"])]
+        episode_key: Option<String>,
+    },
+    PairCmux,
+}
+
+#[derive(Debug, Args)]
+struct ServiceRunArgs {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    generation: String,
 }
 
 #[derive(Debug, Args)]
@@ -375,6 +419,8 @@ enum WorkflowCliCommand {
         expected_version: i64,
         #[arg(long)]
         family: String,
+        #[arg(long)]
+        preset: Option<String>,
     },
     /// Creates a draft with its workflow; without --family the project default applies.
     CreateTask {
@@ -452,6 +498,10 @@ struct WorkflowSelectionArgs {
     #[arg(long)]
     family: Option<String>,
     #[arg(long, requires = "family")]
+    preset: Option<String>,
+    #[arg(long, requires = "family")]
+    reviewer_profile_revision: Option<String>,
+    #[arg(long, requires = "family")]
     configuration: Option<String>,
     #[arg(long, requires = "family")]
     profile_revision: Option<String>,
@@ -466,6 +516,13 @@ impl WorkflowSelectionArgs {
         };
         Ok(Some(crate::domain::TaskWorkflowSelectionInput {
             family: family.parse().map_err(|error: String| anyhow!(error))?,
+            preset: self
+                .preset
+                .map(|value| value.parse())
+                .transpose()
+                .map_err(|error: String| anyhow!(error))?
+                .unwrap_or_default(),
+            reviewer_profile_revision_id: self.reviewer_profile_revision,
             workspace_mode: Default::default(),
             execution_config_revision_id: self.configuration,
             profile_revision_id: self.profile_revision,
@@ -874,8 +931,102 @@ struct UnixConnectProbeArgs {
     path: PathBuf,
 }
 
+async fn run_service(args: ServiceArgs) -> Result<()> {
+    let paths = InstancePaths::resolve(args.data_dir)?;
+    let result = match args.action {
+        ServiceAction::Resolve => {
+            serde_json::json!({"instance_key":paths.root_key(),"data_dir":paths.root,"diagnostics":paths.logs})
+        }
+        ServiceAction::Status => serde_json::to_value(crate::service::status(&paths).await?)?,
+        ServiceAction::Stop => {
+            serde_json::json!({"instance_key":paths.root_key(),"status":crate::service::stop(&paths).await?})
+        }
+        ServiceAction::Uninstall => {
+            crate::service::uninstall(&paths).await?;
+            serde_json::json!({"instance_key":paths.root_key(),"uninstalled":true})
+        }
+        action @ (ServiceAction::Install | ServiceAction::Start | ServiceAction::Login { .. }) => {
+            let owned = paths.clone();
+            tokio::task::spawn_blocking(move || match action {
+                ServiceAction::Install => crate::service::install(&owned),
+                ServiceAction::Start => crate::service::start(&owned),
+                ServiceAction::Login { mode } => crate::service::login(&owned, mode == "enable"),
+                _ => bail!("Invalid service lifecycle operation"),
+            })
+            .await??;
+            serde_json::to_value(crate::service::status(&paths).await?)?
+        }
+        ServiceAction::Attention => {
+            native_service_request(&paths, ControlRequest::AttentionSnapshot).await?
+        }
+        ServiceAction::PairCmux => native_service_request(&paths, ControlRequest::PairCmux).await?,
+        ServiceAction::Dashboard {
+            instance_key,
+            attention_id,
+            episode_key,
+        } => {
+            let activation = match (instance_key, attention_id, episode_key) {
+                (Some(instance_key), Some(attention_id), Some(episode_key)) => {
+                    Some(crate::domain::DesktopActivation {
+                        instance_key,
+                        attention_id,
+                        episode_key,
+                    })
+                }
+                (None, None, None) => None,
+                _ => bail!("Desktop activation requires all three identity fields"),
+            };
+            native_service_request(&paths, ControlRequest::OpenDashboard { activation }).await?
+        }
+    };
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
+}
+
+async fn native_service_request(
+    paths: &InstancePaths,
+    request: ControlRequest,
+) -> Result<serde_json::Value> {
+    let response = control::request(&paths.control_socket, &request).await?;
+    if !response.ok {
+        bail!(
+            "{}",
+            response
+                .error
+                .unwrap_or_else(|| "Desktop request was refused".into())
+        )
+    }
+    if response.result["instance_key"].as_str() != Some(&paths.root_key()) {
+        bail!("Desktop response belongs to a different instance")
+    }
+    Ok(response.result)
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Service(args) => run_service(args).await,
+        Command::ServiceRun(args) => {
+            tracing_subscriber::fmt().init();
+            let paths = InstancePaths::resolve(Some(args.data_dir))?;
+            crate::service::enter_clean_environment(&paths, &args.generation)?;
+            let startup = paths.clone();
+            let lock = tokio::task::spawn_blocking(move || {
+                crate::service::acquire_startup(&startup, &args.generation)
+            })
+            .await??;
+            crate::server::serve_locked(
+                paths,
+                0,
+                false,
+                crate::database::BackupOptions {
+                    every_hours: None,
+                    directory: None,
+                },
+                lock,
+                true,
+            )
+            .await
+        }
         Command::Serve(args) => {
             tracing_subscriber::fmt()
                 .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -2075,11 +2226,17 @@ async fn run_workflow(args: WorkflowArgs) -> Result<()> {
             project,
             expected_version,
             family,
+            preset,
         } => WorkflowCommand::SetProjectWorkflowDefault {
             operation_id,
             project_id: project,
             expected_version,
             family: family.parse().map_err(|error: String| anyhow!(error))?,
+            preset: preset
+                .map(|value| value.parse())
+                .transpose()
+                .map_err(|error: String| anyhow!(error))?
+                .unwrap_or_default(),
         },
         WorkflowCliCommand::CreateTask {
             project,

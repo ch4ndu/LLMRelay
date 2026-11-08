@@ -2,17 +2,23 @@ import { ErrorNotice } from "./ErrorNotice";
 import { useRef, useState } from "react";
 import { command, operationId } from "../api";
 import type { Project, Task } from "../types";
+import { HistorySearch } from "./HistorySearch";
+import { UsageComparisons } from "./UsageComparisons";
 export function History(
-  { tasks, projects, onOpen, onChanged }: {
+  { tasks, projects, projectId, incarnation, onOpen, onChanged }: {
     tasks: Task[];
     projects: Project[];
+    projectId?: string;
+    incarnation: string;
     onOpen: (task: Task) => void;
     onChanged: () => void;
   },
 ) {
   const [showArchived, setShowArchived] = useState(false);
+  const [view, setView] = useState<"tasks" | "search" | "usage">("tasks");
   const [error, setError] = useState("");
   const operationIds = useRef(new Map<string, string>());
+  const insightsKey = JSON.stringify([incarnation, projectId]);
   const toggle = async (task: Task) => {
     const key = `${task.archived ? "restore" : "archive"}:${task.id}:${task.version}`;
     const id = operationIds.current.get(key) || operationId();
@@ -40,22 +46,32 @@ export function History(
       <header className="page-heading">
         <div>
           <span className="eyebrow">History</span>
-          <h1>Completed and archived tasks</h1>
+          <h1>{view === "tasks" ? "Completed and archived tasks" : view === "search" ? "Search history" : "Observed usage"}</h1>
           <p>
-            Accepted, cancelled and archived tasks. Their results and evidence
-            stay available here.
+            {view === "tasks"
+              ? "Accepted, cancelled and archived tasks. Their results and evidence stay available here."
+              : view === "search"
+              ? "Find saved text across projects, tasks and attempts."
+              : "Compare partial response observations across projects, workflows and roles."}
           </p>
         </div>
-        <label className="toggle">
+        {view === "tasks" && <label className="toggle">
           <input
             type="checkbox"
             checked={showArchived}
             onChange={(e) => setShowArchived(e.target.checked)}
           />Show archived
-        </label>
+        </label>}
       </header>
+      <nav className="history-views" aria-label="History views">
+        <button aria-pressed={view === "tasks"} onClick={() => setView("tasks")}>Tasks</button>
+        <button aria-pressed={view === "search"} onClick={() => setView("search")}>Search</button>
+        <button aria-pressed={view === "usage"} onClick={() => setView("usage")}>Observed usage</button>
+      </nav>
+      {view === "search" && <HistorySearch key={insightsKey} projects={projects} initialProjectId={projectId} tasks={tasks} onOpen={onOpen} />}
+      {view === "usage" && <UsageComparisons key={insightsKey} projects={projects} initialProjectId={projectId} />}
       {error && <ErrorNotice error={error} />}
-      <div className="history-list">
+      {view === "tasks" && <div className="history-list">
         {!rows.length && (
           <p className="empty">No completed or archived tasks yet.</p>
         )}
@@ -80,7 +96,7 @@ export function History(
             </button>
           </article>
         ))}
-      </div>
+      </div>}
     </section>
   );
 }

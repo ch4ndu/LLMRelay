@@ -24,6 +24,12 @@ A profile is a saved provider, model and set of instructions. A setup check runs
 a small trial to confirm that the selected profile works in the required way.
 Checks can use your provider allowance. Saving settings alone does not run them.
 
+The optional [background service and menu companion](OPERATIONS.md#background-service-and-menu-bar)
+do not replace project setup or native provider trust. Background hosts use the
+account's installed provider CLIs and a fixed PATH rather than a terminal's shell
+startup environment. Complete the same exact profile checks and answer native
+folder/hook prompts through the provider's normal controls.
+
 ## TRIP setup
 
 The following five stages apply to TRIP:
@@ -169,7 +175,7 @@ can make an earlier result stale.
 
 A project does not need a TRIP installation to run [Single agent](WORKFLOWS.md#single-agent-workflow)
 tasks. In **Projects**, each project offers **Default workflow for new tasks**
-(TRIP or Single agent). Saving it affects only tasks created later; existing
+(TRIP or a Single agent preset). Saving it affects only tasks created later; existing
 tasks, recipes and schedules keep their workflow. Projects without a saved
 choice default to TRIP.
 
@@ -179,9 +185,13 @@ Under **Single agent profiles and configuration**:
   documentation policy and optional checks. Guidance files are read from the
   project's registered commit when you save; uncommitted edits are not
   included. Each save creates a new immutable revision.
-- **Agent profiles** name a provider, exact model, effort and instructions.
-  Saved instructions are not shown again; changing the provider, model, effort
-  or instructions creates a new revision that needs its own admission, while a
+- **Agent profiles** name a provider, exact model, effort, instructions and purpose:
+  workspace writer, retained repository reader or fresh repository reviewer.
+  Research requires a reader; Build and review requires a writer and a separate
+  reviewer profile. The same provider/model may be used, but their authority and
+  conversations remain separate.
+  Saved instructions are not shown again; changing the provider, model, effort,
+  instructions or purpose creates a new revision that needs its own admission, while a
   rename does not.
 - **Prepare admission** records exactly which profile revision would be admitted
   with the newest configuration; it starts nothing. **Probe this profile…**
@@ -199,6 +209,13 @@ admission probe; it does not activate a profile or replace its current capabilit
 proof.
 
 
+Reader/reviewer contracts are separate from those writer qualifications and
+currently remain unqualified. Saving their profiles or recipes is not evidence
+that a native call can start. A release must first carry reviewed evidence for
+the exact policy and provider version; each project then prepares, probes and
+activates its own admission. Research probes establish authenticated read and
+retained recall; reviewer probes require fresh identity. Neither reuses a writer
+proof or promotes a native policy from an agent's assertion alone.
 
 ## Existing workflow files
 

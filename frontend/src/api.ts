@@ -1,4 +1,6 @@
 import type {
+  DesktopActivation,
+  DesktopTarget,
   AppState,
   CapabilityRecordFunctionalProofOperation,
   CmuxKeyboardControlAction,
@@ -10,6 +12,10 @@ import type {
   HistoryPaneOutcome,
   HistoryPaneView,
   HistorySelection,
+  HistoricalSource,
+  HistoricalSourceKey,
+  HistorySearchFilters,
+  HistorySearchPage,
   ModelCatalog,
   Operation,
   ProtocolDescriptor,
@@ -26,6 +32,8 @@ import type {
   StateWaitResult,
   TaskContent,
   TranscriptPage,
+  UsageComparisonFilters,
+  UsageComparisonPage,
   GuidanceReauthorizationPreview,
 } from "./types";
 import { ROLES } from "./types";
@@ -257,15 +265,59 @@ async function json<T>(
     init?.signal?.removeEventListener("abort", abortFromCaller);
   }
 }
+let desktopActivation: DesktopActivation | "stale" | undefined;
+
+export function pendingDesktopActivation(): DesktopActivation | "stale" | undefined {
+  return desktopActivation;
+}
+
+export function clearDesktopActivation(
+  activation: DesktopActivation | "stale",
+): void {
+  if (desktopActivation === activation) desktopActivation = undefined;
+}
+
+export function desktopTarget(
+  activation: DesktopActivation,
+  signal?: AbortSignal,
+): Promise<DesktopTarget> {
+  const query = new URLSearchParams({ ...activation });
+  return json<DesktopTarget>(
+    `/api/desktop-target?${query}`,
+    { signal },
+    transportTimeouts.read,
+    ["desktop_target_v1"],
+  );
+}
+
 export async function bootstrap(): Promise<void> {
   const hash = new URLSearchParams(location.hash.slice(1));
   const token = hash.get("bootstrap");
+  // Scrub before decoding metadata or sending the exchange, including errors.
+  if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+  const encoded = hash.get("activation");
+  if (hash.get("desktop_stale") === "1") desktopActivation = "stale";
+  if (encoded) {
+    desktopActivation = "stale";
+    try {
+      if (encoded.length > 2048) throw new Error("Desktop activation is too large");
+      const bytes = Uint8Array.from(atob(encoded.replace(/-/g, "+").replace(/_/g, "/")), (character) => character.charCodeAt(0));
+      const candidate: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+      const instance = field(candidate, "instance_key");
+      const attention = field(candidate, "attention_id");
+      const episode = field(candidate, "episode_key");
+      if (typeof instance === "string" && /^[a-f0-9]{64}$/.test(instance) &&
+        typeof attention === "string" && attention.length > 0 && attention.length <= 512 &&
+        typeof episode === "string" && /^v1:[a-f0-9]{64}$/.test(episode)) {
+        desktopActivation = { instance_key: instance, attention_id: attention, episode_key: episode };
+      }
+    } catch { /* Invalid navigation metadata grants no navigation authority. */ }
+  }
   if (!token) return;
   await json("/api/bootstrap", {
     method: "POST",
     body: JSON.stringify({ token }),
   }, transportTimeouts.mutation);
-  history.replaceState(null, "", location.pathname + location.search);
 }
 const field = (value: unknown, name: string): unknown =>
   typeof value === "object" && value !== null && !Array.isArray(value)
@@ -547,6 +599,7 @@ const singleAgentStages = [
   "writing",
   "result_submitted_waiting_for_stop",
   "awaiting_selected_checks",
+  "awaiting_review", "review_running", "review_blocked",
   "awaiting_human",
   "accepted",
   "probe_evidence_recorded",
@@ -586,8 +639,16 @@ const singleAgentRunIsCurrent = (value: unknown) => {
   const runChecks = field(value, "checks");
   const result = field(value, "result");
   const rows = field(result, "acceptance_rows");
+  const review = field(value, "review");
+  const findings = field(review, "findings");
   return hasStrings(value, ["attempt_id", "definition_state", "stage_reason"]) &&
     singleAgentStages.includes(String(field(value, "stage"))) &&
+    (field(value, "preset") === undefined || ["single_agent", "repository_research", "build_and_review"].includes(String(field(value, "preset")))) &&
+    (review == null || (hasStrings(review, ["delivery_id", "state", "candidate_hash", "result_binding_id"]) &&
+      Number.isSafeInteger(field(review, "ordinal")) && Number.isSafeInteger(field(review, "remaining_deliveries")) &&
+      typeof field(review, "repair_used") === "boolean" && hasNullableString(review, "reason") &&
+      hasNullableString(review, "summary") && hasNullableString(review, "verdict") &&
+      Array.isArray(findings) && findings.every((finding) => typeof finding === "string"))) &&
     typeof field(value, "integration_recorded") === "boolean" &&
     Array.isArray(actions) && actions.every((action) =>
       [
@@ -681,6 +742,18 @@ const providerValidationStateIsCurrent = (value: unknown) => {
     );
 };
 const currentSnapshot = (state: AppState): AppState => {
+  const recipePins = (value: unknown) => {
+    const family = field(value, "family");
+    if (family == null || family === "trip") {
+      return ["profile_revision_id", "config_revision_id"].every((key) => typeof field(value, key) === "string");
+    }
+    const preset = field(value, "preset");
+    return family === "single_agent" &&
+      ["single_agent", "repository_research", "build_and_review"].includes(String(preset)) &&
+      field(value, "profile_revision_id") === null && field(value, "config_revision_id") === null &&
+      ["definition_id", "execution_config_revision_id", "primary_profile_revision_id"].every((key) => typeof field(value, key) === "string") &&
+      (preset === "build_and_review" ? typeof field(value, "reviewer_profile_revision_id") === "string" : field(value, "reviewer_profile_revision_id") === null);
+  };
   const recipeArray = (value: unknown, keys: string[]) =>
     Array.isArray(value) && value.every((item) =>
       keys.every((key) => typeof field(item, key) === "string") &&
@@ -701,9 +774,9 @@ const currentSnapshot = (state: AppState): AppState => {
           typeof field(config, "effort") === "string";
       })
     ) ||
-    !recipeArray(state.task_recipes, ["id", "project_id", "name", "revision_id", "profile_revision_id", "config_revision_id", "configuration_hash", "workflow_version", "workflow_hash", "title", "description"]) ||
+    !recipeArray(state.task_recipes, ["id", "project_id", "name", "revision_id", "configuration_hash", "workflow_version", "workflow_hash", "title", "description"]) ||
     !state.task_recipes.every((item) =>
-      Number.isSafeInteger(item.revision) && Number.isSafeInteger(item.priority) &&
+      recipePins(item) && Number.isSafeInteger(item.revision) && Number.isSafeInteger(item.priority) &&
       Array.isArray(item.acceptance_criteria) && item.acceptance_criteria.every((text) => typeof text === "string") &&
       Array.isArray(item.required_check_ids) && item.required_check_ids.every((id) => typeof id === "string")
     ) ||
@@ -728,7 +801,7 @@ const currentSnapshot = (state: AppState): AppState => {
       const provenance = task.recipe_provenance;
       const requiredCheckIds = field(provenance, "required_check_ids");
       return provenance == null ||
-        (["recipe_id", "recipe_name", "recipe_revision_id", "profile_revision_id", "config_revision_id", "configuration_hash", "workflow_version", "workflow_hash"].every((key) => typeof field(provenance, key) === "string") &&
+        (recipePins(provenance) && ["recipe_id", "recipe_name", "recipe_revision_id", "configuration_hash", "workflow_version", "workflow_hash"].every((key) => typeof field(provenance, key) === "string") &&
           Number.isSafeInteger(field(provenance, "recipe_revision")) &&
           Array.isArray(requiredCheckIds) && requiredCheckIds.every((id) => typeof id === "string") &&
           (field(provenance, "schedule_id") === null || typeof field(provenance, "schedule_id") === "string") &&
@@ -911,7 +984,7 @@ const taskContentRecordIsCurrent = (value: unknown) =>
     const item = field(value, name);
     return item === undefined || item === null || typeof item === "string";
   });
-const executionActors: string[] = [...ROLES, "single_agent"];
+const executionActors: string[] = [...ROLES, "single_agent", "single_agent_reviewer"];
 const currentInputOutcome = (kind: unknown) =>
   kind === "question" ? "needs_input" : kind === "blocked" ? "blocked" : undefined;
 const currentInputUnavailableReasons = [
@@ -1049,10 +1122,19 @@ const preserveMutationIdentity = <T>(
   });
 export const command = (body: Command) =>
   preserveMutationIdentity(
-    json<{ result: Record<string, unknown> }>("/api/command", {
-      method: "POST",
-      body: JSON.stringify(body),
-    }, transportTimeouts.mutation),
+    json<{ result: Record<string, unknown> }>(
+      "/api/command",
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      },
+      transportTimeouts.mutation,
+      ["add_task_comment", "edit_guidance", "cancel_guidance"].includes(
+          String(body.kind),
+        )
+        ? ["task_interactions_v1"]
+        : body.kind === "upsert_single_agent_recipe" ? ["single_agent_presets_v1"] : [],
+    ),
     body.operation_id,
   );
 export const operation = async <T = Record<string, unknown>>(
@@ -1294,7 +1376,9 @@ export const inspectProviderValidation = (batchId: string) =>
  * its first outcome; changed input under the same ID is refused.
  */
 export const submitWorkflowCommand = (command: WorkflowCommand) =>
-  featureOperation(MULTI_WORKFLOW_FEATURE, {
+  featureOperation((command.kind === "save_agent_profile" && command.profile.purpose && command.profile.purpose !== "workspace_writer") ||
+    (command.kind === "set_project_workflow_default" && command.preset && command.preset !== "single_agent") ||
+    ((command.kind === "set_task_workflow" || command.kind === "create_task") && command.selection && ((command.selection.preset && command.selection.preset !== "single_agent") || command.selection.reviewer_profile_revision_id)) ? "single_agent_presets_v1" : MULTI_WORKFLOW_FEATURE, {
     kind: "workflow",
     command,
   }, workflowCommandResultIsCurrent);
@@ -1329,3 +1413,55 @@ export const reuseOperationIdentity = (
   }
   return { id: operationId(), request };
 };
+
+export const permissionCoverage = (
+  request_id: string,
+  expected_revision: number,
+  command: string,
+  lifetime: "session" | "project",
+) =>
+  json<import("./types").PermissionCoveragePreview>(
+    "/api/permission-coverage",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        request_id,
+        expected_revision,
+        command,
+        lifetime,
+      }),
+    },
+    transportTimeouts.read,
+    ["task_interactions_v1"],
+  );
+
+export const taskActivity = (taskId: string, cursor?: string) =>
+  json<import("./types").TaskActivityPage>(
+    `/api/tasks/${encodeURIComponent(taskId)}/activity${
+      cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""
+    }`,
+    undefined,
+    transportTimeouts.read,
+    ["task_interactions_v1"],
+  );
+
+export function historySearch(filters: HistorySearchFilters, cursor?: string, signal?: AbortSignal): Promise<HistorySearchPage> {
+  const params = new URLSearchParams({ query: filters.query, exclude_archived: String(filters.exclude_archived) });
+  if (filters.project_id) params.set("project_id", filters.project_id);
+  if (filters.kind) params.set("kind", filters.kind);
+  if (cursor) params.set("cursor", cursor);
+  return json<HistorySearchPage>(`/api/history/search?${params}`, { signal }, transportTimeouts.read, ["history_insights_v1"]);
+}
+
+export function historicalSource(key: HistoricalSourceKey, signal?: AbortSignal): Promise<HistoricalSource> {
+  const params = new URLSearchParams({ task_id: key.task_id, kind: key.kind, id: key.id });
+  if (key.attempt_id !== null) params.set("attempt_id", key.attempt_id);
+  return json<HistoricalSource>(`/api/history/source?${params}`, { signal }, transportTimeouts.read, ["history_insights_v1"]);
+}
+
+export function usageComparisons(filters: UsageComparisonFilters, cursor?: string, signal?: AbortSignal): Promise<UsageComparisonPage> {
+  const params = new URLSearchParams({ group_by: filters.group_by });
+  for (const [key, value] of Object.entries(filters)) if (value) params.set(key, value);
+  if (cursor) params.set("cursor", cursor);
+  return json<UsageComparisonPage>(`/api/history/usage?${params}`, { signal }, transportTimeouts.read, ["history_insights_v1"]);
+}

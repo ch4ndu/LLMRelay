@@ -144,6 +144,52 @@ pub(crate) fn apply_command(
 ) -> Result<OperationResult> {
     let operation = command.operation_id();
     match command {
+        HumanCommand::UpsertSingleAgentRecipe {
+            project_id,
+            recipe_id,
+            expected_version,
+            recipe,
+            ..
+        } => {
+            visible_project(tx, project_id)?;
+            bounded(&recipe.name, "recipe name", 100)?;
+            bounded(&recipe.title, "task title", 200)?;
+            if recipe.description.len() > 16_384
+                || recipe.acceptance_criteria.is_empty()
+                || recipe.acceptance_criteria.len() > 32
+                || recipe
+                    .acceptance_criteria
+                    .iter()
+                    .any(|item| item.trim().is_empty() || item.len() > 2_000)
+            {
+                bail!("Recipe needs bounded task content and acceptance criteria")
+            }
+            let selection = &recipe.selection;
+            let (config_hash, primary_hash, reviewer_hash) =
+                crate::workflow::single_agent_recipe_pins(tx, project_id, selection)?;
+            let definition = crate::workflow::ensure_preset_definition(tx, selection.preset, now)?;
+            let (id, revision, version) = match (recipe_id, expected_version) {
+                (None, None) => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    tx.execute("INSERT INTO task_recipes(id,project_id,name,current_revision,version,created_at,updated_at) VALUES(?1,?2,?3,1,1,?4,?4)",params![id,project_id,recipe.name.trim(),now])?;
+                    (id, 1, 1)
+                }
+                (Some(id), Some(expected)) => {
+                    let revision =
+                        current_version(tx, "task_recipes", id, project_id, *expected)? + 1;
+                    tx.execute("UPDATE task_recipes SET name=?1,current_revision=?2,version=version+1,updated_at=?3 WHERE id=?4",params![recipe.name.trim(),revision,now,id])?;
+                    (id.clone(), revision, expected + 1)
+                }
+                _ => bail!("Recipe creation and update require matching identity and version"),
+            };
+            let revision_id = uuid::Uuid::new_v4().to_string();
+            tx.execute("INSERT INTO task_recipe_revisions(id,recipe_id,revision,title,description,acceptance_criteria_json,priority,required_check_ids_json,configuration_hash,workflow_version,workflow_hash,created_at,family,preset,definition_id,execution_config_revision_id,primary_profile_revision_id,primary_profile_hash,reviewer_profile_revision_id,reviewer_profile_hash)
+                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'single_agent',?13,?14,?15,?16,?17,?18,?19)",
+                params![revision_id,id,revision,recipe.title.trim(),recipe.description,serde_json::to_string(&recipe.acceptance_criteria)?,recipe.priority,serde_json::to_string(&selection.check_ids)?,config_hash,crate::workflow_resources::single_agent_definition(selection.preset).version,definition.1,now,selection.preset.as_str(),definition.0,selection.execution_config_revision_id,selection.profile_revision_id,primary_hash,selection.reviewer_profile_revision_id,reviewer_hash])?;
+            let mut result = outcome(operation, "recipe", id, version, "saved");
+            result.detail = json!({"revision_id":revision_id,"revision":revision});
+            Ok(result)
+        }
         HumanCommand::UpsertProfileSet {
             project_id,
             profile_set_id,
@@ -308,7 +354,11 @@ pub(crate) fn apply_command(
                 bail!("exact recipe revision does not belong to the requested recipe")
             }
             let task_id = materialize(tx, project_id, recipe_revision_id, None, now)?;
-            Ok(outcome(operation, "task", task_id, 1, "backlog"))
+            let version =
+                tx.query_row("SELECT version FROM tasks WHERE id=?1", [&task_id], |row| {
+                    row.get(0)
+                })?;
+            Ok(outcome(operation, "task", task_id, version, "backlog"))
         }
         HumanCommand::UpsertRecipeSchedule {
             project_id,
@@ -440,6 +490,15 @@ fn require_recipe_revision(
 }
 
 pub(crate) fn require_binding_current(connection: &Connection, task_id: &str) -> Result<()> {
+    let single: Option<(String,String)> = connection.query_row("SELECT project_id,recipe_revision_id FROM task_recipe_bindings WHERE task_id=?1 AND family='single_agent'",[task_id],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+    if let Some((project, revision)) = single {
+        let selection = single_agent_selection(connection, &project, &revision)?;
+        let matches: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM task_workflow_selections s JOIN task_recipe_bindings b ON b.task_id=s.task_id WHERE s.task_id=?1 AND s.family=b.family AND s.preset=b.preset AND s.definition_id=b.definition_id AND s.execution_config_revision_id=b.execution_config_revision_id AND s.profile_revision_id=b.primary_profile_revision_id AND s.reviewer_profile_revision_id IS b.reviewer_profile_revision_id AND s.check_ids_json=b.required_check_ids_json AND s.workspace_mode='isolated_worktree')",[task_id],|row|row.get(0))?;
+        if !matches || selection.family != crate::domain::WorkflowFamily::SingleAgent {
+            bail!("Recipe selection changed; create a draft from the current recipe revision")
+        }
+        return Ok(());
+    }
     let binding: Option<(String,String,String,String,String,String,String,String)> = connection.query_row(
         "SELECT b.project_id,b.recipe_revision_id,b.profile_revision_id,b.required_check_ids_json,b.config_revision_id,b.configuration_hash,b.workflow_version,b.workflow_hash FROM task_recipe_bindings b WHERE b.task_id=?1",
         [task_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
@@ -482,6 +541,9 @@ fn materialize(
     schedule: Option<(&str, &str)>,
     now: &str,
 ) -> Result<String> {
+    if recipe_family(tx, revision_id)? == "single_agent" {
+        return materialize_single_agent(tx, project_id, revision_id, schedule, now);
+    }
     let (config_id, hash) = active_pin(tx, project_id)?;
     let row: Option<(String,String,String,i64,String,String,String,String,String,String,String)> = tx.query_row(
         "SELECT rr.title,rr.description,rr.acceptance_criteria_json,rr.priority,rr.profile_revision_id,rr.required_check_ids_json,rr.config_revision_id,rr.configuration_hash,rr.workflow_version,rr.workflow_hash,pr.roles_json
@@ -537,6 +599,79 @@ fn materialize(
         .unwrap_or((None, None));
     tx.execute("INSERT INTO task_recipe_bindings(task_id,project_id,recipe_revision_id,profile_revision_id,required_check_ids_json,config_revision_id,configuration_hash,workflow_version,workflow_hash,schedule_id,scheduled_for_utc,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![task_id,project_id,revision_id,profile_id,checks,config_id,hash,workflow_version,workflow_hash,schedule_id,scheduled_for,now])?;
     Ok(task_id)
+}
+
+fn recipe_family(connection: &Connection, revision_id: &str) -> Result<String> {
+    Ok(connection.query_row(
+        "SELECT family FROM task_recipe_revisions WHERE id=?1",
+        [revision_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn single_agent_selection(
+    connection: &Connection,
+    project_id: &str,
+    revision_id: &str,
+) -> Result<crate::domain::TaskWorkflowSelectionInput> {
+    require_recipe_revision(connection, project_id, revision_id)?;
+    let (preset, definition_id, definition_hash, version, config, config_hash, primary, primary_hash, reviewer, reviewer_hash, checks):
+        (String,String,String,String,String,String,String,String,Option<String>,Option<String>,String) = connection.query_row(
+        "SELECT preset,definition_id,workflow_hash,workflow_version,execution_config_revision_id,configuration_hash,primary_profile_revision_id,primary_profile_hash,reviewer_profile_revision_id,reviewer_profile_hash,required_check_ids_json FROM task_recipe_revisions WHERE id=?1 AND family='single_agent'",
+        [revision_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?)))?;
+    let selection = crate::domain::TaskWorkflowSelectionInput {
+        family: crate::domain::WorkflowFamily::SingleAgent,
+        preset: preset.parse().map_err(|error: String| anyhow!(error))?,
+        workspace_mode: Default::default(),
+        execution_config_revision_id: Some(config),
+        profile_revision_id: Some(primary),
+        reviewer_profile_revision_id: reviewer,
+        check_ids: serde_json::from_str(&checks)?,
+    };
+    let definition = crate::workflow_resources::single_agent_definition(selection.preset);
+    let stored: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM workflow_definitions WHERE id=?1 AND content_hash=?2 AND definition_text=?3)",params![definition.id,definition.hash(),definition.text],|row|row.get(0))?;
+    if !stored
+        || definition.id != definition_id
+        || definition.hash() != definition_hash
+        || definition.version != version
+        || crate::workflow::single_agent_recipe_pins(connection, project_id, &selection)?
+            != (config_hash, primary_hash, reviewer_hash)
+    {
+        bail!("The recipe definition, configuration or profile is stale; save a current revision")
+    }
+    Ok(selection)
+}
+
+fn materialize_single_agent(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    revision_id: &str,
+    schedule: Option<(&str, &str)>,
+    now: &str,
+) -> Result<String> {
+    visible_project(tx, project_id)?;
+    let selection = single_agent_selection(tx, project_id, revision_id)?;
+    let (title, description, criteria, priority): (String,String,String,i64) = tx.query_row("SELECT title,description,acceptance_criteria_json,priority FROM task_recipe_revisions WHERE id=?1",[revision_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+    let task = crate::workflow::insert_task_rows(
+        tx,
+        project_id,
+        &title,
+        &description,
+        &serde_json::from_str::<Vec<String>>(&criteria)?,
+        priority,
+        &Value::Null,
+        None,
+        false,
+        now,
+    )?;
+    crate::workflow::set_task_workflow(tx, &task, 1, &selection, now)?;
+    let (schedule_id, scheduled_for) = schedule
+        .map(|(id, time)| (Some(id), Some(time)))
+        .unwrap_or((None, None));
+    tx.execute("INSERT INTO task_recipe_bindings(task_id,project_id,recipe_revision_id,required_check_ids_json,configuration_hash,workflow_version,workflow_hash,schedule_id,scheduled_for_utc,created_at,family,preset,definition_id,execution_config_revision_id,primary_profile_revision_id,primary_profile_hash,reviewer_profile_revision_id,reviewer_profile_hash)
+        SELECT ?1,?2,id,required_check_ids_json,configuration_hash,workflow_version,workflow_hash,?3,?4,?5,family,preset,definition_id,execution_config_revision_id,primary_profile_revision_id,primary_profile_hash,reviewer_profile_revision_id,reviewer_profile_hash FROM task_recipe_revisions WHERE id=?6",
+        params![task,project_id,schedule_id,scheduled_for,now,revision_id])?;
+    Ok(task)
 }
 
 fn parse_utc(input: &str) -> Result<DateTime<Utc>> {
@@ -616,6 +751,12 @@ fn fire_ineligible(
 ) -> Result<Option<&'static str>> {
     if let Err(error) = visible_project(connection, project_id) {
         return expected_ineligibility(error, "project_unavailable");
+    }
+    if recipe_family(connection, revision_id)? == "single_agent" {
+        return match single_agent_selection(connection, project_id, revision_id) {
+            Ok(_) => Ok(None),
+            Err(error) => expected_ineligibility(error, "single_agent_recipe_pins_unavailable"),
+        };
     }
     let current = match active_pin(connection, project_id) {
         Ok(pin) => pin,
@@ -806,6 +947,8 @@ pub(crate) fn task_provenance(connection: &Connection, task_id: &str) -> Result<
     connection.query_row(
         "SELECT json_object('recipe_id',r.id,'recipe_name',r.name,'recipe_revision_id',rr.id,
              'recipe_revision',rr.revision,'profile_revision_id',b.profile_revision_id,
+             'family',b.family,'preset',b.preset,'definition_id',b.definition_id,
+             'execution_config_revision_id',b.execution_config_revision_id,'primary_profile_revision_id',b.primary_profile_revision_id,'reviewer_profile_revision_id',b.reviewer_profile_revision_id,
              'required_check_ids',json(b.required_check_ids_json),'config_revision_id',b.config_revision_id,
              'configuration_hash',b.configuration_hash,'workflow_version',b.workflow_version,
              'workflow_hash',b.workflow_hash,'schedule_id',b.schedule_id,
@@ -842,7 +985,11 @@ pub(crate) fn projection(connection: &Connection) -> Result<(Vec<Value>, Vec<Val
           'acceptance_criteria',json(rr.acceptance_criteria_json),'priority',rr.priority,
           'profile_revision_id',rr.profile_revision_id,'required_check_ids',json(rr.required_check_ids_json),
           'config_revision_id',rr.config_revision_id,'configuration_hash',rr.configuration_hash,
-          'workflow_version',rr.workflow_version,'workflow_hash',rr.workflow_hash)
+          'workflow_version',rr.workflow_version,'workflow_hash',rr.workflow_hash,
+          'family',rr.family,'preset',rr.preset,'definition_id',rr.definition_id,
+          'execution_config_revision_id',rr.execution_config_revision_id,'primary_profile_revision_id',rr.primary_profile_revision_id,
+          'primary_profile_hash',rr.primary_profile_hash,'reviewer_profile_revision_id',rr.reviewer_profile_revision_id,'reviewer_profile_hash',rr.reviewer_profile_hash,
+          'revisions',json((SELECT json_group_array(json_object('id',h.id,'revision',h.revision,'family',h.family,'preset',h.preset,'definition_id',h.definition_id,'execution_config_revision_id',h.execution_config_revision_id,'primary_profile_revision_id',h.primary_profile_revision_id,'reviewer_profile_revision_id',h.reviewer_profile_revision_id,'workflow_version',h.workflow_version,'workflow_hash',h.workflow_hash)) FROM (SELECT * FROM task_recipe_revisions WHERE recipe_id=r.id ORDER BY revision DESC) h)))
          FROM task_recipes r JOIN projects p ON p.id=r.project_id AND p.internal_purpose IS NULL
          JOIN task_recipe_revisions rr ON rr.recipe_id=r.id AND rr.revision=r.current_revision
          ORDER BY r.project_id,r.name")?;
@@ -850,7 +997,8 @@ pub(crate) fn projection(connection: &Connection) -> Result<(Vec<Value>, Vec<Val
         "SELECT json_object('id',s.id,'project_id',s.project_id,'name',s.name,
           'version',s.version,'archived',json(CASE WHEN s.archived_at IS NULL THEN 'false' ELSE 'true' END),'paused',json(CASE WHEN s.paused=1 THEN 'true' ELSE 'false' END),
           'recipe_revision_id',s.recipe_revision_id,'recipe_name',r.name,
-          'recipe_config_revision_id',rr.config_revision_id,
+          'recipe_config_revision_id',COALESCE(rr.execution_config_revision_id,rr.config_revision_id),
+          'recipe_family',rr.family,'recipe_preset',rr.preset,
           'recipe_archived',json(CASE WHEN r.archived_at IS NULL THEN 'false' ELSE 'true' END),
           'cadence',s.cadence,
           'anchor_utc',s.anchor_utc,'next_fire_utc',s.next_fire_utc,

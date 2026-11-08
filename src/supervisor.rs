@@ -418,6 +418,189 @@ pub(crate) fn capture_cmux_host_ancestry() -> Option<CmuxHostAncestry> {
     None
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PairedCmuxProof {
+    pid: u32,
+    start: String,
+    executable: std::path::PathBuf,
+    service_boot: String,
+}
+
+impl PairedCmuxProof {
+    pub(crate) fn capture(peer: &PeerProcessIdentity, service_boot: &str) -> Result<Self> {
+        let inventory = process_inventory()?;
+        let by_pid = inventory
+            .iter()
+            .map(|process| (process.pid, process))
+            .collect::<HashMap<_, _>>();
+        let connector = by_pid
+            .get(&peer.pid)
+            .context("Pairing client exited before ancestry capture")?;
+        if !same_process_start(&connector.start, &peer.native_start_marker) {
+            bail!("Pairing client generation changed")
+        }
+        let mut current = connector.ppid;
+        let mut visited = HashSet::new();
+        while current > 1 && visited.insert(current) {
+            let process = by_pid
+                .get(&current)
+                .context("Cannot establish the pairing client's complete ancestry")?;
+            let executable = process_executable_path(current)?;
+            if executable.file_name().and_then(|name| name.to_str()) == Some("cmux") {
+                validate_cmux_bundle(&executable)?;
+                let start = paired_generation_start(current)?;
+                if !same_process_start(&native_start_marker(current)?, &process.start) {
+                    bail!("cmux restarted during pairing")
+                }
+                let proof = Self {
+                    pid: current,
+                    start,
+                    executable,
+                    service_boot: service_boot.into(),
+                };
+                let refreshed = process_inventory()?;
+                let mut ancestor = peer.pid;
+                let mut seen = HashSet::new();
+                while ancestor > 1 && ancestor != proof.pid && seen.insert(ancestor) {
+                    ancestor = refreshed
+                        .iter()
+                        .find(|process| process.pid == ancestor)
+                        .context("Pairing ancestry changed during capture")?
+                        .ppid;
+                }
+                if ancestor != proof.pid || proof.verified_executable(service_boot).is_none() {
+                    bail!("cmux generation or ancestry changed during pairing")
+                }
+                return Ok(proof);
+            }
+            current = process.ppid;
+        }
+        bail!("Run llmrelay service pair-cmux from a terminal in the installed cmux app. Automatic routing still requires cmux endpoint access; manual llmrelay attach remains available.")
+    }
+
+    pub(crate) fn verified_executable(&self, service_boot: &str) -> Option<std::path::PathBuf> {
+        if self.service_boot != service_boot
+            || validate_cmux_bundle(&self.executable).is_err()
+            || !paired_generation_start(self.pid)
+                .ok()
+                .zip(process_executable_path(self.pid).ok())
+                .is_some_and(|(start, executable)| {
+                    self.matches_current(service_boot, &start, &executable)
+                })
+        {
+            return None;
+        }
+        if paired_generation_start(self.pid).ok().as_deref() != Some(self.start.as_str()) {
+            return None;
+        }
+        Some(self.executable.clone())
+    }
+
+    fn matches_current(
+        &self,
+        service_boot: &str,
+        start: &str,
+        executable: &std::path::Path,
+    ) -> bool {
+        self.service_boot == service_boot && start == self.start && executable == self.executable
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn paired_generation_start(pid: u32) -> Result<String> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // The kernel writes the complete fixed SDK structure or the call fails.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
+    };
+    if written != size as i32 {
+        bail!("Cannot establish the exact cmux kernel generation")
+    }
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != pid
+        || info.pbi_uid != unsafe { libc::geteuid() }
+        || info.pbi_start_tvsec == 0
+    {
+        bail!("cmux kernel process identity is unavailable or belongs to another user")
+    }
+    Ok(format!(
+        "{}:{}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn paired_generation_start(_pid: u32) -> Result<String> {
+    bail!("cmux pairing requires the supported macOS kernel identity")
+}
+
+#[cfg(test)]
+pub(crate) fn assert_paired_cmux_generation_contract() {
+    let executable = std::path::PathBuf::from("/Applications/cmux.app/Contents/MacOS/cmux");
+    let proof = PairedCmuxProof {
+        pid: 4243,
+        start: "100:1".into(),
+        executable: executable.clone(),
+        service_boot: "service-one".into(),
+    };
+    // Connector lifetime is intentionally absent after the capture boundary.
+    assert!(proof.matches_current("service-one", &proof.start, &executable));
+    assert!(!proof.matches_current("service-two", &proof.start, &executable));
+    assert!(!proof.matches_current("service-one", "100:2", &executable));
+    assert!(!proof.matches_current(
+        "service-one",
+        &proof.start,
+        std::path::Path::new("/usr/local/bin/cmux")
+    ));
+    assert!(validate_cmux_bundle(std::path::Path::new("/usr/local/bin/cmux")).is_err());
+}
+
+fn validate_cmux_bundle(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let (home, _, uid) = crate::service::owner_identity()?;
+    let system = std::path::PathBuf::from("/Applications/cmux.app/Contents/MacOS/cmux");
+    let personal = home.join("Applications/cmux.app/Contents/MacOS/cmux");
+    if path != system && path != personal {
+        bail!("Unsupported cmux installation path: use /Applications/cmux.app or your home Applications/cmux.app; a PATH executable is not a pairing proof")
+    }
+    let mut current = path;
+    loop {
+        let metadata = std::fs::symlink_metadata(current)?;
+        // macOS's system Applications container is root:admin (80), commonly
+        // 0775. Only this exact privileged container may be group-writable;
+        // every bundle/executable and personal Applications component stays strict.
+        let system_container = current == std::path::Path::new("/Applications")
+            && metadata.uid() == 0
+            && metadata.gid() == 80
+            && metadata.mode() & 0o7777 == 0o775;
+        if metadata.file_type().is_symlink()
+            || ![0, uid].contains(&metadata.uid())
+            || (metadata.mode() & 0o022 != 0 && !system_container)
+            || (current != path && !metadata.is_dir())
+        {
+            bail!("cmux bundle path has untrusted ownership or writable components")
+        }
+        if current == path && !metadata.is_file() {
+            bail!("cmux executable is not a regular file")
+        }
+        if current == home || current == std::path::Path::new("/Applications") {
+            break;
+        }
+        current = current.parent().context("cmux bundle path is incomplete")?;
+    }
+    if std::fs::canonicalize(path)? != path {
+        bail!("cmux bundle resolves to a different path")
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn current_process_cmux_ancestry_for_tests() -> Result<CmuxHostAncestry> {
     let pid = std::process::id();
@@ -6109,7 +6292,8 @@ exit 23
                     )
                     .unwrap();
                 assert!(store
-                    .reserve_guidance_delivery(first_id, session, epoch, None, &submitted)
+                    .reserve_guidance_delivery(first_id, session, epoch, None, &submitted, 1)
+                    .map(|outcome| outcome == crate::store::GuidanceReservation::Reserved)
                     .unwrap());
                 let paste = format!("\x1b[200~{submitted}\x1b[201~");
                 if refusal == "post_paste_claim" {
@@ -6371,13 +6555,117 @@ exit 23
                     serde_json::json!({"background_tasks":[],"session_crons":[]}),
                 );
             }
-            let ordinary = roles.deliver_guidance("guidance").unwrap();
+            if refusal == "policy" {
+                store.lock().unwrap().execute_batch("UPDATE role_generations SET role='manager'; UPDATE guidance_messages SET reason='awaiting_supported_idle_boundary' WHERE id='guidance';").unwrap();
+                let version = || -> i64 {
+                    store
+                        .lock()
+                        .unwrap()
+                        .query_row("SELECT version FROM tasks WHERE id='t'", [], |row| {
+                            row.get(0)
+                        })
+                        .unwrap()
+                };
+                let edit = |id: &str, body: String, revision: i64| {
+                    crate::domain::HumanCommand::EditGuidance {
+                        operation_id: id.into(),
+                        task_id: "t".into(),
+                        guidance_id: "guidance".into(),
+                        expected_revision: revision,
+                        expected_version: version(),
+                        body,
+                    }
+                };
+                let bad = edit("invalid-edit", " ".into(), 1);
+                assert!(crate::workflow::execute(&store, &bad).is_err());
+                let large = edit("oversized-edit", "x".repeat(65536), 1);
+                assert!(crate::workflow::execute(&store, &large).is_err());
+                let valid = edit("valid-edit", "Use the smaller scope".into(), 1);
+                let applied = crate::workflow::execute(&store, &valid).unwrap();
+                assert_eq!(
+                    crate::workflow::execute(&store, &valid).unwrap().entity_id,
+                    applied.entity_id
+                );
+                store.lock().unwrap().execute_batch("INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,reason,created_at) SELECT 'cancel-note',attempt_id,role_generation_id,'cancel me','queued','awaiting_supported_idle_boundary',created_at FROM guidance_messages WHERE id='guidance';").unwrap();
+                let cancel = crate::domain::HumanCommand::CancelGuidance {
+                    operation_id: "cancel-note".into(),
+                    task_id: "t".into(),
+                    guidance_id: "cancel-note".into(),
+                    expected_revision: 1,
+                    expected_version: version(),
+                };
+                crate::workflow::execute(&store, &cancel).unwrap();
+                let cancelled = store
+                    .reserve_guidance_delivery("cancel-note", session, epoch, None, "cancel me", 1)
+                    .unwrap();
+                assert_eq!(cancelled, crate::store::GuidanceReservation::Cancelled);
+                store
+                    .lock()
+                    .unwrap()
+                    .execute_batch("UPDATE role_generations SET role='implementer';")
+                    .unwrap();
+                // Commit the edit after the old body is prepared, during the exact lease UPSERT.
+                store.lock().unwrap().execute_batch("CREATE TEMP TRIGGER edit_before_guidance_reservation AFTER UPDATE ON input_leases
+                    WHEN NEW.owner_id='guidance:guidance' AND NEW.revoked_at IS NULL
+                     AND (SELECT message_revision FROM guidance_messages WHERE id='guidance')=2
+                    BEGIN UPDATE guidance_messages SET body='Use the smaller scope now',message_revision=3,reason='human_guidance_edited' WHERE id='guidance'; END;").unwrap();
+                let deferred = roles.retry_ready_guidance().unwrap();
+                assert_eq!(deferred[0]["action"], "guidance_deferred");
+                assert!(std::fs::read(&terminal_input).unwrap().is_empty());
+                {
+                    let connection = store.lock().unwrap();
+                    let effects: (i64, i64, i64) = connection
+                        .query_row(
+                            "SELECT (SELECT COUNT(*) FROM input_leases WHERE revoked_at IS NULL),
+                         (SELECT COUNT(*) FROM recovery_records),
+                         (SELECT COUNT(*) FROM guidance_messages WHERE id='guidance'
+                          AND state='queued' AND message_revision=3 AND submitted_text IS NULL)",
+                            [],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .unwrap();
+                    assert_eq!(effects, (0, 0, 1));
+                    connection
+                        .execute_batch("DROP TRIGGER edit_before_guidance_reservation;")
+                        .unwrap();
+                }
+                let current = roles.retry_ready_guidance().unwrap();
+                assert_eq!(current[0]["state"], "written_awaiting_submit");
+                assert!(String::from_utf8(std::fs::read(&terminal_input).unwrap())
+                    .unwrap()
+                    .contains("Use the smaller scope now"));
+                store
+                    .lock()
+                    .unwrap()
+                    .execute_batch("UPDATE role_generations SET role='manager';")
+                    .unwrap();
+                let late = edit("reservation-first", "late text".into(), 3);
+                assert!(crate::workflow::execute(&store, &late).is_err());
+                let late_cancel = crate::domain::HumanCommand::CancelGuidance {
+                    operation_id: "late-cancel".into(),
+                    task_id: "t".into(),
+                    guidance_id: "guidance".into(),
+                    expected_revision: 3,
+                    expected_version: version(),
+                };
+                assert!(crate::workflow::execute(&store, &late_cancel).is_err());
+                store
+                    .lock()
+                    .unwrap()
+                    .execute_batch("UPDATE role_generations SET role='implementer';")
+                    .unwrap();
+            }
+            let ordinary = if refusal == "policy" {
+                serde_json::json!({"state":"written_awaiting_submit"})
+            } else {
+                roles.deliver_guidance("guidance").unwrap()
+            };
             assert_eq!(ordinary["state"], "written_awaiting_submit");
             let ordinary_bytes = std::fs::read(&terminal_input).unwrap();
             assert!(ordinary_bytes.ends_with(b"\r"));
             hook(
                 "UserPromptSubmit",
-                serde_json::json!({"prompt":"Use the smaller scope"}),
+                serde_json::json!({"prompt":if refusal == "policy" {"Use the smaller scope now"} else {"Use the smaller scope"}}),
             );
             hook(
                 "Stop",

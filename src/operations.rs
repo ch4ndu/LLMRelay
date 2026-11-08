@@ -48,6 +48,9 @@ pub struct Application {
     role_tokens: Arc<RwLock<HashMap<String, String>>>,
     dispatch_enabled: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
+    drain_progress: Arc<Mutex<DrainProgress>>,
+    pub(crate) bootstrap: auth::BootstrapIssuer,
+    paired_cmux: Arc<Mutex<Option<crate::supervisor::PairedCmuxProof>>>,
     coordinator_lock: Arc<Mutex<()>>,
     intake_lock: Arc<Mutex<()>>,
     rework_lock: Arc<Mutex<()>>,
@@ -59,6 +62,12 @@ pub struct Application {
     /// Set once this boot's first observation pass has discarded earlier candidates.
     attention_baseline_reset: Arc<AtomicBool>,
     attention_failure_reported: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Default)]
+struct DrainProgress {
+    captured: Option<Vec<String>>,
+    checks: crate::checks::CheckInterruptProgress,
 }
 
 enum BrowserLaunchDispatch {
@@ -473,6 +482,9 @@ impl Application {
             role_tokens: Arc::new(RwLock::new(HashMap::new())),
             dispatch_enabled: Arc::new(AtomicBool::new(dispatch_enabled)),
             draining: Arc::new(AtomicBool::new(false)),
+            drain_progress: Arc::new(Mutex::new(DrainProgress::default())),
+            bootstrap: auth::BootstrapIssuer::default(),
+            paired_cmux: Arc::new(Mutex::new(None)),
             coordinator_lock: Arc::new(Mutex::new(())),
             intake_lock: Arc::new(Mutex::new(())),
             rework_lock: Arc::new(Mutex::new(())),
@@ -767,12 +779,89 @@ impl Application {
         self.draining.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn request_drain(&self) {
+        self.dispatch_enabled.store(false, Ordering::SeqCst);
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn request_idle_shutdown(&self) -> Result<()> {
+        let _coordinator = self
+            .coordinator_lock
+            .lock()
+            .map_err(|_| anyhow!("coordinator ownership is unavailable; use stop --drain"))?;
+        let _intake = self
+            .intake_lock
+            .lock()
+            .map_err(|_| anyhow!("intake ownership is unavailable; use stop --drain"))?;
+        if self.drain_status()?["quiescent"] != true {
+            bail!("service still owns active or unknown sessions or checks; use stop --drain to interrupt and visibly reconcile them")
+        }
+        self.request_drain();
+        Ok(())
+    }
+
     pub fn service_boot_id(&self) -> &str {
         self.permission_boot_id.as_str()
     }
 
-    /// Automatic cmux routing is a host-start property.  Socket availability
-    /// and inherited environment are deliberately not considered here.
+    pub(crate) fn desktop_snapshot(&self) -> Result<crate::domain::DesktopSnapshot> {
+        use crate::domain::{DesktopSnapshot, DesktopSnapshotState};
+        let instance_key = self.paths.root_key();
+        let projected = crate::workflow::desktop_attention(&self.store, &instance_key);
+        let (revision, mut entries, state) = match projected {
+            Ok((revision, entries)) => (revision, entries, DesktopSnapshotState::Complete),
+            Err(_) => ("0".into(), Vec::new(), DesktopSnapshotState::Unavailable),
+        };
+        let count = entries.len();
+        entries.retain(|entry| !entry.attention_id.is_empty() && entry.attention_id.len() <= 512);
+        for entry in &mut entries {
+            if serde_json::to_vec(&entry.target)?.len() > 4096 {
+                entry.target = None;
+                entry.episode_key = None;
+            }
+        }
+        entries.truncate(100);
+        let mut snapshot = DesktopSnapshot {
+            instance_key,
+            incarnation: self.service_boot_id().into(),
+            revision,
+            count,
+            state: if count > entries.len() {
+                DesktopSnapshotState::Truncated
+            } else {
+                state
+            },
+            entries,
+        };
+        // Account for the entire envelope, including bounded typed targets.
+        while serde_json::to_vec(&snapshot)?.len() > 128 * 1024 {
+            snapshot.entries.pop();
+            snapshot.state = DesktopSnapshotState::Truncated;
+        }
+        Ok(snapshot)
+    }
+
+    pub(crate) fn desktop_target(
+        &self,
+        activation: &crate::domain::DesktopActivation,
+    ) -> Result<crate::domain::DesktopTarget> {
+        activation.validate()?;
+        let (revision, entries) =
+            crate::workflow::desktop_attention(&self.store, &self.paths.root_key())?;
+        let target = activation.resolve(
+            &self.paths.root_key(),
+            &revision,
+            self.service_boot_id(),
+            entries,
+        );
+        if serde_json::to_vec(&target)?.len() > 4096 {
+            return Ok(crate::domain::DesktopTarget::Stale { message: "This attention binding exceeds the desktop limit. Choose an item from the dashboard.".into() });
+        }
+        Ok(target)
+    }
+
+    /// Foreground ancestry and explicit pairing are separate local proofs.
+    /// Each cmux operation still checks the independent endpoint contract.
     pub(crate) fn automatic_cmux_routing_permitted(&self) -> bool {
         self.cmux_executable_path().is_some()
     }
@@ -781,6 +870,34 @@ impl Application {
         self.cmux_host_ancestry
             .as_ref()
             .and_then(|identity| identity.verified_executable())
+            .or_else(|| {
+                self.paired_cmux
+                    .lock()
+                    .ok()?
+                    .as_ref()?
+                    .verified_executable(self.service_boot_id())
+            })
+    }
+
+    pub(crate) fn pair_cmux(
+        &self,
+        proof: crate::supervisor::PairedCmuxProof,
+    ) -> Result<serde_json::Value> {
+        if proof.verified_executable(self.service_boot_id()).is_none() {
+            bail!("cmux pairing generation is no longer current")
+        }
+        *self
+            .paired_cmux
+            .lock()
+            .map_err(|_| anyhow!("cmux pairing state unavailable"))? = Some(proof);
+        let endpoint = crate::cmux::require_persistent_cmux_contract(self);
+        Ok(
+            serde_json::json!({"instance_key":self.paths.root_key(),"paired":true,
+            "automatic_routing":endpoint.is_ok(),"message":match endpoint {
+                Ok(()) => "Paired with the current cmux generation and endpoint.".to_owned(),
+                Err(_) => "The cmux process is paired, but its independent endpoint policy refused or could not verify access. Use the session's manual llmrelay attach command; pairing does not change cmux settings.".to_owned()
+            }}),
+        )
     }
 
     pub fn executable_path(&self) -> &Path {
@@ -788,21 +905,40 @@ impl Application {
     }
 
     pub fn begin_drain(&self) -> Result<serde_json::Value> {
-        self.dispatch_enabled.store(false, Ordering::SeqCst);
-        // A fire holding intake_lock commits before drain activation; later fires see the disabled gate.
+        self.request_drain();
+        // Close dispatch first, then capture only after any in-flight intake commits.
         {
             let _intake = self
                 .intake_lock
-                .lock()
-                .map_err(|_| anyhow!("intake mutex is poisoned"))?;
+                .try_lock()
+                .map_err(|_| anyhow!("drain is waiting for the current intake operation"))?;
             self.draining.store(true, Ordering::SeqCst);
         }
-        let _guard = self
-            .coordinator_lock
+        let mut progress = self
+            .drain_progress
             .lock()
-            .map_err(|_| anyhow!("coordinator mutex is poisoned"))?;
+            .map_err(|_| anyhow!("drain progress is unavailable"))?;
+        // A synchronous selected check owns the scheduling mutex until it exits.
+        // Interrupt its exact recorded generation first, retaining partial receipts
+        // even while capture must wait for the in-flight coordinator action.
+        let check_interrupts = self.checks.interrupt_pending(&mut progress.checks);
+        let _guard = match self.coordinator_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                bail!("drain is waiting for the current coordinator operation")
+            }
+        };
+        // This mutex protects scheduling, not recoverable data. Exclusive drain
+        // may recover a poisoned guard; capture and positive process checks still
+        // have to succeed, and ordinary coordinator dispatch remains refused.
+        if progress.captured.is_none() {
+            progress.captured = Some(crate::recovery::capture_desired_running_before_drain(
+                &self.store,
+            )?);
+        }
+        let desired_running = progress.captured.clone().unwrap_or_default();
         let reconciled = self.supervisor.reconcile_inventory()?;
-        let desired_running = crate::recovery::capture_desired_running_before_drain(&self.store)?;
         #[cfg(test)]
         if TEST_INTERRUPT_DRAIN_AFTER_CAPTURE.with(|armed| armed.replace(false)) {
             bail!(
@@ -820,7 +956,19 @@ impl Application {
         let mut interrupted = Vec::new();
         let mut already_interrupt_requested = Vec::new();
         let mut unknown = Vec::new();
-        let (active, interrupted_checks, process_inventory) = match inventory {
+        let interrupted_checks = match check_interrupts {
+            Ok(ids) => ids,
+            Err(error) => {
+                unknown.push(
+                    serde_json::json!({"check_inventory":"unknown","error":format!("{error:#}")}),
+                );
+                Vec::new()
+            }
+        };
+        if progress.checks.pending() {
+            unknown.push(serde_json::json!({"check_interrupts":progress.checks.snapshot()}));
+        }
+        let (active, process_inventory) = match inventory {
             SessionInventory::Observed(active) => {
                 for session in &active {
                     match self.supervisor.interrupt_once(session) {
@@ -838,14 +986,9 @@ impl Application {
                         ),
                     }
                 }
-                let interrupted_checks = self.checks.interrupt_all()?;
-                (
-                    active,
-                    interrupted_checks,
-                    serde_json::json!({"state":"observed"}),
-                )
+                (active, serde_json::json!({"state":"observed"}))
             }
-            // No signal is sent without an exact current inventory, and the
+            // No session signal is sent without an exact current inventory; the
             // unknown entry keeps every caller from reading this as quiescent.
             SessionInventory::Unknown { attached, reason } => {
                 unknown.extend(
@@ -856,7 +999,6 @@ impl Application {
                 unknown.push(serde_json::json!({"process_inventory":"unknown","error":reason}));
                 (
                     attached,
-                    Vec::new(),
                     serde_json::json!({"state":"unknown","reason":reason}),
                 )
             }
@@ -7383,6 +7525,27 @@ impl Application {
         human: Option<&crate::store::SingleAgentResumeBinding<'_>>,
         verification: bool,
     ) -> Result<serde_json::Value> {
+        {
+            let connection = self.store.lock()?;
+            let review: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM single_agent_review_deliveries WHERE attempt_id=?1 AND state='ready')",
+                [attempt_id],
+                |row| row.get(0),
+            )?;
+            if review {
+                crate::review::require_single_agent_review_launch(
+                    &connection,
+                    attempt_id,
+                    "awaiting_review",
+                )?;
+                if !self.dispatch_enabled() {
+                    return Err(crate::review::SingleAgentReviewDeferred(
+                        "The service is draining; the independent review will wait".into(),
+                    )
+                    .into());
+                }
+            }
+        }
         self.store
             .require_execution_unheld("Single agent launches")?;
         if !self.dispatch_enabled() {
@@ -7392,6 +7555,8 @@ impl Application {
             let connection = self.store.lock()?;
             crate::store::require_failure_stop_released(&connection, attempt_id)?;
         }
+        crate::workflow::prepare_read_probe(&self.store, attempt_id)?;
+        self.reviews.prepare_research_baseline(attempt_id)?;
         let context = if verification {
             self.store
                 .single_agent_verification_context(attempt_id, resume.is_some())?
@@ -7407,7 +7572,16 @@ impl Application {
         } else {
             false
         };
-        let prompt = if verification {
+        let prompt = if context.review_delivery_id.is_some() {
+            format!(
+                "{}\n\nRead the authenticated context for delivery {} before reviewing.",
+                crate::workflow_resources::SINGLE_AGENT_REVIEWER_PROMPT,
+                context
+                    .review_delivery_id
+                    .as_deref()
+                    .context("Reviewer has no delivery")?
+            )
+        } else if verification {
             message
                 .ok_or_else(|| anyhow!("Main verification omitted its exact prompt"))?
                 .to_owned()
@@ -7424,7 +7598,7 @@ impl Application {
             (None, _) => {
                 let mut prompt = format!(
                     "{}\n\nRun binding: {}\nProfile revision: {}\nRead your full task context with the role context command before starting.",
-                    crate::workflow_resources::SINGLE_AGENT_PROMPT.trim(),
+                    crate::workflow_resources::single_agent_definition(context.preset).prompt.trim(),
                     context.attempt_id,
                     context.profile_revision_id
                 );
@@ -7440,6 +7614,7 @@ impl Application {
         let executable = self.executable.canonicalize()?;
         let mut prepared =
             providers::prepare_single_agent_launch(&providers::SingleAgentLaunchRequest {
+                purpose: context.purpose,
                 provider: context.provider,
                 model: &context.model,
                 effort: &context.effort,
@@ -7469,10 +7644,28 @@ impl Application {
                 .store
                 .reserve_single_agent_invocation(&context, &prepared)?,
         }
-        if self.checkout_scope(attempt_id)? != checkout_scope {
-            let error = anyhow!(
-                "The checkout protections changed after reservation; no process was started"
-            );
+        let checkout_check = (|| -> Result<()> {
+            if context.review_delivery_id.is_some() && !self.dispatch_enabled() {
+                return Err(crate::review::SingleAgentReviewDeferred(
+                    "The service is draining; the independent review will wait".into(),
+                )
+                .into());
+            }
+            if self.checkout_scope(attempt_id)? != checkout_scope {
+                bail!("The checkout protections changed after reservation; no process was started")
+            }
+            Ok(())
+        })();
+        if let Err(error) = checkout_check {
+            if context.review_delivery_id.is_some()
+                && self.store.defer_single_agent_review_before_spawn(
+                    &context.session_id,
+                    &context.transcript_epoch,
+                    !self.dispatch_enabled(),
+                )?
+            {
+                return Err(crate::review::SingleAgentReviewDeferred(error.to_string()).into());
+            }
             if resume.is_some() {
                 self.store.restore_resume_after_proven_nondelivery(
                     &context.session_id,
@@ -7485,11 +7678,19 @@ impl Application {
             return Err(error);
         }
         let process = if self.synthetic_dispatch_for_tests {
-            self.store.mark_session_spawning(
+            if let Err(error) = self.store.mark_session_spawning(
                 &context.session_id,
                 &context.transcript_epoch,
                 "synthetic-dispatch-no-process",
-            )?;
+            ) {
+                if context.review_delivery_id.is_some()
+                    && !error.is::<crate::review::SingleAgentReviewDeferred>()
+                {
+                    self.store
+                        .update_session_launch_failed(&context.session_id, &error.to_string())?;
+                }
+                return Err(error);
+            }
             ProcessIdentity {
                 pid: std::process::id(),
                 process_group_id: 0,
@@ -7505,6 +7706,24 @@ impl Application {
             ) {
                 Ok(process) => process,
                 Err(error) => {
+                    if context.review_delivery_id.is_some()
+                        && matches!(&error, SpawnFailure::ProvenNondelivery { owned_process_state, .. } if owned_process_state.is_quiescent())
+                    {
+                        // The supervisor preserves its nondelivery classification; the
+                        // exact receipt preserves the typed admission refusal it wraps.
+                        let deferred: bool = self.store.lock()?.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM audit_events WHERE event_code='single_agent_review.launch_deferred'
+                               AND entity_id=?1 AND json_extract(detail_json,'$.transcript_epoch')=?2)",
+                            rusqlite::params![context.session_id, context.transcript_epoch],
+                            |row| row.get(0),
+                        )?;
+                        if deferred {
+                            return Err(crate::review::SingleAgentReviewDeferred(
+                                error.to_string(),
+                            )
+                            .into());
+                        }
+                    }
                     self.record_spawn_failure(&context.session_id, &error, resume.is_some())?;
                     return Err(error.into());
                 }
@@ -8540,6 +8759,9 @@ mod drain_interruption_tests {
             .unwrap();
         assert_eq!(interrupt_events, 0);
         drop(connection);
+        let _ = app.begin_drain();
+        assert_eq!(app.store.lock().unwrap().query_row("SELECT COUNT(*) FROM audit_events WHERE event_code='restart.desired_running.captured'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        crate::checks::assert_partial_drain_interrupt_progress();
         drop(app);
 
         let reopened = Store::open_current_writable(&paths.database).unwrap();
@@ -8571,6 +8793,60 @@ mod drain_interruption_tests {
         ).unwrap();
         assert_eq!(quiescent, 0);
         drop(reopened);
+        let check_root = root.join("held-check");
+        let (store, checks) = crate::checks::seeded_drain_service(&check_root, "held-check");
+        let paths = InstancePaths::resolve(Some(check_root.clone())).unwrap();
+        paths.create().unwrap();
+        let mut held = Application::new(paths, store, std::env::current_exe().unwrap()).unwrap();
+        held.checks = checks.clone();
+        let coordinator = held.coordinator_lock.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _guard = coordinator.lock().unwrap();
+            let result = crate::checks::run_interruptible_drain_check(checks, check_root, ready_tx);
+            done_tx.send(result).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(held.checks.active_status().unwrap().len(), 1);
+        let waiting = held.begin_drain().unwrap_err();
+        assert!(waiting
+            .to_string()
+            .contains("waiting for the current coordinator operation"));
+        assert!(!held.dispatch_enabled());
+        assert!(held.drain_progress.lock().unwrap().captured.is_none());
+        let receipts = held.drain_progress.lock().unwrap().checks.snapshot();
+        assert!(receipts.iter().any(|value| {
+            value["check_id"] == "held-check" && value["outcome"]["state"] == "issued"
+        }));
+        let completed = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(completed["timed_out"], false);
+        assert_eq!(completed["recovery_required"], false);
+        assert!(completed["exit_code"].is_null());
+        held.begin_drain().unwrap();
+        assert_eq!(held.drain_status().unwrap()["quiescent"], true);
+        let poisoned = held.coordinator_lock.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("injected coordinator poison after owned check exit");
+        })
+        .join()
+        .is_err());
+        assert!(held.coordinator_tick().is_err());
+        held.begin_drain().unwrap();
+        assert_eq!(held.store.lock().unwrap().query_row("SELECT COUNT(*) FROM audit_events WHERE event_code='restart.desired_running.captured'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        drop(held);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -15,7 +15,7 @@ A **workflow** is the sequence of steps a task follows.
 
 Both workflows are implemented. Single-agent execution has native verification records for Codex and Claude. Complete TRIP tasks have also reached acceptance using only Codex and only Claude. Your own project profiles still need their setup checks before they can run.
 
-Custom workflow editing and separate **Build and review** or **Research** presets are not available yet. Recipes and schedules currently use TRIP.
+Recipes and draft-only schedules support TRIP and Single agent selections. **Repository research** and **Build and review** execution require separately qualified native policies, which remain unavailable pending qualification. Custom workflow editing is not available.
 
 ## Start LLMRelay
 
@@ -34,6 +34,12 @@ Replace `/path/to` with the folder where you extracted the package. If you built
 ```
 
 Keep the terminal open. The app chooses a free local port and opens your browser with a signed-in dashboard. It does not install a background login service.
+
+For optional background use, the package also includes `LLMRelay.app`, a menu bar
+companion. Opening it leaves the service stopped until you explicitly choose
+**Install dormant service** and **Start service**. Login startup and notifications
+are separate choices. See [background service and menu bar](docs/OPERATIONS.md#background-service-and-menu-bar)
+for instance selection, durable Stop and cmux pairing.
 
 For live agent output that opens directly from the dashboard, start the app inside **cmux**, the terminal application used for those views. Another terminal can host the app too, with [manual terminal attachment](docs/OPERATIONS.md#attach-from-a-terminal).
 
@@ -110,12 +116,18 @@ Open **Workspace**. **Needs your attention** and **Approvals** show questions, p
 | **Changes** | Inspect the proposed code changes and integration status. |
 | **Checks** | Review test commands, authorize them and inspect results. |
 | **Roles** | See agent settings and the task's workflow choice. |
-| **Activity** | Follow sessions and open agent output. |
+| **Activity** | Follow sessions, read task history, and add human notes. |
 | **View output** | Watch a live agent without taking keyboard control. |
 | **Take control** / **Release control** | Answer a terminal prompt, then let automation continue. |
 | **View recorded output** | Read, search or download saved output from an ended session. |
 
+Use **Edit** or **Cancel** for eligible queued Manager guidance, and **Add comment** for a note that stays with the task without instructing an agent. See [task controls and activity](docs/WORKFLOWS.md#dashboard-workspace). The approval scope dialog can also [preview a sample command’s coverage](docs/SECURITY.md#action-permissions) before you decide.
+
+In **History**, use **Search** to find saved text across archived tasks and earlier attempts, then open the exact historical source. **Observed usage** compares partial Codex observations by project, workflow or role, with optional session-start dates. See [history search](docs/OPERATIONS.md#history-search) and [usage comparisons](docs/OPERATIONS.md#codex-observed-usage) for coverage and limits.
+
 Closing an output view does not stop the agent. Releasing keyboard control does not restart or resume a task.
+
+Single agent recipes can pin the ordinary writer, **Repository research** or **Build and review** preset. The new presets require separate qualified reader/reviewer policies; setup explains any unavailable policy. See [preset behavior and review limits](docs/WORKFLOWS.md#research-and-independent-review-presets).
 
 For Single agent, use **Resume agent** when offered to send an answer and continue its conversation. **Request changes** starts a linked new run with your feedback and preserves the previous result.
 

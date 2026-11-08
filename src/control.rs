@@ -51,9 +51,17 @@ where
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlRequest {
     Status,
+    AttentionSnapshot,
+    OpenDashboard {
+        activation: Option<crate::domain::DesktopActivation>,
+    },
+    PairCmux,
     RestartPreview,
     Stop {
         drain: bool,
+    },
+    StopInstalled {
+        binding: crate::service::InstalledStopBinding,
     },
     CapabilityLaunch {
         request: ValidationLaunchRequest,
@@ -497,6 +505,7 @@ struct ConnectionAttachment {
 }
 
 struct ConnectionState {
+    admission: Option<PeerAdmissionProof>,
     peer_identity: PeerProcessIdentity,
     attachment: Option<ConnectionAttachment>,
 }
@@ -520,6 +529,20 @@ fn release_attachment_lease(app: &Application, binding: &AttachmentBinding, leas
 }
 
 impl ConnectionState {
+    fn native_peer(&mut self, app: &Application) -> Result<()> {
+        let proof = self
+            .admission
+            .as_mut()
+            .context("Native requests require the retained macOS audit-token admission proof")?;
+        proof.revalidate_after_inventory()?;
+        admit_human_control(
+            proof.identity.clone(),
+            |peer| app.supervisor.peer_is_managed_or_descendant(peer),
+            || proof.revalidate_after_inventory(),
+            |_| Ok(()),
+        )
+    }
+
     fn attachment(&self) -> Result<&ConnectionAttachment> {
         self.attachment
             .as_ref()
@@ -824,19 +847,23 @@ async fn handle(
     shutdown: watch::Sender<bool>,
     instance: serde_json::Value,
 ) -> Result<()> {
-    // The audit-token proof is retained through the supervisor's one
-    // admission-time inventory, then revalidated before this socket is read.
-    let mut peer_admission = peer_admission(&stream)?;
-    let (mut reader, mut writer, peer_identity) = admit_human_control(
-        peer_admission.identity.clone(),
-        |peer| app.supervisor.peer_is_managed_or_descendant(peer),
-        || peer_admission.revalidate_after_inventory(),
-        |peer_identity| {
-            let (reader, writer) = stream.into_split();
-            Ok((BufReader::new(reader), writer, peer_identity))
-        },
-    )?;
+    let admission_app = app.clone();
+    let (stream, peer_admission, peer_identity) =
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let mut proof = peer_admission(&stream)?;
+            let identity = admit_human_control(
+                proof.identity.clone(),
+                |peer| admission_app.supervisor.peer_is_managed_or_descendant(peer),
+                || proof.revalidate_after_inventory(),
+                |peer| Ok(peer),
+            )?;
+            Ok((stream, proof, identity))
+        })
+        .await??;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
     let connection = ConnectionState {
+        admission: Some(peer_admission),
         peer_identity,
         attachment: None,
     };
@@ -906,14 +933,15 @@ async fn serve_connection(
                 return Err(protocol::ProtocolError::new("wrong_client_kind", Some(hello.declaration.generation)));
             }
             protocol::validate(&hello.declaration, hello.declaration.client_kind)?;
-            Ok(hello.declaration.client_kind)
+            Ok(hello.declaration)
         });
         let _negotiated = match negotiation {
-            Ok(kind) => {
+            Ok(declaration) => {
+                let kind = declaration.client_kind;
                 let instance_id = instance.get("instance_id").and_then(serde_json::Value::as_str).unwrap_or_default();
                 let response = serde_json::json!({"ok":true,"descriptor":protocol::Descriptor::new(instance_id.to_owned(), kind)});
                 write_protocol_response(writer, &response).await?;
-                (protocol::GENERATION, kind)
+                declaration
             }
             Err(error) => {
                 let response = serde_json::json!({"ok":false,"error":error.guidance,"protocol_error":error});
@@ -939,16 +967,23 @@ async fn serve_connection(
                     break;
                 }
             };
+            if matches!(&request, ControlRequest::AttentionSnapshot | ControlRequest::OpenDashboard { .. } | ControlRequest::PairCmux | ControlRequest::StopInstalled { .. })
+                && (_negotiated.client_kind != ClientKind::HumanCli || !_negotiated.required_features.iter().any(|feature| feature == protocol::NATIVE_COMPANION_FEATURE)) {
+                write_control_response(writer, &ControlResponse::failure(anyhow!("This request requires native_companion_v1 negotiation"))).await?;
+                continue;
+            }
             let response = if blocking_control_request(&request) {
                 let permit = Arc::clone(&app.blocking_operations).acquire_owned().await;
                 let blocking_app = app.clone();
                 let blocking_shutdown = shutdown.clone();
                 let blocking_instance = instance.clone();
                 let peer_identity = connection.peer_identity.clone();
+                let admission = connection.admission.clone();
                 match permit {
                     Ok(permit) => match tokio::task::spawn_blocking(move || {
                         let _permit = permit;
                         let mut stateless_connection = ConnectionState {
+                            admission,
                             peer_identity,
                             attachment: None,
                         };
@@ -1033,7 +1068,7 @@ fn set_close_on_exec(fd: RawFd) -> Result<()> {
 fn dispatch(
     request: ControlRequest,
     app: &Application,
-    shutdown: &watch::Sender<bool>,
+    _shutdown: &watch::Sender<bool>,
     instance: &serde_json::Value,
     connection: &mut ConnectionState,
 ) -> Result<ControlResponse> {
@@ -1044,33 +1079,71 @@ fn dispatch(
             status["coordinator"] = app.drain_status()?;
             ControlResponse::success(status)
         }
+        ControlRequest::AttentionSnapshot => {
+            connection.native_peer(app)?;
+            let snapshot = app.desktop_snapshot();
+            connection.native_peer(app)?;
+            ControlResponse::success(snapshot?)
+        }
+        ControlRequest::PairCmux => {
+            connection.native_peer(app)?;
+            let proof = crate::supervisor::PairedCmuxProof::capture(
+                &connection.peer_identity,
+                app.service_boot_id(),
+            )?;
+            connection.native_peer(app)?;
+            ControlResponse::success(app.pair_cmux(proof)?)
+        }
+        ControlRequest::OpenDashboard { activation } => {
+            connection.native_peer(app)?;
+            let resolved = activation
+                .as_ref()
+                .map(|value| app.desktop_target(value))
+                .transpose()?;
+            let clean = instance["address"]
+                .as_str()
+                .context("Current dashboard address is unavailable")?;
+            let token = app.bootstrap.issue()?;
+            connection.native_peer(app)?;
+            let mut url = format!("{clean}/#bootstrap={token}");
+            if let Some(activation) = activation.filter(|_| {
+                matches!(
+                    &resolved,
+                    Some(crate::domain::DesktopTarget::Current { .. })
+                )
+            }) {
+                use base64::Engine;
+                url.push_str("&activation=");
+                url.push_str(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(serde_json::to_vec(&activation)?),
+                );
+            } else if resolved.is_some() {
+                url.push_str("&desktop_stale=1");
+            }
+            crate::server::open_browser_blocking(&url).context(
+                "The browser could not be opened; use Open dashboard again for a fresh login",
+            )?;
+            ControlResponse::success(
+                serde_json::json!({"instance_key":app.paths.root_key(),"opened":true,"url":clean,
+                "message":if matches!(&resolved, Some(crate::domain::DesktopTarget::Stale { .. })) { "That attention episode changed. Opened the dashboard without selecting a replacement." } else { "Opened the dashboard." }}),
+            )
+        }
         ControlRequest::RestartPreview => ControlResponse::success(app.restart_preview()?),
+        ControlRequest::StopInstalled { binding } => {
+            connection.native_peer(app)?;
+            let stopped = crate::service::request_bound_drain(app, &binding)?;
+            let drain = app.begin_drain().unwrap_or_else(
+                |error| serde_json::json!({"draining":true,"pending":format!("{error:#}")}),
+            );
+            ControlResponse::success(serde_json::json!({"binding":stopped,"drain":drain}))
+        }
         ControlRequest::Stop { drain } => {
+            crate::service::clear_desired_running(&app.paths)?;
             if drain {
-                let status = app.begin_drain()?;
-                let quiescent = status
-                    .get("active")
-                    .and_then(|value| value.as_array())
-                    .is_some_and(Vec::is_empty)
-                    && status
-                        .get("active_checks")
-                        .and_then(|value| value.as_array())
-                        .is_some_and(Vec::is_empty)
-                    && status
-                        .get("unknown")
-                        .and_then(|value| value.as_array())
-                        .is_some_and(Vec::is_empty)
-                    && status["process_inventory"]["state"] == "observed";
-                if quiescent {
-                    signal_shutdown(shutdown)?;
-                }
-                return ControlResponse::success(status);
+                return ControlResponse::success(app.begin_drain()?);
             }
-            let status = app.drain_status()?;
-            if status.get("quiescent") != Some(&serde_json::Value::Bool(true)) {
-                bail!("service still owns active sessions or checks {}; use stop --drain to interrupt and visibly reconcile them", status)
-            }
-            signal_shutdown(shutdown)?;
+            app.request_idle_shutdown()?;
             ControlResponse::success(
                 serde_json::json!({"shutdown_requested": true, "drain": false, "active_dispatch": "quiescent"}),
             )
@@ -1752,8 +1825,12 @@ fn blocking_control_request(request: &ControlRequest) -> bool {
         | ControlRequest::AttachmentResize { .. }
         | ControlRequest::AttachmentDetach => false,
         ControlRequest::Status
+        | ControlRequest::AttentionSnapshot
+        | ControlRequest::OpenDashboard { .. }
+        | ControlRequest::PairCmux
         | ControlRequest::RestartPreview
         | ControlRequest::Stop { .. }
+        | ControlRequest::StopInstalled { .. }
         | ControlRequest::CapabilityLaunch { .. }
         | ControlRequest::CapabilityWorkflowLaunch { .. }
         | ControlRequest::CapabilityList
@@ -1798,7 +1875,7 @@ fn blocking_control_request(request: &ControlRequest) -> bool {
     }
 }
 
-fn signal_shutdown(shutdown: &watch::Sender<bool>) -> Result<()> {
+pub(crate) fn signal_shutdown(shutdown: &watch::Sender<bool>) -> Result<()> {
     match shutdown.send(true) {
         Ok(()) => Ok(()),
         Err(_) if *shutdown.borrow() => Ok(()),
@@ -1875,6 +1952,7 @@ struct AuditToken {
     values: [u32; 8],
 }
 
+#[derive(Clone)]
 struct PeerAdmissionProof {
     identity: PeerProcessIdentity,
     #[cfg(target_os = "macos")]
@@ -1900,6 +1978,7 @@ impl PeerAdmissionProof {
 extern "C" {
     fn audit_token_to_pid(token: AuditToken) -> libc::pid_t;
     fn audit_token_to_pidversion(token: AuditToken) -> libc::c_int;
+    fn audit_token_to_euid(token: AuditToken) -> libc::uid_t;
 }
 
 #[cfg(target_os = "macos")]
@@ -1933,6 +2012,9 @@ fn peer_admission(stream: &UnixStream) -> Result<PeerAdmissionProof> {
     }
     let pid = unsafe { audit_token_to_pid(token) };
     let pid_version = unsafe { audit_token_to_pidversion(token) };
+    if unsafe { audit_token_to_euid(token) } != unsafe { libc::geteuid() } {
+        bail!("human control requires a kernel-authenticated same-user peer")
+    }
     if pid <= 0 || pid_version <= 0 {
         bail!("control peer audit token has no usable PID/version identity")
     }
@@ -2068,6 +2150,7 @@ mod tests {
         std::fs::write(&outside, sentinel).unwrap();
         let (shutdown, _) = watch::channel(false);
         let mut connection = ConnectionState {
+            admission: None,
             peer_identity: PeerProcessIdentity::new(1, "control-transcript-test".into()).unwrap(),
             attachment: None,
         };
@@ -2264,6 +2347,7 @@ mod tests {
         lease: String,
     ) -> ConnectionState {
         ConnectionState {
+            admission: None,
             peer_identity: PeerProcessIdentity::new(1, "persistent-control-peer".into()).unwrap(),
             attachment: Some(ConnectionAttachment {
                 binding,
@@ -2813,6 +2897,7 @@ mod tests {
                     &mut BufReader::new(server_reader), &mut server_writer,
                     app, shutdown, serde_json::json!({"instance_id":"fixture"}),
                     ConnectionState {
+                        admission: None,
                         peer_identity: PeerProcessIdentity::new(1, "fixture".into()).unwrap(),
                         attachment: None,
                     },
@@ -2842,6 +2927,7 @@ mod tests {
                 shutdown,
                 serde_json::json!({"instance_id":"fixture"}),
                 ConnectionState {
+                    admission: None,
                     peer_identity: PeerProcessIdentity::new(1, "fixture".into()).unwrap(),
                     attachment: None,
                 },
@@ -2977,6 +3063,7 @@ mod tests {
                 shutdown,
                 serde_json::json!({}),
                 ConnectionState {
+                    admission: None,
                     peer_identity: PeerProcessIdentity::new(1, "g14-peer".into()).unwrap(),
                     attachment: Some(ConnectionAttachment {
                         binding: server_binding,
@@ -3056,6 +3143,37 @@ mod tests {
         drop(client_writer);
         drop(app);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn desktop_pairing_revalidates_queued_peer_and_exact_cmux_generation() {
+        let peer = PeerProcessIdentity::new(4242, "Thu Sep 18 12:00:00 2026".into()).unwrap();
+        let current = Cell::new(true);
+        let captures = Cell::new(0);
+        let capture = || {
+            admit_human_control(
+                peer.clone(),
+                |_| Ok(false),
+                || {
+                    if current.get() {
+                        Ok(())
+                    } else {
+                        Err(anyhow!("retained audit token is stale"))
+                    }
+                },
+                |_| {
+                    captures.set(captures.get() + 1);
+                    Ok(())
+                },
+            )
+        };
+        capture().unwrap();
+        current.set(false); // Same PID and coarse start after queued dispatch.
+        assert!(format!("{:#}", capture().unwrap_err()).contains("audit token is stale"));
+        assert_eq!(captures.get(), 1);
+        current.set(true);
+        assert!(admit_human_control(peer, |_| Ok(true), || Ok(()), |_| Ok(())).is_err());
+        crate::supervisor::assert_paired_cmux_generation_contract();
     }
 
     #[test]

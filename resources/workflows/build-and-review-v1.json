@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "family": "single_agent",
+  "id": "llmrelay-build-and-review-v1",
+  "version": "build-and-review-v1",
+  "description": "Build in an isolated workspace, run selected checks, and independently review the exact frozen result before human acceptance.",
+  "evaluator": {"id": "llmrelay-single-agent-evaluator", "revision": 1},
+  "steps": ["agent_execution", "structured_result", "selected_checks", "fresh_review", "human_decision"],
+  "slots": [
+    {"key": "single_agent", "policy_mode": "single_agent_writer", "authority": "workspace_write", "session_contract": "retained", "count": 1},
+    {"key": "single_agent_reviewer", "policy_mode": "single_agent_reviewer", "authority": "read_only", "session_contract": "fresh", "count": 1}
+  ],
+  "result": {"schema_revision": 1, "completing_outcome": "result_ready", "non_completing_outcomes": ["blocked", "needs_input"], "evidence_kinds": ["source", "check", "manual", "not_run"]},
+  "review": {"schema_revision": 1, "verdicts": ["approved", "changes_requested", "needs_rework"], "max_deliveries_per_task": 2, "max_repairs_per_task": 1},
+  "workspace_mode": "isolated_worktree",
+  "check_requirement": "selected",
+  "human_acceptance": "required"
+}

@@ -56,7 +56,6 @@ struct WebState {
     boot_id: String,
     allowed_hosts: Vec<String>,
     session_cookie: String,
-    bootstrap_hash: Arc<Mutex<Option<String>>>,
     browser_sessions: Arc<Mutex<HashSet<String>>>,
     shutdown: watch::Receiver<bool>,
     state_waiters: Arc<Semaphore>,
@@ -170,7 +169,7 @@ fn canonical_decimal(value: &str) -> Option<u64> {
     canonical.then(|| value.parse().ok()).flatten()
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InstanceRecord {
     pub instance_id: String,
     pub boot_id: String,
@@ -377,7 +376,11 @@ enum WebOperation {
 impl WebOperation {
     fn required_feature(&self) -> Option<&'static str> {
         match self {
-            Self::Workflow { .. } => Some(protocol::MULTI_WORKFLOW_FEATURE),
+            Self::Workflow { command } => Some(if command.uses_single_agent_presets() {
+                protocol::SINGLE_AGENT_PRESETS_FEATURE
+            } else {
+                protocol::MULTI_WORKFLOW_FEATURE
+            }),
             Self::HistoryPage { .. }
             | Self::HistoryExportText { .. }
             | Self::HistoryPaneOpen { .. }
@@ -583,9 +586,38 @@ pub(crate) async fn serve(
     open_browser: bool,
     backup_options: BackupOptions,
 ) -> Result<()> {
+    let owned = paths.clone();
+    let (lock, backup_options) = tokio::task::spawn_blocking(move || -> Result<_> {
+        backup_options.resolve(&owned)?;
+        owned.create()?;
+        Ok((Arc::new(InstanceLock::acquire(&owned)?), backup_options))
+    })
+    .await??;
+    serve_locked(
+        paths,
+        requested_port,
+        open_browser,
+        backup_options,
+        lock,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn serve_locked(
+    paths: InstancePaths,
+    requested_port: u16,
+    open_browser: bool,
+    backup_options: BackupOptions,
+    lock: Arc<InstanceLock>,
+    background: bool,
+) -> Result<()> {
+    let startup_paths = paths.clone();
+    let startup_lock = lock.clone();
+    let (app, backup_configuration) = tokio::task::spawn_blocking(move || -> Result<_> {
+    let paths = startup_paths;
+    let lock = startup_lock;
     let backup_configuration = backup_options.resolve(&paths)?;
-    paths.create()?;
-    let lock = Arc::new(InstanceLock::acquire(&paths)?);
     crate::database::recover_interrupted_restore_locked(&paths)?;
     crate::database::validate_live_database_family(&paths)?;
     let store = crate::database::open_service_locked(&paths, &lock)?;
@@ -647,6 +679,8 @@ pub(crate) async fn serve(
         None,
         serde_json::json!({"enabled":backup_configuration.is_some(),"interval_hours":backup_options.every_hours,"destination":backup_configuration.as_ref().map(|(_, path)|path)}),
     );
+    Ok((app, backup_configuration))
+    }).await??;
     let listener = TcpListener::bind(SocketAddr::new(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         requested_port,
@@ -654,11 +688,21 @@ pub(crate) async fn serve(
     .await
     .with_context(|| format!("bind loopback port {requested_port}"))?;
     let bound = listener.local_addr()?;
-    let control_listener = control::bind(&app)?;
-    let role_listener = crate::task_cli::bind(&app)?;
+    let endpoint_app = app.clone();
+    let (control_listener, role_listener) = tokio::task::spawn_blocking(move || -> Result<_> {
+        Ok((
+            control::bind(&endpoint_app)?,
+            crate::task_cli::bind(&endpoint_app)?,
+        ))
+    })
+    .await??;
     let instance_id = uuid::Uuid::new_v4().to_string();
     let boot_id = app.service_boot_id().to_owned();
-    let bootstrap = auth::issue_secret();
+    let bootstrap = if background {
+        None
+    } else {
+        Some(app.bootstrap.issue()?)
+    };
     let record = InstanceRecord {
         instance_id: instance_id.clone(),
         boot_id: boot_id.clone(),
@@ -670,8 +714,18 @@ pub(crate) async fn serve(
         started_at: chrono::Utc::now().to_rfc3339(),
         status: "running".to_owned(),
     };
-    atomic_write(&paths.instance_file, &serde_json::to_vec_pretty(&record)?)?;
-    append_startup_event(&paths, &record)?;
+    let startup_paths = paths.clone();
+    let startup_record = record.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        atomic_write(
+            &startup_paths.instance_file,
+            &serde_json::to_vec_pretty(&startup_record)?,
+        )?;
+        append_startup_event(&startup_paths, &startup_record)
+    })
+    .await??;
+    let interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     println!("LLMRelay {}", crate::VERSION);
     println!("Instance: {} (boot {})", record.instance_id, record.boot_id);
@@ -680,7 +734,7 @@ pub(crate) async fn serve(
     println!("Role socket: {}", paths.role_socket.display());
 
     let clean_dashboard_url = record.address.clone();
-    let bootstrap_url = format!("{}/#bootstrap={}", record.address, bootstrap);
+    let bootstrap_url = bootstrap.map(|token| format!("{}/#bootstrap={}", record.address, token));
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let web_state = WebState {
@@ -692,7 +746,6 @@ pub(crate) async fn serve(
             format!("localhost:{}", bound.port()),
         ],
         session_cookie: browser_session_cookie_name(&paths.root),
-        bootstrap_hash: Arc::new(Mutex::new(Some(crate::auth::hash_secret(&bootstrap)))),
         browser_sessions: Arc::new(Mutex::new(HashSet::new())),
         shutdown: shutdown_rx.clone(),
         state_waiters: Arc::new(Semaphore::new(MAX_STATE_WAITERS)),
@@ -730,8 +783,8 @@ pub(crate) async fn serve(
         }
     });
     let coordinator_app = app.clone();
-    let coordinator_shutdown = shutdown_tx.clone();
-    let coordinator_failure = failure_tx.clone();
+    let drain_observation = Arc::new(tokio::sync::Notify::new());
+    let coordinator_drain_observation = drain_observation.clone();
     let mut reconcile_shutdown = shutdown_rx.clone();
     let coordinator_lock = Arc::clone(&lock);
     let backup_cancelled = Arc::new(AtomicBool::new(false));
@@ -761,57 +814,57 @@ pub(crate) async fn serve(
                     if let Some(backup) = &mut scheduled_backup {
                         backup.tick(&coordinator_app, &coordinator_lock, Instant::now()).await;
                     }
-                    let tick_app=coordinator_app.clone();
-                    match tokio::task::spawn_blocking(move||{
+                    let tick_app = coordinator_app.clone();
+                    let result = tokio::task::spawn_blocking(move || {
                         if let Err(error) = tick_app.checks.reap_pending_children() {
                             tracing::warn!(error=%error, "retained check cleanup deferred");
                         }
                         let coordinator = tick_app.coordinator_tick();
                         let intake = tick_app.scheduled_intake_tick(chrono::Utc::now(), service_started_at);
-                        (coordinator, intake)
-                    }).await {
-                        Ok((coordinator, intake))=>{
-                            if let Err(error) = intake {
-                                if !intake_error_reported {
-                                    tracing::warn!(error=%error,"scheduled intake deferred");
-                                    let _=coordinator_app.diagnostics.record("warn","recipe.intake","recipe_schedule","deferred",None,serde_json::json!({"cause":format!("{error:#}")}));
-                                    intake_error_reported = true;
+                        if let Err(error) = intake {
+                            if !intake_error_reported {
+                                tracing::warn!(error=%error, "scheduled intake deferred");
+                                let _ = tick_app.diagnostics.record("warn", "recipe.intake", "recipe_schedule", "deferred", None, serde_json::json!({"cause":format!("{error:#}")}));
+                            }
+                            intake_error_reported = true;
+                        } else { intake_error_reported = false; }
+                        match coordinator {
+                            Ok(result) => {
+                                if tick_deferral_open {
+                                    match crate::coordinator::record_tick_recovered(&tick_app.store) {
+                                        Ok(_) => tick_deferral_open = false,
+                                        Err(error) => tracing::warn!(error=%error, "coordinator recovery record deferred"),
+                                    }
                                 }
-                            } else {
-                                intake_error_reported = false;
-                            }
-                            match coordinator {
-                        Ok(result)=>{
-                            if tick_deferral_open {
-                                match crate::coordinator::record_tick_recovered(&coordinator_app.store){
-                                    Ok(_)=>tick_deferral_open=false,
-                                    Err(error)=>tracing::warn!(error=%error,"coordinator recovery record deferred"),
+                                if result.get("action").and_then(serde_json::Value::as_str) != Some("idle") {
+                                    let _ = tick_app.diagnostics.record("info", "coordinator.tick", "coordinator", "success", None, result);
                                 }
                             }
-                            if result.get("action").and_then(|value|value.as_str())!=Some("idle"){
-                                let _=coordinator_app.diagnostics.record("info","coordinator.tick","coordinator","success",None,result);
-                            }
-                            match coordinator_app.drain_status(){
-                                Ok(status) if status.get("draining")==Some(&serde_json::Value::Bool(true))&&status.get("quiescent")==Some(&serde_json::Value::Bool(true))=>{let _=coordinator_shutdown.send(true);break},
-                                Ok(_)=>{},
-                                Err(error)=>tracing::warn!(error=%error,"drain reconciliation failed"),
-                            }
-                        }
-                        Err(error)=>{
-                            let cause=format!("{error:#}");
-                            tick_deferral_open=true;
-                            // Diagnostics and the durable record are written once per
-                            // distinct cause, not on every retry.
-                            let subject=error.downcast_ref::<crate::coordinator::TickSubject>().map(|subject|subject.attempt_id.clone());
-                            match crate::coordinator::record_tick_deferred(&coordinator_app.store,&cause,subject.as_deref()){
-                                Ok(false)=>{},
-                                Ok(true)=>{tracing::warn!(error=%error,"coordinator action deferred");let _=coordinator_app.diagnostics.record("warn","coordinator.tick","coordinator","deferred",None,serde_json::json!({"cause":cause}));}
-                                Err(record_error)=>{tracing::warn!(error=%error,record_error=%record_error,"coordinator action deferred");let _=coordinator_app.diagnostics.record("warn","coordinator.tick","coordinator","deferred",None,serde_json::json!({"cause":cause}));}
+                            Err(error) => {
+                                let cause = format!("{error:#}");
+                                tick_deferral_open = true;
+                                let subject = error.downcast_ref::<crate::coordinator::TickSubject>().map(|subject| subject.attempt_id.clone());
+                                match crate::coordinator::record_tick_deferred(&tick_app.store, &cause, subject.as_deref()) {
+                                    Ok(false) => {},
+                                    Ok(true) | Err(_) => {
+                                        tracing::warn!(error=%error, "coordinator action deferred");
+                                        let _ = tick_app.diagnostics.record("warn", "coordinator.tick", "coordinator", "deferred", None, serde_json::json!({"cause":cause}));
+                                    }
+                                }
                             }
                         }
-                            }
+                        (intake_error_reported, tick_deferral_open)
+                    }).await;
+                    match result {
+                        Ok((intake_error, tick_deferral)) => {
+                            intake_error_reported = intake_error;
+                            tick_deferral_open = tick_deferral;
+                            coordinator_drain_observation.notify_one();
                         }
-                        Err(error)=>{let _=coordinator_failure.send(Some(format!("coordinator task failed: {error}")));let _=coordinator_shutdown.send(true);break}
+                        Err(error) => {
+                            tracing::error!(error=%error, "coordinator worker failed; retaining ownership while drain reconciles");
+                            coordinator_app.request_drain();
+                        }
                     }
                 }
                 changed = reconcile_shutdown.changed() => { if changed.is_err() || *reconcile_shutdown.borrow() { break } }
@@ -823,7 +876,7 @@ pub(crate) async fn serve(
         }
     });
     let mut opener_shutdown = shutdown_rx.clone();
-    let opener_task = if open_browser {
+    let opener_task = if let Some(bootstrap_url) = bootstrap_url.filter(|_| open_browser) {
         Some(tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
@@ -845,26 +898,32 @@ pub(crate) async fn serve(
             }
         }))
     } else {
-        println!("Automatic browser opening disabled by --no-open.");
-        println!("Manual dashboard login: {bootstrap_url}");
+        if !background {
+            let token = app.bootstrap.issue()?;
+            println!("Automatic browser opening disabled by --no-open.");
+            println!(
+                "Manual dashboard login: {}/#bootstrap={token}",
+                record.address
+            );
+        } else {
+            println!(
+                "Dashboard: {} (use Open dashboard to authenticate)",
+                record.address
+            );
+        }
         None
     };
     let signal_shutdown = shutdown_tx.clone();
     let signal_app = app.clone();
-    tokio::spawn(async move {
-        loop {
-            if tokio::signal::ctrl_c().await.is_err() {
-                break;
-            }
-            match signal_app.begin_drain() {
-                Ok(status) if status.get("active").and_then(|value|value.as_array()).is_some_and(Vec::is_empty)
-                    && status.get("active_checks").and_then(|value|value.as_array()).is_some_and(Vec::is_empty)
-                    && status.get("unknown").and_then(|value|value.as_array()).is_some_and(Vec::is_empty)
-                    && status["process_inventory"]["state"]=="observed"=>{let _=signal_shutdown.send(true);break}
-                Ok(status)=>eprintln!("LLMRelay is draining managed work before shutdown: {status}"),
-                Err(error)=>eprintln!("LLMRelay kept running because process ownership could not be reconciled: {error:#}"),
-            }
-        }
+    let shutdown_owner = tokio::spawn(async move {
+        shutdown_owner(
+            signal_app,
+            signal_shutdown,
+            interrupt,
+            terminate,
+            drain_observation,
+        )
+        .await
     });
     let server_result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -883,6 +942,11 @@ pub(crate) async fn serve(
 
     backup_cancelled.store(true, AtomicOrdering::SeqCst);
     let _ = shutdown_tx.send(true);
+    let shutdown_error = match shutdown_owner.await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(format!("shutdown owner failed: {error:#}")),
+        Err(error) => Some(format!("shutdown owner task failed: {error}")),
+    };
     let coordinator_error = coordinator_task
         .await
         .err()
@@ -899,6 +963,7 @@ pub(crate) async fn serve(
     let listener_failure = failure_tx
         .borrow()
         .clone()
+        .or(shutdown_error)
         .or(coordinator_error)
         .or(control_error);
     let final_record = InstanceRecord {
@@ -909,10 +974,11 @@ pub(crate) async fn serve(
         },
         ..record
     };
-    atomic_write(
-        &paths.instance_file,
-        &serde_json::to_vec_pretty(&final_record)?,
-    )?;
+    let final_path = paths.instance_file.clone();
+    tokio::task::spawn_blocking(move || {
+        atomic_write(&final_path, &serde_json::to_vec_pretty(&final_record)?)
+    })
+    .await??;
     drop(lock);
     server_result.context("dashboard listener failed")?;
     if let Some(error) = listener_failure {
@@ -922,10 +988,103 @@ pub(crate) async fn serve(
     }
 }
 
+async fn shutdown_owner(
+    app: Application,
+    shutdown: watch::Sender<bool>,
+    mut interrupt: tokio::signal::unix::Signal,
+    mut terminate: tokio::signal::unix::Signal,
+    observation: Arc<tokio::sync::Notify>,
+) -> Result<()> {
+    let mut stopped = shutdown.subscribe();
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = interrupt.recv() => app.request_drain(),
+            _ = terminate.recv() => app.request_drain(),
+            _ = interval.tick() => {},
+            _ = observation.notified() => {},
+            _ = stopped.wait_for(|value| *value) => return Ok(()),
+        }
+        if !app.is_draining() {
+            continue;
+        }
+        let drain_app = app.clone();
+        let status = tokio::task::spawn_blocking(move || {
+            let initiation = drain_app.begin_drain();
+            // Observation is independent of a held/failed ordinary tick and of
+            // failed initiation. Unknown ownership can never become a timeout.
+            let status = drain_app.drain_status();
+            (initiation, status)
+        })
+        .await;
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::error!(error=%error, "shutdown observation failed; retaining instance ownership for retry");
+                continue;
+            }
+        };
+        if status.0.is_ok()
+            && status
+                .1
+                .as_ref()
+                .is_ok_and(|value| value["quiescent"] == true)
+        {
+            control::signal_shutdown(&shutdown)?;
+            return Ok(());
+        }
+    }
+}
+
+async fn api_desktop_target(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(activation): Query<crate::domain::DesktopActivation>,
+) -> Response {
+    if let Err(response) = require_browser(&state, &headers) {
+        return response;
+    }
+    if !declared_features(&headers)
+        .iter()
+        .any(|feature| feature == protocol::DESKTOP_TARGET_FEATURE)
+    {
+        return (
+            StatusCode::CONFLICT,
+            "Reload the dashboard to open desktop attention",
+        )
+            .into_response();
+    }
+    let incarnation = state.instance_id.clone();
+    match tokio::task::spawn_blocking(move || state.app.desktop_target(&activation)).await {
+        Ok(Ok(mut target)) => {
+            if let crate::domain::DesktopTarget::Current {
+                incarnation: current,
+                ..
+            } = &mut target
+            {
+                *current = incarnation;
+            }
+            Json(target).into_response()
+        }
+        Ok(Err(_)) => (
+            StatusCode::CONFLICT,
+            "Attention could not be revalidated. Refresh the dashboard.",
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Desktop attention is unavailable",
+        )
+            .into_response(),
+    }
+}
+
 fn web_router(web_state: WebState) -> Router {
     let operational = Router::new()
         .route("/api/health", get(health))
         .route("/api/state", get(api_state))
+        .route("/api/desktop-target", get(api_desktop_target))
         .route("/api/state/wait", get(api_state_wait))
         .route("/api/restart-preview", get(api_restart_preview))
         .route("/api/model-catalog", get(api_model_catalog))
@@ -938,6 +1097,11 @@ fn web_router(web_state: WebState) -> Router {
             "/api/tasks/{task_id}/guidance-reauthorization",
             get(api_guidance_reauthorization),
         )
+        .route("/api/tasks/{task_id}/activity", get(api_task_activity))
+        .route("/api/history/search", get(api_history_search))
+        .route("/api/history/source", get(api_historical_source))
+        .route("/api/history/usage", get(api_usage_comparisons))
+        .route("/api/permission-coverage", post(api_permission_coverage))
         .route("/api/command", post(api_command))
         .route("/api/operation", post(api_operation))
         .route("/api/diagnostics", get(api_diagnostics))
@@ -955,8 +1119,13 @@ fn web_router(web_state: WebState) -> Router {
         .with_state(web_state)
 }
 
-#[cfg(target_os = "macos")]
 async fn open_default_browser(url: &str) -> Result<()> {
+    let url = url.to_owned();
+    tokio::task::spawn_blocking(move || open_browser_blocking(&url)).await?
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn open_browser_blocking(url: &str) -> Result<()> {
     let mut child = Command::new("/usr/bin/open")
         .arg(url)
         .stdin(Stdio::null())
@@ -964,7 +1133,7 @@ async fn open_default_browser(url: &str) -> Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .context("launch /usr/bin/open")?;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = Instant::now() + std::time::Duration::from_secs(3);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -983,13 +1152,13 @@ async fn open_default_browser(url: &str) -> Result<()> {
                 return Err(error).context("wait for /usr/bin/open");
             }
         }
-        if tokio::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             if let Err(cleanup_error) = terminate_and_reap_browser_opener(&mut child) {
                 bail!("/usr/bin/open timed out and cleanup also failed: {cleanup_error:#}")
             }
             bail!("/usr/bin/open did not finish within 3 seconds")
         }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 
@@ -1008,7 +1177,7 @@ fn terminate_and_reap_browser_opener(child: &mut Child) -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn open_default_browser(_url: &str) -> Result<()> {
+pub(crate) fn open_browser_blocking(_url: &str) -> Result<()> {
     bail!("automatic browser opening is supported only on macOS")
 }
 
@@ -1064,26 +1233,12 @@ async fn bootstrap_session(
     if let Err(response) = check_origin(&state, &headers, true) {
         return response;
     }
-    let supplied_hash = crate::auth::hash_secret(&request.token);
-    let mut bootstrap = match state.bootstrap_hash.lock() {
-        Ok(value) => value,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "browser authentication state unavailable",
-            )
-                .into_response()
-        }
-    };
-    let Some(expected) = bootstrap.as_ref() else {
+    if state.app.bootstrap.consume(&request.token).is_err() {
         return (
             StatusCode::UNAUTHORIZED,
-            "bootstrap credential was already consumed",
+            "bootstrap credential is invalid, expired, or consumed",
         )
             .into_response();
-    };
-    if crate::auth::verify_secret(&request.token, expected).is_err() || supplied_hash != *expected {
-        return (StatusCode::UNAUTHORIZED, "invalid bootstrap credential").into_response();
     }
     let session = auth::issue_secret();
     let session_hash = crate::auth::hash_secret(&session);
@@ -1096,7 +1251,6 @@ async fn bootstrap_session(
         )
             .into_response();
     }
-    *bootstrap = None;
     let mut response = Json(serde_json::json!({"authenticated": true})).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
@@ -1493,6 +1647,32 @@ async fn api_command_with_executor(
 ) -> Response {
     if let Err(response) = require_browser(&state, &headers) {
         return response;
+    }
+    if matches!(command, HumanCommand::UpsertSingleAgentRecipe { .. })
+        && !declared_features(&headers)
+            .iter()
+            .any(|feature| feature == protocol::SINGLE_AGENT_PRESETS_FEATURE)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"Reload the dashboard to use Single agent recipes."})),
+        )
+            .into_response();
+    }
+    if matches!(
+        command,
+        HumanCommand::AddTaskComment { .. }
+            | HumanCommand::EditGuidance { .. }
+            | HumanCommand::CancelGuidance { .. }
+    ) && !declared_features(&headers)
+        .iter()
+        .any(|f| f == protocol::TASK_INTERACTIONS_FEATURE)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"Reload the dashboard to add comments."})),
+        )
+            .into_response();
     }
     let permits = Arc::clone(&state.app.blocking_operations);
     let operation_id = command.operation_id().to_owned();
@@ -2527,7 +2707,6 @@ mod web_operation_tests {
             app,
             instance_id: "server-boundary-instance".to_owned(),
             allowed_hosts: vec!["server-boundary.test".to_owned()],
-            bootstrap_hash: Arc::new(Mutex::new(None)),
             browser_sessions: Arc::new(Mutex::new(HashSet::from([browser_hash]))),
             shutdown,
             state_waiters: Arc::new(Semaphore::new(MAX_STATE_WAITERS)),
@@ -2545,6 +2724,121 @@ mod web_operation_tests {
     }
 
     #[tokio::test]
+    async fn stage_a_permission_preview_handler_is_read_only_and_bound_to_revision() {
+        let (root, app, binding, _) = server_test_application();
+        let repository_path = root.join("preview-repository");
+        std::fs::create_dir(&repository_path).unwrap();
+        for arguments in ["init -q", "-c user.name=Fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false -c core.hooksPath=/dev/null commit --allow-empty -qm fixture"] {
+            let mut git = std::process::Command::new("git");
+            git.current_dir(&repository_path).args(arguments.split_whitespace());
+            for variable in ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"] {
+                git.env_remove(variable);
+            }
+            assert!(git.output().unwrap().status.success());
+        }
+        let repository = crate::workspace::inspect(&repository_path).unwrap();
+        let worktree = root.join("preview-worktree");
+        crate::workspace::create_detached_worktree(&repository, &worktree, &repository.head)
+            .unwrap();
+        let worktree = worktree.canonicalize().unwrap();
+        let executable = std::fs::canonicalize("/usr/bin/true").unwrap();
+        let family = serde_json::json!({
+            "executable_kind":"absolute", "executable_value":executable,
+            "display_family":"true with all arguments", "canonical_executable":executable,
+            "registered_root":repository.root, "repository_identity":repository.identity,
+            "worktree_path":worktree, "session_preview":{}, "project_preview":{}
+        });
+        {
+            let connection = app.store.lock().unwrap();
+            let (rp, wp) = (
+                repository.root.to_string_lossy(),
+                worktree.to_string_lossy(),
+            );
+            let (sid, gid) = (&binding.session_id, &binding.role_generation_id);
+            let (identity, head) = (&repository.identity, &repository.head);
+            let executable = executable.to_string_lossy();
+            connection.execute(
+                "UPDATE projects SET repository_path=?1,repository_identity=?2,base_revision=?3 WHERE id='project'",
+                params![rp, identity, head],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO workspaces(id,attempt_id,repository_identity,path,base_revision,worktree_head,policy_json,state,created_at,updated_at)
+                 VALUES('preview-workspace','attempt',?1,?2,?3,?3,'{}','ready','2026-01-01','2026-01-01')",
+                params![identity, wp, head],
+            ).unwrap();
+            connection.execute(
+                "UPDATE sessions SET native_session_id='preview-native',capability_key='preview-policy' WHERE id=?1",
+                params![sid],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO permission_requests(id,hook_invocation_nonce,connection_nonce,provider,project_id,task_id,attempt_id,session_id,role_generation_id,role,service_boot_id,native_session_id,cwd,policy_fingerprint,tool_name,input_digest,input_json,family_json,created_at,deadline_at,state,updated_at)
+                 VALUES('preview-request','preview-hook','preview-connection','codex','project','task','attempt',?1,?2,'manager','preview-boot','preview-native',?3,'preview-policy','shell','preview-digest','{}',?4,'2026-01-01','9999-01-01T00:00:00Z','pending','2026-01-01')",
+                params![sid, gid, wp, family.to_string()],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO permission_rules(id,provider,project_id,role,lifetime,session_id,role_generation_id,native_session_id,registered_root,repository_identity,worktree_path,executable_kind,executable_value,display_family,policy_fingerprint,created_by,created_at,use_count)
+                 VALUES('preview-rule','codex','project','manager','session',?1,?2,'preview-native',?3,?4,?5,'absolute',?6,'true','preview-policy','human','2026-01-01',7)",
+                params![sid, gid, rp, identity, wp, executable],
+            ).unwrap();
+        }
+        let snapshot = || {
+            let connection = app.store.lock().unwrap();
+            connection.query_row(
+                "SELECT json_object('rules',(SELECT json_group_array(json_object('id',id,'uses',use_count,'revision',revision,'revoked',revoked_at,'last_used',last_used_at,'provider',provider,'role',role,'scope',lifetime,'session',session_id,'generation',role_generation_id,'native',native_session_id,'root',registered_root,'repository',repository_identity,'worktree',worktree_path,'kind',executable_kind,'value',executable_value,'policy',policy_fingerprint)) FROM permission_rules),
+                 'receipts',(SELECT COUNT(*) FROM operation_receipts),'resolutions',(SELECT COUNT(*) FROM permission_native_resolutions),
+                 'request',(SELECT json_object('input',input_json,'state',state,'revision',revision,'kind',decision_kind,'actor',decision_actor,'reason',decision_reason,'decided',decided_at,'rule',matching_rule_id,
+                 'delivery',delivery_state,'reserved',delivery_reserved_at,'behavior',reserved_behavior,'delivered',delivered_at,'unknown',delivery_unknown_at,'delivery_reason',delivery_reason,'consumed',consumed_at,'updated',updated_at) FROM permission_requests WHERE id='preview-request'))",
+                [], |row| row.get::<_, String>(0),
+            ).unwrap()
+        };
+        let before = snapshot();
+        let (state, mut headers, _) = browser_state(app.clone());
+        headers.insert(protocol::HTTP_HEADER, HeaderValue::from_static(
+            r#"{"generation":1,"client_kind":"browser","required_features":["http_operational_v1","task_interactions_v1"]}"#,
+        ));
+        let mut sample = crate::domain::PermissionCoverageSample {
+            request_id: "preview-request".into(),
+            expected_revision: 1,
+            command: "/usr/bin/true --help".into(),
+            lifetime: crate::domain::PermissionLifetime::Session,
+        };
+        let mut unauthenticated = headers.clone();
+        unauthenticated.remove(header::COOKIE);
+        assert_eq!(
+            api_permission_coverage(State(state.clone()), unauthenticated, Json(sample.clone()))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        for (command, status, reason) in [
+            ("/usr/bin/true --help", "eligible", "family_compatible"),
+            ("/usr/bin/false", "ineligible", "executable_family_mismatch"),
+            ("sh -c true", "ineligible", "command_policy"),
+            ("/usr/bin/true > output", "ineligible", "command_policy"),
+        ] {
+            sample.command = command.into();
+            let response = api_permission_coverage(
+                State(state.clone()),
+                headers.clone(),
+                Json(sample.clone()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let preview: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(preview["status"], status);
+            assert_eq!(preview["reason_code"], reason);
+        }
+        sample.expected_revision += 1;
+        let response = api_permission_coverage(State(state), headers, Json(sample)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(snapshot(), before);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn operational_protocol_guard_is_auth_first_and_descriptor_is_authenticated() {
         let (root, app, _, _) = server_test_application();
         let (state, mut headers, _) = browser_state(app);
@@ -2558,7 +2852,7 @@ mod web_operation_tests {
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(
-            api_protocol(State(state.clone()), unauthenticated)
+            api_protocol(State(state.clone()), unauthenticated.clone())
                 .await
                 .status(),
             StatusCode::UNAUTHORIZED
@@ -2882,8 +3176,7 @@ mod web_operation_tests {
         let bootstrap = |state: WebState| {
             let anonymous = anonymous.clone();
             async move {
-                let token = crate::auth::issue_secret();
-                *state.bootstrap_hash.lock().unwrap() = Some(crate::auth::hash_secret(&token));
+                let token = state.app.bootstrap.issue().unwrap();
                 let response =
                     bootstrap_session(State(state), anonymous, Json(BootstrapRequest { token }))
                         .await;
@@ -3427,6 +3720,7 @@ mod web_operation_tests {
             project_id: "project".into(),
             expected_version: 0,
             family: crate::domain::WorkflowFamily::SingleAgent,
+            preset: Default::default(),
         };
         let worker_state = state.clone();
         let worker_command = command.clone();
@@ -4347,5 +4641,176 @@ mod web_operation_tests {
 
         drop((state, app));
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+async fn api_permission_coverage(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(sample): Json<crate::domain::PermissionCoverageSample>,
+) -> Response {
+    if let Err(response) = require_browser(&state, &headers) {
+        return response;
+    }
+    if !declared_features(&headers)
+        .iter()
+        .any(|f| f == protocol::TASK_INTERACTIONS_FEATURE)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(
+                serde_json::json!({"error":"Reload the dashboard to preview permission coverage."}),
+            ),
+        )
+            .into_response();
+    }
+    let store = state.app.store.clone();
+    match tokio::task::spawn_blocking(move || crate::permissions::coverage_preview(&store, &sample))
+        .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":format!("{error:#}")})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ActivityQuery {
+    cursor: Option<String>,
+}
+
+fn require_history_insights(state: &WebState, headers: &HeaderMap) -> Result<(), Response> {
+    require_browser(state, headers)?;
+    if !declared_features(headers)
+        .iter()
+        .any(|f| f == protocol::HISTORY_INSIGHTS_FEATURE)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error":"Reload the dashboard to use History search and usage comparisons."
+            })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+async fn api_history_search(
+    State(state): State<WebState>,
+    axum::extract::Query(query): axum::extract::Query<crate::domain::HistorySearchQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_history_insights(&state, &headers) {
+        return response;
+    }
+    let store = state.app.store.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::workflow::history_search(&store, query, &state.instance_id)
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_historical_source(
+    State(state): State<WebState>,
+    axum::extract::Query(key): axum::extract::Query<crate::domain::HistoricalSourceKey>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_history_insights(&state, &headers) {
+        return response;
+    }
+    let store = state.app.store.clone();
+    match tokio::task::spawn_blocking(move || crate::workflow::historical_source(&store, &key)).await {
+        Ok(Ok(Some(value))) => Json(value).into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"This exact historical source is unavailable. Refresh the search results."}))).into_response(),
+        Ok(Err(error)) => (StatusCode::CONFLICT, Json(serde_json::json!({"error":error.to_string()}))).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":error.to_string()}))).into_response(),
+    }
+}
+
+async fn api_usage_comparisons(
+    State(state): State<WebState>,
+    axum::extract::Query(query): axum::extract::Query<crate::domain::UsageComparisonQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_history_insights(&state, &headers) {
+        return response;
+    }
+    let store = state.app.store.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::workflow::usage_comparisons(&store, query, &state.instance_id)
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+async fn api_task_activity(
+    State(state): State<WebState>,
+    AxumPath(task_id): AxumPath<String>,
+    axum::extract::Query(query): axum::extract::Query<ActivityQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_browser(&state, &headers) {
+        return response;
+    }
+    if !declared_features(&headers)
+        .iter()
+        .any(|f| f == protocol::TASK_INTERACTIONS_FEATURE)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"Reload the dashboard to read task activity."})),
+        )
+            .into_response();
+    }
+    let store = state.app.store.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::workflow::task_activity(&store, &task_id, query.cursor.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
     }
 }

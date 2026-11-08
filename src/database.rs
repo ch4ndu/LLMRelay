@@ -1190,6 +1190,13 @@ fn establish_restore_hold(paths: &InstancePaths, journal: &RestoreJournal) -> Re
         crate::store::finish_settled_provider_batches_in(&tx, &now)?;
         tx.execute("UPDATE history_pane_views SET state='unknown',failure_reason='database restore cannot show whether this history pane opened; check cmux before opening another history pane',updated_at=?1 WHERE state='reserved'", [&now])?;
     }
+    if require_maintenance_schema(&tx)? >= 43 {
+        // Restoring cannot restore knowledge of external delivery or candidate
+        // bytes. Preserve every spent reservation and repair receipt.
+        tx.execute("UPDATE single_agent_review_deliveries SET state='abandoned',reason='Database restore invalidated the delivery and its external materialization; allowance remains spent',updated_at=?1 WHERE state!='abandoned' AND result_binding_id IN (SELECT id FROM workflow_result_bindings WHERE state!='accepted')",[&now])?;
+        tx.execute("UPDATE workflow_result_bindings SET state='review_blocked',state_reason='Database restore requires review recovery; no new review allowance was granted',updated_at=?1 WHERE state IN ('awaiting_review','review_running','review_changes_requested') OR (state='awaiting_human' AND id IN (SELECT result_binding_id FROM single_agent_review_deliveries WHERE state='abandoned'))",[&now])?;
+        tx.execute("UPDATE attempts SET phase='review_blocked',status='needs_input',updated_at=?1 WHERE id IN (SELECT attempt_id FROM workflow_result_bindings WHERE state='review_blocked') AND status!='done'",[&now])?;
+    }
     tx.commit()?;
     Ok(())
 }

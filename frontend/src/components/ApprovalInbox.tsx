@@ -1,6 +1,11 @@
 import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ApiError, command, reuseOperationIdentity } from "../api";
+import {
+  ApiError,
+  command,
+  permissionCoverage,
+  reuseOperationIdentity,
+} from "../api";
 import { withStorageLock } from "../storageCoordination";
 import {
   type AppState,
@@ -92,6 +97,9 @@ export function ServiceCheckPermissionActions(
         LLMRelay runs this check itself in the task's workspace. Approving it
         does not change what agents are allowed to do.
       </small>
+      {permission.coverage_explanation && (
+        <p>{permission.coverage_explanation}</p>
+      )}
       <TechnicalDetails>
         <pre>{JSON.stringify(selection.command, null, 2)}</pre>
         <p>
@@ -108,7 +116,8 @@ export function ServiceCheckPermissionActions(
       </TechnicalDetails>
       {permission.family_unavailable_reason && (
         <small className="hint">
-          “Always approve” is not available: {permission.family_unavailable_reason}
+          “Always approve” is not available:{" "}
+          {permission.family_unavailable_reason}
         </small>
       )}
       {permission.inactive_reason && (
@@ -279,9 +288,11 @@ export function ApprovalInbox(
       // Sent requests settle independently of the view's mounted lifetime.
       await settleIdentity();
     } catch {
-      if (!signal.aborted) setNotice(
-        "Your action was confirmed, but its saved request could not be cleared. Refresh and check the outcome before retrying.",
-      );
+      if (!signal.aborted) {
+        setNotice(
+          "Your action was confirmed, but its saved request could not be cleared. Refresh and check the outcome before retrying.",
+        );
+      }
     }
     return true;
   };
@@ -866,6 +877,49 @@ function ScopeDialog(
     onConfirm: () => void;
   },
 ) {
+  const [sample, setSample] = useState(request.command_display || "");
+  const [coverage, setCoverage] = useState<
+    import("../types").PermissionCoveragePreview
+  >();
+  const [sampleError, setSampleError] = useState("");
+  const sampleEpoch = useRef(0);
+  const sampleBinding = JSON.stringify([
+    request.id,
+    request.revision,
+    sample,
+    scope,
+  ]);
+  const currentSampleBinding = useRef(sampleBinding);
+  currentSampleBinding.current = sampleBinding;
+  useEffect(() => {
+    sampleEpoch.current += 1;
+    setCoverage(undefined);
+    setSampleError("");
+    return () => {
+      sampleEpoch.current += 1;
+    };
+  }, [sample, scope, request.id, request.revision]);
+  const previewSample = async () => {
+    setSampleError("");
+    const epoch = ++sampleEpoch.current;
+    try {
+      const result = await permissionCoverage(
+        request.id,
+        request.revision,
+        sample,
+        scope,
+      );
+      if (
+        epoch === sampleEpoch.current &&
+        currentSampleBinding.current === sampleBinding
+      ) setCoverage(result);
+    } catch (cause) {
+      if (
+        epoch === sampleEpoch.current &&
+        currentSampleBinding.current === sampleBinding
+      ) setSampleError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
   return (
     <div className="modal-backdrop" role="presentation">
       <section
@@ -926,6 +980,29 @@ function ScopeDialog(
             </div>
           )}
         </dl>
+        <label>
+          Sample command<input
+            value={sample}
+            onChange={(event) => setSample(event.target.value)}
+          />
+        </label>
+        <button onClick={previewSample}>Preview sample coverage</button>
+        {sampleError && <ErrorNotice error={sampleError} />}
+        {coverage && (
+          <div>
+            <p>
+              {coverage.status}: {coverage.explanation} Recorded request:{" "}
+              {coverage.recorded_state}.
+            </p>
+            {coverage.saved_rules.map((rule) => (
+              <p key={rule.rule_id}>
+                {rule.eligible
+                  ? "Eligible saved rule"
+                  : "Ineligible saved rule"}: {rule.explanation}
+              </p>
+            ))}
+          </div>
+        )}
         <p className="warning">{preview.warning}</p>
         <p>
           This grants all current and future arguments for the displayed

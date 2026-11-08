@@ -28074,11 +28074,18 @@ fn t07_input_lease_excludes_guidance_and_rejects_stale_authority() {
                 "codex-resume-epoch",
                 Some("codex-resume-invocation"),
                 text,
+                1,
             )
             .unwrap()
     };
-    assert!(reserve(submitted));
-    assert!(!reserve(original));
+    assert_eq!(
+        reserve(submitted),
+        agenticjira::store::GuidanceReservation::Reserved
+    );
+    assert_eq!(
+        reserve(original),
+        agenticjira::store::GuidanceReservation::Conflict
+    );
     assert!(guidance_connection
         .execute(
             "UPDATE guidance_messages SET submitted_text=body WHERE id='enveloped-guidance'",
@@ -36401,6 +36408,7 @@ fn provider_failure_hold_keeps_guidance_queued_until_its_cooldown_passes() {
             "e",
             None,
             "Use the smaller scope",
+            1,
         )
     };
     let refused_while_held = |when: &str| {
@@ -36472,7 +36480,10 @@ fn provider_failure_hold_keeps_guidance_queued_until_its_cooldown_passes() {
         .is_empty());
     assert_eq!(fixture.scalar::<String>(&effects), before_deadline);
     assert_eq!(fixture.scalar::<String>(delivery), undelivered);
-    assert!(reserve().unwrap());
+    assert_eq!(
+        reserve().unwrap(),
+        agenticjira::store::GuidanceReservation::Reserved
+    );
     fixture.assert_scalar::<String>(
         "SELECT state FROM guidance_messages WHERE id='held-guidance'",
         "delivery_reserved".into(),
@@ -38044,7 +38055,10 @@ fn single_agent_bundles() -> agenticjira::provider_compatibility::BundleSet {
         let mut pack: serde_json::Value = serde_json::from_str(manifest).unwrap();
         for selector in pack["selectors"].as_array_mut().unwrap() {
             for contract in selector["contracts"].as_array_mut().unwrap() {
-                if contract["mode"] == "single_agent_writer" {
+                if contract["mode"]
+                    .as_str()
+                    .is_some_and(|mode| mode.starts_with("single_agent_"))
+                {
                     contract["qualification"] = serde_json::json!({
                         "state": "qualified",
                         "evidence_reference": "synthetic-single-agent-review"
@@ -38236,10 +38250,25 @@ fn running_single_agent(
         .store
         .single_agent_launch_context(&plan.attempt_id)
         .unwrap();
+    (start_single_agent_fixture_turn(fixture, context), artifacts)
+}
+
+fn prepare_single_agent_fixture_turn(
+    fixture: &Fixture,
+    mut context: agenticjira::store::SingleAgentLaunchContext,
+) -> (
+    agenticjira::store::SingleAgentLaunchContext,
+    providers::SingleAgentLaunch,
+) {
+    let paths = instance_paths(fixture);
+    ReviewService::new(fixture.store.clone(), paths.artifacts.clone())
+        .prepare_research_baseline(&context.attempt_id)
+        .unwrap();
     let hooks = test_hooks(fixture);
     let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
     let bundles = single_agent_bundles();
-    let launch = providers::prepare_single_agent_launch(&providers::SingleAgentLaunchRequest {
+    let mut launch = providers::prepare_single_agent_launch(&providers::SingleAgentLaunchRequest {
+        purpose: context.purpose,
         provider: context.provider,
         model: &context.model,
         effort: &context.effort,
@@ -38258,6 +38287,18 @@ fn running_single_agent(
         checkout_scope: None,
     })
     .unwrap();
+    launch.record["prompt_hash"] =
+        serde_json::json!(agenticjira::store::json_hash(&"fixture").unwrap());
+    if context.capability_key.as_deref() == Some("stage-c-offline-only") {
+        context.capability_key = None;
+        let key = context.capability_key_for(&launch.identity).unwrap();
+        fixture.execute(
+            "UPDATE profile_admissions SET capability_key=?1 WHERE id=?2",
+            params![key, context.admission_id],
+        );
+        context.capability_key = Some(key.clone());
+        context.core_capability_key = Some(key);
+    }
     assert!(
         launch
             .arguments
@@ -38266,6 +38307,14 @@ fn running_single_agent(
         "the writer launch carries no TRIP role contract: {:?}",
         launch.arguments
     );
+    (context, launch)
+}
+
+fn start_single_agent_fixture_turn(
+    fixture: &Fixture,
+    context: agenticjira::store::SingleAgentLaunchContext,
+) -> agenticjira::store::SingleAgentLaunchContext {
+    let (context, launch) = prepare_single_agent_fixture_turn(fixture, context);
     fixture
         .store
         .reserve_single_agent_invocation(&context, &launch)
@@ -38286,7 +38335,25 @@ fn running_single_agent(
             SINGLE_AGENT_PROCESS,
         )
         .unwrap();
-    (context, artifacts)
+    context
+}
+
+// Only offline fixtures seed activation; this is never native admission proof.
+fn offline_purpose_profile(fixture: &Fixture, setup: &SingleAgentSetup, purpose: &str) -> String {
+    let saved = workflow_command(fixture,serde_json::json!({
+        "kind":"save_agent_profile","operation_id":format!("profile-{purpose}"),"project_id":setup.project_id,
+        "profile":{"display_name":purpose,"purpose":purpose,"provider":"codex","model":"gpt-fixture","effort":"medium","instructions_text":""}
+    })).unwrap();
+    let revision = saved.detail["profile_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let admission = workflow_command(fixture,serde_json::json!({
+        "kind":"prepare_profile_admission","operation_id":format!("prepare-{purpose}"),"project_id":setup.project_id,
+        "profile_revision_id":revision,"execution_config_revision_id":setup.config_id
+    })).unwrap();
+    fixture.execute("UPDATE profile_admissions SET state='activated',capability_key='stage-c-offline-only',proof_hash='offline fixture',activated_at=created_at WHERE id=?1",[&admission.entity_id]);
+    revision
 }
 
 fn single_agent_report(
@@ -42241,10 +42308,12 @@ fn trusted_checkout_authorization_refuses_alias_retarget_policy_and_mode_drift()
     assert!(current
         .checkout_authorization_reason
         .unwrap()
-        .contains("writer policy changed"));
+        .contains("profile purpose or policy changed"));
     let error = workflow::execute(&fixture.store, &changed_root).unwrap_err();
     assert!(
-        error.to_string().contains("writer policy changed"),
+        error
+            .to_string()
+            .contains("profile purpose or policy changed"),
         "{error}"
     );
     fixture.execute(
@@ -42789,6 +42858,372 @@ fn finish_single_agent_writer(
 }
 
 #[test]
+fn single_agent_presets_recipe_definitions_and_draft_schedule_are_idempotent() {
+    let (fixture, repository) = single_agent_fixture("preset-recipes");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let reader = offline_purpose_profile(&fixture, &setup, "repository_reader");
+    let reviewer = offline_purpose_profile(&fixture, &setup, "repository_reviewer");
+    let app = single_agent_application(&fixture);
+    for (preset, primary) in [
+        ("single_agent", setup.profile_revision_id.as_str()),
+        ("repository_research", reader.as_str()),
+        ("build_and_review", setup.profile_revision_id.as_str()),
+    ] {
+        let mut selection = serde_json::json!({
+            "family":"single_agent","preset":preset,"workspace_mode":"isolated_worktree",
+            "profile_revision_id":primary,"execution_config_revision_id":setup.config_id,"check_ids":[]
+        });
+        if preset == "build_and_review" {
+            selection["reviewer_profile_revision_id"] = reviewer.clone().into();
+        }
+        let command: HumanCommand = serde_json::from_value(serde_json::json!({
+            "kind":"upsert_single_agent_recipe","operation_id":format!("recipe-{preset}"),
+            "project_id":setup.project_id,"recipe_id":null,"expected_version":null,
+            "recipe":{"name":preset,"title":"Inspect","description":"Frozen pins",
+                "priority":0,"acceptance_criteria":["Evidence reviewed"],"selection":selection}
+        }))
+        .unwrap();
+        let recipe = workflow::execute(&fixture.store, &command).unwrap();
+        let draft = HumanCommand::CreateDraftFromRecipe {
+            operation_id: format!("draft-{preset}"),
+            project_id: setup.project_id.clone(),
+            recipe_id: recipe.entity_id,
+            expected_recipe_version: 1,
+            recipe_revision_id: recipe.detail["revision_id"].as_str().unwrap().into(),
+        };
+        let first = workflow::execute(&fixture.store, &draft).unwrap();
+        let repeated = workflow::execute(&fixture.store, &draft).unwrap();
+        assert_eq!(first.entity_id, repeated.entity_id);
+        let schedule: HumanCommand = serde_json::from_value(serde_json::json!({
+            "kind":"upsert_recipe_schedule","operation_id":format!("schedule-{preset}"),
+            "project_id":setup.project_id,"schedule_id":null,"expected_version":null,
+            "name":preset,"recipe_revision_id":recipe.detail["revision_id"],
+            "cadence":"daily","anchor_utc":"2030-01-01T09:00:00Z"
+        }))
+        .unwrap();
+        let schedule = workflow::execute(&fixture.store, &schedule).unwrap();
+        fixture.execute(
+            "UPDATE recipe_schedules SET paused=0,next_fire_utc='2030-01-01T09:00:00Z' WHERE id=?1",
+            [&schedule.entity_id],
+        );
+    }
+    let now = chrono::DateTime::parse_from_rfc3339("2030-01-01T09:00:00Z").unwrap();
+    let now = now.with_timezone(&chrono::Utc);
+    assert_eq!(app.scheduled_intake_tick(now, now).unwrap(), 3);
+    assert_eq!(app.scheduled_intake_tick(now, now).unwrap(), 0);
+    fixture.assert_scalar(
+        "SELECT COUNT(DISTINCT version) FROM workflow_definitions",
+        3_i64,
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM task_recipe_bindings WHERE family='single_agent' AND config_revision_id IS NULL AND profile_revision_id IS NULL", 6_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM tasks t JOIN task_recipe_bindings b ON b.task_id=t.id WHERE t.lifecycle!='backlog'", 0_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM trip_runtime_admissions", 0_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM trip_task_profile_activations", 0_i64);
+}
+
+#[test]
+fn single_agent_reader_initial_resume_policy_and_reviewer_credentials_are_separate() {
+    use agenticjira::domain::ProfilePurpose;
+    use agenticjira::permissions::{begin_actor_request, BridgeStart, PermissionActor};
+    let (fixture, repository) = single_agent_fixture("reader-boundaries");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let reader = offline_purpose_profile(&fixture, &setup, "repository_reader");
+    let task = workflow_command(&fixture, serde_json::json!({
+        "kind":"create_task","operation_id":"research","project_id":setup.project_id,
+        "title":"Inspect","description":"Read only","acceptance_criteria":["Evidence reviewed"],"priority":0,
+        "selection":{"family":"single_agent","preset":"repository_research",
+            "execution_config_revision_id":setup.config_id,"profile_revision_id":reader,"check_ids":[]}
+    })).unwrap();
+    make_ready(&fixture, &task.entity_id, task.version.unwrap()).unwrap();
+    let (context, _) = running_single_agent(&fixture, &task.entity_id);
+    let native = single_agent_session_start(&fixture, &context);
+    let channel = single_agent_channel(&fixture, &context);
+    let actor = PermissionActor::single_agent(&fixture.store, &channel).unwrap();
+    assert!(!actor.writer);
+    let payload = permission_payload(
+        &native,
+        "deny-read-escalation",
+        serde_json::json!({"command":"touch forbidden","cwd":context.workspace}),
+        None,
+    );
+    let result = begin_actor_request(&fixture.store, &actor, &payload, "boot", "reader").unwrap();
+    assert!(
+        matches!(result, BridgeStart::Immediate(ref answer) if response_behavior(answer)=="deny")
+    );
+    let paths = instance_paths(&fixture);
+    let hooks = test_hooks(&fixture);
+    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let bundles = single_agent_bundles();
+    let mut request = providers::SingleAgentLaunchRequest {
+        purpose: ProfilePurpose::RepositoryReader,
+        provider: context.provider,
+        model: &context.model,
+        effort: &context.effort,
+        cwd: &context.workspace,
+        read_denials: &context.read_denials,
+        service_root: &paths.root,
+        prompt: "fixture",
+        role_socket: &paths.role_socket,
+        token: &context.token,
+        role_generation_id: &context.role_generation_id,
+        session_id: &context.session_id,
+        native_session_id: None,
+        assets: &hooks,
+        executable_path: &executable,
+        bundles: &bundles,
+        checkout_scope: None,
+    };
+    let first = providers::prepare_single_agent_launch(&request).unwrap();
+    request.native_session_id = Some(&native);
+    let resumed = providers::prepare_single_agent_launch(&request).unwrap();
+    assert_eq!(
+        first.identity.security_policy,
+        resumed.identity.security_policy
+    );
+    let profile: toml::Value = resumed
+        .arguments
+        .iter()
+        .find(|arg| arg.starts_with("permissions.agenticjira_role="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        profile["permissions"]["agenticjira_role"]["filesystem"]
+            [context.workspace.to_str().unwrap()]
+        .as_str(),
+        Some("read")
+    );
+    assert!(resumed
+        .arguments
+        .windows(2)
+        .any(|args| args[0] == "--ask-for-approval" && args[1] == "never"));
+    request.purpose = ProfilePurpose::RepositoryReviewer;
+    assert!(providers::prepare_single_agent_launch(&request).is_err());
+    request.native_session_id = None;
+    let reviewer = providers::prepare_single_agent_launch(&request).unwrap();
+    assert_ne!(
+        reviewer.identity.policy_binding_hash,
+        first.identity.policy_binding_hash
+    );
+    let mut forged = channel.clone();
+    forged.purpose = ProfilePurpose::RepositoryReviewer;
+    assert!(PermissionActor::single_agent(&fixture.store, &forged).is_err());
+    exit_single_agent(&fixture, &context);
+    let reviews = ReviewService::new(fixture.store.clone(), paths.artifacts);
+    reviews
+        .prepare_research_baseline(&context.attempt_id)
+        .unwrap();
+    std::fs::write(context.workspace.join("unexpected.txt"), "changed").unwrap();
+    assert!(reviews
+        .prepare_research_baseline(&context.attempt_id)
+        .is_err());
+}
+
+#[test]
+fn single_agent_review_exact_quiescence_repair_restart_recheck_and_delivery_cap() {
+    let (mut fixture, repository) = single_agent_fixture("independent-review");
+    let mut previous_candidate = repository.clone();
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let reviewer = offline_purpose_profile(&fixture, &setup, "repository_reviewer");
+    let task = workflow_command(&fixture, serde_json::json!({
+        "kind":"create_task","operation_id":"build-review","project_id":setup.project_id,
+        "title":"Say done","description":"Write DONE","acceptance_criteria":["The fixture says done"],"priority":0,
+        "selection":{"family":"single_agent","preset":"build_and_review","profile_revision_id":setup.profile_revision_id,
+            "execution_config_revision_id":setup.config_id,"reviewer_profile_revision_id":reviewer,"check_ids":[]}
+    })).unwrap();
+    make_ready(&fixture, &task.entity_id, task.version.unwrap()).unwrap();
+    let (mut writer, _) = running_single_agent(&fixture, &task.entity_id);
+    for (ordinal, verdict, findings) in [
+        (1, "changes_requested", vec!["Include date"]),
+        (2, "approved", vec![]),
+    ] {
+        let app = single_agent_application(&fixture);
+        single_agent_session_start(&fixture, &writer);
+        let result = finish_single_agent_writer(&fixture, &app, &writer, "result.txt", "DONE\n");
+        let attempt = &writer.attempt_id;
+        let control = |operation: &str, action: &str| {
+            let version: i64 = fixture.scalar(&format!(
+                "SELECT version FROM tasks WHERE id='{}'",
+                task.entity_id
+            ));
+            workflow::execute(
+                &fixture.store,
+                &HumanCommand::Control {
+                    operation_id: operation.into(),
+                    task_id: task.entity_id.clone(),
+                    expected_version: version,
+                    action: action.into(),
+                    payload: serde_json::json!({}),
+                },
+            )
+        };
+        let delivery = app.reviews.prepare_single_agent_review(attempt).unwrap();
+        let repeated = app.reviews.prepare_single_agent_review(attempt).unwrap();
+        assert_eq!(repeated, delivery);
+        let context = fixture.store.single_agent_launch_context(attempt).unwrap();
+        assert_ne!(context.workspace, writer.workspace);
+        let bytes = std::fs::read(context.workspace.join("result.txt")).unwrap();
+        assert_eq!(bytes, b"DONE\n");
+        let (context, launch) = prepare_single_agent_fixture_turn(&fixture, context);
+        for kind in ["pause_now", "pause_after_role", "cancel"] {
+            control(&format!("before-{ordinal}-{kind}"), kind).unwrap();
+            assert!(fixture
+                .store
+                .reserve_single_agent_invocation(&context, &launch)
+                .is_err());
+            assert!(app.reviews.prepare_single_agent_review(attempt).is_err());
+            fixture.assert_scalar(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{attempt}' AND g.role='single_agent_reviewer'"), 0_i64);
+            fixture.execute(
+                "UPDATE controls SET state='finished' WHERE requested_operation_id=?1",
+                [format!("before-{ordinal}-{kind}")],
+            );
+            fixture.execute(
+                "UPDATE tasks SET attention='none' WHERE id=?1",
+                [&task.entity_id],
+            );
+        }
+        // Commit a human pause after reservation, before actual spawn admission.
+        fixture.execute(&format!("CREATE TRIGGER pause_reserved_review AFTER UPDATE OF state ON single_agent_review_deliveries
+            WHEN NEW.id='{delivery}' AND NEW.state='launched' BEGIN
+            INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
+            VALUES('after-{ordinal}',NEW.attempt_id,'pause_now','requested',1,'{{}}','2026-01-01','2026-01-01'); END"),[]);
+        let deferred = app.coordinator_tick().unwrap();
+        assert_eq!(deferred["action"], "pause_now");
+        fixture.execute("DROP TRIGGER pause_reserved_review", []);
+        fixture.assert_scalar(&format!("SELECT COUNT(*) FROM single_agent_review_deliveries d JOIN attempts a ON a.id=d.attempt_id WHERE d.id='{delivery}' AND d.state='ready' AND d.ordinal={ordinal} AND d.candidate_hash=a.candidate_hash AND a.phase='awaiting_review'"), 1_i64);
+        fixture.assert_scalar(&format!("SELECT COUNT(*) FROM single_agent_review_deliveries d JOIN sessions s ON s.id=d.session_id JOIN role_credentials c ON c.id=d.credential_id JOIN audit_events e ON e.entity_id=s.id AND e.event_code='single_agent_review.launch_deferred' WHERE d.id='{delivery}' AND s.status='launch_failed' AND s.process_identity_json IS NULL AND s.native_session_id IS NULL AND c.revoked_at IS NOT NULL AND json_extract(s.exit_json,'$.native_spawned')=0"), 1_i64);
+        let refused: String = fixture.scalar(&format!(
+            "SELECT session_id FROM single_agent_review_deliveries WHERE id='{delivery}'"
+        ));
+        let epoch: String = fixture.scalar(&format!(
+            "SELECT transcript_epoch FROM sessions WHERE id='{refused}'"
+        ));
+        assert!(fixture
+            .store
+            .mark_session_spawning(&refused, &epoch, "stale")
+            .is_err());
+        assert!(fixture.store.single_agent_launch_context(attempt).is_err());
+        let projected = workflow::state(&fixture.store).unwrap();
+        let controls = &projected
+            .decisions
+            .iter()
+            .find(|decision| decision.subject.attempt_id.as_deref() == Some(attempt.as_str()))
+            .unwrap()
+            .control_policy
+            .allowed_controls;
+        assert!(controls.contains(&"continue".to_owned()));
+        control(&format!("release-{ordinal}"), "continue").unwrap();
+        tick_until(&fixture, &app, "continued");
+        assert_eq!(
+            app.reviews.prepare_single_agent_review(attempt).unwrap(),
+            delivery
+        );
+        let context = fixture.store.single_agent_launch_context(attempt).unwrap();
+        let review = start_single_agent_fixture_turn(&fixture, context);
+        assert_ne!(review.session_id, refused);
+        let channel = single_agent_channel(&fixture, &review);
+        let native = uuid::Uuid::new_v4().to_string();
+        let sibling = review.workspace.with_file_name("sibling-review");
+        std::fs::create_dir_all(&sibling).unwrap();
+        for cwd in [
+            &writer.workspace,
+            &sibling,
+            &previous_candidate,
+            &review.workspace,
+        ] {
+            assert!(cwd.is_dir());
+            let valid = cwd == &review.workspace;
+            for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
+                let hook = fixture
+                    .store
+                    .save_single_agent_hook_event(
+                        &channel,
+                        &HookEnvelope {
+                            provider: review.provider,
+                            payload: serde_json::json!({"hook_event_name":event,"session_id":native,"cwd":cwd}),
+                        },
+                        &RolePeerProvenance {
+                            peer_pid: 4242,
+                            peer_process_group_id: 4242,
+                            peer_start_marker: "single-agent-peer".into(),
+                            managed_root_pid: 4242,
+                            managed_root_start_marker: "fixture".into(),
+                            state: "managed_process_group_untrusted_payload".into(),
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(hook["native_identity_candidate"], valid);
+                assert_eq!(hook["safe_idle_boundary"], valid && event == "Stop");
+            }
+        }
+        previous_candidate = review.workspace.clone();
+        let restart = recovery::prepare_restart_candidates(&fixture.store).unwrap();
+        assert!(restart.is_empty());
+        assert_ne!(review.credential_id, writer.credential_id);
+        assert!(fixture.store.single_agent_launch_context(attempt).is_err());
+        let candidate: String = fixture.scalar(&format!(
+            "SELECT candidate_hash FROM attempts WHERE id='{attempt}'"
+        ));
+        let revision: i64 = fixture.scalar(&format!("SELECT selected_check_revision FROM single_agent_review_deliveries WHERE id='{delivery}'"));
+        let report = RoleResultReport {
+            operation_id: format!("review-{ordinal}"),
+            outcome: "review_complete".into(),
+            summary: "Independent inspection".into(),
+            evidence: vec![],
+            metadata: serde_json::json!({"delivery_id":delivery,"result_binding_id":result["result_binding_id"],
+                "candidate_hash":candidate,"selected_check_revision":revision,"verdict":verdict,"findings":findings}),
+        };
+        let recorded = fixture
+            .store
+            .save_single_agent_result(&channel, &report)
+            .unwrap();
+        assert_eq!(recorded["accepted"], true);
+        let decide = |kind: &str, operation: &str| {
+            let version: i64 = fixture.scalar(&format!(
+                "SELECT version FROM tasks WHERE id='{}'",
+                task.entity_id
+            ));
+            let mut command = serde_json::json!({"kind":kind,"operation_id":operation,"task_id":task.entity_id,
+                "attempt_id":attempt,"expected_version":version,"result_binding_id":result["result_binding_id"],"candidate_hash":candidate});
+            if kind == "request_rework" {
+                command["feedback"] = "One more repair".into();
+            }
+            workflow_command(&fixture, command)
+        };
+        assert!(decide("accept_result", "accept-live").is_err());
+        exit_single_agent(&fixture, &review);
+        tick_until(&fixture, &app, "single_agent_review_settled");
+        assert!(fixture.store.execution_context(&review.token).is_err());
+        if ordinal == 1 {
+            fixture.assert_scalar("SELECT COUNT(*) FROM single_agent_repair_receipts", 1_i64);
+            fixture.assert_scalar("SELECT COUNT(*) FROM workflow_result_acceptances WHERE decision='changes_requested'", 0_i64);
+            tick_until(&fixture, &app, "rework_materialized");
+            let child: String =
+                fixture.scalar("SELECT child_attempt_id FROM single_agent_repair_receipts");
+            drop(app);
+            fixture.store = Store::open(&fixture.database)
+                .unwrap()
+                .with_synthetic_bundles_for_tests(single_agent_bundles())
+                .unwrap();
+            let context = fixture.store.single_agent_launch_context(&child).unwrap();
+            writer = start_single_agent_fixture_turn(&fixture, context);
+        } else {
+            assert!(decide("request_rework", "third-delivery").is_err());
+            std::fs::write(review.workspace.join("result.txt"), "tampered").unwrap();
+            assert!(decide("accept_result", "accept-tampered").is_err());
+            std::fs::write(review.workspace.join("result.txt"), "DONE\n").unwrap();
+            let accepted = decide("accept_result", "accept-exact").unwrap();
+            assert_eq!(accepted.state, "accepted");
+        }
+    }
+    fixture.assert_scalar("SELECT COUNT(*) FROM single_agent_review_deliveries", 2_i64);
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM single_agent_review_budgets WHERE repair_attempt_id IS NOT NULL",
+        1_i64,
+    );
+}
+
+#[test]
 fn single_agent_selected_checks_run_only_under_exact_human_authorization() {
     let (fixture, repository) = single_agent_fixture("single-agent-checks");
     let setup = admitted_single_agent_project_with(
@@ -43002,6 +43437,48 @@ fn single_agent_selected_checks_run_only_under_exact_human_authorization() {
         .attention
         .iter()
         .any(|item| item.id == review_notice));
+
+    // The checked preset reaches independent review before human acceptance.
+    let reviewer = offline_purpose_profile(&fixture, &setup, "repository_reviewer");
+    let checked = workflow_command(&fixture, serde_json::json!({
+        "kind":"create_task","operation_id":"checked-review","project_id":setup.project_id,
+        "title":"Say done","description":"Write DONE","acceptance_criteria":["The fixture says done"],"priority":0,
+        "selection":{"family":"single_agent","preset":"build_and_review","profile_revision_id":setup.profile_revision_id,
+            "execution_config_revision_id":setup.config_id,"reviewer_profile_revision_id":reviewer,"check_ids":[check_id]}
+    })).unwrap();
+    make_ready(&fixture, &checked.entity_id, checked.version.unwrap()).unwrap();
+    let (writer, _) = running_single_agent(&fixture, &checked.entity_id);
+    single_agent_session_start(&fixture, &writer);
+    finish_single_agent_writer(&fixture, &app, &writer, "result.txt", "DONE\n");
+    let check = single_agent_run(&fixture, &checked.entity_id).checks[0].clone();
+    workflow_command(&fixture, serde_json::json!({
+        "kind":"authorize_check","operation_id":"checked-review-allow","task_id":checked.entity_id,
+        "attempt_id":writer.attempt_id,"check_id":check_id,"exact_command_hash":check.exact_command_hash,
+        "scope_hash":check.scope_hash,"decision":"authorized","lifetime":"once"
+    })).unwrap();
+    tick_until(&fixture, &app, "single_agent_check_finished");
+    tick_until(&fixture, &app, "single_agent_checks_passed");
+    let checked_run = single_agent_run(&fixture, &checked.entity_id);
+    assert_eq!(
+        checked_run.stage,
+        agenticjira::domain::SingleAgentStage::AwaitingReview
+    );
+    assert!(!checked_run
+        .available_actions
+        .contains(&"accept_result".into()));
+    let delivery = app
+        .reviews
+        .prepare_single_agent_review(&writer.attempt_id)
+        .unwrap();
+    fixture.assert_scalar(&format!("SELECT json_array_length(check_receipts_json) FROM single_agent_review_deliveries WHERE id='{delivery}'"), 1_i64);
+    fixture.execute(
+        "UPDATE check_runs SET freshness_state='stale' WHERE attempt_id=?1",
+        [&writer.attempt_id],
+    );
+    assert!(app
+        .reviews
+        .prepare_single_agent_review(&writer.attempt_id)
+        .is_err());
 
     // Only verified integration of this accepted manifest counts.
     let (dependent, version) = single_agent_task(&fixture, &setup);
@@ -43334,6 +43811,7 @@ fn single_agent_writer_resumes_only_its_exact_retained_conversation() {
     let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
     let bundles = single_agent_bundles();
     let mut request = providers::SingleAgentLaunchRequest {
+        purpose: next.purpose,
         provider: next.provider,
         model: &next.model,
         effort: &next.effort,
@@ -47653,7 +48131,12 @@ fn mb14_stale_exit_cannot_mutate_reserved_or_running_replacement_generation() {
 }
 
 /// Tables read directly or through helper decisions by `workflow::state`.
-const STATE_PROJECTED_TABLES: [&str; 90] = [
+const STATE_PROJECTED_TABLES: [&str; 96] = [
+    "single_agent_admission_challenges",
+    "single_agent_review_budgets",
+    "single_agent_review_deliveries",
+    "single_agent_review_results",
+    "single_agent_repair_receipts",
     "agent_profile_revisions",
     "agent_profiles",
     "attempts",
@@ -47709,6 +48192,7 @@ const STATE_PROJECTED_TABLES: [&str; 90] = [
     "sessions",
     "snapshots",
     "switch_intents",
+    "task_comments",
     "task_dependencies",
     "task_recipe_bindings",
     "task_recipe_revisions",
@@ -47765,7 +48249,7 @@ fn state_untracked_columns(table: &str) -> &'static [&'static str] {
         "input_leases" => &["expires_at", "updated_at"],
         "session_processes" => &["last_seen_at"],
         "sessions" => &["transcript_last_sequence", "updated_at"],
-        // Delivery correlation that no projection reads, set once beside tracked columns.
+        // Non-null content is hidden; nullness also contributes to `unsubmitted`.
         "guidance_messages" => &["submitted_text", "submitted_digest"],
         _ => &[],
     }
@@ -47813,7 +48297,9 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
     // Guidance's submitted form is write-once (exercised in t07); this disposable
     // database drops only that trigger so each column change tests the cursor alone.
     connection
-        .execute_batch("DROP TRIGGER guidance_submitted_form_once;")
+        .execute_batch("DROP TRIGGER guidance_submitted_form_once;
+            DROP TRIGGER task_recipe_revisions_immutable; DROP TRIGGER task_recipe_bindings_immutable;
+            DROP TRIGGER single_agent_review_results_immutable; DROP TRIGGER single_agent_repair_receipts_immutable;")
         .unwrap();
     let mut marker = 1_000_000_i64;
     for table in STATE_PROJECTED_TABLES
@@ -47897,6 +48383,35 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
                     |row| row.get(0),
                 )
                 .unwrap();
+            if *table == "guidance_messages"
+                && state_untracked_columns(table).contains(&column.as_str())
+            {
+                // Content stays hidden, but either field can change `unsubmitted`.
+                let before = committed_state_revision(&connection);
+                connection
+                    .execute(
+                        "UPDATE guidance_messages SET submitted_text=NULL,submitted_digest=NULL WHERE rowid=?1",
+                        [rowid],
+                    )
+                    .unwrap();
+                assert_step(before, true, "clear submitted form");
+                let before = committed_state_revision(&connection);
+                connection
+                    .execute(
+                        &format!("UPDATE guidance_messages SET {column}=?1 WHERE rowid=?2"),
+                        params![marker, rowid],
+                    )
+                    .unwrap();
+                assert_step(before, true, &format!("set {column} from null"));
+                let before = committed_state_revision(&connection);
+                connection
+                    .execute(
+                        "UPDATE guidance_messages SET submitted_text=?1,submitted_digest=?1 WHERE rowid=?2",
+                        params![marker, rowid],
+                    )
+                    .unwrap();
+                assert_step(before, false, "restore hidden submitted content");
+            }
         }
 
         let before = committed_state_revision(&connection);
@@ -48050,7 +48565,8 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .unwrap();
     connection
         .execute_batch(
-            "DROP TABLE state_revision;
+            "DROP TRIGGER IF EXISTS state_revision_guidance_messages_update;
+             DROP TABLE state_revision;
              PRAGMA user_version=28;
              INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
                VALUES('v28','v28','/tmp/state-revision-v28','state-revision-v28','base','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
@@ -48064,7 +48580,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 41_i64);
+    fixture.assert_scalar("PRAGMA user_version", 43_i64);
     fixture.assert_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%'",
         i64::try_from(triggers.len()).unwrap(),
@@ -48099,7 +48615,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 41_i64);
+    fixture.assert_scalar("PRAGMA user_version", 43_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -48910,6 +49426,89 @@ fn attention_routes_a_reported_question_to_its_running_manager() {
     assert_eq!(item.action.kind, AttentionActionKind::ResolveIssue);
     assert!(matches!(item.target, Some(AttentionTarget::Task(_))));
     assert_ne!(item.reason, message);
+}
+
+#[test]
+fn stage_b_history_search_preserves_exact_sources_and_read_only_pages() -> anyhow::Result<()> {
+    use agenticjira::domain::{HistorySearchQuery as Query, HistorySourceKind};
+    let fixture = Fixture::new("stage-b-history");
+    seed_attempt(&fixture, "planning");
+    seed_session(&fixture, "a", "manager", "g", "s", "exited");
+    fixture.execute_batch("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+        SELECT 'a-old',task_id,'old-context',phase,base_revision,configuration_revision,'completed',created_at,updated_at FROM attempts;
+        UPDATE tasks SET archived_at=created_at;
+        INSERT INTO tasks(id,project_id,title,lifecycle,created_at,updated_at)
+        VALUES('other','p','Needle %_','backlog','2026-01-01','2026-01-01'),
+              ('nonliteral','p','Needle xy','backlog','2026-01-01','2026-01-01');");
+    seed_session(&fixture, "a-old", "manager", "g-old", "s-old", "exited");
+    fixture.execute(
+        "UPDATE tasks SET title=?1 WHERE id='t'",
+        params!["Needle %_".repeat(9000)],
+    );
+    let metadata = r#"{"plan":"public plan","private":"SECRET-METADATA"}"#;
+    for n in 0..41 {
+        let (generation, session) = if n % 2 == 0 {
+            ("g-old", "s-old")
+        } else {
+            ("g", "s")
+        };
+        fixture.execute("INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at)
+            VALUES(?1,?1,?2,?3,'plan_ready','Needle %_ report','[]',?4,'2026-01-02T00:00:00Z')",
+            params![format!("r{n:02}"), session, generation, metadata]);
+    }
+    let search = |query| workflow::history_search(&fixture.store, query, "boot");
+    let query = Query {
+        query: "needle %_".into(),
+        ..Query::default()
+    };
+    let revision: i64 = fixture.scalar("SELECT revision FROM state_revision");
+    let first = search(query.clone())?;
+    assert_eq!(first.results.len(), 40);
+    assert!(serde_json::to_vec(&first)?.len() <= 128 * 1024);
+    let old = &first.results[2];
+    assert_eq!(old.source.id, "r00");
+    assert_eq!(old.source.attempt_id.as_deref(), Some("a-old"));
+    let source = workflow::historical_source(&fixture.store, &old.source)?.unwrap();
+    assert!(source.text.contains("public plan") && !source.text.contains("SECRET-METADATA"));
+    let mut wrong = old.source.clone();
+    wrong.attempt_id = Some("a".into());
+    assert!(workflow::historical_source(&fixture.store, &wrong)?.is_none());
+    wrong = old.source.clone();
+    wrong.task_id = "other".into();
+    assert!(workflow::historical_source(&fixture.store, &wrong)?.is_none());
+    let mut next = query.clone();
+    next.cursor = first.next_cursor.clone();
+    let second = search(next.clone())?;
+    assert_eq!(second.results.len(), 3);
+    assert!(second.next_cursor.is_none());
+    let all: Vec<_> = first.results.iter().chain(&second.results).collect();
+    assert!(all.iter().any(|hit| hit.source.task_id == "other"));
+    assert!(!all.iter().any(|hit| hit.source.task_id == "nonliteral"));
+    assert!(all
+        .iter()
+        .any(|hit| hit.source.attempt_id.as_deref() == Some("a")));
+    let archived = all.iter().filter(|hit| hit.source.task_id == "t");
+    assert!(archived.into_iter().all(|hit| hit.archived));
+    let mut filtered = query.clone();
+    filtered.exclude_archived = true;
+    assert_eq!(search(filtered)?.results.len(), 1);
+    let mut private = query.clone();
+    private.query = "SECRET-METADATA".into();
+    assert!(search(private)?.results.is_empty());
+    let mut altered = next.clone();
+    altered.kind = Some(HistorySourceKind::Task);
+    let changed_filter = search(altered).unwrap_err().to_string();
+    assert!(changed_filter.contains("Results changed"));
+    let restarted = workflow::history_search(&fixture.store, next.clone(), "restart");
+    assert!(restarted
+        .unwrap_err()
+        .to_string()
+        .contains("Results changed"));
+    fixture.assert_scalar("SELECT revision FROM state_revision", revision);
+    fixture.execute_batch("UPDATE tasks SET description='changed' WHERE id='t'");
+    let changed_revision = search(next).unwrap_err().to_string();
+    assert!(changed_revision.contains("Results changed"));
+    Ok(())
 }
 
 #[test]
@@ -56600,14 +57199,15 @@ fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordina
 #[test]
 fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
-    fixture.assert_scalar("PRAGMA user_version", 41_i64);
+    fixture.assert_scalar("PRAGMA user_version", 43_i64);
     let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
     fixture.execute_batch(&format!(
         "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; PRAGMA user_version=30;"
     ));
+    restore_schema_30_recipe_tables(&fixture);
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 41_i64);
+    fixture.assert_scalar("PRAGMA user_version", 43_i64);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
@@ -57384,9 +57984,27 @@ fn stale_restart_candidate_cancellation_refuses_live_sessions_and_pending_admiss
 }
 
 const MIGRATION_031_SQL: &str = include_str!("../migrations/031_final_repair_recheck.sql");
-/// Undoes 039 first (its tables and the sessions owner rebuild); every fixture
-/// upgrades afterwards and 039 recreates the sessions indexes and triggers.
+/// Drops post-32 tables and undoes the sessions owner rebuild. Callers retaining
+/// recipes also restore their schema-30 shape before upgrading through 043.
 const DROP_AFTER_SCHEMA_32: &str = "PRAGMA foreign_keys=OFF;
+     DROP TABLE single_agent_repair_receipts;
+     DROP TABLE single_agent_review_results;
+     DROP TABLE single_agent_review_deliveries;
+     DROP TABLE single_agent_review_budgets;
+     DROP TABLE single_agent_admission_challenges;
+     DROP TABLE task_comments;
+     DROP TRIGGER IF EXISTS state_revision_guidance_messages_update;
+     ALTER TABLE guidance_messages DROP COLUMN message_revision;
+     CREATE TRIGGER state_revision_guidance_messages_update AFTER UPDATE ON guidance_messages
+     WHEN OLD.id IS NOT NEW.id OR OLD.attempt_id IS NOT NEW.attempt_id
+       OR OLD.role_generation_id IS NOT NEW.role_generation_id OR OLD.body IS NOT NEW.body
+       OR OLD.state IS NOT NEW.state OR OLD.reason IS NOT NEW.reason
+       OR OLD.created_at IS NOT NEW.created_at OR OLD.acknowledged_at IS NOT NEW.acknowledged_at
+       OR OLD.written_at IS NOT NEW.written_at OR OLD.submitted_at IS NOT NEW.submitted_at
+       OR OLD.delivery_session_id IS NOT NEW.delivery_session_id
+       OR OLD.delivery_transcript_epoch IS NOT NEW.delivery_transcript_epoch
+       OR OLD.delivery_resume_invocation_id IS NOT NEW.delivery_resume_invocation_id
+     BEGIN UPDATE state_revision SET revision=revision+1; END;
      DROP TABLE history_pane_views;
      DROP TABLE workflow_result_acceptances; DROP TABLE workflow_result_bindings;
      DROP TABLE workflow_check_authorizations; DROP TABLE workflow_check_selections;
@@ -57437,6 +58055,56 @@ const DROP_AFTER_SCHEMA_32: &str = "PRAGMA foreign_keys=OFF;
      DROP TABLE permission_native_resolutions;
      DROP TABLE permission_request_hooks; DROP TABLE role_result_supersessions;";
 
+fn restore_schema_30_recipe_tables(fixture: &Fixture) {
+    let historical = Connection::open_in_memory().unwrap();
+    historical
+        .execute_batch(include_str!("../migrations/030_recipes.sql"))
+        .unwrap();
+    let connection = fixture.connection();
+    connection
+        .execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")
+        .unwrap();
+    for table in ["task_recipe_revisions", "task_recipe_bindings"] {
+        let columns = historical
+            .prepare(&format!("SELECT * FROM {table}"))
+            .unwrap()
+            .column_names()
+            .join(",");
+        let definition: String = historical
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // Copy only historical columns without renaming the referenced tables.
+        // Restore rows before triggers so fixture setup does not move the cursor.
+        connection
+            .execute_batch(&format!(
+                "CREATE TEMP TABLE recipe_schema_30_rows AS SELECT {columns} FROM {table};
+                 DROP TABLE {table};
+                 {definition};
+                 INSERT INTO {table} ({columns}) SELECT {columns} FROM recipe_schema_30_rows;
+                 DROP TABLE recipe_schema_30_rows;"
+            ))
+            .unwrap();
+        let mut triggers = historical
+            .prepare(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?1 ORDER BY name",
+            )
+            .unwrap();
+        for trigger in triggers
+            .query_map([table], |row| row.get::<_, String>(0))
+            .unwrap()
+        {
+            connection.execute_batch(&trigger.unwrap()).unwrap();
+        }
+    }
+    connection
+        .execute_batch("COMMIT; PRAGMA foreign_keys=ON;")
+        .unwrap();
+}
+
 /// Every column a schema-31 receipt has, quoted so that NULLs compare exactly.
 const SCHEMA_31_RECEIPT_ROWS: &str = "SELECT group_concat(
     quote(attempt_id)||quote(task_id)||quote(operation_id)||quote(request_hash)
@@ -57459,6 +58127,7 @@ fn schema_31_receipt_fixture(name: &str) -> Fixture {
         "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; {MIGRATION_031_SQL}
          PRAGMA user_version=31;"
     ));
+    restore_schema_30_recipe_tables(&fixture);
     fixture.execute_batch(
         r#"INSERT INTO role_results(id,operation_id,session_id,role_generation_id,outcome,summary,evidence_json,metadata_json,created_at,consumed_at)
              VALUES('final-result','final-report','s-final','g-final','request_changes','repair','[]',
@@ -57532,7 +58201,7 @@ fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
     fixture.assert_scalar("PRAGMA user_version", 31_i64);
 
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 41_i64);
+    fixture.assert_scalar("PRAGMA user_version", 43_i64);
     assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(
@@ -63249,4 +63918,58 @@ fn trip_command_manager_replacement_recovers_with_new_begin_identity_and_version
         .unwrap(),
         serde_json::to_value(result).unwrap()
     );
+}
+
+#[test]
+fn stage_a_comments_replay_and_task_activity_isolates_durable_pages() {
+    let fixture = Fixture::new("stage-a-comments");
+    let (_, task, plan) = new_task(&fixture, "comments-project", "comments-task");
+    let project: String = fixture.scalar("SELECT project_id FROM tasks LIMIT 1");
+    let other = create_task(&fixture, &project, "other-comment-task", 1);
+    let guidance: i64 = fixture.scalar("SELECT COUNT(*) FROM guidance_messages");
+    let approvals: i64 = fixture.scalar("SELECT COUNT(*) FROM permission_requests");
+    let before: String =
+        fixture.scalar("SELECT group_concat(phase || ':' || status) FROM attempts");
+    let command = HumanCommand::AddTaskComment {
+        operation_id: "comment-once".into(),
+        task_id: task.clone(),
+        body: "Human note <script>plain text</script>".into(),
+    };
+    let first = workflow::execute(&fixture.store, &command).unwrap();
+    let replay = workflow::execute(&fixture.store, &command).unwrap();
+    assert_eq!(first.entity_id, replay.entity_id);
+    fixture.assert_scalar("SELECT COUNT(*) FROM task_comments", 1_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM guidance_messages", guidance);
+    fixture.assert_scalar("SELECT COUNT(*) FROM permission_requests", approvals);
+    fixture.assert_scalar(
+        "SELECT group_concat(phase || ':' || status) FROM attempts",
+        before,
+    );
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::AddTaskComment {
+            operation_id: "other-note".into(),
+            task_id: other.clone(),
+            body: "another task".into(),
+        },
+    )
+    .unwrap();
+    fixture.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at) SELECT 'historical-comment-attempt',task_id,'historical-context',phase,base_revision,configuration_revision,'completed',created_at,updated_at FROM attempts WHERE id=?1",params![plan.attempt_id]);
+    for n in 0..45 {
+        fixture.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?1,'service','fixture.old_attempt','attempt',?2,'{}','2026-01-01T00:00:00Z')",params![format!("older-{n}"),"historical-comment-attempt"]);
+    }
+    let first_page = workflow::task_activity(&fixture.store, &task, None).unwrap();
+    assert_eq!(first_page.events.len(), 40);
+    let cursor = first_page.next_cursor.unwrap();
+    let older = workflow::task_activity(&fixture.store, &task, Some(&cursor)).unwrap();
+    assert!(older
+        .events
+        .iter()
+        .any(|event| event["entity_id"] == first.entity_id));
+    assert!(!older
+        .events
+        .iter()
+        .any(|event| event["body"] == "another task"));
+    assert!(workflow::task_activity(&fixture.store, &other, Some(&cursor)).is_err());
+    assert!(workflow::task_activity(&fixture.store, &task, Some("malformed")).is_err());
 }

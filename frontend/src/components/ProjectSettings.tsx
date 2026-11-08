@@ -9,6 +9,8 @@ import type {
   ExecutionConfigurationInput,
   Project,
   ProjectExecution,
+  ProfilePurpose,
+  SingleAgentPreset,
   Task,
   TripSetupState,
   TripVerificationCheck,
@@ -358,6 +360,7 @@ function ExecutionConfigurationEditor(
 }
 
 type ProfileDraft = {
+  purpose?: ProfilePurpose;
   profile?: AgentProfile;
   display_name: string;
   provider: ValidationProvider;
@@ -381,6 +384,7 @@ const saveProfileCommand = (
   profile_id: target?.id ?? null,
   expected_version: target?.version ?? null,
   profile: {
+    ...(fields.purpose && fields.purpose !== "workspace_writer" ? { purpose: fields.purpose } : {}),
     display_name: fields.display_name.trim(),
     provider: fields.provider,
     model: fields.model.trim(),
@@ -409,6 +413,7 @@ const storedProfileCreation = (
   const model = field(profile, "model");
   const effort = field(profile, "effort");
   const instructions_text = field(profile, "instructions_text");
+  const purpose = field(profile, "purpose");
   if (
     field(value, "kind") !== "save_agent_profile" ||
     field(value, "project_id") !== projectId ||
@@ -416,9 +421,9 @@ const storedProfileCreation = (
     typeof display_name !== "string" ||
     (provider !== "codex" && provider !== "claude") ||
     typeof model !== "string" || typeof effort !== "string" ||
-    typeof instructions_text !== "string"
+    typeof instructions_text !== "string" || (purpose !== undefined && purpose !== "workspace_writer" && purpose !== "repository_reader" && purpose !== "repository_reviewer")
   ) return undefined;
-  return { display_name, provider, model, effort, instructions_text };
+  return { display_name, provider, model, effort, instructions_text, ...(purpose === undefined ? {} : { purpose }) };
 };
 
 /** Creates a profile, or a new revision of one; it never changes old runs. */
@@ -515,6 +520,14 @@ function AgentProfileEditor(
             setValue({ ...value, display_name: event.target.value })}
         />
       </label>
+      <label>Purpose
+        <select value={value.purpose ?? "workspace_writer"} onChange={(event) => setValue({ ...value, purpose: event.target.value as ProfilePurpose })}>
+          <option value="workspace_writer">Workspace writer · retained conversation</option>
+          <option value="repository_reader">Repository reader · retained conversation</option>
+          <option value="repository_reviewer">Independent reviewer · fresh conversation</option>
+        </select>
+      </label>
+      <p className="hint">{value.purpose === "repository_reader" ? "Reads repository files and returns research. Initial and resumed turns are read-only." : value.purpose === "repository_reviewer" ? "Reads a frozen candidate in a fresh isolated conversation. Cannot edit files or grant acceptance." : "May edit files in the task's authorized workspace."} Admission below shows whether this exact purpose and provider version are qualified.</p>
       <label>
         Provider
         <select
@@ -598,6 +611,8 @@ function SingleAgentProjectSettings(
   const [defaultFamily, setDefaultFamily] = useState<WorkflowFamily>(
     execution.default_family,
   );
+  const [defaultPreset, setDefaultPreset] = useState<SingleAgentPreset>(execution.default_preset ?? "single_agent");
+  useEffect(() => setDefaultPreset(execution.default_preset ?? "single_agent"), [execution.default_preset, execution.default_version]);
   useEffect(() => setDefaultFamily(execution.default_family), [
     execution.default_family,
     execution.default_version,
@@ -613,6 +628,7 @@ function SingleAgentProjectSettings(
       project_id: project.id,
       expected_version: execution.default_version,
       family: defaultFamily,
+      ...(defaultFamily === "single_agent" && defaultPreset !== "single_agent" ? { preset: defaultPreset } : {}),
     }));
   return (
     <div className="single-agent-project">
@@ -629,13 +645,14 @@ function SingleAgentProjectSettings(
             {option === "trip" ? "TRIP" : "Single agent"}
           </label>
         ))}
+        {defaultFamily === "single_agent" && <label>Default task type<select value={defaultPreset} onChange={(event) => setDefaultPreset(event.target.value as SingleAgentPreset)}><option value="single_agent">Build with one agent</option><option value="repository_research">Repository research</option><option value="build_and_review">Build and review</option></select></label>}
         <small>
           Only tasks created later start with this choice. Existing tasks,
           recipes and schedules keep their workflow.
         </small>
         <button
           type="button"
-          disabled={defaultFamily === execution.default_family}
+          disabled={defaultFamily === execution.default_family && (defaultFamily === "trip" || defaultPreset === (execution.default_preset ?? "single_agent"))}
           onClick={saveDefault}
         >
           Save default workflow
@@ -694,6 +711,7 @@ function SingleAgentProjectSettings(
                     ? "Claude"
                     : "Codex"} · {profile.current_revision.model} ·{" "}
                   {profile.current_revision.effort}
+                  {" · "}{(profile.current_revision.purpose ?? "workspace_writer").replaceAll("_", " ")}
                 </span>
               )
               : <span>No current revision</span>}
@@ -702,6 +720,7 @@ function SingleAgentProjectSettings(
               onClick={() =>
                 setProfileDraft({
                   profile,
+                  purpose: profile.current_revision?.purpose,
                   display_name: profile.display_name,
                   provider: profile.current_revision?.provider ?? "codex",
                   model: profile.current_revision?.model ?? "",
