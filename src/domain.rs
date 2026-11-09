@@ -893,6 +893,8 @@ pub enum WorkflowCommand {
         priority: i64,
         #[serde(default)]
         selection: Option<TaskWorkflowSelectionInput>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_source: Option<crate::providers::codex_app_server::ConversationSourceInput>,
     },
     /// Continues a held Single agent writer's exact retained conversation,
     /// bound to the session and transcript epoch the person reviewed.
@@ -3250,6 +3252,14 @@ pub struct TaskAttentionTarget {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AttentionTarget {
+    Conversation {
+        project_id: String,
+        conversation_id: String,
+        generation: String,
+        request_id: Option<String>,
+        turn_id: Option<String>,
+        operation_id: Option<String>,
+    },
     Task(TaskAttentionTarget),
     Attempt {
         project_id: String,
@@ -3429,6 +3439,21 @@ impl DesktopActivation {
 impl AttentionTarget {
     pub(crate) fn desktop_episode_source(&self) -> Option<serde_json::Value> {
         match self {
+            Self::Conversation {
+                conversation_id,
+                generation,
+                request_id,
+                turn_id,
+                operation_id,
+                ..
+            } => Some(serde_json::json!([
+                "conversation",
+                conversation_id,
+                generation,
+                request_id,
+                turn_id,
+                operation_id
+            ])),
             Self::PermissionRequest {
                 request_id,
                 request_revision,
@@ -3590,7 +3615,7 @@ impl AttentionTarget {
             | Self::PermissionRequest { task_id, .. }
             | Self::RecoveryRecord { task_id, .. }
             | Self::RoleSettings { task_id, .. } => Some(task_id),
-            Self::ProjectSetup { .. } | Self::Diagnostics => None,
+            Self::Conversation { .. } | Self::ProjectSetup { .. } | Self::Diagnostics => None,
         }
     }
 }

@@ -11,6 +11,8 @@ import {
   SingleAgentSelectionFields,
 } from "./RoleSettings";
 import {
+  type ConversationPromotion,
+  type ConversationSourceInput,
   type Project,
   type ProjectExecution,
   type Provider,
@@ -26,6 +28,7 @@ import {
 const efforts = ["low", "medium", "high", "xhigh", "max", "ultra"];
 
 export interface TaskDraft {
+  promotion?: ConversationPromotion;
   project_id: string;
   title: string;
   description: string;
@@ -45,6 +48,8 @@ export type TaskRoleDraft = Omit<RoleConfig, "provider"> & {
 
 type PendingTaskOperation = { body: string; id: string };
 type CompletedTaskSave = {
+  taskId?: string;
+  projectId?: string;
   operation?: PendingTaskOperation;
   draft: TaskDraft;
   storedDraft?: string;
@@ -90,6 +95,7 @@ type TaskCreateRequest = {
   role_overrides: Partial<Record<Role, RoleConfig>>;
 };
 type WorkflowCreateRequest = {
+  conversation_source?: ConversationSourceInput;
   kind: "create_task";
   project_id: string;
   title: string;
@@ -98,7 +104,7 @@ type WorkflowCreateRequest = {
   priority: number;
   selection:
     | ({ family: "single_agent"; workspace_mode?: WorkspaceMode } & SingleAgentSelection)
-    | { family: "trip"; workspace_mode: "main_checkout" };
+    | { family: "trip"; workspace_mode: WorkspaceMode };
 };
 type TaskEditRequest = {
   kind: "update_task";
@@ -180,7 +186,8 @@ const pendingWorkflowCreate = (
   if (
     value.kind !== "create_task" ||
     Object.keys(value).sort().join() !==
-      "acceptance_criteria,description,kind,priority,project_id,selection,title" ||
+      (value.conversation_source === undefined ? "acceptance_criteria,description,kind,priority,project_id,selection,title" : "acceptance_criteria,conversation_source,description,kind,priority,project_id,selection,title") ||
+    (value.conversation_source !== undefined && !validSource(value.conversation_source)) ||
     typeof value.project_id !== "string" || typeof value.title !== "string" ||
     typeof value.description !== "string" ||
     !isStringList(value.acceptance_criteria) ||
@@ -194,9 +201,9 @@ const pendingWorkflowCreate = (
   ) return undefined;
   let parsedSelection: WorkflowCreateRequest["selection"];
   if (selection.family === "trip") {
-    if (selection.workspace_mode !== "main_checkout" ||
+    if ((selection.workspace_mode !== "main_checkout" && selection.workspace_mode !== "isolated_worktree") ||
       Object.keys(selection).sort().join() !== "family,workspace_mode") return undefined;
-    parsedSelection = { family: "trip", workspace_mode: "main_checkout" };
+    parsedSelection = { family: "trip", workspace_mode: selection.workspace_mode };
   } else if (selection.family === "single_agent" &&
     Object.keys(selection).every((key) => ["family", "check_ids", "execution_config_revision_id", "profile_revision_id", "workspace_mode", "preset", "reviewer_profile_revision_id"].includes(key)) &&
     (selection.preset === undefined || selection.preset === "single_agent" || selection.preset === "repository_research" || selection.preset === "build_and_review") &&
@@ -222,6 +229,7 @@ const pendingWorkflowCreate = (
     acceptance_criteria: value.acceptance_criteria,
     priority: value.priority,
     selection: parsedSelection,
+    ...(validSource(value.conversation_source) ? { conversation_source: value.conversation_source } : {}),
   };
 };
 
@@ -290,8 +298,23 @@ const pendingEditRequest = (
   }
 };
 
+const validSource = (value: unknown): value is ConversationSourceInput =>
+  isRecord(value) && typeof value.conversation_id === "string" &&
+  Array.isArray(value.messages) && value.messages.length <= 16 && value.messages.every((message) =>
+    isRecord(message) && typeof message.message_id === "string" && typeof message.content_hash === "string");
+const validPromotion = (value: unknown): value is ConversationPromotion => {
+  if (!isRecord(value) || typeof value.project_id !== "string" || typeof value.original_request !== "string" ||
+    !validSource(value.source) || !Array.isArray(value.previews)) return false;
+  const source = value.source;
+  return value.previews.length === source.messages.length && value.previews.every((preview, index) =>
+    isRecord(preview) && typeof preview.text === "string" && isRecord(preview.source) &&
+    preview.source.conversation_id === source.conversation_id && preview.id === source.messages[index].message_id &&
+    preview.content_hash === source.messages[index].content_hash && typeof preview.coverage === "string");
+};
+
 const normalizeDraft = (value: unknown): TaskDraft | undefined => {
   if (!isRecord(value)) return undefined;
+  if (value.promotion !== undefined && (!validPromotion(value.promotion) || value.promotion.project_id !== value.project_id)) return undefined;
   if (value.workspace_mode !== undefined && value.workspace_mode !== "isolated_worktree" &&
     value.workspace_mode !== "main_checkout") return undefined;
   const storedRoles = isRecord(value.roles) ? value.roles : {};
@@ -300,6 +323,7 @@ const normalizeDraft = (value: unknown): TaskDraft | undefined => {
     ? value.priority
     : 0;
   return {
+    ...(validPromotion(value.promotion) ? { promotion: value.promotion } : {}),
     project_id: stringField(value, "project_id"),
     title: stringField(value, "title"),
     description: stringField(value, "description"),
@@ -352,11 +376,13 @@ export function TaskForm(
     onClose,
     onOpenSetup = () => {},
     workflowExecution,
+    promotion,
   }: {
     projects: Project[];
     selectedProjectId?: string;
     editing?: Task;
-    onSaved: () => void;
+    onSaved: (taskId?: string, projectId?: string) => void;
+    promotion?: ConversationPromotion;
     onClose: () => void;
     onOpenSetup?: (projectId: string) => void;
     /**
@@ -457,7 +483,7 @@ export function TaskForm(
       item.id === selectedProjectId
     );
     return {
-      draft: blank(selectedIsValid ? selectedProjectId : projects[0]?.id),
+      draft: promotion ? { ...blank(promotion.project_id), promotion, description: promotion.original_request } : blank(selectedIsValid ? selectedProjectId : projects[0]?.id),
       restored: false,
       recovery,
     };
@@ -791,7 +817,7 @@ export function TaskForm(
     changeUnresolved(undefined);
     try {
       const settled = await withStorageLock(key, () => settleCompletedSave(completed), queued);
-      if (settled && !form.aborted) onSaved();
+      if (settled && !form.aborted) onSaved(completed.taskId, completed.projectId);
     } catch {
       setError("The change is already saved, but this browser could not coordinate browser storage with your other open LLMRelay windows to finish it. Keep this form open and copy any newer text, then choose Finish saving locally to try again; that button sends no new task request.");
     }
@@ -911,6 +937,9 @@ export function TaskForm(
     })
     : undefined;
   const validationReason = (() => {
+    if (promotion && JSON.stringify(promotion) !== JSON.stringify(draft.promotion)) return "A different saved draft is open. Your requested conversation selection has not replaced it. Finish or recover this draft, then select the source again.";
+    if (draft.promotion && draft.promotion.project_id !== draft.project_id) return "The saved source belongs to another project. Restore the original draft.";
+    if (draft.promotion && ROLES.some((role) => draft.roleOverrides[role])) return "Promoted tasks use project role defaults. Remove overrides before saving; configure task roles after creation.";
     if (completedSave) return "The change is already saved. Finish saving locally before another action.";
     if (draftRecovery) return "Recover or explicitly replace the saved draft before saving this task.";
     if (!editing && !draft.project_id) return "Choose a project.";
@@ -977,14 +1006,15 @@ export function TaskForm(
     description: draft.description,
     acceptance_criteria: criteria,
     priority: draft.priority,
+    ...(draft.promotion ? { conversation_source: draft.promotion.source } : {}),
     selection: singleAgent
       ? { family: "single_agent", ...singleAgentSelection,
         ...(mainCheckout ? { workspace_mode: "main_checkout" as const } : {}) }
-      : { family: "trip", workspace_mode: "main_checkout" },
+      : { family: "trip", workspace_mode: draft.workspace_mode },
   });
   const createRequest = (ready: boolean): TaskCreateRequest | WorkflowCreateRequest => {
     const criteria = draft.criteria.split("\n").map((value) => value.trim()).filter(Boolean);
-    return singleAgent || mainCheckout ? workflowCreate(criteria) : {
+    return draft.promotion || singleAgent || mainCheckout ? workflowCreate(criteria) : {
       kind: "create_task",
       project_id: draft.project_id,
       title: draft.title,
@@ -1052,9 +1082,12 @@ export function TaskForm(
     form: AbortSignal,
   ) => {
     const { operation } = published;
+    let taskId: string | undefined;
     try {
       if ("selection" in body) {
-        await submitWorkflowCommand({ ...body, operation_id: operation.id });
+        const result = await submitWorkflowCommand({ ...body, operation_id: operation.id });
+        if (result.entity_kind !== "task") throw new ApiError("The service returned a different entity for this task create. Keep the exact request and reconcile its outcome.", 0, operation.id, true);
+        taskId = result.entity_id;
       } else {
         await command({ ...body, operation_id: operation.id });
       }
@@ -1077,6 +1110,8 @@ export function TaskForm(
       return;
     }
     await finishSavingLocally({
+      taskId,
+      projectId: "project_id" in body ? body.project_id : editing?.project_id,
       operation,
       draft: submittedDraft,
       storedDraft: published.storedDraft,
@@ -1085,7 +1120,7 @@ export function TaskForm(
   };
   const submit = async (requestedReady: boolean) => {
     if (saveGuard.current || workspaceCommands.busy) return;
-    const ready = requestedReady && !singleAgent && !mainCheckout;
+    const ready = requestedReady && !draft.promotion && !singleAgent && !mainCheckout;
     const reason = ready ? readyReason : validationReason;
     if (reason) {
       setError(reason);
@@ -1152,15 +1187,20 @@ export function TaskForm(
     try {
       const retained = await withStorageLock(key, () => retainReplay(submittedOperation), signal);
       if (!retained || signal.aborted) return;
+      let taskId: string | undefined;
       if ("selection" in request) {
-        await submitWorkflowCommand({
+        const result = await submitWorkflowCommand({
           ...request,
           operation_id: submittedOperation.id,
         });
+        if (result.entity_kind !== "task") throw new ApiError("The saved create returned a different entity. Keep its exact request and check the outcome.", 0, submittedOperation.id, true);
+        taskId = result.entity_id;
       } else {
         await command({ ...request, operation_id: submittedOperation.id });
       }
       await finishSavingLocally({
+        taskId,
+        projectId: request.project_id,
         operation: submittedOperation,
         draft: submittedDraft,
         storedDraft: retained.storedDraft,
@@ -1254,12 +1294,29 @@ export function TaskForm(
             ×
           </button>
         </header>
+        {promotion && JSON.stringify(promotion) !== JSON.stringify(draft.promotion) && <section className="warning" aria-label="Different conversation selection">
+          <p>A saved draft is already open. Its text, workflow and source have been preserved. The new selection has not replaced it.</p>
+          <p>Use the selected conversation to replace this draft’s source and project explicitly. Task text stays editable. Promoted TRIP drafts use project role defaults; any role overrides will be removed by this action.</p>
+          <button type="button" disabled={saving || !!unresolvedCreate || !!draftRecovery || !!completedSave} onClick={() => chooseSavedDraft(() => {
+            if (!checkDraftOwnership() || currentUnresolved.current) return;
+            setDraft((current) => ({ ...current, project_id: promotion.project_id, promotion, roles: {}, roleOverrides: {},
+              ...(current.project_id === promotion.project_id ? {} : { workflowChoice: undefined, singleAgentChoice: undefined }) }));
+          })}>Use this conversation selection and project defaults</button>
+        </section>}
+        {draft.promotion && <section className="panel" aria-label="Conversation source selection">
+          <h3>Create task from conversation</h3>
+          <p>This saves a linked draft. Open the saved task and explicitly choose Make Ready after reviewing setup. Conversation capacity can delay Ready work; disconnecting may let it start if pickup is enabled.</p>
+          <p>Source: {draft.promotion.source.conversation_id}. {draft.promotion.source.messages.length ? `${draft.promotion.source.messages.length} messages selected.` : "No source messages selected; the source conversation link is still saved."}</p>
+          <p>These are previews of the selected server records. Change the selection in Conversations to change the source; editing task text cannot change the frozen evidence.</p>
+          {draft.promotion.previews.map((message) => <details key={message.id}><summary>{message.id}</summary><p className="conversation-excerpt">{message.text}</p><small>{message.content_hash} · {message.coverage}</small></details>)}
+          <details><summary>Original request</summary><p className="conversation-excerpt">{draft.promotion.original_request || "No delivered user request is available in the recorded history."}</p></details>
+        </section>}
         <div className="form-grid">
           <label>
             Project
             <select
               value={draft.project_id}
-              disabled={!!editing || saving}
+              disabled={!!editing || saving || !!draft.promotion || !!unresolvedCreate}
               onChange={(event) => update("project_id", event.target.value)}
             >
               <option value="">Choose a project</option>
@@ -1279,7 +1336,7 @@ export function TaskForm(
             Priority
             <select
               value={draft.priority}
-              disabled={saving}
+              disabled={saving || !!unresolvedCreate}
               onChange={(event) =>
                 update("priority", Number(event.target.value))}
             >
@@ -1295,7 +1352,7 @@ export function TaskForm(
             ref={titleInput}
             value={draft.title}
             maxLength={200}
-            disabled={saving}
+            disabled={saving || !!unresolvedCreate}
             onChange={(event) => update("title", event.target.value)}
           />
         </label>
@@ -1318,7 +1375,7 @@ export function TaskForm(
           />
         </label>
         {!editing && workflowExecution && (
-          <fieldset className="workflow-choice" disabled={saving}>
+          <fieldset className="workflow-choice" disabled={saving || !!unresolvedCreate}>
             <legend>Workflow</legend>
             <div role="radiogroup" aria-label="Workflow">
               {(["trip", "single_agent"] as const).map((option) => (
@@ -1348,7 +1405,7 @@ export function TaskForm(
           </fieldset>
         )}
         {workflowExecution && (!editing || (!editing.active_attempt && ["backlog", "ready"].includes(editing.lifecycle))) && (
-          <fieldset disabled={saving || workspaceCommands.busy}>
+          <fieldset disabled={saving || workspaceCommands.busy || !!unresolvedCreate}>
             <legend>Workspace</legend>
             <div role="radiogroup" aria-label="Workspace">
               {(["isolated_worktree", "main_checkout"] as const).map((mode) => (
@@ -1402,10 +1459,10 @@ export function TaskForm(
               onChange={(selection) => {
                 setDraft((current) => ({ ...current, singleAgentChoice: { project_id: current.project_id, selection }, workspace_mode: selection.preset && selection.preset !== "single_agent" ? "isolated_worktree" : current.workspace_mode }));
               }}
-              disabled={saving}
+              disabled={saving || !!unresolvedCreate}
             />
           )
-          : (
+          : draft.promotion ? <p className="hint">Promoted TRIP drafts use project role defaults. Task-only role overrides are unavailable here; review or change them in the saved task’s Roles tab before Make Ready.</p> : (
             <details>
               <summary>Role overrides</summary>
               <div className="role-grid">
@@ -1460,7 +1517,7 @@ export function TaskForm(
                             knownExactModels={knownExactModels(
                               config.provider,
                             )}
-                            disabled={saving}
+                            disabled={saving || !!unresolvedCreate}
                           />
                           <select
                             aria-label={`${roleLabel(role)} effort`}
@@ -1497,6 +1554,7 @@ export function TaskForm(
             operation identity. {draftRecovery
               ? "Current edits stay in this form while saved draft recovery is pending."
               : "Current form edits remain saved separately."}
+            <details><summary>Exact saved create request</summary><p>Reconciliation uses this original workflow and source selection. Neither is changed by edits to another saved draft.</p><pre>{unresolvedCreate.body}</pre></details>
             <button
               type="button"
               disabled={saving || !!draftRecovery}
@@ -1607,13 +1665,13 @@ export function TaskForm(
             selectedProject.trip?.readiness !== "ready" && (
             <button
               type="button"
-              disabled={saving}
+              disabled={saving || !!unresolvedCreate}
               onClick={() => onOpenSetup(selectedProject.id)}
             >
               Open project setup
             </button>
           )}
-          {(editing || (!singleAgent && !mainCheckout)) && (
+          {(editing || (!draft.promotion && !singleAgent && !mainCheckout)) && (
             <button
               className="primary"
               type="submit"

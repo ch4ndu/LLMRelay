@@ -61,6 +61,10 @@ function unresolvedTarget(
       : "the permission request was already decided, answered in the agent, or changed.";
   }
   if (target.kind === "diagnostics") return undefined;
+  // The current attention item itself is the narrow conversation identity
+  // projection. Detail revalidates ownership and generation before controls.
+  if (target.kind === "conversation") return state.projects.some((project) => project.id === target.project_id)
+    ? undefined : "the conversation's project is no longer registered.";
   if (target.kind === "project_setup") {
     const project = state.projects.find((candidate) =>
       candidate.id === target.project_id
@@ -147,6 +151,8 @@ export function attentionTargetProblem(
 // Panels mark their focus container with `data-attention-target="<kind>:<id>"`.
 const attentionMarker = (target: AttentionTarget) => {
   switch (target.kind) {
+    case "conversation":
+      return `conversation:${target.conversation_id}`;
     case "task":
       return `task:${target.task_id}`;
     case "attempt":

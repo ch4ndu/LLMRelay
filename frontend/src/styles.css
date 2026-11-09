@@ -3317,3 +3317,34 @@ details.panel > summary,
 .usage-comparisons { overflow-x: auto; }
 .usage-comparisons table { width: 100%; border-collapse: collapse; }
 .usage-comparisons th, .usage-comparisons td { text-align: left; vertical-align: top; padding: .75rem; border-bottom: 1px solid var(--line); }
+.conversation-columns {
+  display: grid;
+  grid-template-columns: minmax(13rem, 1fr) minmax(0, 3fr);
+  align-items: start;
+  gap: 1rem;
+  margin-block: 1rem;
+}
+.conversation-main, .conversation-workspace { min-width: 0; }
+.conversation-workspace .panel { margin-block: 1rem; }
+.conversation-workspace label { display: grid; gap: .4rem; margin-block: .8rem; }
+.conversation-workspace textarea, .conversation-workspace select { width: 100%; max-width: 100%; }
+.conversation-workspace pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.conversation-columns aside ul { list-style: none; padding: 0; }
+.conversation-columns aside li { margin-block: .5rem; }
+.conversation-columns aside button { text-align: start; overflow-wrap: anywhere; }
+.conversation-columns [aria-current="true"] { font-weight: 700; text-decoration: underline; }
+.conversation-history { padding-inline-start: 1.5rem; }
+.conversation-history li { margin-block: 1rem; overflow-wrap: anywhere; }
+.conversation-history p { white-space: pre-wrap; }
+.conversation-profile { border-block-start: 1px solid var(--border, #666); padding-block: 1rem; }
+@media (max-width: 760px) {
+  .conversation-columns { grid-template-columns: minmax(0, 1fr); }
+  .conversation-workspace .button-row { flex-wrap: wrap; }
+}
+
+.conversation-source-choice { display: flex; align-items: flex-start; gap: .75rem; margin-block: .75rem; }
+.conversation-source-choice > input { flex: 0 0 auto; width: auto; margin-top: .3rem; }
+.conversation-source-choice > span { min-width: 0; }
+.conversation-source-choice small { display: block; overflow-wrap: anywhere; }
+.conversation-excerpt { display: block; white-space: pre-wrap; overflow-wrap: anywhere; margin-block: .5rem; }
+.conversation-promotion { border-top: 1px solid var(--border); margin-top: 1rem; padding-top: 1rem; }

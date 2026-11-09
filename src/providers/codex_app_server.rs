@@ -13,6 +13,8 @@ pub const POLICY: &str = "conversation_read_only_v1";
 pub const SCHEMA_HASH: &str = "021462a9bacd117f4cd40c256a4888619d059cec6a65b795198d521ba660e554";
 pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_INPUT_BYTES: usize = 12 * 1024;
+pub const MAX_OPERATION_BYTES: usize = 16 * 1024;
+pub const MAX_RECEIPT_BYTES: usize = 128 * 1024;
 pub const MAX_EVENT_BYTES: usize = 16 * 1024;
 pub const MAX_EVENTS: i64 = 4096;
 pub const MAX_PROJECTION_BYTES: i64 = 4 * 1024 * 1024;
@@ -62,9 +64,226 @@ pub struct ProfileInput {
     pub instructions: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ConversationWorkspaceIdentity {
+    pub project_id: String,
+    pub storage_scope: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConversationPage<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConversationSummary {
+    pub id: String,
+    pub project_id: String,
+    pub admission_id: String,
+    pub state: String,
+    pub generation: String,
+    pub session_id: Option<String>,
+    pub reservation_state: Option<String>,
+    pub active_turn_id: Option<String>,
+    pub binding_valid: bool,
+    pub is_probe: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConversationAdmissionSummary {
+    pub id: String,
+    pub profile_revision_id: String,
+    pub recorded_state: String,
+    pub evidence_hash: Option<String>,
+    pub probe_invocation_id: Option<String>,
+    pub live_eligibility_checked: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConversationEventProjection {
+    pub sequence: i64,
+    pub kind: String,
+    pub payload: Value,
+    pub turn_id: Option<String>,
+    pub operation_id: Option<String>,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConversationRequestProjection {
+    pub generation: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub request_id: String,
+    pub method: String,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConversationDetail {
+    pub conversation: ConversationSummary,
+    pub profile: ConversationProfileRevision,
+    pub admission: ConversationAdmissionSummary,
+    pub unresolved_operation: bool,
+    pub unresolved_operation_id: Option<String>,
+    pub requests: Vec<ConversationRequestProjection>,
+    pub events: Vec<ConversationEventProjection>,
+    pub next_after: i64,
+    pub has_more: bool,
+    pub history_coverage: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ConversationMessageSource {
+    Assistant {
+        conversation_id: String,
+        turn_id: Option<String>,
+        item_id: Option<String>,
+    },
+    User {
+        conversation_id: String,
+        operation_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConversationMessageProjection {
+    pub id: String,
+    pub source: ConversationMessageSource,
+    pub first_sequence: i64,
+    pub last_sequence: i64,
+    pub text: String,
+    pub content_hash: String,
+    pub selectable: bool,
+    pub coverage: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConversationMessages {
+    pub messages: Vec<ConversationMessageProjection>,
+    pub through_sequence: i64,
+    pub history_coverage: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationSourceSelection {
+    pub message_id: String,
+    pub content_hash: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationSourceInput {
+    pub conversation_id: String,
+    pub messages: Vec<ConversationSourceSelection>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FrozenConversationMessage {
+    pub id: String,
+    pub source: ConversationMessageSource,
+    pub first_sequence: i64,
+    pub last_sequence: i64,
+    pub coverage: String,
+    pub text: String,
+    pub content_hash: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConversationSourceAttribution {
+    pub identity_hash: String,
+    pub profile_revision_id: String,
+    pub profile_hash: String,
+    pub model: String,
+    pub effort: String,
+    pub executable_version: String,
+    pub adapter_revision: String,
+    pub adapter_hash: String,
+    pub schema_hash: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConversationSourceBundle {
+    pub format_revision: u32,
+    pub project_id: String,
+    pub conversation_id: String,
+    pub attribution: ConversationSourceAttribution,
+    pub through_sequence: i64,
+    pub history_coverage: String,
+    pub messages: Vec<FrozenConversationMessage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FrozenConversationSource {
+    pub bundle: ConversationSourceBundle,
+    pub bundle_hash: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TaskSources {
+    pub project_id: String,
+    pub task_id: String,
+    pub conversation_source: Option<FrozenConversationSource>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConversationReceiptLookup {
+    pub operation_id: String,
+    pub request_hash: String,
+    pub found: bool,
+    pub kind: Option<String>,
+    pub delivery_state: Option<String>,
+    pub conversation_id: Option<String>,
+    pub generation: Option<String>,
+    pub profile_revision_id: Option<String>,
+    pub admission_id: Option<String>,
+    pub state: Option<String>,
+    pub quiescence: Option<String>,
+    pub retained_uncertainty_session_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConversationOperation {
+    WorkspaceIdentity {
+        project_id: String,
+    },
+    TaskSources {
+        project_id: String,
+        task_id: String,
+    },
+    List {
+        project_id: String,
+        cursor: Option<String>,
+    },
+    Profiles {
+        project_id: String,
+        cursor: Option<String>,
+    },
+    Admissions {
+        project_id: String,
+        cursor: Option<String>,
+    },
+    Detail {
+        project_id: String,
+        conversation_id: String,
+        after: i64,
+    },
+    Messages {
+        project_id: String,
+        conversation_id: String,
+    },
+    Receipt {
+        project_id: String,
+        operation_id: String,
+        original_request: Value,
+        request_hash: String,
+    },
     CreateProfile {
         input: ProfileInput,
     },
@@ -101,6 +320,19 @@ pub enum ConversationOperation {
         operation_id: String,
         conversation_id: String,
     },
+    InterruptTurn {
+        operation_id: String,
+        conversation_id: String,
+        expected_session_id: String,
+        expected_generation: String,
+        expected_turn_id: String,
+    },
+    DisconnectIdle {
+        operation_id: String,
+        conversation_id: String,
+        expected_session_id: String,
+        expected_generation: String,
+    },
     Resume {
         operation_id: String,
         conversation_id: String,
@@ -126,14 +358,87 @@ pub enum ConversationOperation {
 impl ConversationOperation {
     pub fn validate(&self) -> Result<()> {
         // This also caps identifiers and rejects oversized nested requests.
-        if serde_json::to_vec(self)?.len() > MAX_INPUT_BYTES + 4096 {
+        let limit = if matches!(self, Self::Receipt { .. }) {
+            MAX_RECEIPT_BYTES
+        } else {
+            MAX_OPERATION_BYTES
+        };
+        if serde_json::to_vec(self)?.len() > limit {
             bail!("Conversation request is too large; shorten the input.")
         }
+        let value = serde_json::to_value(self)?;
+        if let Some(fields) = value.as_object() {
+            for (key, value) in fields {
+                if key != "action" && key != "input" && key != "original_request" {
+                    if let Some(text) = value.as_str() {
+                        bounded(text, 128, key)?;
+                    }
+                }
+            }
+        }
         match self {
+            Self::WorkspaceIdentity { project_id } => bounded(project_id, 128, "project ID"),
+            Self::TaskSources {
+                project_id,
+                task_id,
+            } => {
+                bounded(project_id, 128, "project ID")?;
+                bounded(task_id, 128, "task ID")
+            }
+            Self::List { project_id, cursor }
+            | Self::Profiles { project_id, cursor }
+            | Self::Admissions { project_id, cursor } => {
+                bounded(project_id, 128, "project ID")?;
+                if let Some(cursor) = cursor {
+                    bounded(cursor, 128, "list cursor")?;
+                }
+                Ok(())
+            }
+            Self::Detail {
+                project_id,
+                conversation_id,
+                after,
+            } => {
+                bounded(project_id, 128, "project ID")?;
+                bounded(conversation_id, 128, "conversation ID")?;
+                if !(0..=MAX_EVENTS).contains(after) {
+                    bail!("Invalid conversation event cursor.")
+                }
+                Ok(())
+            }
+            Self::Messages {
+                project_id,
+                conversation_id,
+            } => {
+                bounded(project_id, 128, "project ID")?;
+                bounded(conversation_id, 128, "conversation ID")
+            }
+            Self::Receipt {
+                project_id,
+                operation_id,
+                request_hash,
+                ..
+            } => {
+                bounded(project_id, 128, "project ID")?;
+                bounded(operation_id, 128, "operation ID")?;
+                if request_hash.len() != 64 || !request_hash.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    bail!("Invalid conversation request hash.")
+                }
+                Ok(())
+            }
             Self::CreateProfile { input } => {
+                bounded(&input.project_id, 128, "project ID")?;
+                bounded(
+                    &input.execution_config_revision_id,
+                    128,
+                    "execution configuration ID",
+                )?;
                 bounded(&input.model, 128, "model")?;
                 bounded(&input.effort, 32, "effort")?;
-                bounded(&input.instructions, MAX_INPUT_BYTES, "instructions")?;
+                if input.instructions.len() > MAX_INPUT_BYTES || input.instructions.contains('\0') {
+                    bail!("Invalid conversation instructions; use at most 12 KiB without NUL characters.")
+                }
                 bounded(&input.operation_id, 128, "operation ID")
             }
             Self::Inspect {
@@ -162,6 +467,30 @@ impl ConversationOperation {
                 ..
             } => {
                 bounded(input, MAX_INPUT_BYTES, "message")?;
+                bounded(operation_id, 128, "operation ID")
+            }
+            Self::InterruptTurn {
+                operation_id,
+                conversation_id,
+                expected_session_id,
+                expected_generation,
+                expected_turn_id,
+            } => {
+                bounded(conversation_id, 128, "conversation ID")?;
+                bounded(expected_session_id, 128, "session ID")?;
+                bounded(expected_generation, 128, "generation")?;
+                bounded(expected_turn_id, 128, "turn ID")?;
+                bounded(operation_id, 128, "operation ID")
+            }
+            Self::DisconnectIdle {
+                operation_id,
+                conversation_id,
+                expected_session_id,
+                expected_generation,
+            } => {
+                bounded(conversation_id, 128, "conversation ID")?;
+                bounded(expected_session_id, 128, "session ID")?;
+                bounded(expected_generation, 128, "generation")?;
                 bounded(operation_id, 128, "operation ID")
             }
             Self::Prepare { operation_id, .. }

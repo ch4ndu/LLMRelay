@@ -27,6 +27,7 @@ import {
 } from "./liveState";
 import {
   type AppState,
+  type ConversationPromotion,
   type AttentionItem,
   type AttentionTarget,
   type CmuxKeyboardControlAction,
@@ -58,11 +59,13 @@ import { pendingApprovalCount } from "./components/ApprovalInbox";
 import { Workspace } from "./components/Workspace";
 import { History } from "./components/History";
 import { Recipes } from "./components/Recipes";
+import { ConversationWorkspace } from "./components/ConversationWorkspace";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { CompatibilityDetails, RoleSettings } from "./components/RoleSettings";
 import { ProviderSettings } from "./components/ProviderSettings";
 type Page =
   | "workspace"
+  | "conversations"
   | "board"
   | "recipes"
   | "roles"
@@ -71,6 +74,7 @@ type Page =
   | "diagnostics";
 const pages: Array<{ id: Page; label: string; icon: string }> = [
   { id: "workspace", label: "Workspace", icon: "◫" },
+  { id: "conversations", label: "Conversations", icon: "◌" },
   { id: "board", label: "Board", icon: "▦" },
   { id: "recipes", label: "Recipes", icon: "▤" },
   { id: "roles", label: "Projects", icon: "▣" },
@@ -373,6 +377,9 @@ export function App() {
   });
   const [error, setError] = useState("");
   const [lastSuccessfulAt, setLastSuccessfulAt] = useState("");
+  const [promotion, setPromotion] = useState<ConversationPromotion>();
+  const [sourceConversation, setSourceConversation] = useState<{ project_id: string; conversation_id: string }>();
+  const [createdTaskId, setCreatedTaskId] = useState<{ id: string; project_id?: string; after: number }>();
   const [attentionFocus, setAttentionFocus] = useState<AttentionTarget>();
   const [navigationNotice, setNavigationNotice] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
@@ -497,6 +504,16 @@ export function App() {
       window.removeEventListener("online", refreshOnReturn);
     };
   }, [refresh]);
+  useEffect(() => {
+    if (!createdTaskId || acceptedSnapshots.current <= createdTaskId.after) return;
+    const created = state.tasks.find((task) => task.id === createdTaskId.id && (!createdTaskId.project_id || task.project_id === createdTaskId.project_id));
+    if (!created) return;
+    setProject(created.project_id);
+    setSelectedId(created.id);
+    setAttentionFocus(undefined);
+    setPage("board");
+    setCreatedTaskId(undefined);
+  }, [createdTaskId, state.tasks, state.revision]);
   // A routed attention click settles in the render that routed it. Without its
   // exact marker nothing stands in: the route is withdrawn, explained and
   // refreshed once.
@@ -621,6 +638,8 @@ export function App() {
   );
   const nav = (value: Page) => {
     setPage(value);
+    setAttentionFocus(undefined);
+    setSourceConversation(undefined);
     setMenuOpen(false);
     if (value === "recipes") {
       setSelectedId(undefined);
@@ -697,6 +716,11 @@ export function App() {
     }
     setForm(undefined);
     switch (target.kind) {
+      case "conversation":
+        setPage("conversations");
+        setSourceConversation(undefined);
+        setSelectedId(undefined);
+        break;
       case "project_setup":
         setPage("roles");
         setSelectedId(undefined);
@@ -1020,6 +1044,7 @@ export function App() {
               className="primary"
               onClick={() => {
                 setEditing(undefined);
+                setPromotion(undefined);
                 setForm("new");
               }}
             >
@@ -1114,6 +1139,21 @@ export function App() {
             />
           </>
         )}
+        {page === "conversations" && (project
+          ? <ConversationWorkspace
+              key={`${state.incarnation}:${project}`}
+              projectId={project}
+              revision={state.revision}
+              execution={state.workflow_execution?.find((item) => item.project_id === project)}
+              onOpenSetup={openSetup}
+              onOpenProviders={() => nav("providers")}
+              target={attentionFocus?.kind === "conversation" && attentionFocus.project_id === project ? attentionFocus : undefined}
+              targetCurrent={attentionFocus?.kind !== "conversation" || state.attention.some((item) => item.target?.kind === "conversation" && JSON.stringify(item.target) === JSON.stringify(attentionFocus))}
+              onLeaveTarget={() => setAttentionFocus(undefined)}
+              sourceConversationId={sourceConversation?.project_id === project ? sourceConversation.conversation_id : undefined}
+              onPromote={(input) => { setPromotion(input); setEditing(undefined); setForm("new"); }}
+            />
+          : <section className="panel"><h1>Conversations</h1><p>Choose a project in the project selector to open its conversations and admission setup.</p></section>)}
         {page === "recipes" && (
           <Recipes
             key={project || "all"}
@@ -1309,6 +1349,10 @@ export function App() {
             setSelectedId(undefined);
             openSetup(projectId);
           }}
+          onOpenConversation={(projectId, conversationId) => {
+            setSelectedId(undefined); setAttentionFocus(undefined); setProject(projectId);
+            setSourceConversation({ project_id: projectId, conversation_id: conversationId }); setPage("conversations");
+          }}
           onTaskAction={openTaskAction}
           onOpenRecoveryRecord={(attemptId, recoveryId) =>
             openRecoveryRecord(selected.id, attemptId, recoveryId)}
@@ -1322,10 +1366,18 @@ export function App() {
           projects={state.projects}
           selectedProjectId={project}
           editing={editing}
-          onClose={() => setForm(undefined)}
-          onSaved={() => {
+          promotion={form === "new" ? promotion : undefined}
+          onClose={() => { setForm(undefined); setPromotion(undefined); }}
+          onSaved={(taskId, projectId) => {
             setForm(undefined);
-            void refresh();
+            setPromotion(undefined);
+            if (taskId) {
+              const before = acceptedSnapshots.current;
+              setCreatedTaskId({ id: taskId, project_id: projectId, after: before });
+              void refresh().then(() => {
+                if (acceptedSnapshots.current <= before) setNavigationNotice("The task was saved. Refresh the dashboard to load and open its exact returned task ID.");
+              }).catch(() => setNavigationNotice("The task was saved, but refresh failed. Refresh the dashboard to open its exact returned task ID."));
+            } else void refresh();
           }}
           onOpenSetup={openSetup}
           workflowExecution={state.workflow_execution}

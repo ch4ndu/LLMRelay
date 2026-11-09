@@ -1240,6 +1240,7 @@ export type WorkflowCommand =
     acceptance_criteria: string[];
     priority: number;
     selection?: TaskWorkflowSelectionInput | null;
+    conversation_source?: ConversationSourceInput;
   }
   | {
     /** Bound to the session and transcript epoch the person reviewed. */
@@ -1564,7 +1565,9 @@ export interface TaskAttentionTarget {
   task_id: string;
   task_version: number;
 }
+export type ConversationAttentionTarget = { kind: "conversation"; project_id: string; conversation_id: string; generation: string; request_id: string | null; turn_id: string | null; operation_id: string | null };
 export type AttentionTarget =
+  | ConversationAttentionTarget
   | ({ kind: "task" } & TaskAttentionTarget)
   | {
     kind: "attempt";
@@ -2171,6 +2174,142 @@ export type Command = Record<string, unknown> & {
   operation_id: string;
 };
 export type Operation = Record<string, unknown> & { kind: string };
+export interface ConversationProfile {
+  id: string;
+  project_id: string;
+  execution_config_revision_id: string;
+  model: string;
+  effort: string;
+  instructions: string;
+  instructions_hash: string;
+  profile_hash: string;
+}
+export interface ConversationAdmission {
+  id: string;
+  profile_revision_id: string;
+  recorded_state: string;
+  evidence_hash: string | null;
+  probe_invocation_id: string | null;
+  live_eligibility_checked: boolean;
+}
+export interface ConversationSummary {
+  id: string;
+  project_id: string;
+  admission_id: string;
+  state: string;
+  generation: string;
+  session_id: string | null;
+  reservation_state: string | null;
+  active_turn_id: string | null;
+  binding_valid: boolean;
+  is_probe: boolean;
+  created_at: string;
+  updated_at: string;
+}
+export interface ConversationPage<T> { items: T[]; next_cursor: string | null }
+export interface ConversationEvent {
+  sequence: number;
+  kind: string;
+  payload: Record<string, unknown>;
+  turn_id: string | null;
+  operation_id: string | null;
+  observed_at: string;
+}
+export interface ConversationDetail {
+  conversation: ConversationSummary;
+  profile: ConversationProfile;
+  admission: ConversationAdmission;
+  unresolved_operation: boolean;
+  unresolved_operation_id: string | null;
+  requests: Array<{ generation: string; thread_id: string; turn_id: string; request_id: string; method: string; state: string }>;
+  events: ConversationEvent[];
+  next_after: number;
+  has_more: boolean;
+  history_coverage: string;
+}
+export type ConversationMessageSource =
+  | { kind: "assistant"; conversation_id: string; turn_id: string | null; item_id: string | null }
+  | { kind: "user"; conversation_id: string; operation_id: string };
+export interface ConversationMessage {
+  id: string;
+  source: ConversationMessageSource;
+  first_sequence: number;
+  last_sequence: number;
+  text: string;
+  content_hash: string;
+  selectable: boolean;
+  coverage: string;
+}
+export interface ConversationSourceInput {
+  conversation_id: string;
+  messages: Array<{ message_id: string; content_hash: string }>;
+}
+export interface ConversationPromotion {
+  project_id: string;
+  source: ConversationSourceInput;
+  previews: ConversationMessage[];
+  original_request: string;
+}
+export interface TaskSources {
+  project_id: string;
+  task_id: string;
+  conversation_source: null | {
+    bundle_hash: string;
+    bundle: {
+      format_revision: number; project_id: string; conversation_id: string;
+      attribution: { identity_hash: string; profile_revision_id: string; profile_hash: string; model: string; effort: string; executable_version: string; adapter_revision: string; adapter_hash: string; schema_hash: string };
+      through_sequence: number; history_coverage: string;
+      messages: Array<Omit<ConversationMessage, "selectable">>;
+    };
+  };
+}
+export interface ConversationMessages {
+  messages: ConversationMessage[];
+  through_sequence: number;
+  history_coverage: string;
+}
+export type ConversationMutation =
+  | { action: "create_profile"; input: { operation_id: string; project_id: string; execution_config_revision_id: string; model: string; effort: string; instructions: string } }
+  | { action: "prepare"; operation_id: string; profile_revision_id: string }
+  | { action: "probe"; operation_id: string; admission_id: string }
+  | { action: "activate"; operation_id: string; admission_id: string; evidence_hash: string }
+  | { action: "start"; operation_id: string; admission_id: string; input: string }
+  | { action: "submit"; operation_id: string; conversation_id: string; input: string }
+  | { action: "steer"; operation_id: string; conversation_id: string; expected_turn_id: string; input: string }
+  | { action: "interrupt_turn"; operation_id: string; conversation_id: string; expected_session_id: string; expected_generation: string; expected_turn_id: string }
+  | { action: "disconnect_idle"; operation_id: string; conversation_id: string; expected_session_id: string; expected_generation: string }
+  | { action: "resume" | "reconcile"; operation_id: string; conversation_id: string };
+export interface ConversationWorkspaceIdentity {
+  project_id: string;
+  storage_scope: string;
+}
+export type ConversationRead =
+  | { action: "workspace_identity"; project_id: string }
+  | { action: "list" | "profiles" | "admissions"; project_id: string; cursor: string | null }
+  | { action: "detail"; project_id: string; conversation_id: string; after: number }
+  | { action: "task_sources"; project_id: string; task_id: string }
+  | { action: "messages"; project_id: string; conversation_id: string }
+  | { action: "receipt"; project_id: string; operation_id: string; original_request: ConversationMutation; request_hash: string };
+export interface ConversationMutationResult {
+  state?: string;
+  conversation_id?: string;
+  admission_id?: string;
+  profile?: ConversationProfile;
+}
+export interface ConversationReceipt {
+  operation_id: string;
+  request_hash: string;
+  found: boolean;
+  kind: string | null;
+  delivery_state: string | null;
+  conversation_id: string | null;
+  generation: string | null;
+  profile_revision_id: string | null;
+  admission_id: string | null;
+  state: string | null;
+  quiescence: string | null;
+  retained_uncertainty_session_id?: string | null;
+}
 export const ROLES: Role[] = [
   "manager",
   "explorer",

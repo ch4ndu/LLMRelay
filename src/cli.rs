@@ -2253,6 +2253,7 @@ async fn run_workflow(args: WorkflowArgs) -> Result<()> {
             acceptance_criteria: criteria,
             priority,
             selection: selection.selection()?,
+            conversation_source: None,
         },
         WorkflowCliCommand::SetTaskWorkflow {
             task,

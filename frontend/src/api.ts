@@ -37,6 +37,11 @@ import type {
   GuidanceReauthorizationPreview,
 } from "./types";
 import { ROLES } from "./types";
+import type {
+  ConversationAdmission, ConversationDetail, ConversationMessages, ConversationMutation,
+  ConversationMutationResult, ConversationPage, ConversationProfile, ConversationRead,
+  ConversationReceipt, ConversationSummary, ConversationWorkspaceIdentity,
+} from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -376,6 +381,9 @@ const taskTargetIsCurrent = (value: unknown) =>
   Number.isInteger(field(value, "task_version"));
 const attentionTargetIsCurrent = (value: unknown): boolean => {
   switch (field(value, "kind")) {
+    case "conversation":
+      return hasStrings(value, ["project_id", "conversation_id", "generation"]) &&
+        ["request_id", "turn_id", "operation_id"].every((key) => hasNullableString(value, key));
     case "task":
       return taskTargetIsCurrent(value);
     case "attempt":
@@ -1219,6 +1227,126 @@ const featureOperation = async <T>(
   }
   return response.result;
 };
+
+const nullableText = (value: unknown): boolean => value === null || typeof value === "string";
+const conversationProfileIsCurrent = (value: unknown): value is ConversationProfile =>
+  hasStrings(value, ["id", "project_id", "execution_config_revision_id", "model", "effort", "instructions", "instructions_hash", "profile_hash"]);
+const conversationAdmissionIsCurrent = (value: unknown): value is ConversationAdmission =>
+  hasStrings(value, ["id", "profile_revision_id", "recorded_state"]) &&
+  ["evidence_hash", "probe_invocation_id"].every((key) => nullableText(field(value, key))) &&
+  typeof field(value, "live_eligibility_checked") === "boolean";
+const conversationSummaryIsCurrent = (value: unknown): value is ConversationSummary =>
+  hasStrings(value, ["id", "project_id", "admission_id", "state", "generation", "created_at", "updated_at"]) &&
+  ["session_id", "reservation_state", "active_turn_id"].every((key) => nullableText(field(value, key))) &&
+  ["binding_valid", "is_probe"].every((key) => typeof field(value, key) === "boolean");
+
+export function conversationMutationIsCurrent(value: unknown): value is ConversationMutation {
+  const action = field(value, "action");
+  if (action === "create_profile") return hasStrings(field(value, "input"),
+    ["operation_id", "project_id", "execution_config_revision_id", "model", "effort", "instructions"]);
+  if (!hasStrings(value, ["operation_id"])) return false;
+  switch (action) {
+    case "prepare": return hasStrings(value, ["profile_revision_id"]);
+    case "probe": return hasStrings(value, ["admission_id"]);
+    case "activate": return hasStrings(value, ["admission_id", "evidence_hash"]);
+    case "start": return hasStrings(value, ["admission_id", "input"]);
+    case "submit": return hasStrings(value, ["conversation_id", "input"]);
+    case "steer": return hasStrings(value, ["conversation_id", "expected_turn_id", "input"]);
+    case "interrupt_turn": return hasStrings(value, ["conversation_id", "expected_session_id", "expected_generation", "expected_turn_id"]);
+    case "disconnect_idle": return hasStrings(value, ["conversation_id", "expected_session_id", "expected_generation"]);
+    case "resume": case "reconcile": return hasStrings(value, ["conversation_id"]);
+    default: return false;
+  }
+}
+interface ConversationReadResults {
+  workspace_identity: ConversationWorkspaceIdentity;
+  list: ConversationPage<ConversationSummary>;
+  profiles: ConversationPage<ConversationProfile>;
+  admissions: ConversationPage<ConversationAdmission>;
+  detail: ConversationDetail;
+  messages: ConversationMessages;
+  task_sources: import("./types").TaskSources;
+  receipt: ConversationReceipt;
+}
+function conversationReadIsCurrent(action: ConversationRead["action"], value: unknown): boolean {
+  if (action === "workspace_identity") return hasStrings(value, ["project_id", "storage_scope"]) &&
+    /^[a-f0-9]{64}$/.test(String(field(value, "storage_scope")));
+  if (action === "list" || action === "profiles" || action === "admissions") {
+    const items = field(value, "items");
+    const valid = action === "list" ? conversationSummaryIsCurrent : action === "profiles" ? conversationProfileIsCurrent : conversationAdmissionIsCurrent;
+    return Array.isArray(items) && items.length <= 50 && items.every(valid) && nullableText(field(value, "next_cursor"));
+  }
+  if (action === "receipt") return hasStrings(value, ["operation_id", "request_hash"]) &&
+    typeof field(value, "found") === "boolean" &&
+    ["kind", "delivery_state", "conversation_id", "generation", "profile_revision_id", "admission_id", "state", "quiescence"].every((key) => nullableText(field(value, key))) &&
+    (field(value, "retained_uncertainty_session_id") === undefined || nullableText(field(value, "retained_uncertainty_session_id")));
+  if (action === "task_sources") {
+    const frozen = field(value, "conversation_source");
+    if (!hasStrings(value, ["project_id", "task_id"])) return false;
+    if (frozen === null) return true;
+    const bundle = field(frozen, "bundle"), messages = field(bundle, "messages");
+    return hasStrings(frozen, ["bundle_hash"]) && hasStrings(bundle, ["project_id", "conversation_id", "history_coverage"]) &&
+      isNonNegativeInteger(field(bundle, "format_revision")) && isNonNegativeInteger(field(bundle, "through_sequence")) &&
+      hasStrings(field(bundle, "attribution"), ["identity_hash", "profile_revision_id", "profile_hash", "model", "effort", "executable_version", "adapter_revision", "adapter_hash", "schema_hash"]) &&
+      Array.isArray(messages) && messages.length <= 16 && messages.every((message) =>
+        hasStrings(message, ["id", "text", "content_hash", "coverage"]) &&
+        ["first_sequence", "last_sequence"].every((key) => isNonNegativeInteger(field(message, key))) &&
+        hasStrings(field(message, "source"), ["conversation_id"]) &&
+        (field(field(message, "source"), "kind") === "user" ? hasStrings(field(message, "source"), ["operation_id"]) :
+          field(field(message, "source"), "kind") === "assistant" && ["turn_id", "item_id"].every((key) => nullableText(field(field(message, "source"), key)))));
+  }
+  if (action === "messages") {
+    const messages = field(value, "messages");
+    return Array.isArray(messages) && messages.every((message) => {
+      const source = field(message, "source");
+      return hasStrings(message, ["id", "text", "content_hash", "coverage"]) &&
+        ["first_sequence", "last_sequence"].every((key) => isNonNegativeInteger(field(message, key))) &&
+        typeof field(message, "selectable") === "boolean" && hasStrings(source, ["conversation_id"]) &&
+        (field(source, "kind") === "user" ? hasStrings(source, ["operation_id"]) :
+          field(source, "kind") === "assistant" && ["turn_id", "item_id"].every((key) => nullableText(field(source, key))));
+    }) && isNonNegativeInteger(field(value, "through_sequence")) && hasStrings(value, ["history_coverage"]);
+  }
+  const events = field(value, "events"), requests = field(value, "requests");
+  return conversationSummaryIsCurrent(field(value, "conversation")) &&
+    conversationProfileIsCurrent(field(value, "profile")) && conversationAdmissionIsCurrent(field(value, "admission")) &&
+    typeof field(value, "unresolved_operation") === "boolean" && nullableText(field(value, "unresolved_operation_id")) && typeof field(value, "has_more") === "boolean" &&
+    isNonNegativeInteger(field(value, "next_after")) && hasStrings(value, ["history_coverage"]) &&
+    Array.isArray(requests) && requests.every((request) => hasStrings(request, ["generation", "thread_id", "turn_id", "request_id", "method", "state"])) &&
+    Array.isArray(events) && events.length <= 50 && events.every((event) =>
+      isNonNegativeInteger(field(event, "sequence")) && hasStrings(event, ["kind", "observed_at"]) &&
+      ["turn_id", "operation_id"].every((key) => nullableText(field(event, key))) &&
+      typeof field(event, "payload") === "object" && field(event, "payload") !== null && !Array.isArray(field(event, "payload")));
+}
+export function conversationRead<T extends ConversationRead>(operation: T): Promise<ConversationReadResults[T["action"]]> {
+  return featureOperation("conversation_v1", { kind: "conversation", operation },
+    (value): value is ConversationReadResults[T["action"]] => conversationReadIsCurrent(operation.action, value));
+}
+export async function prepareConversationMutation(operation: ConversationMutation): Promise<void> {
+  if (!conversationMutationIsCurrent(operation)) throw new Error("The conversation request is invalid. Review its fields before sending.");
+  const encoder = new TextEncoder();
+  if (encoder.encode(JSON.stringify(operation)).length > 16384) throw new Error("The serialized conversation request exceeds 16 KiB. Shorten the input before sending.");
+  const fields = operation.action === "create_profile" ? operation.input : operation;
+  for (const [key, value] of Object.entries(fields)) {
+    if (typeof value === "string" && key !== "action" && key !== "instructions" && key !== "input" &&
+      (!value.trim() || value.includes("\0") || encoder.encode(value).length > (key === "effort" ? 32 : 128))) {
+      throw new Error("The conversation request contains an invalid identifier. Review its fields before sending.");
+    }
+  }
+  const descriptor = negotiated ?? await negotiate();
+  if (!descriptor.supported_features.includes("conversation_v1")) throw new ProtocolError(
+    `This service version does not support conversations. ${PROTOCOL_GUIDANCE}`, "missing_required_feature");
+  const input = operation.action === "create_profile" ? operation.input.instructions : "input" in operation ? operation.input : undefined;
+  if (input !== undefined && ((operation.action !== "create_profile" && !input.trim()) || input.includes("\0") || encoder.encode(input).length > 12288)) {
+    throw new Error("Enter a message or instructions within the 12 KiB limit before sending.");
+  }
+}
+export function conversationMutate(operation: ConversationMutation): Promise<ConversationMutationResult> {
+  return preserveMutationIdentity(featureOperation("conversation_v1", { kind: "conversation", operation },
+    (value): value is ConversationMutationResult => typeof value === "object" && value !== null && !Array.isArray(value) &&
+      ["state", "conversation_id", "admission_id"].every((key) => field(value, key) === undefined || typeof field(value, key) === "string") &&
+      (field(value, "profile") === undefined || conversationProfileIsCurrent(field(value, "profile")))),
+    operation.action === "create_profile" ? operation.input.operation_id : operation.operation_id);
+}
 const transcriptPageIsCurrent = (value: unknown): value is TranscriptPage => {
   const frames = field(value, "frames");
   return Array.isArray(frames) &&

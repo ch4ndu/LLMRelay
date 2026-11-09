@@ -11,6 +11,7 @@ import {
   operation,
   reuseOperationIdentity,
   taskActivity,
+  conversationRead,
 } from "../api";
 import {
   type AppState,
@@ -24,6 +25,7 @@ import {
   ROLES,
   type Session,
   type Task,
+  type TaskSources,
   type TaskAction,
   type TaskProgress,
 } from "../types";
@@ -253,6 +255,7 @@ export function TaskDetail(
     onClose,
     onChanged,
     onOpenSetup = () => {},
+    onOpenConversation,
     onTaskAction,
     onOpenRecoveryRecord,
     onOpenPermission,
@@ -278,6 +281,7 @@ export function TaskDetail(
     onClose: () => void;
     onChanged: () => void;
     onOpenSetup?: (projectId: string) => void;
+    onOpenConversation?: (projectId: string, conversationId: string) => void;
     /** Opens `itemId`, or the action's primary item, exactly. */
     onTaskAction?: (action: TaskAction, itemId?: string) => void;
     /** Opens this task's exact recovery record, or returns why it cannot. */
@@ -299,6 +303,24 @@ export function TaskDetail(
     ) => Promise<CmuxViewOutcome>;
   },
 ) {
+  const [sources, setSources] = useState<TaskSources>();
+  const [sourcesError, setSourcesError] = useState("");
+  const [sourcesRetry, setSourcesRetry] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    setSources(undefined); setSourcesError("");
+    void conversationRead({ action: "task_sources", project_id: task.project_id, task_id: task.id }).then((result) => {
+      if (cancelled) return;
+      if (result.project_id !== task.project_id || result.task_id !== task.id ||
+        (result.conversation_source && result.conversation_source.bundle.project_id !== task.project_id)) {
+        throw new Error("Saved source ownership could not be confirmed for this task. Refresh to try again.");
+      }
+      setSources(result);
+    }).catch((cause: unknown) => { if (!cancelled) setSourcesError(cause instanceof Error ? cause.message : String(cause)); });
+    return () => { cancelled = true; };
+  }, [task.project_id, task.id, sourcesRetry]);
+  const currentSources = sources?.task_id === task.id && sources.project_id === task.project_id ? sources : undefined;
+  const frozenSource = currentSources?.conversation_source;
   const [localTab, setLocalTab] = useState<TaskTab>("overview");
   // A role-settings route shows Roles in the same render, so the focus that
   // follows the route finds the role; choosing any tab ends that override.
@@ -1214,6 +1236,7 @@ export function TaskDetail(
           onChanged={onChanged}
           onOpenPlan={openPlan}
         />
+        {frozenSource && <p className="hint">Make Ready validates the task’s current workflow setup. A setup refusal leaves this draft unchanged. After admission, conversation capacity may delay Ready work until the session is disconnected; releasing capacity can start queued work when pickup is enabled.</p>}
         <WorkflowControls
           task={task}
           project={project}
@@ -2055,7 +2078,19 @@ export function TaskDetail(
           role="tabpanel"
           aria-labelledby={`task-tab-${tab}`}
         >
-          {tab === "overview" && overview}
+          {tab === "overview" && <>{overview}
+            <section className="panel" aria-label="Saved conversation sources">
+              <h3>Conversation source</h3>
+              {sourcesError ? <><ErrorNotice error={sourcesError} /><button onClick={() => setSourcesRetry((value) => value + 1)}>Retry saved sources</button></> : !currentSources ? <p role="status">Loading immutable saved sources…</p> : !frozenSource ? <p>No saved conversation source is linked to this task.</p> : <>
+                <p>Frozen reference material saved with this task. Later conversation activity and task edits do not change these excerpts.</p>
+                <button disabled={!onOpenConversation} onClick={() => onOpenConversation?.(task.project_id, frozenSource.bundle.conversation_id)}>Open exact source conversation</button>
+                <p>{frozenSource.bundle.attribution.model} · {frozenSource.bundle.attribution.effort} · {frozenSource.bundle.history_coverage}</p>
+                {!frozenSource.bundle.messages.length && <p>No source messages selected; the source conversation link is saved.</p>}
+                {frozenSource.bundle.messages.map((message) => <article key={message.id}><strong>{message.source.kind === "user" ? "You" : "Assistant"}</strong><p className="conversation-excerpt">{message.text}</p><small>{message.coverage} · sequence {message.first_sequence}–{message.last_sequence}</small><details><summary>Immutable message identity</summary><pre>{JSON.stringify({ id: message.id, source: message.source, content_hash: message.content_hash }, null, 2)}</pre></details></article>)}
+                <details><summary>Frozen profile, adapter and coverage metadata</summary><pre>{JSON.stringify({ project_id: frozenSource.bundle.project_id, conversation_id: frozenSource.bundle.conversation_id, format_revision: frozenSource.bundle.format_revision, through_sequence: frozenSource.bundle.through_sequence, history_coverage: frozenSource.bundle.history_coverage, attribution: frozenSource.bundle.attribution, bundle_hash: frozenSource.bundle_hash }, null, 2)}</pre></details>
+              </>}
+            </section>
+          </>}
           {tab === "changes" && changes}
           {tab === "checks" && checksTab}
           {tab === "roles" && roles}

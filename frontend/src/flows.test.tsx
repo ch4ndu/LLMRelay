@@ -22746,3 +22746,20 @@ Deno.test("Approval journal clears a definite refusal of a new request before a 
     localStorage.clear();
   }
 });
+
+Deno.test("Conversation preflight rejects JSON expansion and invalid identifiers before transport", async () => {
+  const { prepareConversationMutation } = await import("./api");
+  let requests = 0;
+  globalThis.fetch = (async () => { requests++; throw new Error("unexpected transport"); }) as typeof fetch;
+  try {
+    for (const request of [
+      { action: "start" as const, operation_id: "size", admission_id: "a", input: '"'.repeat(10000) },
+      { action: "submit" as const, operation_id: "control", conversation_id: "c", input: "\u0001".repeat(3000) },
+      { action: "resume" as const, operation_id: "id", conversation_id: "c".repeat(129) },
+    ]) {
+      let refused = false;
+      try { await prepareConversationMutation(request); } catch { refused = true; }
+      check(refused && requests === 0, "invalid serialized input reached transport");
+    }
+  } finally { globalThis.fetch = nativeFetch; }
+});

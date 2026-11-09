@@ -1140,6 +1140,67 @@ impl Supervisor {
         Ok(false)
     }
 
+    pub(crate) fn disconnect_idle_conversation(
+        &self,
+        operation: &str,
+        request: &serde_json::Value,
+        conversation: &str,
+        session: &str,
+        generation: &str,
+    ) -> Result<serde_json::Value> {
+        if let Some(receipt) = self.store.conversation_receipt(operation, request)? {
+            return Ok(receipt);
+        }
+        let handle = self.handle(session)?;
+        let _boundary = handle
+            .io_boundary
+            .lock()
+            .map_err(|_| anyhow!("Conversation I/O unavailable"))?;
+        let mut first_stop = handle
+            .first_stop_requested_at
+            .lock()
+            .map_err(|_| anyhow!("Conversation stop state unavailable"))?;
+        if handle.owner != SessionOwner::Conversation(conversation.into())
+            || handle.transcript_epoch != generation
+            || first_stop.is_some()
+        {
+            bail!("The conversation session changed or is already stopping. Refresh and inspect its outcome.")
+        }
+        self.verify_process(&handle)?;
+        let (result, fresh) = self.store.conversation_reserve_disconnect(
+            operation,
+            request,
+            conversation,
+            session,
+            generation,
+            &serde_json::to_string(&handle.process)?,
+        )?;
+        if !fresh {
+            return Ok(result);
+        }
+        // Reserve in memory before either verification or delivery can fail.
+        // EOF cleanup and replay also consult the durable disconnect receipt.
+        *first_stop = Some(std::time::Instant::now());
+        let delivered = self
+            .verify_process(&handle)
+            .and_then(|()| {
+                // The same managed group has just been verified under its I/O boundary.
+                if unsafe { libc::kill(-handle.process.process_group_id, libc::SIGINT) } != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("disconnect verified idle conversation");
+                }
+                Ok(())
+            })
+            .is_ok();
+        self.store
+            .conversation_disconnect_delivery(operation, delivered)?;
+        self.store
+            .conversation_receipt(operation, request)?
+            .context(
+            "Disconnect receipt is unavailable; refresh and inspect before taking another action.",
+        )
+    }
+
     // Only the existing stdout reader completes these requests. Waiter cancellation
     // leaves the exact generation and RPC ownership in this registry.
     #[cfg(test)]
@@ -3213,6 +3274,11 @@ impl Supervisor {
     }
 
     pub fn interrupt_once(&self, session_id: &str) -> Result<InterruptOutcome> {
+        // An intentional disconnect has its own durable one-delivery boundary,
+        // including a failed signal. Transport cleanup must never retry it.
+        if self.store.conversation_disconnect_owns_stop(session_id)? {
+            return Ok(InterruptOutcome::AlreadyRequested);
+        }
         let handle = self.handle(session_id)?;
         let mut first_stop = handle
             .first_stop_requested_at

@@ -6565,7 +6565,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
             .map(|project| project.id.clone())
             .collect::<Vec<_>>(),
     )?;
-    let attention = AttentionSources {
+    let mut attention = AttentionSources {
         projects: &projects,
         workflow_execution: &workflow_execution,
         tasks: &tasks,
@@ -6580,6 +6580,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         codex_capacity: &codex_capacity,
     }
     .items();
+    attention.extend(crate::store::conversation_attention_in(&connection)?);
     let task_actions = crate::domain::task_actions(&attention);
     for task in &mut tasks {
         task.progress = task_progress(&connection, task, &decisions, &task_actions, &attention)?;
@@ -15695,6 +15696,7 @@ pub fn execute_workflow_command(
             acceptance_criteria,
             priority,
             selection,
+            conversation_source,
             ..
         } => {
             let (settings, default_family): (String, String) = transaction
@@ -15721,6 +15723,12 @@ pub fn execute_workflow_command(
                 ),
             };
             let defaults: serde_json::Value = serde_json::from_str(&settings)?;
+            let source = conversation_source
+                .as_ref()
+                .map(|input| {
+                    crate::store::freeze_conversation_source_in(&transaction, project_id, input)
+                })
+                .transpose()?;
             let id = insert_task_rows(
                 &transaction,
                 project_id,
@@ -15740,6 +15748,12 @@ pub fn execute_workflow_command(
                 }
                 None => 1,
             };
+            if let Some(source) = source {
+                transaction.execute(
+                    "INSERT INTO task_conversation_sources(task_id,bundle_json,bundle_hash) VALUES(?1,?2,?3)",
+                    params![id, serde_json::to_string(&source.bundle)?, source.bundle_hash],
+                )?;
+            }
             let mut created = result(operation_id, "task", id, Some(version), "created");
             created.detail = serde_json::json!({"family": family});
             created
@@ -17091,6 +17105,12 @@ fn draft_deletion_blocker(connection: &Connection, task_id: &str) -> Result<Opti
         Some("Restore this archived draft before deleting it.".into())
     } else if depended_on {
         Some("Other tasks depend on this draft. Remove those dependencies in each task's Changes tab before deleting it.".into())
+    } else if connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_conversation_sources WHERE task_id=?1)",
+        [task_id],
+        |row| row.get::<_, bool>(0),
+    )? {
+        Some("This draft has immutable conversation sources and cannot be deleted. Use Archive when available to keep its source history.".into())
     } else if history {
         Some("This draft has saved comments, verification or scheduling history and cannot be deleted. Keep it in task history, or use Archive when available to remove it from the board.".into())
     } else {

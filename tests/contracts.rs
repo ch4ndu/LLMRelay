@@ -1407,6 +1407,196 @@ struct Fixture {
     synthetic_bundles: Option<agenticjira::provider_compatibility::BundleSet>,
 }
 
+#[test]
+fn conversation_promotion_is_atomic_replayable_and_frozen() {
+    let fixture = Fixture::new("conversation-promotion").with_synthetic_claude();
+    let connection = fixture.connection();
+    connection.execute_batch("INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+        VALUES('cp','Conversation','/synthetic/repository','promotion-repository','head','now','now'),
+              ('foreign','Foreign','/synthetic/foreign','foreign-repository','head','now','now');
+        INSERT INTO execution_config_revisions(id,project_id,revision,config_json,content_hash,approved_at,created_at)
+        VALUES('ce','cp',1,'{}','config','now','now');
+        INSERT INTO conversation_profiles(id,project_id,execution_config_revision_id,profile_json,profile_hash,created_at)
+        VALUES('cr','cp','ce','{}','profile','now');
+        INSERT INTO conversation_admissions(id,profile_revision_id,identity_json,identity_hash,state,created_at,updated_at)
+        VALUES('ca','cr','{}','identity','active','now','now');
+        INSERT INTO conversations(id,project_id,admission_id,identity_json,identity_hash,generation,native_thread_id,state,created_at,updated_at)
+        VALUES('cc','cp','ca','{}','identity','generation','thread','idle','now','now');
+        INSERT INTO conversation_events(conversation_id,sequence,generation,native_thread_id,native_turn_id,kind,payload_json,observed_at)
+        VALUES('cc',1,'generation','thread','turn','agent_message','{\"item_id\":\"item\",\"delta\":\"frozen answer\"}','now'),
+              ('cc',2,'generation','thread','turn','turn_completed','{\"status\":\"completed\"}','now');").unwrap();
+    let identity = serde_json::json!({
+        "executable":{"canonical_path":"/private/provider","device":1,"inode":2,"bytes":3,"modified_seconds":0,"modified_nanos":0},
+        "executable_version":"synthetic-version","schema_hash":"schema","adapter_revision":"adapter","adapter_hash":"adapter-hash",
+        "profile":{"id":"cr","project_id":"cp","execution_config_revision_id":"ce","model":"model","effort":"medium",
+            "instructions":"private instructions","instructions_hash":"instructions","profile_hash":"profile"},
+        "repository_identity":"promotion-repository","repository_root":"/private/repository","guidance_hash":"guidance",
+        "execution_config_hash":"config","policy_hash":"policy","credential_contract":"private-contract",
+        "configuration_hash":"configuration","release_binding":"release","instance_id":"instance","restore_epoch":"epoch"
+    });
+    connection
+        .execute(
+            "UPDATE conversations SET identity_json=?1 WHERE id='cc'",
+            [identity.to_string()],
+        )
+        .unwrap();
+    let app = single_agent_application(&fixture);
+    let preview = app
+        .conversation_operation(
+            serde_json::from_value(serde_json::json!({
+                "action":"messages","project_id":"cp","conversation_id":"cc"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let request = serde_json::json!({"kind":"create_task","operation_id":"promote","project_id":"cp",
+        "title":"Promoted draft","description":"Editable","acceptance_criteria":["Done"],"priority":0,
+        "selection":{"family":"trip"},"conversation_source":{"conversation_id":"cc","messages":[{
+            "message_id":preview["messages"][0]["id"],"content_hash":preview["messages"][0]["content_hash"]}]}});
+    let before = fixture.scalar::<i64>("SELECT COUNT(*) FROM tasks");
+    let mut foreign = request.clone();
+    foreign["operation_id"] = "foreign-promotion".into();
+    foreign["project_id"] = "foreign".into();
+    assert!(workflow_command(&fixture, foreign)
+        .unwrap_err()
+        .to_string()
+        .contains("project"));
+    let mut bad_hash = request.clone();
+    bad_hash["operation_id"] = "bad-hash".into();
+    bad_hash["conversation_source"]["messages"][0]["content_hash"] = "0".repeat(64).into();
+    assert!(workflow_command(&fixture, bad_hash)
+        .unwrap_err()
+        .to_string()
+        .contains("changed"));
+    assert_eq!(fixture.scalar::<i64>("SELECT COUNT(*) FROM tasks"), before);
+    let created = workflow_command(&fixture, request.clone()).unwrap();
+    let read = || {
+        serde_json::to_value(
+            fixture
+                .store
+                .task_sources("cp", &created.entity_id)
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let frozen = read();
+    let bundle = &frozen["conversation_source"]["bundle"];
+    assert_eq!(bundle["messages"][0]["text"], "frozen answer");
+    assert_eq!(bundle["messages"][0]["first_sequence"], 1);
+    assert_eq!(bundle["attribution"]["model"], "model");
+    assert_eq!(bundle["format_revision"], 1);
+    let typed: agenticjira::providers::codex_app_server::ConversationSourceBundle =
+        serde_json::from_value(bundle.clone()).unwrap();
+    assert_eq!(
+        frozen["conversation_source"]["bundle_hash"],
+        agenticjira::store::json_hash(&typed).unwrap()
+    );
+    assert!(!frozen.to_string().contains("/private/"));
+    assert!(!frozen.to_string().contains("private instructions"));
+    assert!(fixture
+        .store
+        .task_sources("foreign", &created.entity_id)
+        .is_err());
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE operation_id='promote'",
+        1_i64,
+    );
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='promote'",
+        1_i64,
+    );
+    connection.execute_batch("INSERT INTO conversation_events(conversation_id,sequence,generation,native_thread_id,native_turn_id,kind,payload_json,observed_at)
+        VALUES('cc',3,'generation','thread','turn','agent_message','{\"item_id\":\"item\",\"delta\":\" later activity\"}','later');").unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET description='Edited' WHERE id=?1",
+            [&created.entity_id],
+        )
+        .unwrap();
+    assert_eq!(read(), frozen);
+    assert_eq!(
+        workflow_command(&fixture, request.clone())
+            .unwrap()
+            .entity_id,
+        created.entity_id
+    );
+    let mut changed = request.clone();
+    changed["title"] = "Changed replay".into();
+    assert!(workflow_command(&fixture, changed).is_err());
+    assert!(connection
+        .execute(
+            "UPDATE task_conversation_sources SET bundle_hash='changed' WHERE task_id=?1",
+            [&created.entity_id]
+        )
+        .is_err());
+    assert!(connection
+        .execute(
+            "DELETE FROM task_conversation_sources WHERE task_id=?1",
+            [&created.entity_id]
+        )
+        .is_err());
+    assert!(connection
+        .execute("DELETE FROM tasks WHERE id=?1", [&created.entity_id])
+        .unwrap_err()
+        .to_string()
+        .contains("frozen conversation sources"));
+    let mut empty = request.clone();
+    empty["operation_id"] = "empty-promotion".into();
+    empty["conversation_source"]["messages"] = serde_json::json!([]);
+    let linked = workflow_command(&fixture, empty).unwrap();
+    assert!(fixture
+        .store
+        .task_sources("cp", &linked.entity_id)
+        .unwrap()
+        .conversation_source
+        .unwrap()
+        .bundle
+        .messages
+        .is_empty());
+    let mut ordinary = request;
+    ordinary["operation_id"] = "ordinary-creation".into();
+    ordinary
+        .as_object_mut()
+        .unwrap()
+        .remove("conversation_source");
+    let normal = workflow_command(&fixture, ordinary).unwrap();
+    assert!(fixture
+        .store
+        .task_sources("cp", &normal.entity_id)
+        .unwrap()
+        .conversation_source
+        .is_none());
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::DeleteDraftTask {
+            operation_id: "delete-ordinary-draft".into(),
+            task_id: normal.entity_id.clone(),
+            expected_version: normal.version.unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id=?1",
+                [&normal.entity_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id=?1",
+                [&created.entity_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
+
 // The transport boundary can lose an acknowledgement after a paid submission.
 // Exercise the same durable reservation/send gates used by the pipe writer;
 // neither prompt matching nor a synthetic provider can prove this invariant.
@@ -1654,6 +1844,73 @@ fn terminal_before_steer_acknowledgement_does_not_resurrect_turn() {
     assert_eq!(input, "next");
     assert_eq!(kind, "submit");
     assert_eq!(turn, None);
+    let (s, r, c, g, t) = (store, &request, "cc", "generation", "native-thread");
+    for (send, op, terminal_first) in [
+        ("followup", "interrupt-a", false),
+        ("next-turn", "interrupt-b", true),
+    ] {
+        let ack = serde_json::json!({"turn":{"id":send}});
+        s.conversation_response(c, g, send, &ack, false).unwrap();
+        assert!(s
+            .conversation_reserve_interrupt_turn("stale", r, c, "cs", g, "old")
+            .is_err());
+        assert!(
+            s.conversation_reserve_interrupt_turn(op, r, c, "cs", g, send)
+                .unwrap()
+                .1
+        );
+        let frame = s
+            .conversation_interrupt_send_intent(c, g, op)
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame["params"]["turnId"], send);
+        let end = &terminal;
+        let finish = || {
+            s.conversation_event(c, g, t, Some(send), "turn_completed", end)
+                .unwrap()
+        };
+        if terminal_first {
+            finish();
+        } else {
+            s.conversation_response(c, g, op, r, false).unwrap();
+        }
+        assert!(s
+            .conversation_reserve_input("blocked", r, c, "wait", None)
+            .is_err());
+        if terminal_first {
+            s.conversation_response(c, g, op, r, false).unwrap();
+        } else {
+            finish();
+        }
+        let retained: bool = connection.query_row(
+            "SELECT s.status='running' AND s.interrupt_requested_at IS NULL AND r.state='running'
+             AND c.state='idle' AND o.state='completed' FROM sessions s
+             JOIN conversation_reservations r ON r.session_id=s.id
+             JOIN conversations c ON c.id=r.conversation_id
+             JOIN conversation_operations o ON o.conversation_id=c.id WHERE o.operation_id=?1",
+            [op], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            retained,
+            "interrupt settlement must retain the live reservation"
+        );
+        assert!(
+            !s.conversation_reserve_interrupt_turn(op, r, c, "cs", g, send)
+                .unwrap()
+                .1
+        );
+        let next = if terminal_first {
+            "last-turn"
+        } else {
+            "next-turn"
+        };
+        assert!(
+            s.conversation_reserve_input(next, r, c, "next", None)
+                .unwrap()
+                .1
+        );
+        s.conversation_send_intent(c, g, next).unwrap();
+    }
 }
 
 impl Fixture {
@@ -48496,7 +48753,8 @@ const STATE_UNPROJECTED_TABLES: [&str; 11] = [
 // Conversation inspect has its own event-sequence cursor, separate from
 // workflow::state. Schema 44 also advances the shared revision for the explicit
 // mutations below; its update triggers include value-identical writes.
-const CONVERSATION_CURSOR_TABLES: [(&str, bool, bool, bool); 8] = [
+const CONVERSATION_CURSOR_TABLES: [(&str, bool, bool, bool); 9] = [
+    ("task_conversation_sources", true, false, false),
     ("conversation_runtime", false, false, false),
     ("conversation_profiles", false, false, false),
     ("conversation_admissions", false, true, false),
@@ -48563,7 +48821,8 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
     connection
         .execute_batch("DROP TRIGGER guidance_submitted_form_once;
             DROP TRIGGER task_recipe_revisions_immutable; DROP TRIGGER task_recipe_bindings_immutable;
-            DROP TRIGGER single_agent_review_results_immutable; DROP TRIGGER single_agent_repair_receipts_immutable;")
+            DROP TRIGGER single_agent_review_results_immutable; DROP TRIGGER single_agent_repair_receipts_immutable;
+            DROP TRIGGER task_conversation_source_immutable_update; DROP TRIGGER task_conversation_source_immutable_delete;")
         .unwrap();
     let mut marker = 1_000_000_i64;
     for table in STATE_PROJECTED_TABLES
@@ -48897,7 +49156,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 44_i64);
+    fixture.assert_scalar("PRAGMA user_version", 45_i64);
     let migrated_triggers = connection
         .prepare(
             "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%' ORDER BY name",
@@ -48938,7 +49197,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 44_i64);
+    fixture.assert_scalar("PRAGMA user_version", 45_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -57522,7 +57781,7 @@ fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordina
 #[test]
 fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
-    fixture.assert_scalar("PRAGMA user_version", 44_i64);
+    fixture.assert_scalar("PRAGMA user_version", 45_i64);
     let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
     fixture.execute_batch(&format!(
         "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; PRAGMA user_version=30;"
@@ -57530,7 +57789,7 @@ fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     restore_schema_30_recipe_tables(&fixture);
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 44_i64);
+    fixture.assert_scalar("PRAGMA user_version", 45_i64);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
@@ -58309,8 +58568,10 @@ fn stale_restart_candidate_cancellation_refuses_live_sessions_and_pending_admiss
 const MIGRATION_031_SQL: &str = include_str!("../migrations/031_final_repair_recheck.sql");
 /// Drops post-32 tables and undoes the sessions owner rebuilds (including the
 /// conversation column, its index and cursor triggers). Callers retaining
-/// recipes also restore their schema-30 shape before upgrading through 044.
+/// recipes also restore their schema-30 shape before upgrading through 045.
 const DROP_AFTER_SCHEMA_32: &str = "PRAGMA foreign_keys=OFF;
+     DROP TRIGGER task_conversation_source_task_delete;
+     DROP TABLE task_conversation_sources;
      DROP TRIGGER claims_conversation_admission;
      DROP TRIGGER claims_conversation_readmission;
      DROP TABLE conversation_events;
@@ -58535,7 +58796,7 @@ fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
     fixture.assert_scalar("PRAGMA user_version", 31_i64);
 
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 44_i64);
+    fixture.assert_scalar("PRAGMA user_version", 45_i64);
     assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(

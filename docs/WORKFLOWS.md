@@ -486,3 +486,13 @@ neither establishes idle readiness. Usage allowance or plan-access failures have
 no cooldown or inferred reset deadline. Existing model changes retain their role
 and checkpoint requirements. See [provider recovery operations](OPERATIONS.md#provider-capacity-and-usage-recovery)
 for unsupported signals and reconnect behavior.
+
+## Conversations and source-linked tasks
+
+Choose a project and open **Conversations**. Select an admitted profile, or choose a saved execution configuration and explicitly Save profile, Prepare, Run probe, inspect the evidence, then Activate. A probe starts a provider; navigation and profile selection do not. Recorded admission is revalidated at execution. The experimental model and policy scope remains described in [Security](SECURITY.md#experimental-structured-conversations).
+
+Send a first message, follow up while idle, steer the active turn, or use **Interrupt turn**. **Disconnect idle session** releases capacity only after confirmed process exit; **Resume conversation** requires a valid binding and admission. Recovery items in Attention open the exact conversation. Denied native requests remain history, without an Allow action. Textual questions can be answered in a follow-up. History is a bounded recorded projection, not a full native transcript.
+
+Select up to 16 eligible recorded messages and 24 KiB of text, then choose **Create task from conversation**. Review the title, description, criteria and Single agent or TRIP selection in the existing task form. An empty selection saves the conversation link without excerpts. Promoted TRIP tasks use project role defaults. Save creates a draft and opens the returned task; **Make Ready** is a separate explicit action with the normal setup checks. Capacity can delay an admitted Ready task; disconnecting a conversation may let queued work start when pickup is enabled.
+
+The task’s Conversation source section shows the frozen excerpts, coverage and attribution, and links to the source conversation. The server validates selection identities and hashes and stores the bundle atomically with the task. Both workflow contexts receive the same bundle as untrusted reference material. Editing task text does not alter its evidence. Unknown create outcomes retain the original request for exact reconciliation.

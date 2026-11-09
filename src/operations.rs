@@ -584,6 +584,69 @@ impl Application {
     ) -> Result<serde_json::Value> {
         use crate::providers::codex_app_server::ConversationOperation as Op;
         operation.validate()?;
+        match &operation {
+            Op::WorkspaceIdentity { project_id } => {
+                self.store
+                    .require_conversation_workspace_project(project_id)?;
+                return Ok(serde_json::to_value(
+                    crate::providers::codex_app_server::ConversationWorkspaceIdentity {
+                        project_id: project_id.clone(),
+                        storage_scope: self.paths.root_key(),
+                    },
+                )?);
+            }
+            Op::TaskSources {
+                project_id,
+                task_id,
+            } => {
+                return Ok(serde_json::to_value(
+                    self.store.task_sources(project_id, task_id)?,
+                )?)
+            }
+            Op::List { .. } | Op::Profiles { .. } | Op::Admissions { .. } => {
+                return self.store.conversation_discover(&operation)
+            }
+            Op::Detail {
+                project_id,
+                conversation_id,
+                after,
+            } => {
+                return Ok(serde_json::to_value(self.store.conversation_detail(
+                    project_id,
+                    conversation_id,
+                    *after,
+                )?)?)
+            }
+            Op::Messages {
+                project_id,
+                conversation_id,
+            } => {
+                return Ok(serde_json::to_value(
+                    self.store
+                        .conversation_messages(project_id, conversation_id)?,
+                )?)
+            }
+            Op::Receipt {
+                project_id,
+                operation_id,
+                original_request,
+                request_hash,
+            } => {
+                let _intake = self
+                    .intake_lock
+                    .lock()
+                    .map_err(|_| anyhow!("Conversation intake is unavailable"))?;
+                return Ok(serde_json::to_value(
+                    self.store.conversation_lookup_receipt(
+                        project_id,
+                        operation_id,
+                        original_request,
+                        request_hash,
+                    )?,
+                )?);
+            }
+            _ => {}
+        }
         if let Op::Inspect {
             conversation_id,
             after,
@@ -596,7 +659,16 @@ impl Application {
             .lock()
             .map_err(|_| anyhow!("Conversation intake is unavailable"))?;
         let request = serde_json::to_value(&operation)?;
-        match operation {
+        let receipt_request = match &operation {
+            Op::CreateProfile { input } => serde_json::to_value(input)?,
+            _ => request.clone(),
+        };
+        // Every branch below reserves a durable receipt before any provider
+        // delivery. Intake remains held through refusal recording, and the
+        // store rechecks absence in an immediate transaction. An existing
+        // reservation (including an unknown outcome) can never become refused.
+        let result = (|| -> Result<serde_json::Value> {
+            match operation {
             Op::CreateProfile { input } => self.store.conversation_create_profile(&input),
             Op::Prepare {
                 operation_id,
@@ -680,6 +752,41 @@ impl Application {
                 Some(&expected_turn_id),
                 provisional,
             ),
+            Op::InterruptTurn {
+                operation_id,
+                conversation_id,
+                expected_session_id,
+                expected_generation,
+                expected_turn_id,
+            } => {
+                let (result, fresh) = self.store.conversation_reserve_interrupt_turn(
+                    &operation_id, &request, &conversation_id, &expected_session_id,
+                    &expected_generation, &expected_turn_id,
+                )?;
+                if fresh && self.supervisor.interrupt_conversation(
+                    &expected_session_id, &conversation_id, &expected_generation, &operation_id,
+                ).is_err() {
+                    self.store.conversation_hold_generation(
+                        &conversation_id, &expected_generation,
+                        "Turn interrupt delivery is unknown. Refresh and inspect its outcome before sending another message; it will not be replayed.",
+                    )?;
+                }
+                Ok(self.store.conversation_receipt(&operation_id, &request)?.unwrap_or(result))
+            }
+            Op::DisconnectIdle {
+                operation_id,
+                conversation_id,
+                expected_session_id,
+                expected_generation,
+            } => {
+                if let Some(receipt) = self.store.conversation_receipt(&operation_id, &request)? {
+                    return Ok(receipt);
+                }
+                self.supervisor.disconnect_idle_conversation(
+                    &operation_id, &request, &conversation_id, &expected_session_id,
+                    &expected_generation,
+                )
+            }
             Op::Interrupt {
                 operation_id,
                 conversation_id,
@@ -781,8 +888,20 @@ impl Application {
                 }
                 Ok(result)
             }
-            Op::Inspect { .. } => bail!("Conversation inspection routing changed unexpectedly"),
+            Op::WorkspaceIdentity { .. } | Op::Inspect { .. } | Op::List { .. } | Op::Profiles { .. } | Op::Admissions { .. }
+            | Op::Detail { .. } | Op::Messages { .. } | Op::TaskSources { .. } | Op::Receipt { .. } =>
+                bail!("Conversation inspection routing changed unexpectedly"),
         }
+        })();
+        if let Err(error) = &result {
+            if let Err(receipt_error) = self
+                .store
+                .conversation_record_pre_delivery_refusal(&receipt_request, &error.to_string())
+            {
+                tracing::warn!(error = %receipt_error, "Conversation refusal receipt unavailable; original command error retained");
+            }
+        }
+        result
     }
 
     fn require_conversation_execution(&self) -> Result<()> {
@@ -3742,6 +3861,17 @@ impl Application {
             } else {
                 None
             };
+        let task_source_reference = if ordinary_task {
+            crate::store::task_source_reference_in(
+                &connection,
+                &context.project_id,
+                &context.task_id,
+                &context.session_id,
+                &context.attempt_id,
+            )?
+        } else {
+            None
+        };
         drop(connection);
         let plan = if let Some((id, hash)) = plan_record {
             let path = self
@@ -3860,6 +3990,9 @@ impl Application {
                     "authority":"Exact recorded approved plan and separate implementation authorization. This projection grants no broader scope, check execution, native permission or completion authority."
                 });
             }
+        }
+        if let Some(reference) = task_source_reference {
+            value["task"]["untrusted_conversation_reference"] = reference;
         }
         if serde_json::to_vec(&value)?.len() > 1024 * 1024 {
             bail!("task-scoped role context exceeds the 1 MiB response bound")
