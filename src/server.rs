@@ -214,6 +214,9 @@ where
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(deny_unknown_fields)]
 enum WebOperation {
+    Conversation {
+        operation: crate::providers::codex_app_server::ConversationOperation,
+    },
     SchedulerRunOnce,
     SnapshotFreeze {
         attempt_id: String,
@@ -376,6 +379,7 @@ enum WebOperation {
 impl WebOperation {
     fn required_feature(&self) -> Option<&'static str> {
         match self {
+            Self::Conversation { .. } => Some(protocol::CONVERSATION_FEATURE),
             Self::Workflow { command } => Some(if command.uses_single_agent_presets() {
                 protocol::SINGLE_AGENT_PRESETS_FEATURE
             } else {
@@ -1748,6 +1752,7 @@ async fn api_operation(
         let _permit = permit;
         let state = blocking_state;
         match operation {
+            WebOperation::Conversation { operation } => state.app.conversation_operation(operation),
             WebOperation::SchedulerRunOnce => state.app.coordinator_tick(),
             WebOperation::SnapshotFreeze {
                 attempt_id,

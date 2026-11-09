@@ -181,6 +181,7 @@ pub(crate) fn same_process_start(left: &str, right: &str) -> bool {
 pub enum SessionOwner {
     RoleGeneration(String),
     ProviderValidationInvocation(String),
+    Conversation(String),
 }
 
 impl SessionOwner {
@@ -188,19 +189,22 @@ impl SessionOwner {
         match self {
             Self::RoleGeneration(_) => "role_generation",
             Self::ProviderValidationInvocation(_) => "provider_validation_invocation",
+            Self::Conversation(_) => "conversation",
         }
     }
 
     pub fn id(&self) -> &str {
         match self {
-            Self::RoleGeneration(id) | Self::ProviderValidationInvocation(id) => id,
+            Self::RoleGeneration(id)
+            | Self::ProviderValidationInvocation(id)
+            | Self::Conversation(id) => id,
         }
     }
 
     pub fn role_generation_id(&self) -> Option<&str> {
         match self {
             Self::RoleGeneration(id) => Some(id),
-            Self::ProviderValidationInvocation(_) => None,
+            Self::ProviderValidationInvocation(_) | Self::Conversation(_) => None,
         }
     }
 
@@ -210,12 +214,16 @@ impl SessionOwner {
 
     pub fn require_role_generation(&self, operation: &str) -> Result<&str, String> {
         self.role_generation_id().ok_or_else(|| {
-            format!("{operation} is available only for workflow role sessions, not provider validation checks")
+            if matches!(self,Self::Conversation(_)) {
+                format!("{operation} is available only for workflow role sessions, not conversations")
+            } else {
+                format!("{operation} is available only for workflow role sessions, not provider validation checks")
+            }
         })
     }
 
-    /// Exactly one of the two nullable `sessions` owner columns is set; the
-    /// table CHECK enforces it, and this refuses a row that escaped it.
+    /// Decode legacy PTY ownership. The store separately checks the exclusive
+    /// conversation column before invoking this backwards-compatible decoder.
     pub fn from_columns(
         role_generation_id: Option<String>,
         provider_validation_invocation_id: Option<String>,

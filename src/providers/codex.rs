@@ -90,6 +90,7 @@ enum NativeUserConfig {
 enum NativeLaunchMode {
     InteractiveStandalone,
     ObservationExec,
+    ConversationStdio,
 }
 
 /// Only these validated fields leave the bounded auth parser; token and JWT
@@ -941,13 +942,22 @@ fn inspect_native_compatibility(
     inspect_single_agent_compatibility(cwd, version, user_config, launch_mode)
 }
 
+fn native_version_supported(version: &str, launch_mode: NativeLaunchMode) -> bool {
+    match launch_mode {
+        NativeLaunchMode::ConversationStdio => version == super::codex_app_server::EXACT_VERSION,
+        NativeLaunchMode::InteractiveStandalone | NativeLaunchMode::ObservationExec => {
+            [EXACT_CODEX_VERSION, SINGLE_AGENT_QUALIFICATION_VERSION].contains(&version)
+        }
+    }
+}
+
 fn inspect_single_agent_compatibility(
     cwd: &Path,
     version: &str,
     user_config: NativeUserConfig,
     launch_mode: NativeLaunchMode,
 ) -> Result<NativeCompatibility> {
-    if ![EXACT_CODEX_VERSION, SINGLE_AGENT_QUALIFICATION_VERSION].contains(&version) {
+    if !native_version_supported(version, launch_mode) {
         bail!("This Codex version has no compiled Single agent compatibility predicate")
     }
     if std::env::var_os("CODEX_HOME").is_some() {
@@ -1066,6 +1076,7 @@ fn inspect_single_agent_compatibility(
         "shared_app_server": match launch_mode {
             NativeLaunchMode::InteractiveStandalone => INTERACTIVE_STANDALONE_MODE,
             NativeLaunchMode::ObservationExec => "absent",
+            NativeLaunchMode::ConversationStdio => "owned_local_stdio_v1",
         },
         "capability_roots": "not_supplied_by_local_cli_adapter",
         "remote_executor": "not_forwarded_by_cleared_child_environment",
@@ -1080,6 +1091,97 @@ fn inspect_single_agent_compatibility(
         identity,
         account,
     })
+}
+
+fn validate_conversation_config(value: &toml::Value) -> Result<()> {
+    validate_local_config(value, "conversation layer")?;
+    let policy = super::codex_app_server::POLICY;
+    // Recursive layer merging can retain inherited grants beneath our policy.
+    if value
+        .get("permissions")
+        .and_then(|permissions| permissions.get(policy))
+        .is_some()
+    {
+        bail!("Conversation configuration defines reserved permissions.{policy}; remove that profile definition from system, user, or repository ancestor Codex configuration before preparing or resuming a conversation. LLMRelay supplies this profile.")
+    }
+    if value
+        .get("model_provider")
+        .is_some_and(|value| value.as_str() != Some("openai"))
+        || ["model_providers", "chatgpt_base_url", "openai_base_url"]
+            .iter()
+            .any(|key| value.get(key).is_some())
+    {
+        bail!("Conversation preflight does not admit custom inference providers or endpoint overrides")
+    }
+    Ok(())
+}
+
+/// Reuse the bounded local checks without exporting account or token material.
+/// This entry point has no workflow role, credential copy or PTY predicate.
+pub(crate) fn inspect_conversation_preflight(
+    cwd: &Path,
+    version: &str,
+) -> Result<(Vec<String>, serde_json::Value)> {
+    if version != super::codex_app_server::EXACT_VERSION {
+        bail!(
+            "Conversations require exact {}.",
+            super::codex_app_server::EXACT_VERSION
+        )
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .context("Conversation preflight requires an absolute HOME")?;
+    let canonical = cwd
+        .canonicalize()
+        .context("Resolve conversation configuration scope")?;
+    home.to_str()
+        .context("Conversation HOME must be a UTF-8 path")?;
+    canonical
+        .to_str()
+        .context("Conversation repository must be a UTF-8 path")?;
+    let mut layers = BTreeSet::from([
+        PathBuf::from("/etc/codex/config.toml"),
+        home.join(".codex/config.toml"),
+    ]);
+    layers.extend(
+        canonical
+            .ancestors()
+            .map(|path| path.join(".codex/config.toml")),
+    );
+    let mut layer_hashes = Vec::new();
+    for path in layers {
+        if let Some(value) = parse_config(&path, "conversation layer")? {
+            validate_conversation_config(&value)?;
+            // Bind every parsed setting, including settings unrelated to MCP.
+            // Only a digest leaves this helper; account/token bytes never do.
+            layer_hashes.push(serde_json::json!({
+                "path":path,
+                "hash":crate::store::json_hash(&serde_json::to_value(&value)?)?
+            }));
+        } else {
+            layer_hashes.push(serde_json::json!({"path":path,"state":"absent"}));
+        }
+    }
+    let compatibility = inspect_single_agent_compatibility(
+        cwd,
+        version,
+        NativeUserConfig::Load,
+        NativeLaunchMode::ConversationStdio,
+    )?;
+    let mut configuration = compatibility.identity;
+    configuration["revision"] = serde_json::json!("conversation-local-config-v3-0.167.0");
+    configuration["class"] = serde_json::json!("prelaunch_checks_only_native_unqualified");
+    Ok((
+        compatibility.disabled_mcp_servers.into_iter().collect(),
+        serde_json::json!({
+            "configuration":configuration,
+            "configuration_layers":layer_hashes,
+            "credential_contract":CREDENTIAL_CONTRACT_REVISION,
+            "credential_class":"existing_personal_chatgpt_file_auth",
+            "transport":"owned_local_stdio_v1"
+        }),
+    ))
 }
 
 /// Local eligibility for an app-wide model check, inspected in the empty app
@@ -1558,6 +1660,73 @@ fn usage_responses(tail: &[u8], native_id: &str, turn_id: &str) -> Option<Vec<Co
 #[cfg(test)]
 mod executor_environment_tests {
     use super::*;
+
+    #[test]
+    fn conversation_version_gate_preserves_existing_launch_modes() {
+        for (version, conversation, existing) in [
+            ("codex-cli 0.162.1", false, true),
+            ("codex-cli 0.166.0", false, true),
+            ("codex-cli 0.167.0", true, false),
+            ("codex-cli 0.167.1", false, false),
+            ("codex-cli 0.168.0", false, false),
+            ("0.167.0", false, false),
+        ] {
+            assert_eq!(
+                native_version_supported(version, NativeLaunchMode::ConversationStdio),
+                conversation,
+                "conversation version {version}"
+            );
+            for mode in [
+                NativeLaunchMode::InteractiveStandalone,
+                NativeLaunchMode::ObservationExec,
+            ] {
+                assert_eq!(native_version_supported(version, mode), existing);
+                if version != EXACT_CODEX_VERSION {
+                    let error = inspect_native_compatibility(
+                        Path::new("/"),
+                        version,
+                        NativeUserConfig::Ignore,
+                        mode,
+                    )
+                    .unwrap_err();
+                    assert_eq!(
+                        error.to_string(),
+                        format!("Codex local compatibility requires exact {EXACT_CODEX_VERSION}")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conversation_config_rejects_reserved_profile_without_changing_legacy_scope() {
+        for definition in [
+            "[permissions.conversation_read_only_v1]",
+            "[permissions.conversation_read_only_v1]\nextends = 'other'",
+            "[permissions.conversation_read_only_v1.filesystem]\n'/repository/output' = 'write'",
+            "[permissions.conversation_read_only_v1.filesystem]\n'/protected/child' = 'read'",
+            "[permissions]\nconversation_read_only_v1 = {}",
+            "[permissions]\nconversation_read_only_v1 = false",
+        ] {
+            let value = definition.parse::<toml::Value>().unwrap();
+            let error = validate_conversation_config(&value)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("reserved permissions.conversation_read_only_v1"));
+            assert!(error.contains("remove that profile definition"));
+            assert!(validate_local_config(&value, "legacy layer").is_ok());
+        }
+        for definition in [
+            "",
+            "[permissions.other]\nextends = 'read-only'",
+            "[permissions.other.filesystem]\n'/repository/output' = 'write'",
+            "[permissions.conversation_read_only_v10]",
+        ] {
+            let value = definition.parse::<toml::Value>().unwrap();
+            assert!(validate_conversation_config(&value).is_ok());
+            assert!(validate_local_config(&value, "legacy layer").is_ok());
+        }
+    }
 
     const CAPACITY_NATIVE: &str = "01a0fad1-a051-7941-84b4-e64979f74d26";
     const CAPACITY_TURN: &str = "01a0fad1-a06e-7da3-8bfc-1a96b443ad5d";

@@ -820,6 +820,7 @@ pub fn reconcile_restart_candidates(store: &Store) -> Result<Vec<serde_json::Val
 }
 
 pub fn reconcile_prior_boot(store: &Store) -> Result<Vec<serde_json::Value>> {
+    store.reconcile_conversation_restart()?;
     let mut results = store.release_unconsumed_launch_permits(
         None,
         "service restarted before launch permit was consumed",

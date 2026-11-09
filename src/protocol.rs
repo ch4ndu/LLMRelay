@@ -14,6 +14,7 @@ pub const MULTI_WORKFLOW_FEATURE: &str = "multi_workflow_v1";
 pub const SINGLE_AGENT_PRESETS_FEATURE: &str = "single_agent_presets_v1";
 pub const NATIVE_COMPANION_FEATURE: &str = "native_companion_v1";
 pub const DESKTOP_TARGET_FEATURE: &str = "desktop_target_v1";
+pub const CONVERSATION_FEATURE: &str = "conversation_v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +36,7 @@ impl ClientKind {
                 TASK_INTERACTIONS_FEATURE,
                 HISTORY_INSIGHTS_FEATURE,
                 DESKTOP_TARGET_FEATURE,
+                CONVERSATION_FEATURE,
             ],
             Self::HumanCli => &[
                 "control_requests_v1",

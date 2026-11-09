@@ -197,3 +197,22 @@ The explicit foundation-only build override does not include the normal dashboar
 Its fallback page's legacy health probe does not declare protocol generation 1 and
 therefore reports a connection failure. Use the normal frontend build and matched
 package for dashboard operation; this limitation does not indicate a failed service.
+
+## Structured conversation qualification
+
+The conversation adapter targets exact `codex-cli 0.167.0`; the compiled conversation manifest records experimental `qualified_split_evidence_v1` for tested macOS with `gpt-6.1-sol` at medium effort. Host tests do not establish native permission enforcement.
+
+The ignored `providers::native_qualification::app_server_conversation` case reuses the existing disposable fixture. Run it only with explicit task authorization, a selected supported model/effort, compatible existing authentication, a source-matched LLMRelay executable and a fresh absolute disposable directory. Build the production executable and precompile the library test with `cargo test --locked --lib --no-run --message-format=json` before starting the timed run. Resolve the exact library-test executable from Cargo artifact output:
+
+```sh
+LLMRELAY_NATIVE_QUALIFICATION_DIR=<new-absolute-directory> \
+LLMRELAY_NATIVE_QUALIFICATION_EXECUTABLE=<source-matched-absolute-executable> \
+LLMRELAY_NATIVE_QUALIFICATION_PROVIDER=codex \
+LLMRELAY_NATIVE_QUALIFICATION_MODEL=<selected-model> \
+LLMRELAY_NATIVE_QUALIFICATION_EFFORT=<selected-effort> \
+LLMRELAY_NATIVE_QUALIFICATION_EXACT_VERSION='codex-cli 0.167.0' \
+LLMRELAY_NATIVE_QUALIFICATION_HELPER_PYTHON=<canonical-absolute-python3> \
+<precompiled-library-test> providers::native_qualification::app_server_conversation --ignored --exact --nocapture --test-threads=1
+```
+
+Each separately authorized run allows three fresh conversations, seven model-generating submissions, one resume and three standalone diagnostic commands, with thirty minutes overall and ten minutes per conversation. Acquisition is capped at twenty-five minutes, with three minutes reserved for cleanup and two for setup/output. Charges precede dispatch; rejected or ambiguous delivery is not refunded. There are no automatic retries. Keep cumulative prior charges in the manager receipt; the fixture’s historical baseline accounting does not authorize another run. The helper opens disposable files without reading, writing or truncating them and connects only to an owned numeric-loopback listener. Matching host positive controls and correlated syscall permission errors are required. Standalone commands have separate lifetime ownership; an absent server group does not prove diagnostic termination. Pending diagnostics, incomplete cleanup or missing terminal interruption evidence fail qualification. Cleanup history preserves earlier errors. Forced idle-process loss and same-instance reconstruction establish only that bounded recovery path. Saved evidence remains unqualified with the residual unaccepted until independent review; only the distinctly labeled split-evidence release gate may then be considered. See the security guide for its unobserved model-tool enforcement limitation.

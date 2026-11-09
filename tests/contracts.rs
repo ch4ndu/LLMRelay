@@ -1407,6 +1407,255 @@ struct Fixture {
     synthetic_bundles: Option<agenticjira::provider_compatibility::BundleSet>,
 }
 
+// The transport boundary can lose an acknowledgement after a paid submission.
+// Exercise the same durable reservation/send gates used by the pipe writer;
+// neither prompt matching nor a synthetic provider can prove this invariant.
+#[test]
+fn ambiguous_conversation_delivery_keeps_ownership_and_never_resubmits() {
+    let fixture = Fixture::new("conversation-unknown-delivery");
+    let connection = Connection::open(&fixture.database).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    connection.execute_batch("BEGIN IMMEDIATE;
+        INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+        VALUES('cp','Conversation','/synthetic/repository','synthetic-conversation-repository','head','now','now');
+        INSERT INTO execution_config_revisions(id,project_id,revision,config_json,content_hash,approved_at,created_at)
+        VALUES('ce','cp',1,'{}','config','now','now');
+        INSERT INTO conversation_profiles(id,project_id,execution_config_revision_id,profile_json,profile_hash,created_at)
+        VALUES('cr','cp','ce','{}','profile','now');
+        INSERT INTO conversation_admissions(id,profile_revision_id,identity_json,identity_hash,state,created_at,updated_at)
+        VALUES('ca','cr','{}','identity','active','now','now');
+        INSERT INTO conversations(id,project_id,admission_id,identity_json,identity_hash,generation,native_thread_id,state,created_at,updated_at)
+        VALUES('cc','cp','ca','{}','identity','generation','native-thread','idle','now','now');
+        INSERT INTO sessions(id,conversation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+        VALUES('cs','cc','codex','running','{}','synthetic','generation','now','now');
+        INSERT INTO conversation_reservations(conversation_id,session_id,repository_identity,state,created_at,updated_at)
+        VALUES('cc','cs','synthetic-conversation-repository','running','now','now');
+        COMMIT;").unwrap();
+    let request =
+        serde_json::json!({"operation_id":"send-once","conversation_id":"cc","input":"question"});
+    let (_, fresh) = fixture
+        .store
+        .conversation_reserve_input("send-once", &request, "cc", "question", None)
+        .unwrap();
+    assert!(fresh);
+    let mut submissions = 0;
+    let (thread, message, _, _) = fixture
+        .store
+        .conversation_send_intent("cc", "generation", "send-once")
+        .unwrap();
+    assert_eq!(
+        (thread.as_str(), message.as_str()),
+        ("native-thread", "question")
+    );
+    submissions += 1; // The writer now crosses its persisted sending boundary.
+    fixture
+        .store
+        .mark_session_delivery_ambiguous("cs", "transport lost after delivery")
+        .unwrap();
+    let (receipt, fresh) = fixture
+        .store
+        .conversation_reserve_input("send-once", &request, "cc", "question", None)
+        .unwrap();
+    if fresh {
+        fixture
+            .store
+            .conversation_send_intent("cc", "generation", "send-once")
+            .unwrap();
+        submissions += 1;
+    }
+    assert_eq!(submissions, 1);
+    assert_eq!(receipt["delivery_state"], "unknown");
+    assert!(!fresh);
+    assert!(fixture
+        .store
+        .conversation_send_intent("cc", "generation", "send-once")
+        .is_err());
+    assert!(fixture
+        .store
+        .conversation_reserve_input(
+            "different-operation",
+            &serde_json::json!({"input":"question"}),
+            "cc",
+            "question",
+            None
+        )
+        .is_err());
+    assert_eq!(
+        fixture.store.session_owner("cs").unwrap(),
+        agenticjira::domain::SessionOwner::Conversation("cc".into())
+    );
+    let (state,session,reservation):(String,String,String)=connection.query_row(
+        "SELECT c.state,s.status,r.state FROM conversations c JOIN sessions s ON s.conversation_id=c.id JOIN conversation_reservations r ON r.conversation_id=c.id WHERE c.id='cc'",[],
+        |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert_eq!(
+        (state.as_str(), session.as_str(), reservation.as_str()),
+        ("recovery_required", "recovery_required", "unknown")
+    );
+}
+
+#[test]
+fn conversation_exit_is_exact_and_released_transport_rejects_new_input() {
+    let fixture = Fixture::new("conversation-resumed-exit-fence");
+    let connection = Connection::open(&fixture.database).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    connection.execute_batch("BEGIN IMMEDIATE;
+        INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+        VALUES('cp','Conversation','/synthetic/repository','synthetic-conversation-repository','head','now','now');
+        INSERT INTO execution_config_revisions(id,project_id,revision,config_json,content_hash,approved_at,created_at)
+        VALUES('ce','cp',1,'{}','config','now','now');
+        INSERT INTO conversation_profiles(id,project_id,execution_config_revision_id,profile_json,profile_hash,created_at)
+        VALUES('cr','cp','ce','{}','profile','now');
+        INSERT INTO conversation_admissions(id,profile_revision_id,identity_json,identity_hash,state,created_at,updated_at)
+        VALUES('ca','cr','{}','identity','active','now','now');
+        INSERT INTO conversations(id,project_id,admission_id,identity_json,identity_hash,generation,native_thread_id,state,created_at,updated_at)
+        VALUES('cc','cp','ca','{}','identity','resumed','native-thread','idle','now','now');
+        INSERT INTO sessions(id,conversation_id,provider,status,launch_config_json,executable_version,transcript_epoch,process_identity_json,created_at,updated_at)
+        VALUES('old','cc','codex','exited','{}','synthetic','original','old-process','now','now'),
+              ('current','cc','codex','running','{}','synthetic','resumed','current-process','now','now');
+        INSERT INTO conversation_reservations(conversation_id,session_id,repository_identity,state,created_at,updated_at)
+        VALUES('cc','current','synthetic-conversation-repository','running','now','now');
+        COMMIT;").unwrap();
+    let store = &fixture.store;
+    let exit = serde_json::json!({"process_group_quiescent":true}).to_string();
+    assert!(!store
+        .update_session_exit("old", "original", "old-process", &exit)
+        .unwrap());
+    assert!(!store
+        .update_session_exit("current", "original", "current-process", &exit)
+        .unwrap());
+    assert!(!store
+        .update_session_exit("current", "resumed", "old-process", &exit)
+        .unwrap());
+    let reservation = || -> String {
+        connection.query_row(
+            "SELECT state FROM conversation_reservations WHERE conversation_id='cc' AND session_id='current'",
+            [], |row| row.get(0),
+        ).unwrap()
+    };
+    assert_eq!(reservation(), "running");
+    assert!(store
+        .update_session_exit("current", "resumed", "current-process", &exit)
+        .unwrap());
+    assert_eq!(reservation(), "released");
+    let request = serde_json::json!({"input":"recall"});
+    let error = store
+        .conversation_reserve_input("after-exit", &request, "cc", "recall", None)
+        .unwrap_err();
+    assert!(error.to_string().contains("process is stopped or stopping"));
+    assert!(store
+        .conversation_send_intent("cc", "resumed", "after-exit")
+        .is_err());
+    let receipts: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM conversation_operations WHERE operation_id='after-exit'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(receipts, 0);
+}
+
+#[test]
+fn terminal_before_steer_acknowledgement_does_not_resurrect_turn() {
+    let fixture = Fixture::new("conversation-terminal-before-steer");
+    let connection = Connection::open(&fixture.database).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    connection.execute_batch("BEGIN IMMEDIATE;
+        INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+        VALUES('cp','Conversation','/synthetic/repository','synthetic-conversation-repository','head','now','now');
+        INSERT INTO execution_config_revisions(id,project_id,revision,config_json,content_hash,approved_at,created_at)
+        VALUES('ce','cp',1,'{}','config','now','now');
+        INSERT INTO conversation_profiles(id,project_id,execution_config_revision_id,profile_json,profile_hash,created_at)
+        VALUES('cr','cp','ce','{}','profile','now');
+        INSERT INTO conversation_admissions(id,profile_revision_id,identity_json,identity_hash,state,created_at,updated_at)
+        VALUES('ca','cr','{}','identity','active','now','now');
+        INSERT INTO conversations(id,project_id,admission_id,identity_json,identity_hash,generation,native_thread_id,state,created_at,updated_at)
+        VALUES('cc','cp','ca','{}','identity','generation','native-thread','idle','now','now');
+        INSERT INTO sessions(id,conversation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+        VALUES('cs','cc','codex','running','{}','synthetic','generation','now','now');
+        INSERT INTO conversation_reservations(conversation_id,session_id,repository_identity,state,created_at,updated_at)
+        VALUES('cc','cs','synthetic-conversation-repository','running','now','now');
+        COMMIT;").unwrap();
+    let store = &fixture.store;
+    let request = serde_json::json!({});
+    let first_ack = serde_json::json!({"turn":{"id":"turn"}});
+    let steer_ack = serde_json::json!({"turnId":"turn"});
+    store
+        .conversation_reserve_input("first", &request, "cc", "question", None)
+        .unwrap();
+    store
+        .conversation_send_intent("cc", "generation", "first")
+        .unwrap();
+    store
+        .conversation_response("cc", "generation", "first", &first_ack, false)
+        .unwrap();
+    store
+        .conversation_reserve_input("steer", &request, "cc", "clarify", Some("turn"))
+        .unwrap();
+    store
+        .conversation_send_intent("cc", "generation", "steer")
+        .unwrap();
+    let terminal = serde_json::json!({"status":"completed"});
+    let finish = || {
+        store
+            .conversation_event(
+                "cc",
+                "generation",
+                "native-thread",
+                Some("turn"),
+                "turn_completed",
+                &terminal,
+            )
+            .unwrap();
+    };
+    finish();
+    // The terminal arrives while the steer is still waiting for its response.
+    let pending: String = connection
+        .query_row(
+            "SELECT state FROM conversation_operations WHERE operation_id='steer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, "sending");
+    store
+        .conversation_response("cc", "generation", "steer", &steer_ack, false)
+        .unwrap();
+    finish();
+    let settled: bool = connection
+        .query_row(
+            "SELECT c.state='idle' AND c.active_turn_id IS NULL AND o.state='completed'
+             AND json_extract(o.result_json,'$.outcome')='completed'
+             AND (SELECT COUNT(*) FROM conversation_events WHERE kind='turn_completed')=1
+             FROM conversations c JOIN conversation_operations o ON o.conversation_id=c.id
+             WHERE o.operation_id='steer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        settled,
+        "terminal outcome must settle steer without resurrection"
+    );
+    let (_, fresh) = store
+        .conversation_reserve_input("followup", &request, "cc", "next", None)
+        .unwrap();
+    assert!(fresh);
+    let (thread, input, kind, turn) = store
+        .conversation_send_intent("cc", "generation", "followup")
+        .unwrap();
+    assert_eq!(thread, "native-thread");
+    assert_eq!(input, "next");
+    assert_eq!(kind, "submit");
+    assert_eq!(turn, None);
+}
+
 impl Fixture {
     fn new(name: &str) -> Self {
         install_synthetic_codex_home();
@@ -48244,6 +48493,20 @@ const STATE_UNPROJECTED_TABLES: [&str; 11] = [
     "trip_setup_reads",
 ];
 
+// Conversation inspect has its own event-sequence cursor, separate from
+// workflow::state. Schema 44 also advances the shared revision for the explicit
+// mutations below; its update triggers include value-identical writes.
+const CONVERSATION_CURSOR_TABLES: [(&str, bool, bool, bool); 8] = [
+    ("conversation_runtime", false, false, false),
+    ("conversation_profiles", false, false, false),
+    ("conversation_admissions", false, true, false),
+    ("conversations", true, true, false),
+    ("conversation_reservations", false, false, false),
+    ("conversation_operations", true, true, false),
+    ("conversation_events", true, false, false),
+    ("conversation_requests", false, false, false),
+];
+
 fn state_untracked_columns(table: &str) -> &'static [&'static str] {
     match table {
         "input_leases" => &["expires_at", "updated_at"],
@@ -48281,6 +48544,7 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
         .iter()
         .chain(STATE_UNPROJECTED_TABLES.iter())
         .chain(["state_revision"].iter())
+        .chain(CONVERSATION_CURSOR_TABLES.iter().map(|(table, ..)| table))
         .map(|table| table.to_string())
         .collect::<Vec<_>>();
     classified.sort();
@@ -48305,12 +48569,19 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
     for table in STATE_PROJECTED_TABLES
         .iter()
         .chain(STATE_UNPROJECTED_TABLES.iter())
+        .chain(CONVERSATION_CURSOR_TABLES.iter().map(|(table, ..)| table))
     {
         // Only open observations are projected; their cursor has its own test.
         if *table == "attention_observations" {
             continue;
         }
         let projected = STATE_PROJECTED_TABLES.contains(table);
+        let conversation = CONVERSATION_CURSOR_TABLES
+            .iter()
+            .find(|(name, ..)| name == table);
+        let (insert_advances, update_advances, delete_advances) = conversation
+            .map(|(_, insert, update, delete)| (*insert, *update, *delete))
+            .unwrap_or((projected, projected, projected));
         let columns = connection
             .prepare(&format!("PRAGMA table_info({table})"))
             .unwrap()
@@ -48346,8 +48617,29 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
                 rusqlite::params_from_iter(&values),
             )
             .unwrap();
-        assert_step(before, projected, "insert");
+        assert_step(before, insert_advances, "insert");
         let mut rowid = connection.last_insert_rowid();
+
+        if *table == "conversation_profiles" {
+            let before = committed_state_revision(&connection);
+            let error = connection
+                .execute(
+                    "UPDATE conversation_profiles SET profile_hash=profile_hash",
+                    [],
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("conversation profile revisions are immutable"),
+                "{error}"
+            );
+            assert_step(before, false, "rejected immutable profile update");
+            // As with the immutable recipe rows above, isolate cursor coverage
+            // after checking the production mutation restriction.
+            connection
+                .execute_batch("DROP TRIGGER conversation_profile_immutable;")
+                .unwrap();
+        }
 
         let identical = columns
             .iter()
@@ -48362,7 +48654,11 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
             )
             .unwrap();
         assert_eq!(updated, 1, "{table}");
-        assert_step(before, false, "value-identical update");
+        assert_step(
+            before,
+            conversation.is_some() && update_advances,
+            "value-identical update",
+        );
 
         for column in &columns {
             marker += 1;
@@ -48374,7 +48670,8 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
                 )
                 .unwrap();
             assert_eq!(updated, 1, "{table}.{column}");
-            let semantic = projected && !state_untracked_columns(table).contains(&column.as_str());
+            let semantic =
+                update_advances && !state_untracked_columns(table).contains(&column.as_str());
             assert_step(before, semantic, &format!("update {column}"));
             rowid = connection
                 .query_row(
@@ -48418,7 +48715,7 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
         connection
             .execute(&format!("DELETE FROM {table} WHERE rowid=?1"), [rowid])
             .unwrap();
-        assert_step(before, projected, "delete");
+        assert_step(before, delete_advances, "delete");
     }
 
     let checked = fixture.connection();
@@ -48544,7 +48841,27 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(triggers.len(), 3 * STATE_PROJECTED_TABLES.len());
+    let mut expected_triggers = STATE_PROJECTED_TABLES
+        .iter()
+        .flat_map(|table| {
+            let table = match *table {
+                "codex_usage_observations" => "codex_usage",
+                table => table,
+            };
+            ["insert", "update", "delete"].map(|event| format!("state_revision_{table}_{event}"))
+        })
+        .collect::<Vec<_>>();
+    for (table, insert, update, delete) in CONVERSATION_CURSOR_TABLES {
+        for (event, advances) in [("insert", insert), ("update", update), ("delete", delete)] {
+            if advances {
+                expected_triggers.push(format!("state_revision_{table}_{event}"));
+            }
+        }
+    }
+    expected_triggers.sort();
+    let mut actual_triggers = triggers.clone();
+    actual_triggers.sort();
+    assert_eq!(actual_triggers, expected_triggers);
     for trigger in &triggers {
         connection
             .execute_batch(&format!("DROP TRIGGER {trigger}"))
@@ -48580,11 +48897,17 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 43_i64);
-    fixture.assert_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%'",
-        i64::try_from(triggers.len()).unwrap(),
-    );
+    fixture.assert_scalar("PRAGMA user_version", 44_i64);
+    let migrated_triggers = connection
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%' ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(migrated_triggers, expected_triggers);
     let state = workflow::state(&migrated).unwrap();
     assert_eq!(state.revision, "0");
     assert!(state.projects.iter().any(|project| project.id == "v28"));
@@ -48615,7 +48938,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 43_i64);
+    fixture.assert_scalar("PRAGMA user_version", 44_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -57199,7 +57522,7 @@ fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordina
 #[test]
 fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
-    fixture.assert_scalar("PRAGMA user_version", 43_i64);
+    fixture.assert_scalar("PRAGMA user_version", 44_i64);
     let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
     fixture.execute_batch(&format!(
         "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; PRAGMA user_version=30;"
@@ -57207,7 +57530,7 @@ fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     restore_schema_30_recipe_tables(&fixture);
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 43_i64);
+    fixture.assert_scalar("PRAGMA user_version", 44_i64);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
@@ -57984,9 +58307,20 @@ fn stale_restart_candidate_cancellation_refuses_live_sessions_and_pending_admiss
 }
 
 const MIGRATION_031_SQL: &str = include_str!("../migrations/031_final_repair_recheck.sql");
-/// Drops post-32 tables and undoes the sessions owner rebuild. Callers retaining
-/// recipes also restore their schema-30 shape before upgrading through 043.
+/// Drops post-32 tables and undoes the sessions owner rebuilds (including the
+/// conversation column, its index and cursor triggers). Callers retaining
+/// recipes also restore their schema-30 shape before upgrading through 044.
 const DROP_AFTER_SCHEMA_32: &str = "PRAGMA foreign_keys=OFF;
+     DROP TRIGGER claims_conversation_admission;
+     DROP TRIGGER claims_conversation_readmission;
+     DROP TABLE conversation_events;
+     DROP TABLE conversation_requests;
+     DROP TABLE conversation_operations;
+     DROP TABLE conversation_reservations;
+     DROP TABLE conversations;
+     DROP TABLE conversation_admissions;
+     DROP TABLE conversation_profiles;
+     DROP TABLE conversation_runtime;
      DROP TABLE single_agent_repair_receipts;
      DROP TABLE single_agent_review_results;
      DROP TABLE single_agent_review_deliveries;
@@ -58201,7 +58535,7 @@ fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
     fixture.assert_scalar("PRAGMA user_version", 31_i64);
 
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 43_i64);
+    fixture.assert_scalar("PRAGMA user_version", 44_i64);
     assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(

@@ -1256,6 +1256,10 @@ impl Store {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         provider_validation_batch_in(&transaction, batch_id)?;
+        let conversation_probe:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM conversation_admissions a JOIN provider_validation_invocations v ON v.id=a.probe_invocation_id WHERE v.batch_id=?1)",[batch_id],|row|row.get(0))?;
+        if conversation_probe {
+            bail!("This is a project conversation probe. Use its conversation Interrupt operation to stop it.")
+        }
         transaction.execute(
             "UPDATE provider_validation_batches SET state='cancel_requested',updated_at=?1
              WHERE id=?2 AND state='running'",
@@ -2570,6 +2574,1223 @@ const MIGRATION_040: &str = include_str!("../migrations/040_trusted_checkout.sql
 const MIGRATION_041: &str = include_str!("../migrations/041_provider_error_recovery.sql");
 const MIGRATION_042: &str = include_str!("../migrations/042_task_interaction_history.sql");
 const MIGRATION_043: &str = include_str!("../migrations/043_single_agent_presets_recipes.sql");
+const MIGRATION_044: &str = include_str!("../migrations/044_agent_conversations.sql");
+
+impl Store {
+    pub(crate) fn conversation_profile(
+        &self,
+        id: &str,
+    ) -> Result<crate::providers::codex_app_server::ConversationProfileRevision> {
+        let text: String = self.lock()?.query_row(
+            "SELECT profile_json FROM conversation_profiles WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    pub fn conversation_inspect(&self, id: &str, after: i64) -> Result<serde_json::Value> {
+        let connection = self.lock()?;
+        let mut result: serde_json::Value = connection.query_row(
+            "SELECT id,project_id,state,generation,native_thread_id,active_turn_id,binding_valid,identity_json,created_at,updated_at FROM conversations WHERE id=?1", [id], |r|Ok(serde_json::json!({
+                "id":r.get::<_,String>(0)?,"project_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,
+                "generation":r.get::<_,String>(3)?,"native_thread_id":r.get::<_,Option<String>>(4)?,
+                "active_turn_id":r.get::<_,Option<String>>(5)?,"binding_valid":r.get::<_,bool>(6)?,
+                "provenance":parse_value(r.get::<_,String>(7)?),"created_at":r.get::<_,String>(8)?,"updated_at":r.get::<_,String>(9)?
+            })))?;
+        let admission: serde_json::Value = connection.query_row(
+            "SELECT a.id,a.state,a.evidence_hash FROM conversations c
+             JOIN conversation_admissions a ON a.id=c.admission_id WHERE c.id=?1",
+            [id],
+            |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "state": row.get::<_, String>(1)?,
+                    "evidence_hash": row.get::<_, Option<String>>(2)?
+                }))
+            },
+        )?;
+        result["admission"] = admission;
+        let mut requests=connection.prepare("SELECT generation,native_thread_id,native_turn_id,request_id,method,state FROM conversation_requests WHERE conversation_id=?1 ORDER BY created_at DESC LIMIT 50")?;
+        result["requests"]=serde_json::json!(requests.query_map([id],|r|Ok(serde_json::json!({"generation":r.get::<_,String>(0)?,"thread_id":r.get::<_,String>(1)?,"turn_id":r.get::<_,String>(2)?,"request_id":r.get::<_,String>(3)?,"method":r.get::<_,String>(4)?,"state":r.get::<_,String>(5)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
+        let mut statement = connection.prepare("SELECT sequence,kind,payload_json,native_turn_id,operation_id,observed_at FROM conversation_events WHERE conversation_id=?1 AND sequence>?2 ORDER BY sequence LIMIT 100")?;
+        let events = statement.query_map(params![id,after], |r|Ok(serde_json::json!({
+            "sequence":r.get::<_,i64>(0)?,"kind":r.get::<_,String>(1)?,"payload":parse_value(r.get::<_,String>(2)?),
+            "turn_id":r.get::<_,Option<String>>(3)?,"operation_id":r.get::<_,Option<String>>(4)?,"observed_at":r.get::<_,String>(5)?
+        })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        result["events"] = serde_json::json!(events);
+        result["history_coverage"] =
+            serde_json::json!("bounded_projection_native_history_authoritative");
+        Ok(result)
+    }
+
+    pub(crate) fn conversation_receipt(
+        &self,
+        operation: &str,
+        input: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>> {
+        let connection = self.lock()?;
+        conversation_receipt_in(&connection, operation, input)
+    }
+
+    pub(crate) fn conversation_create_profile(
+        &self,
+        input: &crate::providers::codex_app_server::ProfileInput,
+    ) -> Result<serde_json::Value> {
+        use crate::providers::codex_app_server::ConversationProfileRevision;
+        let request = serde_json::to_value(input)?;
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = conversation_receipt_in(&tx, &input.operation_id, &request)? {
+            return Ok(receipt);
+        }
+        let config: String = tx.query_row(
+            "SELECT content_hash FROM execution_config_revisions WHERE id=?1 AND project_id=?2",
+            params![input.execution_config_revision_id, input.project_id],
+            |r| r.get(0),
+        )?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let profile_hash = json_hash(
+            &serde_json::json!({"request":request,"execution_config_hash":config,"policy":crate::providers::codex_app_server::POLICY}),
+        )?;
+        let profile = ConversationProfileRevision {
+            id: id.clone(),
+            project_id: input.project_id.clone(),
+            execution_config_revision_id: input.execution_config_revision_id.clone(),
+            model: input.model.clone(),
+            effort: input.effort.clone(),
+            instructions: input.instructions.clone(),
+            instructions_hash: json_hash(&serde_json::json!(input.instructions))?,
+            profile_hash,
+        };
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO conversation_profiles(id,project_id,execution_config_revision_id,
+                 profile_json,profile_hash,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                id,
+                input.project_id,
+                input.execution_config_revision_id,
+                serde_json::to_string(&profile)?,
+                profile.profile_hash,
+                now,
+            ],
+        )?;
+        let result =
+            serde_json::json!({"profile":profile,"state":"saved","native_execution":false});
+        insert_conversation_receipt(
+            &tx,
+            &input.operation_id,
+            &request,
+            "create_profile",
+            None,
+            None,
+            &result,
+            &now,
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn conversation_prepare_admission(
+        &self,
+        operation: &str,
+        request: &serde_json::Value,
+        identity: &crate::providers::codex_app_server::ConversationNativeIdentity,
+    ) -> Result<serde_json::Value> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = conversation_receipt_in(&tx, operation, request)? {
+            return Ok(receipt);
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO conversation_admissions(id,profile_revision_id,identity_json,
+                 identity_hash,state,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,'prepared',?5,?5)",
+            params![
+                id,
+                identity.profile.id,
+                serde_json::to_string(identity)?,
+                json_hash(&serde_json::to_value(identity)?)?,
+                now,
+            ],
+        )?;
+        let result =
+            serde_json::json!({"admission_id":id,"state":"prepared","native_calls_authorized":0});
+        insert_conversation_receipt(
+            &tx, operation, request, "prepare", None, None, &result, &now,
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn conversation_admission(
+        &self,
+        id: &str,
+    ) -> Result<(
+        crate::providers::codex_app_server::ConversationNativeIdentity,
+        String,
+    )> {
+        let (identity, state): (String, String) = self.lock()?.query_row(
+            "SELECT identity_json,state FROM conversation_admissions WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((serde_json::from_str(&identity)?, state))
+    }
+
+    pub(crate) fn conversation_activate(
+        &self,
+        operation: &str,
+        request: &serde_json::Value,
+        admission: &str,
+        identity_hash: &str,
+        evidence: &str,
+    ) -> Result<serde_json::Value> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = conversation_receipt_in(&tx, operation, request)? {
+            return Ok(receipt);
+        }
+        let now = Utc::now().to_rfc3339();
+        let changed = tx.execute(
+            "UPDATE conversation_admissions SET state='active',updated_at=?1
+             WHERE id=?2 AND state='proven' AND identity_hash=?3 AND evidence_hash=?4
+               AND EXISTS(SELECT 1 FROM provider_validation_invocations v
+                   WHERE v.id=probe_invocation_id AND v.state='succeeded')",
+            params![now, admission, identity_hash, evidence],
+        )?;
+        if changed != 1 {
+            bail!("Probe evidence is missing or stale. Prepare and probe the exact conversation profile before activation.")
+        }
+        let result = serde_json::json!({"admission_id":admission,"state":"active"});
+        insert_conversation_receipt(
+            &tx, operation, request, "activate", None, None, &result, &now,
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn conversation_reserve_start(
+        &self,
+        operation: &str,
+        request: &serde_json::Value,
+        admission: &str,
+        identity: &crate::providers::codex_app_server::ConversationNativeIdentity,
+        input: &str,
+        probe: bool,
+    ) -> Result<(serde_json::Value, bool)> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = conversation_receipt_in(&tx, operation, request)? {
+            return Ok((receipt, false));
+        }
+        let hash = json_hash(&serde_json::to_value(identity)?)?;
+        let admitted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversation_admissions
+                 WHERE id=?1 AND identity_hash=?2 AND state=?3)",
+            params![admission, hash, if probe { "prepared" } else { "active" }],
+            |row| row.get(0),
+        )?;
+        if !admitted {
+            bail!("The conversation admission is not current. Prepare, probe and activate this profile.")
+        }
+        if !session_capacity_available(&tx, "codex", false, None, None)? {
+            bail!("Conversation session capacity is full; uncertain and stopping sessions still count.")
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let session = uuid::Uuid::new_v4().to_string();
+        let generation = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        tx.execute("INSERT INTO conversations(id,project_id,admission_id,identity_json,identity_hash,generation,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,'reserved',?7,?7)",params![id,identity.profile.project_id,admission,serde_json::to_string(identity)?,hash,generation,now])?;
+        tx.execute("INSERT INTO sessions(id,conversation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at,workflow_version,workflow_hash,prompt_hash) VALUES(?1,?2,'codex','launch_reserved',?3,?4,?5,?6,?6,'conversation_v1',?7,?8)",params![session,id,serde_json::to_string(identity)?,identity.executable_version,generation,now,identity.adapter_hash,json_hash(&serde_json::json!(input))?])?;
+        tx.execute("INSERT INTO conversation_reservations(conversation_id,session_id,repository_identity,state,created_at,updated_at) VALUES(?1,?2,?3,'reserved',?4,?4)",params![id,session,identity.repository_identity,now])?;
+        let result = serde_json::json!({"conversation_id":id,"session_id":session,"generation":generation,"operation_id":operation,"state":"reserved"});
+        insert_conversation_receipt(
+            &tx,
+            operation,
+            request,
+            if probe { "probe" } else { "start" },
+            Some(&id),
+            Some(&generation),
+            &result,
+            &now,
+        )?;
+        tx.execute("UPDATE conversation_operations SET input_json=?1,state='reserved' WHERE operation_id=?2",params![serde_json::json!({"request":request,"message":input}).to_string(),operation])?;
+        if probe {
+            tx.execute("INSERT INTO provider_validation_batches(id,operation_id,request_hash,preview_hash,selection_json,max_fresh_calls,native_calls_authorized,state,created_at,updated_at) VALUES(?1,?1,?2,?2,'[]',1,1,'running',?3,?3)",params![id,hash,now])?;
+            tx.execute("INSERT INTO provider_validation_invocations(id,batch_id,ordinal,provider,model,effort,evidence_key,state,created_at,updated_at) VALUES(?1,?1,0,'codex',?2,?3,?4,'reserved',?5,?5)",params![id,identity.profile.model,identity.profile.effort,hash,now])?;
+            tx.execute("UPDATE conversation_admissions SET state='probing',probe_invocation_id=?1,updated_at=?2 WHERE id=?3",params![id,now,admission])?;
+        }
+        tx.commit()?;
+        Ok((result, true))
+    }
+
+    pub fn conversation_reserve_input(
+        &self,
+        operation: &str,
+        request: &serde_json::Value,
+        id: &str,
+        input: &str,
+        steer: Option<&str>,
+    ) -> Result<(serde_json::Value, bool)> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = conversation_receipt_in(&tx, operation, request)? {
+            return Ok((receipt, false));
+        }
+        let (generation,thread,turn,state):(String,String,Option<String>,String)=tx.query_row("SELECT generation,native_thread_id,active_turn_id,state FROM conversations WHERE id=?1 AND binding_valid=1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        let live:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversation_reservations r JOIN sessions s ON s.id=r.session_id WHERE r.conversation_id=?1 AND r.state='running' AND s.status='running' AND s.transcript_epoch=?2)",params![id,generation],|r|r.get(0))?;
+        if !live {
+            bail!("This conversation process is stopped or stopping. Verify quiescence before resuming it.")
+        }
+        if steer.is_some() {
+            if state != "running" || turn.as_deref() != steer {
+                bail!("The turn changed; refresh before steering.")
+            }
+        } else if state != "idle" {
+            bail!("The conversation is not ready for another message. Inspect its current outcome before retrying.")
+        }
+        let uncertain: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversation_operations WHERE conversation_id=?1 AND state IN ('reserved','sending','unknown'))",[id],|r|r.get(0))?;
+        if uncertain {
+            bail!("A prior conversation request has an unresolved outcome. It will not be submitted again.")
+        }
+        let now = Utc::now().to_rfc3339();
+        let result = serde_json::json!({"conversation_id":id,"operation_id":operation,"generation":generation,"state":"reserved"});
+        insert_conversation_receipt(
+            &tx,
+            operation,
+            request,
+            if steer.is_some() { "steer" } else { "submit" },
+            Some(id),
+            Some(&generation),
+            &result,
+            &now,
+        )?;
+        tx.execute("UPDATE conversation_operations SET state='reserved',input_json=?1,native_thread_id=?2,native_turn_id=?3 WHERE operation_id=?4",params![serde_json::json!({"request":request,"message":input}).to_string(),thread,steer,operation])?;
+        if steer.is_none() {
+            tx.execute("UPDATE conversations SET state='running',active_turn_id=NULL,updated_at=?1 WHERE id=?2",params![now,id])?;
+        }
+        tx.commit()?;
+        Ok((result, true))
+    }
+
+    pub fn conversation_send_intent(
+        &self,
+        id: &str,
+        generation: &str,
+        operation: &str,
+    ) -> Result<(String, String, String, Option<String>)> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let live:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversation_reservations r JOIN sessions s ON s.id=r.session_id WHERE r.conversation_id=?1 AND r.state='running' AND s.status='running' AND s.transcript_epoch=?2)",params![id,generation],|r|r.get(0))?;
+        if !live {
+            bail!("Conversation transport is no longer admitted for input")
+        }
+        let (thread,input,kind,turn):(String,String,String,Option<String>)=tx.query_row("SELECT c.native_thread_id,o.input_json,o.kind,o.native_turn_id FROM conversations c JOIN conversation_operations o ON o.conversation_id=c.id AND o.generation=c.generation JOIN conversation_admissions a ON a.id=c.admission_id AND a.identity_hash=c.identity_hash WHERE c.id=?1 AND c.generation=?2 AND c.binding_valid=1 AND c.state IN ('starting','running','idle') AND o.operation_id=?3 AND o.state='reserved' AND (a.state='active' OR (a.state='probing' AND EXISTS(SELECT 1 FROM provider_validation_invocations v JOIN provider_validation_batches b ON b.id=v.batch_id WHERE v.id=a.probe_invocation_id AND v.state='running' AND b.state='running')))",params![id,generation,operation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        let input: serde_json::Value = serde_json::from_str(&input)?;
+        let message = input["message"]
+            .as_str()
+            .context("Reserved conversation message is unavailable")?
+            .to_owned();
+        let (count,bytes):(i64,i64)=tx.query_row("SELECT COUNT(*),COALESCE(SUM(length(CAST(payload_json AS BLOB))),0) FROM conversation_events WHERE conversation_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        if count >= crate::providers::codex_app_server::MAX_EVENTS
+            || bytes + message.len() as i64 + 256
+                > crate::providers::codex_app_server::MAX_PROJECTION_BYTES
+        {
+            bail!("Conversation history is full; create a new conversation")
+        }
+        tx.execute("INSERT INTO conversation_events(conversation_id,sequence,generation,native_thread_id,operation_id,kind,payload_json,observed_at) VALUES(?1,?2,?3,?4,?5,'user_message',?6,?7)",params![id,count+1,generation,thread,operation,crate::diagnostics::sanitize_value(serde_json::json!({"text":message})).to_string(),Utc::now().to_rfc3339()])?;
+        tx.execute("UPDATE conversation_operations SET state='sending',native_thread_id=?1,updated_at=?2 WHERE operation_id=?3 AND state='reserved'",params![thread,Utc::now().to_rfc3339(),operation])?;
+        tx.commit()?;
+        Ok((thread, message, kind, turn))
+    }
+
+    pub(crate) fn conversation_bind_thread(
+        &self,
+        id: &str,
+        generation: &str,
+        thread: &str,
+    ) -> Result<()> {
+        crate::providers::codex_app_server::bounded(thread, 128, "native thread ID")?;
+        let connection = self.lock()?;
+        let changed=connection.execute("UPDATE conversations SET native_thread_id=?1,state='starting',updated_at=?2 WHERE id=?3 AND generation=?4 AND binding_valid=1 AND state IN ('reserved','starting') AND (native_thread_id IS NULL OR native_thread_id=?1)",params![thread,Utc::now().to_rfc3339(),id,generation])?;
+        if changed != 1 {
+            bail!("Native thread response does not match its conversation generation.")
+        }
+        Ok(())
+    }
+
+    pub fn conversation_response(
+        &self,
+        id: &str,
+        generation: &str,
+        operation: &str,
+        result: &serde_json::Value,
+        failed: bool,
+    ) -> Result<()> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expected: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT o.kind,o.native_turn_id FROM conversation_operations o
+                 JOIN conversations c ON c.id=o.conversation_id AND c.generation=o.generation
+                 WHERE o.operation_id=?1 AND c.id=?2 AND c.generation=?3
+                 AND c.binding_valid=1 AND o.state='sending'
+                 AND (o.kind!='steer' OR o.native_thread_id=c.native_thread_id)",
+                params![operation, id, generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((kind, expected_turn)) = expected else {
+            bail!("Stale or unsolicited native response rejected.")
+        };
+        if kind == "interrupt" {
+            if failed {
+                hold_conversation_in(
+                    &tx,
+                    id,
+                    "Native interrupt acknowledgement is unknown; ownership remains held.",
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE conversation_operations SET state='completed',
+                     result_json=json_set(result_json,'$.native_interrupt_acknowledged',1,
+                         '$.quiescence','unverified'),updated_at=?1 WHERE operation_id=?2",
+                    params![Utc::now().to_rfc3339(), operation],
+                )?;
+            }
+            tx.commit()?;
+            return Ok(());
+        }
+        let turn = if kind == "steer" {
+            result["turnId"].as_str()
+        } else {
+            result["turn"]["id"].as_str()
+        };
+        if failed || turn.is_none() || (expected_turn.is_some() && expected_turn.as_deref() != turn)
+        {
+            hold_conversation_in(
+                &tx,
+                id,
+                "Native turn acknowledgement is unavailable or inconsistent.",
+            )?;
+        } else {
+            let turn = turn.context("native turn ID missing")?;
+            crate::providers::codex_app_server::bounded(turn, 128, "native turn ID")?;
+            // A terminal notification can overtake the steer acknowledgement.
+            // Its exact recorded outcome must never reactivate that turn.
+            let terminal: Option<String> = if kind == "steer" {
+                tx.query_row(
+                    "SELECT e.payload_json FROM conversation_events e
+                     JOIN conversation_operations o ON o.operation_id=?1
+                     WHERE e.conversation_id=o.conversation_id AND e.generation=o.generation
+                     AND e.native_thread_id=o.native_thread_id AND e.native_turn_id=?2
+                     AND e.kind='turn_completed' ORDER BY e.sequence LIMIT 1",
+                    params![operation, turn],
+                    |row| row.get(0),
+                )
+                .optional()?
+            } else {
+                None
+            };
+            if let Some(terminal) = terminal {
+                let payload: serde_json::Value = serde_json::from_str(&terminal)?;
+                tx.execute(
+                    "UPDATE conversation_operations SET state='completed',
+                     result_json=json_set(result_json,'$.native_turn_id',?1,'$.outcome',?2,
+                         '$.usage_coverage','partial_native_observation'),updated_at=?3
+                     WHERE operation_id=?4",
+                    params![
+                        turn,
+                        payload["status"].as_str().unwrap_or("unknown"),
+                        Utc::now().to_rfc3339(),
+                        operation
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok(());
+            }
+            tx.execute("UPDATE conversation_operations SET native_turn_id=?1,state='bound',result_json=json_set(result_json,'$.native_turn_id',?1),updated_at=?2 WHERE operation_id=?3",params![turn,Utc::now().to_rfc3339(),operation])?;
+            tx.execute("UPDATE conversations SET active_turn_id=?1,state=CASE WHEN state='stopping' THEN state ELSE 'running' END,updated_at=?2 WHERE id=?3 AND (active_turn_id IS NULL OR active_turn_id=?1)",params![turn,Utc::now().to_rfc3339(),id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn conversation_event(
+        &self,
+        id: &str,
+        generation: &str,
+        thread: &str,
+        turn: Option<&str>,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        use crate::providers::codex_app_server::{
+            MAX_EVENTS, MAX_EVENT_BYTES, MAX_PROJECTION_BYTES,
+        };
+        let payload = crate::diagnostics::sanitize_value(payload.clone());
+        let bytes = serde_json::to_vec(&payload)?;
+        if bytes.len() > MAX_EVENT_BYTES {
+            bail!("Conversation event exceeds its bound")
+        }
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if kind == "turn_completed" {
+            tx.execute(
+                "UPDATE conversation_requests SET state='expired' WHERE conversation_id=?1
+                 AND generation=?2 AND native_thread_id=?3 AND native_turn_id=?4 AND state='denied'",
+                params![id, generation, thread, turn],
+            )?;
+            let duplicate: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversation_events e
+                 JOIN conversations c ON c.id=e.conversation_id AND c.generation=e.generation
+                     AND c.native_thread_id=e.native_thread_id AND c.binding_valid=1
+                 WHERE e.conversation_id=?1 AND e.generation=?2
+                 AND e.native_thread_id=?3 AND e.native_turn_id=?4
+                 AND e.kind='turn_completed')",
+                params![id, generation, thread, turn],
+                |r| r.get(0),
+            )?;
+            if duplicate {
+                return Ok(());
+            }
+        }
+        let current: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversations c WHERE c.id=?1 AND c.generation=?2
+             AND c.native_thread_id=?3 AND c.binding_valid=1
+             AND (?4 IS NULL OR c.active_turn_id=?4
+                 OR (?5 IN ('usage','tool_activity','agent_message')
+                     AND EXISTS(SELECT 1 FROM conversation_operations o
+                         WHERE o.conversation_id=c.id AND o.generation=c.generation
+                         AND o.native_turn_id=?4 AND o.state='completed'))))",
+            params![id, generation, thread, turn, kind],
+            |r| r.get(0),
+        )?;
+        if !current {
+            bail!(
+                "Out-of-order or stale native event rejected; inspect the unresolved conversation."
+            )
+        }
+        let (count, total): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(payload_json AS BLOB))),0)
+             FROM conversation_events WHERE conversation_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if count >= MAX_EVENTS || total + bytes.len() as i64 > MAX_PROJECTION_BYTES {
+            bail!(
+                "Conversation history limit reached; stop this conversation and create a new one."
+            )
+        }
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO conversation_events(conversation_id,sequence,generation,
+                 native_thread_id,native_turn_id,operation_id,kind,payload_json,observed_at)
+             VALUES(?1,?2,?3,?4,?5,
+                 (SELECT operation_id FROM conversation_operations
+                  WHERE conversation_id=?1 AND native_turn_id=?5
+                  AND kind IN ('start','probe','submit') ORDER BY created_at LIMIT 1),?6,?7,?8)",
+            params![
+                id,
+                count + 1,
+                generation,
+                thread,
+                turn,
+                kind,
+                payload.to_string(),
+                now
+            ],
+        )?;
+        if kind == "turn_completed" {
+            tx.execute(
+                "UPDATE conversation_operations SET state='completed',
+                 result_json=json_set(result_json,'$.outcome',?5,
+                     '$.usage_coverage','partial_native_observation'),updated_at=?1
+                 WHERE conversation_id=?2 AND generation=?3 AND native_turn_id=?4 AND state='bound'",
+                params![now, id, generation, turn, payload["status"].as_str().unwrap_or("unknown")],
+            )?;
+            tx.execute(
+                "UPDATE conversations SET state=CASE WHEN state='running' THEN 'idle' ELSE state END,
+                 active_turn_id=NULL,updated_at=?1
+                 WHERE id=?2 AND active_turn_id=?3 AND state IN ('running','stopping')",
+                params![now, id, turn],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn conversation_hold(&self, id: &str, reason: &str) -> Result<()> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        hold_conversation_in(&tx, id, reason)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn conversation_proven_spawn_failure(&self, id: &str, session: &str) -> Result<()> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = Utc::now().to_rfc3339();
+        let changed=tx.execute("UPDATE sessions SET status='launch_failed',launch_state='failed',launch_error='The local conversation wrapper could not start; no native submission occurred.',updated_at=?1 WHERE id=?2 AND conversation_id=?3 AND process_identity_json IS NULL AND recovery_root_pid IS NULL AND launch_state='spawning'",params![now,session,id])?;
+        if changed != 1 {
+            bail!("Conversation launch failure no longer has definitive non-delivery evidence")
+        }
+        tx.execute("UPDATE conversations SET binding_valid=0,state='history_only',updated_at=?1 WHERE id=?2",params![now,id])?;
+        tx.execute("UPDATE conversation_operations SET state='failed',updated_at=?1 WHERE conversation_id=?2 AND state='reserved'",params![now,id])?;
+        tx.execute("UPDATE conversation_reservations SET state='released',updated_at=?1 WHERE conversation_id=?2 AND session_id=?3",params![now,id,session])?;
+        tx.execute("UPDATE provider_validation_invocations SET state='failed',failure_reason='Local wrapper spawn failed before native delivery',finished_at=?1,updated_at=?1 WHERE id=?2 AND state='reserved'",params![now,id])?;
+        tx.execute("UPDATE provider_validation_batches SET state='finished',finished_at=?1,updated_at=?1 WHERE id=?2",params![now,id])?;
+        tx.execute("UPDATE conversation_admissions SET state='invalidated',updated_at=?1 WHERE probe_invocation_id=?2 AND state='probing'",params![now,id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn conversation_hold_generation(
+        &self,
+        id: &str,
+        generation: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1 AND generation=?2 AND binding_valid=1)",params![id,generation],|r|r.get(0))?;
+        if current {
+            hold_conversation_in(&tx, id, reason)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn conversation_event_waits_for_ack(
+        &self,
+        id: &str,
+        generation: &str,
+        thread: &str,
+        turn: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM conversations c WHERE c.id=?1 AND c.generation=?2 AND c.binding_valid=1 AND c.native_thread_id=?3 AND ?4 IS NOT NULL AND c.active_turn_id IS NULL AND EXISTS(SELECT 1 FROM conversation_operations o WHERE o.conversation_id=c.id AND o.generation=c.generation AND o.state='sending'))",params![id,generation,thread,turn],|r|r.get(0))?)
+    }
+
+    pub(crate) fn conversation_restored_usage(
+        &self,
+        id: &str,
+        generation: &str,
+        thread: &str,
+        turn: Option<&str>,
+        kind: &str,
+        validated_history: &[String],
+    ) -> Result<bool> {
+        if kind != "usage"
+            || !turn.is_some_and(|turn| validated_history.iter().any(|id| id == turn))
+        {
+            return Ok(false);
+        }
+        let verified: bool = self.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversations c WHERE c.id=?1 AND c.generation=?2
+             AND c.native_thread_id=?3 AND c.binding_valid=1
+             AND EXISTS(SELECT 1 FROM conversation_operations r WHERE r.conversation_id=c.id
+                 AND r.generation=c.generation AND r.kind='resume' AND r.state='completed')
+             AND EXISTS(SELECT 1 FROM conversation_operations o WHERE o.conversation_id=c.id
+                 AND o.generation!=c.generation AND o.native_thread_id=c.native_thread_id
+                 AND o.native_turn_id=?4 AND o.kind IN ('start','probe','submit')
+                 AND o.state='completed'))",
+            params![id, generation, thread, turn],
+            |row| row.get(0),
+        )?;
+        if !verified {
+            bail!("Restored native usage does not match the validated conversation resume")
+        }
+        // Resume replays a persisted snapshot, not model work in this generation.
+        // Do not project it again or change the active turn or usage accounting.
+        Ok(true)
+    }
+
+    pub(crate) fn conversation_native_denial(
+        &self,
+        id: &str,
+        generation: &str,
+        thread: &str,
+        turn: &str,
+        request: &serde_json::Value,
+        method: &str,
+    ) -> Result<()> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::permissions::deny_conversation_request(
+            &tx, id, generation, thread, turn, request, method,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn conversation_acknowledge_denial(
+        &self,
+        operation: &str,
+        request: &serde_json::Value,
+        id: &str,
+        generation: &str,
+        thread: &str,
+        turn: &str,
+        request_id: &str,
+    ) -> Result<serde_json::Value> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = conversation_receipt_in(&tx, operation, request)? {
+            return Ok(receipt);
+        }
+        let changed = tx.execute(
+            "UPDATE conversation_requests SET state='acknowledged' WHERE conversation_id=?1
+             AND generation=?2 AND native_thread_id=?3 AND native_turn_id=?4
+             AND request_id=?5 AND state='denied'
+             AND EXISTS(SELECT 1 FROM conversations c WHERE c.id=?1 AND c.generation=?2
+                 AND c.native_thread_id=?3 AND c.active_turn_id=?4
+                 AND c.binding_valid=1 AND c.state='running')",
+            params![id, generation, thread, turn, request_id],
+        )?;
+        if changed != 1 {
+            bail!("This denied request is stale. Refresh the conversation; acknowledgement cannot grant permission.")
+        }
+        let result = serde_json::json!({"state":"denied","acknowledged":true,"native_allow":false});
+        insert_conversation_receipt(
+            &tx,
+            operation,
+            request,
+            "deny",
+            Some(id),
+            Some(generation),
+            &result,
+            &Utc::now().to_rfc3339(),
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn conversation_session(&self, id: &str) -> Result<(String, String)> {
+        self.lock()?
+            .query_row(
+                "SELECT r.session_id,c.generation FROM conversation_reservations r
+             JOIN conversations c ON c.id=r.conversation_id WHERE c.id=?1 AND r.state!='released'",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .context("This conversation process is unavailable or stopped. Inspect its outcome and verify quiescence before resuming it.")
+    }
+
+    pub(crate) fn conversation_transport_closed(&self, id: &str, generation: &str) -> Result<()> {
+        let connection = self.lock()?;
+        let unresolved: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversation_operations WHERE conversation_id=?1
+             AND generation=?2 AND state IN ('reserved','sending','bound','unknown'))",
+            params![id, generation],
+            |r| r.get(0),
+        )?;
+        drop(connection);
+        if unresolved {
+            self.conversation_hold_generation(
+                id,
+                generation,
+                "The native transport ended before the request outcome was confirmed.",
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_conversation_restart(&self) -> Result<()> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE conversation_operations SET state='unknown',updated_at=?1
+             WHERE state IN ('reserved','sending','bound')",
+            [&now],
+        )?;
+        tx.execute(
+            "UPDATE conversations SET state='recovery_required',updated_at=?1
+             WHERE binding_valid=1 AND EXISTS(SELECT 1 FROM conversation_reservations r
+                 WHERE r.conversation_id=conversations.id AND r.state!='released')",
+            [&now],
+        )?;
+        tx.execute(
+            "UPDATE conversation_reservations SET state='unknown',updated_at=?1 WHERE state!='released'",
+            [&now],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET status='recovery_required',desired_running=0,updated_at=?1
+             WHERE conversation_id IS NOT NULL
+             AND status IN ('launch_reserved','running','interrupt_requested')",
+            [&now],
+        )?;
+        tx.execute(
+            "UPDATE conversation_requests SET state='expired' WHERE state='denied'",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn conversation_reserve_resume(
+        &self,
+        operation: &str,
+        request: &serde_json::Value,
+        id: &str,
+        identity: &crate::providers::codex_app_server::ConversationNativeIdentity,
+    ) -> Result<(serde_json::Value, String)> {
+        let prior: Option<String> = {
+            let connection = self.lock()?;
+            connection
+                .query_row(
+                    "SELECT session_id FROM conversation_reservations
+                     WHERE conversation_id=?1 AND state!='released'",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?
+        };
+        let quiescence = prior
+            .as_ref()
+            .map(|session| crate::recovery::verify_session_quiescent(self, session))
+            .transpose()?;
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if conversation_receipt_in(&tx, operation, request)?.is_some() {
+            bail!("Resume is already reserved; inspect the conversation instead of resending it")
+        }
+        let hash = json_hash(&serde_json::to_value(identity)?)?;
+        let thread: String = tx.query_row(
+            "SELECT c.native_thread_id FROM conversations c
+             JOIN conversation_admissions a ON a.id=c.admission_id
+             WHERE c.id=?1 AND c.identity_hash=?2 AND c.binding_valid=1
+             AND c.state IN ('idle','recovery_required') AND a.state='active' AND a.identity_hash=?2
+             AND NOT EXISTS(SELECT 1 FROM conversation_operations o
+                 WHERE o.conversation_id=c.id AND o.state IN ('reserved','sending','bound','unknown'))",
+            params![id, hash],
+            |r| r.get(0),
+        )?;
+        if let Some(session) = prior {
+            if quiescence.is_none() {
+                bail!("Conversation process quiescence is unavailable")
+            }
+            tx.execute("UPDATE sessions SET status='exited',launch_state='finished',capture_state='complete',exit_json=?1,updated_at=?2 WHERE id=?3 AND conversation_id=?4",params![serde_json::json!({"process_group_quiescent":true,"observation":quiescence}).to_string(),Utc::now().to_rfc3339(),session,id])?;
+            tx.execute(
+                "UPDATE conversation_reservations SET state='released' WHERE conversation_id=?1",
+                [id],
+            )?;
+        }
+        if !session_capacity_available(&tx, "codex", false, None, None)? {
+            bail!("Conversation session capacity is full")
+        }
+        let session = uuid::Uuid::new_v4().to_string();
+        let generation = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "DELETE FROM conversation_reservations WHERE conversation_id=?1 AND state='released'",
+            [id],
+        )?;
+        tx.execute("UPDATE conversations SET generation=?1,state='reserved',active_turn_id=NULL,updated_at=?2 WHERE id=?3",params![generation,now,id])?;
+        tx.execute("INSERT INTO sessions(id,conversation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at,workflow_version,workflow_hash,prompt_hash) VALUES(?1,?2,'codex','launch_reserved',?3,?4,?5,?6,?6,'conversation_v1',?7,'')",params![session,id,serde_json::to_string(identity)?,identity.executable_version,generation,now,identity.adapter_hash])?;
+        tx.execute("INSERT INTO conversation_reservations(conversation_id,session_id,repository_identity,state,created_at,updated_at) VALUES(?1,?2,?3,'reserved',?4,?4)",params![id,session,identity.repository_identity,now])?;
+        let result = serde_json::json!({"conversation_id":id,"session_id":session,"generation":generation,"state":"resume_reserved"});
+        insert_conversation_receipt(
+            &tx,
+            operation,
+            request,
+            "resume",
+            Some(id),
+            Some(&generation),
+            &result,
+            &now,
+        )?;
+        tx.execute("UPDATE conversation_operations SET state='reserved',native_thread_id=?1 WHERE operation_id=?2",params![thread,operation])?;
+        tx.commit()?;
+        Ok((result, thread))
+    }
+
+    pub(crate) fn conversation_validate_history(
+        &self,
+        id: &str,
+        thread: &serde_json::Value,
+    ) -> Result<Vec<String>> {
+        let connection = self.lock()?;
+        let expected_thread: String = connection.query_row(
+            "SELECT native_thread_id FROM conversations WHERE id=?1 AND binding_valid=1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if thread["id"].as_str() != Some(expected_thread.as_str()) {
+            bail!("Native history belongs to a different conversation")
+        }
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT native_turn_id,json_extract(result_json,'$.outcome')
+             FROM conversation_operations WHERE conversation_id=?1 AND native_turn_id IS NOT NULL
+             AND kind IN ('start','probe','submit') AND state='completed' ORDER BY native_turn_id",
+        )?;
+        let expected = statement
+            .query_map([id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let turns = thread["turns"]
+            .as_array()
+            .context("Native history does not provide definitive turn identities")?;
+        let mut observed = turns
+            .iter()
+            .map(|turn| {
+                let status = turn["status"]
+                    .as_str()
+                    .context("Native history turn lacks its outcome")?;
+                if !matches!(status, "completed" | "interrupted" | "failed") {
+                    bail!("Native history contains an unconfirmed turn")
+                }
+                Ok((
+                    turn["id"]
+                        .as_str()
+                        .context("Native history turn lacks its identity")?
+                        .to_owned(),
+                    status.to_owned(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        observed.sort();
+        if observed != expected {
+            bail!("Native and recorded turn history differ. Recovery is required; no input will be replayed.")
+        }
+        Ok(expected.into_iter().map(|(turn, _)| turn).collect())
+    }
+
+    pub(crate) fn conversation_resume_bound(
+        &self,
+        id: &str,
+        generation: &str,
+        operation: &str,
+    ) -> Result<()> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE conversation_operations SET state='completed',updated_at=?1
+             WHERE operation_id=?2 AND kind='resume' AND conversation_id=?3
+             AND generation=?4 AND state='reserved'",
+            params![Utc::now().to_rfc3339(), operation, id, generation],
+        )?;
+        if changed != 1 {
+            bail!("Conversation resume binding is stale")
+        }
+        tx.execute(
+            "UPDATE conversations SET state='idle',updated_at=?1
+             WHERE id=?2 AND generation=?3 AND state='starting'",
+            params![Utc::now().to_rfc3339(), id, generation],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn conversation_reconcile_quiescence(
+        &self,
+        operation: &str,
+        request: &serde_json::Value,
+        id: &str,
+    ) -> Result<serde_json::Value> {
+        if let Some(receipt) = self.conversation_receipt(operation, request)? {
+            return Ok(receipt);
+        }
+        let (session, generation): (String, String) = self.lock()?.query_row(
+            "SELECT r.session_id,c.generation FROM conversation_reservations r
+             JOIN conversations c ON c.id=r.conversation_id WHERE c.id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        // Observes recorded process generations only; never signals a restored
+        // process and never treats a human acknowledgement as quiescence.
+        let proof = crate::recovery::verify_session_quiescent(self, &session)?;
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = conversation_receipt_in(&tx, operation, request)? {
+            return Ok(receipt);
+        }
+        let current: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversations c
+             JOIN conversation_reservations r ON r.conversation_id=c.id
+             WHERE c.id=?1 AND c.generation=?2 AND r.session_id=?3)",
+            params![id, generation, session],
+            |r| r.get(0),
+        )?;
+        if !current {
+            bail!("Conversation ownership changed during quiescence inspection")
+        }
+        let uncertain: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversation_operations WHERE conversation_id=?1
+             AND state IN ('reserved','sending','bound','unknown'))",
+            [id],
+            |r| r.get(0),
+        )?;
+        let now = Utc::now().to_rfc3339();
+        if uncertain {
+            hold_conversation_in(
+                &tx,
+                id,
+                "Native delivery remains unknown. This conversation is history only; create a separately identified conversation.",
+            )?;
+            tx.execute(
+                "UPDATE conversations SET binding_valid=0,state='history_only',updated_at=?1 WHERE id=?2",
+                params![now, id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE conversations SET state=CASE WHEN binding_valid=1 THEN 'idle'
+                     ELSE 'history_only' END,updated_at=?1 WHERE id=?2",
+                params![now, id],
+            )?;
+        }
+        tx.execute(
+            "UPDATE conversation_reservations SET state='released',updated_at=?1
+             WHERE conversation_id=?2 AND session_id=?3",
+            params![now, id, session],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET status='exited',launch_state='finished',capture_state='complete',
+             desired_running=0,exit_json=?1,updated_at=?2 WHERE id=?3",
+            params![
+                serde_json::json!({"process_group_quiescent": true, "observation": proof})
+                    .to_string(),
+                now,
+                session
+            ],
+        )?;
+        tx.execute(
+            "UPDATE recovery_records SET state='resolved',resolved_at=?1,updated_at=?1
+             WHERE session_id=?2 AND state='attention_required'
+             AND json_extract(detail_json,'$.kind')='database_restore_conversation'",
+            params![now, session],
+        )?;
+        let result = serde_json::json!({
+            "conversation_id": id,
+            "process_quiescence": "verified",
+            "reservation": "released",
+            "unknown_delivery_preserved": uncertain,
+            "replayed": false
+        });
+        insert_conversation_receipt(
+            &tx,
+            operation,
+            request,
+            "reconcile",
+            Some(id),
+            Some(&generation),
+            &result,
+            &now,
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn conversation_identity(
+        &self,
+        id: &str,
+    ) -> Result<crate::providers::codex_app_server::ConversationNativeIdentity> {
+        let value: String = self.lock()?.query_row(
+            "SELECT identity_json FROM conversations WHERE id=?1 AND binding_valid=1",
+            [id],
+            |r| r.get(0),
+        )?;
+        Ok(serde_json::from_str(&value)?)
+    }
+
+    pub(crate) fn conversation_active_sessions(&self) -> Result<Vec<String>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT r.session_id FROM conversation_reservations r
+             JOIN sessions s ON s.id=r.session_id WHERE r.state!='released' ORDER BY r.created_at",
+        )?;
+        let rows = statement
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    pub(crate) fn conversation_ready_to_stop(&self, id: &str) -> Result<bool> {
+        Ok(self.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversations c WHERE c.id=?1 AND c.binding_valid=1
+             AND ((c.state='stopping' AND c.active_turn_id IS NULL
+                   AND NOT EXISTS(SELECT 1 FROM conversation_operations o
+                       WHERE o.conversation_id=c.id AND o.kind='interrupt' AND o.state!='completed'))
+                  OR (c.state='idle' AND EXISTS(SELECT 1 FROM conversation_admissions a
+                      JOIN provider_validation_invocations v ON v.id=a.probe_invocation_id
+                      WHERE a.id=c.admission_id AND a.state='probing' AND v.state='running' AND v.id=c.id))))",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn conversation_interrupt_receipt(
+        &self,
+        operation: &str,
+        request: &serde_json::Value,
+        id: &str,
+    ) -> Result<(serde_json::Value, bool)> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = conversation_receipt_in(&tx, operation, request)? {
+            return Ok((receipt, false));
+        }
+        let generation: String = tx.query_row(
+            "SELECT generation FROM conversations WHERE id=?1 AND binding_valid=1
+             AND state IN ('idle','running','starting','recovery_required')",
+            [id],
+            |r| r.get(0),
+        )?;
+        let active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversation_reservations
+             WHERE conversation_id=?1 AND state!='released')",
+            [id],
+            |r| r.get(0),
+        )?;
+        let now = Utc::now().to_rfc3339();
+        let result = serde_json::json!({
+            "conversation_id": id,
+            "state": if active { "stop_requested" } else { "already_quiet" },
+            "quiescence": if active { "unverified" } else { "previously_verified" }
+        });
+        insert_conversation_receipt(
+            &tx,
+            operation,
+            request,
+            "interrupt",
+            Some(id),
+            Some(&generation),
+            &result,
+            &now,
+        )?;
+        if !active {
+            tx.commit()?;
+            return Ok((result, false));
+        }
+        tx.execute(
+            "UPDATE provider_validation_invocations SET state='cancel_requested',updated_at=?1
+             WHERE id=?2 AND state IN ('reserved','running')",
+            params![now, id],
+        )?;
+        tx.execute(
+            "UPDATE provider_validation_batches SET state='cancel_requested',updated_at=?1
+             WHERE id=?2 AND state='running'",
+            params![now, id],
+        )?;
+        tx.execute(
+            "UPDATE conversation_operations SET state='reserved',
+             native_thread_id=(SELECT native_thread_id FROM conversations WHERE id=?1),
+             native_turn_id=(SELECT active_turn_id FROM conversations WHERE id=?1)
+             WHERE operation_id=?2
+             AND (SELECT active_turn_id FROM conversations WHERE id=?1) IS NOT NULL",
+            params![id, operation],
+        )?;
+        tx.execute(
+            "UPDATE conversations SET state='stopping',updated_at=?1
+             WHERE id=?2 AND state!='recovery_required'",
+            params![now, id],
+        )?;
+        tx.execute(
+            "UPDATE conversation_reservations SET state='stopping',updated_at=?1
+             WHERE conversation_id=?2 AND state!='released'",
+            params![now, id],
+        )?;
+        tx.execute(
+            "UPDATE conversation_requests SET state='expired'
+             WHERE conversation_id=?1 AND state='denied'",
+            [id],
+        )?;
+        tx.commit()?;
+        Ok((result, true))
+    }
+
+    pub(crate) fn conversation_interrupt_send_intent(
+        &self,
+        id: &str,
+        generation: &str,
+        operation: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ids: Option<(String, String)> = tx
+            .query_row(
+                "SELECT o.native_thread_id,o.native_turn_id FROM conversation_operations o
+                 JOIN conversations c ON c.id=o.conversation_id AND c.generation=o.generation
+                 WHERE o.operation_id=?1 AND c.id=?2 AND c.generation=?3
+                 AND c.binding_valid=1 AND o.kind='interrupt' AND o.state='reserved'",
+                params![operation, id, generation],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((thread, turn)) = ids else {
+            return Ok(None);
+        };
+        tx.execute(
+            "UPDATE conversation_operations SET state='sending',updated_at=?1 WHERE operation_id=?2",
+            params![Utc::now().to_rfc3339(), operation],
+        )?;
+        tx.commit()?;
+        Ok(Some(serde_json::json!({
+            "id": operation,
+            "method": "turn/interrupt",
+            "params": {
+                "threadId": thread,
+                "turnId": turn
+            }
+        })))
+    }
+}
+
+fn conversation_receipt_in(
+    connection: &Connection,
+    operation: &str,
+    request: &serde_json::Value,
+) -> Result<Option<serde_json::Value>> {
+    let row:Option<(String,String,String)>=connection.query_row("SELECT request_hash,state,result_json FROM conversation_operations WHERE operation_id=?1 AND actor_key='human_control'",[operation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let Some((hash, state, result)) = row else {
+        return Ok(None);
+    };
+    if hash != json_hash(request)? {
+        bail!("This operation ID was already used with different conversation input.")
+    }
+    let mut result: serde_json::Value = serde_json::from_str(&result)?;
+    if !result.is_object() {
+        bail!("Conversation receipt is malformed. Inspect the stored operation before creating new work.")
+    }
+    result["delivery_state"] = serde_json::json!(state);
+    result["replayed"] = serde_json::json!(false);
+    if state == "unknown" {
+        result["state"] = serde_json::json!("recovery_required");
+        result["message"]=serde_json::json!("The request outcome is unknown. Inspect the conversation and verify process quiescence before creating separately identified work. This request will not be replayed.");
+    }
+    Ok(Some(result))
+}
+
+fn insert_conversation_receipt(
+    tx: &Transaction<'_>,
+    operation: &str,
+    request: &serde_json::Value,
+    kind: &str,
+    conversation: Option<&str>,
+    generation: Option<&str>,
+    result: &serde_json::Value,
+    now: &str,
+) -> Result<()> {
+    tx.execute("INSERT INTO conversation_operations(operation_id,actor_key,request_hash,kind,conversation_id,generation,state,input_json,result_json,created_at,updated_at) VALUES(?1,'human_control',?2,?3,?4,?5,'completed',?6,?7,?8,?8)",params![operation,json_hash(request)?,kind,conversation,generation,request.to_string(),result.to_string(),now])?;
+    Ok(())
+}
+
+fn hold_conversation_in(tx: &Transaction<'_>, id: &str, reason: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    tx.execute("UPDATE conversations SET state='recovery_required',updated_at=?1 WHERE id=?2 AND state!='history_only'",params![now,id])?;
+    tx.execute("UPDATE conversation_operations SET state='unknown',updated_at=?1 WHERE conversation_id=?2 AND state IN ('reserved','sending','bound')",params![now,id])?;
+    tx.execute("UPDATE conversation_reservations SET state='unknown',updated_at=?1 WHERE conversation_id=?2 AND state!='released'",params![now,id])?;
+    tx.execute("UPDATE sessions SET status='recovery_required',launch_error=?1,updated_at=?2 WHERE conversation_id=?3 AND status IN ('launch_reserved','running','interrupt_requested','recovery_required')",params![reason,now,id])?;
+    tx.execute("UPDATE conversation_requests SET state='expired' WHERE conversation_id=?1 AND state='denied'",[id])?;
+    Ok(())
+}
 // Same value rusqlite installs at open; set explicitly before any pragma or DDL can contend.
 pub(crate) const STATE_DATABASE_BUSY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
@@ -5166,7 +6387,14 @@ impl Store {
                  SELECT 1 FROM provider_validation_invocations invocation
                  JOIN provider_validation_batches batch ON batch.id=invocation.batch_id
                  WHERE invocation.id=sessions.provider_validation_invocation_id
-                   AND invocation.state='reserved' AND batch.state='running'))",
+                   AND invocation.state='reserved' AND batch.state='running'))
+               AND (conversation_id IS NULL OR EXISTS(SELECT 1 FROM conversations c
+                 JOIN conversation_admissions a ON a.id=c.admission_id
+                 WHERE c.id=sessions.conversation_id AND c.generation=sessions.transcript_epoch
+                   AND c.binding_valid=1 AND c.state='reserved' AND a.identity_hash=c.identity_hash
+                   AND (a.state='active' OR (a.state='probing' AND EXISTS(
+                     SELECT 1 FROM provider_validation_invocations v JOIN provider_validation_batches b ON b.id=v.batch_id
+                     WHERE v.id=a.probe_invocation_id AND v.state='reserved' AND b.state='running')))))",
             params![boot_identity, Utc::now().to_rfc3339(), session_id, transcript_epoch],
         )?;
         if changed != 1 {
@@ -5250,6 +6478,20 @@ impl Store {
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
+        if let SessionOwner::Conversation(conversation) = session_owner_in(&connection, session_id)?
+        {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed=transaction.execute("UPDATE sessions SET status='running',launch_state='started',process_identity_json=?1,updated_at=?2 WHERE id=?3 AND conversation_id=?4 AND transcript_epoch=?5 AND status='launch_reserved' AND launch_state='spawning'",params![process_json,now,session_id,conversation,transcript_epoch])?;
+            if changed != 1 {
+                bail!("Conversation process reservation is stale")
+            }
+            transaction.execute("UPDATE conversation_reservations SET state='running',updated_at=?1 WHERE conversation_id=?2 AND session_id=?3 AND state='reserved'",params![now,conversation,session_id])?;
+            transaction.execute("UPDATE conversations SET state='starting',updated_at=?1 WHERE id=?2 AND generation=?3 AND state='reserved'",params![now,conversation,transcript_epoch])?;
+            transaction.execute("UPDATE provider_validation_invocations SET state='running',updated_at=?1 WHERE id=?2 AND state='reserved'",params![now,conversation])?;
+            transaction.commit()?;
+            return Ok(());
+        }
         if let SessionOwner::ProviderValidationInvocation(invocation_id) =
             session_owner_in(&connection, session_id)?
         {
@@ -5560,6 +6802,11 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let SessionOwner::Conversation(id) = session_owner_in(&transaction, session_id)? {
+            hold_conversation_in(&transaction, &id, reason)?;
+            transaction.commit()?;
+            return Ok(());
+        }
         if let SessionOwner::ProviderValidationInvocation(invocation_id) =
             session_owner_in(&transaction, session_id)?
         {
@@ -5897,6 +7144,11 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let SessionOwner::Conversation(id) = session_owner_in(&transaction, session_id)? {
+            hold_conversation_in(&transaction, &id, reason)?;
+            transaction.commit()?;
+            return Ok(());
+        }
         if let SessionOwner::ProviderValidationInvocation(invocation_id) =
             session_owner_in(&transaction, session_id)?
         {
@@ -6359,6 +7611,38 @@ impl Store {
             transaction.commit()?;
             return Ok(false);
         }
+        if let SessionOwner::Conversation(id) = session_owner_in(&transaction, session_id)? {
+            if exit
+                .get("process_group_quiescent")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                bail!("Conversation ownership cannot be released without proven process quiescence")
+            }
+            let unresolved:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM conversation_operations WHERE conversation_id=?1 AND state IN ('reserved','sending','bound','unknown'))",[&id],|r|r.get(0))?;
+            if unresolved {
+                hold_conversation_in(&transaction,&id,"The process stopped with an unresolved native outcome; no request will be replayed.")?;
+            } else {
+                transaction.execute("UPDATE conversations SET state='idle',active_turn_id=NULL,updated_at=?1 WHERE id=?2 AND binding_valid=1",params![now,id])?;
+            }
+            transaction.execute("UPDATE conversation_reservations SET state='released',updated_at=?1 WHERE conversation_id=?2 AND session_id=?3",params![now,id,session_id])?;
+            transaction.execute("UPDATE sessions SET status='exited',capture_state='complete',updated_at=?1 WHERE id=?2",params![now,session_id])?;
+            transaction.execute("UPDATE conversation_requests SET state='expired' WHERE conversation_id=?1 AND state='denied'",[&id])?;
+            let probe:Option<String>=transaction.query_row("SELECT id FROM conversation_admissions WHERE probe_invocation_id=?1 AND state='probing'",[&id],|r|r.get(0)).optional()?;
+            if let Some(admission) = probe {
+                let success:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM conversation_events WHERE conversation_id=?1 AND kind='turn_completed' AND json_extract(payload_json,'$.status')='completed')",[&id],|r|r.get(0))?;
+                let authorized:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM provider_validation_invocations v JOIN provider_validation_batches b ON b.id=v.batch_id WHERE v.id=?1 AND v.state='running' AND b.state='running')",[&id],|r|r.get(0))?;
+                let success = success && !unresolved && authorized;
+                let evidence = json_hash(
+                    &serde_json::json!({"conversation_id":id,"identity":transaction.query_row::<String,_,_>("SELECT identity_hash FROM conversations WHERE id=?1",[&id],|r|r.get(0))?,"exit":exit,"native_turn_completed":success}),
+                )?;
+                transaction.execute("UPDATE conversation_admissions SET state=?1,evidence_hash=?2,updated_at=?3 WHERE id=?4",params![if success{"proven"}else{"unknown"},if success{Some(evidence)}else{None},now,admission])?;
+                transaction.execute("UPDATE provider_validation_invocations SET state=?1,updated_at=?2,finished_at=?2 WHERE id=?3",params![if success{"succeeded"}else{"delivery_unknown"},now,id])?;
+                transaction.execute("UPDATE provider_validation_batches SET state='finished',finished_at=?1,updated_at=?1 WHERE id=?2",params![now,id])?;
+            }
+            transaction.commit()?;
+            return Ok(true);
+        }
         transaction.execute(
             "UPDATE resume_invocations SET state='exited',updated_at=?1
              WHERE session_id=?2 AND transcript_epoch=?3 AND process_identity_json=?4
@@ -6431,6 +7715,9 @@ impl Store {
 
     pub fn session_json(&self, session_id: &str) -> Result<serde_json::Value> {
         let connection = self.lock()?;
+        if let SessionOwner::Conversation(id) = session_owner_in(&connection, session_id)? {
+            return Ok(connection.query_row("SELECT status,transcript_epoch,process_identity_json,launch_state,launch_error,exit_json FROM sessions WHERE id=?1",[session_id],|r|Ok(serde_json::json!({"id":session_id,"conversation_id":id,"status":r.get::<_,String>(0)?,"transcript_epoch":r.get::<_,String>(1)?,"process_identity":parse_optional_value(r.get::<_,Option<String>>(2)?),"launch_state":r.get::<_,String>(3)?,"launch_error":r.get::<_,Option<String>>(4)?,"exit":parse_optional_value(r.get::<_,Option<String>>(5)?)})))?);
+        }
         connection.query_row(
             "SELECT s.id, s.status, s.provider, s.validation_cell, s.launch_config_json, s.executable_version,
                     s.native_session_id, s.native_identity_source, s.process_identity_json, s.transcript_epoch,
@@ -13431,14 +14718,20 @@ pub(crate) fn verify_input_lease_in(
 }
 
 pub(crate) fn session_owner_in(connection: &Connection, session_id: &str) -> Result<SessionOwner> {
-    let (role_generation_id, invocation_id): (Option<String>, Option<String>) = connection
+    let (role_generation_id, invocation_id, conversation_id): (Option<String>, Option<String>, Option<String>) = connection
         .query_row(
-            "SELECT role_generation_id,provider_validation_invocation_id FROM sessions WHERE id=?1",
+            "SELECT role_generation_id,provider_validation_invocation_id,conversation_id FROM sessions WHERE id=?1",
             params![session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?
         .ok_or_else(|| anyhow!("unknown session {session_id}"))?;
+    if let Some(id) = conversation_id {
+        if role_generation_id.is_some() || invocation_id.is_some() {
+            bail!("session {session_id} has multiple owners")
+        }
+        return Ok(SessionOwner::Conversation(id));
+    }
     SessionOwner::from_columns(role_generation_id, invocation_id)
         .map_err(|error| anyhow!("session {session_id}: {error}"))
 }
@@ -13450,15 +14743,18 @@ pub(crate) fn refuse_validation_session_in(
     session_id: &str,
     operation: &str,
 ) -> Result<()> {
-    let invocation: Option<Option<String>> = connection
+    let invocation: Option<(Option<String>, Option<String>)> = connection
         .query_row(
-            "SELECT provider_validation_invocation_id FROM sessions WHERE id=?1",
+            "SELECT provider_validation_invocation_id,conversation_id FROM sessions WHERE id=?1",
             params![session_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    if matches!(invocation, Some(Some(_))) {
+    if matches!(invocation, Some((Some(_), _))) {
         bail!("{operation} is available only for workflow role sessions, not provider validation checks")
+    }
+    if matches!(invocation, Some((_, Some(_)))) {
+        bail!("{operation} is available only for workflow role sessions, not conversations")
     }
     Ok(())
 }
@@ -14965,7 +16261,7 @@ impl Store {
     }
 }
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 43;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 44;
 
 /// Reads the durable state cursor. It is committed state only when the
 /// connection is in autocommit mode.
@@ -14977,13 +16273,13 @@ pub(crate) fn read_state_revision(connection: &Connection) -> rusqlite::Result<i
 
 /// The prior schemas an existing database may be migrated from at service
 /// start. Every other non-current version is left unchanged and refused.
-pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 12] =
-    [31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42];
+pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 13] =
+    [31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43];
 
 pub(crate) fn require_maintenance_schema(connection: &Connection) -> Result<i64> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != CURRENT_SCHEMA_VERSION && !SERVICE_UPGRADABLE_SCHEMA_VERSIONS.contains(&version) {
-        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–43")
+        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–44")
     }
     Ok(version)
 }
@@ -15555,6 +16851,29 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             transaction
                 .commit()
                 .context("commit Single agent preset migration")
+        })();
+        let restored = restore_foreign_key_enforcement(connection);
+        restored?;
+        migrated?;
+    }
+    if version <= 43 {
+        connection.pragma_update(None, "foreign_keys", "OFF")?;
+        let migrated = (|| -> Result<()> {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(MIGRATION_044)?;
+            let violations: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                [],
+                |row| row.get(0),
+            )?;
+            if violations != 0 {
+                bail!("Conversation migration would leave {violations} foreign-key violations")
+            }
+            transaction.pragma_update(None, "user_version", 44)?;
+            transaction
+                .commit()
+                .context("commit conversation migration")
         })();
         let restored = restore_foreign_key_enforcement(connection);
         restored?;
@@ -20951,6 +22270,134 @@ mod interruption_tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
+    fn resumed_historical_usage_is_ignored_only_for_validated_history() {
+        let root =
+            std::env::temp_dir().join(format!("llmrelay-resume-usage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&root.join("state.sqlite3")).unwrap();
+        store.lock().unwrap().execute_batch(
+            "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+               VALUES('p','p','/synthetic/repository','repository','head','now','now');
+             INSERT INTO execution_config_revisions(id,project_id,revision,config_json,content_hash,approved_at,created_at)
+               VALUES('e','p',1,'{}','config','now','now');
+             INSERT INTO conversation_profiles(id,project_id,execution_config_revision_id,profile_json,profile_hash,created_at)
+               VALUES('pr','p','e','{}','profile','now');
+             INSERT INTO conversation_admissions(id,profile_revision_id,identity_json,identity_hash,state,created_at,updated_at)
+               VALUES('a','pr','{}','identity','active','now','now');
+             INSERT INTO conversations(id,project_id,admission_id,identity_json,identity_hash,generation,native_thread_id,state,created_at,updated_at)
+               VALUES('c','p','a','{}','identity','new','thread','reserved','now','now');
+             INSERT INTO sessions(id,conversation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+               VALUES('s','c','codex','running','{}','synthetic','new','now','now');
+             INSERT INTO conversation_reservations(conversation_id,session_id,repository_identity,state,created_at,updated_at)
+               VALUES('c','s','repository','running','now','now');
+             INSERT INTO conversation_operations(operation_id,actor_key,request_hash,kind,conversation_id,generation,native_thread_id,native_turn_id,state,input_json,result_json,created_at,updated_at)
+               VALUES('first','human_control','first','start','c','old','thread','prior','completed','{}','{\"outcome\":\"completed\"}','now','now'),
+                     ('resume','human_control','resume','resume','c','new','thread',NULL,'reserved','{}','{}','now','now');"
+        ).unwrap();
+        let history =
+            serde_json::json!({"id":"thread","turns":[{"id":"prior","status":"completed"}]});
+        let mut divergent = history.clone();
+        divergent["turns"][0]["status"] = "failed".into();
+        assert!(store
+            .conversation_validate_history("c", &divergent)
+            .is_err());
+        let validated = store.conversation_validate_history("c", &history).unwrap();
+        assert!(store
+            .conversation_restored_usage("c", "new", "thread", Some("prior"), "usage", &validated)
+            .is_err());
+        store
+            .conversation_bind_thread("c", "new", "thread")
+            .unwrap();
+        store
+            .conversation_resume_bound("c", "new", "resume")
+            .unwrap();
+        let payload =
+            serde_json::json!({"last":{"total_tokens":10},"cumulative":{"total_tokens":10}});
+        // The original event fence rejects this legitimate post-resume snapshot.
+        assert!(store
+            .conversation_event("c", "new", "thread", Some("prior"), "usage", &payload)
+            .is_err());
+        let dispatch = |generation, thread, turn, kind, history: &[String]| -> Result<()> {
+            if !store.conversation_restored_usage(
+                "c",
+                generation,
+                thread,
+                Some(turn),
+                kind,
+                history,
+            )? {
+                store.conversation_event("c", generation, thread, Some(turn), kind, &payload)?;
+            }
+            Ok(())
+        };
+        dispatch("new", "thread", "prior", "usage", &validated).unwrap();
+        dispatch("new", "thread", "prior", "usage", &validated).unwrap();
+        for (generation, thread, turn, kind) in [
+            ("old", "thread", "prior", "usage"),
+            ("new", "wrong-thread", "prior", "usage"),
+            ("new", "thread", "unknown", "usage"),
+            ("new", "thread", "prior", "agent_message"),
+            ("new", "thread", "prior", "tool_activity"),
+            ("new", "thread", "prior", "turn_completed"),
+        ] {
+            assert!(dispatch(generation, thread, turn, kind, &validated).is_err());
+        }
+        assert!(dispatch("new", "thread", "prior", "usage", &[]).is_err());
+        let unchanged: bool = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state='idle' AND active_turn_id IS NULL AND binding_valid=1
+             AND NOT EXISTS(SELECT 1 FROM conversation_events WHERE conversation_id='c')
+             AND NOT EXISTS(SELECT 1 FROM conversation_operations WHERE state!='completed')
+             FROM conversations WHERE id='c'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            unchanged,
+            "restored usage must not create usage, a turn, or work"
+        );
+        let request = serde_json::json!({"input":"next"});
+        let (_, fresh) = store
+            .conversation_reserve_input("next", &request, "c", "next", None)
+            .unwrap();
+        assert!(fresh);
+        let (_, input, kind, turn) = store.conversation_send_intent("c", "new", "next").unwrap();
+        assert_eq!(
+            (input.as_str(), kind.as_str(), turn),
+            ("next", "submit", None)
+        );
+        store
+            .conversation_response(
+                "c",
+                "new",
+                "next",
+                &serde_json::json!({"turn":{"id":"live"}}),
+                false,
+            )
+            .unwrap();
+        dispatch("new", "thread", "live", "usage", &validated).unwrap();
+        let recorded: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_events WHERE kind='usage' AND generation='new'
+             AND native_turn_id='live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, 1,
+            "live usage still uses the normal event projection"
+        );
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn committed_role_report_replays_receipt_without_duplicate_result_or_audit() {
         let root = std::env::temp_dir().join(format!("llmrelay-report-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -21132,8 +22579,19 @@ mod interruption_tests {
     }
 
     pub(super) fn prior_service_schema_sql(version: i64) -> String {
-        let mut drop_schema_43 = String::from(
-            "PRAGMA foreign_keys=OFF;
+        let sessions_43=MIGRATION_039.split_once("CREATE TABLE sessions_rebuilt (").unwrap().1
+            .split_once("-- Presentation only:").unwrap().0
+            .replace("setup_permit_id,interrupt_requested_at,NULL\nFROM sessions", "setup_permit_id,interrupt_requested_at,provider_validation_invocation_id\nFROM sessions");
+        let drop_schema_44=format!("PRAGMA foreign_keys=OFF;
+            DROP TRIGGER claims_conversation_admission; DROP TRIGGER claims_conversation_readmission;
+            DROP TABLE conversation_events; DROP TABLE conversation_requests;
+            DROP TABLE conversation_operations; DROP TABLE conversation_reservations;
+            CREATE TABLE sessions_rebuilt ({sessions_43}
+            DROP TABLE conversations; DROP TABLE conversation_admissions;
+            DROP TABLE conversation_profiles; DROP TABLE conversation_runtime;");
+        let mut drop_schema_43 = format!("{drop_schema_44}");
+        drop_schema_43.push_str(
+            "
             DROP TABLE single_agent_repair_receipts; DROP TABLE single_agent_review_results;
             DROP TABLE single_agent_review_deliveries; DROP TABLE single_agent_review_budgets;
             DROP TABLE single_agent_admission_challenges;",
@@ -21266,6 +22724,7 @@ mod interruption_tests {
                      PRAGMA user_version=39;"
                 );
             }
+            43 => return format!("{drop_schema_44} PRAGMA user_version=43;"),
             42 => return format!("{drop_schema_43} PRAGMA user_version=42;"),
             41 => return format!("{drop_schema_42} PRAGMA user_version=41;"),
             40 => return format!("{restore_schema_40} PRAGMA user_version=40;"),
@@ -22296,7 +23755,7 @@ mod interruption_tests {
 
         for _ in 0..2 {
             drop(Store::open_service(&database).unwrap());
-            assert_eq!(scalar(version), "Integer(43)");
+            assert_eq!(scalar(version), "Integer(44)");
             assert_eq!(scalar(history), expected_history);
             assert_eq!(scalar(schema), current_schema);
             assert_eq!(
@@ -22313,7 +23772,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(32))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(43)");
+        assert_eq!(scalar(version), "Integer(44)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         // Schema 33 gains only the guidance submitted form and the later migrations.
@@ -22322,7 +23781,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(33))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(43)");
+        assert_eq!(scalar(version), "Integer(44)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -22330,7 +23789,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(34))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(43)");
+        assert_eq!(scalar(version), "Integer(44)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -22338,7 +23797,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(35))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(43)");
+        assert_eq!(scalar(version), "Integer(44)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -22346,7 +23805,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(36))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(43)");
+        assert_eq!(scalar(version), "Integer(44)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -22354,7 +23813,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(37))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(43)");
+        assert_eq!(scalar(version), "Integer(44)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         assert_eq!(
@@ -22367,13 +23826,13 @@ mod interruption_tests {
             .unwrap();
         assert_eq!(scalar(version), "Integer(38)");
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(43)");
+        assert_eq!(scalar(version), "Integer(44)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         // An ordinary open of the current schema reopens it without migrating;
         // only a newer schema is refused as unknown.
         drop(Store::open(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(43)");
+        assert_eq!(scalar(version), "Integer(44)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         let future_version = CURRENT_SCHEMA_VERSION + 1;
@@ -22441,7 +23900,7 @@ mod interruption_tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            43
+            CURRENT_SCHEMA_VERSION
         );
         assert_eq!(
             connection.query_row(
@@ -23184,7 +24643,7 @@ mod interruption_tests {
             1
         );
         drop(store);
-        assert_eq!(scalar("PRAGMA user_version"), "Integer(43)");
+        assert_eq!(scalar("PRAGMA user_version"), "Integer(44)");
         assert_eq!(scalar(SCHEMA_38_SESSION_ROWS), sessions);
         assert_eq!(scalar(references), "Text(\"1:1:1\")");
         assert_eq!(
@@ -23211,7 +24670,7 @@ mod interruption_tests {
                  WHERE tbl_name='sessions' AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY name)"
             ),
             "Text(\"sessions_interrupt_requested_deadline,sessions_launch_state_idx,\
-             sessions_one_per_validation_invocation,state_revision_sessions_delete,\
+             sessions_one_live_conversation,sessions_one_per_validation_invocation,state_revision_sessions_delete,\
              state_revision_sessions_insert,state_revision_sessions_update\")"
         );
 
@@ -26118,7 +27577,7 @@ mod attention_observation_tests {
         let rows: String = session.scalar(OLD_ROWS);
         let revision = session.revision();
         let reopened = Store::open(&session.root.join("state.sqlite3")).unwrap();
-        assert_eq!(session.scalar::<i64>("PRAGMA user_version"), 43);
+        assert_eq!(session.scalar::<i64>("PRAGMA user_version"), 44);
         assert_eq!(session.scalar::<String>(OLD_ROWS), rows);
         assert_eq!(session.revision(), revision);
         let connection = reopened.lock().unwrap();

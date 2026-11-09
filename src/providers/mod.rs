@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod codex;
+pub mod codex_app_server;
 #[cfg(test)]
 mod native_qualification;
 
@@ -162,7 +163,7 @@ pub fn inspect_installation(provider: Provider) -> Result<ProviderInstallation> 
     })
 }
 
-fn executable_fingerprint(path: &Path) -> Result<ExecutableFingerprint> {
+pub(crate) fn executable_fingerprint(path: &Path) -> Result<ExecutableFingerprint> {
     let canonical = path
         .canonicalize()
         .with_context(|| format!("resolve provider executable {}", path.display()))?;

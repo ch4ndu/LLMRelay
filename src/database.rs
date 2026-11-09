@@ -217,6 +217,8 @@ struct BackupManifest {
     // Absent in pre-retention-domain manifests; such points are never pruned automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_instance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_restore_epoch: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -547,6 +549,16 @@ fn finalize_backup(
             integrity_check: integrity,
             foreign_key_violations: foreign_keys,
             source_instance: Some(source_instance.to_owned()),
+            conversation_restore_epoch: if sqlite_schema_version >= 44 {
+                // Published snapshots must remain sidecar-free for ownership classification.
+                Some(open_sqlite_for_verification(&database)?.query_row(
+                    "SELECT restore_epoch FROM conversation_runtime WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )?)
+            } else {
+                None
+            },
         };
         write_private_json(&staging.join("manifest.json"), &manifest)?;
         sync_directory(&staging)?;
@@ -856,7 +868,7 @@ pub(crate) fn restore_prerequisites(
     let mut statement = connection.prepare(
         "SELECT 'session',s.id,s.status,a.task_id FROM sessions s
            LEFT JOIN role_generations rg ON rg.id=s.role_generation_id LEFT JOIN attempts a ON a.id=rg.attempt_id
-           WHERE s.status IN ('launch_reserved','launching','running','recovery_required')
+           WHERE s.status IN ('launch_reserved','launching','running','interrupt_requested','recovery_required')
          UNION ALL SELECT 'claim',id,state,task_id FROM claims WHERE state IN ('reserved','launching','running','unknown','stopping')
          UNION ALL SELECT 'check',c.id,c.status,a.task_id FROM check_runs c JOIN attempts a ON a.id=c.attempt_id
            WHERE c.status IN ('launch_reserved','running','recovery_required','launch_ambiguous')
@@ -1190,6 +1202,50 @@ fn establish_restore_hold(paths: &InstancePaths, journal: &RestoreJournal) -> Re
         crate::store::finish_settled_provider_batches_in(&tx, &now)?;
         tx.execute("UPDATE history_pane_views SET state='unknown',failure_reason='database restore cannot show whether this history pane opened; check cmux before opening another history pane',updated_at=?1 WHERE state='reserved'", [&now])?;
     }
+    if require_maintenance_schema(&tx)? >= 44 {
+        tx.execute(
+            "INSERT OR IGNORE INTO recovery_records(id,session_id,attempt_id,state,
+                 process_identity_json,detail_json,created_at,updated_at)
+             SELECT ?1||':conversation:'||s.id,s.id,NULL,'attention_required',
+                 s.process_identity_json,json_object('kind','database_restore_conversation',
+                     'operation_id',?1,'automatic_signal',0),?2,?2
+             FROM sessions s JOIN conversation_reservations r ON r.session_id=s.id
+             WHERE r.state!='released'",
+            rusqlite::params![journal.operation_id, now],
+        )?;
+        tx.execute(
+            "UPDATE conversation_runtime SET restore_epoch=lower(hex(randomblob(16))) WHERE singleton=1",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE conversations SET binding_valid=0,state='history_only',updated_at=?1",
+            [&now],
+        )?;
+        tx.execute(
+            "UPDATE conversation_admissions SET state='invalidated',updated_at=?1",
+            [&now],
+        )?;
+        tx.execute(
+            "UPDATE conversation_operations SET state='unknown',updated_at=?1
+             WHERE state IN ('reserved','sending','bound')",
+            [&now],
+        )?;
+        tx.execute(
+            "UPDATE conversation_requests SET state='expired' WHERE state='denied'",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE conversation_reservations SET state='unknown',updated_at=?1 WHERE state!='released'",
+            [&now],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET status='recovery_required',
+             launch_error='Restored conversation history cannot authorize signalling or resuming its old native process.',
+             desired_running=0,updated_at=?1 WHERE conversation_id IS NOT NULL
+             AND status IN ('launch_reserved','running','interrupt_requested','recovery_required')",
+            [&now],
+        )?;
+    }
     if require_maintenance_schema(&tx)? >= 43 {
         // Restoring cannot restore knowledge of external delivery or candidate
         // bytes. Preserve every spent reservation and repair receipt.
@@ -1265,7 +1321,7 @@ fn displaced_inventory(paths: &InstancePaths) -> Result<DisplacedInventory> {
 fn capture_inventory(connection: &Connection) -> Result<serde_json::Value> {
     let sessions = collect_json_rows(
         connection,
-        "SELECT json_object('kind','session','id',id,'status',status,'process_identity',process_identity_json,'recovery_process_group_id',recovery_process_group_id,'recovery_anchor',recovery_anchor_json,'launch_boot_identity',launch_boot_identity,'native_session_id',native_session_id) FROM sessions WHERE status IN ('launch_reserved','launching','running','recovery_required')",
+        "SELECT json_object('kind','session','id',id,'status',status,'process_identity',process_identity_json,'recovery_process_group_id',recovery_process_group_id,'recovery_anchor',recovery_anchor_json,'launch_boot_identity',launch_boot_identity,'native_session_id',native_session_id) FROM sessions WHERE status IN ('launch_reserved','launching','running','interrupt_requested','recovery_required')",
     )?;
     let checks = collect_json_rows(
         connection,

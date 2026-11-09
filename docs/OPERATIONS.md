@@ -1372,3 +1372,17 @@ operation before retrying. The functional publication identity is the nested
 create a replacement request merely because the response was lost. Permission,
 provider-capacity, quota and restart holds still require their existing recovery
 checks; functional qualification does not release them.
+
+## Experimental conversation recovery
+
+Structured conversations are a separate service foundation without a conversation dashboard. Execution remains closed while the compiled manifest is unqualified. The experimental `qualified_split_evidence_v1` label distinguishes real-model lifecycle evidence from standalone enforcement diagnostics; it does not claim an observed denied model-tool call. Release qualification does not replace per-project probing and activation. Active conversations share repository and global work capacity with tasks, and their processes count toward session limits. Reserved, stopping and uncertain ownership continue to hold capacity.
+
+An interrupt request, its native acknowledgement, the correlated terminal turn and termination of owned descendants are distinct events. An active turn receives native interruption before its transport is stopped. Ownership is released only after verified quiescence; silence, acknowledgement or a user dismissing uncertainty cannot establish that condition.
+
+Ordinary same-instance recovery may resume an exact native thread only after validating its binding, admission, native history and prior process quiescence. Uncertain delivery remains blocked rather than replayed. The bounded qualification fixture covers forced loss of an idle owned process followed by same-instance application reconstruction and resume; that evidence must not be described as an OS reboot or active-turn process-loss qualification.
+
+Database restore invalidates every conversation native binding, including idle bindings, and invalidates admissions. Restored conversations are readable history only; start a new conversation after valid admission. Restored records cannot authorize signalling the old instance's processes. Uncertain prior ownership retains recovery holds until positively resolved. Backup manifests retain the source instance and conversation restore epoch.
+
+Startup failures after process creation retain cleanup ownership and attempt exact-process cleanup. If identity, inventory or durable exit recording is unavailable, the session remains held for inspection; a failed start is not proof that no provider process exists. Qualification records cleanup even when a spawn operation returns an error, without retrying that operation.
+
+A recorded terminal turn remains authoritative if a steering acknowledgement arrives late. The acknowledgement settles against the exact generation, thread and turn without reactivating the completed turn; duplicate terminal notifications do not create another completion.

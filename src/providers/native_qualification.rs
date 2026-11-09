@@ -57,6 +57,7 @@ struct Inputs {
     effort: String,
     purpose: crate::domain::ProfilePurpose,
     exact_version: Option<String>,
+    conversation: bool,
 }
 
 fn input(name: &str) -> Result<String> {
@@ -85,11 +86,903 @@ fn inputs() -> Result<Inputs> {
             .parse()
             .map_err(|error: String| anyhow!(error))?,
         exact_version: std::env::var("LLMRELAY_NATIVE_QUALIFICATION_EXACT_VERSION").ok(),
+        conversation: false,
     })
 }
 
 fn sha256(bytes: impl AsRef<[u8]>) -> String {
     hex::encode(Sha256::digest(bytes.as_ref()))
+}
+
+// Reuse the disposable setup, never its role identity or release eligibility.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native conversation qualification; explicit model/effort and finite manager authorization required"]
+async fn app_server_conversation() {
+    let started = Instant::now();
+    let mut inputs = inputs().expect("explicit native qualification inputs");
+    inputs.conversation = true;
+    assert_eq!(inputs.provider, Provider::Codex);
+    assert_eq!(inputs.model, "gpt-6.1-sol");
+    assert_eq!(inputs.effort, "medium");
+    assert_eq!(
+        inputs.exact_version.as_deref(),
+        Some(super::codex_app_server::EXACT_VERSION)
+    );
+    std::fs::create_dir(&inputs.dir).expect("qualification directory must be new");
+    inputs.dir = inputs
+        .dir
+        .canonicalize()
+        .expect("canonical qualification directory");
+    let overall = started + Duration::from_secs(1800);
+    let mut evidence = json!({
+        "kind":"app_server_conversation_candidate", "requested_model":inputs.model,
+        "requested_effort":inputs.effort, "platform":std::env::consts::OS,
+        "release_eligibility":"unqualified", "residual_accepted":false,
+        "model_tool_denial_observed":false,
+        "evidence_basis":"app_server_standalone_enforcement_plus_model_lifecycle_v1",
+        "policy_equivalence":"Same trusted startup inputs/shared compiler; additional model-tool permission merging and execution were not observed. Policy hashes are input bindings, not compiled-policy attestation.",
+        "ceilings":{"fresh_conversations":3,"model_submissions":7,"resumes":1,
+            "diagnostic_rpcs":3,"acquisition_seconds":1500,"cleanup_seconds":180,
+            "setup_output_seconds":120,"cumulative_seconds":1800,"per_conversation_seconds":600,"automatic_retry":false},
+        "prior_spending":{"fresh_conversations":7,"model_submissions":14,"resumes":2,"wrapper_seconds":134.458},
+        "aggregate_ceiling":{"fresh_conversations":10,"model_submissions":21,"resumes":3,"diagnostic_rpcs":3,"wrapper_seconds":1980}
+    });
+    evidence["test_artifact"] = json!(super::executable_fingerprint(
+        &std::env::current_exe().expect("current precompiled test artifact"),
+    )
+    .expect("fingerprint precompiled test artifact"));
+    evidence["package_version"] = json!(env!("CARGO_PKG_VERSION"));
+    evidence["helper_source_sha256"] = json!(sha256(SYSCALL_HELPER));
+    let mut owner = ConversationOwner {
+        app: None,
+        guard: None,
+        listener: None,
+    };
+    let setup = tokio::time::timeout(
+        Duration::from_secs(60),
+        writer_setup(&inputs, &mut evidence, false),
+    )
+    .await;
+    let mut allowance = ConversationAllowance {
+        overall: overall - Duration::from_secs(240),
+        deadline: overall,
+        counts: [0; 3],
+    };
+    let outcome = match setup {
+        Ok(Ok((app, targets))) => {
+            owner.app = Some(app);
+            let limit = allowance
+                .overall
+                .min(Instant::now() + Duration::from_secs(1500));
+            allowance.overall = limit;
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(limit),
+                acquire_conversations(&inputs, &mut owner, &targets, &mut evidence, &mut allowance),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!("Acquisition deadline reached; no retry")),
+            }
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(anyhow!("Setup deadline reached; no acquisition")),
+    };
+    evidence["acquisition_error"] = json!(outcome.as_ref().err().map(|e| format!("{e:#}")));
+    let cleanup_deadline = overall.min(Instant::now() + Duration::from_secs(180));
+    evidence["diagnostic_quiescence_unknown"] = json!(true);
+    let cleanup = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(cleanup_deadline),
+        owner.cleanup(cleanup_deadline, &mut evidence),
+    )
+    .await;
+    evidence["outer_cleanup"] = json!({"verified":matches!(&cleanup, Ok(Ok(()))),
+        "outcome":format!("{cleanup:?}")});
+    evidence["spent"] = json!({"fresh_conversations":allowance.counts[0],
+        "model_submissions":allowance.counts[1],"resumes":allowance.counts[2],
+        "diagnostic_rpcs":evidence["diagnostic_rpcs"].as_u64().unwrap_or(0),
+        "elapsed_seconds":started.elapsed().as_secs_f64()});
+    evidence["cleanup_verified"] = json!(matches!(&cleanup, Ok(Ok(()))));
+    let succeeded = outcome.is_ok() && matches!(&cleanup, Ok(Ok(()))) && Instant::now() < overall;
+    let held = save_evidence(&inputs, "app-server-conversation", &mut evidence, succeeded)
+        .expect("persist original acquisition and cleanup outcomes before assertions");
+    assert!(
+        held,
+        "native qualification incomplete; inspect saved candidate evidence"
+    );
+}
+
+struct ConversationOwner {
+    app: Option<Application>,
+    guard: Option<SpawnedSession>,
+    listener: Option<tokio::net::TcpListener>,
+}
+
+impl ConversationOwner {
+    async fn cleanup(&mut self, deadline: Instant, evidence: &mut Value) -> Result<()> {
+        // Retain the listener across acquisition cancellation; closing is synchronous.
+        self.listener.take();
+        evidence["listener_closed"] = json!(true);
+        if let Some(app) = &self.app {
+            let until = deadline.min(Instant::now() + Duration::from_secs(30));
+            while !app.supervisor.diagnostic_pending()?.is_empty() && Instant::now() < until {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    until.min(Instant::now() + POLL),
+                ))
+                .await;
+            }
+            let pending = app.supervisor.diagnostic_pending()?;
+            evidence["pending_diagnostics"] = json!(pending);
+            evidence["diagnostic_quiescence_unknown"] = json!(!pending.is_empty());
+            if !pending.is_empty() {
+                evidence["diagnostic_recovery_boundary"] = json!(
+                    "No independently recorded diagnostic descendant identity/exit receipt; do not guess or signal a PID. Retain RPC/session/generation and server cleanup evidence.");
+            }
+            // A failed database lookup must not orphan the already attached
+            // process. This disposable Application owns only this fixture.
+            let attached = app.supervisor.attached_session_ids()?;
+            if let [session] = attached.as_slice() {
+                if self
+                    .guard
+                    .as_ref()
+                    .is_none_or(|guard| guard.session != *session)
+                {
+                    self.guard = Some(SpawnedSession {
+                        supervisor: app.supervisor.clone(),
+                        session: session.clone(),
+                        armed: true,
+                    });
+                }
+            }
+            if let Some(guard) = &mut self.guard {
+                conversation_cleanup(app, guard, deadline, evidence).await?;
+            }
+            if !pending.is_empty() {
+                bail!("Diagnostic quiescence unknown: retain exact RPC recovery record; server-group absence is insufficient")
+            }
+        } else {
+            evidence["diagnostic_quiescence_unknown"] = json!(false);
+        }
+        Ok(())
+    }
+}
+
+struct ConversationAllowance {
+    overall: Instant,
+    deadline: Instant,
+    counts: [usize; 3],
+}
+
+impl ConversationAllowance {
+    fn dispatch_spawn(
+        &mut self,
+        app: &Application,
+        operation: super::codex_app_server::ConversationOperation,
+        evidence: &mut Value,
+        owned: &mut Option<SpawnedSession>,
+    ) -> Result<Value> {
+        use super::codex_app_server::ConversationOperation as Op;
+        let operation_id = match &operation {
+            Op::Start { operation_id, .. }
+            | Op::Probe { operation_id, .. }
+            | Op::Resume { operation_id, .. } => operation_id.clone(),
+            _ => bail!("Expected conversation spawn operation"),
+        };
+        let result = self.dispatch(app, operation);
+        // Synchronous dispatch has reserved its generation before returning, even
+        // on ambiguous delivery. Transfer it to the outer owner before any await.
+        if let Err(error) = &result {
+            evidence["dispatch_errors"][&operation_id] = json!(format!("{error:#}"));
+        }
+        let session = if let Ok(receipt) = &result {
+            Some(
+                receipt["session_id"]
+                    .as_str()
+                    .context("spawn receipt session")?
+                    .to_owned(),
+            )
+        } else {
+            app.store
+                .lock()?
+                .query_row(
+                    "SELECT s.id FROM conversation_operations o JOIN sessions s
+                 ON s.conversation_id=o.conversation_id AND s.transcript_epoch=o.generation
+                 WHERE o.operation_id=?1",
+                    [&operation_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+        };
+        if let Some(session) = session {
+            *owned = Some(SpawnedSession {
+                supervisor: app.supervisor.clone(),
+                session,
+                armed: true,
+            });
+        }
+        result
+    }
+
+    fn dispatch(
+        &mut self,
+        app: &Application,
+        operation: super::codex_app_server::ConversationOperation,
+    ) -> Result<Value> {
+        use super::codex_app_server::ConversationOperation as Op;
+        let fresh = matches!(&operation, Op::Probe { .. } | Op::Start { .. });
+        let resume = matches!(&operation, Op::Resume { .. });
+        let submission =
+            fresh || resume || matches!(&operation, Op::Submit { .. } | Op::Steer { .. });
+        if fresh {
+            self.deadline = self.overall.min(Instant::now() + WRITER_LIMIT);
+        }
+        if Instant::now() >= self.overall || (self.counts[0] > 0 && Instant::now() >= self.deadline)
+        {
+            bail!("Native conversation deadline reached before dispatch; no retry")
+        }
+        for (index, (charge, limit)) in [(fresh, 3), (submission, 7), (resume, 1)]
+            .into_iter()
+            .enumerate()
+        {
+            if charge && self.counts[index] >= limit {
+                bail!("Native conversation allowance exhausted; no retry")
+            }
+        }
+        // Spend even if delivery is rejected or ambiguous; resume never resets the deadline.
+        self.counts[0] += usize::from(fresh);
+        self.counts[1] += usize::from(submission);
+        self.counts[2] += usize::from(resume);
+        app.qualification_conversation_operation(operation)
+    }
+}
+
+async fn conversation_wait(
+    app: &Application,
+    id: &str,
+    deadline: Instant,
+    ready: impl Fn(&Value) -> bool,
+) -> Result<Value> {
+    loop {
+        if Instant::now() >= deadline {
+            bail!("Per-conversation native deadline reached")
+        }
+        app.supervisor.reconcile()?;
+        let mut state = app.store.conversation_inspect(id, 0)?;
+        let mut events = Vec::new();
+        let mut page = state.clone();
+        for _ in 0..=super::codex_app_server::MAX_EVENTS / 100 {
+            let chunk = page["events"].as_array().context("native event page")?;
+            events.extend(chunk.iter().cloned());
+            if chunk.len() < 100 {
+                break;
+            }
+            let after = chunk.last().context("event cursor")?["sequence"]
+                .as_i64()
+                .context("event sequence")?;
+            page = app.store.conversation_inspect(id, after)?;
+        }
+        if events.len() as i64 > super::codex_app_server::MAX_EVENTS {
+            bail!("Native event evidence exceeds the projection bound")
+        }
+        state["events"] = json!(events);
+        if ready(&state) {
+            return Ok(state);
+        }
+        if state["state"] == "recovery_required" || state["state"] == "history_only" {
+            bail!("Native conversation uncertain; no retry")
+        }
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            deadline.min(Instant::now() + POLL),
+        ))
+        .await;
+    }
+}
+
+async fn conversation_cleanup(
+    app: &Application,
+    guard: &mut SpawnedSession,
+    deadline: Instant,
+    evidence: &mut Value,
+) -> Result<()> {
+    let session = &guard.session;
+    if evidence["cleanup_history"][session].is_null() {
+        evidence["cleanup_history"][session] = json!([]);
+    }
+    let history = evidence["cleanup_history"][session]
+        .as_array_mut()
+        .context("Conversation cleanup history must be an array")?;
+    let attempt = history.len();
+    history.push(json!({"quiescence":"unknown","awaited_cleanup_started":true}));
+    let mut stopped_by = "already_exited_before_cleanup";
+    let mut last_state = Value::Null;
+    let cleanup = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        async {
+            let binding = || -> Result<(String, Option<String>)> {
+                Ok(app.store.lock()?.query_row(
+                    "SELECT transcript_epoch,process_identity_json FROM sessions WHERE id=?1",
+                    params![session],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            };
+            let generation = binding()?;
+            let mut stop_deadline = None;
+            let mut forced = false;
+            loop {
+                app.supervisor.reconcile()?;
+                if binding()? != generation {
+                    bail!("Conversation cleanup generation changed; quiescence unknown")
+                }
+                let (status, exit, last_sequence) = session_state(app, session)?;
+                last_state = json!({
+                    "status":status,"exit":exit,"transcript_last_sequence":last_sequence
+                });
+                if status == "exited" {
+                    let observation = crate::recovery::verify_session_quiescent(&app.store, session)
+                        .context("verify exact conversation cleanup quiescence")?;
+                    return Ok(json!({
+                        "session":{"status":status,"exit":exit,"transcript_last_sequence":last_sequence},
+                        "quiescence":{"verified":true,"observation":observation}
+                    }));
+                }
+                let root_live = match app.supervisor.process_snapshot()? {
+                    crate::supervisor::ProcessSnapshot::Read(live) => {
+                        live.iter().any(|root| root.session_id == *session)
+                    }
+                    crate::supervisor::ProcessSnapshot::Unavailable => {
+                        bail!("Conversation cleanup process inventory unavailable; quiescence unknown")
+                    }
+                };
+                // Recovery is a hold, not an exit. Reconcile keeps the attached
+                // child receipt and persists its exit after recorded descendants settle.
+                if !root_live && stopped_by == "already_exited_before_cleanup" {
+                    stopped_by = "awaited_recorded_descendants";
+                }
+                if status != "recovery_required" && root_live {
+                    if stop_deadline.is_none() {
+                        app.supervisor
+                            .interrupt_once(session)
+                            .context("interrupt exact conversation process")?;
+                        stopped_by = "interrupt";
+                        stop_deadline = Some(Instant::now() + STOP_SETTLE);
+                    } else if stop_deadline.is_some_and(|until| Instant::now() >= until) {
+                        if forced {
+                            bail!("Forced conversation stop did not settle; quiescence unknown")
+                        }
+                        app.supervisor
+                            .force_stop_exact_managed_process(session)
+                            .context("force stop exact conversation process")?;
+                        stopped_by = "forced_stop";
+                        forced = true;
+                        stop_deadline = Some(Instant::now() + STOP_SETTLE);
+                    }
+                }
+                tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    deadline.min(Instant::now() + POLL),
+                ))
+                .await;
+            }
+        },
+    )
+    .await
+    .context("Exact conversation cleanup deadline reached; quiescence unknown")
+    .and_then(|result| result);
+    guard.armed = cleanup.is_err();
+    let record = match cleanup {
+        Ok(mut result) => {
+            result["stopped_by"] = json!(stopped_by);
+            json!({"result":result,"errors":[]})
+        }
+        Err(error) => json!({
+            "result":{"stopped_by":stopped_by,"session":last_state,"quiescence":{"verified":false}},
+            "errors":[format!("{error:#}")]
+        }),
+    };
+    evidence["cleanup_history"][session][attempt] = record.clone();
+    evidence["cleanup"][session] = record;
+    if guard.armed {
+        bail!("Exact conversation cleanup incomplete; inspect cleanup evidence")
+    }
+    Ok(())
+}
+
+async fn acquire_conversations(
+    inputs: &Inputs,
+    owner: &mut ConversationOwner,
+    targets: &[(&str, PathBuf)],
+    evidence: &mut Value,
+    allowance: &mut ConversationAllowance,
+) -> Result<()> {
+    use super::codex_app_server::{ConversationOperation as Op, ProfileInput};
+    let app = owner.app.as_mut().context("outer application owner")?;
+    let config: String = app.store.lock()?.query_row(
+        "SELECT id FROM execution_config_revisions WHERE project_id='diagnostic-project' ORDER BY revision DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let profile = allowance.dispatch(
+        &app,
+        Op::CreateProfile {
+            input: ProfileInput {
+                operation_id: "conversation-profile".into(),
+                project_id: "diagnostic-project".into(),
+                execution_config_revision_id: config,
+                model: inputs.model.clone(),
+                effort: inputs.effort.clone(),
+                instructions: "Explore read-only. Never escalate or inspect real credentials. Report native tool outcomes.".into(),
+            },
+        },
+    )?;
+    let prepared = allowance.dispatch(
+        &app,
+        Op::Prepare {
+            operation_id: "conversation-prepare".into(),
+            profile_revision_id: profile["profile"]["id"]
+                .as_str()
+                .context("profile ID")?
+                .into(),
+        },
+    )?;
+    let admission = prepared["admission_id"]
+        .as_str()
+        .context("admission ID")?
+        .to_owned();
+    let nonce = format!("conversation-retained-{}", uuid::Uuid::new_v4());
+    evidence["continuity_challenge_sha256"] = json!(sha256(&nonce));
+    let sentinel = inputs
+        .dir
+        .join("repository/conversation-read-only-sentinel");
+    std::fs::write(&sentinel, b"unchanged conversation sentinel")?;
+    for (case, prompt) in [
+        ("probe", String::new()),
+        (
+            "continuity",
+            format!("Read the repository. Remember {nonce} and reply with it. Never write it to a file."),
+        ),
+        (
+            "interruption",
+            "Use native read-only shell once for `sleep 20`, then describe the repository. Never modify files.".into(),
+        ),
+    ] {
+        let operation_id = format!("conversation-{case}");
+        let operation = if case == "probe" {
+            Op::Probe {
+                operation_id,
+                admission_id: admission.clone(),
+            }
+        } else {
+            Op::Start {
+                operation_id,
+                admission_id: admission.clone(),
+                input: prompt,
+            }
+        };
+        let receipt = allowance
+            .dispatch_spawn(app, operation, evidence, &mut owner.guard)?;
+        let id = receipt["conversation_id"].as_str().context("conversation ID")?;
+        let state = conversation_wait(
+            &app,
+            id,
+            allowance.deadline,
+            |state| {
+                if case == "interruption" {
+                    state["state"] == "running" && state["active_turn_id"].is_string()
+                        && state["events"].as_array().is_some_and(|events| events.iter().any(|event| {
+                            event["kind"] == "tool_activity" && event["turn_id"] == state["active_turn_id"]
+                                && event["operation_id"] == "conversation-interruption"
+                                && event["payload"]["phase"] == "item/started"
+                                && event["payload"]["type"] == "commandExecution"
+                                && event["payload"]["command_hash"].as_str().is_some_and(|hash| {
+                                    // Native command presentation uses shlex_join on argv.
+                                    ["sleep 20", "/bin/zsh -lc 'sleep 20'", "/bin/bash -lc 'sleep 20'"]
+                                        .iter().any(|command| sha256(command) == hash)
+                                })
+                        }))
+                } else {
+                    state["state"] == "idle"
+                }
+            },
+        )
+        .await?;
+        evidence[case] = state.clone();
+        if case == "continuity" {
+            let continuity: Result<()> = async {
+                for operation_id in ["conversation-followup", "conversation-after-resume"] {
+                    if operation_id == "conversation-after-resume" {
+                        // Forced loss of an idle owned process, then same-instance Application reconstruction.
+                        app.supervisor
+                            .force_stop_exact_managed_process(&owner.guard.as_ref().context("outer guard")?.session)?;
+                        evidence["process_loss"] = json!({
+                            "kind": "forced_idle_process_loss",
+                            "session_id": owner.guard.as_ref().context("outer guard")?.session
+                        });
+                        // SIGKILL delivery precedes child reaping; do not race it with an interrupt.
+                        let mut settle_errors = Vec::new();
+                        let settled = exited(
+                            &app, &owner.guard.as_ref().context("outer guard")?.session,
+                            STOP_SETTLE.min(allowance.deadline.saturating_duration_since(Instant::now())),
+                            &mut settle_errors,
+                        ).await;
+                        evidence["process_loss"]["settlement"] = json!({
+                            "exited": settled,
+                            "errors": settle_errors
+                        });
+                        if !settled || !settle_errors.is_empty() {
+                            bail!("Forced conversation process loss did not reconcile to exit")
+                        }
+                        let quiescence =
+                            crate::recovery::verify_session_quiescent(&app.store, &owner.guard.as_ref().context("outer guard")?.session)
+                                .context("verify exact quiescence after forced conversation process loss")?;
+                        evidence["process_loss"]["quiescence"] =
+                            json!({"verified": true, "observation": quiescence});
+                        conversation_cleanup(&app, owner.guard.as_mut().context("outer guard")?, allowance.deadline, evidence).await?;
+                        crate::recovery::reconcile_prior_boot(&app.store)?;
+                        *app = Application::new(
+                            app.paths.clone(),
+                            app.store.clone(),
+                            inputs.executable.clone(),
+                        )?;
+                        allowance.dispatch_spawn(
+                            &app,
+                            Op::Resume { operation_id:"conversation-resume".into(), conversation_id:id.into() },
+                            evidence, &mut owner.guard,
+                        )?;
+                        conversation_wait(
+                            &app,
+                            id,
+                            allowance.deadline,
+                            |state| state["state"] == "idle",
+                        )
+                        .await?;
+                    }
+                    allowance.dispatch(
+                        &app,
+                        Op::Submit {
+                            operation_id: operation_id.into(),
+                            conversation_id: id.into(),
+                            input: "Recall the earlier nonce from native conversation memory only; never inspect transcripts or fixture state.".into(),
+                        },
+                    )?;
+                    let recalled = conversation_wait(
+                        &app,
+                        id,
+                        allowance.deadline,
+                        |state| state["state"] == "idle",
+                    )
+                    .await?;
+                    let text = recalled["events"]
+                        .as_array()
+                        .context("recall events")?
+                        .iter()
+                        .filter(|event| {
+                            event["kind"] == "agent_message"
+                                && event["operation_id"] == operation_id
+                        })
+                        .filter_map(|event| event["payload"]["delta"].as_str())
+                        .collect::<String>();
+                    evidence[operation_id] = recalled;
+                    if !text.contains(&nonce) {
+                        bail!("Correlated nonce continuity missing; no retry")
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            continuity?;
+            // The resumed continuity process stays live; an idle admission probe must shut down.
+            standalone_denials(inputs, app, owner.guard.as_ref().context("outer guard")?,
+                targets, &mut owner.listener, allowance.deadline, evidence).await?;
+        } else if case == "interruption" {
+            let turn = state["active_turn_id"].as_str().context("active native turn")?;
+            allowance.dispatch(
+                &app,
+                Op::Steer {
+                    operation_id: "conversation-steer".into(),
+                    conversation_id: id.into(),
+                    expected_turn_id: turn.into(),
+                    input: "Stop after the current command; do not start another tool.".into(),
+                },
+            )?;
+            conversation_wait(
+                &app,
+                id,
+                allowance.deadline,
+                |_| {
+                    app.store
+                        .lock()
+                        .and_then(|connection| {
+                            Ok(connection.query_row(
+                                "SELECT state='bound' FROM conversation_operations WHERE operation_id='conversation-steer'",
+                                [],
+                                |row| row.get::<_, bool>(0),
+                            )?)
+                        })
+                        .unwrap_or(false)
+                },
+            )
+            .await?;
+            allowance.dispatch(
+                &app,
+                Op::Interrupt {
+                    operation_id: "conversation-interrupt".into(),
+                    conversation_id: id.into(),
+                },
+            )?;
+            let terminal = conversation_wait(
+                &app,
+                id,
+                allowance.deadline,
+                |state| {
+                    state["events"].as_array().is_some_and(|events| {
+                        events.iter().any(|event| {
+                            event["kind"] == "turn_completed"
+                                && event["turn_id"] == turn
+                                && event["operation_id"] == "conversation-interruption"
+                                && event["payload"]["status"] == "interrupted"
+                        })
+                    })
+                },
+            )
+            .await?;
+            evidence["interrupted"] = terminal;
+        }
+        conversation_cleanup(&app, owner.guard.as_mut().context("outer guard")?, allowance.deadline, evidence).await?;
+        if case == "probe" {
+            let state = app.store.conversation_inspect(id, 0)?;
+            allowance.dispatch(
+                &app,
+                Op::Activate {
+                    operation_id: "conversation-activate".into(),
+                    admission_id: admission.clone(),
+                    evidence_hash: state["admission"]["evidence_hash"]
+                        .as_str()
+                        .context("probe evidence hash")?
+                        .into(),
+                },
+            )?;
+        }
+    }
+    let unresolved: i64 = app.store.lock()?.query_row(
+        "SELECT COUNT(*) FROM conversation_operations WHERE state IN ('reserved','sending','bound','unknown')",
+        [],
+        |row| row.get(0),
+    )?;
+    if unresolved != 0
+        || crate::provider_compatibility::conversation_release(
+            super::codex_app_server::EXACT_VERSION,
+        )
+        .is_ok()
+    {
+        bail!("Native operation evidence unresolved or release manifest changed")
+    }
+    evidence["lifecycle_complete"] = json!(true);
+    evidence["checks"] = json!({
+        "required_correlated_evidence": true,
+        "standalone_enforcement_complete": evidence["standalone_enforcement_complete"] == true,
+        "three_terminal_diagnostic_responses": evidence["diagnostics"].as_object()
+            .is_some_and(|probes| probes.len() == 3 && probes.values().all(|probe| probe["terminal_response"] == true)),
+        "release_manifest_unqualified": true
+    });
+    Ok(())
+}
+
+// A single interpreter process, no shell/subprocess/fork. No file bytes are read
+// or written. Alarm/socket timeouts bound syscalls independently of command/exec.
+const SYSCALL_HELPER: &str = r#"
+import json, os, signal, socket, sys
+operation, nonce, target, identity = sys.argv[1:]
+signal.signal(signal.SIGALRM, signal.SIG_DFL)
+signal.alarm(4)
+code = 0
+if operation == 'connect':
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(2)
+    try:
+        sock.connect(('127.0.0.1', int(target)))
+    except OSError as error:
+        code = error.errno if isinstance(error.errno, int) else -1
+    finally:
+        sock.close()
+elif operation in ('openwrite', 'openread'):
+    flags = os.O_WRONLY if operation == 'openwrite' else os.O_RDONLY
+    try:
+        fd = os.open(target, flags | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError as error:
+        code = error.errno if isinstance(error.errno, int) else -1
+    else:
+        os.close(fd)
+else:
+    sys.exit(2)
+print(json.dumps(dict(operation=operation, nonce=nonce, target=identity,
+                      errno=code, result='success' if code == 0 else 'error')))
+"#;
+
+async fn standalone_denials(
+    inputs: &Inputs,
+    app: &Application,
+    guard: &SpawnedSession,
+    targets: &[(&str, PathBuf)],
+    listener: &mut Option<tokio::net::TcpListener>,
+    deadline: Instant,
+    evidence: &mut Value,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let python = PathBuf::from(input("HELPER_PYTHON")?);
+    if !python.is_absolute() || python.canonicalize()? != python {
+        bail!("Helper interpreter must be an explicit canonical absolute executable")
+    }
+    evidence["helper_interpreter"] = json!(super::executable_fingerprint(&python)?);
+    let (generation, identity, process): (String, String, String) = app.store.lock()?.query_row(
+        "SELECT s.transcript_epoch,c.identity_json,s.process_identity_json FROM sessions s JOIN conversations c ON c.id=s.conversation_id WHERE s.id=?1",
+        [&guard.session], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+    let identity: super::codex_app_server::ConversationNativeIdentity =
+        serde_json::from_str(&identity)?;
+    evidence["standalone_binding"] = json!({
+        "scope":"app_server_standalone_enforcement", "native_identity":identity,
+        "session_id":guard.session,"generation":generation,
+        "process_identity":serde_json::from_str::<Value>(&process)?,
+        "input_hashes_are_attestation":false
+    });
+    *listener = Some(tokio::net::TcpListener::bind("127.0.0.1:0").await?);
+    let address = listener.as_ref().context("owned listener")?.local_addr()?;
+    evidence["listener"] = json!({"address":address.to_string(),"owned":true});
+    let sentinel = inputs
+        .dir
+        .join("repository/conversation-read-only-sentinel");
+    let protected = &targets
+        .iter()
+        .find(|(tag, _)| *tag == "service_root")
+        .context("disposable protected-read target")?
+        .1;
+    let mut probes = Vec::new();
+    let control_deadline = tokio::time::Instant::from_std(deadline);
+    for (operation, path) in [
+        ("openwrite", sentinel.as_path()),
+        ("openread", protected.as_path()),
+    ] {
+        let metadata =
+            tokio::time::timeout_at(control_deadline, tokio::fs::symlink_metadata(path)).await??;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            bail!("Positive control target is not an unaliased regular file")
+        }
+        let target = sha256(format!(
+            "{}:{}:{}",
+            path.display(),
+            metadata.dev(),
+            metadata.ino()
+        ));
+        probes.push((operation, path.to_string_lossy().into_owned(), target));
+    }
+    probes.push((
+        "connect",
+        address.port().to_string(),
+        sha256(address.to_string()),
+    ));
+    // All matching host controls precede the first native negative. File opens
+    // use no read/write/truncate; nonblocking avoids waiting on unexpected nodes.
+    for (operation, target, binding) in &probes {
+        if Instant::now() >= deadline {
+            bail!("Positive control deadline reached")
+        }
+        if *operation == "connect" {
+            let connected = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(
+                    deadline.min(Instant::now() + Duration::from_secs(2)),
+                ),
+                tokio::net::TcpStream::connect(address),
+            )
+            .await??;
+            drop(connected);
+            let (accepted, _) = tokio::time::timeout_at(
+                control_deadline,
+                listener.as_ref().context("owned listener")?.accept(),
+            )
+            .await??;
+            drop(accepted);
+        } else {
+            let file = tokio::time::timeout_at(
+                control_deadline,
+                tokio::fs::OpenOptions::new()
+                    .read(*operation == "openread")
+                    .write(*operation == "openwrite")
+                    .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+                    .open(target),
+            )
+            .await??;
+            let metadata = tokio::time::timeout_at(control_deadline, file.metadata()).await??;
+            if sha256(format!("{target}:{}:{}", metadata.dev(), metadata.ino())) != *binding {
+                bail!("Positive control target identity changed")
+            }
+        }
+        evidence["positive_controls"][*operation] =
+            json!({"target":binding,"errno":0,"result":"success"});
+    }
+    for (operation, target, binding) in probes {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining < Duration::from_secs(12) {
+            bail!("No bounded diagnostic time remains")
+        }
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let rpc = uuid::Uuid::new_v4().to_string();
+        let argv = vec![
+            python.to_string_lossy().into_owned(),
+            "-I".into(),
+            "-S".into(),
+            "-c".into(),
+            SYSCALL_HELPER.into(),
+            operation.into(),
+            nonce.clone(),
+            target,
+            binding.clone(),
+        ];
+        evidence["diagnostics"][operation] = json!({"rpc_id":rpc,"nonce_sha256":sha256(&nonce),
+            "target":binding,"argv_sha256":sha256(serde_json::to_vec(&argv)?),
+            "started_at":chrono::Utc::now().to_rfc3339()});
+        evidence["diagnostic_rpcs"] = json!(evidence["diagnostic_rpcs"].as_u64().unwrap_or(0) + 1);
+        let process = app.supervisor.diagnostic_command(
+            &guard.session,
+            &generation,
+            &rpc,
+            &argv,
+            &inputs.dir.join("repository"),
+            Duration::from_secs(8),
+        )?;
+        evidence["diagnostics"][operation]["process_binding"] = process;
+        let until = deadline.min(Instant::now() + Duration::from_secs(12));
+        let result = loop {
+            if let Some(result) =
+                app.supervisor
+                    .diagnostic_result(&guard.session, &generation, &rpc)?
+            {
+                break result;
+            }
+            if Instant::now() >= until {
+                bail!("Diagnostic waiter timed out; pending RPC ownership retained")
+            }
+            tokio::time::sleep_until(tokio::time::Instant::from_std(
+                until.min(Instant::now() + POLL),
+            ))
+            .await;
+        };
+        evidence["diagnostics"][operation]["terminal_response"] = json!(true);
+        if result["exitCode"] != 0 || result["stderr"] != "" {
+            bail!("Helper failed or produced unexpected stderr; inconclusive")
+        }
+        let raw = result["stdout"].as_str().context("helper stdout")?;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Observation {
+            operation: String,
+            nonce: String,
+            target: String,
+            errno: i32,
+            result: String,
+        }
+        let observed: Observation = serde_json::from_str(raw)
+            .context("Malformed, duplicate, mistyped or truncated helper result")?;
+        if observed.operation != operation
+            || observed.nonce != nonce
+            || observed.target != binding
+            || !matches!(observed.result.as_str(), "success" | "error")
+        {
+            bail!("Helper identity/result mismatch; inconclusive")
+        }
+        let code = observed.errno;
+        evidence["diagnostics"][operation]["observed"] = json!({
+            "operation":operation,"target":binding,"errno":code,"result":observed.result,
+            "nonce_matched":true,"completed_at":chrono::Utc::now().to_rfc3339()});
+        if code == 0 || observed.result == "success" {
+            bail!("Unexpected syscall access succeeded; stop without another probe")
+        }
+        if ![libc::EPERM, libc::EACCES].contains(&code) {
+            bail!("Syscall outcome is inconclusive; only EPERM/EACCES establish denial")
+        }
+    }
+    if !app.supervisor.diagnostic_pending()?.is_empty() {
+        bail!("Diagnostic quiescence unknown")
+    }
+    evidence["standalone_enforcement_complete"] = json!(true);
+    Ok(())
 }
 
 /// Stops the exact owned process group if the case panics or is cancelled
@@ -688,6 +1581,20 @@ async fn writer_setup(
                 "documentation_policy": "Disposable diagnostic evidence only", "checks": []},
         }),
     )?;
+    if inputs.conversation {
+        let protected = app.paths.root.join("conversation-credential-surrogate.txt");
+        std::fs::write(
+            &protected,
+            b"Disposable conversation protected-read surrogate",
+        )?;
+        evidence["fixture_setup"] = json!({
+            "project_id": "diagnostic-project",
+            "configuration": config,
+            "identity": "conversation_only",
+            "seeded_role_execution": false
+        });
+        return Ok((app, vec![("service_root", protected)]));
+    }
     let profile = writer_command(
         &app,
         json!({

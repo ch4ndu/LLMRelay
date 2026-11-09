@@ -9,6 +9,87 @@ const CODEX_POLICY_BYTES: &str =
     include_str!("../resources/provider-compatibility/single-agent-codex.json");
 const CLAUDE_POLICY_BYTES: &str =
     include_str!("../resources/provider-compatibility/single-agent-claude.json");
+const CONVERSATION_BYTES: &str =
+    include_str!("../resources/provider-compatibility/conversation-codex.json");
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationRelease {
+    schema: u32,
+    provider: Provider,
+    adapter_revision: String,
+    exact_version: String,
+    schema_hash: String,
+    policy: String,
+    eligibility: String,
+    evidence_digest: Option<String>,
+    #[serde(default)]
+    split_evidence: Option<ConversationSplitEvidence>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationSplitEvidence {
+    evidence_basis: String,
+    lifecycle_complete: bool,
+    standalone_enforcement_complete: bool,
+    cleanup_verified: bool,
+    residual_accepted: bool,
+    model_tool_denial_observed: bool,
+}
+
+impl ConversationRelease {
+    fn independently_qualified(&self) -> bool {
+        let digest_valid = self
+            .evidence_digest
+            .as_deref()
+            .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        digest_valid
+            && match self.eligibility.as_str() {
+                "qualified" => self.split_evidence.is_none(),
+                "qualified_split_evidence_v1" => {
+                    self.split_evidence.as_ref().is_some_and(|summary| {
+                        summary.evidence_basis
+                            == "app_server_standalone_enforcement_plus_model_lifecycle_v1"
+                            && summary.lifecycle_complete
+                            && summary.standalone_enforcement_complete
+                            && summary.cleanup_verified
+                            && summary.residual_accepted
+                            && !summary.model_tool_denial_observed
+                    })
+                }
+                _ => false,
+            }
+    }
+}
+
+pub(crate) fn conversation_release(version: &str) -> anyhow::Result<String> {
+    conversation_release_inner(version, false)
+}
+
+fn conversation_release_inner(version: &str, provisional: bool) -> anyhow::Result<String> {
+    use crate::providers::codex_app_server as conversation;
+    let pack: ConversationRelease = serde_json::from_str(CONVERSATION_BYTES)?;
+    if pack.schema != 1
+        || pack.provider != Provider::Codex
+        || version != conversation::EXACT_VERSION
+        || pack.exact_version != version
+        || pack.adapter_revision != conversation::ADAPTER_REVISION
+        || pack.schema_hash != conversation::SCHEMA_HASH
+        || pack.policy != conversation::POLICY
+    {
+        anyhow::bail!("This executable has no supported native conversation contract.")
+    }
+    if !provisional && !pack.independently_qualified() {
+        anyhow::bail!("Native conversations are unqualified in this release. An independently reviewed native qualification is required before project probing or execution.")
+    }
+    Ok(hex::encode(Sha256::digest(CONVERSATION_BYTES.as_bytes())))
+}
+
+#[cfg(test)]
+pub(crate) fn provisional_conversation_release(version: &str) -> anyhow::Result<String> {
+    conversation_release_inner(version, true)
+}
 pub const CODEX_EXACT_VERSION: &str = crate::providers::codex::EXACT_CODEX_VERSION;
 const REQUIRED_EVIDENCE: [&str; 4] = [
     "exact_native_policy",
@@ -1087,6 +1168,62 @@ fn validate_compiled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_split_release_requires_exact_complete_reviewed_summary() {
+        let mut manifest: serde_json::Value = serde_json::from_str(CONVERSATION_BYTES).unwrap();
+        manifest.as_object_mut().unwrap().remove("split_evidence");
+        manifest["eligibility"] = "qualified_split_evidence_v1".into();
+        manifest["evidence_digest"] = "a".repeat(64).into();
+        let summary = serde_json::json!({
+            "evidence_basis":"app_server_standalone_enforcement_plus_model_lifecycle_v1",
+            "lifecycle_complete":true, "standalone_enforcement_complete":true,
+            "cleanup_verified":true, "residual_accepted":true,
+            "model_tool_denial_observed":false
+        });
+        let admits = |value: &serde_json::Value| {
+            serde_json::from_value::<ConversationRelease>(value.clone())
+                .is_ok_and(|pack| pack.independently_qualified())
+        };
+        assert!(!admits(&manifest));
+        manifest["split_evidence"] = summary.clone();
+        assert!(admits(&manifest));
+        for field in summary.as_object().unwrap().keys() {
+            for replacement in [serde_json::Value::Null, "true".into(), false.into()] {
+                let mut incomplete = manifest.clone();
+                incomplete["split_evidence"][field] = replacement;
+                let expected = field == "model_tool_denial_observed"
+                    && incomplete["split_evidence"][field] == false;
+                assert_eq!(admits(&incomplete), expected, "{field}");
+            }
+            let mut missing = manifest.clone();
+            missing["split_evidence"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(!admits(&missing), "missing {field}");
+        }
+        for label in ["qualified", "qualified_split_evidence_v2", "unqualified"] {
+            let mut changed = manifest.clone();
+            changed["eligibility"] = label.into();
+            assert!(!admits(&changed));
+        }
+        for (field, value) in [
+            ("model_tool_denial_observed", true.into()),
+            ("evidence_basis", "unknown".into()),
+            ("unexpected", true.into()),
+        ] {
+            let mut changed = manifest.clone();
+            changed["split_evidence"][field] = value;
+            assert!(!admits(&changed));
+        }
+        manifest["evidence_digest"] = "invalid".into();
+        assert!(!admits(&manifest));
+        manifest["eligibility"] = "qualified".into();
+        manifest.as_object_mut().unwrap().remove("split_evidence");
+        manifest["evidence_digest"] = "a".repeat(64).into();
+        assert!(admits(&manifest));
+    }
 
     #[test]
     fn exact_selection_and_provenance_are_separate_from_authority() {

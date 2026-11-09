@@ -17,6 +17,8 @@ Both workflows are implemented. Single-agent execution has native verification r
 
 Recipes and draft-only schedules support TRIP and Single agent selections. **Repository research** and **Build and review** execution require separately qualified native policies, which remain unavailable pending qualification. Custom workflow editing is not available.
 
+A separate read-only conversation runtime has experimental split-evidence qualification on macOS for exact Codex CLI 0.167.0 with `gpt-6.1-sol` at medium effort. Real-model lifecycle checks and same-server standalone enforcement probes support this scope; denied execution through the model-tool path was not directly observed. Each project still needs its own probe and activation. This foundation exposes authenticated service operations; the conversation dashboard is a later delivery. See the [security contract](docs/SECURITY.md#experimental-structured-conversations) for the evidence boundary. Existing task workflows retain their own compatibility requirements.
+
 ## Start LLMRelay
 
 You need macOS, Git, and an installed, signed-in Codex or Claude Code CLI. A CLI is a program you run in a terminal. Rust and Deno are needed only if you [build LLMRelay from source](docs/BUILDING.md).

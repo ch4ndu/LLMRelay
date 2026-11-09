@@ -125,7 +125,7 @@ fn recorded_admission_hold(
 
 fn scheduler_capacity(connection: &Connection) -> Result<(i64, Vec<serde_json::Value>)> {
     let global_active = connection.query_row(
-        "SELECT COUNT(*) FROM claims WHERE state IN ('reserved','launching','running','unknown','stopping')",
+        "SELECT (SELECT COUNT(*) FROM claims WHERE state IN ('reserved','launching','running','unknown','stopping'))+(SELECT COUNT(*) FROM conversation_reservations WHERE state!='released')",
         [],
         |row| row.get(0),
     )?;
@@ -285,6 +285,12 @@ fn evaluate_ready_task(
         }),
         None,
     ));
+    let conversation_reserved: bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM conversation_reservations WHERE repository_identity=?1 AND state!='released')",[&task.repository_identity],|row|row.get(0))?;
+    if conversation_reserved {
+        return Ok(blocked_scheduler_evaluation(&task,"scheduler.conversation_repository_reserved",DecisionEvidenceState::Pending,DecisionOwner::Service,
+            serde_json::json!({"repository_identity":task.repository_identity}),Some("A conversation still owns this repository. Stop it and verify that its processes are quiet before starting a task.".into()),
+            prerequisites,SchedulerMutation::None,None,Vec::new()));
+    }
     let repository_claim: Option<(String, String, String, String, String, i64)> = connection
         .query_row(
             "SELECT claim.id,claim.task_id,claim.attempt_id,claim.state,owner.project_id,owner.version

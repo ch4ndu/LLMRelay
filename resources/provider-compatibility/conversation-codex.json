@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "provider": "codex",
+  "adapter_revision": "codex-local-stdio-conversation-v1",
+  "exact_version": "codex-cli 0.167.0",
+  "schema_hash": "021462a9bacd117f4cd40c256a4888619d059cec6a65b795198d521ba660e554",
+  "policy": "conversation_read_only_v1",
+  "eligibility": "qualified_split_evidence_v1",
+  "evidence_digest": "898b8fac5f0852515ded1c96488f186193e2947f2b0f832cc601c6a3e7879d04",
+  "split_evidence": {
+    "evidence_basis": "app_server_standalone_enforcement_plus_model_lifecycle_v1",
+    "lifecycle_complete": true,
+    "standalone_enforcement_complete": true,
+    "cleanup_verified": true,
+    "residual_accepted": true,
+    "model_tool_denial_observed": false
+  }
+}

@@ -21,6 +21,8 @@ pub(crate) const GRACEFUL_STOP_SECONDS: i64 = 30;
 
 #[derive(Clone)]
 pub struct Supervisor {
+    #[cfg(test)]
+    diagnostic_commands: Arc<Mutex<HashMap<(String, String, String), Option<serde_json::Value>>>>,
     store: Store,
     transcripts_root: std::path::PathBuf,
     sessions: Arc<RwLock<HashMap<String, Arc<SessionHandle>>>>,
@@ -121,7 +123,22 @@ struct SessionHandle {
     first_stop_requested_at: Mutex<Option<std::time::Instant>>,
     codex_helper_image: Option<Mutex<Option<ExecutableFingerprint>>>,
     codex_helper_identity: Mutex<Option<NativeHelperIdentity>>,
-    _master: Mutex<Box<dyn MasterPty + Send>>,
+    _master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+}
+
+fn write_conversation_frame(handle: &SessionHandle, value: &serde_json::Value) -> Result<()> {
+    let mut bytes = serde_json::to_vec(value)?;
+    if bytes.len() > crate::providers::codex_app_server::MAX_FRAME_BYTES {
+        bail!("Conversation input frame exceeds its limit")
+    }
+    bytes.push(b'\n');
+    let mut input = handle
+        .input
+        .lock()
+        .map_err(|_| anyhow!("Conversation input lock unavailable"))?;
+    input.write_all(&bytes)?;
+    input.flush()?;
+    Ok(())
 }
 
 struct StartupCapture {
@@ -723,8 +740,783 @@ impl std::error::Error for SpawnFailure {
 }
 
 impl Supervisor {
+    pub(crate) fn spawn_conversation(
+        &self,
+        session: &str,
+        conversation: &str,
+        generation: &str,
+        operation: &str,
+        prepared: crate::providers::codex_app_server::PreparedConversation,
+        supervision_executable: &std::path::Path,
+        resume_thread: Option<String>,
+    ) -> Result<()> {
+        use std::process::Stdio;
+        if self.store.compatibility_bundles.is_synthetic() {
+            bail!("Synthetic compatibility cannot launch a native conversation.")
+        }
+        let owner = SessionOwner::Conversation(conversation.to_owned());
+        if self.store.session_owner(session)? != owner {
+            bail!("Conversation session owner changed before launch.")
+        }
+        let boot = system_boot_identity()?;
+        let anchor_root = self.transcripts_root.join(".launch-anchors");
+        std::fs::create_dir_all(&anchor_root)?;
+        let anchor_path = anchor_root.join(format!("{session}-{generation}.json"));
+        if anchor_path.exists() {
+            bail!("Conversation launch anchor already exists; this generation cannot be replayed.")
+        }
+        self.store
+            .mark_session_spawning(session, generation, &boot)?;
+        // Use the same app-owned group wrapper as PTY launches, with pipes.
+        let mut command = Command::new(supervision_executable);
+        command.env_clear();
+        for key in [
+            "HOME",
+            "PATH",
+            "SHELL",
+            "TMPDIR",
+            "USER",
+            "LOGNAME",
+            "LANG",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command
+            .arg("internal-launch")
+            .arg("--anchor")
+            .arg(&anchor_path)
+            .arg("--executable")
+            .arg(&prepared.identity.executable.canonical_path)
+            .arg("--")
+            .args(&prepared.arguments)
+            .current_dir(&prepared.identity.repository_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                self.store
+                    .conversation_proven_spawn_failure(conversation, session)?;
+                return Err(error).context("start local conversation wrapper");
+            }
+        };
+        let root_pid = child.id();
+        // The Child stays locally owned until either the complete live handle
+        // or a cleanup-only handle is installed. No post-spawn `?` escapes it.
+        let root_start = native_start_marker(root_pid);
+        let mut cleanup_identity = None;
+        let setup = (|| -> Result<_> {
+            let root_start = root_start.as_ref().map_err(|error| anyhow!("{error:#}"))?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let (leader, provider) = loop {
+                if let Ok(bytes) = std::fs::read(&anchor_path) {
+                    if bytes.len() > 16 * 1024 {
+                        bail!("Conversation launch handshake is oversized")
+                    }
+                    match serde_json::from_slice::<LaunchHandshake>(&bytes)? {
+                        LaunchHandshake::ProviderSpawned { leader, provider } => {
+                            break (leader, provider)
+                        }
+                        LaunchHandshake::PreProviderSpawnFailed { .. } => {
+                            bail!("Conversation wrapper could not start the provider")
+                        }
+                        LaunchHandshake::ProviderExited { .. } => {
+                            bail!("Conversation provider exited during startup")
+                        }
+                    }
+                }
+                if child.try_wait()?.is_some() {
+                    bail!("Conversation wrapper exited before its handshake")
+                }
+                if std::time::Instant::now() >= deadline {
+                    bail!("Conversation startup acknowledgement is unknown")
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            if leader.pid != root_pid
+                || leader.process_group_id != root_pid as i32
+                || provider.process_group_id != leader.process_group_id
+                || provider.pid == root_pid
+                || leader.boot_identity != boot
+                || provider.boot_identity != boot
+                || !same_process_start(root_start, &leader.native_start_marker)
+                || !same_process_start(&native_start_marker(root_pid)?, &leader.native_start_marker)
+                || !same_process_start(
+                    &native_start_marker(provider.pid)?,
+                    &provider.native_start_marker,
+                )
+            {
+                bail!("Conversation process generation does not match its launch anchor")
+            }
+            let process = ProcessIdentity {
+                pid: provider.pid,
+                process_group_id: provider.process_group_id,
+                native_start_marker: provider.native_start_marker.clone(),
+                observed_started_at: Utc::now().to_rfc3339(),
+            };
+            cleanup_identity = Some((leader.clone(), process.clone()));
+            let inventory = self.process_inventory()?;
+            if !inventory.iter().any(|p| {
+                p.pid == provider.pid && p.ppid == root_pid && p.pgid == leader.process_group_id
+            }) {
+                bail!("Conversation provider is not an exact child of its owned wrapper")
+            }
+            self.store
+                .record_session_anchor(session, generation, &leader)?;
+            let process_json = serde_json::to_string(&process)?;
+            self.store.record_session_process(
+                session,
+                generation,
+                &process_json,
+                provider.pid,
+                &provider.native_start_marker,
+                provider.process_group_id,
+                root_pid,
+            )?;
+            self.store
+                .update_session_running(session, generation, &process_json)?;
+            let input = child
+                .stdin
+                .take()
+                .context("Conversation input pipe is unavailable")?;
+            #[cfg(test)]
+            {
+                let flags = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_GETFL) };
+                if flags < 0
+                    || unsafe {
+                        libc::fcntl(input.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                    } < 0
+                {
+                    return Err(std::io::Error::last_os_error())
+                        .context("bound diagnostic pipe writes");
+                }
+            }
+            let stdout = child
+                .stdout
+                .take()
+                .context("Conversation output pipe is unavailable")?;
+            let stderr = child
+                .stderr
+                .take()
+                .context("Conversation diagnostic pipe is unavailable")?;
+            let sessions = self
+                .sessions
+                .write()
+                .map_err(|_| anyhow!("Supervisor session map unavailable"))?;
+            Ok((leader, provider, process, input, stdout, stderr, sessions))
+        })();
+        let make_handle = |child: std::process::Child,
+                           leader: ProcessGenerationAnchor,
+                           process: ProcessIdentity,
+                           input: Box<dyn Write + Send>,
+                           known| {
+            Arc::new(SessionHandle {
+                session_id: session.into(),
+                owner: owner.clone(),
+                transcript_epoch: generation.into(),
+                process,
+                group_leader: leader.clone(),
+                child: Mutex::new(Box::new(child)),
+                input: Mutex::new(input),
+                io_boundary: Mutex::new(()),
+                known_members: Mutex::new(known),
+                first_stop_requested_at: Mutex::new(None),
+                codex_helper_image: None,
+                codex_helper_identity: Mutex::new(None),
+                _master: Mutex::new(None),
+            })
+        };
+        let (stdout, mut stderr) = match setup {
+            Ok((leader, provider, process, input, stdout, stderr, mut sessions)) => {
+                let known = HashMap::from([
+                    (root_pid, leader.native_start_marker.clone()),
+                    (provider.pid, provider.native_start_marker.clone()),
+                ]);
+                let handle = make_handle(child, leader, process, Box::new(input), known);
+                sessions.insert(session.into(), handle);
+                (stdout, stderr)
+            }
+            Err(error) => {
+                let start = root_start.unwrap_or_default();
+                let leader = ProcessGenerationAnchor {
+                    pid: root_pid,
+                    process_group_id: root_pid as i32,
+                    native_start_marker: start.clone(),
+                    boot_identity: boot,
+                };
+                let process = ProcessIdentity {
+                    pid: root_pid,
+                    process_group_id: root_pid as i32,
+                    native_start_marker: start.clone(),
+                    observed_started_at: Utc::now().to_rfc3339(),
+                };
+                let (leader, process) = cleanup_identity.unwrap_or((leader, process));
+                let known = HashMap::from([
+                    (root_pid, start.clone()),
+                    (process.pid, process.native_start_marker.clone()),
+                ]);
+                let input: Box<dyn Write + Send> = child
+                    .stdin
+                    .take()
+                    .map(|input| Box::new(input) as Box<dyn Write + Send>)
+                    .unwrap_or_else(|| Box::new(std::io::sink()));
+                let handle = make_handle(child, leader.clone(), process, input, known);
+                // Restore the map's single-entry insertion invariant while its
+                // exclusive guard is held, keeping exact stop/drain usable.
+                let mut sessions = self
+                    .sessions
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner());
+                sessions.insert(session.into(), handle);
+                self.sessions.clear_poison();
+                drop(sessions);
+                let _ = self.store.record_session_spawn_uncertainty(
+                    session,
+                    Some(root_pid),
+                    Some(root_pid as i32),
+                    &[],
+                );
+                let _ = self
+                    .store
+                    .record_session_anchor(session, generation, &leader);
+                let _ = self.store.conversation_hold(
+                    conversation,
+                    "Conversation startup is uncertain; ownership remains held until exact cleanup is verified.",
+                );
+                // Never signal an unverified/reused PID or group. Reconcile is
+                // bounded and releases only after observing exact quiescence.
+                if !start.is_empty() {
+                    let _ = self.force_stop_exact_managed_process(session);
+                    let _ = self.reconcile();
+                }
+                return Err(error);
+            }
+        };
+        // Diagnostics are drained and discarded. Native stderr can contain
+        // account/configuration material and is never a transcript or API event.
+        let supervisor = self.clone();
+        let conversation_id = conversation.to_owned();
+        let diagnostic_supervisor = self.clone();
+        let diagnostic_conversation = conversation.to_owned();
+        let diagnostic_generation = generation.to_owned();
+        let diagnostic_session = session.to_owned();
+        let started = std::thread::Builder::new()
+            .name(format!("conversation-stderr-{session}"))
+            .spawn(move || {
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    match stderr.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(_) => {},
+                        Err(_) => {
+                            let _ = diagnostic_supervisor.store.conversation_hold_generation(
+                                &diagnostic_conversation,
+                                &diagnostic_generation,
+                                "The native diagnostic pipe failed; inspect this conversation before continuing.",
+                            );
+                            let _ = diagnostic_supervisor.interrupt_once(&diagnostic_session);
+                            break;
+                        }
+                    }
+                }
+            });
+        if started.is_err() {
+            let _ = self.store.conversation_hold(
+                conversation,
+                "Conversation diagnostics could not be drained.",
+            );
+            let _ = self.force_stop_exact_managed_process(session);
+            let _ = self.reconcile();
+            bail!("Conversation diagnostic reader could not start")
+        }
+        let tracked_session = session.to_owned();
+        let tracked_generation = generation.to_owned();
+        let tracked_operation = operation.to_owned();
+        let start = std::thread::Builder::new()
+            .name(format!("conversation-stdout-{session}"))
+            .spawn(move || {
+                let outcome = supervisor.read_conversation(
+                    stdout,
+                    &tracked_session,
+                    &conversation_id,
+                    &tracked_generation,
+                    &tracked_operation,
+                    &prepared,
+                    resume_thread.as_deref(),
+                );
+                if outcome.is_err() {
+                    let _ = supervisor.store.conversation_hold_generation(
+                        &conversation_id,
+                        &tracked_generation,
+                        "The native conversation outcome is unknown. Refresh and inspect it; the request will not be replayed.",
+                    );
+                    let _ = supervisor.interrupt_once(&tracked_session);
+                }
+            });
+        if start.is_err() {
+            let _ = self
+                .store
+                .conversation_hold(conversation, "Conversation output reader could not start.");
+            let _ = self.force_stop_exact_managed_process(session);
+            let _ = self.reconcile();
+            bail!("Conversation output reader could not start")
+        }
+        Ok(())
+    }
+
+    pub(crate) fn send_conversation(
+        &self,
+        session: &str,
+        conversation: &str,
+        generation: &str,
+        operation: &str,
+        effort: &str,
+    ) -> Result<()> {
+        let handle = self.handle(session)?;
+        let _boundary = handle
+            .io_boundary
+            .lock()
+            .map_err(|_| anyhow!("Conversation I/O unavailable"))?;
+        self.verify_process(&handle)?;
+        if handle.owner != SessionOwner::Conversation(conversation.into())
+            || handle.transcript_epoch != generation
+        {
+            bail!("Conversation process generation changed")
+        }
+        let (thread, input, kind, turn) =
+            self.store
+                .conversation_send_intent(conversation, generation, operation)?;
+        let frame = crate::providers::codex_app_server::turn_request(
+            operation,
+            &thread,
+            &input,
+            effort,
+            if kind == "steer" {
+                turn.as_deref()
+            } else {
+                None
+            },
+        );
+        if write_conversation_frame(&handle, &frame).is_err() {
+            self.store.conversation_hold(
+                conversation,
+                "The message may have been delivered; it will not be sent again.",
+            )?;
+            bail!("Conversation message delivery is unknown. Inspect before retrying.")
+        }
+        Ok(())
+    }
+
+    pub(crate) fn interrupt_conversation(
+        &self,
+        session: &str,
+        conversation: &str,
+        generation: &str,
+        operation: &str,
+    ) -> Result<bool> {
+        let handle = self.handle(session)?;
+        let _boundary = handle
+            .io_boundary
+            .lock()
+            .map_err(|_| anyhow!("Conversation I/O unavailable"))?;
+        self.verify_process(&handle)?;
+        if handle.owner != SessionOwner::Conversation(conversation.into())
+            || handle.transcript_epoch != generation
+        {
+            bail!("Conversation process generation changed")
+        }
+        if let Some(frame) =
+            self.store
+                .conversation_interrupt_send_intent(conversation, generation, operation)?
+        {
+            write_conversation_frame(&handle, &frame)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    // Only the existing stdout reader completes these requests. Waiter cancellation
+    // leaves the exact generation and RPC ownership in this registry.
+    #[cfg(test)]
+    pub(crate) fn diagnostic_command(
+        &self,
+        session: &str,
+        generation: &str,
+        rpc: &str,
+        argv: &[String],
+        cwd: &std::path::Path,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value> {
+        if argv.is_empty() || timeout.is_zero() || timeout > std::time::Duration::from_secs(10) {
+            bail!("Invalid bounded diagnostic command")
+        }
+        let handle = self.handle(session)?;
+        let _boundary = handle
+            .io_boundary
+            .try_lock()
+            .map_err(|_| anyhow!("Diagnostic I/O unavailable"))?;
+        self.verify_process(&handle)?;
+        if !matches!(&handle.owner, SessionOwner::Conversation(_))
+            || handle.transcript_epoch != generation
+        {
+            bail!("Diagnostic conversation generation changed")
+        }
+        let key = (session.into(), generation.into(), rpc.into());
+        let mut pending = self
+            .diagnostic_commands
+            .lock()
+            .map_err(|_| anyhow!("Diagnostic registry unavailable"))?;
+        if pending.contains_key(&key) || pending.len() >= 3 {
+            bail!("Diagnostic request already owned or allowance exhausted")
+        }
+        let frame = serde_json::json!({"id":rpc,"method":"command/exec","params":{
+            "command":argv,"cwd":cwd,"timeoutMs":timeout.as_millis(),"outputBytesCap":2048
+        }});
+        pending.insert(key, None);
+        drop(pending);
+        let mut bytes = serde_json::to_vec(&frame)?;
+        if bytes.len() > crate::providers::codex_app_server::MAX_FRAME_BYTES {
+            bail!("Diagnostic request exceeds the input bound")
+        }
+        bytes.push(b'\n');
+        let mut input = handle
+            .input
+            .try_lock()
+            .map_err(|_| anyhow!("Diagnostic input busy"))?;
+        input.write_all(&bytes)?;
+        input.flush()?;
+        Ok(
+            serde_json::json!({"session_id":session,"generation":generation,"rpc_id":rpc,
+            "process":handle.process,"group":handle.group_leader}),
+        )
+    }
+
+    #[cfg(test)]
+    fn route_diagnostic_command(
+        &self,
+        session: &str,
+        generation: &str,
+        frame: &[u8],
+    ) -> Result<bool> {
+        if frame.len() > crate::providers::codex_app_server::MAX_FRAME_BYTES {
+            bail!("Diagnostic frame exceeds the native transport bound")
+        }
+        let value: serde_json::Value = serde_json::from_slice(frame)?;
+        if value.get("method").is_some() {
+            return Ok(false);
+        }
+        let Some(id) = value["id"].as_str() else {
+            return Ok(false);
+        };
+        let mut pending = self
+            .diagnostic_commands
+            .lock()
+            .map_err(|_| anyhow!("Diagnostic registry unavailable"))?;
+        let Some(result) = pending.get_mut(&(session.into(), generation.into(), id.into())) else {
+            return Ok(false);
+        };
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Terminal {
+            id: String,
+            result: Output,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct Output {
+            exit_code: i32,
+            stdout: String,
+            stderr: String,
+        }
+        let terminal = serde_json::from_slice::<Terminal>(frame);
+        let valid = terminal.as_ref().is_ok_and(|terminal| {
+            terminal.id == id
+                && terminal.result.stdout.len() <= 2048
+                && terminal.result.stderr.len() <= 2048
+                && value["result"]["exitCode"] == terminal.result.exit_code
+        });
+        if result.is_some() || !valid {
+            *result = None;
+            bail!("Malformed diagnostic terminal response; diagnostic quiescence unknown")
+        }
+        let body = &value["result"];
+        *result = Some(body.clone());
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diagnostic_result(
+        &self,
+        session: &str,
+        generation: &str,
+        rpc: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(self
+            .diagnostic_commands
+            .lock()
+            .map_err(|_| anyhow!("Diagnostic registry unavailable"))?
+            .get(&(session.into(), generation.into(), rpc.into()))
+            .cloned()
+            .flatten())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diagnostic_pending(&self) -> Result<Vec<(String, String, String)>> {
+        Ok(self
+            .diagnostic_commands
+            .lock()
+            .map_err(|_| anyhow!("Diagnostic registry unavailable"))?
+            .iter()
+            .filter(|(_, result)| result.is_none())
+            .map(|(key, _)| key.clone())
+            .collect())
+    }
+
+    fn read_conversation(
+        &self,
+        mut stdout: std::process::ChildStdout,
+        session: &str,
+        conversation: &str,
+        generation: &str,
+        operation: &str,
+        prepared: &crate::providers::codex_app_server::PreparedConversation,
+        resume_thread: Option<&str>,
+    ) -> Result<()> {
+        use crate::providers::codex_app_server::{self as adapter, Projection};
+        let handle = self.handle(session)?;
+        let initialize_id = uuid::Uuid::new_v4().to_string();
+        let thread_id = uuid::Uuid::new_v4().to_string();
+        let history_id = uuid::Uuid::new_v4().to_string();
+        write_conversation_frame(&handle, &adapter::initialize(&initialize_id))?;
+        // SAFETY: stdout owns this descriptor throughout configuration and polling.
+        let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                < 0
+        {
+            return Err(std::io::Error::last_os_error()).context("configure conversation output");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let mut pending = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        let mut initialized = false;
+        let mut bound = false;
+        let mut validated_history = Vec::new();
+        let mut awaiting_ack: Vec<(String, Option<String>, &'static str, serde_json::Value)> =
+            Vec::new();
+        loop {
+            if std::time::Instant::now() >= deadline {
+                bail!("Conversation runtime limit reached")
+            }
+            let mut poll = libc::pollfd {
+                fd: stdout.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let polled = unsafe { libc::poll(&mut poll, 1, 1000) };
+            if polled < 0 {
+                return Err(std::io::Error::last_os_error()).context("poll conversation output");
+            }
+            if polled == 0 {
+                continue;
+            }
+            match stdout.read(&mut buffer) {
+                Ok(0) => {
+                    self.store
+                        .conversation_transport_closed(conversation, generation)?;
+                    let _ = self.interrupt_once(session);
+                    return Ok(());
+                }
+                Ok(count) => pending.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error.into()),
+            }
+            while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                let frame = pending.drain(..=end).collect::<Vec<_>>();
+                #[cfg(test)]
+                if self.route_diagnostic_command(session, generation, &frame)? {
+                    continue;
+                }
+                match adapter::project(&frame)? {
+                    Projection::Response {
+                        id,
+                        result: _,
+                        failed,
+                    } if id == initialize_id && !initialized => {
+                        if failed {
+                            bail!("Native initialization was rejected")
+                        }
+                        initialized = true;
+                        write_conversation_frame(
+                            &handle,
+                            &serde_json::json!({"method":"initialized"}),
+                        )?;
+                        if let Some(thread) = resume_thread {
+                            write_conversation_frame(
+                                &handle,
+                                &serde_json::json!({"id":history_id,"method":"thread/read","params":{"threadId":thread,"includeTurns":true}}),
+                            )?;
+                        } else {
+                            write_conversation_frame(
+                                &handle,
+                                &adapter::thread_request(&thread_id, prepared, None),
+                            )?;
+                        }
+                    }
+                    Projection::Response { id, result, failed }
+                        if id == history_id && initialized && !bound =>
+                    {
+                        if failed {
+                            bail!("Native history reconciliation is unavailable")
+                        }
+                        validated_history = self
+                            .store
+                            .conversation_validate_history(conversation, &result["thread"])?;
+                        write_conversation_frame(
+                            &handle,
+                            &adapter::thread_request(&thread_id, prepared, resume_thread),
+                        )?;
+                    }
+                    Projection::Response { id, result, failed }
+                        if id == thread_id && initialized && !bound =>
+                    {
+                        if failed {
+                            bail!("Native thread admission was rejected")
+                        }
+                        if result["model"].as_str()
+                            != Some(prepared.identity.profile.model.as_str())
+                            || result["modelProvider"].as_str() != Some("openai")
+                            || result["reasoningEffort"].as_str()
+                                != Some(prepared.identity.profile.effort.as_str())
+                            || result["cwd"].as_str() != prepared.identity.repository_root.to_str()
+                            || result["approvalPolicy"].as_str() != Some("never")
+                            || result["sandbox"]["type"].as_str() != Some("readOnly")
+                            || result["sandbox"]["networkAccess"]
+                                .as_bool()
+                                .unwrap_or(false)
+                        {
+                            bail!("Native thread settings do not match the admitted conversation identity")
+                        }
+                        let native = result["thread"]["id"]
+                            .as_str()
+                            .context("Native thread acknowledgement lacks its identity")?;
+                        if resume_thread.is_some_and(|expected| expected != native) {
+                            bail!("Native resume returned a different thread")
+                        }
+                        self.store
+                            .conversation_bind_thread(conversation, generation, native)?;
+                        bound = true;
+                        if resume_thread.is_some() {
+                            self.store.conversation_resume_bound(
+                                conversation,
+                                generation,
+                                operation,
+                            )?;
+                        } else {
+                            self.send_conversation(
+                                session,
+                                conversation,
+                                generation,
+                                operation,
+                                &prepared.identity.profile.effort,
+                            )?;
+                        }
+                    }
+                    Projection::Response { id, result, failed } if bound => {
+                        self.store.conversation_response(
+                            conversation,
+                            generation,
+                            &id,
+                            &result,
+                            failed,
+                        )?;
+                        for (thread, turn, kind, payload) in awaiting_ack.drain(..) {
+                            self.store.conversation_event(
+                                conversation,
+                                generation,
+                                &thread,
+                                turn.as_deref(),
+                                kind,
+                                &payload,
+                            )?;
+                        }
+                    }
+                    Projection::Response { .. } => bail!("Unexpected native response rejected"),
+                    Projection::Event {
+                        thread,
+                        turn,
+                        kind,
+                        payload,
+                    } if bound => {
+                        if self.store.conversation_restored_usage(
+                            conversation,
+                            generation,
+                            &thread,
+                            turn.as_deref(),
+                            kind,
+                            &validated_history,
+                        )? {
+                            continue;
+                        }
+                        if self.store.conversation_event_waits_for_ack(
+                            conversation,
+                            generation,
+                            &thread,
+                            turn.as_deref(),
+                        )? {
+                            if awaiting_ack.len() >= 32 {
+                                bail!("Native pre-acknowledgement event limit exceeded")
+                            }
+                            awaiting_ack.push((thread, turn, kind, payload));
+                        } else {
+                            self.store.conversation_event(
+                                conversation,
+                                generation,
+                                &thread,
+                                turn.as_deref(),
+                                kind,
+                                &payload,
+                            )?;
+                        }
+                    }
+                    Projection::Deny {
+                        id,
+                        thread,
+                        turn,
+                        method,
+                        response,
+                    } => {
+                        self.store.conversation_native_denial(
+                            conversation,
+                            generation,
+                            &thread,
+                            &turn,
+                            &id,
+                            &method,
+                        )?;
+                        write_conversation_frame(&handle, &response)?;
+                    }
+                    Projection::Ignore | Projection::Event { .. } => {}
+                }
+            }
+            if pending.len() > adapter::MAX_FRAME_BYTES {
+                bail!("Native conversation frame exceeds its limit")
+            }
+            if bound && self.store.conversation_ready_to_stop(conversation)? {
+                self.interrupt_once(session)?;
+            }
+        }
+    }
+
     pub fn new(store: Store, transcripts_root: std::path::PathBuf) -> Self {
         Self {
+            #[cfg(test)]
+            diagnostic_commands: Arc::new(Mutex::new(HashMap::new())),
             store,
             transcripts_root,
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -1223,7 +2015,7 @@ impl Supervisor {
             first_stop_requested_at: Mutex::new(None),
             codex_helper_image,
             codex_helper_identity: Mutex::new(None),
-            _master: Mutex::new(pair.master),
+            _master: Mutex::new(Some(pair.master)),
         });
         match self.sessions.write() {
             Ok(mut sessions) => {
@@ -1559,7 +2351,14 @@ impl Supervisor {
     /// reported as unknown rather than as an error or an empty session list.
     pub(crate) fn session_inventory(&self) -> Result<SessionInventory> {
         Ok(match self.observe_attached_sessions()? {
-            Ok(active) => SessionInventory::Observed(active),
+            Ok(mut active) => {
+                for session in self.store.conversation_active_sessions()? {
+                    if !active.contains(&session) {
+                        active.push(session);
+                    }
+                }
+                SessionInventory::Observed(active)
+            }
             Err(error) => SessionInventory::Unknown {
                 attached: self.attached_session_ids()?,
                 reason: format!("{error:#}"),
@@ -1633,6 +2432,9 @@ impl Supervisor {
         let handles = self.handles()?;
         let attached = !handles.is_empty();
         for handle in handles {
+            if handle.process.native_start_marker.is_empty() {
+                bail!("Startup process identity is unavailable; child ownership remains held")
+            }
             let child_exit = handle
                 .child
                 .lock()
@@ -1685,7 +2487,7 @@ impl Supervisor {
                             .flatten()
                         })
                         .flatten();
-                    self.store.update_session_exit(
+                    let recorded = self.store.update_session_exit(
                         &handle.session_id,
                         &handle.transcript_epoch,
                         &process_json,
@@ -1697,6 +2499,12 @@ impl Supervisor {
                         })
                         .to_string(),
                     )?;
+                    if recorded && matches!(&handle.owner, SessionOwner::Conversation(_)) {
+                        self.sessions
+                            .write()
+                            .map_err(|_| anyhow!("Supervisor session map unavailable"))?
+                            .remove(&handle.session_id);
+                    }
                 } else if service_stop_is_settling(
                     *handle
                         .first_stop_requested_at
@@ -2277,6 +3085,8 @@ impl Supervisor {
             ._master
             .lock()
             .map_err(|_| anyhow!("PTY master lock poisoned"))?
+            .as_ref()
+            .context("This conversation has no terminal to resize")?
             .resize(PtySize {
                 rows,
                 cols,
@@ -4132,7 +4942,7 @@ exit 23
                 )),
                 codex_helper_image: None,
                 codex_helper_identity: Mutex::new(None),
-                _master: Mutex::new(pty.master),
+                _master: Mutex::new(Some(pty.master)),
             }),
         );
         let unrelated_pty = native_pty_system().openpty(PtySize::default()).unwrap();
@@ -4163,7 +4973,7 @@ exit 23
                 first_stop_requested_at: Mutex::new(None),
                 codex_helper_image: None,
                 codex_helper_identity: Mutex::new(None),
-                _master: Mutex::new(unrelated_pty.master),
+                _master: Mutex::new(Some(unrelated_pty.master)),
             }),
         );
         supervisor.fail_process_inventory_for_tests(Some("fixture inventory unavailable"));
@@ -4371,7 +5181,7 @@ exit 23
             first_stop_requested_at: Mutex::new(None),
             codex_helper_image: None,
             codex_helper_identity: Mutex::new(None),
-            _master: Mutex::new(pty.master),
+            _master: Mutex::new(Some(pty.master)),
         });
         app.supervisor
             .sessions
@@ -4585,7 +5395,7 @@ exit 23
                         first_stop_requested_at: Mutex::new(None),
                         codex_helper_image: None,
                         codex_helper_identity: Mutex::new(None),
-                        _master: Mutex::new(pty.master),
+                        _master: Mutex::new(Some(pty.master)),
                     }),
                 );
                 for _ in 0..200 {
@@ -6158,7 +6968,7 @@ exit 23
                     first_stop_requested_at: Mutex::new(None),
                     codex_helper_image: None,
                     codex_helper_identity: Mutex::new(None),
-                    _master: Mutex::new(pty.master),
+                    _master: Mutex::new(Some(pty.master)),
                 }),
             );
 
@@ -6856,7 +7666,7 @@ exit 23
                 first_stop_requested_at: Mutex::new(None),
                 codex_helper_image: None,
                 codex_helper_identity: Mutex::new(None),
-                _master: Mutex::new(pty.master),
+                _master: Mutex::new(Some(pty.master)),
             }),
         );
         let facts = || {

@@ -3575,3 +3575,23 @@ pub fn coverage_preview(
     }
     Ok(preview)
 }
+pub(crate) fn deny_conversation_request(
+    tx: &rusqlite::Transaction<'_>,
+    conversation: &str,
+    generation: &str,
+    thread: &str,
+    turn: &str,
+    request: &serde_json::Value,
+    method: &str,
+) -> anyhow::Result<()> {
+    let request = request.to_string();
+    if request.len() > 256 || method.len() > 128 {
+        anyhow::bail!("Native permission identity exceeds its bound")
+    }
+    let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1 AND generation=?2 AND binding_valid=1 AND state IN ('starting','running','idle') AND (?3='' OR native_thread_id=?3) AND (?4='' OR active_turn_id=?4))",rusqlite::params![conversation,generation,thread,turn],|r|r.get(0))?;
+    if !current {
+        anyhow::bail!("Stale native permission request rejected")
+    }
+    tx.execute("INSERT INTO conversation_requests(conversation_id,generation,native_thread_id,native_turn_id,request_id,method,state,created_at) VALUES(?1,?2,?3,?4,?5,?6,'denied',?7) ON CONFLICT(conversation_id,generation,request_id) DO NOTHING",rusqlite::params![conversation,generation,thread,turn,request,method,chrono::Utc::now().to_rfc3339()])?;
+    Ok(())
+}
