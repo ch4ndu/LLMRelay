@@ -2576,6 +2576,86 @@ const MIGRATION_042: &str = include_str!("../migrations/042_task_interaction_his
 const MIGRATION_043: &str = include_str!("../migrations/043_single_agent_presets_recipes.sql");
 const MIGRATION_044: &str = include_str!("../migrations/044_agent_conversations.sql");
 const MIGRATION_045: &str = include_str!("../migrations/045_conversation_workspace.sql");
+const MIGRATION_046: &str = include_str!("../migrations/046_workflow_comparison_timing.sql");
+
+#[derive(Clone, Copy)]
+enum ExecutionBoundaryKind {
+    Started,
+    Ended,
+}
+
+enum ExecutionExitEvidence {
+    CompletionObserved,
+    QuiescenceOnly,
+}
+
+fn record_execution_boundary_in(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    transcript_epoch: &str,
+    process_json: &str,
+    kind: ExecutionBoundaryKind,
+    observed_at: &str,
+) -> Result<()> {
+    let generation: Option<String> = transaction
+        .query_row(
+            "SELECT role_generation_id FROM sessions
+         WHERE id=?1 AND transcript_epoch=?2 AND process_identity_json=?3",
+            params![session_id, transcript_epoch, process_json],
+            |row| row.get(0),
+        )
+        .context("bind execution timing to the current invocation")?;
+    let Some(generation) = generation else {
+        return Ok(());
+    };
+    let process: crate::domain::ProcessIdentity =
+        serde_json::from_str(process_json).context("parse execution boundary process identity")?;
+    let process_hash = json_hash(&process)?;
+    let kind = match kind {
+        ExecutionBoundaryKind::Started => "started",
+        ExecutionBoundaryKind::Ended => "ended",
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    transaction
+        .execute(
+            "INSERT INTO workflow_execution_boundaries(id,session_id,role_generation_id,
+           transcript_epoch,process_identity_hash,process_identity_json,kind,observed_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+         ON CONFLICT(session_id,role_generation_id,transcript_epoch,process_identity_hash,kind)
+         DO NOTHING",
+            params![
+                id,
+                session_id,
+                generation,
+                transcript_epoch,
+                process_hash,
+                serde_json::to_string(&process)?,
+                kind,
+                observed_at
+            ],
+        )
+        .context("persist observed execution boundary")?;
+    // Keep the original fact and durable conflicting evidence in the same lifecycle commit.
+    transaction
+        .execute(
+            "INSERT INTO workflow_execution_boundary_conflicts(boundary_id,fact_hash,observed_at)
+         SELECT id,?1,?2 FROM workflow_execution_boundaries
+         WHERE session_id=?3 AND role_generation_id=?4 AND transcript_epoch=?5
+           AND process_identity_hash=?6 AND kind=?7 AND observed_at!=?2
+         ON CONFLICT(boundary_id,fact_hash) DO NOTHING",
+            params![
+                json_hash(&observed_at)?,
+                observed_at,
+                session_id,
+                generation,
+                transcript_epoch,
+                process_hash,
+                kind
+            ],
+        )
+        .context("preserve conflicting execution boundary evidence")?;
+    Ok(())
+}
 
 impl Store {
     pub(crate) fn require_conversation_workspace_project(&self, project: &str) -> Result<()> {
@@ -7483,6 +7563,7 @@ impl Store {
             transaction.commit()?;
             return Ok(());
         }
+        let connection = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = connection.execute(
             "UPDATE sessions SET status='running',launch_state='started',launch_error=NULL,
                     process_identity_json=?1,updated_at=?2
@@ -7587,6 +7668,17 @@ impl Store {
                 )?;
             }
         }
+        let process: crate::domain::ProcessIdentity = serde_json::from_str(process_json)
+            .context("parse confirmed execution process identity")?;
+        record_execution_boundary_in(
+            &connection,
+            session_id,
+            transcript_epoch,
+            process_json,
+            ExecutionBoundaryKind::Started,
+            &process.observed_started_at,
+        )?;
+        connection.commit()?;
         Ok(())
     }
 
@@ -8533,6 +8625,39 @@ impl Store {
         process_json: &str,
         exit_json: &str,
     ) -> Result<bool> {
+        self.update_session_exit_with_observation(
+            session_id,
+            transcript_epoch,
+            process_json,
+            exit_json,
+            ExecutionExitEvidence::QuiescenceOnly,
+        )
+    }
+
+    pub(crate) fn update_session_observed_exit(
+        &self,
+        session_id: &str,
+        transcript_epoch: &str,
+        process_json: &str,
+        exit_json: &str,
+    ) -> Result<bool> {
+        self.update_session_exit_with_observation(
+            session_id,
+            transcript_epoch,
+            process_json,
+            exit_json,
+            ExecutionExitEvidence::CompletionObserved,
+        )
+    }
+
+    fn update_session_exit_with_observation(
+        &self,
+        session_id: &str,
+        transcript_epoch: &str,
+        process_json: &str,
+        exit_json: &str,
+        evidence: ExecutionExitEvidence,
+    ) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -8574,6 +8699,27 @@ impl Store {
         if changed == 0 {
             transaction.commit()?;
             return Ok(false);
+        }
+        if let ExecutionExitEvidence::CompletionObserved = evidence {
+            let observed_at = exit
+                .get("observed_at")
+                .and_then(serde_json::Value::as_str)
+                .context("observed process completion requires an observation timestamp")?;
+            if exit
+                .get("process_group_quiescent")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                bail!("observed process completion requires proven process-group quiescence")
+            }
+            record_execution_boundary_in(
+                &transaction,
+                session_id,
+                transcript_epoch,
+                process_json,
+                ExecutionBoundaryKind::Ended,
+                observed_at,
+            )?;
         }
         if let SessionOwner::Conversation(id) = session_owner_in(&transaction, session_id)? {
             if exit
@@ -17254,7 +17400,7 @@ impl Store {
     }
 }
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 45;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 46;
 
 /// Reads the durable state cursor. It is committed state only when the
 /// connection is in autocommit mode.
@@ -17266,13 +17412,13 @@ pub(crate) fn read_state_revision(connection: &Connection) -> rusqlite::Result<i
 
 /// The prior schemas an existing database may be migrated from at service
 /// start. Every other non-current version is left unchanged and refused.
-pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 14] =
-    [31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44];
+pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 15] =
+    [31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45];
 
 pub(crate) fn require_maintenance_schema(connection: &Connection) -> Result<i64> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != CURRENT_SCHEMA_VERSION && !SERVICE_UPGRADABLE_SCHEMA_VERSIONS.contains(&version) {
-        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–45")
+        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–46")
     }
     Ok(version)
 }
@@ -17879,6 +18025,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction
             .commit()
             .context("commit frozen conversation source migration")?;
+    }
+    if version <= 45 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_046)?;
+        transaction.pragma_update(None, "user_version", 46)?;
+        transaction
+            .commit()
+            .context("commit workflow comparison timing migration")?;
     }
     Ok(())
 }
@@ -23957,7 +24111,12 @@ mod interruption_tests {
     }
 
     pub(super) fn prior_service_schema_sql(version: i64) -> String {
-        let drop_schema_45 = "DROP TRIGGER task_conversation_source_task_delete; DROP TABLE task_conversation_sources;";
+        let drop_schema_46 = "DROP TABLE IF EXISTS workflow_execution_boundary_conflicts;
+            DROP TABLE IF EXISTS workflow_execution_boundaries;";
+        if version == 45 {
+            return format!("{drop_schema_46} PRAGMA user_version=45;");
+        }
+        let drop_schema_45 = format!("{drop_schema_46} DROP TRIGGER task_conversation_source_task_delete; DROP TABLE task_conversation_sources;");
         let sessions_43=MIGRATION_039.split_once("CREATE TABLE sessions_rebuilt (").unwrap().1
             .split_once("-- Presentation only:").unwrap().0
             .replace("setup_permit_id,interrupt_requested_at,NULL\nFROM sessions", "setup_permit_id,interrupt_requested_at,provider_validation_invocation_id\nFROM sessions");
@@ -25135,7 +25294,7 @@ mod interruption_tests {
 
         for _ in 0..2 {
             drop(Store::open_service(&database).unwrap());
-            assert_eq!(scalar(version), "Integer(45)");
+            assert_eq!(scalar(version), "Integer(46)");
             assert_eq!(scalar(history), expected_history);
             assert_eq!(scalar(schema), current_schema);
             assert_eq!(
@@ -25152,7 +25311,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(32))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(45)");
+        assert_eq!(scalar(version), "Integer(46)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         // Schema 33 gains only the guidance submitted form and the later migrations.
@@ -25161,7 +25320,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(33))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(45)");
+        assert_eq!(scalar(version), "Integer(46)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -25169,7 +25328,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(34))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(45)");
+        assert_eq!(scalar(version), "Integer(46)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -25177,7 +25336,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(35))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(45)");
+        assert_eq!(scalar(version), "Integer(46)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -25185,7 +25344,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(36))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(45)");
+        assert_eq!(scalar(version), "Integer(46)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         Connection::open(&database)
@@ -25193,7 +25352,7 @@ mod interruption_tests {
             .execute_batch(&prior_service_schema_sql(37))
             .unwrap();
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(45)");
+        assert_eq!(scalar(version), "Integer(46)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         assert_eq!(
@@ -25206,13 +25365,13 @@ mod interruption_tests {
             .unwrap();
         assert_eq!(scalar(version), "Integer(38)");
         drop(Store::open_service(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(45)");
+        assert_eq!(scalar(version), "Integer(46)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         // An ordinary open of the current schema reopens it without migrating;
         // only a newer schema is refused as unknown.
         drop(Store::open(&database).unwrap());
-        assert_eq!(scalar(version), "Integer(45)");
+        assert_eq!(scalar(version), "Integer(46)");
         assert_eq!(scalar(history), expected_history);
         assert_eq!(scalar(schema), current_schema);
         let future_version = CURRENT_SCHEMA_VERSION + 1;
@@ -26023,7 +26182,7 @@ mod interruption_tests {
             1
         );
         drop(store);
-        assert_eq!(scalar("PRAGMA user_version"), "Integer(45)");
+        assert_eq!(scalar("PRAGMA user_version"), "Integer(46)");
         assert_eq!(scalar(SCHEMA_38_SESSION_ROWS), sessions);
         assert_eq!(scalar(references), "Text(\"1:1:1\")");
         assert_eq!(
@@ -27772,6 +27931,333 @@ mod attention_observation_tests {
     }
 
     #[test]
+    fn comparison_timing_atomic_boundaries_replay_conflict_and_backup() {
+        let session = ObservedSession::new("comparison-boundaries");
+        session.execute("UPDATE sessions SET status='launch_reserved',launch_state='spawning',process_identity_json=NULL;
+            UPDATE role_generations SET status='launch_reserved';
+            CREATE TEMP TRIGGER refuse_timing_start BEFORE INSERT ON workflow_execution_boundaries
+            BEGIN SELECT RAISE(ABORT,'timing write refused'); END;");
+        assert!(session
+            .store
+            .update_session_running("s", "e", PROCESS)
+            .is_err());
+        assert_eq!(
+            session.scalar::<String>("SELECT status FROM sessions WHERE id='s'"),
+            "launch_reserved"
+        );
+        assert_eq!(
+            session.scalar::<i64>("SELECT COUNT(*) FROM workflow_execution_boundaries"),
+            0
+        );
+        session.execute("DROP TRIGGER refuse_timing_start");
+        session
+            .store
+            .update_session_running("s", "e", PROCESS)
+            .unwrap();
+        let applied = read_state_revision(&session.store.lock().unwrap()).unwrap();
+        {
+            let mut connection = session.store.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            record_execution_boundary_in(
+                &transaction,
+                "s",
+                "e",
+                PROCESS,
+                ExecutionBoundaryKind::Started,
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        assert_eq!(
+            read_state_revision(&session.store.lock().unwrap()).unwrap(),
+            applied
+        );
+        let exit = r#"{"observed_at":"2026-01-01T00:01:00Z","process_group_quiescent":true}"#;
+        session.execute(
+            "CREATE TEMP TRIGGER refuse_timing_end BEFORE INSERT ON workflow_execution_boundaries
+            WHEN NEW.kind='ended' BEGIN SELECT RAISE(ABORT,'timing end refused'); END;",
+        );
+        assert!(session
+            .store
+            .update_session_observed_exit("s", "e", PROCESS, exit)
+            .is_err());
+        assert_eq!(
+            session.scalar::<String>("SELECT status FROM sessions WHERE id='s'"),
+            "running"
+        );
+        assert_eq!(
+            session.scalar::<i64>("SELECT COUNT(*) FROM workflow_execution_boundaries"),
+            1
+        );
+        session.execute("DROP TRIGGER refuse_timing_end");
+        assert!(session
+            .store
+            .update_session_observed_exit("s", "e", PROCESS, exit)
+            .unwrap());
+        assert!(!session
+            .store
+            .update_session_observed_exit("s", "e", PROCESS, exit)
+            .unwrap());
+        let timing = crate::comparisons::task_timing(&session.store, "t").unwrap();
+        assert_eq!(
+            timing.runs[0].complete_observed_interval_millis,
+            Some(60_000)
+        );
+        assert_eq!(timing.state, crate::domain::ComparisonTimingState::Ongoing);
+        assert_ne!(timing.state_revision, applied);
+        let before_conflict = timing.state_revision;
+        {
+            let mut connection = session.store.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            for _ in 0..2 {
+                record_execution_boundary_in(
+                    &transaction,
+                    "s",
+                    "e",
+                    PROCESS,
+                    ExecutionBoundaryKind::Ended,
+                    "2026-01-01T00:02:00Z",
+                )
+                .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        assert_eq!(
+            session.scalar::<i64>("SELECT COUNT(*) FROM workflow_execution_boundary_conflicts"),
+            1
+        );
+        assert_eq!(
+            session.scalar::<String>(
+                "SELECT observed_at FROM workflow_execution_boundaries WHERE kind='ended'"
+            ),
+            "2026-01-01T00:01:00Z"
+        );
+        let invalid = crate::comparisons::task_timing(&session.store, "t").unwrap();
+        assert!(invalid.state_revision > before_conflict);
+        assert_eq!(invalid.runs[0].complete_observed_interval_millis, None);
+        assert_eq!(invalid.runs[0].missing_epochs, 1);
+        let mut copied = Connection::open_in_memory().unwrap();
+        {
+            let connection = session.store.lock().unwrap();
+            let backup = rusqlite::backup::Backup::new(&connection, &mut copied).unwrap();
+            assert!(matches!(
+                backup.step(-1).unwrap(),
+                rusqlite::backup::StepResult::Done
+            ));
+        }
+        assert_eq!(
+            copied
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_execution_boundaries",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            copied
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_execution_boundary_conflicts",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            copied
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            46
+        );
+    }
+
+    #[test]
+    fn comparison_timing_missing_earlier_epoch_prevents_accepted_elapsed_sample() {
+        let session = ObservedSession::new("comparison-epochs");
+        {
+            let mut connection = session.store.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            record_execution_boundary_in(
+                &transaction,
+                "s",
+                "e",
+                PROCESS,
+                ExecutionBoundaryKind::Started,
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        assert!(session
+            .store
+            .update_session_observed_exit(
+                "s",
+                "e",
+                PROCESS,
+                r#"{"observed_at":"2026-01-01T00:01:00Z","process_group_quiescent":true}"#
+            )
+            .unwrap());
+        session.execute(
+            "UPDATE tasks SET lifecycle='done';
+            UPDATE attempts SET status='done',human_acceptance_at='2026-01-01T00:02:00Z';",
+        );
+        let complete = crate::comparisons::task_timing(&session.store, "t").unwrap();
+        assert_eq!(complete.elapsed_to_acceptance_millis, Some(120_000));
+        assert!(complete.first_start_coverage_complete);
+        session.execute("UPDATE sessions SET resume_count=1;
+            INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,prior_transcript_epoch,
+                launch_config_json,capability_key,capability_identity_json,state,process_identity_json,created_at,updated_at)
+            SELECT 'resume','s',1,'e','earlier','{}','key','{}','exited',process_identity_json,created_at,updated_at
+              FROM sessions WHERE id='s';");
+        let partial = crate::comparisons::task_timing(&session.store, "t").unwrap();
+        assert_eq!(
+            partial.state,
+            crate::domain::ComparisonTimingState::Unavailable
+        );
+        assert_eq!(partial.elapsed_to_acceptance_millis, None);
+        assert_eq!(
+            partial.human_acceptance_at.as_deref(),
+            Some("2026-01-01T00:02:00Z")
+        );
+        assert!(!partial.first_start_coverage_complete);
+        assert_eq!(partial.runs[0].complete_observed_interval_millis, None);
+        assert_eq!(partial.runs[0].known_partial_interval_millis, Some(60_000));
+        assert_eq!(
+            (
+                partial.runs[0].complete_epochs,
+                partial.runs[0].missing_epochs
+            ),
+            (1, 1)
+        );
+        assert!(partial.runs[0].invocations.iter().any(|invocation| {
+            invocation.transcript_epoch.as_deref() == Some("earlier")
+                && invocation.start_boundary_id.is_none()
+        }));
+        session.execute("UPDATE resume_invocations SET prior_transcript_epoch=NULL;");
+        let missing_history = crate::comparisons::task_timing(&session.store, "t").unwrap();
+        assert!(missing_history.runs[0]
+            .invocations
+            .iter()
+            .any(|invocation| {
+                invocation.transcript_epoch.is_none()
+                    && invocation.unavailable_reason.as_deref()
+                        == Some("incomplete_invocation_history")
+            }));
+        session.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at)
+            VALUES('old-run','t','old-context','implementation','base',1,'failed','2025-12-31T00:00:00Z','2025-12-31T00:00:00Z');
+            INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+            VALUES('old-generation','old-run','implementer','claude',1,1,'exited','old-authority','2025-12-31T00:00:00Z','2025-12-31T00:00:00Z');
+            INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+            VALUES('old-session','old-generation','claude','exited','{}','fixture','old-epoch','2025-12-31T00:00:00Z','2025-12-31T00:00:00Z');");
+        let historical = crate::comparisons::task_timing(&session.store, "t").unwrap();
+        assert_eq!(historical.runs.len(), 2);
+        assert_eq!(historical.runs[0].attempt_id, "old-run");
+        assert_eq!(historical.runs[0].invocations[0].session_id, "old-session");
+        assert_eq!(historical.elapsed_to_acceptance_millis, None);
+    }
+
+    #[test]
+    fn comparison_timing_ongoing_absence_and_invalid_intervals_never_become_zero() {
+        let session = ObservedSession::new("comparison-missing-end");
+        {
+            let mut connection = session.store.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            record_execution_boundary_in(
+                &transaction,
+                "s",
+                "e",
+                PROCESS,
+                ExecutionBoundaryKind::Started,
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        let ongoing = crate::comparisons::task_timing(&session.store, "t").unwrap();
+        assert_eq!(ongoing.runs[0].ongoing_epochs, 1);
+        assert_eq!(ongoing.runs[0].known_partial_interval_millis, None);
+        assert!(session.store.update_session_exit("s", "e", PROCESS,
+            r#"{"observed_at":"2026-01-01T00:01:00Z","process_group_quiescent":true,"source":"absence_only"}"#).unwrap());
+        assert_eq!(
+            session.scalar::<i64>(
+                "SELECT COUNT(*) FROM workflow_execution_boundaries WHERE kind='ended'"
+            ),
+            0
+        );
+        let absent = crate::comparisons::task_timing(&session.store, "t").unwrap();
+        assert_eq!(absent.runs[0].missing_epochs, 1);
+        assert_eq!(absent.runs[0].complete_observed_interval_millis, None);
+        for end in ["2025-12-31T23:59:59Z", "not-a-timestamp"] {
+            let mut connection = session.store.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            record_execution_boundary_in(
+                &transaction,
+                "s",
+                "e",
+                PROCESS,
+                ExecutionBoundaryKind::Ended,
+                end,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+            drop(connection);
+            let invalid = crate::comparisons::task_timing(&session.store, "t").unwrap();
+            assert_eq!(invalid.runs[0].complete_observed_interval_millis, None);
+            assert_eq!(invalid.runs[0].known_partial_interval_millis, None);
+        }
+        let copied_path = session.root.join("timing-restore.sqlite3");
+        {
+            let mut copy = Connection::open(&copied_path).unwrap();
+            let source = session.store.lock().unwrap();
+            let backup = rusqlite::backup::Backup::new(&source, &mut copy).unwrap();
+            assert!(matches!(
+                backup.step(-1).unwrap(),
+                rusqlite::backup::StepResult::Done
+            ));
+        }
+        let restored = Store::open_current_readonly(&copied_path).unwrap();
+        assert_eq!(
+            crate::comparisons::task_timing(&restored, "t")
+                .unwrap()
+                .runs[0]
+                .complete_observed_interval_millis,
+            None
+        );
+        for (end, expected) in [("not-a-timestamp", None), ("2026-01-01T00:00:00Z", Some(0))] {
+            let isolated = ObservedSession::new("comparison-interval-value");
+            {
+                let mut connection = isolated.store.lock().unwrap();
+                let transaction = connection.transaction().unwrap();
+                record_execution_boundary_in(
+                    &transaction,
+                    "s",
+                    "e",
+                    PROCESS,
+                    ExecutionBoundaryKind::Started,
+                    "2026-01-01T00:00:00Z",
+                )
+                .unwrap();
+                transaction.commit().unwrap();
+            }
+            isolated
+                .store
+                .update_session_observed_exit(
+                    "s",
+                    "e",
+                    PROCESS,
+                    &serde_json::json!({"observed_at":end,"process_group_quiescent":true})
+                        .to_string(),
+                )
+                .unwrap();
+            let value = crate::comparisons::task_timing(&isolated.store, "t").unwrap();
+            assert_eq!(value.runs[0].complete_observed_interval_millis, expected);
+        }
+    }
+
+    #[test]
     fn report_reminder_requirements_follow_each_role_and_admitted_report() {
         use crate::workflow::ReportRequirement;
 
@@ -28957,7 +29443,7 @@ mod attention_observation_tests {
         let rows: String = session.scalar(OLD_ROWS);
         let revision = session.revision();
         let reopened = Store::open(&session.root.join("state.sqlite3")).unwrap();
-        assert_eq!(session.scalar::<i64>("PRAGMA user_version"), 45);
+        assert_eq!(session.scalar::<i64>("PRAGMA user_version"), 46);
         assert_eq!(session.scalar::<String>(OLD_ROWS), rows);
         assert_eq!(session.revision(), revision);
         let connection = reopened.lock().unwrap();

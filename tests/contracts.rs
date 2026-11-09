@@ -5076,7 +5076,8 @@ fn start_synthetic_setup_resume(
     let process = serde_json::json!({
         "pid": 41,
         "process_group_id": 41,
-        "native_start_marker": format!("synthetic-setup-{setup}-{role_name}")
+        "native_start_marker": format!("synthetic-setup-{setup}-{role_name}"),
+        "observed_started_at": "2026-01-01T00:00:00Z"
     })
     .to_string();
     start_session(
@@ -17864,7 +17865,14 @@ fn trip_disjoint_lanes_keep_independent_credentials_and_require_quiescence() {
             &launch_context.session_id,
             &launch_context.transcript_epoch,
             &format!("{lane}-boot"),
-            &serde_json::json!({"fixture":"lane","lane":lane}).to_string(),
+            &serde_json::json!({
+                "fixture":"lane","lane":lane,
+                "pid":if lane == "lane_a" { 4242 } else { 4243 },
+                "process_group_id":if lane == "lane_a" { 4242 } else { 4243 },
+                "native_start_marker":format!("synthetic-{lane}"),
+                "observed_started_at":"2026-01-01T00:00:00Z"
+            })
+            .to_string(),
         );
         let context = fixture.store.role_context(&launch_context.token).unwrap();
         let sources: serde_json::Value = fixture
@@ -19640,7 +19648,13 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         &manager_launch.session_id,
         &manager_launch.transcript_epoch,
         "independent-manager-boot",
-        &serde_json::json!({"fixture":"independent-manager"}).to_string(),
+        &serde_json::json!({
+            "fixture":"independent-manager",
+            "pid":4242,"process_group_id":4242,
+            "native_start_marker":"synthetic-independent-manager",
+            "observed_started_at":"2026-01-01T00:00:00Z"
+        })
+        .to_string(),
     );
     let independent_manager = independent
         .store
@@ -26387,7 +26401,13 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         )
         .unwrap();
     assert_eq!(latest, "later");
-    let validation_process = serde_json::json!({"fixture":"reviewer-validation"}).to_string();
+    let validation_process = serde_json::json!({
+        "fixture":"reviewer-validation",
+        "pid":4242,"process_group_id":4242,
+        "native_start_marker":"synthetic-reviewer-validation",
+        "observed_started_at":"2026-01-01T00:00:00Z"
+    })
+    .to_string();
     reopened
         .mark_session_spawning(
             &captured.session_id,
@@ -26530,7 +26550,13 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         .store
         .mark_switch_dispatched(&first_intent, &first_replacement.role_generation_id)
         .unwrap();
-    let first_process = serde_json::json!({"fixture":"manager-lineage-first"}).to_string();
+    let first_process = serde_json::json!({
+        "fixture":"manager-lineage-first",
+        "pid":4242,"process_group_id":4242,
+        "native_start_marker":"synthetic-manager-lineage-first",
+        "observed_started_at":"2026-01-01T00:00:00Z"
+    })
+    .to_string();
     start_session(
         &inherited,
         &first_replacement.session_id,
@@ -26608,7 +26634,13 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         .unwrap();
     inherited.assert_scalar::<String>(&format!("SELECT activation_id FROM trip_attempt_profiles WHERE attempt_id='{owner_attempt}' AND role='manager'", owner_attempt = inherited_plan.attempt_id), initial_activation.0.clone());
     inherited.assert_scalar::<String>(&format!("SELECT capability_proof_hash FROM trip_attempt_profiles WHERE attempt_id='{owner_attempt}' AND role='manager'", owner_attempt = inherited_plan.attempt_id), initial_activation.1.clone());
-    let current_process = serde_json::json!({"fixture":"manager-lineage"}).to_string();
+    let current_process = serde_json::json!({
+        "fixture":"manager-lineage",
+        "pid":4243,"process_group_id":4243,
+        "native_start_marker":"synthetic-manager-lineage",
+        "observed_started_at":"2026-01-01T00:00:01Z"
+    })
+    .to_string();
     start_session(
         &inherited,
         &replacement.session_id,
@@ -26738,7 +26770,13 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
             "manager-validation-request",
         )
         .unwrap();
-    let manager_process = serde_json::json!({"fixture":true}).to_string();
+    let manager_process = serde_json::json!({
+        "fixture":true,
+        "pid":4242,"process_group_id":4242,
+        "native_start_marker":"synthetic-manager-validation",
+        "observed_started_at":"2026-01-01T00:00:00Z"
+    })
+    .to_string();
     start_session(
         &manager_fixture,
         &manager_context.session_id,
@@ -26902,7 +26940,13 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         .store
         .mark_switch_dispatched(&writer_intent, &writer_context.role_generation_id)
         .unwrap();
-    let writer_process = serde_json::json!({"fixture":"writer"}).to_string();
+    let writer_process = serde_json::json!({
+        "fixture":"writer",
+        "pid":4242,"process_group_id":4242,
+        "native_start_marker":"synthetic-writer-validation",
+        "observed_started_at":"2026-01-01T00:00:00Z"
+    })
+    .to_string();
     start_session(
         &writer_fixture,
         &writer_context.session_id,
@@ -43731,6 +43775,11 @@ fn single_agent_review_exact_quiescence_repair_restart_recheck_and_delivery_cap(
 
 #[test]
 fn single_agent_selected_checks_run_only_under_exact_human_authorization() {
+    use agenticjira::domain::{
+        ComparisonCheckState, ComparisonCohort, ComparisonEvidenceFact, ComparisonEvidenceMetric,
+        ComparisonEvidenceQuery, WorkflowComparisonQuery,
+    };
+
     let (fixture, repository) = single_agent_fixture("single-agent-checks");
     let setup = admitted_single_agent_project_with(
         &fixture,
@@ -43881,6 +43930,63 @@ fn single_agent_selected_checks_run_only_under_exact_human_authorization() {
         accepted_run.checks[0].latest_run_id.as_deref(),
         Some(finished["result"]["check_id"].as_str().unwrap())
     );
+    let assert_accepted_comparison = || {
+        let selection = WorkflowComparisonQuery {
+            cohort: ComparisonCohort::Run,
+            project_id: Some(setup.project_id.clone()),
+            workflow: Some("single_agent".into()),
+            ..Default::default()
+        };
+        let page = agenticjira::comparisons::workflow_comparisons(
+            &fixture.store,
+            selection.clone(),
+            "accepted-check-contract",
+        )
+        .unwrap();
+        // Admission leaves its probe run in this project alongside the checked run.
+        assert_eq!(page.total_selected_units, 2);
+        assert_eq!(page.groups.len(), 1);
+        let group = &page.groups[0];
+        assert_eq!(group.counts.accepted, 1);
+        assert_eq!(group.counts.selected_checks, 1);
+        assert_eq!(group.counts.checks_passed, 1);
+        assert_eq!(group.counts.checks_failed, 0);
+        assert_eq!(group.counts.checks_stale, 0);
+        assert_eq!(group.counts.unknown_check_matrices, 0);
+        let evidence = agenticjira::comparisons::comparison_evidence(
+            &fixture.store,
+            ComparisonEvidenceQuery {
+                selection: serde_json::to_string(&selection).unwrap(),
+                snapshot: page.snapshot.clone(),
+                group: group.key.clone(),
+                metric: ComparisonEvidenceMetric::Check,
+                cursor: None,
+            },
+            "accepted-check-contract",
+        )
+        .unwrap();
+        let selected: Vec<_> = evidence
+            .rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    &row.fact,
+                    ComparisonEvidenceFact::Check { selected: true, .. }
+                )
+            })
+            .collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].attempt_id.as_deref(),
+            Some(context.attempt_id.as_str())
+        );
+        assert!(matches!(&selected[0].fact, ComparisonEvidenceFact::Check {
+            check_id: id, receipt_id: Some(receipt), state: ComparisonCheckState::Passed,
+            candidate_hash: Some(hash), ..
+        } if id == &check_id && receipt == finished["result"]["check_id"].as_str().unwrap()
+            && hash == &candidate));
+    };
+    assert_accepted_comparison();
     assert!(app
         .checks
         .run_single_agent_check(&context.attempt_id, &check_id)
@@ -43937,6 +44043,25 @@ fn single_agent_selected_checks_run_only_under_exact_human_authorization() {
         "SELECT json_array_length(check_receipts_json,'$.check_runs') FROM workflow_result_acceptances",
         1_i64,
     );
+    fixture.execute(
+        "INSERT INTO check_runs(id,attempt_id,candidate_hash,executable,arguments_json,cwd,status,
+            exit_code,check_id,selected_check_revision,inputs_hash,freshness_state,launch_state,created_at)
+         SELECT 'later-unaccepted-rerun',attempt_id,candidate_hash,executable,arguments_json,cwd,'finished',
+            1,check_id,selected_check_revision,inputs_hash,'failed','finished','9999-01-01T00:00:00Z'
+         FROM check_runs WHERE id=?1",
+        params![finished["result"]["check_id"].as_str().unwrap()],
+    );
+    fixture.execute(
+        "INSERT INTO workflow_check_selections(attempt_id,revision,check_id,selected_by,created_at)
+         SELECT attempt_id,revision+1,check_id,selected_by,'9999-01-01T00:00:00Z'
+         FROM workflow_check_selections WHERE attempt_id=?1",
+        params![context.attempt_id],
+    );
+    fixture.execute(
+        "UPDATE attempts SET selected_checks_revision=(SELECT MAX(revision) FROM workflow_check_selections WHERE attempt_id=?1) WHERE id=?1",
+        params![context.attempt_id],
+    );
+    assert_accepted_comparison();
     assert!(!single_agent_run(&fixture, &task_id).integration_recorded);
     assert!(!workflow::state(&fixture.store)
         .unwrap()
@@ -48637,7 +48762,7 @@ fn mb14_stale_exit_cannot_mutate_reserved_or_running_replacement_generation() {
 }
 
 /// Tables read directly or through helper decisions by `workflow::state`.
-const STATE_PROJECTED_TABLES: [&str; 96] = [
+const STATE_PROJECTED_TABLES: [&str; 98] = [
     "single_agent_admission_challenges",
     "single_agent_review_budgets",
     "single_agent_review_deliveries",
@@ -48729,6 +48854,8 @@ const STATE_PROJECTED_TABLES: [&str; 96] = [
     "workflow_check_authorizations",
     "workflow_check_selections",
     "workflow_definitions",
+    "workflow_execution_boundaries",
+    "workflow_execution_boundary_conflicts",
     "workflow_result_acceptances",
     "workflow_result_bindings",
     "workflow_run_bindings",
@@ -49105,6 +49232,8 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .flat_map(|table| {
             let table = match *table {
                 "codex_usage_observations" => "codex_usage",
+                "workflow_execution_boundaries" => "execution_boundary",
+                "workflow_execution_boundary_conflicts" => "execution_boundary_conflict",
                 table => table,
             };
             ["insert", "update", "delete"].map(|event| format!("state_revision_{table}_{event}"))
@@ -49156,7 +49285,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 45_i64);
+    fixture.assert_scalar("PRAGMA user_version", 46_i64);
     let migrated_triggers = connection
         .prepare(
             "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%' ORDER BY name",
@@ -49197,7 +49326,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 45_i64);
+    fixture.assert_scalar("PRAGMA user_version", 46_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -57781,7 +57910,7 @@ fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordina
 #[test]
 fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
-    fixture.assert_scalar("PRAGMA user_version", 45_i64);
+    fixture.assert_scalar("PRAGMA user_version", 46_i64);
     let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
     fixture.execute_batch(&format!(
         "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; PRAGMA user_version=30;"
@@ -57789,7 +57918,7 @@ fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     restore_schema_30_recipe_tables(&fixture);
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 45_i64);
+    fixture.assert_scalar("PRAGMA user_version", 46_i64);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
@@ -58568,8 +58697,10 @@ fn stale_restart_candidate_cancellation_refuses_live_sessions_and_pending_admiss
 const MIGRATION_031_SQL: &str = include_str!("../migrations/031_final_repair_recheck.sql");
 /// Drops post-32 tables and undoes the sessions owner rebuilds (including the
 /// conversation column, its index and cursor triggers). Callers retaining
-/// recipes also restore their schema-30 shape before upgrading through 045.
+/// recipes also restore their schema-30 shape before upgrading through 046.
 const DROP_AFTER_SCHEMA_32: &str = "PRAGMA foreign_keys=OFF;
+     DROP TABLE workflow_execution_boundary_conflicts;
+     DROP TABLE workflow_execution_boundaries;
      DROP TRIGGER task_conversation_source_task_delete;
      DROP TABLE task_conversation_sources;
      DROP TRIGGER claims_conversation_admission;
@@ -58796,7 +58927,7 @@ fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
     fixture.assert_scalar("PRAGMA user_version", 31_i64);
 
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 45_i64);
+    fixture.assert_scalar("PRAGMA user_version", 46_i64);
     assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(

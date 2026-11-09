@@ -34,6 +34,10 @@ import type {
   TranscriptPage,
   UsageComparisonFilters,
   UsageComparisonPage,
+  WorkflowComparisonQuery,
+  WorkflowComparisonPage,
+  ComparisonEvidenceQuery,
+  ComparisonEvidencePage,
   GuidanceReauthorizationPreview,
 } from "./types";
 import { ROLES } from "./types";
@@ -1592,4 +1596,29 @@ export function usageComparisons(filters: UsageComparisonFilters, cursor?: strin
   for (const [key, value] of Object.entries(filters)) if (value) params.set(key, value);
   if (cursor) params.set("cursor", cursor);
   return json<UsageComparisonPage>(`/api/history/usage?${params}`, { signal }, transportTimeouts.read, ["history_insights_v1"]);
+}
+
+async function requireWorkflowComparisons(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw new DOMException("Request cancelled", "AbortError");
+  const descriptor = await negotiate();
+  if (signal?.aborted) throw new DOMException("Request cancelled", "AbortError");
+  if (!descriptor.supported_features.includes("workflow_comparisons_v1")) {
+    throw new ProtocolError(`This service version does not support workflow comparisons. ${PROTOCOL_GUIDANCE}`, "missing_required_feature");
+  }
+}
+
+export async function workflowComparisons(selection: WorkflowComparisonQuery, signal?: AbortSignal): Promise<WorkflowComparisonPage> {
+  await requireWorkflowComparisons(signal);
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(selection)) {
+    if (value !== undefined && value !== null && value !== "") params.set(key, value);
+  }
+  return json<WorkflowComparisonPage>(`/api/history/comparisons?${params}`, { signal }, transportTimeouts.read, ["workflow_comparisons_v1"]);
+}
+
+export async function comparisonEvidence(query: ComparisonEvidenceQuery, signal?: AbortSignal): Promise<ComparisonEvidencePage> {
+  await requireWorkflowComparisons(signal);
+  const params = new URLSearchParams({ selection: query.selection, snapshot: query.snapshot, group: query.group, metric: query.metric });
+  if (query.cursor) params.set("cursor", query.cursor);
+  return json<ComparisonEvidencePage>(`/api/history/comparisons/evidence?${params}`, { signal }, transportTimeouts.read, ["workflow_comparisons_v1"]);
 }

@@ -735,17 +735,19 @@ export type ProviderFailureHoldRelease =
   | "already_released"
   | "expired"
   | "superseded";
+export interface ObservedUsageCounters {
+  input_tokens: number;
+  cached_input_tokens: number;
+  cache_write_input_tokens: number | null;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+}
+
 export interface ObservedUsage {
   status: "observed" | "unavailable" | "invalid";
   partial: boolean;
-  counters: {
-    input_tokens: number;
-    cached_input_tokens: number;
-    cache_write_input_tokens: number | null;
-    output_tokens: number;
-    reasoning_output_tokens: number;
-    total_tokens: number;
-  } | null;
+  counters: ObservedUsageCounters | null;
   observed_responses: number | null;
   source: string;
   last_observed_at: string | null;
@@ -2407,4 +2409,310 @@ export interface UsageComparisonGroup {
 export interface UsageComparisonPage {
   groups: UsageComparisonGroup[];
   next_cursor: string | null;
+}
+
+
+export type ComparisonCohort = "task" | "run";
+
+export type ComparisonDimension = "project" | "workflow" | "preset" | "provider" | "model" | "effort" | "profile_revision" | "adapter";
+
+export interface WorkflowComparisonQuery {
+  cohort: ComparisonCohort;
+  group_by: ComparisonDimension;
+  project_id?: string | null;
+  workflow?: string | null;
+  preset?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  profile_revision?: string | null;
+  adapter_id?: string | null;
+  adapter_hash?: string | null;
+  start_date?: string | null;
+  end_date?: string | null;
+  cursor?: string | null;
+}
+
+export type ComparisonAttributionState = "known" | "mixed" | "incomplete" | "unavailable";
+
+export interface ComparisonAttribution {
+  state: ComparisonAttributionState;
+  values: string[];
+}
+
+export interface ComparisonExecutionIdentity {
+  provider: string | null;
+  model: string | null;
+  effort: string | null;
+  profile_revision: string | null;
+  profile_hash: string | null;
+  settings_revision: number | null;
+  adapter_id: string | null;
+  adapter_hash: string | null;
+  executable_version: string | null;
+  compatibility_revision: string | null;
+}
+
+export interface ComparisonDurationSummary {
+  sum_millis: number | null;
+  mean_millis: number | null;
+  complete_samples: number;
+  unavailable_samples: number;
+  ongoing_samples: number;
+}
+
+export interface ComparisonCounts {
+  units: number;
+  accepted: number;
+  cancelled: number;
+  failed: number;
+  incomplete: number;
+  human_changes: number;
+  provider_verdicts: number;
+  provider_negative_verdicts: number;
+  repairs_authorized: number;
+  repairs_started: number;
+  repair_classification_unavailable: number;
+  human_classification_unavailable: number;
+  provider_classification_unavailable: number;
+  infrastructure_recoveries: number;
+  complete_execution_epochs: number;
+  missing_execution_epochs: number;
+  ongoing_execution_epochs: number;
+  never_executed_epochs: number;
+  selected_checks: number;
+  unknown_check_matrices: number;
+  checks_passed: number;
+  checks_failed: number;
+  checks_running: number;
+  checks_not_run: number;
+  checks_stale: number;
+  checks_unavailable: number;
+  matching_sessions: number;
+  sessions_with_usage: number;
+  sessions_without_usage: number;
+}
+
+export interface WorkflowComparisonGroup {
+  key: string;
+  attribution: ComparisonAttribution;
+  counts: ComparisonCounts;
+  elapsed_to_acceptance: ComparisonDurationSummary;
+  observed_execution_intervals: ComparisonDurationSummary;
+  known_partial_execution_intervals: ComparisonDurationSummary;
+  recorded_recovery_waits: ComparisonDurationSummary;
+  check_execution: ComparisonDurationSummary;
+  usage: ObservedUsage;
+}
+
+export interface WorkflowComparisonPage {
+  groups: WorkflowComparisonGroup[];
+  selection: WorkflowComparisonQuery;
+  total_selected_units: number;
+  displayed_group_units: number;
+  cohort: ComparisonCohort;
+  date_basis: string;
+  outcome_scope: string;
+  usage_scope: string;
+  timing_scope: string;
+  wait_scope: string;
+  snapshot: string;
+  next_cursor: string | null;
+}
+
+export type ComparisonEvidenceMetric = "all" | "outcome" | "execution" | "usage" | "human_change" | "provider_verdict" | "repair" | "recovery" | "check" | "timing";
+
+export interface ComparisonEvidenceQuery {
+  selection: string;
+  snapshot: string;
+  group: string;
+  metric: ComparisonEvidenceMetric;
+  cursor?: string | null;
+}
+
+export type ComparisonCheckState = "passed" | "failed" | "running" | "not_run" | "stale" | "unavailable";
+
+export type ComparisonEvidenceFact =
+  | {
+    kind: "outcome";
+    lifecycle: string;
+    run_status: string | null;
+    archived: boolean;
+    human_acceptance_at: string | null;
+    outcome: string;
+  }
+  | {
+    kind: "execution";
+    role_generation_id: string;
+    session_id: string;
+    transcript_epoch: string;
+    identity: ComparisonExecutionIdentity;
+    matching: boolean;
+    usage: ObservedUsage;
+  }
+  | {
+    kind: "usage_observation";
+    provider: string;
+    native_thread_id: string;
+    native_turn_id: string;
+    response_id: string;
+    session_id: string;
+    transcript_epoch: string;
+    role_generation_id: string;
+    accepted_hook_event_id: string;
+    invalid: boolean;
+    received_at: string;
+    counters: ObservedUsageCounters;
+    owner_task_id: string;
+    owner_attempt_id: string;
+    source_version: string;
+    contract_revision: string;
+  }
+  | {
+    kind: "classification_unavailable";
+    metric: ComparisonEvidenceMetric;
+    reason: string;
+  }
+  | {
+    kind: "human_change";
+    decision_id: string;
+    child_attempt_id: string | null;
+  }
+  | {
+    kind: "provider_verdict";
+    decision_id: string;
+    result_id: string | null;
+    verdict: string;
+  }
+  | {
+    kind: "repair";
+    authorization_id: string;
+    originating_decision_id: string;
+    started_session_id: string | null;
+    classification_reason: string | null;
+  }
+  | {
+    kind: "recovery";
+    recovery_id: string;
+    session_id: string | null;
+    state: string;
+    reason: string | null;
+    created_at: string;
+    resolved_at: string | null;
+    elapsed_millis: number | null;
+    ongoing: boolean;
+  }
+  | {
+    kind: "check";
+    check_id: string;
+    selection_revision: number;
+    receipt_id: string | null;
+    state: ComparisonCheckState;
+    candidate_hash: string | null;
+    inputs_hash: string | null;
+    elapsed_millis: number | null;
+    selected: boolean;
+    reason: string | null;
+    recorded_status: string | null;
+    freshness_state: string | null;
+    launch_state: string | null;
+    exit_code: number | null;
+  }
+  | {
+    kind: "unknown_check_matrix";
+    reason: string;
+  }
+  | {
+    kind: "timing";
+    invocation: ComparisonInvocationTiming;
+  }
+  | {
+    kind: "run";
+    status: string;
+    workflow: string | null;
+    preset: string | null;
+    created_at: string;
+    human_acceptance_at: string | null;
+    candidate_hash: string | null;
+    selection_revision: number;
+  }
+  | {
+    kind: "boundary";
+    boundary_id: string;
+    session_id: string;
+    transcript_epoch: string;
+    process_identity_hash: string;
+    boundary_kind: string;
+    observed_at: string;
+  }
+  | {
+    kind: "boundary_conflict";
+    boundary_id: string;
+    fact_hash: string;
+    observed_at: string;
+  }
+  | {
+    kind: "task_timing";
+    state: ComparisonTimingState;
+    elapsed_millis: number | null;
+    first_start_coverage_complete: boolean;
+    reason: string | null;
+  };
+
+export interface ComparisonEvidenceRow {
+  key: string;
+  unit_id: string;
+  task_id: string;
+  attempt_id: string | null;
+  source: HistoricalSourceKey | null;
+  fact: ComparisonEvidenceFact;
+  truncated: boolean;
+}
+
+export interface ComparisonEvidencePage {
+  rows: ComparisonEvidenceRow[];
+  total_rows: number;
+  snapshot: string;
+  next_cursor: string | null;
+}
+
+export type ComparisonTimingState = "complete" | "ongoing" | "unavailable" | "never_executed";
+
+export interface ComparisonInvocationTiming {
+  evidence_basis: string | null;
+  session_id: string;
+  role_generation_id: string;
+  transcript_epoch: string | null;
+  process_identity_hash: string | null;
+  start_boundary_id: string | null;
+  end_boundary_id: string | null;
+  observed_start: string | null;
+  observed_end: string | null;
+  elapsed_millis: number | null;
+  state: ComparisonTimingState;
+  unavailable_reason: string | null;
+}
+
+export interface ComparisonRunTiming {
+  attempt_id: string;
+  complete_observed_interval_millis: number | null;
+  known_partial_interval_millis: number | null;
+  complete_epochs: number;
+  missing_epochs: number;
+  ongoing_epochs: number;
+  never_executed_epochs: number;
+  first_start_coverage_complete: boolean;
+  invocations: ComparisonInvocationTiming[];
+}
+
+export interface ComparisonTaskTiming {
+  task_id: string;
+  state_revision: number;
+  state: ComparisonTimingState;
+  earliest_known_observed_start: string | null;
+  first_start_coverage_complete: boolean;
+  human_acceptance_at: string | null;
+  elapsed_to_acceptance_millis: number | null;
+  unavailable_reason: string | null;
+  runs: ComparisonRunTiming[];
 }

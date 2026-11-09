@@ -1192,7 +1192,7 @@ recent-history window. Cached input is included in input; reasoning is included
 in output. Neither is added again to the provider-reported total. An explicitly
 observed zero is zero; an absent cache-write count is unavailable.
 
-**History → Observed usage** compares projects, workflow families or roles.
+**History → Observed usage and comparisons → Session usage** compares projects, workflow families or roles.
 Choose filters and select **Apply**. **Sessions started (UTC)** selects sessions
 by their saved start date, including both selected endpoint dates; the values
 include those sessions' lifetime observations, even responses observed later.
@@ -1392,3 +1392,53 @@ The browser saves each conversation mutation’s exact request and operation ide
 Promoted tasks retain immutable conversation source bundles in the state database and backups. Task edits and later conversation activity cannot rewrite them. A source-linked draft cannot be deleted; archive it when available. Restoring a backup preserves these reference bundles but never restores authority to resume a native conversation.
 
 After reconciliation proves the exact uncertain conversation is history-only and its process has exited, **Retain uncertainty and allow separate work** preserves the full original request for inspection and releases only its browser active-request slot. This explicit action does not resolve delivery, resend input, or enable the old conversation. A separate new conversation requires a new deliberate Start. The dashboard checks fresh service evidence and retains the archived request before removing the active slot; storage failure keeps sending blocked. Serialized request limits are checked before publication, and receipt envelopes allow bounded recovery of earlier size-validation refusals. Proven wrapper-spawn nondelivery has an explicit refusal receipt; other failures remain uncertain.
+
+
+## Workflow and provider comparisons
+
+Open **History → Observed usage and comparisons**, select task or run comparisons,
+choose filters and grouping, and select **Apply**. Task cohorts use task creation;
+run cohorts use attempt creation, not execution start. Date endpoints are
+inclusive UTC days. Archived ordinary tasks and earlier runs are included;
+internal fixture projects are excluded. Never-run tasks remain visible.
+
+Filters include project, workflow, preset, provider, exact model and effort,
+profile revision, adapter ID/hash and dates. Workflow and execution filters must
+match the same run. Whole-unit outcomes keep mixed/incomplete attribution;
+matching-execution token observations have a separately labeled scope. Missing
+historical identity is not filled from today's configuration. No cost estimate
+or causal provider ranking is produced.
+
+Use **Inspect all evidence** or a metric's inspection action to read exact
+historical task/run/session, decision, check, recovery and timing facts. Source
+links read supported historical sources separately; unavailable sources do not
+replace saved facts. **Open task (current context)** opens current task state.
+Applied results retain their filters while controls are edited. Changed saved
+state or service incarnation requires **Apply again**, including before the
+first evidence read. Groups and evidence pages contain at most 50 rows within
+256 KiB; cursors are bounded to 8 KiB and long evidence reasons disclose truncation.
+
+Human acceptance requires recorded human evidence. Human changes, provider
+verdicts, authorized repairs, proven repair starts and recovery counts are
+separate, potentially overlapping metrics. Unknown historical repair linkage
+has explicit coverage. Checks reduce each run's selected matrix to its pinned
+accepted receipt or latest eligible matching receipt; earlier reruns remain
+inspectable. Empty selection, unknown selection, not run, running, stale,
+unavailable and executed failure are distinct.
+
+Timing reports observations, not exact native runtime. Start observations follow
+launch identity checks; end observations follow confirmed completion and
+quiescence. Their latency is unmeasured. Complete task elapsed-to-acceptance
+requires first-execution coverage across all contributing attempts and epochs;
+an older possible execution with missing start evidence makes that sample
+unavailable. Complete interval sums require covered endpoints for every relevant
+epoch. Known partial sums and missing/ongoing sample counts are shown separately.
+Overlapping invocation intervals are not CPU time or task elapsed time. Recovery
+waits cover only persisted recovery intervals, not all human or queue waiting.
+
+Schema 46 adds transactional execution boundaries and separate conflict facts.
+Absence-only reconciliation cannot invent an end timestamp; conflicting or
+invalid evidence is unavailable. Eligible legacy observations have a labeled
+basis; other history stays unknown. Whole-database backup/restore preserves the
+facts without manufacturing missing endpoints. Comparison evidence never grants
+process ownership, resume authority or approval.

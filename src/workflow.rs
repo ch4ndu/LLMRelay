@@ -7248,7 +7248,7 @@ fn permanent_resume_rejection_route(
 
 const NATIVE_TURN_TEXT_LIMIT: usize = 2048;
 
-fn fold_observed_usage(
+pub(crate) fn fold_observed_usage(
     usage: &mut crate::domain::ObservedUsage,
     sum: &mut Option<crate::domain::ObservedUsageCounters>,
     row: &rusqlite::Row<'_>,
@@ -14674,7 +14674,7 @@ fn single_agent_check_projection(
     Ok(checks)
 }
 
-fn accepted_single_agent_checks(
+pub(crate) fn accepted_single_agent_checks(
     connection: &Connection,
     attempt_id: &str,
     result: &crate::domain::SingleAgentResultDto,
@@ -17383,7 +17383,7 @@ struct HistoryReadCursor {
     last: Vec<String>,
 }
 
-fn history_read_position(
+pub(crate) fn history_read_position(
     cursor: Option<&str>,
     incarnation: &str,
     revision: i64,
@@ -17406,7 +17406,7 @@ fn history_read_position(
     Ok(cursor.last)
 }
 
-fn history_cursor(
+pub(crate) fn history_cursor(
     incarnation: &str,
     revision: i64,
     filters: &serde_json::Value,
@@ -17602,7 +17602,7 @@ struct UsageScopeSession {
     visible: bool,
 }
 
-fn usage_workflow_family(binding: Option<String>, identity: &str) -> String {
+pub(crate) fn usage_workflow_family(binding: Option<String>, identity: &str) -> String {
     match binding.as_deref() {
         Some("trip") => "trip",
         Some("single_agent") => "single_agent",
@@ -17618,7 +17618,7 @@ fn usage_workflow_family(binding: Option<String>, identity: &str) -> String {
     .into()
 }
 
-fn usage_date(value: Option<&str>) -> Result<Option<chrono::NaiveDate>> {
+pub(crate) fn usage_date(value: Option<&str>) -> Result<Option<chrono::NaiveDate>> {
     value
         .map(|value| {
             if value.len() != 10 {
@@ -17869,4 +17869,54 @@ pub fn usage_comparisons(
     }
     page.next_cursor = None;
     Ok(page)
+}
+
+pub(crate) fn comparison_observed_usage(
+    connection: &Connection,
+    executions: &[(String, String)],
+) -> Result<crate::domain::ObservedUsage> {
+    use crate::domain::{ObservedUsage, ObservedUsageStatus};
+    let selected = serde_json::to_string(executions)?;
+    let unresolved:bool=connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM codex_usage_observations o
+         LEFT JOIN sessions s ON s.id=o.session_id
+         LEFT JOIN role_generations g ON g.id=s.role_generation_id
+         LEFT JOIN attempts a ON a.id=g.attempt_id
+         WHERE a.task_id IS NOT o.task_id OR g.attempt_id IS NOT o.attempt_id
+           OR g.id IS NOT o.role_generation_id OR json_type(o.conflict_owners_json)!='array'
+           OR EXISTS(SELECT 1 FROM json_each(o.conflict_owners_json) owner
+               WHERE NOT EXISTS(SELECT 1 FROM sessions cs JOIN role_generations cg ON cg.id=cs.role_generation_id
+                   JOIN attempts ca ON ca.id=cg.attempt_id
+                   WHERE cs.id=json_extract(owner.value,'$.session_id')
+                     AND ca.task_id=json_extract(owner.value,'$.task_id'))))",
+        [],|row|row.get(0),
+    )?;
+    if unresolved {
+        bail!("Comparison usage is unavailable because saved response ownership cannot be resolved. Inspect the saved ownership records.");
+    }
+    let mut statement = connection.prepare(
+        "SELECT input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,
+          reasoning_output_tokens,total_tokens,(invalid OR json_array_length(conflict_owners_json)>0),received_at,source_version,contract_revision
+         FROM codex_usage_observations o
+         WHERE EXISTS(SELECT 1 FROM json_each(?1) selected
+             WHERE json_extract(selected.value,'$[0]')=o.session_id
+               AND json_extract(selected.value,'$[1]')=o.transcript_epoch)
+            OR EXISTS(SELECT 1 FROM json_each(o.conflict_owners_json) owner JOIN json_each(?1) selected
+               ON json_extract(owner.value,'$.session_id')=json_extract(selected.value,'$[0]')
+               WHERE json_extract(owner.value,'$.transcript_epoch') IS NULL
+                  OR json_extract(owner.value,'$.transcript_epoch')=json_extract(selected.value,'$[1]'))
+         ORDER BY o.rowid",
+    )?;
+    let mut rows = statement.query([selected])?;
+    let mut usage = ObservedUsage::unavailable(
+        "No supported response usage was recorded for the matching executions.",
+    );
+    let mut sum = None;
+    while let Some(row) = rows.next()? {
+        fold_observed_usage(&mut usage, &mut sum, row)?;
+    }
+    if usage.status == ObservedUsageStatus::Observed {
+        usage.counters = sum;
+    }
+    Ok(usage)
 }

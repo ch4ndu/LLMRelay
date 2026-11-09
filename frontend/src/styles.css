@@ -3348,3 +3348,17 @@ details.panel > summary,
 .conversation-source-choice small { display: block; overflow-wrap: anywhere; }
 .conversation-excerpt { display: block; white-space: pre-wrap; overflow-wrap: anywhere; margin-block: .5rem; }
 .conversation-promotion { border-top: 1px solid var(--border); margin-top: 1rem; padding-top: 1rem; }
+
+.workflow-comparisons { min-width: 0; }
+.comparison-group, .comparison-evidence, .comparison-fact {
+  margin-block: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.comparison-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr)); gap: 1.5rem; }
+.comparison-summary small { display: block; }
+.comparison-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); gap: .6rem 1rem; }
+.comparison-facts dt { font-weight: 600; }
+.comparison-facts dd { margin: .2rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.comparison-evidence > label { display: inline-grid; gap: .35rem; margin-right: 1rem; }

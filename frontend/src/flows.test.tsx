@@ -15,6 +15,10 @@ import type {
   ContinuationAction,
   DecisionExplanation,
   ObservedUsage,
+  WorkflowComparisonPage,
+  WorkflowComparisonQuery,
+  ComparisonEvidencePage,
+  ComparisonEvidenceRow,
   PermissionRequest,
   Project,
   ProjectExecution,
@@ -116,6 +120,7 @@ const allFeatures = [
   "multi_workflow_v1",
   "task_interactions_v1",
   "history_insights_v1",
+  "workflow_comparisons_v1",
 ];
 const protocolFixture = () =>
   new Response(
@@ -22762,4 +22767,178 @@ Deno.test("Conversation preflight rejects JSON expansion and invalid identifiers
       check(refused && requests === 0, "invalid serialized input reached transport");
     }
   } finally { globalThis.fetch = nativeFetch; }
+});
+
+Deno.test("Workflow comparisons keep applied filters and older-run facts through source, archived task, stale first evidence and reapply", async () => {
+  const currentTask: Task = { ...task, active_attempt: { ...task.active_attempt!, id: "new-active-run" } };
+  const archivedTask: Task = { ...task, id: "archived-task", title: "Archived accepted task", lifecycle: "done", archived: true, active_attempt: { ...task.active_attempt!, id: "archived-run", status: "accepted" } };
+  const opened: Task[] = [];
+  const requests: { url: URL; init?: RequestInit }[] = [];
+  const selection: WorkflowComparisonQuery = {
+    cohort: "run", group_by: "model", project_id: "p1", workflow: "trip", preset: "build_and_review", provider: "codex",
+    model: "recorded-model", effort: "medium", profile_revision: "profile-r2", adapter_id: "adapter-id", adapter_hash: "adapter-hash",
+    start_date: "2026-11-01", end_date: "2026-11-08", cursor: null,
+  };
+  const unavailableUsage: ObservedUsage = {
+    status: "unavailable", partial: true, counters: null, observed_responses: 0,
+    source: "recorded observations", last_observed_at: null, reason: "No saved usage for this invocation.",
+  };
+  const duration = { sum_millis: null, mean_millis: null, complete_samples: 0, unavailable_samples: 1, ongoing_samples: 0 };
+  const page = (snapshot: string): WorkflowComparisonPage => ({
+    selection, cohort: "run", total_selected_units: 2, displayed_group_units: 2, snapshot, next_cursor: null,
+    date_basis: "attempts.created_at UTC", outcome_scope: "Whole selected runs; acceptance requires human evidence.",
+    usage_scope: "Matching execution observations only.", timing_scope: "Observed interval latency is unmeasured.", wait_scope: "Recorded recovery waits only.",
+    groups: [{
+      key: "incomplete", attribution: { state: "incomplete", values: [] },
+      counts: {
+        units: 2, accepted: 2, cancelled: 0, failed: 0, incomplete: 0, human_changes: 1, provider_verdicts: 2, provider_negative_verdicts: 1,
+        repairs_authorized: 1, repairs_started: 0, repair_classification_unavailable: 1, human_classification_unavailable: 0, provider_classification_unavailable: 0,
+        infrastructure_recoveries: 1, complete_execution_epochs: 1, missing_execution_epochs: 1, ongoing_execution_epochs: 0, never_executed_epochs: 0,
+        selected_checks: 2, unknown_check_matrices: 1, checks_passed: 1, checks_failed: 0, checks_running: 0, checks_not_run: 0, checks_stale: 1, checks_unavailable: 0,
+        matching_sessions: 1, sessions_with_usage: 0, sessions_without_usage: 1,
+      },
+      elapsed_to_acceptance: duration, observed_execution_intervals: duration,
+      known_partial_execution_intervals: { ...duration, sum_millis: 50, mean_millis: 50, complete_samples: 1 },
+      recorded_recovery_waits: { ...duration, ongoing_samples: 1 }, check_execution: duration, usage: unavailableUsage,
+    }],
+  });
+  const sourceKey = { task_id: task.id, attempt_id: "old-run", kind: "report" as const, id: "old-report" };
+  const rows: ComparisonEvidenceRow[] = [
+    { key: "old-outcome", unit_id: "old-run", task_id: task.id, attempt_id: "old-run", source: sourceKey, truncated: false,
+      fact: { kind: "outcome", lifecycle: "done", run_status: "accepted", archived: false, human_acceptance_at: "2026-11-05T12:00:00Z", outcome: "accepted" } },
+    { key: "old-check", unit_id: "old-run", task_id: task.id, attempt_id: "old-run", source: null, truncated: true,
+      fact: { kind: "check", check_id: "selected-check", selection_revision: 2, receipt_id: "pinned-old-receipt", state: "passed", candidate_hash: "old-candidate",
+        inputs_hash: "old-input", elapsed_millis: 0, selected: true, reason: null, recorded_status: "passed", freshness_state: "fresh", launch_state: "exited", exit_code: 0 } },
+    { key: "archived-outcome", unit_id: "archived-run", task_id: archivedTask.id, attempt_id: "archived-run", source: null, truncated: false,
+      fact: { kind: "outcome", lifecycle: "done", run_status: "accepted", archived: true, human_acceptance_at: "2026-11-05T12:00:00Z", outcome: "accepted" } },
+  ];
+  let snapshot = "snapshot-one";
+  let staleFirstRead = false;
+  let sourceMissing = false;
+  let delayed = false;
+  const pending: { resolve: (response: Response) => void; signal: AbortSignal | null | undefined }[] = [];
+  const response = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input), "http://127.0.0.1");
+    requests.push({ url, init });
+    if (url.pathname === "/api/history/comparisons") return response(page(snapshot));
+    if (url.pathname === "/api/history/comparisons/evidence") {
+      if (delayed) { delayed = false; return await new Promise<Response>((resolve) => pending.push({ resolve, signal: init?.signal })); }
+      if (staleFirstRead) { staleFirstRead = false; return response({ error: "Results changed. Apply again." }, 409); }
+      const more = url.searchParams.get("cursor") === "evidence-next";
+      const evidence: ComparisonEvidencePage = { rows: more ? rows.slice(2) : rows.slice(0, 2), total_rows: rows.length, snapshot, next_cursor: more ? null : "evidence-next" };
+      return response(evidence);
+    }
+    if (url.pathname === "/api/history/source") return sourceMissing ? response({ error: "Historical source unavailable" }, 404) : response({
+      hit: { source: sourceKey, project_id: "p1", project_name: "Saved project", task_title: "Saved old title", created_at: "2026-11-05T10:00:00Z", archived: false, snippet: "Old report" },
+      text: "Exact old attempt report", truncated: false,
+    });
+    throw new Error(`Unexpected comparison request: ${url}`);
+  };
+  try {
+    mount(<History tasks={[currentTask, archivedTask]} projects={[project]} incarnation="comparisons-flow" onOpen={(t) => opened.push(t)} onChanged={noop} />);
+    click("Observed usage");
+    change(findSelect("Counting unit"), "run");
+    change(findSelect("Compare by"), "model");
+    change(findSelect("Project"), "p1");
+    change(findSelect("Workflow"), "trip");
+    change(findSelect("Preset"), "build_and_review");
+    change(findSelect("Provider"), "codex");
+    for (const [label, value] of [["Exact model", "recorded-model"], ["Effort", "medium"], ["Profile revision", "profile-r2"], ["Adapter ID", "adapter-id"], ["Adapter hash", "adapter-hash"], ["From", "2026-11-01"], ["Through", "2026-11-08"]]) field(label, value);
+    click("Apply");
+    await settle();
+    const aggregate = requests.find((r) => r.url.pathname === "/api/history/comparisons")!;
+    for (const [key, value] of Object.entries(selection)) if (value !== null) check(aggregate.url.searchParams.get(key) === value, `filter ${key} was lost`);
+    check(aggregate.init?.credentials === "same-origin" && new Headers(aggregate.init.headers).get("x-llmrelay-protocol")?.includes("workflow_comparisons_v1"), "comparison read lost browser auth or capability");
+    check(document.body.textContent?.includes("incomplete attribution") && document.body.textContent.includes("2 human accepted") && document.body.textContent.includes("1 missing"), "coverage or human outcome was hidden");
+    check(document.body.textContent?.includes("Inspect evidence for recorded identities") && !document.body.textContent.includes("No recorded values"), "incomplete summary falsely claimed recorded identities were absent");
+    field("Exact model", "unapplied-model");
+    change(findSelect("Compare by"), "provider");
+    check(document.body.textContent?.includes("grouped by model") && document.body.textContent.includes("Displayed results keep the applied selection"), "edited controls relabeled the applied result");
+    click("Inspect all evidence");
+    await settle();
+    const first = requests.find((r) => r.url.pathname.endsWith("/evidence"))!.url.searchParams;
+    check(first.get("snapshot") === "snapshot-one" && first.get("selection") === JSON.stringify(selection) && first.get("group") === "incomplete" && first.get("metric") === "all" && !first.has("cursor"), "first evidence read was not bound to the normalized applied selection and snapshot");
+    check(document.body.textContent?.includes("old-run") && document.body.textContent.includes("pinned-old-receipt") && document.body.textContent.includes("Truncated:"), "old attempt facts, exact receipts or truncation disappeared");
+    click("View historical source");
+    await settle();
+    check(document.querySelector('[aria-label="Historical comparison source"]')?.textContent?.includes("Exact old attempt report"), "historical source was not opened");
+    const sourceRequest = requests.find((r) => r.url.pathname === "/api/history/source")!.url;
+    check(sourceRequest.searchParams.get("attempt_id") === "old-run" && sourceRequest.searchParams.get("id") === "old-report", "source navigation substituted the active attempt");
+    click("Open task (current context)");
+    check(opened[0] === currentTask && opened[0].active_attempt?.id === "new-active-run", "Open task did not use the task's current context");
+    click("Load more evidence");
+    await settle();
+    const nextEvidence = requests.filter((r) => r.url.pathname.endsWith("/evidence")).at(-1)!.url.searchParams;
+    check(nextEvidence.get("cursor") === "evidence-next" && nextEvidence.get("snapshot") === "snapshot-one" && nextEvidence.get("selection") === JSON.stringify(selection) && document.body.textContent?.includes("3 of 3 facts loaded"), "bounded evidence pagination lost its snapshot or contributors");
+    const archivedRow = [...document.querySelectorAll(".comparison-fact")].find((row) => row.textContent?.includes("archived-task"));
+    check(!!archivedRow, "archived task evidence was omitted");
+    click("Open task (current context)", archivedRow!);
+    check(opened[1] === archivedTask && opened[1].archived, "archived task context was not available from evidence");
+    sourceMissing = true;
+    click("View historical source");
+    await settle();
+    check(document.body.textContent?.includes("Frozen comparison facts and outcomes remain unchanged") && document.body.textContent.includes("pinned-old-receipt"), "missing source erased frozen outcome evidence");
+    click("Close evidence");
+    staleFirstRead = true;
+    click("Inspect all evidence");
+    await settle();
+    check(!document.querySelector('[aria-label="Comparison evidence"]') && findButton("Inspect all evidence").disabled && findButton("Apply again"), "stale first evidence did not require reapply");
+    field("Exact model", "recorded-model");
+    change(findSelect("Compare by"), "model");
+    snapshot = "snapshot-two";
+    click("Apply again");
+    await settle();
+    delayed = true;
+    click("Inspect all evidence");
+    await settle();
+    click("Apply");
+    await settle();
+    check(pending.at(-1)?.signal?.aborted, "Apply did not abort the old evidence request");
+    await act(async () => pending.at(-1)?.resolve(response({ error: "Results changed. Apply again." }, 409)));
+    await settle();
+    check(!document.body.textContent?.includes("Saved facts changed.") && !findButton("Inspect all evidence").disabled, "a late stale failure invalidated a newer applied snapshot");
+    click("Inspect all evidence");
+    await settle();
+    check(requests.filter((r) => r.url.pathname.endsWith("/evidence")).at(-1)?.url.searchParams.get("snapshot") === "snapshot-two" && document.body.textContent?.includes("pinned-old-receipt"), "reapplied evidence used an old snapshot");
+    delayed = true;
+    change(findSelect("Evidence metric"), "timing");
+    await settle();
+    unmount();
+    check(pending.at(-1)?.signal?.aborted, "unmount did not abort the evidence request");
+    await act(async () => pending.at(-1)?.resolve(response({ rows: [], total_rows: 0, snapshot, next_cursor: null })));
+  } finally {
+    pending.at(-1)?.resolve(response({ rows: [], total_rows: 0, snapshot, next_cursor: null }));
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("History session usage keeps its endpoint, UTC filters, observed zero and unavailable coverage", async () => {
+  const requests: URL[] = [];
+  const zero: ObservedUsage = {
+    status: "observed", partial: true, counters: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: null, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 0 },
+    observed_responses: 1, source: "Saved response observation", last_observed_at: null, reason: null,
+  };
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input), "http://127.0.0.1");
+    requests.push(url);
+    if (url.pathname !== "/api/history/usage") throw new Error(`Unexpected session usage request: ${url}`);
+    return new Response(JSON.stringify({ groups: [
+      { key: "p1", label: "Fixture", sessions: 2, codex_sessions: 1, claude_sessions: 1, unknown_provider_sessions: 0, sessions_with_observations: 1, sessions_without_observations: 1, usage: zero },
+    ], next_cursor: null }));
+  };
+  try {
+    mount(<History tasks={[task]} projects={[project]} incarnation="session-usage-flow" onOpen={noop} onChanged={noop} />);
+    click("Observed usage");
+    change(findSelect("Project"), "p1");
+    change(findSelect("Workflow"), "trip");
+    change(findSelect("Role"), "implementer");
+    field("From", "2026-11-01");
+    field("Through", "2026-11-08");
+    click("Apply");
+    await settle();
+    check(requests.length === 1 && requests[0].searchParams.get("role") === "implementer" && requests[0].searchParams.get("start_date") === "2026-11-01" && requests[0].searchParams.get("project_id") === "p1" && requests[0].searchParams.get("workflow") === "trip", "session filters or endpoint changed");
+    check(document.body.textContent?.includes("Provider-reported observed total: 0 tokens") && document.body.textContent.includes("1 without") && document.body.textContent.includes("lifetime observations"), "session observed zero, missing coverage or lifetime scope was lost");
+  } finally { unmount(); globalThis.fetch = nativeFetch; }
 });

@@ -2177,6 +2177,370 @@ pub struct UsageComparisonPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonCohort {
+    #[default]
+    Task,
+    Run,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonDimension {
+    #[default]
+    Project,
+    Workflow,
+    Preset,
+    Provider,
+    Model,
+    Effort,
+    ProfileRevision,
+    Adapter,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkflowComparisonQuery {
+    pub cohort: ComparisonCohort,
+    pub group_by: ComparisonDimension,
+    pub project_id: Option<String>,
+    pub workflow: Option<String>,
+    pub preset: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub profile_revision: Option<String>,
+    pub adapter_id: Option<String>,
+    pub adapter_hash: Option<String>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonAttributionState {
+    Known,
+    Mixed,
+    Incomplete,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ComparisonAttribution {
+    pub state: ComparisonAttributionState,
+    pub values: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ComparisonExecutionIdentity {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub profile_revision: Option<String>,
+    pub profile_hash: Option<String>,
+    pub settings_revision: Option<i64>,
+    pub adapter_id: Option<String>,
+    pub adapter_hash: Option<String>,
+    pub executable_version: Option<String>,
+    pub compatibility_revision: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ComparisonDurationSummary {
+    pub sum_millis: Option<i64>,
+    pub mean_millis: Option<f64>,
+    pub complete_samples: usize,
+    pub unavailable_samples: usize,
+    pub ongoing_samples: usize,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ComparisonCounts {
+    pub units: usize,
+    pub accepted: usize,
+    pub cancelled: usize,
+    pub failed: usize,
+    pub incomplete: usize,
+    pub human_changes: usize,
+    pub provider_verdicts: usize,
+    pub provider_negative_verdicts: usize,
+    pub repairs_authorized: usize,
+    pub repairs_started: usize,
+    pub repair_classification_unavailable: usize,
+    pub human_classification_unavailable: usize,
+    pub provider_classification_unavailable: usize,
+    pub infrastructure_recoveries: usize,
+    pub complete_execution_epochs: usize,
+    pub missing_execution_epochs: usize,
+    pub ongoing_execution_epochs: usize,
+    pub never_executed_epochs: usize,
+    pub selected_checks: usize,
+    pub unknown_check_matrices: usize,
+    pub checks_passed: usize,
+    pub checks_failed: usize,
+    pub checks_running: usize,
+    pub checks_not_run: usize,
+    pub checks_stale: usize,
+    pub checks_unavailable: usize,
+    pub matching_sessions: usize,
+    pub sessions_with_usage: usize,
+    pub sessions_without_usage: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkflowComparisonGroup {
+    pub key: String,
+    pub attribution: ComparisonAttribution,
+    pub counts: ComparisonCounts,
+    pub elapsed_to_acceptance: ComparisonDurationSummary,
+    pub observed_execution_intervals: ComparisonDurationSummary,
+    pub known_partial_execution_intervals: ComparisonDurationSummary,
+    pub recorded_recovery_waits: ComparisonDurationSummary,
+    pub check_execution: ComparisonDurationSummary,
+    pub usage: ObservedUsage,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkflowComparisonPage {
+    pub groups: Vec<WorkflowComparisonGroup>,
+    pub selection: WorkflowComparisonQuery,
+    pub total_selected_units: usize,
+    pub displayed_group_units: usize,
+    pub cohort: ComparisonCohort,
+    pub date_basis: String,
+    pub outcome_scope: String,
+    pub usage_scope: String,
+    pub timing_scope: String,
+    pub wait_scope: String,
+    pub snapshot: String,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonEvidenceMetric {
+    #[default]
+    All,
+    Outcome,
+    Execution,
+    Usage,
+    HumanChange,
+    ProviderVerdict,
+    Repair,
+    Recovery,
+    Check,
+    Timing,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComparisonEvidenceQuery {
+    pub selection: String,
+    pub snapshot: String,
+    pub group: String,
+    #[serde(default)]
+    pub metric: ComparisonEvidenceMetric,
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonCheckState {
+    Passed,
+    Failed,
+    Running,
+    NotRun,
+    Stale,
+    Unavailable,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ComparisonEvidenceFact {
+    Outcome {
+        lifecycle: String,
+        run_status: Option<String>,
+        archived: bool,
+        human_acceptance_at: Option<String>,
+        outcome: String,
+    },
+    Execution {
+        role_generation_id: String,
+        session_id: String,
+        transcript_epoch: String,
+        identity: ComparisonExecutionIdentity,
+        matching: bool,
+        usage: ObservedUsage,
+    },
+    UsageObservation {
+        provider: String,
+        native_thread_id: String,
+        native_turn_id: String,
+        response_id: String,
+        session_id: String,
+        transcript_epoch: String,
+        role_generation_id: String,
+        accepted_hook_event_id: String,
+        invalid: bool,
+        received_at: String,
+        counters: ObservedUsageCounters,
+        owner_task_id: String,
+        owner_attempt_id: String,
+        source_version: String,
+        contract_revision: String,
+    },
+    ClassificationUnavailable {
+        metric: ComparisonEvidenceMetric,
+        reason: String,
+    },
+    HumanChange {
+        decision_id: String,
+        child_attempt_id: Option<String>,
+    },
+    ProviderVerdict {
+        decision_id: String,
+        result_id: Option<String>,
+        verdict: String,
+    },
+    Repair {
+        authorization_id: String,
+        originating_decision_id: String,
+        started_session_id: Option<String>,
+        classification_reason: Option<String>,
+    },
+    Recovery {
+        recovery_id: String,
+        session_id: Option<String>,
+        state: String,
+        reason: Option<String>,
+        created_at: String,
+        resolved_at: Option<String>,
+        elapsed_millis: Option<i64>,
+        ongoing: bool,
+    },
+    Check {
+        check_id: String,
+        selection_revision: i64,
+        receipt_id: Option<String>,
+        state: ComparisonCheckState,
+        candidate_hash: Option<String>,
+        inputs_hash: Option<String>,
+        elapsed_millis: Option<i64>,
+        selected: bool,
+        reason: Option<String>,
+        recorded_status: Option<String>,
+        freshness_state: Option<String>,
+        launch_state: Option<String>,
+        exit_code: Option<i64>,
+    },
+    UnknownCheckMatrix {
+        reason: String,
+    },
+    Timing {
+        invocation: ComparisonInvocationTiming,
+    },
+    Run {
+        status: String,
+        workflow: Option<String>,
+        preset: Option<String>,
+        created_at: String,
+        human_acceptance_at: Option<String>,
+        candidate_hash: Option<String>,
+        selection_revision: i64,
+    },
+    Boundary {
+        boundary_id: String,
+        session_id: String,
+        transcript_epoch: String,
+        process_identity_hash: String,
+        boundary_kind: String,
+        observed_at: String,
+    },
+    BoundaryConflict {
+        boundary_id: String,
+        fact_hash: String,
+        observed_at: String,
+    },
+    TaskTiming {
+        state: ComparisonTimingState,
+        elapsed_millis: Option<i64>,
+        first_start_coverage_complete: bool,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComparisonEvidenceRow {
+    pub key: String,
+    pub unit_id: String,
+    pub task_id: String,
+    pub attempt_id: Option<String>,
+    pub source: Option<HistoricalSourceKey>,
+    pub fact: ComparisonEvidenceFact,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComparisonEvidencePage {
+    pub rows: Vec<ComparisonEvidenceRow>,
+    pub total_rows: usize,
+    pub snapshot: String,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonTimingState {
+    Complete,
+    Ongoing,
+    Unavailable,
+    NeverExecuted,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComparisonInvocationTiming {
+    pub evidence_basis: Option<String>,
+    pub session_id: String,
+    pub role_generation_id: String,
+    pub transcript_epoch: Option<String>,
+    pub process_identity_hash: Option<String>,
+    pub start_boundary_id: Option<String>,
+    pub end_boundary_id: Option<String>,
+    pub observed_start: Option<String>,
+    pub observed_end: Option<String>,
+    pub elapsed_millis: Option<i64>,
+    pub state: ComparisonTimingState,
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComparisonRunTiming {
+    pub attempt_id: String,
+    pub complete_observed_interval_millis: Option<i64>,
+    pub known_partial_interval_millis: Option<i64>,
+    pub complete_epochs: usize,
+    pub missing_epochs: usize,
+    pub ongoing_epochs: usize,
+    pub never_executed_epochs: usize,
+    pub first_start_coverage_complete: bool,
+    pub invocations: Vec<ComparisonInvocationTiming>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComparisonTaskTiming {
+    pub task_id: String,
+    pub state_revision: i64,
+    pub state: ComparisonTimingState,
+    pub earliest_known_observed_start: Option<String>,
+    pub first_start_coverage_complete: bool,
+    pub human_acceptance_at: Option<String>,
+    pub elapsed_to_acceptance_millis: Option<i64>,
+    pub unavailable_reason: Option<String>,
+    pub runs: Vec<ComparisonRunTiming>,
+}
+
 /// Where a task stands, derived from authoritative workflow evidence. Hook
 /// traffic and process liveness are reported separately and never count as
 /// progress.

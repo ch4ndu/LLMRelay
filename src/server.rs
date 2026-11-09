@@ -1105,6 +1105,11 @@ fn web_router(web_state: WebState) -> Router {
         .route("/api/history/search", get(api_history_search))
         .route("/api/history/source", get(api_historical_source))
         .route("/api/history/usage", get(api_usage_comparisons))
+        .route("/api/history/comparisons", get(api_workflow_comparisons))
+        .route(
+            "/api/history/comparisons/evidence",
+            get(api_comparison_evidence),
+        )
         .route("/api/permission-coverage", post(api_permission_coverage))
         .route("/api/command", post(api_command))
         .route("/api/operation", post(api_operation))
@@ -4781,6 +4786,79 @@ async fn api_usage_comparisons(
             .into_response(),
     }
 }
+fn require_workflow_comparisons(state: &WebState, headers: &HeaderMap) -> Result<(), Response> {
+    require_browser(state, headers)?;
+    if !declared_features(headers)
+        .iter()
+        .any(|f| f == protocol::WORKFLOW_COMPARISONS_FEATURE)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error":"Reload the dashboard to use workflow comparisons."
+            })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+async fn api_workflow_comparisons(
+    State(state): State<WebState>,
+    axum::extract::Query(query): axum::extract::Query<crate::domain::WorkflowComparisonQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_workflow_comparisons(&state, &headers) {
+        return response;
+    }
+    let store = state.app.store.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::comparisons::workflow_comparisons(&store, query, &state.instance_id)
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_comparison_evidence(
+    State(state): State<WebState>,
+    axum::extract::Query(query): axum::extract::Query<crate::domain::ComparisonEvidenceQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_workflow_comparisons(&state, &headers) {
+        return response;
+    }
+    let store = state.app.store.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::comparisons::comparison_evidence(&store, query, &state.instance_id)
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn api_task_activity(
     State(state): State<WebState>,
     AxumPath(task_id): AxumPath<String>,

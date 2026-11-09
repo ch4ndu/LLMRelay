@@ -462,6 +462,27 @@ A trusted accepted resumed turn can supersede its own prior unconsumed blocked o
 
 Permission decisions, response delivery, native resolution, role report submission, verification and human acceptance remain separate. A native notification or failed turn does not consume a review call or imply a role verdict. See [operations](OPERATIONS.md#permission-notices-and-appearance) and the [signal matrix](PERMISSION_SIGNAL_MATRIX.md).
 
+## Workflow and provider comparisons
+
+In **History → Observed usage and comparisons**, choose task or run outcomes,
+apply filters, and inspect the evidence behind a group or metric. Task/run
+creation dates define separate UTC cohorts; the retained session-usage view has
+its own cohort. Exact workflow/provider/model filters match one contributing run
+and execution together. A selected task still retains its full mixed or
+incomplete attribution, including earlier attempts and archived tasks.
+
+Human acceptance, provider verdicts, repair authorizations, proven repair starts
+and infrastructure recovery are separate facts. Selected checks use each run's
+recorded matrix, with accepted Single agent receipts pinned to acceptance.
+Earlier reruns remain inspectable without increasing the selected denominator.
+Missing evidence stays unavailable; these observations do not rank providers or
+grant execution, approval or acceptance authority.
+
+The evidence panel opens exact historical attempts. **Open task (current context)**
+opens the current task separately. Editing filters does not relabel applied
+results. If saved state changes, choose **Apply again** before further evidence
+reads or pagination. See [comparison scope and limits](OPERATIONS.md#workflow-and-provider-comparisons).
+
 ## Observed usage authority
 
 Codex usage is presentation-only evidence from uniquely attributed admitted-version

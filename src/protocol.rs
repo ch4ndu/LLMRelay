@@ -9,6 +9,7 @@ pub const GUIDANCE: &str = "Reload the dashboard or use a CLI built for this ser
 pub const HISTORY_VIEW_FEATURE: &str = "history_view_v1";
 pub const PROVIDER_VALIDATION_FEATURE: &str = "provider_validation_v1";
 pub const TASK_INTERACTIONS_FEATURE: &str = "task_interactions_v1";
+pub const WORKFLOW_COMPARISONS_FEATURE: &str = "workflow_comparisons_v1";
 pub const HISTORY_INSIGHTS_FEATURE: &str = "history_insights_v1";
 pub const MULTI_WORKFLOW_FEATURE: &str = "multi_workflow_v1";
 pub const SINGLE_AGENT_PRESETS_FEATURE: &str = "single_agent_presets_v1";
@@ -35,6 +36,7 @@ impl ClientKind {
                 SINGLE_AGENT_PRESETS_FEATURE,
                 TASK_INTERACTIONS_FEATURE,
                 HISTORY_INSIGHTS_FEATURE,
+                WORKFLOW_COMPARISONS_FEATURE,
                 DESKTOP_TARGET_FEATURE,
                 CONVERSATION_FEATURE,
             ],

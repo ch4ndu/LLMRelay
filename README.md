@@ -125,7 +125,7 @@ Open **Workspace**. **Needs your attention** and **Approvals** show questions, p
 
 Use **Edit** or **Cancel** for eligible queued Manager guidance, and **Add comment** for a note that stays with the task without instructing an agent. See [task controls and activity](docs/WORKFLOWS.md#dashboard-workspace). The approval scope dialog can also [preview a sample command’s coverage](docs/SECURITY.md#action-permissions) before you decide.
 
-In **History**, use **Search** to find saved text across archived tasks and earlier attempts, then open the exact historical source. **Observed usage** compares partial Codex observations by project, workflow or role, with optional session-start dates. See [history search](docs/OPERATIONS.md#history-search) and [usage comparisons](docs/OPERATIONS.md#codex-observed-usage) for coverage and limits.
+In **History**, use **Search** to find saved text across archived tasks and earlier attempts, then open the exact historical source. **Observed usage and comparisons** compares task/run outcomes, recorded execution identities, checks, repairs, timing and partial token observations, with exact historical evidence drilldowns and explicit coverage. See [history search](docs/OPERATIONS.md#history-search) and [workflow comparisons](docs/OPERATIONS.md#workflow-and-provider-comparisons) for coverage and limits.
 
 Closing an output view does not stop the agent. Releasing keyboard control does not restart or resume a task.
 

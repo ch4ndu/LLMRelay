@@ -2,6 +2,7 @@ pub mod auth;
 pub mod checks;
 pub mod cli;
 pub mod cmux;
+pub mod comparisons;
 pub mod config;
 pub mod control;
 pub mod coordinator;

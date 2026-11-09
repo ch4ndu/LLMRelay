@@ -46,13 +46,13 @@ export function History(
       <header className="page-heading">
         <div>
           <span className="eyebrow">History</span>
-          <h1>{view === "tasks" ? "Completed and archived tasks" : view === "search" ? "Search history" : "Observed usage"}</h1>
+          <h1>{view === "tasks" ? "Completed and archived tasks" : view === "search" ? "Search history" : "Workflow and provider comparisons"}</h1>
           <p>
             {view === "tasks"
               ? "Accepted, cancelled and archived tasks. Their results and evidence stay available here."
               : view === "search"
               ? "Find saved text across projects, tasks and attempts."
-              : "Compare partial response observations across projects, workflows and roles."}
+              : "Compare saved task and run outcomes, execution evidence and observed session usage."}
           </p>
         </div>
         {view === "tasks" && <label className="toggle">
@@ -66,10 +66,10 @@ export function History(
       <nav className="history-views" aria-label="History views">
         <button aria-pressed={view === "tasks"} onClick={() => setView("tasks")}>Tasks</button>
         <button aria-pressed={view === "search"} onClick={() => setView("search")}>Search</button>
-        <button aria-pressed={view === "usage"} onClick={() => setView("usage")}>Observed usage</button>
+        <button aria-pressed={view === "usage"} onClick={() => setView("usage")}>Observed usage and comparisons</button>
       </nav>
       {view === "search" && <HistorySearch key={insightsKey} projects={projects} initialProjectId={projectId} tasks={tasks} onOpen={onOpen} />}
-      {view === "usage" && <UsageComparisons key={insightsKey} projects={projects} initialProjectId={projectId} />}
+      {view === "usage" && <UsageComparisons key={insightsKey} projects={projects} initialProjectId={projectId} tasks={tasks} onOpen={onOpen} />}
       {error && <ErrorNotice error={error} />}
       {view === "tasks" && <div className="history-list">
         {!rows.length && (

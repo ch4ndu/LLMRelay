@@ -2548,7 +2548,7 @@ impl Supervisor {
                             .flatten()
                         })
                         .flatten();
-                    let recorded = self.store.update_session_exit(
+                    let recorded = self.store.update_session_observed_exit(
                         &handle.session_id,
                         &handle.transcript_epoch,
                         &process_json,
@@ -3827,7 +3827,7 @@ impl Supervisor {
                 .flatten()
             })
             .flatten();
-        self.store.update_session_exit(
+        self.store.update_session_observed_exit(
             &handle.session_id,
             &handle.transcript_epoch,
             &process_json,
